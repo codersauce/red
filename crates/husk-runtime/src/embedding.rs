@@ -1527,6 +1527,7 @@ fn runtime_to_owned(value: Value) -> anyhow::Result<OwnedValue> {
                 .map(runtime_to_owned)
                 .collect::<anyhow::Result<Vec<_>>>()?,
         }),
+        Value::Resource { type_name, handle } => Ok(OwnedValue::Resource { type_name, handle }),
         Value::Json(value) => Ok(OwnedValue::Json(value)),
         Value::Callback(callback) => anyhow::bail!(
             "function `{}` from instance `{}` cannot be detached as ordinary data",
@@ -1605,6 +1606,7 @@ fn owned_to_runtime(value: OwnedValue) -> anyhow::Result<Value> {
                 fields: Arc::new(fields),
             })
         }
+        OwnedValue::Resource { type_name, handle } => Ok(Value::Resource { type_name, handle }),
         OwnedValue::Json(value) => Ok(Value::from_json(value)),
     }
 }
@@ -1642,6 +1644,9 @@ fn ensure_owned_value_size(values: &[OwnedValue], limit: usize) -> anyhow::Resul
                     .saturating_add(type_name.len())
                     .saturating_add(case.len());
                 pending.extend(fields);
+            }
+            OwnedValue::Resource { type_name, .. } => {
+                total = total.saturating_add(type_name.len());
             }
             OwnedValue::Json(value) => {
                 let mut json = vec![value];

@@ -6,7 +6,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use anyhow::Context;
@@ -16,15 +19,20 @@ use husk_types::{
     ParameterDescriptor, TypeDefinitionDescriptor, TypeDefinitionKind, TypeDescriptor,
     VariantCaseDescriptor, Version,
 };
-use husk_value::OwnedValue;
+use husk_value::{OwnedValue, ResourceHandle};
 use thiserror::Error;
 use wasmtime::{
     Config, Engine, Store, StoreLimits, StoreLimitsBuilder,
     component::{
-        Component, ComponentExportIndex, Instance as ComponentInstance, Linker, Val,
-        types::{ComponentFunc, ComponentInstance as ComponentInstanceType, ComponentItem, Type},
+        Component, ComponentExportIndex, Instance as ComponentInstance, Linker, ResourceAny, Val,
+        types::{
+            ComponentFunc, ComponentInstance as ComponentInstanceType, ComponentItem, ResourceType,
+            Type,
+        },
     },
 };
+
+static NEXT_RESOURCE_OWNER: AtomicU64 = AtomicU64::new(1);
 
 /// Compilation and capability policy for one component.
 #[derive(Debug, Clone)]
@@ -102,6 +110,12 @@ struct NamedType {
 }
 
 #[derive(Debug, Clone)]
+struct NamedResource {
+    husk_name: String,
+    ty: ResourceType,
+}
+
+#[derive(Debug, Clone)]
 struct WasmFunction {
     export: ComponentExportIndex,
     parameters: Vec<Type>,
@@ -113,6 +127,7 @@ struct WasmComponentInner {
     component: Component,
     descriptor: ModuleDescriptor,
     functions: BTreeMap<String, WasmFunction>,
+    resources: Vec<NamedResource>,
     actual_imports: BTreeSet<Capability>,
     raw_imports: Vec<String>,
 }
@@ -192,6 +207,7 @@ impl WasmComponent {
                 component,
                 descriptor: inspection.descriptor,
                 functions: inspection.functions,
+                resources: inspection.resources,
                 actual_imports,
                 raw_imports,
             }),
@@ -257,12 +273,115 @@ impl WasmComponent {
             instance,
             limits,
             poisoned: false,
+            resource_owner: NEXT_RESOURCE_OWNER.fetch_add(1, Ordering::Relaxed),
+            resources: ResourceTable::default(),
         })
     }
 }
 
 struct StoreData {
     store_limits: StoreLimits,
+}
+
+struct ResourceEntry {
+    type_name: String,
+    value: ResourceAny,
+}
+
+struct ResourceSlot {
+    generation: u32,
+    entry: Option<ResourceEntry>,
+}
+
+#[derive(Default)]
+struct ResourceTable {
+    slots: Vec<ResourceSlot>,
+    free: Vec<u32>,
+}
+
+impl ResourceTable {
+    fn insert(
+        &mut self,
+        owner: u64,
+        type_name: String,
+        value: ResourceAny,
+    ) -> anyhow::Result<ResourceHandle> {
+        anyhow::ensure!(
+            value.owned(),
+            "borrowed resources cannot escape a component call"
+        );
+        let slot = if let Some(slot) = self.free.pop() {
+            slot
+        } else {
+            let slot =
+                u32::try_from(self.slots.len()).context("extension resource table is full")?;
+            self.slots.push(ResourceSlot {
+                generation: 1,
+                entry: None,
+            });
+            slot
+        };
+        let resource_slot = &mut self.slots[slot as usize];
+        debug_assert!(resource_slot.entry.is_none());
+        resource_slot.entry = Some(ResourceEntry { type_name, value });
+        Ok(ResourceHandle::new(owner, slot, resource_slot.generation))
+    }
+
+    fn get(
+        &self,
+        owner: u64,
+        handle: ResourceHandle,
+        expected_type: &str,
+    ) -> anyhow::Result<&ResourceEntry> {
+        anyhow::ensure!(
+            handle.owner() == owner,
+            "resource belongs to a different extension instance"
+        );
+        let slot = self
+            .slots
+            .get(handle.slot() as usize)
+            .ok_or_else(|| anyhow::anyhow!("resource handle is stale"))?;
+        anyhow::ensure!(
+            slot.generation == handle.generation(),
+            "resource handle is stale"
+        );
+        let entry = slot
+            .entry
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("resource handle is stale"))?;
+        anyhow::ensure!(
+            entry.type_name == expected_type,
+            "resource has type `{}`, expected `{expected_type}`",
+            entry.type_name
+        );
+        Ok(entry)
+    }
+
+    fn take(
+        &mut self,
+        owner: u64,
+        handle: ResourceHandle,
+        expected_type: &str,
+    ) -> anyhow::Result<ResourceAny> {
+        self.get(owner, handle, expected_type)?;
+        let slot = &mut self.slots[handle.slot() as usize];
+        let entry = slot
+            .entry
+            .take()
+            .expect("resource entry was just validated");
+        slot.generation = slot.generation.wrapping_add(1).max(1);
+        self.free.push(handle.slot());
+        Ok(entry.value)
+    }
+
+    fn drain(&mut self) -> impl Iterator<Item = ResourceAny> + '_ {
+        self.free.clear();
+        self.slots.iter_mut().filter_map(|slot| {
+            let entry = slot.entry.take()?;
+            slot.generation = slot.generation.wrapping_add(1).max(1);
+            Some(entry.value)
+        })
+    }
 }
 
 /// One mutable, non-shareable WebAssembly Component instance.
@@ -272,12 +391,45 @@ pub struct WasmInstance {
     instance: ComponentInstance,
     limits: WasmLimits,
     poisoned: bool,
+    resource_owner: u64,
+    resources: ResourceTable,
 }
 
 impl WasmInstance {
     #[must_use]
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+
+    /// Explicitly destroy a resource owned by this extension instance.
+    pub fn drop_resource(&mut self, handle: ResourceHandle) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            handle.owner() == self.resource_owner,
+            "resource belongs to a different extension instance"
+        );
+        let type_name = self
+            .resources
+            .slots
+            .get(handle.slot() as usize)
+            .and_then(|slot| slot.entry.as_ref())
+            .map(|entry| entry.type_name.clone())
+            .ok_or_else(|| anyhow::anyhow!("resource handle is stale"))?;
+        let resource = self
+            .resources
+            .take(self.resource_owner, handle, &type_name)?;
+        resource
+            .resource_drop(&mut self.store)
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("drop extension resource `{type_name}`"))
+    }
+
+    #[must_use]
+    pub fn live_resource_count(&self) -> usize {
+        self.resources
+            .slots
+            .iter()
+            .filter(|slot| slot.entry.is_some())
+            .count()
     }
 
     /// Invoke a normalized Husk path such as `api::is_match`.
@@ -310,21 +462,6 @@ impl WasmInstance {
         }
         ensure_value_size(arguments, self.limits.max_value_bytes)
             .context("extension arguments exceed configured value limit")?;
-
-        let parameters = arguments
-            .iter()
-            .zip(&function.parameters)
-            .enumerate()
-            .map(|(index, (value, ty))| {
-                owned_to_component(value, ty).with_context(|| {
-                    format!(
-                        "convert argument {index} for extension call `{}::{path}`",
-                        self.component.inner.descriptor.name
-                    )
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let mut results = vec![Val::Bool(false); function.results.len()];
         self.store
             .set_fuel(self.limits.fuel_per_call)
             .map_err(anyhow::Error::from)
@@ -333,7 +470,36 @@ impl WasmInstance {
             .instance
             .get_func(&mut self.store, function.export)
             .ok_or_else(|| anyhow::anyhow!("compiled extension export `{path}` is missing"))?;
+
+        let mut lowering = ResourceLowering {
+            owner: self.resource_owner,
+            resources: &mut self.resources,
+            named_resources: &self.component.inner.resources,
+            consumed: Vec::new(),
+        };
+        let parameters = arguments
+            .iter()
+            .zip(&function.parameters)
+            .enumerate()
+            .map(|(index, (value, ty))| {
+                owned_to_component(&mut lowering, value, ty).with_context(|| {
+                    format!(
+                        "convert argument {index} for extension call `{}::{path}`",
+                        self.component.inner.descriptor.name
+                    )
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>();
+        let parameters = match parameters {
+            Ok(parameters) => parameters,
+            Err(error) => {
+                lowering.drop_consumed(&mut self.store);
+                return Err(error);
+            }
+        };
+        let mut results = vec![Val::Bool(false); function.results.len()];
         if let Err(error) = func.call(&mut self.store, &parameters, &mut results) {
+            lowering.drop_consumed(&mut self.store);
             self.poisoned = true;
             return Err(anyhow::Error::from(error)).with_context(|| {
                 format!(
@@ -342,22 +508,42 @@ impl WasmInstance {
                 )
             });
         }
+        lowering.consumed.clear();
 
+        let mut lifting = ResourceLifting {
+            owner: self.resource_owner,
+            resources: &mut self.resources,
+            named_resources: &self.component.inner.resources,
+            inserted: Vec::new(),
+            store: &mut self.store,
+        };
         let values = results
             .into_iter()
             .zip(&function.results)
             .enumerate()
             .map(|(index, (value, ty))| {
-                component_to_owned(value, ty).with_context(|| {
+                component_to_owned(&mut lifting, value, ty).with_context(|| {
                     format!(
                         "convert result {index} from extension call `{}::{path}`",
                         self.component.inner.descriptor.name
                     )
                 })
             })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        ensure_value_size(&values, self.limits.max_value_bytes)
-            .context("extension results exceed configured value limit")?;
+            .collect::<anyhow::Result<Vec<_>>>();
+        let values = match values {
+            Ok(values) => values,
+            Err(error) => {
+                lifting.rollback();
+                return Err(error);
+            }
+        };
+        if let Err(error) = ensure_value_size(&values, self.limits.max_value_bytes)
+            .context("extension results exceed configured value limit")
+        {
+            lifting.rollback();
+            return Err(error);
+        }
+        lifting.inserted.clear();
         Ok(match values.len() {
             0 => OwnedValue::Unit,
             1 => values.into_iter().next().expect("one result"),
@@ -366,9 +552,18 @@ impl WasmInstance {
     }
 }
 
+impl Drop for WasmInstance {
+    fn drop(&mut self) {
+        for resource in self.resources.drain() {
+            let _ = resource.resource_drop(&mut self.store);
+        }
+    }
+}
+
 struct Inspection {
     descriptor: ModuleDescriptor,
     functions: BTreeMap<String, WasmFunction>,
+    resources: Vec<NamedResource>,
 }
 
 fn inspect_exports(
@@ -388,7 +583,58 @@ fn inspect_exports(
                 _ => None,
             }),
     )?;
-    let root_types = build_type_definitions(&root_named)?;
+    let root_resources = collect_named_resources(
+        module_name,
+        None,
+        component_type
+            .exports(engine)
+            .filter_map(|(name, export)| match export.ty {
+                ComponentItem::Resource(ty) => Some((name.to_string(), ty)),
+                _ => None,
+            }),
+    )?;
+    let mut visible_resources = root_resources.clone();
+    visible_resources.extend(collect_named_resources(
+        module_name,
+        None,
+        component_type
+            .exports(engine)
+            .filter_map(|(name, export)| match export.ty {
+                ComponentItem::Type(Type::Own(ty) | Type::Borrow(ty)) => {
+                    Some((name.to_string(), ty))
+                }
+                _ => None,
+            }),
+    )?);
+    for (original_name, export) in component_type.exports(engine) {
+        let ComponentItem::ComponentInstance(instance_type) = export.ty else {
+            continue;
+        };
+        let interface_name = normalize_wit_name(short_export_name(original_name))?;
+        visible_resources.extend(collect_named_resources(
+            module_name,
+            Some(&interface_name),
+            instance_type
+                .exports(engine)
+                .filter_map(|(name, export)| match export.ty {
+                    ComponentItem::Resource(ty) => Some((name.to_string(), ty)),
+                    _ => None,
+                }),
+        )?);
+        visible_resources.extend(collect_named_resources(
+            module_name,
+            Some(&interface_name),
+            instance_type
+                .exports(engine)
+                .filter_map(|(name, export)| match export.ty {
+                    ComponentItem::Type(Type::Own(ty) | Type::Borrow(ty)) => {
+                        Some((name.to_string(), ty))
+                    }
+                    _ => None,
+                }),
+        )?);
+    }
+    let root_types = build_type_definitions(&root_named, &root_resources)?;
 
     let mut functions = BTreeMap::new();
     let mut function_descriptors = Vec::new();
@@ -397,7 +643,7 @@ fn inspect_exports(
 
     for (original_name, export) in component_type.exports(engine) {
         match export.ty {
-            ComponentItem::Type(_) => {}
+            ComponentItem::Type(_) | ComponentItem::Resource(_) => {}
             ComponentItem::ComponentFunc(function) => {
                 let husk_name =
                     normalize_and_track(original_name, &mut member_names, "root component export")?;
@@ -408,6 +654,7 @@ fn inspect_exports(
                     &husk_name,
                     function,
                     &root_named,
+                    &visible_resources,
                     export_index,
                     original_name,
                 )?;
@@ -429,6 +676,7 @@ fn inspect_exports(
                     &interface_name,
                     instance_type,
                     &root_named,
+                    &visible_resources,
                     parent_index,
                     &mut functions,
                 )?;
@@ -456,6 +704,7 @@ fn inspect_exports(
     Ok(Inspection {
         descriptor,
         functions,
+        resources: visible_resources,
     })
 }
 
@@ -468,6 +717,7 @@ fn inspect_interface(
     interface_name: &str,
     instance_type: ComponentInstanceType,
     root_named: &[NamedType],
+    root_resources: &[NamedResource],
     parent_index: ComponentExportIndex,
     functions: &mut BTreeMap<String, WasmFunction>,
 ) -> anyhow::Result<InterfaceDescriptor> {
@@ -483,13 +733,25 @@ fn inspect_interface(
     )?;
     let mut visible_named = root_named.to_vec();
     visible_named.extend(interface_named.clone());
-    let type_definitions = build_type_definitions(&interface_named)?;
+    let interface_resources = collect_named_resources(
+        module_name,
+        Some(interface_name),
+        instance_type
+            .exports(engine)
+            .filter_map(|(name, export)| match export.ty {
+                ComponentItem::Resource(ty) => Some((name.to_string(), ty)),
+                _ => None,
+            }),
+    )?;
+    let mut visible_resources = root_resources.to_vec();
+    visible_resources.extend(interface_resources.clone());
+    let type_definitions = build_type_definitions(&interface_named, &interface_resources)?;
     let mut descriptors = Vec::new();
     let mut normalized_names = BTreeMap::new();
 
     for (original_name, export) in instance_type.exports(engine) {
         match export.ty {
-            ComponentItem::Type(_) => {}
+            ComponentItem::Type(_) | ComponentItem::Resource(_) => {}
             ComponentItem::ComponentFunc(function) => {
                 let husk_name = normalize_and_track(
                     original_name,
@@ -507,6 +769,7 @@ fn inspect_interface(
                     &husk_name,
                     function,
                     &visible_named,
+                    &visible_resources,
                     export_index,
                     &format!("{original_interface_name}/{original_name}"),
                 )?;
@@ -536,6 +799,7 @@ fn describe_function(
     husk_name: &str,
     function: ComponentFunc,
     named_types: &[NamedType],
+    named_resources: &[NamedResource],
     export: ComponentExportIndex,
     context: &str,
 ) -> anyhow::Result<(FunctionDescriptor, WasmFunction)> {
@@ -556,17 +820,17 @@ fn describe_function(
             };
             let normalized =
                 normalize_and_track(&original, &mut parameter_names, "function parameter")?;
-            let ty = map_type(ty, named_types, context)?;
+            let ty = map_type(ty, named_types, named_resources, context)?;
             ParameterDescriptor::new(normalized, ty).map_err(anyhow::Error::from)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let result = match result_types.as_slice() {
         [] => TypeDescriptor::Unit,
-        [result] => map_type(result, named_types, context)?,
+        [result] => map_type(result, named_types, named_resources, context)?,
         results => TypeDescriptor::Tuple(
             results
                 .iter()
-                .map(|ty| map_type(ty, named_types, context))
+                .map(|ty| map_type(ty, named_types, named_resources, context))
                 .collect::<anyhow::Result<Vec<_>>>()?,
         ),
     };
@@ -606,14 +870,39 @@ fn collect_named_types(
     Ok(result)
 }
 
+fn collect_named_resources(
+    module_name: &str,
+    interface_name: Option<&str>,
+    exports: impl IntoIterator<Item = (String, ResourceType)>,
+) -> anyhow::Result<Vec<NamedResource>> {
+    let mut names = BTreeMap::new();
+    let mut result = Vec::new();
+    for (original_name, ty) in exports {
+        let short_name = short_export_name(&original_name);
+        let local_name = normalize_and_track(short_name, &mut names, "exported WIT resource")?;
+        let prefix = match interface_name {
+            Some(interface) => format!("{module_name}_{interface}_{local_name}"),
+            None => format!("{module_name}_{local_name}"),
+        };
+        result.push(NamedResource {
+            husk_name: normalize_wit_name(&prefix)?,
+            ty,
+        });
+    }
+    result.sort_unstable_by(|left, right| left.husk_name.cmp(&right.husk_name));
+    Ok(result)
+}
+
 fn build_type_definitions(
     named_types: &[NamedType],
+    named_resources: &[NamedResource],
 ) -> anyhow::Result<Vec<TypeDefinitionDescriptor>> {
-    named_types
+    let mut definitions = named_types
         .iter()
         .map(|named| {
             let context = format!("exported type `{}`", named.original_name);
             let kind = match &named.ty {
+                Type::Own(_) | Type::Borrow(_) => TypeDefinitionKind::Resource,
                 Type::Record(record) => TypeDefinitionKind::Record(
                     record
                         .fields()
@@ -623,6 +912,7 @@ fn build_type_definitions(
                                 map_type_excluding(
                                     &field.ty,
                                     named_types,
+                                    named_resources,
                                     &context,
                                     Some(&named.husk_name),
                                 )?,
@@ -647,6 +937,7 @@ fn build_type_definitions(
                                         map_type_excluding(
                                             ty,
                                             named_types,
+                                            named_resources,
                                             &context,
                                             Some(&named.husk_name),
                                         )
@@ -660,6 +951,7 @@ fn build_type_definitions(
                 ty => TypeDefinitionKind::Alias(map_type_excluding(
                     ty,
                     named_types,
+                    named_resources,
                     &context,
                     Some(&named.husk_name),
                 )?),
@@ -667,19 +959,56 @@ fn build_type_definitions(
             TypeDefinitionDescriptor::new(named.husk_name.clone(), kind)
                 .map_err(anyhow::Error::from)
         })
-        .collect()
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    definitions.extend(
+        named_resources
+            .iter()
+            .map(|resource| {
+                TypeDefinitionDescriptor::new(
+                    resource.husk_name.clone(),
+                    TypeDefinitionKind::Resource,
+                )
+                .map_err(anyhow::Error::from)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
+    );
+    definitions.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    Ok(definitions)
 }
 
-fn map_type(ty: &Type, named_types: &[NamedType], context: &str) -> anyhow::Result<TypeDescriptor> {
-    map_type_excluding(ty, named_types, context, None)
+fn map_type(
+    ty: &Type,
+    named_types: &[NamedType],
+    named_resources: &[NamedResource],
+    context: &str,
+) -> anyhow::Result<TypeDescriptor> {
+    map_type_excluding(ty, named_types, named_resources, context, None)
 }
 
 fn map_type_excluding(
     ty: &Type,
     named_types: &[NamedType],
+    named_resources: &[NamedResource],
     context: &str,
     excluded_name: Option<&str>,
 ) -> anyhow::Result<TypeDescriptor> {
+    match ty {
+        Type::Own(resource) => {
+            return Ok(TypeDescriptor::OwnResource(resource_name(
+                resource,
+                named_resources,
+                context,
+            )?));
+        }
+        Type::Borrow(resource) => {
+            return Ok(TypeDescriptor::BorrowResource(resource_name(
+                resource,
+                named_resources,
+                context,
+            )?));
+        }
+        _ => {}
+    }
     if let Some(named) = named_types
         .iter()
         .find(|named| named.husk_name != excluded_name.unwrap_or_default() && named.ty == *ty)
@@ -695,30 +1024,38 @@ fn map_type_excluding(
         Type::List(list) => Ok(TypeDescriptor::list(map_type_excluding(
             &list.ty(),
             named_types,
+            named_resources,
             context,
             excluded_name,
         )?)),
         Type::Tuple(tuple) => Ok(TypeDescriptor::Tuple(
             tuple
                 .types()
-                .map(|ty| map_type_excluding(&ty, named_types, context, excluded_name))
+                .map(|ty| {
+                    map_type_excluding(&ty, named_types, named_resources, context, excluded_name)
+                })
                 .collect::<anyhow::Result<Vec<_>>>()?,
         )),
         Type::Option(option) => Ok(TypeDescriptor::option(map_type_excluding(
             &option.ty(),
             named_types,
+            named_resources,
             context,
             excluded_name,
         )?)),
         Type::Result(result) => Ok(TypeDescriptor::result(
             result
                 .ok()
-                .map(|ty| map_type_excluding(&ty, named_types, context, excluded_name))
+                .map(|ty| {
+                    map_type_excluding(&ty, named_types, named_resources, context, excluded_name)
+                })
                 .transpose()?
                 .unwrap_or(TypeDescriptor::Unit),
             result
                 .err()
-                .map(|ty| map_type_excluding(&ty, named_types, context, excluded_name))
+                .map(|ty| {
+                    map_type_excluding(&ty, named_types, named_resources, context, excluded_name)
+                })
                 .transpose()?
                 .unwrap_or(TypeDescriptor::Unit),
         )),
@@ -737,12 +1074,28 @@ fn map_type_excluding(
         Type::Char => Err(WasmDescriptorError::UnsupportedType("char").into()),
         Type::Map(_) => Err(WasmDescriptorError::UnsupportedType("map").into()),
         Type::Flags(_) => Err(WasmDescriptorError::UnsupportedType("flags").into()),
-        Type::Own(_) => Err(WasmDescriptorError::UnsupportedType("own resource").into()),
-        Type::Borrow(_) => Err(WasmDescriptorError::UnsupportedType("borrowed resource").into()),
+        Type::Own(_) | Type::Borrow(_) => unreachable!("resources returned above"),
         Type::Future(_) => Err(WasmDescriptorError::UnsupportedType("future").into()),
         Type::Stream(_) => Err(WasmDescriptorError::UnsupportedType("stream").into()),
         Type::ErrorContext => Err(WasmDescriptorError::UnsupportedType("error-context").into()),
     }
+}
+
+fn resource_name(
+    ty: &ResourceType,
+    named_resources: &[NamedResource],
+    context: &str,
+) -> anyhow::Result<String> {
+    named_resources
+        .iter()
+        .find(|resource| resource.ty == *ty)
+        .map(|resource| resource.husk_name.clone())
+        .ok_or_else(|| {
+            WasmDescriptorError::AnonymousNominalType {
+                context: context.to_string(),
+            }
+            .into()
+        })
 }
 
 /// Convert a WIT kebab-case member name into one valid Husk identifier.
@@ -844,7 +1197,26 @@ fn capability_for_import(name: &str) -> Result<Capability, WasmDescriptorError> 
         .map_err(|_| WasmDescriptorError::UnsupportedImport(name.to_string()))
 }
 
-fn owned_to_component(value: &OwnedValue, ty: &Type) -> anyhow::Result<Val> {
+struct ResourceLowering<'a> {
+    owner: u64,
+    resources: &'a mut ResourceTable,
+    named_resources: &'a [NamedResource],
+    consumed: Vec<ResourceAny>,
+}
+
+impl ResourceLowering<'_> {
+    fn drop_consumed(&mut self, store: &mut Store<StoreData>) {
+        for resource in self.consumed.drain(..) {
+            let _ = resource.resource_drop(&mut *store);
+        }
+    }
+}
+
+fn owned_to_component(
+    resources: &mut ResourceLowering<'_>,
+    value: &OwnedValue,
+    ty: &Type,
+) -> anyhow::Result<Val> {
     match (value, ty) {
         (OwnedValue::Bool(value), Type::Bool) => Ok(Val::Bool(*value)),
         (OwnedValue::I32(value), Type::S32) => Ok(Val::S32(*value)),
@@ -867,7 +1239,7 @@ fn owned_to_component(value: &OwnedValue, ty: &Type) -> anyhow::Result<Val> {
         (OwnedValue::List(values), Type::List(list)) => Ok(Val::List(
             values
                 .iter()
-                .map(|value| owned_to_component(value, &list.ty()))
+                .map(|value| owned_to_component(resources, value, &list.ty()))
                 .collect::<anyhow::Result<Vec<_>>>()?,
         )),
         (OwnedValue::Tuple(values), Type::Tuple(tuple)) => {
@@ -883,7 +1255,7 @@ fn owned_to_component(value: &OwnedValue, ty: &Type) -> anyhow::Result<Val> {
                 values
                     .iter()
                     .zip(&types)
-                    .map(|(value, ty)| owned_to_component(value, ty))
+                    .map(|(value, ty)| owned_to_component(resources, value, ty))
                     .collect::<anyhow::Result<Vec<_>>>()?,
             ))
         }
@@ -909,7 +1281,7 @@ fn owned_to_component(value: &OwnedValue, ty: &Type) -> anyhow::Result<Val> {
                         })?;
                         Ok((
                             field.name.to_string(),
-                            owned_to_component(value, &field.ty)?,
+                            owned_to_component(resources, value, &field.ty)?,
                         ))
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?,
@@ -924,7 +1296,7 @@ fn owned_to_component(value: &OwnedValue, ty: &Type) -> anyhow::Result<Val> {
                 .ok_or_else(|| anyhow::anyhow!("unknown variant case `{case}`"))?;
             let payload = match (&matching.ty, fields.as_slice()) {
                 (None, []) => None,
-                (Some(ty), [field]) => Some(Box::new(owned_to_component(field, ty)?)),
+                (Some(ty), [field]) => Some(Box::new(owned_to_component(resources, field, ty)?)),
                 (None, _) => anyhow::bail!("unit variant `{case}` does not take a payload"),
                 (Some(_), _) => anyhow::bail!("variant `{case}` requires exactly one payload"),
             };
@@ -943,6 +1315,7 @@ fn owned_to_component(value: &OwnedValue, ty: &Type) -> anyhow::Result<Val> {
         (OwnedValue::Variant { case, fields, .. }, Type::Option(option)) => match case.as_str() {
             "None" if fields.is_empty() => Ok(Val::Option(None)),
             "Some" if fields.len() == 1 => Ok(Val::Option(Some(Box::new(owned_to_component(
+                resources,
                 &fields[0],
                 &option.ty(),
             )?)))),
@@ -951,10 +1324,12 @@ fn owned_to_component(value: &OwnedValue, ty: &Type) -> anyhow::Result<Val> {
             _ => anyhow::bail!("expected Option::Some or Option::None, got `{case}`"),
         },
         (OwnedValue::Variant { case, fields, .. }, Type::Result(result)) => {
-            let payload = |ty: Option<Type>, fields: &[OwnedValue]| -> anyhow::Result<_> {
+            let mut payload = |ty: Option<Type>, fields: &[OwnedValue]| -> anyhow::Result<_> {
                 match (ty, fields) {
                     (None, []) => Ok(None),
-                    (Some(ty), [field]) => Ok(Some(Box::new(owned_to_component(field, &ty)?))),
+                    (Some(ty), [field]) => {
+                        Ok(Some(Box::new(owned_to_component(resources, field, &ty)?)))
+                    }
                     (None, _) => anyhow::bail!("unit result case does not take a payload"),
                     (Some(_), _) => anyhow::bail!("result case requires exactly one payload"),
                 }
@@ -965,6 +1340,38 @@ fn owned_to_component(value: &OwnedValue, ty: &Type) -> anyhow::Result<Val> {
                 _ => anyhow::bail!("expected Result::Ok or Result::Err, got `{case}`"),
             }
         }
+        (OwnedValue::Resource { type_name, handle }, Type::Borrow(expected_resource)) => {
+            let expected_name = resource_name(
+                expected_resource,
+                resources.named_resources,
+                "function argument",
+            )?;
+            anyhow::ensure!(
+                type_name == &expected_name,
+                "resource has type `{type_name}`, expected `{expected_name}`"
+            );
+            let resource = resources
+                .resources
+                .get(resources.owner, *handle, &expected_name)?
+                .value;
+            Ok(Val::Resource(resource))
+        }
+        (OwnedValue::Resource { type_name, handle }, Type::Own(expected_resource)) => {
+            let expected_name = resource_name(
+                expected_resource,
+                resources.named_resources,
+                "function argument",
+            )?;
+            anyhow::ensure!(
+                type_name == &expected_name,
+                "resource has type `{type_name}`, expected `{expected_name}`"
+            );
+            let resource = resources
+                .resources
+                .take(resources.owner, *handle, &expected_name)?;
+            resources.consumed.push(resource);
+            Ok(Val::Resource(resource))
+        }
         _ => anyhow::bail!(
             "Husk {} value is incompatible with WIT {}",
             value.kind_name(),
@@ -973,7 +1380,29 @@ fn owned_to_component(value: &OwnedValue, ty: &Type) -> anyhow::Result<Val> {
     }
 }
 
-fn component_to_owned(value: Val, ty: &Type) -> anyhow::Result<OwnedValue> {
+struct ResourceLifting<'a> {
+    owner: u64,
+    resources: &'a mut ResourceTable,
+    named_resources: &'a [NamedResource],
+    inserted: Vec<(ResourceHandle, String)>,
+    store: &'a mut Store<StoreData>,
+}
+
+impl ResourceLifting<'_> {
+    fn rollback(&mut self) {
+        for (handle, type_name) in self.inserted.drain(..) {
+            if let Ok(resource) = self.resources.take(self.owner, handle, &type_name) {
+                let _ = resource.resource_drop(&mut *self.store);
+            }
+        }
+    }
+}
+
+fn component_to_owned(
+    resources: &mut ResourceLifting<'_>,
+    value: Val,
+    ty: &Type,
+) -> anyhow::Result<OwnedValue> {
     match (value, ty) {
         (Val::Bool(value), Type::Bool) => Ok(OwnedValue::Bool(value)),
         (Val::S32(value), Type::S32) => Ok(OwnedValue::I32(value)),
@@ -991,7 +1420,7 @@ fn component_to_owned(value: Val, ty: &Type) -> anyhow::Result<OwnedValue> {
             .map(OwnedValue::Bytes),
         (Val::List(values), Type::List(list)) => values
             .into_iter()
-            .map(|value| component_to_owned(value, &list.ty()))
+            .map(|value| component_to_owned(resources, value, &list.ty()))
             .collect::<anyhow::Result<Vec<_>>>()
             .map(OwnedValue::List),
         (Val::Tuple(values), Type::Tuple(tuple)) => {
@@ -1006,7 +1435,7 @@ fn component_to_owned(value: Val, ty: &Type) -> anyhow::Result<OwnedValue> {
             values
                 .into_iter()
                 .zip(&types)
-                .map(|(value, ty)| component_to_owned(value, ty))
+                .map(|(value, ty)| component_to_owned(resources, value, ty))
                 .collect::<anyhow::Result<Vec<_>>>()
                 .map(OwnedValue::Tuple)
         }
@@ -1031,7 +1460,7 @@ fn component_to_owned(value: Val, ty: &Type) -> anyhow::Result<OwnedValue> {
                     }
                     Ok((
                         normalize_wit_name(field.name)?,
-                        component_to_owned(value, &field.ty)?,
+                        component_to_owned(resources, value, &field.ty)?,
                     ))
                 })
                 .collect::<anyhow::Result<BTreeMap<_, _>>>()
@@ -1046,7 +1475,9 @@ fn component_to_owned(value: Val, ty: &Type) -> anyhow::Result<OwnedValue> {
                 })?;
             let fields = match (payload, definition.ty) {
                 (None, None) => Vec::new(),
-                (Some(value), Some(ty)) => vec![component_to_owned(*value, &ty)?],
+                (Some(value), Some(ty)) => {
+                    vec![component_to_owned(resources, *value, &ty)?]
+                }
                 _ => anyhow::bail!("component returned the wrong payload shape for `{case}`"),
             };
             Ok(OwnedValue::Variant {
@@ -1069,7 +1500,7 @@ fn component_to_owned(value: Val, ty: &Type) -> anyhow::Result<OwnedValue> {
             type_name: "Option".to_string(),
             case: if payload.is_some() { "Some" } else { "None" }.to_string(),
             fields: payload
-                .map(|value| component_to_owned(*value, &option.ty()))
+                .map(|value| component_to_owned(resources, *value, &option.ty()))
                 .transpose()?
                 .into_iter()
                 .collect(),
@@ -1083,7 +1514,7 @@ fn component_to_owned(value: Val, ty: &Type) -> anyhow::Result<OwnedValue> {
                         result_type
                             .ok()
                             .ok_or_else(|| anyhow::anyhow!("unexpected Result::Ok payload"))
-                            .and_then(|ty| component_to_owned(*value, &ty))
+                            .and_then(|ty| component_to_owned(resources, *value, &ty))
                     })
                     .transpose()?
                     .into_iter()
@@ -1097,13 +1528,37 @@ fn component_to_owned(value: Val, ty: &Type) -> anyhow::Result<OwnedValue> {
                         result_type
                             .err()
                             .ok_or_else(|| anyhow::anyhow!("unexpected Result::Err payload"))
-                            .and_then(|ty| component_to_owned(*value, &ty))
+                            .and_then(|ty| component_to_owned(resources, *value, &ty))
                     })
                     .transpose()?
                     .into_iter()
                     .collect(),
             }),
         },
+        (Val::Resource(resource), Type::Own(expected_resource)) => {
+            anyhow::ensure!(
+                resource.owned(),
+                "component returned a borrowed resource for an owning result"
+            );
+            let type_name = resource_name(
+                expected_resource,
+                resources.named_resources,
+                "function result",
+            )?;
+            let handle =
+                resources
+                    .resources
+                    .insert(resources.owner, type_name.clone(), resource)?;
+            resources.inserted.push((handle, type_name.clone()));
+            Ok(OwnedValue::Resource { type_name, handle })
+        }
+        (Val::Resource(resource), Type::Borrow(_)) => {
+            resource
+                .resource_drop(&mut *resources.store)
+                .map_err(anyhow::Error::from)
+                .context("release borrowed component result")?;
+            anyhow::bail!("borrowed resources cannot escape a component call")
+        }
         (value, ty) => anyhow::bail!(
             "component returned {value:?}, which is incompatible with WIT {}",
             wit_type_name(ty)
@@ -1189,6 +1644,7 @@ fn charge_value(value: &OwnedValue, remaining: &mut usize) -> anyhow::Result<()>
             }
             Ok(())
         }
+        OwnedValue::Resource { type_name, .. } => charge(remaining, type_name.len()),
         OwnedValue::Json(value) => {
             charge(remaining, serde_json_size(value))?;
             Ok(())
@@ -1256,6 +1712,43 @@ mod tests {
             (export "choice" (type $choice)))
     "#;
 
+    const RESOURCE_COMPONENT: &str = include_str!("../tests/fixtures/resource.wat");
+
+    fn lower_plain(value: &OwnedValue, ty: &Type) -> anyhow::Result<Val> {
+        let mut table = ResourceTable::default();
+        owned_to_component(
+            &mut ResourceLowering {
+                owner: 1,
+                resources: &mut table,
+                named_resources: &[],
+                consumed: Vec::new(),
+            },
+            value,
+            ty,
+        )
+    }
+
+    fn lift_plain(engine: &Engine, value: Val, ty: &Type) -> anyhow::Result<OwnedValue> {
+        let mut table = ResourceTable::default();
+        let mut store = Store::new(
+            engine,
+            StoreData {
+                store_limits: StoreLimitsBuilder::new().build(),
+            },
+        );
+        component_to_owned(
+            &mut ResourceLifting {
+                owner: 1,
+                resources: &mut table,
+                named_resources: &[],
+                inserted: Vec::new(),
+                store: &mut store,
+            },
+            value,
+            ty,
+        )
+    }
+
     #[test]
     fn discovers_and_dynamically_calls_unknown_function() {
         let component = WasmComponent::compile_bytes(
@@ -1283,6 +1776,88 @@ mod tests {
                 .call("add", &[OwnedValue::I32(1), OwnedValue::I32(2)])
                 .unwrap(),
             OwnedValue::I32(3)
+        );
+    }
+
+    #[test]
+    fn owns_drops_and_rejects_stale_or_cross_instance_resources() {
+        let component = WasmComponent::compile_bytes(
+            "resources",
+            Version::new(1, 0, 0),
+            RESOURCE_COMPONENT.as_bytes(),
+            WasmCompileOptions::default(),
+        )
+        .unwrap();
+        let factory = component
+            .descriptor()
+            .interfaces
+            .iter()
+            .find(|interface| interface.name == "factory")
+            .unwrap();
+        assert!(
+            factory
+                .types
+                .iter()
+                .any(|definition| { matches!(definition.kind, TypeDefinitionKind::Resource) })
+        );
+        let new_item = factory
+            .functions
+            .iter()
+            .find(|function| function.name == "new_item")
+            .unwrap();
+        let TypeDescriptor::OwnResource(resource_type) = &new_item.result else {
+            panic!("constructor must return an owned resource");
+        };
+        let item_value = factory
+            .functions
+            .iter()
+            .find(|function| function.name == "item_value")
+            .unwrap();
+        assert_eq!(
+            item_value.parameters[0].ty,
+            TypeDescriptor::BorrowResource(resource_type.clone())
+        );
+        let consume_item = factory
+            .functions
+            .iter()
+            .find(|function| function.name == "consume_item")
+            .unwrap();
+        assert_eq!(
+            consume_item.parameters[0].ty,
+            TypeDescriptor::OwnResource(resource_type.clone())
+        );
+
+        let mut first = component.instantiate(WasmLimits::default()).unwrap();
+        let mut second = component.instantiate(WasmLimits::default()).unwrap();
+        let resource = first.call("factory::new_item", &[]).unwrap();
+        let OwnedValue::Resource { handle, .. } = &resource else {
+            panic!("expected an opaque resource handle");
+        };
+        assert_eq!(first.live_resource_count(), 1);
+        assert_eq!(
+            first
+                .call("factory::item_value", std::slice::from_ref(&resource))
+                .unwrap(),
+            OwnedValue::I32(100)
+        );
+        assert_eq!(first.live_resource_count(), 1);
+        assert!(
+            second
+                .drop_resource(*handle)
+                .unwrap_err()
+                .to_string()
+                .contains("different")
+        );
+        first
+            .call("factory::consume_item", std::slice::from_ref(&resource))
+            .unwrap();
+        assert_eq!(first.live_resource_count(), 0);
+        assert!(
+            first
+                .drop_resource(*handle)
+                .unwrap_err()
+                .to_string()
+                .contains("stale")
         );
     }
 
@@ -1382,8 +1957,8 @@ mod tests {
         };
         let round_trip = |name: &str, value: OwnedValue| {
             let ty = export_type(name);
-            let component_value = owned_to_component(&value, &ty).unwrap();
-            component_to_owned(component_value, &ty).unwrap()
+            let component_value = lower_plain(&value, &ty).unwrap();
+            lift_plain(&component.inner.engine, component_value, &ty).unwrap()
         };
 
         assert_eq!(
@@ -1459,7 +2034,7 @@ mod tests {
             panic!("expected list");
         };
         assert!(
-            owned_to_component(&OwnedValue::I32(256), &list.ty())
+            lower_plain(&OwnedValue::I32(256), &list.ty())
                 .unwrap_err()
                 .to_string()
                 .contains("outside u8 range")

@@ -7,10 +7,12 @@
 //! those lifecycles, not for implementing editor behavior within them.
 
 use std::{
+    ffi::{OsStr, OsString},
     fs,
     io::{stdout, Write as _},
     panic,
     path::{Path, PathBuf},
+    process::ExitCode,
 };
 
 #[cfg(unix)]
@@ -48,11 +50,31 @@ const DETACHED_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DETACHED_RENDER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[tokio::main(flavor = "multi_thread")]
-async fn main() {
+async fn main() -> ExitCode {
+    if let Some(arguments) = forwarded_husk_arguments() {
+        return husk_cli::run_from(arguments);
+    }
     if let Err(error) = run().await {
         print_error(&error);
-        std::process::exit(1);
+        return ExitCode::FAILURE;
     }
+    ExitCode::SUCCESS
+}
+
+fn forwarded_husk_arguments() -> Option<Vec<OsString>> {
+    forwarded_husk_arguments_from(std::env::args_os())
+}
+
+fn forwarded_husk_arguments_from(
+    arguments: impl IntoIterator<Item = OsString>,
+) -> Option<Vec<OsString>> {
+    let mut arguments = arguments.into_iter();
+    let _program = arguments.next()?;
+    (arguments.next().as_deref() == Some(OsStr::new("husk"))).then(|| {
+        std::iter::once(OsString::from("red husk"))
+            .chain(arguments)
+            .collect()
+    })
 }
 
 async fn run() -> anyhow::Result<()> {
@@ -721,6 +743,24 @@ fn resolve_log_path(config_dir: &Path, configured_path: &str) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forwards_only_the_husk_subcommand() {
+        assert_eq!(
+            forwarded_husk_arguments_from(
+                ["red", "husk", "check", "script.hk"].map(OsString::from)
+            ),
+            Some(
+                ["red husk", "check", "script.hk"]
+                    .map(OsString::from)
+                    .to_vec()
+            )
+        );
+        assert_eq!(
+            forwarded_husk_arguments_from(["red", "file.txt"].map(OsString::from)),
+            None
+        );
+    }
 
     #[test]
     fn runtime_config_falls_back_for_missing_theme_and_invalid_log_path() {

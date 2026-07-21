@@ -1148,8 +1148,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "flate2",
  "husk",
  "husk-extension",
+ "reqwest",
+ "semver",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 
@@ -2147,6 +2152,7 @@ dependencies = [
  "futures",
  "fuzzy-matcher",
  "husk-ast",
+ "husk-cli",
  "husk-diagnostics",
  "husk-lexer",
  "husk-parser",
@@ -2252,7 +2258,9 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64",
  "bytes",
+ "futures-channel",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",

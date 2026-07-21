@@ -18,6 +18,8 @@ const MATH_COMPONENT: &str = r#"
         (export "example:math/api@1.0.0" (instance $api)))
 "#;
 
+const RESOURCE_COMPONENT: &str = include_str!("../../husk-wasm/tests/fixtures/resource.wat");
+
 #[test]
 fn component_descriptor_typechecks_and_dispatches_through_engine() {
     let component = WasmComponent::compile_bytes(
@@ -90,4 +92,36 @@ fn direct_wasm_instance_api_remains_available_for_hosts() {
             .unwrap(),
         OwnedValue::I32(42)
     );
+}
+
+#[test]
+fn resource_constructor_borrow_and_own_transfer_work_in_husk_source() {
+    let component = WasmComponent::compile_bytes(
+        "resources",
+        Version::new(1, 0, 0),
+        RESOURCE_COMPONENT.as_bytes(),
+        WasmCompileOptions::default(),
+    )
+    .unwrap();
+    let engine = Engine::<()>::builder()
+        .register_wasm_component(component)
+        .unwrap()
+        .build()
+        .unwrap();
+    let compiled = engine
+        .compile_source(
+            "main",
+            "main.hk",
+            r#"
+                fn main() -> i32 {
+                    let item = resources::factory::new_item();
+                    let value = resources::factory::item_value(item);
+                    resources::factory::consume_item(item);
+                    value
+                }
+            "#,
+        )
+        .unwrap();
+    let mut instance = engine.instantiate(compiled, ()).unwrap();
+    assert_eq!(instance.call("main", &[]).unwrap(), OwnedValue::I64(100));
 }

@@ -143,6 +143,10 @@ pub enum TypeDescriptor {
         ok: Box<TypeDescriptor>,
         error: Box<TypeDescriptor>,
     },
+    /// An extension resource transferred into or out of a call.
+    OwnResource(String),
+    /// An extension resource borrowed for the duration of a call.
+    BorrowResource(String),
     /// A nominal type declared by this module or a future module graph.
     Named(String),
 }
@@ -168,7 +172,9 @@ impl TypeDescriptor {
 
     fn validate(&self) -> Result<(), DescriptorError> {
         match self {
-            Self::Named(name) => validate_identifier(name, "type"),
+            Self::Named(name) | Self::OwnResource(name) | Self::BorrowResource(name) => {
+                validate_identifier(name, "type")
+            }
             Self::List(element) | Self::Option(element) => element.validate(),
             Self::Tuple(elements) => {
                 for element in elements {
@@ -226,6 +232,8 @@ impl TypeDescriptor {
                 error.canonical(output);
                 output.push('>');
             }
+            Self::OwnResource(name) => push_canonical_string(output, "own-resource", name),
+            Self::BorrowResource(name) => push_canonical_string(output, "borrow-resource", name),
             Self::Named(name) => push_canonical_string(output, "named", name),
         }
     }
@@ -297,6 +305,7 @@ pub enum TypeDefinitionKind {
     Record(Vec<FieldDescriptor>),
     Enum(Vec<String>),
     Variant(Vec<VariantCaseDescriptor>),
+    Resource,
 }
 
 /// A named external type made visible while checking module calls.
@@ -345,6 +354,7 @@ impl TypeDefinitionDescriptor {
                 }
                 Ok(())
             }
+            TypeDefinitionKind::Resource => Ok(()),
         }
     }
 
@@ -373,6 +383,7 @@ impl TypeDefinitionDescriptor {
                     case.canonical(output);
                 }
             }
+            TypeDefinitionKind::Resource => output.push_str("resource"),
         }
     }
 }

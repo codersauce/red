@@ -33,6 +33,21 @@ fn check_accepts_a_valid_script() {
 }
 
 #[test]
+fn help_is_a_successful_command() {
+    let output = Command::new(env!("CARGO_BIN_EXE_husk"))
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("Compile and run Husk scripts")
+    );
+}
+
+#[test]
 fn run_supports_unit_exit_codes_arguments_and_shebangs() {
     assert!(run_script("fn main() {}", &[]).status.success());
 
