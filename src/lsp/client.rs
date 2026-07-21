@@ -1523,11 +1523,15 @@ impl LspClient for RealLspClient {
                     self.config.command,
                     PROCESS_EXIT_GRACE
                 );
-                if let Err(error) = child.start_kill() {
-                    log!("[lsp] failed to terminate {}: {}", self.config.command, error);
-                }
-                if let Err(error) = child.wait().await {
-                    log!("[lsp] error reaping {}: {}", self.config.command, error);
+                match child.start_kill() {
+                    Ok(()) => {
+                        if let Err(error) = child.wait().await {
+                            log!("[lsp] error reaping {}: {}", self.config.command, error);
+                        }
+                    }
+                    Err(error) => {
+                        log!("[lsp] failed to terminate {}: {}", self.config.command, error);
+                    }
                 }
             }
             status = child.wait() => {
