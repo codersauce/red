@@ -42,7 +42,10 @@ fn mock_codex(directory: &std::path::Path) -> std::path::PathBuf {
     std::fs::write(
         &path,
         r#"#!/usr/bin/env python3
-import json, sys
+import json, os, sys
+
+assert "features.hooks=false" not in sys.argv
+assert "features.codex_hooks=false" not in sys.argv
 
 def send(value):
     print(json.dumps(value), flush=True)
@@ -60,11 +63,15 @@ for line in sys.stdin:
     elif method == "config/read":
         send({"id": ident, "result": {"config": {"mcp_servers": {}}, "origins": {}}})
     elif method == "configRequirements/read":
-        send({"id": ident, "result": {"requirements": None}})
+        requirements = json.loads(os.environ.get("RED_MOCK_REQUIREMENTS", "null"))
+        send({"id": ident, "result": {"requirements": requirements}})
     elif method == "thread/start":
         assert message["params"]["sandbox"] == "read-only"
         assert message["params"]["approvalPolicy"] == "never"
         assert len(message["params"]["dynamicTools"]) == 9
+        expected_hooks = os.environ.get("RED_MOCK_EXPECT_HOOKS") == "true"
+        assert message["params"]["config"]["features"]["hooks"] is expected_hooks
+        assert "codex_hooks" not in message["params"]["config"]["features"]
         send({"id": ident, "result": {"thread": {"id": "thread-red"}}})
     elif method == "turn/start":
         text = message["params"]["input"][0]["text"]
@@ -150,6 +157,51 @@ async fn direct_app_server_streams_and_routes_writes_to_the_host() {
         vec![("src/main.rs".to_string(), "proposed\n".to_string())]
     );
 
+    drop(bridge);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn direct_app_server_starts_with_required_hooks() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex = mock_codex(directory.path());
+    let host = RecordingHost {
+        writes: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut spec = CodexProcessSpec::new(codex, directory.path());
+    spec.environment.insert(
+        "RED_MOCK_REQUIREMENTS".into(),
+        json!({
+            "allowManagedHooksOnly": null,
+            "featureRequirements": {"hooks": true}
+        })
+        .to_string()
+        .into(),
+    );
+    spec.environment
+        .insert("RED_MOCK_EXPECT_HOOKS".into(), "true".into());
+    let (mut bridge, task) = start_codex(spec, host, NonZeroUsize::new(32).unwrap()).unwrap();
+
+    bridge
+        .send(CodexCommand::NewSession {
+            cwd: directory.path().to_path_buf(),
+        })
+        .await
+        .unwrap();
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(event) = bridge.try_recv() {
+                break event;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        matches!(event, CodexEvent::SessionCreated { session_id } if session_id == "thread-red")
+    );
     drop(bridge);
     task.await.unwrap().unwrap();
 }
