@@ -1,4 +1,5 @@
 mod adapter_build;
+mod adapter_install;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -34,6 +35,24 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Generate, sandbox-build, verify, and install a Rust crate adapter.
+    Add {
+        #[command(flatten)]
+        request: CrateRequest,
+        /// Narrow installation to an exact public API path. Repeat as needed.
+        ///
+        /// Without this option, every API with complete adapter lowering is included.
+        #[arg(long = "include")]
+        includes: Vec<String>,
+        /// Husk package directory or Husk.toml. Defaults to the current package.
+        #[arg(long, default_value = ".")]
+        package: PathBuf,
+        /// Refuse any change to the existing Husk.lock.
+        #[arg(long)]
+        locked: bool,
+        #[command(flatten)]
+        limits: AdapterBuildLimits,
+    },
     /// Start an interactive Husk session.
     Repl {
         /// Pure portable extension bundle to expose in the session.
@@ -153,13 +172,25 @@ enum CrateCommand {
         /// Permit Cargo dependency resolution to access the network.
         #[arg(long)]
         allow_network: bool,
-        /// Maximum seconds for each Cargo operation.
-        #[arg(long, default_value_t = 300)]
-        timeout_seconds: u64,
-        /// Maximum combined stdout and stderr bytes for each Cargo operation.
-        #[arg(long, default_value_t = 1024 * 1024)]
-        max_output_bytes: u64,
+        #[command(flatten)]
+        limits: AdapterBuildLimits,
     },
+}
+
+#[derive(Debug, Args)]
+struct AdapterBuildLimits {
+    /// Maximum seconds for each Cargo operation.
+    #[arg(long, default_value_t = 300)]
+    timeout_seconds: u64,
+    /// Maximum combined stdout and stderr bytes for each Cargo operation.
+    #[arg(long, default_value_t = 1024 * 1024)]
+    max_output_bytes: u64,
+    /// Maximum aggregate resident memory bytes added by the build.
+    #[arg(long, default_value_t = 2 * 1024 * 1024 * 1024)]
+    max_memory_bytes: u64,
+    /// Maximum additional processes available to the build.
+    #[arg(long, default_value_t = 64)]
+    max_processes: u64,
 }
 
 #[derive(Debug, Args)]
@@ -177,7 +208,7 @@ struct CrateRequest {
     /// Inspect a local crate directory instead of crates.io.
     #[arg(long)]
     path: Option<PathBuf>,
-    /// Require all Cargo metadata to be available locally.
+    /// Require crate metadata, Rustdoc data, and build inputs to be available locally.
     #[arg(long)]
     offline: bool,
 }
@@ -215,6 +246,13 @@ pub fn run_from(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
 
 fn execute(cli: Cli) -> anyhow::Result<ExitCode> {
     match cli.command {
+        Command::Add {
+            request,
+            includes,
+            package,
+            locked,
+            limits,
+        } => execute_add(request, &includes, &package, locked, &limits),
         Command::Repl { extensions } => {
             let engine = cli_engine(&extensions, None, false)?;
             let interactive = io::stdin().is_terminal();
@@ -835,6 +873,109 @@ struct AdapterCallableInspection {
     implementation: String,
 }
 
+fn execute_add(
+    request: CrateRequest,
+    includes: &[String],
+    package: &Path,
+    locked: bool,
+    limits: &AdapterBuildLimits,
+) -> anyhow::Result<ExitCode> {
+    validate_build_limits(limits)?;
+    let manifest = husk::discover_manifest(package)
+        .with_context(|| format!("find Husk package from `{}`", package.display()))?;
+    if locked {
+        let package = ResolvedPackage::open(&manifest, PackageLimits::default())
+            .context("open locked Husk package")?;
+        package
+            .enforce_lock()
+            .context("verify existing Husk.lock before installation")?;
+        anyhow::bail!(
+            "`--locked` prevents adding `{}` because Husk.toml and Husk.lock would change",
+            request.crate_name
+        );
+    }
+    let offline = request.offline;
+    let report = inspect_crate(request.into())?;
+    let generated = tempfile::tempdir().context("create temporary adapter workspace")?;
+    let adapter = generated.path().join("adapter");
+    write_adapter_package(&report, includes, &adapter)?;
+    let output = adapter_build::build(
+        &adapter,
+        &adapter_build::BuildOptions {
+            allow_network: !offline,
+            timeout: Duration::from_secs(limits.timeout_seconds),
+            max_output_bytes: limits.max_output_bytes,
+            max_memory_bytes: limits.max_memory_bytes,
+            max_processes: limits.max_processes,
+        },
+    )?;
+    let component = componentize_core_bytes(&output.core_module)?;
+    verify_adapter_component(&output.report, &component)?;
+    let identity = adapter_identity(&output.report)?;
+    let installed =
+        adapter_install::install(&manifest, &identity, &component, &output.report, locked)
+            .with_context(|| {
+                format!(
+                    "install verified adapter `{}` into `{}`",
+                    identity.name,
+                    manifest.display()
+                )
+            })?;
+    println!(
+        "installed {} {} at {} (sha256 {})",
+        identity.name,
+        identity.version,
+        installed.bundle.display(),
+        installed.digest
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn validate_build_limits(limits: &AdapterBuildLimits) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        limits.timeout_seconds > 0,
+        "timeout must be greater than zero"
+    );
+    anyhow::ensure!(
+        limits.max_output_bytes > 0,
+        "output limit must be greater than zero"
+    );
+    anyhow::ensure!(
+        limits.max_memory_bytes > 0,
+        "memory limit must be greater than zero"
+    );
+    anyhow::ensure!(
+        limits.max_processes > 0,
+        "process limit must be greater than zero"
+    );
+    Ok(())
+}
+
+fn adapter_identity(report: &[u8]) -> anyhow::Result<adapter_install::AdapterIdentity> {
+    let report: serde_json::Value =
+        serde_json::from_slice(report).context("parse adapter identity report")?;
+    let name = report
+        .get("crate")
+        .and_then(serde_json::Value::as_str)
+        .context("adapter report omitted its crate name")?
+        .to_string();
+    let version = report
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .context("adapter report omitted its crate version")?;
+    let version = Version::parse(version)
+        .with_context(|| format!("adapter report contained invalid version `{version}`"))?;
+    let wit_name = wit_identifier(&name);
+    let module = husk::normalize_wit_name(&wit_name)?;
+    let world = format!("husk:{wit_name}/{wit_name}-adapter@{version}");
+    Ok(adapter_install::AdapterIdentity {
+        name,
+        version,
+        module,
+        world,
+    })
+}
+
 fn execute_crate(command: CrateCommand) -> anyhow::Result<ExitCode> {
     match command {
         CrateCommand::Inspect { request, json } => {
@@ -864,14 +1005,9 @@ fn execute_crate(command: CrateCommand) -> anyhow::Result<ExitCode> {
         CrateCommand::BuildAdapter {
             adapter,
             allow_network,
-            timeout_seconds,
-            max_output_bytes,
+            limits,
         } => {
-            anyhow::ensure!(timeout_seconds > 0, "timeout must be greater than zero");
-            anyhow::ensure!(
-                max_output_bytes > 0,
-                "output limit must be greater than zero"
-            );
+            validate_build_limits(&limits)?;
             let component_path = adapter.join("component.wasm");
             anyhow::ensure!(
                 !component_path.exists(),
@@ -882,8 +1018,10 @@ fn execute_crate(command: CrateCommand) -> anyhow::Result<ExitCode> {
                 &adapter,
                 &adapter_build::BuildOptions {
                     allow_network,
-                    timeout: Duration::from_secs(timeout_seconds),
-                    max_output_bytes,
+                    timeout: Duration::from_secs(limits.timeout_seconds),
+                    max_output_bytes: limits.max_output_bytes,
+                    max_memory_bytes: limits.max_memory_bytes,
+                    max_processes: limits.max_processes,
                 },
             )?;
             let component = componentize_core_bytes(&output.core_module)?;
@@ -1097,9 +1235,6 @@ fn inspect_public_api(
     offline: bool,
     local_path: bool,
 ) -> PublicApiInspection {
-    if offline {
-        return unavailable_public_api("offline mode does not contact docs.rs");
-    }
     if local_path {
         return unavailable_public_api(
             "local crates require sandboxed Rustdoc generation, which is not implemented yet",
@@ -1113,11 +1248,84 @@ fn inspect_public_api(
         return unavailable_public_api("only crates.io releases currently have a safe API source");
     }
 
-    match download_rustdoc_json(&package.name, &package.version)
+    let document = if offline {
+        read_cached_rustdoc_json(&package.name, &package.version)
+    } else {
+        download_rustdoc_json(&package.name, &package.version).inspect(|document| {
+            cache_rustdoc_json(&package.name, &package.version, document).ok();
+        })
+    };
+    match document
         .and_then(|document| analyze_rustdoc_json(&package.name, &package.version, document))
     {
         Ok(report) => report,
         Err(error) => unavailable_public_api(&error.to_string()),
+    }
+}
+
+fn rustdoc_cache_path(crate_name: &str, version: &str) -> anyhow::Result<PathBuf> {
+    validate_crate_name(crate_name)?;
+    semver::Version::parse(version)
+        .with_context(|| format!("Cargo returned invalid crate version `{version}`"))?;
+    let root = if let Some(path) = std::env::var_os("HUSK_CACHE_DIR") {
+        PathBuf::from(path)
+    } else {
+        PathBuf::from(
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .context(
+                    "neither HOME nor USERPROFILE is set; set HUSK_CACHE_DIR to use the Rustdoc cache",
+                )?,
+        )
+        .join(".cache")
+        .join("husk")
+    };
+    Ok(root
+        .join("rustdoc")
+        .join(format!("{crate_name}-{version}.json")))
+}
+
+fn read_cached_rustdoc_json(crate_name: &str, version: &str) -> anyhow::Result<serde_json::Value> {
+    let path = rustdoc_cache_path(crate_name, version)?;
+    let file = fs::File::open(&path).with_context(|| {
+        format!(
+            "offline mode requires cached Rustdoc JSON at `{}`",
+            path.display()
+        )
+    })?;
+    let mut bytes = Vec::new();
+    file.take(MAX_RUSTDOC_JSON_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read cached Rustdoc JSON `{}`", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_RUSTDOC_JSON_BYTES,
+        "cached Rustdoc JSON exceeds the safety limit"
+    );
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse cached Rustdoc JSON `{}`", path.display()))
+}
+
+fn cache_rustdoc_json(
+    crate_name: &str,
+    version: &str,
+    document: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let path = rustdoc_cache_path(crate_name, version)?;
+    if path.exists() {
+        return Ok(());
+    }
+    let parent = path.parent().context("Rustdoc cache path has no parent")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create Rustdoc cache `{}`", parent.display()))?;
+    let bytes = serde_json::to_vec(document).context("serialize Rustdoc cache entry")?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_RUSTDOC_JSON_BYTES,
+        "Rustdoc JSON exceeds the cache safety limit"
+    );
+    match write_new_file(&path, &bytes) {
+        Ok(()) => Ok(()),
+        Err(_error) if path.is_file() => Ok(()),
+        Err(error) => Err(error),
     }
 }
 

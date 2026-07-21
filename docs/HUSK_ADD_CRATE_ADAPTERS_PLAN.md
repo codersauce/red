@@ -145,9 +145,8 @@ time/output/resources, minimal environment inheritance, and no network unless
 explicitly authorized. Componentize it on the trusted host, then verify exports
 and actual capability imports.
 
-Status: initial macOS build sandbox, host-side componentization, and exact
-export/capability verification implemented. Explicit memory and process-count
-limits are still required before installation is enabled.
+Status: initial cross-platform build sandbox, host-side componentization,
+resource limits, and exact export/capability verification implemented.
 
 `wasm32-wasip2` was rejected for the default path after a real `regex` build
 introduced ambient WASI CLI, I/O, environment, process, and random imports.
@@ -173,11 +172,15 @@ red husk crate build-adapter ./regex-adapter
 This dedicated command is offline by default. Dependency resolution may use the
 network only with `--allow-network`; compilation is always offline and
 network-denied. The build runs against a copied source tree with a minimal
-environment, bounded time and output, read-only toolchain and registry access,
-and writes confined to a disposable directory. Only the lockfile, verified
-`component.wasm`, and verified build status are published back. The first
-sandbox backend is macOS; other operating systems fail closed until their
-backends are implemented.
+environment, bounded time, output, aggregate resident memory, and process
+count. Toolchain and registry access is read-only, writes are confined to a
+disposable directory, and only the lockfile, verified `component.wasm`, and
+verified build status are published back.
+
+The macOS backend uses Seatbelt, Linux uses Bubblewrap and fails closed when
+`bwrap` is unavailable, and Windows uses Windows Sandbox with networking
+disabled. Windows fails closed when the optional Windows Sandbox feature is
+unavailable. Windows Sandbox requires a memory limit of at least 2 GiB.
 
 ### 7. Implement `husk add`
 
@@ -188,7 +191,30 @@ Make installation transactional and reproducible:
 - support `--locked`, `--offline`, and explicit feature selection;
 - roll back every partial change after failure.
 
-Status: not started.
+Status: initial implementation complete.
+
+```shell
+red husk add regex
+red husk add glob --features feature-a,feature-b
+```
+
+- Crate inspection, automatic or explicit API selection, source generation,
+  sandboxed compilation, componentization, and exact verification run as one
+  command.
+- Verified bundles are stored under `.husk/cache/<sha256>.huskext`.
+- Each bundle keeps `husk-adapter.json`, including every selected and skipped
+  API with its reason.
+- `Husk.toml` comments are preserved and `Husk.lock` records the exact
+  component digest.
+- Both package files are prepared before publication, validated through the
+  normal package resolver afterward, and restored if any publication or
+  validation step fails.
+- `--offline` uses only Cargo inputs and Rustdoc JSON already present in local
+  caches. Online inspection populates the bounded Rustdoc cache.
+- `--locked` validates the existing lock and refuses an add that would change
+  either package file.
+- `--features`, `--no-default-features`, `--version`, and repeatable
+  `--include` selections flow through the complete pipeline.
 
 ## Temporary command location
 
@@ -196,6 +222,7 @@ Until Husk becomes its own project, its CLI is available through Red:
 
 ```shell
 red husk --help
+red husk add regex
 red husk crate inspect regex
 red husk check script.hk
 red husk run script.hk
@@ -211,6 +238,8 @@ unsupported native code or capabilities fail with an explicit report.
 
 ## Next milestone
 
-Add explicit memory and process-count limits plus equivalent fail-closed build
-sandbox backends for Linux and Windows, then connect the verified artifact to
-transactional `husk add`. Ordinary Husk commands must still never invoke Cargo.
+Expand conservative Rust-to-WIT lowering so more arbitrary crates are useful:
+additional integer widths, collections, records/enums, associated constructors,
+owned resource arguments, and capability inference. Add native Linux and
+Windows CI smoke tests for their sandbox backends. Ordinary Husk commands must
+still never invoke Cargo.

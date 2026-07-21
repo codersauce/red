@@ -286,6 +286,40 @@ fn locked_mode_rejects_missing_or_changed_package_lock() {
 }
 
 #[test]
+fn add_locked_rejects_before_creating_install_state() {
+    let directory = TempDir::new().unwrap();
+    write_package(&directory);
+    let initialize = Command::new(env!("CARGO_BIN_EXE_husk"))
+        .arg("check")
+        .arg(directory.path())
+        .output()
+        .unwrap();
+    assert!(initialize.status.success(), "{initialize:?}");
+    let original_manifest = fs::read(directory.path().join("Husk.toml")).unwrap();
+    let original_lock = fs::read(directory.path().join("Husk.lock")).unwrap();
+
+    let add = Command::new(env!("CARGO_BIN_EXE_husk"))
+        .args(["add", "any-arbitrary-crate", "--locked", "--offline"])
+        .arg("--package")
+        .arg(directory.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(add.status.code(), Some(1), "{add:?}");
+    let stderr = String::from_utf8_lossy(&add.stderr);
+    assert!(stderr.contains("would change"), "{add:?}");
+    assert_eq!(
+        fs::read(directory.path().join("Husk.toml")).unwrap(),
+        original_manifest
+    );
+    assert_eq!(
+        fs::read(directory.path().join("Husk.lock")).unwrap(),
+        original_lock
+    );
+    assert!(!directory.path().join(".husk").exists());
+}
+
+#[test]
 fn package_manifest_loads_declared_portable_extensions() {
     let directory = TempDir::new().unwrap();
     let (extension_manifest, component) = write_extension_source(&directory);
