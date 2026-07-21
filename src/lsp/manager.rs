@@ -11,6 +11,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     path::{Path, PathBuf},
 };
 
@@ -46,6 +47,18 @@ pub struct DocumentInfo {
 struct DocumentSelector {
     server_name: String,
     language_id: String,
+}
+
+async fn complete_shutdowns<I, F>(shutdowns: I) -> Result<(), LspError>
+where
+    I: IntoIterator<Item = F>,
+    F: Future<Output = Result<(), LspError>>,
+{
+    let results = futures::future::join_all(shutdowns).await;
+    for result in results {
+        result?;
+    }
+    Ok(())
 }
 
 /// Lazily starts and routes documents across configured language servers.
@@ -674,16 +687,20 @@ impl LspClient for LspManager {
     }
 
     async fn shutdown(&mut self) -> Result<(), LspError> {
-        for client in self.clients.values_mut() {
-            client.shutdown().await?;
-        }
-        Ok(())
+        complete_shutdowns(self.clients.values_mut().map(|client| client.shutdown())).await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     use crate::{
         config::{LanguageDocumentConfig, LanguageServerConfig},
@@ -724,6 +741,49 @@ mod tests {
             initialization_options: None,
             workspace_name: None,
         }
+    }
+
+    #[tokio::test]
+    async fn shutdowns_are_driven_concurrently() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let shutdowns = (0..2).map(|_| {
+            let started = Arc::clone(&started);
+            async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                tokio::time::timeout(Duration::from_millis(100), async {
+                    while started.load(Ordering::SeqCst) < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .map_err(|_| {
+                    LspError::ProtocolError("shutdown futures ran sequentially".to_string())
+                })?;
+                Ok(())
+            }
+        });
+
+        complete_shutdowns(shutdowns).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_error_does_not_cancel_other_clients() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let shutdowns = (0..2).map(|index| {
+            let completed = Arc::clone(&completed);
+            async move {
+                if index == 0 {
+                    Err(LspError::ProtocolError("expected failure".to_string()))
+                } else {
+                    tokio::task::yield_now().await;
+                    completed.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+        });
+
+        assert!(complete_shutdowns(shutdowns).await.is_err());
+        assert!(completed.load(Ordering::SeqCst));
     }
 
     #[test]

@@ -253,12 +253,14 @@ async fn run() -> anyhow::Result<()> {
 
     let result = editor.run().await;
 
+    let cleanup_result = editor.cleanup();
+
     log!(" ===> after run, shutting down LSP");
     if let Err(e) = editor.lsp_mut().shutdown().await {
         log!("Error shutting down LSP: {}", e);
     }
 
-    editor.cleanup()?;
+    cleanup_result?;
     result?;
 
     Ok(())
