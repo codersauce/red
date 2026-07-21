@@ -319,10 +319,6 @@ async fn run<H: CodexToolHost>(
         .arg("features.plugins=false")
         .arg("-c")
         .arg("features.remote_plugin=false")
-        .arg("-c")
-        .arg("features.hooks=false")
-        .arg("-c")
-        .arg("features.codex_hooks=false")
         .envs(&spec.environment)
         .current_dir(&spec.current_dir)
         .stdin(Stdio::piped())
@@ -731,8 +727,8 @@ async fn handle_response(
             )
             .await?;
         }
-        Pending::Requirements { cwd, config } => {
-            if !requirements_are_safe(&message) {
+        Pending::Requirements { cwd, mut config } => {
+            let Some(hooks_enabled) = required_hooks_mode(&message) else {
                 events
                     .send(CodexEvent::Failed {
                         session_id: None,
@@ -742,7 +738,8 @@ async fn handle_response(
                     .await
                     .ok();
                 return Ok(());
-            }
+            };
+            config["features"]["hooks"] = json!(hooks_enabled);
             let id = rpc_id(next_id);
             pending.insert(id.clone(), Pending::Start { cwd: cwd.clone() });
             write_message(
@@ -1131,33 +1128,42 @@ fn restricted_config(response: &Value) -> Option<Value> {
             "plugins": false,
             "remote_plugin": false,
             "skill_mcp_dependency_install": false,
-            "hooks": false,
-            "codex_hooks": false
+            "hooks": false
         },
         "orchestrator": {"mcp": {"enabled": false}},
         "notify": []
     }))
 }
 
-fn requirements_are_safe(response: &Value) -> bool {
-    let Some(features) = response
-        .pointer("/result/requirements/featureRequirements")
-        .and_then(Value::as_object)
-    else {
-        return response
-            .pointer("/result/requirements")
-            .is_none_or(Value::is_null);
+/// Returns whether hooks must be enabled while rejecting other required
+/// extension features that could escape Red's review boundary.
+fn required_hooks_mode(response: &Value) -> Option<bool> {
+    let Some(requirements) = response.pointer("/result/requirements") else {
+        return Some(false);
     };
-    [
+    if requirements.is_null() {
+        return Some(false);
+    }
+    let features = response
+        .pointer("/result/requirements/featureRequirements")
+        .and_then(Value::as_object)?;
+    if [
         "apps",
         "connectors",
         "plugins",
         "skill_mcp_dependency_install",
-        "hooks",
-        "codex_hooks",
     ]
     .iter()
-    .all(|name| features.get(*name).and_then(Value::as_bool) != Some(true))
+    .any(|name| features.get(*name).and_then(Value::as_bool) == Some(true))
+    {
+        return None;
+    }
+
+    Some(
+        ["hooks", "codex_hooks"]
+            .iter()
+            .any(|name| features.get(*name).and_then(Value::as_bool) == Some(true)),
+    )
 }
 
 fn tool_definitions() -> Value {
@@ -1372,5 +1378,68 @@ mod tests {
         std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         assert!(find_executable(command.to_str().unwrap()).is_none());
+    }
+
+    #[test]
+    fn required_hooks_mode_allows_managed_only_hooks() {
+        for feature in ["hooks", "codex_hooks"] {
+            let response = json!({
+                "result": {
+                    "requirements": {
+                        "allowManagedHooksOnly": true,
+                        "featureRequirements": {(feature): true}
+                    }
+                }
+            });
+
+            assert_eq!(required_hooks_mode(&response), Some(true));
+        }
+    }
+
+    #[test]
+    fn required_hooks_mode_allows_hooks_without_managed_only_enforcement() {
+        for managed_only in [Value::Null, json!(false)] {
+            let response = json!({
+                "result": {
+                    "requirements": {
+                        "allowManagedHooksOnly": managed_only,
+                        "featureRequirements": {"hooks": true}
+                    }
+                }
+            });
+
+            assert_eq!(required_hooks_mode(&response), Some(true));
+        }
+    }
+
+    #[test]
+    fn required_hooks_mode_rejects_other_required_extensions() {
+        for feature in [
+            "apps",
+            "connectors",
+            "plugins",
+            "skill_mcp_dependency_install",
+        ] {
+            let response = json!({
+                "result": {
+                    "requirements": {
+                        "allowManagedHooksOnly": true,
+                        "featureRequirements": {(feature): true}
+                    }
+                }
+            });
+
+            assert_eq!(required_hooks_mode(&response), None);
+        }
+    }
+
+    #[test]
+    fn required_hooks_mode_disables_hooks_without_requirements() {
+        for response in [
+            json!({"result": {"requirements": null}}),
+            json!({"result": {}}),
+        ] {
+            assert_eq!(required_hooks_mode(&response), Some(false));
+        }
     }
 }

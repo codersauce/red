@@ -50,7 +50,9 @@ Every Codex thread is started with:
 - `approvalPolicy = "never"`
 - no execution environments
 - configured MCP servers disabled
-- apps, connectors, plugins, orchestrator MCP, notifications, and hooks disabled
+- apps, connectors, plugins, orchestrator MCP, and notifications disabled
+- hooks disabled unless the managed Codex policy requires them; when required,
+  Codex may also load trusted user, workspace, or plugin hooks
 - Red's bounded dynamic tools and reviewable-edit instructions
 
 Native command, file-change, and permission escalation requests are denied.
