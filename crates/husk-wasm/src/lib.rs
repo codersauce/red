@@ -645,8 +645,10 @@ fn inspect_exports(
         match export.ty {
             ComponentItem::Type(_) | ComponentItem::Resource(_) => {}
             ComponentItem::ComponentFunc(function) => {
-                let husk_name =
-                    normalize_and_track(original_name, &mut member_names, "root component export")?;
+                let Some(husk_name) = normalize_component_function_name(original_name)? else {
+                    continue;
+                };
+                track_normalized_name(&husk_name, original_name, &mut member_names)?;
                 let export_index = component
                     .get_export_index(None, original_name)
                     .ok_or_else(|| WasmDescriptorError::MissingExport(original_name.to_string()))?;
@@ -753,11 +755,10 @@ fn inspect_interface(
         match export.ty {
             ComponentItem::Type(_) | ComponentItem::Resource(_) => {}
             ComponentItem::ComponentFunc(function) => {
-                let husk_name = normalize_and_track(
-                    original_name,
-                    &mut normalized_names,
-                    "interface function",
-                )?;
+                let Some(husk_name) = normalize_component_function_name(original_name)? else {
+                    continue;
+                };
+                track_normalized_name(&husk_name, original_name, &mut normalized_names)?;
                 let export_index = component
                     .get_export_index(Some(&parent_index), original_name)
                     .ok_or_else(|| {
@@ -1138,6 +1139,44 @@ fn normalize_and_track(
         });
     }
     Ok(normalized)
+}
+
+fn normalize_component_function_name(
+    original: &str,
+) -> Result<Option<String>, WasmDescriptorError> {
+    if let Some(resource) = original.strip_prefix("[constructor]") {
+        return normalize_wit_name(&format!("{resource}-new")).map(Some);
+    }
+    if let Some(member) = original
+        .strip_prefix("[method]")
+        .or_else(|| original.strip_prefix("[static]"))
+    {
+        let Some((resource, function)) = member.split_once('.') else {
+            return Err(WasmDescriptorError::InvalidName {
+                original: original.to_string(),
+            });
+        };
+        return normalize_wit_name(&format!("{resource}-{function}")).map(Some);
+    }
+    if original.starts_with("[dtor]") {
+        return Ok(None);
+    }
+    normalize_wit_name(original).map(Some)
+}
+
+fn track_normalized_name(
+    normalized: &str,
+    original: &str,
+    names: &mut BTreeMap<String, String>,
+) -> Result<(), WasmDescriptorError> {
+    if let Some(first) = names.insert(normalized.to_string(), original.to_string()) {
+        return Err(WasmDescriptorError::NameCollision {
+            normalized: normalized.to_string(),
+            first,
+            second: original.to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn normalize_unique<'a>(
@@ -1776,6 +1815,26 @@ mod tests {
                 .call("add", &[OwnedValue::I32(1), OwnedValue::I32(2)])
                 .unwrap(),
             OwnedValue::I32(3)
+        );
+    }
+
+    #[test]
+    fn normalizes_canonical_resource_function_names() {
+        assert_eq!(
+            normalize_component_function_name("[constructor]regex").unwrap(),
+            Some("regex_new".to_string())
+        );
+        assert_eq!(
+            normalize_component_function_name("[method]regex.is-match").unwrap(),
+            Some("regex_is_match".to_string())
+        );
+        assert_eq!(
+            normalize_component_function_name("[static]regex.escape").unwrap(),
+            Some("regex_escape".to_string())
+        );
+        assert_eq!(
+            normalize_component_function_name("[dtor]regex").unwrap(),
+            None
         );
     }
 

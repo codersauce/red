@@ -138,13 +138,30 @@ Cargo. Current Rust lowering covers primitive and string calls plus fallible
 resource construction; additional collection and resource-argument shapes
 remain explicit generation errors.
 
-### 6. Build in a sandbox
+### 6. Build and componentize in a sandbox
 
-Build for `wasm32-wasip2` with pinned inputs, bounded time/output/resources,
-minimal environment inheritance, and no network unless explicitly authorized.
-Then verify exports and actual capability imports.
+Build a core module for `wasm32-unknown-unknown` with pinned inputs, bounded
+time/output/resources, minimal environment inheritance, and no network unless
+explicitly authorized. Componentize it on the trusted host, then verify exports
+and actual capability imports.
 
-Status: not started.
+Status: host-side componentization and verification implemented; the isolated
+Cargo runner is next.
+
+`wasm32-wasip2` was rejected for the default path after a real `regex` build
+introduced ambient WASI CLI, I/O, environment, process, and random imports.
+Building a WIT-aware core module first and componentizing it separately produced
+the same selected exports with no capability imports:
+
+```shell
+red husk extension componentize \
+  --core-module ./target/wasm32-unknown-unknown/release/husk_adapter_regex.wasm \
+  --output ./regex.component.wasm
+```
+
+Componentization rejects oversized or invalid inputs, refuses to overwrite its
+output, validates the encoded component, checks every export through Husk's
+runtime descriptor, and rejects all capability imports.
 
 ### 7. Implement `husk add`
 
@@ -178,6 +195,7 @@ unsupported native code or capabilities fail with an explicit report.
 
 ## Next milestone
 
-Build a generated adapter for `wasm32-wasip2` inside a constrained sandbox,
-then verify that its exports match the proposal and that it imports no
-undeclared capabilities. Ordinary Husk commands must still never invoke Cargo.
+Compile a generated adapter to a `wasm32-unknown-unknown` core module inside a
+constrained Cargo sandbox. The existing trusted componentization step must then
+verify that its exports match the proposal and that it imports no capabilities.
+Ordinary Husk commands must still never invoke Cargo.

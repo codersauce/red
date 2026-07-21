@@ -13,14 +13,15 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use husk::{
     CallContext, CompiledModule, Engine, MainArguments, MainResult, NativeError, NativeModule,
-    OwnedValue, PackageLimits, ReplOutcome, ResolvedPackage, TestExpectation, WasmCompileOptions,
-    WasmComponent,
+    OwnedValue, PackageLimits, ReplOutcome, ResolvedPackage, TestExpectation, Version,
+    WasmCompileOptions, WasmComponent,
 };
 use husk_extension::{BundleLimits, ExtensionBundle, pack_directory};
 use serde::{Deserialize, Serialize};
 
 const MAX_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_RUSTDOC_JSON_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_COMPONENT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "husk", version, about = "Compile and run Husk scripts")]
@@ -94,6 +95,13 @@ enum Command {
 enum ExtensionCommand {
     /// Validate, compile, and print a bundle's derived module signature.
     Inspect { bundle: PathBuf },
+    /// Turn a WIT-aware core Wasm module into a verified component.
+    Componentize {
+        #[arg(long)]
+        core_module: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Assemble a new directory bundle without invoking Cargo.
     Pack {
         #[arg(long)]
@@ -467,6 +475,31 @@ fn execute_extension(command: ExtensionCommand) -> anyhow::Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        ExtensionCommand::Componentize {
+            core_module,
+            output,
+        } => {
+            let component = componentize_core_module(&core_module)?;
+            let verified = WasmComponent::compile_bytes(
+                "adapter",
+                Version::new(0, 0, 0),
+                &component,
+                WasmCompileOptions::default(),
+            )
+            .context("verify component exports and capability imports")?;
+            anyhow::ensure!(
+                verified.raw_imports().is_empty(),
+                "component unexpectedly imports: {}",
+                verified.raw_imports().join(", ")
+            );
+            write_new_file(&output, &component)?;
+            println!(
+                "componentized {} as {} with no capability imports",
+                core_module.display(),
+                output.display()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         ExtensionCommand::Pack {
             manifest,
             component,
@@ -484,6 +517,50 @@ fn execute_extension(command: ExtensionCommand) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+fn componentize_core_module(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect core module `{}`", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "core module `{}` is not a regular file",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_COMPONENT_BYTES,
+        "core module `{}` exceeds the {} byte limit",
+        path.display(),
+        MAX_COMPONENT_BYTES
+    );
+    let module =
+        fs::read(path).with_context(|| format!("read core module `{}`", path.display()))?;
+    wit_component::ComponentEncoder::default()
+        .module(&module)
+        .context("read embedded component metadata from core module")?
+        .validate(true)
+        .encode()
+        .context("encode WebAssembly component")
+}
+
+fn write_new_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    anyhow::ensure!(!path.exists(), "output `{}` already exists", path.display());
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    anyhow::ensure!(
+        parent.is_dir(),
+        "output parent `{}` is not a directory",
+        parent.display()
+    );
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create temporary output in `{}`", parent.display()))?;
+    temporary
+        .write_all(contents)
+        .with_context(|| format!("write temporary output for `{}`", path.display()))?;
+    temporary
+        .persist_noclobber(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("publish output `{}`", path.display()))?;
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -2370,7 +2447,7 @@ fn render_adapter_package(
     for (wit_name, rust_path) in &resources {
         writeln!(
             source,
-            "struct Adapter{}({});",
+            "#[allow(dead_code)]\nstruct Adapter{}({});",
             rust_type_name(wit_name),
             adapter_rust_path(rust_path)
         )?;
