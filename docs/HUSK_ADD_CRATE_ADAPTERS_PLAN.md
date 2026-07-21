@@ -104,7 +104,7 @@ Generate deterministic WIT and Rust glue only for items accepted by the
 inspection report. Preserve the report in the generated artifact so no API is
 silently omitted.
 
-Status: deterministic WIT proposal implemented; Rust glue is next.
+Status: initial deterministic WIT and Rust glue generation implemented.
 
 ```shell
 red husk crate interface regex \
@@ -120,6 +120,23 @@ red husk crate interface regex \
 - Generated proposals are covered by the same WIT parser used by the component
   runtime.
 - No crate code is compiled during proposal generation.
+
+The selected interface can also be materialized as an unbuilt adapter crate:
+
+```shell
+red husk crate adapter regex \
+  --include regex::Regex::new \
+  --include regex::Regex::is_match \
+  --include regex::escape \
+  --output ./regex-adapter
+```
+
+The new directory contains pinned Cargo inputs, parser-validated WIT, generated
+Rust calls into the selected APIs, and the complete machine-readable selection
+report. Generation refuses to overwrite an existing path and does not invoke
+Cargo. Current Rust lowering covers primitive and string calls plus fallible
+resource construction; additional collection and resource-argument shapes
+remain explicit generation errors.
 
 ### 6. Build in a sandbox
 
@@ -161,6 +178,6 @@ unsupported native code or capabilities fail with an explicit report.
 
 ## Next milestone
 
-Generate deterministic Rust adapter glue from the selected WIT proposal. The
-milestone is complete when the `regex` selection produces a reviewable adapter
-crate whose source can be built only inside the future sandbox.
+Build a generated adapter for `wasm32-wasip2` inside a constrained sandbox,
+then verify that its exports match the proposal and that it imports no
+undeclared capabilities. Ordinary Husk commands must still never invoke Cargo.

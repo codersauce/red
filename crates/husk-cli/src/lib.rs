@@ -123,6 +123,17 @@ enum CrateCommand {
         #[arg(long = "include", required = true)]
         includes: Vec<String>,
     },
+    /// Generate a deterministic Rust adapter crate without building it.
+    Adapter {
+        #[command(flatten)]
+        request: CrateRequest,
+        /// Exact public API path to include. Repeat for each selected item.
+        #[arg(long = "include", required = true)]
+        includes: Vec<String>,
+        /// New directory that will receive the generated adapter crate.
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -570,6 +581,20 @@ struct WitCallableInspection {
     owner_resource: Option<String>,
     declaration: String,
     resources: Vec<String>,
+    resource_types: Vec<AdapterResourceInspection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adapter: Option<AdapterCallableInspection>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdapterResourceInspection {
+    wit_name: String,
+    rust_path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AdapterCallableInspection {
+    implementation: String,
 }
 
 fn execute_crate(command: CrateCommand) -> anyhow::Result<ExitCode> {
@@ -586,6 +611,16 @@ fn execute_crate(command: CrateCommand) -> anyhow::Result<ExitCode> {
         CrateCommand::Interface { request, includes } => {
             let report = inspect_crate(request.into())?;
             println!("{}", generate_wit_interface(&report, &includes)?);
+            Ok(ExitCode::SUCCESS)
+        }
+        CrateCommand::Adapter {
+            request,
+            includes,
+            output,
+        } => {
+            let report = inspect_crate(request.into())?;
+            write_adapter_package(&report, &includes, &output)?;
+            println!("generated adapter source at {}", output.display());
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -889,6 +924,11 @@ struct ExportedRustItem {
     kind: String,
 }
 
+struct ApiResourceMappings {
+    names: BTreeMap<String, String>,
+    paths: BTreeMap<String, String>,
+}
+
 fn analyze_rustdoc_json(
     crate_name: &str,
     crate_version: &str,
@@ -917,7 +957,7 @@ fn analyze_rustdoc_json(
         &mut visited_modules,
         &mut exports,
     );
-    let resource_names = build_wit_resource_names(&document, root_namespace, &exports);
+    let resource_mappings = build_wit_resource_names(&document, root_namespace, &exports);
 
     let mut resources = BTreeSet::new();
     let mut items = Vec::new();
@@ -938,12 +978,12 @@ fn analyze_rustdoc_json(
                         "function",
                         None,
                         None,
-                        &resource_names,
+                        &resource_mappings,
                     ));
                 }
             }
             "struct" | "enum" | "union" => {
-                collect_inherent_methods(&document, exported, &resource_names, &mut items);
+                collect_inherent_methods(&document, exported, &resource_mappings, &mut items);
             }
             _ => {}
         }
@@ -973,8 +1013,9 @@ fn build_wit_resource_names(
     document: &serde_json::Value,
     root_namespace: &str,
     exports: &BTreeMap<(String, String), ExportedRustItem>,
-) -> BTreeMap<String, String> {
+) -> ApiResourceMappings {
     let mut names = BTreeMap::new();
+    let mut paths = BTreeMap::new();
     for exported in exports.values() {
         if !matches!(exported.kind.as_str(), "struct" | "enum" | "union") {
             continue;
@@ -991,18 +1032,16 @@ fn build_wit_resource_names(
             .and_then(|path| path.strip_prefix("::"))
             .unwrap_or(&exported.path);
         let candidate = wit_identifier(&public_path.replace("::", "-"));
-        names
-            .entry(exported.id.clone())
-            .and_modify(|current: &mut String| {
-                if candidate.len() < current.len()
-                    || (candidate.len() == current.len() && candidate < *current)
-                {
-                    current.clone_from(&candidate);
-                }
-            })
-            .or_insert(candidate);
+        let should_replace = names.get(&exported.id).is_none_or(|current: &String| {
+            candidate.len() < current.len()
+                || (candidate.len() == current.len() && candidate < *current)
+        });
+        if should_replace {
+            names.insert(exported.id.clone(), candidate);
+            paths.insert(exported.id.clone(), exported.path.clone());
+        }
     }
-    names
+    ApiResourceMappings { names, paths }
 }
 
 fn collect_module_exports(
@@ -1104,7 +1143,7 @@ fn collect_exported_target(
 fn collect_inherent_methods(
     document: &serde_json::Value,
     exported: &ExportedRustItem,
-    resource_names: &BTreeMap<String, String>,
+    resource_mappings: &ApiResourceMappings,
     items: &mut Vec<ApiItemInspection>,
 ) {
     let Some(definition) = rustdoc_index_item(document, &exported.id) else {
@@ -1158,7 +1197,7 @@ fn collect_inherent_methods(
                 "associated-function",
                 Some(&exported.id),
                 Some(&exported.path),
-                resource_names,
+                resource_mappings,
             );
             if owner_has_generics {
                 classified.compatibility = "incompatible";
@@ -1178,7 +1217,7 @@ fn classify_callable(
     default_kind: &'static str,
     owner_id: Option<&str>,
     owner_path: Option<&str>,
-    resource_names: &BTreeMap<String, String>,
+    resource_mappings: &ApiResourceMappings,
 ) -> ApiItemInspection {
     let Some(function) = item.pointer("/inner/function") else {
         return incompatible_api_item(path, default_kind, String::new(), "not a Rust function");
@@ -1260,7 +1299,14 @@ fn classify_callable(
         return incompatible_api_item(path, kind, signature, &format!("return type: {reason}"));
     }
 
-    match render_wit_callable(function, path, kind, owner_id, owner_path, resource_names) {
+    match render_wit_callable(
+        function,
+        path,
+        kind,
+        owner_id,
+        owner_path,
+        resource_mappings,
+    ) {
         Ok(wit) => ApiItemInspection {
             path: path.to_string(),
             kind,
@@ -1382,10 +1428,10 @@ fn render_wit_callable(
     kind: &'static str,
     owner_id: Option<&str>,
     owner_path: Option<&str>,
-    resource_names: &BTreeMap<String, String>,
+    resource_mappings: &ApiResourceMappings,
 ) -> Result<WitCallableInspection, String> {
     let owner_resource = owner_id
-        .and_then(|id| resource_names.get(id))
+        .and_then(|id| resource_mappings.names.get(id))
         .cloned()
         .or_else(|| owner_path.map(wit_path_leaf));
     let mut resources = BTreeSet::new();
@@ -1412,7 +1458,7 @@ fn render_wit_callable(
             Ok(format!(
                 "{}: {}",
                 wit_identifier(name),
-                rust_type_to_wit(ty, false, resource_names, &mut resources)?
+                rust_type_to_wit(ty, false, &resource_mappings.names, &mut resources)?
             ))
         })
         .collect::<Result<Vec<_>, String>>()?
@@ -1420,7 +1466,7 @@ fn render_wit_callable(
     let output = function
         .pointer("/sig/output")
         .filter(|output| !output.is_null())
-        .map(|output| rust_type_to_wit(output, false, resource_names, &mut resources))
+        .map(|output| rust_type_to_wit(output, false, &resource_mappings.names, &mut resources))
         .transpose()?;
     let result = output
         .as_deref()
@@ -1452,11 +1498,322 @@ fn render_wit_callable(
         _ => return Err(format!("unsupported callable kind `{kind}`")),
     };
 
+    let resources = resources.into_iter().collect::<Vec<_>>();
+    let resource_types = resources
+        .iter()
+        .filter_map(|wit_name| {
+            let id = resource_mappings
+                .names
+                .iter()
+                .find_map(|(id, name)| (name == wit_name).then_some(id))?;
+            Some(AdapterResourceInspection {
+                wit_name: wit_name.clone(),
+                rust_path: resource_mappings.paths.get(id)?.clone(),
+            })
+        })
+        .collect();
+    let adapter = render_adapter_callable(function, path, kind, owner_id, resource_mappings)
+        .ok()
+        .map(|implementation| AdapterCallableInspection { implementation });
+
     Ok(WitCallableInspection {
         owner_resource,
         declaration,
-        resources: resources.into_iter().collect(),
+        resources,
+        resource_types,
+        adapter,
     })
+}
+
+fn render_adapter_callable(
+    function: &serde_json::Value,
+    path: &str,
+    kind: &'static str,
+    owner_id: Option<&str>,
+    resource_mappings: &ApiResourceMappings,
+) -> Result<String, String> {
+    let inputs = function
+        .pointer("/sig/inputs")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut parameters = Vec::new();
+    let mut arguments = Vec::new();
+    for input in inputs {
+        let parts = input
+            .as_array()
+            .ok_or_else(|| "Rustdoc input is invalid".to_string())?;
+        let name = parts
+            .first()
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("argument");
+        if name == "self" {
+            continue;
+        }
+        let ty = parts
+            .get(1)
+            .ok_or_else(|| "Rustdoc input omitted its type".to_string())?;
+        let rust_name = rust_identifier(&wit_identifier(name));
+        parameters.push(format!(
+            "{rust_name}: {}",
+            adapter_trait_type(ty, &resource_mappings.names)?
+        ));
+        arguments.push(adapter_argument_expression(ty, &rust_name)?);
+    }
+    let parameters = parameters.join(", ");
+    let arguments = arguments.join(", ");
+    let rust_path = adapter_rust_path(path);
+    let call = match kind {
+        "method" => format!(
+            "self.0.{}({arguments})",
+            path.rsplit("::").next().unwrap_or("call")
+        ),
+        "constructor" | "associated-function" | "function" => {
+            format!("{rust_path}({arguments})")
+        }
+        _ => return Err(format!("unsupported adapter callable kind `{kind}`")),
+    };
+    let method_name = if kind == "constructor" {
+        "new".to_string()
+    } else {
+        rust_identifier(&wit_identifier(path.rsplit("::").next().unwrap_or("call")))
+    };
+    let receiver = if kind == "method" { "&self, " } else { "" };
+    let output = function
+        .pointer("/sig/output")
+        .filter(|output| !output.is_null());
+
+    if kind == "constructor" {
+        let owner_id = owner_id.ok_or_else(|| "constructor owner is missing".to_string())?;
+        if output.is_some_and(|output| resolved_path_has_id(output, owner_id)) {
+            return Ok(format!(
+                "fn {method_name}({parameters}) -> Self {{\n    Self({call})\n}}"
+            ));
+        }
+        let output = output.ok_or_else(|| "constructor output is missing".to_string())?;
+        let path = output
+            .get("resolved_path")
+            .ok_or_else(|| "fallible constructor output is not Result".to_string())?;
+        let mut arguments = rustdoc_type_arguments(path);
+        let ok = arguments
+            .next()
+            .ok_or_else(|| "Result is missing its success type".to_string())?;
+        let error = arguments
+            .next()
+            .ok_or_else(|| "Result is missing its error type".to_string())?;
+        if !resolved_path_has_id(ok, owner_id) {
+            return Err("constructor Result does not return its owner".to_string());
+        }
+        let error_id = error
+            .get("resolved_path")
+            .and_then(|path| path.get("id"))
+            .and_then(rustdoc_id)
+            .ok_or_else(|| "constructor error is not a local resource".to_string())?;
+        let error_name = resource_mappings
+            .names
+            .get(&error_id)
+            .ok_or_else(|| "constructor error has no WIT resource".to_string())?;
+        let error_type = rust_type_name(error_name);
+        let adapter_error_type = format!("Adapter{error_type}");
+        return Ok(format!(
+            "fn {method_name}({parameters}) -> Result<Self, {error_type}> {{\n    \
+             {call}.map(Self).map_err(|error| {error_type}::new({adapter_error_type}(error)))\n}}"
+        ));
+    }
+
+    let (return_type, body) = if let Some(output) = output {
+        (
+            format!(
+                " -> {}",
+                adapter_trait_type(output, &resource_mappings.names)?
+            ),
+            adapter_return_expression(
+                output,
+                &call,
+                &resource_mappings.names,
+                &resource_mappings.paths,
+            )?,
+        )
+    } else {
+        (String::new(), call)
+    };
+    Ok(format!(
+        "fn {method_name}({receiver}{parameters}){return_type} {{\n    {body}\n}}"
+    ))
+}
+
+fn adapter_trait_type(
+    ty: &serde_json::Value,
+    resource_names: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    if let Some(primitive) = ty.get("primitive").and_then(serde_json::Value::as_str) {
+        return match primitive {
+            "bool" | "u8" | "i32" | "i64" | "f64" => Ok(primitive.to_string()),
+            "str" => Ok("String".to_string()),
+            _ => Err(format!("primitive `{primitive}` has no adapter mapping")),
+        };
+    }
+    if let Some(reference) = ty.get("borrowed_ref") {
+        return reference
+            .get("type")
+            .ok_or_else(|| "borrowed type is missing".to_string())
+            .and_then(|ty| adapter_trait_type(ty, resource_names));
+    }
+    if let Some(path) = ty.get("resolved_path") {
+        let leaf = path
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|path| path.rsplit("::").next())
+            .unwrap_or("unknown");
+        if leaf == "String" {
+            return Ok("String".to_string());
+        }
+        if let Some(id) = path.get("id").and_then(rustdoc_id)
+            && let Some(resource) = resource_names.get(&id)
+        {
+            return Ok(rust_type_name(resource));
+        }
+    }
+    Err("adapter source lowering does not support this type yet".to_string())
+}
+
+fn adapter_argument_expression(ty: &serde_json::Value, name: &str) -> Result<String, String> {
+    if let Some(reference) = ty.get("borrowed_ref") {
+        let inner = reference
+            .get("type")
+            .ok_or_else(|| "borrowed type is missing".to_string())?;
+        if inner.get("primitive").and_then(serde_json::Value::as_str) == Some("str")
+            || inner.get("slice").is_some()
+        {
+            return Ok(format!("&{name}"));
+        }
+        return Err("borrowed resource parameters are not lowered yet".to_string());
+    }
+    if ty.get("primitive").is_some() {
+        return Ok(name.to_string());
+    }
+    if ty
+        .pointer("/resolved_path/path")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|path| path.rsplit("::").next())
+        == Some("String")
+    {
+        return Ok(name.to_string());
+    }
+    if ty.get("resolved_path").is_some() {
+        return Err("owned resource parameters are not lowered yet".to_string());
+    }
+    Err("adapter source lowering does not support this parameter yet".to_string())
+}
+
+fn adapter_return_expression(
+    ty: &serde_json::Value,
+    call: &str,
+    resource_names: &BTreeMap<String, String>,
+    resource_paths: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    if let Some(reference) = ty.get("borrowed_ref") {
+        let inner = reference
+            .get("type")
+            .ok_or_else(|| "borrowed type is missing".to_string())?;
+        if inner.get("primitive").and_then(serde_json::Value::as_str) == Some("str") {
+            return Ok(format!("{call}.to_string()"));
+        }
+        return Err("borrowed return values are not lowered yet".to_string());
+    }
+    if ty.get("primitive").is_some() {
+        return Ok(call.to_string());
+    }
+    if let Some(path) = ty.get("resolved_path") {
+        let leaf = path
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|path| path.rsplit("::").next());
+        if leaf == Some("String") {
+            return Ok(call.to_string());
+        }
+        if let Some(id) = path.get("id").and_then(rustdoc_id)
+            && let (Some(resource), Some(_rust_path)) =
+                (resource_names.get(&id), resource_paths.get(&id))
+        {
+            return Ok(format!(
+                "{}::new(Adapter{}({call}))",
+                rust_type_name(resource),
+                rust_type_name(resource)
+            ));
+        }
+    }
+    Err("adapter source lowering does not support this return type yet".to_string())
+}
+
+fn adapter_rust_path(path: &str) -> String {
+    path.split_once("::")
+        .map(|(_, suffix)| format!("inspected::{suffix}"))
+        .unwrap_or_else(|| format!("inspected::{path}"))
+}
+
+fn rust_identifier(wit_name: &str) -> String {
+    let identifier = wit_name.trim_start_matches('%').replace('-', "_");
+    if matches!(
+        identifier.as_str(),
+        "as" | "async"
+            | "await"
+            | "break"
+            | "const"
+            | "continue"
+            | "crate"
+            | "dyn"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "fn"
+            | "for"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "pub"
+            | "ref"
+            | "return"
+            | "self"
+            | "Self"
+            | "static"
+            | "struct"
+            | "super"
+            | "trait"
+            | "true"
+            | "type"
+            | "unsafe"
+            | "use"
+            | "where"
+            | "while"
+            | "yield"
+    ) {
+        format!("r#{identifier}")
+    } else {
+        identifier
+    }
+}
+
+fn rust_type_name(wit_name: &str) -> String {
+    wit_name
+        .trim_start_matches('%')
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut characters = part.chars();
+            characters
+                .next()
+                .map(|first| first.to_ascii_uppercase().to_string() + characters.as_str())
+                .unwrap_or_default()
+        })
+        .collect()
 }
 
 fn rust_type_to_wit(
@@ -1836,37 +2193,7 @@ fn render_wit_interface(
     public_api: &PublicApiInspection,
     includes: &[String],
 ) -> anyhow::Result<String> {
-    anyhow::ensure!(
-        public_api.status == "available",
-        "public API analysis is unavailable: {}",
-        public_api
-            .unavailable_reason
-            .as_deref()
-            .unwrap_or("unknown reason")
-    );
-
-    let requested = includes.iter().collect::<BTreeSet<_>>();
-    anyhow::ensure!(
-        requested.len() == includes.len(),
-        "the interface selection contains duplicate API paths"
-    );
-    let items_by_path = public_api
-        .items
-        .iter()
-        .map(|item| (item.path.as_str(), item))
-        .collect::<BTreeMap<_, _>>();
-    let mut selected = Vec::with_capacity(requested.len());
-    for path in requested {
-        let item = items_by_path
-            .get(path.as_str())
-            .ok_or_else(|| anyhow::anyhow!("public API item `{path}` was not found"))?;
-        anyhow::ensure!(
-            item.compatibility == "compatible",
-            "public API item `{path}` is incompatible: {}",
-            item.reason.as_deref().unwrap_or("unknown reason")
-        );
-        selected.push(*item);
-    }
+    let selected = select_public_api_items(public_api, includes)?;
 
     let mut resources = BTreeSet::new();
     let mut resource_members: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
@@ -1928,6 +2255,256 @@ fn render_wit_interface(
         .push_str("husk-generated.wit", &wit)
         .context("generated WIT proposal is invalid")?;
     Ok(wit)
+}
+
+fn select_public_api_items<'a>(
+    public_api: &'a PublicApiInspection,
+    includes: &[String],
+) -> anyhow::Result<Vec<&'a ApiItemInspection>> {
+    anyhow::ensure!(
+        public_api.status == "available",
+        "public API analysis is unavailable: {}",
+        public_api
+            .unavailable_reason
+            .as_deref()
+            .unwrap_or("unknown reason")
+    );
+
+    let requested = includes.iter().collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        requested.len() == includes.len(),
+        "the interface selection contains duplicate API paths"
+    );
+    let items_by_path = public_api
+        .items
+        .iter()
+        .map(|item| (item.path.as_str(), item))
+        .collect::<BTreeMap<_, _>>();
+    let mut selected = Vec::with_capacity(requested.len());
+    for path in requested {
+        let item = items_by_path
+            .get(path.as_str())
+            .ok_or_else(|| anyhow::anyhow!("public API item `{path}` was not found"))?;
+        anyhow::ensure!(
+            item.compatibility == "compatible",
+            "public API item `{path}` is incompatible: {}",
+            item.reason.as_deref().unwrap_or("unknown reason")
+        );
+        selected.push(*item);
+    }
+    Ok(selected)
+}
+
+struct GeneratedAdapterPackage {
+    manifest: String,
+    wit: String,
+    source: String,
+    report: String,
+    readme: String,
+}
+
+fn render_adapter_package(
+    report: &CrateInspection,
+    includes: &[String],
+) -> anyhow::Result<GeneratedAdapterPackage> {
+    anyhow::ensure!(
+        report.source.contains("crates.io-index"),
+        "adapter source generation currently requires a crates.io release"
+    );
+    let selected = select_public_api_items(&report.public_api, includes)?;
+    let wit = generate_wit_interface(report, includes)?;
+
+    let mut resources = BTreeMap::new();
+    let mut resource_methods: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut free_functions = Vec::new();
+    for item in &selected {
+        let mapping = item
+            .wit
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("public API item `{}` has no WIT mapping", item.path))?;
+        let adapter = mapping.adapter.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "public API item `{}` has WIT mapping but Rust adapter lowering is not implemented",
+                item.path
+            )
+        })?;
+        for resource in &mapping.resource_types {
+            if let Some(existing) =
+                resources.insert(resource.wit_name.clone(), resource.rust_path.clone())
+            {
+                anyhow::ensure!(
+                    existing == resource.rust_path,
+                    "WIT resource `{}` maps to conflicting Rust types",
+                    resource.wit_name
+                );
+            }
+        }
+        if let Some(owner) = &mapping.owner_resource {
+            resource_methods
+                .entry(owner.clone())
+                .or_default()
+                .push(adapter.implementation.clone());
+        } else {
+            free_functions.push(adapter.implementation.clone());
+        }
+    }
+    for methods in resource_methods.values_mut() {
+        methods.sort();
+    }
+    free_functions.sort();
+
+    let package_module = rust_identifier(&wit_identifier(&report.name));
+    let interface_module = package_module.clone();
+    let world = wit_identifier(&format!("{}-adapter", report.name));
+    let mut source = String::new();
+    writeln!(
+        source,
+        "wit_bindgen::generate!({{\n    world: {},\n    path: \"wit\",\n}});\n",
+        toml_string(&world)
+    )?;
+    writeln!(
+        source,
+        "use exports::husk::{package_module}::{interface_module}::*;\n"
+    )?;
+    writeln!(source, "struct Component;\n")?;
+    for (wit_name, rust_path) in &resources {
+        writeln!(
+            source,
+            "struct Adapter{}({});",
+            rust_type_name(wit_name),
+            adapter_rust_path(rust_path)
+        )?;
+    }
+    if !resources.is_empty() {
+        writeln!(source)?;
+    }
+    writeln!(source, "impl Guest for Component {{")?;
+    for wit_name in resources.keys() {
+        let type_name = rust_type_name(wit_name);
+        writeln!(source, "    type {type_name} = Adapter{type_name};")?;
+    }
+    for implementation in &free_functions {
+        writeln!(source)?;
+        write_indented(&mut source, implementation, 4)?;
+    }
+    writeln!(source, "}}\n")?;
+    for wit_name in resources.keys() {
+        let type_name = rust_type_name(wit_name);
+        if let Some(methods) = resource_methods.get(wit_name) {
+            writeln!(source, "impl Guest{type_name} for Adapter{type_name} {{")?;
+            for (index, implementation) in methods.iter().enumerate() {
+                if index > 0 {
+                    writeln!(source)?;
+                }
+                write_indented(&mut source, implementation, 4)?;
+            }
+            writeln!(source, "}}\n")?;
+        } else {
+            writeln!(
+                source,
+                "impl Guest{type_name} for Adapter{type_name} {{}}\n"
+            )?;
+        }
+    }
+    writeln!(source, "export!(Component);")?;
+
+    let mut enabled_features = report
+        .enabled_features
+        .iter()
+        .filter(|feature| {
+            feature.as_str() != "default" && report.available_features.contains(feature)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    enabled_features.sort();
+    let features = enabled_features
+        .iter()
+        .map(|feature| toml_string(feature))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let crate_package = format!("husk-adapter-{}", report.name.replace('_', "-"));
+    let manifest = format!(
+        "[package]\nname = {}\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n\
+         [lib]\ncrate-type = [\"cdylib\"]\n\n\
+         [dependencies]\nwit-bindgen = \"=0.59.0\"\n\n\
+         [dependencies.inspected]\npackage = {}\nversion = {}\ndefault-features = false\nfeatures = [{}]\n",
+        toml_string(&crate_package),
+        toml_string(&report.name),
+        toml_string(&format!("={}", report.version)),
+        features,
+    );
+    let selection_report = serde_json::to_string_pretty(&serde_json::json!({
+        "crate": report.name,
+        "version": report.version,
+        "features": report.enabled_features,
+        "items": selected,
+        "build_status": "not-built",
+    }))?;
+    let readme = format!(
+        "# Generated Husk adapter for `{}`\n\n\
+         This source was generated from the exact public API selection in \
+         `husk-adapter.json`.\n\n\
+         It has **not** been built or executed. Build it only through Husk's \
+         future adapter sandbox; ordinary Husk commands must not invoke Cargo.\n",
+        report.name
+    );
+    Ok(GeneratedAdapterPackage {
+        manifest,
+        wit,
+        source,
+        report: selection_report + "\n",
+        readme,
+    })
+}
+
+fn write_indented(output: &mut String, value: &str, spaces: usize) -> std::fmt::Result {
+    let indentation = " ".repeat(spaces);
+    for line in value.lines() {
+        writeln!(output, "{indentation}{line}")?;
+    }
+    Ok(())
+}
+
+fn write_adapter_package(
+    report: &CrateInspection,
+    includes: &[String],
+    output: &Path,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !output.exists(),
+        "adapter output `{}` already exists",
+        output.display()
+    );
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    anyhow::ensure!(
+        parent.is_dir(),
+        "adapter output parent `{}` is not a directory",
+        parent.display()
+    );
+    let package = render_adapter_package(report, includes)?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".husk-adapter-")
+        .tempdir_in(parent)
+        .with_context(|| {
+            format!(
+                "create temporary adapter directory in `{}`",
+                parent.display()
+            )
+        })?;
+    fs::create_dir(temporary.path().join("src")).context("create adapter source directory")?;
+    fs::create_dir(temporary.path().join("wit")).context("create adapter WIT directory")?;
+    fs::write(temporary.path().join("Cargo.toml"), package.manifest)
+        .context("write adapter Cargo.toml")?;
+    fs::write(temporary.path().join("src/lib.rs"), package.source)
+        .context("write adapter Rust source")?;
+    fs::write(temporary.path().join("wit/world.wit"), package.wit).context("write adapter WIT")?;
+    fs::write(temporary.path().join("husk-adapter.json"), package.report)
+        .context("write adapter selection report")?;
+    fs::write(temporary.path().join("README.md"), package.readme)
+        .context("write adapter README")?;
+    fs::rename(temporary.path(), output)
+        .with_context(|| format!("publish generated adapter at `{}`", output.display()))?;
+    Ok(())
 }
 
 fn wit_declaration_name(declaration: &str) -> &str {
@@ -2487,5 +3064,53 @@ world any-crate-adapter {
                 .contains("generic or lifetime parameters are not supported"),
             "{error:#}"
         );
+
+        let inspection = CrateInspection {
+            name: "any-crate".to_string(),
+            version: "1.2.3".to_string(),
+            source: "registry+https://github.com/rust-lang/crates.io-index".to_string(),
+            rust_version: None,
+            license: None,
+            repository: None,
+            enabled_features: vec!["default".to_string()],
+            available_features: vec!["default".to_string()],
+            targets: Vec::new(),
+            has_library: true,
+            has_build_script: false,
+            native_links: None,
+            readiness: "ready-for-adapter-design",
+            blockers: Vec::new(),
+            warnings: Vec::new(),
+            next_step: "generate adapter",
+            public_api: report,
+        };
+        let package = render_adapter_package(
+            &inspection,
+            &[
+                "any_crate::Widget::matches".to_string(),
+                "any_crate::Widget::open".to_string(),
+            ],
+        )
+        .unwrap();
+        assert!(
+            package
+                .manifest
+                .contains("version = \"=1.2.3\"\ndefault-features = false")
+        );
+        assert!(
+            package
+                .source
+                .contains("struct AdapterWidget(inspected::Widget);")
+        );
+        assert!(
+            package
+                .source
+                .contains("impl GuestWidget for AdapterWidget")
+        );
+        assert!(package.source.contains("self.0.matches(&input)"));
+        assert!(package.source.contains(
+            "inspected::Widget::open(&name).map(Self).map_err(|error| \
+             OpenError::new(AdapterOpenError(error)))"
+        ));
     }
 }
