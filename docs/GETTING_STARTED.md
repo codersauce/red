@@ -179,6 +179,20 @@ adaptive diff pane. It also exposes synchronization, branch, remote, tag,
 stash, worktree, log, reset, and interactive-rebase actions. Authentication
 uses your existing SSH agent or Git credential helper.
 
+The diff pane wraps long lines by default. Press `Tab` or `Ctrl-w w` to move
+between the file list and diff; `Ctrl-w h` and `Ctrl-w l` focus a pane
+directly. Wide terminals show the panes side by side; narrower terminals stack
+the file list above the full-width diff, falling back to one focused pane only
+when there is not enough height for both. In the diff, `j`/`k`,
+`Ctrl-u`/`Ctrl-d`, `Ctrl-b`/`Ctrl-f`, and
+`[h`/`]h` provide line, page, and hunk navigation. `W` toggles wrapping; when
+wrapping is off, `h`/`l`, the arrow keys, and `0`/`$` scroll horizontally.
+
+Use `v` to select changed lines. Lowercase `s`, `u`, and `x` stage, unstage,
+or discard the current changed line or selection; uppercase `S`, `U`, and `X`
+apply the same operation to the current hunk. Destructive actions remain
+confirmation-gated.
+
 ## Agent workflow
 
 Install and authenticate Codex separately, then press `Space A` from Normal or

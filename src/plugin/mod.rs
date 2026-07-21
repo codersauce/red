@@ -48,4 +48,7 @@ pub use window_bar::{
     RenderedWindowBar, WindowBarConfig, WindowBarEdge, WindowBarHitRegion, WindowBarManager,
     WindowBarOverflow, WindowBarSegment, WindowBarSemanticStyle, WindowBarStyle,
 };
-pub use workspace::{WorkspaceConfig, WorkspaceManager, WorkspaceModel, WorkspaceRow};
+pub use workspace::{
+    WorkspaceConfig, WorkspaceDocument, WorkspaceDocumentLine, WorkspaceManager, WorkspaceModel,
+    WorkspaceRow,
+};

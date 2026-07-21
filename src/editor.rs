@@ -7273,7 +7273,7 @@ impl Editor {
                     needs_render = true;
                 }
                 PluginRequest::UpdateWorkspace { id, model } => {
-                    if self.workspace_manager.update(&id, model) {
+                    if self.workspace_manager.update(&id, model, &self.theme) {
                         needs_render = true;
                     }
                 }
@@ -9204,30 +9204,66 @@ impl Editor {
     }
 
     fn handle_workspace_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
-        let Event::Key(event) = ev else {
+        let event = if let Event::Mouse(event) = ev {
+            let horizontal = event.modifiers.contains(KeyModifiers::SHIFT);
+            let action = match event.kind {
+                MouseEventKind::ScrollUp if horizontal => "mouse_left",
+                MouseEventKind::ScrollDown if horizontal => "mouse_right",
+                MouseEventKind::ScrollUp => "mouse_up",
+                MouseEventKind::ScrollDown => "mouse_down",
+                MouseEventKind::Down(MouseButton::Left) => "mouse_click",
+                _ => return None,
+            };
+            self.workspace_manager.handle_mouse(
+                action,
+                event.column as usize,
+                event.row as usize,
+                self.size.1 as usize,
+                self.size.0 as usize,
+            )?
+        } else if let Event::Key(event) = ev {
+            let control = event.modifiers.contains(KeyModifiers::CONTROL);
+            let action = match event.code {
+                KeyCode::Char('w') if control => "ctrl_w".to_string(),
+                KeyCode::Char('u') if control => "half_page_up".to_string(),
+                KeyCode::Char('d') if control => "half_page_down".to_string(),
+                KeyCode::Char('b') if control => "page_up".to_string(),
+                KeyCode::Char('f') if control => "page_down".to_string(),
+                KeyCode::Up | KeyCode::Char('k') => "up".to_string(),
+                KeyCode::Down | KeyCode::Char('j') => "down".to_string(),
+                KeyCode::Left => "left".to_string(),
+                KeyCode::Right => "right".to_string(),
+                KeyCode::Home => "first".to_string(),
+                KeyCode::End => "last".to_string(),
+                KeyCode::PageUp => "page_up".to_string(),
+                KeyCode::PageDown => "page_down".to_string(),
+                KeyCode::Enter => "activate".to_string(),
+                KeyCode::Esc => "escape".to_string(),
+                KeyCode::Tab => "toggle".to_string(),
+                KeyCode::BackTab => "back_toggle".to_string(),
+                KeyCode::Char(c) => c.to_string(),
+                _ => return None,
+            };
+            self.workspace_manager.handle_action(
+                action,
+                self.size.1 as usize,
+                self.size.0 as usize,
+            )?
+        } else {
             return None;
         };
-        let action = match event.code {
-            KeyCode::Up | KeyCode::Char('k') => "up".to_string(),
-            KeyCode::Down | KeyCode::Char('j') => "down".to_string(),
-            KeyCode::PageUp => "page_up".to_string(),
-            KeyCode::PageDown => "page_down".to_string(),
-            KeyCode::Enter => "activate".to_string(),
-            KeyCode::Esc => "escape".to_string(),
-            KeyCode::Tab => "toggle".to_string(),
-            KeyCode::BackTab => "back_toggle".to_string(),
-            KeyCode::Char(c) => c.to_string(),
-            _ => return None,
-        };
-        let event = self
-            .workspace_manager
-            .handle_action(action, self.size.1 as usize)?;
         let id = event.workspace_id.clone();
+        let notify_plugin = event.notify_plugin;
         serde_json::to_value(event).ok().map(|payload| {
-            KeyAction::Multiple(vec![
-                Action::NotifyPlugins(format!("workspace:event:{id}"), payload),
-                Action::Refresh,
-            ])
+            let mut actions = Vec::with_capacity(2);
+            if notify_plugin {
+                actions.push(Action::NotifyPlugins(
+                    format!("workspace:event:{id}"),
+                    payload,
+                ));
+            }
+            actions.push(Action::Refresh);
+            KeyAction::Multiple(actions)
         })
     }
 
@@ -16082,6 +16118,7 @@ impl Editor {
         self.theme = theme;
         self.highlighter = highlighter;
         self.highlight_cache.clear();
+        self.workspace_manager.update_theme(&self.theme);
         self.force_full_redraw = true;
         self.completion_ui.set_theme(&self.theme);
         if let Some(dialog) = &mut self.current_dialog {

@@ -266,7 +266,8 @@ impl Editor {
         self.render_ui_chrome(buffer)?;
         // A modal workspace replaces editor chrome but remains below dialogs
         // and overlays so prompts and transient menus stay interactive.
-        self.workspace_manager.render(buffer, &self.theme.style);
+        self.workspace_manager
+            .render(buffer, &self.theme, self.picker_icons());
         self.render_dialog(buffer)?;
 
         // Render all plugins

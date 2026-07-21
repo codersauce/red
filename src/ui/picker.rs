@@ -2072,7 +2072,7 @@ fn item_file_path(item: &PickerItem) -> Option<&str> {
     }
 }
 
-fn picker_file_icon(path: &str, style: PickerIconStyle) -> &'static str {
+pub(crate) fn picker_file_icon(path: &str, style: PickerIconStyle) -> &'static str {
     let extension = picker_file_extension(path);
     match style {
         PickerIconStyle::Unicode => match extension {
@@ -2118,7 +2118,7 @@ fn picker_file_icon(path: &str, style: PickerIconStyle) -> &'static str {
     }
 }
 
-fn picker_file_icon_color(path: &str) -> Option<Color> {
+pub(crate) fn picker_file_icon_color(path: &str) -> Option<Color> {
     picker_file_devicon(path)
         .1
         .map(|(r, g, b)| Color::Rgb { r, g, b })
