@@ -135,8 +135,10 @@ enum CrateCommand {
     Adapter {
         #[command(flatten)]
         request: CrateRequest,
-        /// Exact public API path to include. Repeat for each selected item.
-        #[arg(long = "include", required = true)]
+        /// Narrow generation to an exact public API path. Repeat as needed.
+        ///
+        /// Without this option, every API with complete adapter lowering is included.
+        #[arg(long = "include")]
         includes: Vec<String>,
         /// New directory that will receive the generated adapter crate.
         #[arg(long)]
@@ -1655,7 +1657,11 @@ fn render_adapter_callable(
     } else {
         rust_identifier(&wit_identifier(path.rsplit("::").next().unwrap_or("call")))
     };
-    let receiver = if kind == "method" { "&self, " } else { "" };
+    let receiver = match (kind, parameters.is_empty()) {
+        ("method", true) => "&self",
+        ("method", false) => "&self, ",
+        _ => "",
+    };
     let output = function
         .pointer("/sig/output")
         .filter(|output| !output.is_null());
@@ -2388,8 +2394,42 @@ fn render_adapter_package(
         report.source.contains("crates.io-index"),
         "adapter source generation currently requires a crates.io release"
     );
-    let selected = select_public_api_items(&report.public_api, includes)?;
-    let wit = generate_wit_interface(report, includes)?;
+    let selected = if includes.is_empty() {
+        anyhow::ensure!(
+            report.public_api.status == "available",
+            "public API analysis is unavailable: {}",
+            report
+                .public_api
+                .unavailable_reason
+                .as_deref()
+                .unwrap_or("unknown reason")
+        );
+        let mut selected = report
+            .public_api
+            .items
+            .iter()
+            .filter(|item| {
+                item.wit
+                    .as_ref()
+                    .and_then(|mapping| mapping.adapter.as_ref())
+                    .is_some()
+            })
+            .collect::<Vec<_>>();
+        selected.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        anyhow::ensure!(
+            !selected.is_empty(),
+            "crate `{}` has no public APIs with complete adapter lowering",
+            report.name
+        );
+        selected
+    } else {
+        select_public_api_items(&report.public_api, includes)?
+    };
+    let selected_paths = selected
+        .iter()
+        .map(|item| item.path.clone())
+        .collect::<Vec<_>>();
+    let wit = generate_wit_interface(report, &selected_paths)?;
 
     let mut resources = BTreeMap::new();
     let mut resource_methods: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -2510,11 +2550,33 @@ fn render_adapter_package(
         toml_string(&format!("={}", report.version)),
         features,
     );
+    let selected_path_set = selected_paths.iter().collect::<BTreeSet<_>>();
+    let skipped = report
+        .public_api
+        .items
+        .iter()
+        .filter(|item| !selected_path_set.contains(&item.path))
+        .map(|item| {
+            let reason = if includes.is_empty() {
+                item.reason.as_deref().unwrap_or(
+                    "the WIT shape is supported, but Rust adapter lowering is not implemented",
+                )
+            } else {
+                "not selected by --include"
+            };
+            serde_json::json!({
+                "path": item.path,
+                "reason": reason,
+            })
+        })
+        .collect::<Vec<_>>();
     let selection_report = serde_json::to_string_pretty(&serde_json::json!({
         "crate": report.name,
         "version": report.version,
         "features": report.enabled_features,
+        "selection": if includes.is_empty() { "automatic" } else { "explicit" },
         "items": selected,
+        "skipped": skipped,
         "build_status": "not-built",
     }))?;
     let readme = format!(
@@ -3189,5 +3251,16 @@ world any-crate-adapter {
             "inspected::Widget::open(&name).map(Self).map_err(|error| \
              OpenError::new(AdapterOpenError(error)))"
         ));
+
+        let automatic = render_adapter_package(&inspection, &[]).unwrap();
+        assert_eq!(automatic.wit, package.wit);
+        let automatic_report: serde_json::Value = serde_json::from_str(&automatic.report).unwrap();
+        assert_eq!(automatic_report["selection"], "automatic");
+        assert_eq!(automatic_report["items"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            automatic_report["skipped"][0]["path"],
+            "any_crate::Widget::convert"
+        );
+        assert!(!automatic.source.contains("&self, )"));
     }
 }

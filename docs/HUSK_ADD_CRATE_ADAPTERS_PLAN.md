@@ -125,9 +125,6 @@ The selected interface can also be materialized as an unbuilt adapter crate:
 
 ```shell
 red husk crate adapter regex \
-  --include regex::Regex::new \
-  --include regex::Regex::is_match \
-  --include regex::escape \
   --output ./regex-adapter
 ```
 
@@ -136,7 +133,10 @@ Rust calls into the selected APIs, and the complete machine-readable selection
 report. Generation refuses to overwrite an existing path and does not invoke
 Cargo. Current Rust lowering covers primitive and string calls plus fallible
 resource construction; additional collection and resource-argument shapes
-remain explicit generation errors.
+remain explicit generation errors. By default, every API with complete adapter
+lowering is included and every skipped API is recorded with a reason.
+`--include <PATH>` remains available as an optional, repeatable filter when a
+smaller surface is desired.
 
 ### 6. Build and componentize in a sandbox
 
