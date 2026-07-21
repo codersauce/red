@@ -854,6 +854,12 @@ impl PanelManager {
             .is_some_and(|panel| panel.composer.is_some())
     }
 
+    pub fn focused_row_panel(&self) -> bool {
+        self.focused
+            .as_deref()
+            .is_some_and(|id| self.panels.contains_key(id))
+    }
+
     pub fn has_focused_panel(&self) -> bool {
         self.focused.is_some()
     }

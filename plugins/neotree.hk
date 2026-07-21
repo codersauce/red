@@ -1,9 +1,9 @@
-// Watched project tree panel with lazy directory expansion and Git status decoration.
+// Watched project tree panel with Neo-tree-style filesystem actions.
 //
 // Directory listings are authoritative snapshots supplied by Rust and may be truncated.
 // Reveal walks one path segment at a time, watchers follow the displayed root, and row
-// IDs are normalized project-relative paths. Deactivation stops watching and removes the
-// panel without changing files.
+// IDs are normalized project-relative paths. All mutations are performed by Red's
+// workspace-confined filesystem host API.
 
 pub fn activate() {
     red::add_command("NeoTree", neotree, Json {
@@ -26,6 +26,13 @@ pub fn activate() {
     red::state_set("status_index", Json {});
     red::state_set("cwd", ".");
     red::state_set("current_file", "");
+    red::state_set("selected", []);
+    red::state_set("clipboard", []);
+    red::state_set("trash_history", []);
+    red::state_set("pending_kind", "");
+    red::state_set("pending_paths", []);
+    red::state_set("paste_queue", []);
+    red::state_set("paste_index", 0);
     clear_reveal();
 }
 
@@ -82,6 +89,23 @@ fn panel_event(event: Json) {
         return;
     }
 
+    if event.action == "Ctrl-r" {
+        red::state_set("clipboard", []);
+        red::execute("Print", "Neo-tree clipboard cleared");
+        render();
+        return;
+    }
+
+    if event.action == "u" || event.action == "U" {
+        restore_last_trash();
+        return;
+    }
+
+    if event.action == "?" {
+        show_help();
+        return;
+    }
+
     let row = event.row;
     if row == red::null() {
         return;
@@ -104,6 +128,76 @@ fn panel_event(event: Json) {
         return;
     }
 
+    if event.action == "Tab" {
+        toggle_selection(row.path);
+        return;
+    }
+
+    if event.action == "a" {
+        open_create_prompt(row, false);
+        return;
+    }
+
+    if event.action == "A" {
+        open_create_prompt(row, true);
+        return;
+    }
+
+    if event.action == "d" {
+        confirm_removal("delete", selected_paths(row));
+        return;
+    }
+
+    if event.action == "T" {
+        confirm_removal("trash", selected_paths(row));
+        return;
+    }
+
+    if event.action == "i" {
+        red::request("FileOperation", stat_loaded, Json {
+            kind: "stat",
+            path: row.path,
+        });
+        return;
+    }
+
+    if event.action == "r" {
+        open_path_prompt("rename", "Rename", path_name(row.path), row.path, path_parent(row.path));
+        return;
+    }
+
+    if event.action == "b" {
+        let name = path_name(row.path);
+        open_path_prompt("basename", "Rename basename", basename(name), row.path, path_parent(row.path));
+        red::state_set("pending_extension", name_extension(name));
+        return;
+    }
+
+    if event.action == "c" || event.action == "m" {
+        let kind = "copy";
+        let title = "Copy to";
+        if event.action == "m" {
+            kind = "move";
+            title = "Move to";
+        }
+        open_path_prompt(kind, title, row.path, row.path, path_parent(row.path));
+        return;
+    }
+
+    if event.action == "y" || event.action == "x" {
+        let action = "copy";
+        if event.action == "x" {
+            action = "move";
+        }
+        update_clipboard(action, selected_paths(row));
+        return;
+    }
+
+    if event.action == "p" {
+        paste_clipboard(row);
+        return;
+    }
+
     if row.kind == "directory" && event.action == "expand" {
         expand_directory(row.path);
     }
@@ -111,6 +205,360 @@ fn panel_event(event: Json) {
     if row.kind == "directory" && event.action == "collapse" {
         collapse_directory(row.path);
     }
+}
+
+fn open_create_prompt(row: Json, directory: bool) {
+    let parent = row.path;
+    if row.kind != "directory" {
+        parent = path_parent(row.path);
+    }
+    if directory {
+        open_path_prompt("create_directory", "New directory", "", "", parent);
+    } else {
+        open_path_prompt("create", "New file or directory (trailing /)", "", "", parent);
+    }
+}
+
+fn open_path_prompt(kind: String, title: String, initial: String, source: String, parent: String) {
+    if source == "." {
+        red::execute("Print", "The workspace root cannot be modified");
+        return;
+    }
+    red::state_set("pending_kind", kind);
+    red::state_set("pending_source", source);
+    red::state_set("pending_parent", parent);
+    red::execute("OpenInput", title, initial, ComposerHandlers {
+        submitted: path_prompt_submitted,
+        cancelled: path_prompt_cancelled,
+    });
+}
+
+fn path_prompt_cancelled(event: ComposerCancelled) {
+    red::state_set("pending_kind", "");
+}
+
+fn path_prompt_submitted(value: String) {
+    let query = red::trim(value);
+    if query == "" {
+        return;
+    }
+
+    let kind = red::string(red::state("pending_kind"), "");
+    let source = red::string(red::state("pending_source"), "");
+    let parent = red::string(red::state("pending_parent"), ".");
+    if kind == "create" || kind == "create_directory" {
+        let create_kind = kind;
+        if kind == "create" && red::ends_with(query, "/") {
+            create_kind = "create_directory";
+        }
+        request_operation(Json {
+            kind: create_kind,
+            path: path_join(parent, query),
+        });
+        return;
+    }
+
+    let destination = query;
+    if kind == "rename" {
+        destination = path_join(parent, query);
+    } else if kind == "basename" {
+        destination = path_join(parent, query + red::string(red::state("pending_extension"), ""));
+    } else {
+        destination = workspace_path(query);
+    }
+    request_operation(Json {
+        kind: kind,
+        source: source,
+        destination: destination,
+    });
+}
+
+fn request_operation(operation: Json) {
+    red::request("FileOperation", operation_loaded, operation);
+}
+
+fn operation_loaded(result: Json) {
+    let kind = red::string(red::state("pending_kind"), "operation");
+    if !red::bool(result.ok, false) {
+        red::execute("Print", "Neo-tree " + kind + " failed: " + red::string(result.error, "unknown error"));
+        return;
+    }
+
+    if kind == "trash" && red::bool(result.undo_supported, false) {
+        red::state_set("trash_history", red::push(red::state("trash_history"), TrashBatch {
+            paths: red::state("pending_paths"),
+        }));
+    }
+    red::state_set("selected", []);
+    red::state_set("pending_kind", "");
+    red::execute("Print", "Neo-tree " + kind + " complete");
+    reset_tree();
+}
+
+fn selected_paths(row: Json) -> Json {
+    let paths = red::state("selected");
+    if red::len(paths) == 0 {
+        if row.path == "." {
+            red::execute("Print", "The workspace root cannot be modified");
+            return [];
+        }
+        return [row.path];
+    }
+    return paths;
+}
+
+fn toggle_selection(path: String) {
+    if path == "." {
+        return;
+    }
+    let selected = red::state("selected");
+    if red::contains(selected, path) {
+        selected = red::remove(selected, path);
+    } else {
+        selected = red::push(selected, path);
+    }
+    red::state_set("selected", selected);
+    render();
+}
+
+fn confirm_removal(kind: String, paths: Json) {
+    if red::len(paths) == 0 {
+        return;
+    }
+    red::state_set("pending_kind", kind);
+    red::state_set("pending_paths", paths);
+    let impact = "Move selected items to the system trash.";
+    if kind == "delete" {
+        impact = "Permanently delete selected items. This cannot be undone.";
+    }
+    red::execute("OpenConfirm", "Confirm " + kind, impact, PickerHandlers {
+        selected: removal_confirmed,
+        cancelled: removal_cancelled,
+    });
+}
+
+fn removal_cancelled(event: PickerCancelled) {
+    red::state_set("pending_kind", "");
+    red::state_set("pending_paths", []);
+}
+
+fn removal_confirmed(item: PickerItem) {
+    if item.id != "accept" {
+        red::state_set("pending_kind", "");
+        return;
+    }
+    request_operation(Json {
+        kind: red::string(red::state("pending_kind"), ""),
+        paths: red::state("pending_paths"),
+    });
+}
+
+fn restore_last_trash() {
+    let history = red::state("trash_history");
+    if red::len(history) == 0 {
+        red::execute("Print", "No trash operation is available to restore");
+        return;
+    }
+    let batch = history[red::len(history) - 1];
+    red::state_set("pending_kind", "restore");
+    red::state_set("pending_paths", batch.paths);
+    red::request("FileOperation", restore_loaded, Json {
+        kind: "undo_trash",
+        paths: batch.paths,
+    });
+}
+
+fn restore_loaded(result: Json) {
+    if !red::bool(result.ok, false) {
+        red::execute("Print", "Neo-tree restore failed: " + red::string(result.error, "unknown error"));
+        return;
+    }
+    let history = red::state("trash_history");
+    let remaining = [];
+    let index = 0;
+    while index < red::len(history) - 1 {
+        remaining = red::push(remaining, history[index]);
+        index = index + 1;
+    }
+    red::state_set("trash_history", remaining);
+    red::state_set("pending_kind", "");
+    red::execute("Print", "Neo-tree restore complete");
+    reset_tree();
+}
+
+fn update_clipboard(action: String, paths: Json) {
+    if red::len(paths) == 0 {
+        return;
+    }
+    let clipboard = [];
+    for entry in red::state("clipboard") {
+        if !red::contains(paths, entry.path) {
+            clipboard = red::push(clipboard, entry);
+        }
+    }
+    for path in paths {
+        clipboard = red::push(clipboard, ClipboardEntry {
+            path: path,
+            action: action,
+        });
+    }
+    red::state_set("clipboard", clipboard);
+    red::state_set("selected", []);
+    red::execute("Print", red::len(paths) + " item(s) marked to " + action);
+    render();
+}
+
+fn paste_clipboard(row: Json) {
+    let clipboard = red::state("clipboard");
+    if red::len(clipboard) == 0 {
+        red::execute("Print", "Neo-tree clipboard is empty");
+        return;
+    }
+    let destination = row.path;
+    if row.kind != "directory" {
+        destination = path_parent(row.path);
+    }
+    let queue = [];
+    for entry in clipboard {
+        queue = red::push(queue, PasteEntry {
+            source: entry.path,
+            destination: path_join(destination, path_name(entry.path)),
+            action: entry.action,
+        });
+    }
+    red::state_set("paste_queue", queue);
+    red::state_set("paste_index", 0);
+    run_next_paste();
+}
+
+fn run_next_paste() {
+    let queue = red::state("paste_queue");
+    let index = red::int(red::state("paste_index"), 0);
+    if index >= red::len(queue) {
+        red::state_set("clipboard", []);
+        red::execute("Print", "Neo-tree paste complete");
+        reset_tree();
+        return;
+    }
+    let entry = queue[index];
+    red::request("FileOperation", paste_loaded, Json {
+        kind: entry.action,
+        source: entry.source,
+        destination: entry.destination,
+    });
+}
+
+fn paste_loaded(result: Json) {
+    if !red::bool(result.ok, false) {
+        red::execute("Print", "Neo-tree paste stopped: " + red::string(result.error, "unknown error"));
+        reset_tree();
+        return;
+    }
+    let index = red::int(red::state("paste_index"), 0);
+    let entry = red::state("paste_queue")[index];
+    let clipboard = [];
+    for candidate in red::state("clipboard") {
+        if candidate.path != entry.source {
+            clipboard = red::push(clipboard, candidate);
+        }
+    }
+    red::state_set("clipboard", clipboard);
+    red::state_set("paste_index", index + 1);
+    run_next_paste();
+}
+
+fn stat_loaded(result: Json) {
+    if !red::bool(result.ok, false) {
+        red::execute("Print", "Neo-tree details failed: " + red::string(result.error, "unknown error"));
+        return;
+    }
+    red::execute("Print",
+        result.path + " · " + result.kind
+        + " · " + red::string(result.size, "0") + " bytes"
+        + " · readonly=" + red::string(result.readonly, "false")
+    );
+}
+
+fn show_help() {
+    red::execute("OpenPicker", "Neo-tree keys", [
+        PickerItem { id: "select", label: "Tab  toggle selection", kind: "Selection" },
+        PickerItem { id: "create", label: "a / A  create file / directory", kind: "Create" },
+        PickerItem { id: "rename", label: "r / b  rename / rename basename", kind: "Rename" },
+        PickerItem { id: "clipboard", label: "y / x / p / Ctrl-r  copy / cut / paste / clear", kind: "Clipboard" },
+        PickerItem { id: "direct", label: "c / m  copy / move to path", kind: "Move" },
+        PickerItem { id: "remove", label: "d / T / u / U  delete / trash / restore", kind: "Remove" },
+        PickerItem { id: "details", label: "i / R / ?  details / refresh / help", kind: "Other" },
+    ], PickerOptions {}, PickerHandlers {});
+}
+
+fn reset_tree() {
+    for watch in red::state("watches") {
+        red::execute("UnwatchDirectory", watch.id);
+    }
+    red::state_set("watches", []);
+    red::state_set("children", []);
+    red::state_set("expanded", ["."]);
+    clear_reveal();
+    request_directory(".");
+    request_git_status();
+}
+
+fn path_name(path: String) -> String {
+    let parts = red::split(normalize_path(path), "/");
+    return parts[red::len(parts) - 1];
+}
+
+fn path_parent(path: String) -> String {
+    let normalized = normalize_path(path);
+    let parts = red::split(normalized, "/");
+    if red::len(parts) <= 2 {
+        return ".";
+    }
+    let parent = ".";
+    let index = 1;
+    while index < red::len(parts) - 1 {
+        parent = parent + "/" + parts[index];
+        index = index + 1;
+    }
+    return parent;
+}
+
+fn path_join(parent: String, child: String) -> String {
+    let child = normalize_path(child);
+    if red::starts_with(child, "./") || red::starts_with(child, "/") {
+        return child;
+    }
+    if parent == "." {
+        return "./" + child;
+    }
+    return normalize_path(parent) + "/" + child;
+}
+
+fn workspace_path(path: String) -> String {
+    let path = normalize_path(path);
+    if red::starts_with(path, "./") || red::starts_with(path, "/") {
+        return path;
+    }
+    return "./" + path;
+}
+
+fn name_extension(name: String) -> String {
+    let parts = red::split(name, ".");
+    if red::len(parts) <= 1 {
+        return "";
+    }
+    if red::starts_with(name, ".") && red::len(parts) == 2 {
+        return "";
+    }
+    return "." + parts[red::len(parts) - 1];
+}
+
+fn basename(name: String) -> String {
+    let extension = name_extension(name);
+    if extension == "" {
+        return name;
+    }
+    return red::slice(name, 0, red::len(name) - red::len(extension));
 }
 
 fn reload_visible_tree() {
@@ -440,7 +888,12 @@ fn append_rows(path: String, ancestors: Json, rows: Json) -> Json {
         let is_directory = entry.kind == "directory";
         let expanded = is_directory && is_expanded(entry.path);
         let status = status_for_path(entry.path);
-        let segments = branch_prefix(ancestors, is_last);
+        let segments = [
+            segment(selection_marker(entry.path), ["list.highlightForeground"], true),
+        ];
+        for prefix in branch_prefix(ancestors, is_last) {
+            segments = red::push(segments, prefix);
+        }
         segments = red::push(segments, segment(entry_icon(entry.name, is_directory, expanded) + " ", entry_style_keys(status, is_directory), false));
         segments = red::push(segments, segment(entry.name, entry_style_keys(status, is_directory), false));
         rows = red::push(rows, PanelRow {
@@ -465,6 +918,21 @@ fn append_rows(path: String, ancestors: Json, rows: Json) -> Json {
         rows = red::push(rows, truncation_row("directory-limit:" + path, "… directory listing truncated"));
     }
     return rows;
+}
+
+fn selection_marker(path: String) -> String {
+    if red::contains(red::state("selected"), path) {
+        return "✓ ";
+    }
+    for entry in red::state("clipboard") {
+        if entry.path == path {
+            if entry.action == "move" {
+                return "✂ ";
+            }
+            return "⧉ ";
+        }
+    }
+    return "  ";
 }
 
 fn truncation_row(id: String, text: String) -> Json {

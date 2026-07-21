@@ -1,6 +1,12 @@
 {
-  "api_version": "0.3.0",
+  "api_version": "0.4.0",
   "changes": [
+    {
+      "version": "0.4.0",
+      "kind": "introduced",
+      "symbols": ["FileOperation", "OpenInput", "OpenConfirm"],
+      "migration_note": "docs/PLUGIN_API.md#workspace-file-operations"
+    },
     {
       "version": "0.3.0",
       "kind": "introduced",

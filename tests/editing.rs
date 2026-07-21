@@ -4610,6 +4610,35 @@ fn focused_panel_allows_ctrl_e_neotree_toggle() {
 }
 
 #[test]
+fn focused_row_panel_forwards_file_operation_keys_to_its_plugin() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    add_tree_panel(&mut harness);
+    assert!(harness.editor.test_focus_panel("tree"));
+
+    for (code, modifiers, expected) in [
+        (KeyCode::Char('a'), KeyModifiers::NONE, "a"),
+        (KeyCode::Char('x'), KeyModifiers::NONE, "x"),
+        (KeyCode::Tab, KeyModifiers::NONE, "Tab"),
+        (KeyCode::Char('r'), KeyModifiers::CONTROL, "Ctrl-r"),
+    ] {
+        let action = harness
+            .editor
+            .test_handle_event(Event::Key(KeyEvent::new(code, modifiers)))
+            .unwrap();
+        assert!(matches!(
+            action,
+            Some(KeyAction::Multiple(actions))
+                if actions.iter().any(|action| matches!(
+                    action,
+                    Action::NotifyPlugins(name, payload)
+                        if name == "panel:event:tree" && payload["action"] == expected
+                ))
+        ));
+    }
+}
+
+#[test]
 fn focused_agent_panel_keeps_leader_available_until_the_composer_is_focused() {
     let buffer = Buffer::new(None, "abcdef".to_string());
     let mut harness = EditorHarness::with_config(buffer, default_key_config());

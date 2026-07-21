@@ -10,7 +10,8 @@ use crossterm::event::{Event, KeyCode, KeyModifiers};
 
 use crate::{
     config::KeyAction,
-    editor::{Action, Editor, RenderBuffer},
+    editor::{Action, ComposerCallback, Editor, RenderBuffer},
+    plugin::ComposerHandle,
     theme::{Style, Theme},
     unicode_utils::{display_width, grapheme_len, grapheme_to_byte, truncate_display_width},
 };
@@ -31,6 +32,7 @@ pub struct InputPrompt {
     selected: bool,
     masked: bool,
     submit: SubmitAction,
+    callback_handle: Option<ComposerHandle>,
     style: Style,
     theme: Theme,
 }
@@ -68,6 +70,7 @@ impl InputPrompt {
             value,
             masked: false,
             submit: Box::new(submit),
+            callback_handle: None,
             style,
             theme: editor.theme.clone(),
         }
@@ -85,6 +88,21 @@ impl InputPrompt {
         prompt
     }
 
+    /// Builds a plugin-owned single-line prompt using the same callback lifecycle as
+    /// [`crate::ui::AgentComposer`].
+    pub fn new_callback(
+        editor: &Editor,
+        title: impl Into<String>,
+        initial: impl Into<String>,
+        handle: ComposerHandle,
+    ) -> Self {
+        let mut prompt = Self::new(editor, title, initial, move |value| {
+            Action::NotifyComposer(handle, Box::new(ComposerCallback::Submitted(value)))
+        });
+        prompt.callback_handle = Some(handle);
+        prompt
+    }
+
     fn insert(&mut self, text: &str) {
         let text = text.split(['\r', '\n']).next().unwrap_or_default();
         if self.selected {
@@ -99,6 +117,10 @@ impl InputPrompt {
 }
 
 impl Component for InputPrompt {
+    fn composer_handle(&self) -> Option<ComposerHandle> {
+        self.callback_handle
+    }
+
     fn set_theme(&mut self, theme: &Theme) {
         self.style = theme.ui_style.dialog.clone();
         self.dialog.style = theme.ui_style.dialog.clone();
@@ -143,17 +165,18 @@ impl Component for InputPrompt {
             }
             Event::Key(key) => match (key.code, key.modifiers) {
                 (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                    Some(KeyAction::Single(Action::CloseDialog))
+                    Some(self.cancel_action())
                 }
                 (KeyCode::Enter, _) => {
                     let value = self.value.trim().to_string();
                     if value.is_empty() {
-                        return Some(KeyAction::Single(Action::CloseDialog));
+                        return Some(self.cancel_action());
                     }
-                    Some(KeyAction::Multiple(vec![
-                        Action::CloseDialog,
-                        (self.submit)(value),
-                    ]))
+                    let submit = (self.submit)(value);
+                    if self.callback_handle.is_some() {
+                        return Some(KeyAction::Multiple(vec![submit, Action::CloseDialog]));
+                    }
+                    Some(KeyAction::Multiple(vec![Action::CloseDialog, submit]))
                 }
                 (KeyCode::Left, _) => {
                     self.selected = false;
@@ -221,6 +244,19 @@ impl Component for InputPrompt {
         };
         let x = self.dialog.x + 1 + offset;
         Some((x, self.dialog.y + 1))
+    }
+}
+
+impl InputPrompt {
+    fn cancel_action(&self) -> KeyAction {
+        if let Some(handle) = self.callback_handle {
+            KeyAction::Multiple(vec![
+                Action::NotifyComposer(handle, Box::new(ComposerCallback::Cancelled)),
+                Action::CloseDialog,
+            ])
+        } else {
+            KeyAction::Single(Action::CloseDialog)
+        }
     }
 }
 
@@ -322,6 +358,36 @@ mod tests {
         assert_eq!(
             prompt.handle_event(&key(KeyCode::Esc)),
             Some(KeyAction::Single(Action::CloseDialog))
+        );
+    }
+
+    #[test]
+    fn callback_input_uses_composer_lifecycle_and_preserves_a_trailing_slash() {
+        let editor = editor();
+        let handle = ComposerHandle::from_raw(9);
+        let mut prompt = InputPrompt::new_callback(&editor, "New path", "", handle);
+
+        prompt.handle_event(&Event::Paste("nested/".to_string()));
+
+        assert_eq!(prompt.composer_handle(), Some(handle));
+        assert_eq!(
+            prompt.handle_event(&key(KeyCode::Enter)),
+            Some(KeyAction::Multiple(vec![
+                Action::NotifyComposer(
+                    handle,
+                    Box::new(ComposerCallback::Submitted("nested/".to_string()))
+                ),
+                Action::CloseDialog,
+            ]))
+        );
+
+        let mut cancelled = InputPrompt::new_callback(&editor, "New path", "", handle);
+        assert_eq!(
+            cancelled.handle_event(&key(KeyCode::Esc)),
+            Some(KeyAction::Multiple(vec![
+                Action::NotifyComposer(handle, Box::new(ComposerCallback::Cancelled)),
+                Action::CloseDialog,
+            ]))
         );
     }
 }

@@ -848,6 +848,29 @@ impl RedHost {
                 });
                 return Ok(Value::Int(i64::from(handle.get())));
             }
+            "OpenConfirm" => {
+                let title = red_required_string(args, 0, "OpenConfirm")?.to_string();
+                let message = red_required_string(args, 1, "OpenConfirm")?.to_string();
+                let handlers = args
+                    .get(2)
+                    .ok_or_else(|| anyhow::anyhow!("OpenConfirm requires PickerHandlers"))
+                    .and_then(|value| red_picker_handlers(plugin, value, "OpenConfirm"))?;
+                let handle = self.policy_mut().allocate_picker_handle();
+                self.policy_mut().picker_handlers.insert(
+                    handle,
+                    PickerRegistration {
+                        plugin: plugin.to_string(),
+                        handlers,
+                    },
+                );
+                self.send_request(PluginRequest::OpenCallbackConfirmation {
+                    owner: plugin.to_string(),
+                    handle,
+                    title,
+                    message,
+                });
+                return Ok(Value::Int(i64::from(handle.get())));
+            }
             "OpenDynamicPicker" => {
                 let title = args.first().and_then(Value::as_str).map(str::to_string);
                 let id = args.get(1).and_then(value_to_i32).unwrap_or(1);
@@ -915,6 +938,29 @@ impl RedHost {
                     title,
                     query,
                     history,
+                });
+                return Ok(Value::Int(i64::from(handle.get())));
+            }
+            "OpenInput" => {
+                let title = red_required_string(args, 0, "OpenInput")?.to_string();
+                let initial = red_required_string(args, 1, "OpenInput")?.to_string();
+                let handlers = args
+                    .get(2)
+                    .ok_or_else(|| anyhow::anyhow!("OpenInput requires ComposerHandlers"))
+                    .and_then(|value| red_composer_handlers(plugin, value, "OpenInput"))?;
+                let handle = self.policy_mut().allocate_composer_handle();
+                self.policy_mut().composer_handlers.insert(
+                    handle,
+                    ComposerRegistration {
+                        plugin: plugin.to_string(),
+                        handlers,
+                    },
+                );
+                self.send_request(PluginRequest::OpenCallbackInput {
+                    owner: plugin.to_string(),
+                    handle,
+                    title,
+                    initial,
                 });
                 return Ok(Value::Int(i64::from(handle.get())));
             }
@@ -1494,6 +1540,13 @@ impl RedHost {
                     .and_then(Value::as_str)
                     .unwrap_or(".")
                     .to_string(),
+                request_id,
+            },
+            "FileOperation" => PluginRequest::FileOperation {
+                operation: args
+                    .first()
+                    .map(value_to_json)
+                    .unwrap_or(serde_json::Value::Null),
                 request_id,
             },
             other => anyhow::bail!("unsupported Red host request: {other}"),
@@ -8906,6 +8959,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn neotree_emits_create_and_multi_item_delete_file_operations() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("neotree", include_str!("../../plugins/neotree.hk"))
+            .await
+            .unwrap();
+
+        runtime
+            .notify(
+                "panel:event:neotree",
+                serde_json::json!({
+                    "action": "a",
+                    "row": { "path": "./src", "kind": "directory" },
+                }),
+            )
+            .await
+            .unwrap();
+        let create_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackInput {
+                owner,
+                handle,
+                title,
+                initial,
+            } => {
+                assert_eq!(owner, "neotree");
+                assert_eq!(title, "New file or directory (trailing /)");
+                assert_eq!(initial, "");
+                handle
+            }
+            _ => panic!("expected Neo-tree create prompt"),
+        };
+        runtime
+            .notify_composer(
+                create_handle,
+                ComposerCallback::Submitted("generated/".to_string()),
+            )
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::FileOperation {
+                operation,
+                request_id,
+            } => {
+                assert_eq!(
+                    operation,
+                    serde_json::json!({
+                        "kind": "create_directory",
+                        "path": "./src/generated",
+                    })
+                );
+                assert!(request_id.get() > 0);
+            }
+            _ => panic!("expected Neo-tree create file operation"),
+        }
+
+        for path in ["./src/one.rs", "./src/two.rs"] {
+            runtime
+                .notify(
+                    "panel:event:neotree",
+                    serde_json::json!({
+                        "action": "Tab",
+                        "row": { "path": path, "kind": "file" },
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        runtime
+            .notify(
+                "panel:event:neotree",
+                serde_json::json!({
+                    "action": "d",
+                    "row": { "path": "./src/two.rs", "kind": "file" },
+                }),
+            )
+            .await
+            .unwrap();
+        let delete_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackConfirmation {
+                handle,
+                title,
+                message,
+                owner,
+            } => {
+                assert_eq!(owner, "neotree");
+                assert_eq!(title, "Confirm delete");
+                assert_eq!(
+                    message,
+                    "Permanently delete selected items. This cannot be undone."
+                );
+                handle
+            }
+            _ => panic!("expected Neo-tree delete confirmation"),
+        };
+        let accept = serde_json::from_value(serde_json::json!({
+            "id": "accept",
+            "label": "Accept",
+        }))
+        .unwrap();
+        runtime
+            .notify_picker(delete_handle, PickerCallback::Selected(accept))
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::FileOperation { operation, .. } => {
+                assert_eq!(operation["kind"], "delete");
+                assert_eq!(
+                    operation["paths"],
+                    serde_json::json!(["./src/one.rs", "./src/two.rs"])
+                );
+            }
+            _ => panic!("expected Neo-tree delete file operation"),
+        }
+    }
+
+    #[tokio::test]
     async fn neotree_reveals_the_active_file_and_renders_git_status() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -9020,6 +9190,11 @@ mod tests {
             PluginRequest::UpdatePanel { id, rows } => {
                 assert_eq!(id, "neotree");
                 assert_eq!(rows[2].id, "./src/main.rs");
+                assert_eq!(rows[1].segments[0].text, "  ");
+                assert_eq!(rows[1].segments[1].text, "  ");
+                assert_eq!(rows[2].segments[0].text, "  ");
+                assert_eq!(rows[2].segments[1].text, "  ");
+                assert_eq!(rows[2].segments[2].text, "└ ");
             }
             _ => panic!("unexpected plugin request"),
         }
