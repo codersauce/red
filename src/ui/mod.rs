@@ -8,6 +8,7 @@
 
 mod agent_composer;
 mod completion;
+mod confirmation;
 mod dialog;
 mod file_picker;
 mod hover_info;
@@ -20,6 +21,7 @@ mod picker;
 pub use agent_composer::AgentComposer;
 pub(crate) use agent_composer::{normalize_newlines, wrap_text};
 pub use completion::CompletionUI;
+pub use confirmation::Confirmation;
 use crossterm::event::{Event, KeyCode, MouseEvent, MouseEventKind};
 use dialog::Dialog;
 pub use file_picker::FilePicker;

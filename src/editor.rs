@@ -97,9 +97,9 @@ use crate::{
     },
     theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
     ui::{
-        AgentComposer, CompletionUI, Component, FilePicker, HoverInfo, HoverInfoFormat, Info,
-        InputPrompt, LegacyPickerOptions, Picker, PickerItem, PickerOptions, PickerPreview,
-        PickerUpdate,
+        AgentComposer, CompletionUI, Component, Confirmation, FilePicker, HoverInfo,
+        HoverInfoFormat, Info, InputPrompt, LegacyPickerOptions, Picker, PickerItem, PickerOptions,
+        PickerPreview, PickerUpdate,
     },
     undo::{AppliedTextEdit, CursorSnapshot, EditOrigin, RevertEdit, TextPosition, TextRange},
     utils::{expand_user_path, get_workspace_path},
@@ -647,6 +647,12 @@ pub enum PluginRequest {
         query: String,
         history: Vec<String>,
     },
+    OpenCallbackInput {
+        owner: String,
+        handle: ComposerHandle,
+        title: String,
+        initial: String,
+    },
     OpenDynamicPicker {
         title: Option<String>,
         id: i32,
@@ -659,6 +665,12 @@ pub enum PluginRequest {
         title: Option<String>,
         items: Vec<PickerItem>,
         options: PickerOptions,
+    },
+    OpenCallbackConfirmation {
+        owner: String,
+        handle: PickerHandle,
+        title: String,
+        message: String,
     },
     UpdatePickerItems {
         id: i32,
@@ -907,6 +919,10 @@ pub enum PluginRequest {
         path: String,
         request_id: RequestId,
     },
+    FileOperation {
+        operation: Value,
+        request_id: RequestId,
+    },
     WatchDirectory {
         path: String,
         watch_id: i32,
@@ -940,8 +956,10 @@ impl PluginRequest {
             Self::OpenLocation { .. } => "OpenLocation",
             Self::OpenAgentComposer { .. } => "OpenAgentComposer",
             Self::OpenCallbackComposer { .. } => "OpenCallbackComposer",
+            Self::OpenCallbackInput { .. } => "OpenCallbackInput",
             Self::OpenDynamicPicker { .. } => "OpenDynamicPicker",
             Self::OpenCallbackPicker { .. } => "OpenCallbackPicker",
+            Self::OpenCallbackConfirmation { .. } => "OpenCallbackConfirmation",
             Self::UpdatePickerItems { .. } => "UpdatePickerItems",
             Self::UpdatePickerQuery { .. } => "UpdatePickerQuery",
             Self::UpdatePickerStatus { .. } => "UpdatePickerStatus",
@@ -1006,6 +1024,7 @@ impl PluginRequest {
             Self::CloseWindowBar { .. } => "CloseWindowBar",
             Self::ListDirectory { .. } => "ListDirectory",
             Self::GetGitStatus { .. } => "GetGitStatus",
+            Self::FileOperation { .. } => "FileOperation",
             Self::WatchDirectory { .. } => "WatchDirectory",
             Self::UnwatchDirectory { .. } => "UnwatchDirectory",
         }
@@ -6457,6 +6476,26 @@ impl Editor {
                     )));
                     needs_render = true;
                 }
+                PluginRequest::OpenCallbackInput {
+                    owner,
+                    handle,
+                    title,
+                    initial,
+                } => {
+                    if runtime.composer_plugin(handle).as_deref() != Some(owner.as_str()) {
+                        runtime.release_composer(handle);
+                        self.last_error = Some(
+                            "ignored an input whose callback owner no longer exists".to_string(),
+                        );
+                        needs_render = true;
+                        continue;
+                    }
+                    self.release_current_dialog_callbacks(runtime);
+                    self.current_dialog = Some(Box::new(InputPrompt::new_callback(
+                        self, title, initial, handle,
+                    )));
+                    needs_render = true;
+                }
                 PluginRequest::OpenDynamicPicker {
                     title,
                     id,
@@ -6496,6 +6535,27 @@ impl Editor {
                     }
                     self.release_current_dialog_callbacks(runtime);
                     self.current_dialog = Some(Box::new(picker));
+                    needs_render = true;
+                }
+                PluginRequest::OpenCallbackConfirmation {
+                    owner,
+                    handle,
+                    title,
+                    message,
+                } => {
+                    if runtime.picker_plugin(handle).as_deref() != Some(owner.as_str()) {
+                        runtime.release_picker(handle);
+                        self.last_error = Some(
+                            "ignored a confirmation whose callback owner no longer exists"
+                                .to_string(),
+                        );
+                        needs_render = true;
+                        continue;
+                    }
+                    self.release_current_dialog_callbacks(runtime);
+                    self.current_dialog = Some(Box::new(Confirmation::new_callback(
+                        self, title, message, handle,
+                    )));
                     needs_render = true;
                 }
                 PluginRequest::UpdatePickerItems { id, items } => {
@@ -7327,6 +7387,17 @@ impl Editor {
                     self.plugin_registry
                         .resolve_request(runtime, request_id, payload)
                         .await?;
+                }
+                PluginRequest::FileOperation {
+                    operation,
+                    request_id,
+                } => {
+                    let outcome = plugin::filesystem::apply_file_operation(&operation);
+                    self.reconcile_plugin_file_operation(&outcome).await?;
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, outcome.payload)
+                        .await?;
+                    needs_render = true;
                 }
                 PluginRequest::WatchDirectory {
                     path,
@@ -9382,15 +9453,27 @@ impl Editor {
                     }
                     KeyCode::Char('H') => "history",
                     KeyCode::Char('N') => "new",
-                    KeyCode::Char('a') => "composer_focus",
-                    KeyCode::Char('x') => "clear",
+                    KeyCode::Char('a') if !self.panel_manager.focused_row_panel() => {
+                        "composer_focus"
+                    }
+                    KeyCode::Char('x') if !self.panel_manager.focused_row_panel() => "clear",
                     KeyCode::Left | KeyCode::Char('h') => "collapse",
                     KeyCode::Right | KeyCode::Char('l') => "expand",
                     KeyCode::Enter => "activate",
                     KeyCode::Char(' ') => "toggle",
                     KeyCode::Char('q') => "close",
                     KeyCode::Char('R') => "refresh",
-                    _ => return None,
+                    _ => {
+                        if let Some(action) = self.panel_global_key_action(ev) {
+                            return Some(action);
+                        }
+                        let action = Self::key_string_for_event(ev)?;
+                        let panel_height = usize::from(self.size.1.saturating_sub(2));
+                        return self
+                            .panel_manager
+                            .handle_focused_key(&action, panel_height, usize::from(self.size.0))
+                            .and_then(Self::panel_event_key_action);
+                    }
                 };
 
                 let panel_height = usize::from(self.size.1.saturating_sub(2));
@@ -16102,6 +16185,55 @@ impl Editor {
             }
         }
         self.ensure_buffer_lsp_opened(buffer_index).await
+    }
+
+    async fn reconcile_plugin_file_operation(
+        &mut self,
+        outcome: &plugin::filesystem::FileOperationOutcome,
+    ) -> anyhow::Result<()> {
+        let mut identity_changes = Vec::new();
+        for index in 0..self.buffers.len() {
+            let Some(file) = self.buffers[index].file.clone() else {
+                continue;
+            };
+            let Ok(absolute) = Path::new(&file).absolutize() else {
+                continue;
+            };
+            let absolute = absolute.into_owned();
+            let previous_uri = self.buffers[index].uri()?.map(|uri| uri.to_string());
+
+            let renamed = outcome.renames.iter().find_map(|(source, destination)| {
+                absolute.strip_prefix(source).ok().map(|suffix| {
+                    if suffix.as_os_str().is_empty() {
+                        destination.clone()
+                    } else {
+                        destination.join(suffix)
+                    }
+                })
+            });
+            if let Some(destination) = renamed {
+                self.buffers[index].file = Some(destination.to_string_lossy().into_owned());
+                identity_changes.push((index, previous_uri));
+                continue;
+            }
+
+            if outcome
+                .removals
+                .iter()
+                .any(|removed| absolute == *removed || absolute.starts_with(removed))
+            {
+                self.buffers[index].file = None;
+                identity_changes.push((index, previous_uri));
+                self.last_error =
+                    Some("Removed file kept open as an unsaved scratch buffer".to_string());
+            }
+        }
+
+        for (index, previous_uri) in identity_changes {
+            self.sync_lsp_document_identity(previous_uri.as_deref(), index)
+                .await?;
+        }
+        Ok(())
     }
 
     fn apply_theme(&mut self, theme_name: &str, update_config: bool) -> anyhow::Result<()> {
@@ -23665,6 +23797,51 @@ mod test {
         let mut editor = Editor::with_size(lsp, 60, 12, config, Theme::default(), buffers).unwrap();
         editor.test_disable_terminal_output();
         editor
+    }
+
+    #[tokio::test]
+    async fn plugin_file_operations_reconcile_open_buffer_identity_without_losing_edits() {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("old.rs");
+        let renamed = root.path().join("nested/renamed.rs");
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(old.to_string_lossy().into_owned()),
+            "unsaved contents".to_string(),
+        )]);
+        editor.buffers[0].dirty = true;
+
+        editor
+            .reconcile_plugin_file_operation(&plugin::filesystem::FileOperationOutcome {
+                payload: Value::Null,
+                renames: vec![(old, renamed.clone())],
+                removals: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            editor.buffers[0].file.as_deref(),
+            Some(renamed.to_str().unwrap())
+        );
+        assert_eq!(editor.buffers[0].contents(), "unsaved contents");
+        assert!(editor.buffers[0].is_dirty());
+
+        editor
+            .reconcile_plugin_file_operation(&plugin::filesystem::FileOperationOutcome {
+                payload: Value::Null,
+                renames: Vec::new(),
+                removals: vec![renamed],
+            })
+            .await
+            .unwrap();
+
+        assert!(editor.buffers[0].file.is_none());
+        assert_eq!(editor.buffers[0].contents(), "unsaved contents");
+        assert!(editor.buffers[0].is_dirty());
+        assert_eq!(
+            editor.last_error.as_deref(),
+            Some("Removed file kept open as an unsaved scratch buffer")
+        );
     }
 
     fn lsp_edit(start: (usize, usize), end: (usize, usize), text: &str) -> LspTextEdit {

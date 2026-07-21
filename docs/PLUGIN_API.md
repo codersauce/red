@@ -1,6 +1,6 @@
 # Husk plugin compatibility
 
-Red host API version `0.3.0` is defined by
+Red host API version `0.4.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -22,6 +22,39 @@ literal host call absent from the canonical schema. Literal host calls also chec
 required/optional arity (`HUSK-A0002`) and obvious literal argument types
 (`HUSK-A0003`) against the machine-readable signature. `--no-typecheck` is an unsupported
 development escape hatch; compatibility guarantees do not apply while it is enabled.
+
+## Workspace file operations
+
+`FileOperation(callback: fn(Json), operation: Json)` applies a structured filesystem
+operation inside the active workspace. Supported `kind` values are `create`,
+`create_file`, `create_directory`, `rename`, `move`, `copy`, `delete`, `trash`,
+`restore`, `undo_trash`, and `stat`. Mutation paths must be workspace-relative; the host
+rejects absolute paths, parent traversal, workspace-root mutation, symlink escapes,
+self/descendant copies, and implicit overwrites.
+
+Create requests accept `path`; `create` treats a trailing slash as a directory and
+supports bounded Bash-style list and range brace expansion. Rename, move, and copy
+accept `source` and `destination`. Delete, trash, restore, and undo accept `paths:
+[String]`. Results contain `ok`, an optional `error`, and operation-specific path data.
+Trash restoration is available only on platforms whose system trash API exposes stable
+item identities.
+
+`FileOperation` was introduced in host API `0.4.0`.
+
+## Compact plugin dialogs
+
+`OpenInput(title: String, initial: String, handlers: ComposerHandlers)` opens the same
+compact, single-line input used by LSP rename. It submits through
+`ComposerHandlers.submitted` and cancels through `ComposerHandlers.cancelled`.
+
+`OpenConfirm(title: String, message: String, handlers: PickerHandlers)` opens a compact
+Accept/Cancel dialog. Cancel is selected by default; Left or `y` selects Accept, Right or
+`n` selects Cancel, Enter confirms the selection, and Escape cancels. Accept invokes
+`PickerHandlers.selected` with an item whose `id` is `accept`; cancellation invokes
+`PickerHandlers.cancelled`.
+
+Both calls were introduced in host API `0.4.0`, and their callback handles remain owned
+and released by the calling plugin.
 
 ## Command discovery metadata
 
@@ -62,8 +95,8 @@ picker. They do not use global `picker:*:<id>` subscriptions. Picker items and c
 payloads use the declared `PickerItem`, `PickerCancelled`, and `PickerActionEvent` records;
 the `PickerItem.data` field remains `Json` so a plugin can attach its own payload.
 
-`OpenPicker` was added in host API `0.3.0`. Plugins using it should declare
-`"red_api_version": "^0.3.0"`. The numeric-ID `OpenDynamicPicker` API remains
+`OpenPicker` was added in host API `0.3.0`. Plugins targeting this Red release should
+declare `"red_api_version": "^0.4.0"`. The numeric-ID `OpenDynamicPicker` API remains
 available for compatibility, but new plugins should not use it.
 
 ## Agent composer

@@ -12,6 +12,7 @@
 
 mod api;
 pub mod decoration;
+pub(crate) mod filesystem;
 pub mod gutter;
 pub mod location;
 pub(crate) mod markdown;

@@ -1,5 +1,5 @@
 {
-  "version": "0.3.0",
+  "version": "0.4.0",
   "calls": [
     { "name": "Print", "kind": "execute", "signature": "(message: String)", "introduced": "0.1.0" },
     { "name": "FilePicker", "kind": "execute", "signature": "()", "introduced": "0.1.0" },
@@ -33,6 +33,8 @@
     { "name": "ClearGutterSigns", "kind": "execute", "signature": "(namespace: String)", "introduced": "0.1.0" },
     { "name": "OpenPicker", "kind": "execute", "signature": "(title: String, items: [PickerItem], options: PickerOptions, handlers: PickerHandlers)", "introduced": "0.3.0" },
     { "name": "OpenComposer", "kind": "execute", "signature": "(title: String, query: String, history: [String], handlers: ComposerHandlers)", "introduced": "0.3.0" },
+    { "name": "OpenInput", "kind": "execute", "signature": "(title: String, initial: String, handlers: ComposerHandlers)", "introduced": "0.4.0" },
+    { "name": "OpenConfirm", "kind": "execute", "signature": "(title: String, message: String, handlers: PickerHandlers)", "introduced": "0.4.0" },
     { "name": "OpenDynamicPicker", "kind": "execute", "signature": "(title: String, id: i32, items: [PickerItem], options: PickerOptions)", "introduced": "0.1.0" },
     { "name": "OpenAgentComposer", "kind": "execute", "signature": "(title: String, id: i32, query: String, history: [String])", "introduced": "0.2.0" },
     { "name": "UpdatePickerItems", "kind": "execute", "signature": "(id: i32, items: [PickerItem])", "introduced": "0.1.0" },
@@ -99,6 +101,7 @@
     { "name": "CharIndexToDisplayColumn", "kind": "request", "signature": "(callback: fn(Json), x: i32, y: i32)", "introduced": "0.1.0" },
     { "name": "DisplayColumnToCharIndex", "kind": "request", "signature": "(callback: fn(Json), column: i32, y: i32)", "introduced": "0.1.0" },
     { "name": "ListDirectory", "kind": "request", "signature": "(callback: fn(Json), path: String)", "introduced": "0.1.0" },
-    { "name": "GetGitStatus", "kind": "request", "signature": "(callback: fn(Json), path: String)", "introduced": "0.1.0" }
+    { "name": "GetGitStatus", "kind": "request", "signature": "(callback: fn(Json), path: String)", "introduced": "0.1.0" },
+    { "name": "FileOperation", "kind": "request", "signature": "(callback: fn(Json), operation: Json)", "introduced": "0.4.0" }
   ]
 }
