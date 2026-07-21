@@ -16,6 +16,7 @@
 //! model.
 
 mod display_layout;
+pub mod agent_manager;
 pub mod buffer_manager;
 pub mod lsp_coordinator;
 pub(crate) mod perf;
