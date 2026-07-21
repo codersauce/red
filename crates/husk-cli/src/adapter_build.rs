@@ -819,6 +819,7 @@ fn run_bounded_windows(
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct UserResourceUsage {
     processes: u64,
     resident_bytes: u64,
