@@ -205,6 +205,18 @@ husk run calculator
 husk test calculator
 ```
 
+Create the same package structure with:
+
+```shell
+red husk new calculator
+cd calculator
+```
+
+`husk new` creates `Husk.toml`, `Husk.lock`, `src/main.hk`, and a
+`.gitignore` that excludes `/.husk/`. It can also initialize the current
+directory with `red husk new .`; use `--name` when the directory name is not
+the desired package name.
+
 An unlocked package command writes or refreshes `Husk.lock`. Reproducible use
 requires the existing lock:
 
@@ -215,6 +227,31 @@ husk test --locked calculator
 ```
 
 `--locked` rejects a missing or changed lock file.
+
+Crate-backed extensions are declarations rather than paths into generated
+state:
+
+```toml
+[extensions.glob]
+crate = "glob"
+version = "*"
+```
+
+`red husk add glob` builds and verifies the adapter, vendors the exact bundle
+under `vendor/husk/`, and installs it under `.husk/extensions/`. Commit the
+manifest, lock file, and vendored bundle; do not commit `.husk/`.
+
+After cloning a package, recreate its installed state without Cargo or network
+access:
+
+```shell
+red husk install --locked --offline
+red husk run --locked .
+```
+
+Installation verifies the locked digest and bundle metadata, stages the full
+extension set, atomically replaces `.husk/extensions/`, and removes stale
+installed bundles. Path-based extensions under `vendor/` remain supported.
 
 ## Tests
 

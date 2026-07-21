@@ -32,9 +32,11 @@ pub use embedding::{
 };
 pub use husk_hir::{FunctionId, IntrinsicMethodId, LocalId, ModuleFunctionId, NodeId};
 pub use husk_package::{
-    ExtensionSource, LOCK_FILE, LockedExtension, LockedPackage, MANIFEST_FILE, PackageError,
-    PackageLimits, PackageLock, PackageManifest, PackageSection, ResolvedExtension,
-    ResolvedPackage, SourceModule, discover_manifest,
+    CrateExtensionSource, ExtensionSource, INSTALL_DIRECTORY, LOCK_FILE, LockedCrateExtension,
+    LockedExtension, LockedPackage, MANIFEST_FILE, PackageError, PackageLimits, PackageLock,
+    PackageManifest, PackageSection, PathExtensionSource, ResolvedExtension, ResolvedPackage,
+    SourceModule, VENDOR_DIRECTORY, discover_manifest, installed_extension_path,
+    vendored_extension_path,
 };
 pub use husk_semantic::SemanticProfile;
 pub use husk_types::{
@@ -42,7 +44,7 @@ pub use husk_types::{
     ModuleDescriptor, ModuleName, ParameterDescriptor, TypeDefinitionDescriptor,
     TypeDefinitionKind, TypeDescriptor, VariantCaseDescriptor, Version,
 };
-pub use husk_value::OwnedValue;
+pub use husk_value::{OwnedValue, ResourceHandle};
 #[cfg(feature = "wasm-extensions")]
 pub use husk_wasm::{
     WasmCompileOptions, WasmComponent, WasmDescriptorError, WasmInstance, WasmLimits,
@@ -82,6 +84,11 @@ pub enum Value {
         type_name: String,
         case: String,
         fields: Arc<Vec<Value>>,
+    },
+    /// Opaque handle to a resource owned by one extension instance.
+    Resource {
+        type_name: String,
+        handle: ResourceHandle,
     },
     /// Opaque JSON from legacy host paths. New runtime values use `Array` and
     /// `Object` so cloning plugin state does not recursively clone JSON.
@@ -161,6 +168,16 @@ impl PartialEq for Value {
                     fields: right_fields,
                 },
             ) => left_type == right_type && left_case == right_case && left_fields == right_fields,
+            (
+                Self::Resource {
+                    type_name: left_type,
+                    handle: left_handle,
+                },
+                Self::Resource {
+                    type_name: right_type,
+                    handle: right_handle,
+                },
+            ) => left_type == right_type && left_handle == right_handle,
             (Self::Json(left), Self::Json(right)) => left == right,
             (Self::Callback(left), Self::Callback(right)) => left == right,
             (Self::Closure(left), Self::Closure(right)) => left == right,
@@ -220,6 +237,7 @@ impl Value {
             Self::Object(_) => "object",
             Self::Struct { .. } => "struct",
             Self::Variant { .. } => "enum variant",
+            Self::Resource { .. } => "resource",
             Self::Json(serde_json::Value::Array(_)) => "array",
             Self::Json(serde_json::Value::Object(_)) => "object",
             Self::Json(_) => "JSON value",
@@ -1564,6 +1582,11 @@ fn push_type_definition(source: &mut String, definition: &TypeDefinitionDescript
             }
             source.push_str("}\n");
         }
+        TypeDefinitionKind::Resource => {
+            source.push_str("struct ");
+            source.push_str(&definition.name);
+            source.push_str(" {}\n");
+        }
     }
 }
 
@@ -1620,7 +1643,9 @@ fn push_type_declaration(source: &mut String, ty: &TypeDescriptor) {
             push_type_declaration(source, error);
             source.push('>');
         }
-        TypeDescriptor::Named(name) => source.push_str(name),
+        TypeDescriptor::Named(name)
+        | TypeDescriptor::OwnResource(name)
+        | TypeDescriptor::BorrowResource(name) => source.push_str(name),
     }
 }
 
@@ -1663,6 +1688,7 @@ fn type_definition_uses_json(definition: &TypeDefinitionDescriptor) -> bool {
             .iter()
             .filter_map(|case| case.payload.as_ref())
             .any(type_uses_json),
+        TypeDefinitionKind::Resource => false,
     }
 }
 
@@ -1678,6 +1704,8 @@ fn type_uses_json(ty: &TypeDescriptor) -> bool {
         | TypeDescriptor::I64
         | TypeDescriptor::F64
         | TypeDescriptor::String
+        | TypeDescriptor::OwnResource(_)
+        | TypeDescriptor::BorrowResource(_)
         | TypeDescriptor::Named(_) => false,
     }
 }
@@ -2045,6 +2073,7 @@ fn heap_value_size(value: &Value) -> usize {
                 .map(heap_value_size)
                 .fold(0, usize::saturating_add),
         ),
+        Value::Resource { type_name, .. } => type_name.len(),
         Value::Json(value) => heap_json_size(value),
         Value::Callback(callback) => callback
             .plugin
@@ -2115,6 +2144,7 @@ fn collect_heap_handles(value: &Value, instance_generation: u64, pending: &mut V
         | Value::String(_)
         | Value::Range { .. }
         | Value::Json(_)
+        | Value::Resource { .. }
         | Value::Callback(_)
         | Value::Closure(_)
         | Value::Missing(_) => {}
@@ -2147,6 +2177,7 @@ fn collect_function_roots(value: &Value, roots: &mut Vec<FunctionHandle>) {
         | Value::String(_)
         | Value::Range { .. }
         | Value::Json(_)
+        | Value::Resource { .. }
         | Value::Callback(_)
         | Value::Missing(_) => {}
     }
@@ -5563,6 +5594,9 @@ fn value_to_json(value: &Value) -> serde_json::Value {
             .into_iter()
             .collect(),
         ),
+        Value::Resource { type_name, .. } => {
+            serde_json::Value::String(format!("<resource:{type_name}>"))
+        }
         Value::Json(value) => value.clone(),
         Value::Callback(callback) => {
             serde_json::Value::String(format!("{}::{}", callback.plugin, callback.function))
@@ -6368,6 +6402,7 @@ fn value_to_log_string(value: &Value) -> String {
                 format!("{type_name}::{case}({payload})")
             }
         }
+        Value::Resource { type_name, .. } => format!("<resource:{type_name}>"),
         Value::Json(value) => value.to_string(),
         Value::Callback(callback) => format!("{}::{}", callback.plugin, callback.function),
         Value::Closure(_) => "<closure>".to_string(),

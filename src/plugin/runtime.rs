@@ -2225,6 +2225,7 @@ fn red_value_to_log_string(value: &Value) -> String {
                 format!("{type_name}::{case}({payload})")
             }
         }
+        Value::Resource { type_name, .. } => format!("<resource:{type_name}>"),
         Value::Json(value) => value.to_string(),
         Value::Callback(callback) => {
             format!("{}::{}", callback.plugin(), callback.function())
@@ -2292,6 +2293,7 @@ fn value_to_string(value: &Value) -> String {
         | Value::Object(_)
         | Value::Struct { .. }
         | Value::Variant { .. } => value.to_json().to_string(),
+        Value::Resource { type_name, .. } => format!("<resource:{type_name}>"),
         Value::Json(value) => value.to_string(),
         Value::Callback(_) => "<callback>".to_string(),
         Value::Closure(_) => "<closure>".to_string(),
@@ -2321,6 +2323,7 @@ fn value_to_json(value: &Value) -> serde_json::Value {
         | Value::Object(_)
         | Value::Struct { .. }
         | Value::Variant { .. } => value.to_json(),
+        Value::Resource { .. } => serde_json::Value::Null,
         Value::Json(value) => value.clone(),
         Value::Callback(_) | Value::Closure(_) => serde_json::Value::Null,
     }

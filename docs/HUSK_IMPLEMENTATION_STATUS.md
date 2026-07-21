@@ -79,9 +79,9 @@ This is not yet a release-complete extraction. The main remaining work is:
 | `husk-types` | Validated module/type/function descriptors and stable hashes. |
 | `husk-extension` | Strict `.huskext` manifests, bounded directory bundles, hashes, and capability-set validation. |
 | `husk-wasm` | Wasmtime Component inspection, descriptor derivation, dynamic calls, conversion, fuel, and store limits. |
-| `husk-package` | Bounded local `Husk.toml`, deterministic module graph, local extensions, and `Husk.lock`. |
+| `husk-package` | Bounded local `Husk.toml`, deterministic module graph, path and crate-backed extensions, and reproducible `Husk.lock`. |
 | `husk-hir` | Spanned executable HIR with stable per-function node and local IDs. |
-| `husk-cli` | `check`, `run`, `test`, `repl`, and extension bundle commands. |
+| `husk-cli` | `new`, `add`, `install`, `check`, `run`, `test`, `repl`, and extension bundle commands. |
 | `husk-lexer`, `husk-ast`, `husk-parser`, `husk-semantic`, `husk-diagnostics` | Frontend and source-aware diagnostics. |
 
 The intended dependency direction is:

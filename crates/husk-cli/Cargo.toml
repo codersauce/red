@@ -9,12 +9,23 @@ description = "Standalone command-line interface for the Husk scripting language
 [[bin]]
 name = "husk"
 path = "src/main.rs"
+doc = false
 
 [dependencies]
 anyhow = "1.0.79"
 clap = { version = "4.5.26", features = ["derive"] }
+flate2 = "1.0"
 husk = { path = "../husk" }
 husk-extension.workspace = true
-
-[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+semver = "1.0"
+serde = { version = "1.0.196", features = ["derive"] }
+serde_json = "1.0.113"
+sha2 = "0.10"
 tempfile = "3.15.0"
+toml_edit = "0.22.6"
+wit-component = "0.251.0"
+wit-parser = "0.251.0"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.28.0", features = ["process", "resource", "signal"] }

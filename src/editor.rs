@@ -16153,15 +16153,15 @@ impl Editor {
         outcome: &plugin::filesystem::FileOperationOutcome,
     ) -> anyhow::Result<()> {
         let mut identity_changes = Vec::new();
-        for index in 0..self.buffers.len() {
-            let Some(file) = self.buffers[index].file.clone() else {
+        for index in 0..self.buffer_manager.len() {
+            let Some(file) = self.buffer_manager[index].file.clone() else {
                 continue;
             };
             let Ok(absolute) = Path::new(&file).absolutize() else {
                 continue;
             };
             let absolute = absolute.into_owned();
-            let previous_uri = self.buffers[index].uri()?.map(|uri| uri.to_string());
+            let previous_uri = self.buffer_manager[index].uri()?.map(|uri| uri.to_string());
 
             let renamed = outcome.renames.iter().find_map(|(source, destination)| {
                 absolute.strip_prefix(source).ok().map(|suffix| {
@@ -16173,7 +16173,7 @@ impl Editor {
                 })
             });
             if let Some(destination) = renamed {
-                self.buffers[index].file = Some(destination.to_string_lossy().into_owned());
+                self.buffer_manager[index].file = Some(destination.to_string_lossy().into_owned());
                 identity_changes.push((index, previous_uri));
                 continue;
             }
@@ -16183,7 +16183,7 @@ impl Editor {
                 .iter()
                 .any(|removed| absolute == *removed || absolute.starts_with(removed))
             {
-                self.buffers[index].file = None;
+                self.buffer_manager[index].file = None;
                 identity_changes.push((index, previous_uri));
                 self.last_error =
                     Some("Removed file kept open as an unsaved scratch buffer".to_string());
@@ -23793,7 +23793,7 @@ mod test {
             Some(old.to_string_lossy().into_owned()),
             "unsaved contents".to_string(),
         )]);
-        editor.buffers[0].dirty = true;
+        editor.buffer_manager[0].dirty = true;
 
         editor
             .reconcile_plugin_file_operation(&plugin::filesystem::FileOperationOutcome {
@@ -23805,11 +23805,11 @@ mod test {
             .unwrap();
 
         assert_eq!(
-            editor.buffers[0].file.as_deref(),
+            editor.buffer_manager[0].file.as_deref(),
             Some(renamed.to_str().unwrap())
         );
-        assert_eq!(editor.buffers[0].contents(), "unsaved contents");
-        assert!(editor.buffers[0].is_dirty());
+        assert_eq!(editor.buffer_manager[0].contents(), "unsaved contents");
+        assert!(editor.buffer_manager[0].is_dirty());
 
         editor
             .reconcile_plugin_file_operation(&plugin::filesystem::FileOperationOutcome {
@@ -23820,9 +23820,9 @@ mod test {
             .await
             .unwrap();
 
-        assert!(editor.buffers[0].file.is_none());
-        assert_eq!(editor.buffers[0].contents(), "unsaved contents");
-        assert!(editor.buffers[0].is_dirty());
+        assert!(editor.buffer_manager[0].file.is_none());
+        assert_eq!(editor.buffer_manager[0].contents(), "unsaved contents");
+        assert!(editor.buffer_manager[0].is_dirty());
         assert_eq!(
             editor.last_error.as_deref(),
             Some("Removed file kept open as an unsaved scratch buffer")

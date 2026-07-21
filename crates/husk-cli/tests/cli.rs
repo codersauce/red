@@ -33,6 +33,56 @@ fn check_accepts_a_valid_script() {
 }
 
 #[test]
+fn help_is_a_successful_command() {
+    let output = Command::new(env!("CARGO_BIN_EXE_husk"))
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("Compile and run Husk scripts")
+    );
+}
+
+#[test]
+fn new_creates_a_clone_ready_package() {
+    let directory = TempDir::new().unwrap();
+    let project = directory.path().join("hello");
+    let created = Command::new(env!("CARGO_BIN_EXE_husk"))
+        .arg("new")
+        .arg("hello")
+        .current_dir(directory.path())
+        .output()
+        .unwrap();
+    assert!(created.status.success(), "{created:?}");
+    assert!(project.join("Husk.toml").is_file());
+    assert!(project.join("Husk.lock").is_file());
+    assert_eq!(
+        fs::read_to_string(project.join(".gitignore")).unwrap(),
+        "/.husk/\n"
+    );
+
+    let installed = Command::new(env!("CARGO_BIN_EXE_husk"))
+        .args(["install", "--locked", "--offline", "--package"])
+        .arg(&project)
+        .output()
+        .unwrap();
+    assert!(installed.status.success(), "{installed:?}");
+    assert!(project.join(".husk/extensions").is_dir());
+
+    let run = Command::new(env!("CARGO_BIN_EXE_husk"))
+        .args(["run", "--locked"])
+        .arg(&project)
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "{run:?}");
+    assert_eq!(String::from_utf8(run.stdout).unwrap(), "Hello from Husk!\n");
+}
+
+#[test]
 fn run_supports_unit_exit_codes_arguments_and_shebangs() {
     assert!(run_script("fn main() {}", &[]).status.success());
 
@@ -268,6 +318,40 @@ fn locked_mode_rejects_missing_or_changed_package_lock() {
             .unwrap()
             .contains("regenerate the lock file")
     );
+}
+
+#[test]
+fn add_locked_rejects_before_creating_install_state() {
+    let directory = TempDir::new().unwrap();
+    write_package(&directory);
+    let initialize = Command::new(env!("CARGO_BIN_EXE_husk"))
+        .arg("check")
+        .arg(directory.path())
+        .output()
+        .unwrap();
+    assert!(initialize.status.success(), "{initialize:?}");
+    let original_manifest = fs::read(directory.path().join("Husk.toml")).unwrap();
+    let original_lock = fs::read(directory.path().join("Husk.lock")).unwrap();
+
+    let add = Command::new(env!("CARGO_BIN_EXE_husk"))
+        .args(["add", "any-arbitrary-crate", "--locked", "--offline"])
+        .arg("--package")
+        .arg(directory.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(add.status.code(), Some(1), "{add:?}");
+    let stderr = String::from_utf8_lossy(&add.stderr);
+    assert!(stderr.contains("would change"), "{add:?}");
+    assert_eq!(
+        fs::read(directory.path().join("Husk.toml")).unwrap(),
+        original_manifest
+    );
+    assert_eq!(
+        fs::read(directory.path().join("Husk.lock")).unwrap(),
+        original_lock
+    );
+    assert!(!directory.path().join(".husk").exists());
 }
 
 #[test]
