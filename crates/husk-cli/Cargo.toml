@@ -9,6 +9,7 @@ description = "Standalone command-line interface for the Husk scripting language
 [[bin]]
 name = "husk"
 path = "src/main.rs"
+doc = false
 
 [dependencies]
 anyhow = "1.0.79"
