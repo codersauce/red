@@ -7,9 +7,7 @@ use std::{
 };
 
 use crate::{
-    agent_tools::PendingEditorTool,
-    agent_workspace::ProposalWorkspace,
-    codex::CodexBridge,
+    agent_tools::PendingEditorTool, agent_workspace::ProposalWorkspace, codex::CodexBridge,
 };
 
 /// Encapsulates background AI agent task state, active turn metrics, and tool channels.
@@ -37,7 +35,9 @@ impl AgentManager {
 
     /// Returns `true` if an AI agent task is actively executing.
     pub fn is_task_active(&self) -> bool {
-        self.task.as_ref().is_some_and(|handle| !handle.is_finished())
+        self.task
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
     }
 
     /// Returns the set of active session IDs.
@@ -62,6 +62,8 @@ impl AgentManager {
 
     /// Takes turn start timestamp and returns elapsed duration if recorded.
     pub fn elapsed_turn_duration(&mut self, turn_id: &str) -> Option<std::time::Duration> {
-        self.turn_started_at.remove(turn_id).map(|start| start.elapsed())
+        self.turn_started_at
+            .remove(turn_id)
+            .map(|start| start.elapsed())
     }
 }

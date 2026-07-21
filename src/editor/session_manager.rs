@@ -1,7 +1,7 @@
 //! Session recovery and snapshot management for Red editor sessions.
 
-use std::time::{Duration, Instant};
 use crate::session::SessionStore;
+use std::time::{Duration, Instant};
 
 /// Default interval for background session snapshot flushes (10 seconds).
 pub const DEFAULT_SESSION_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(10);

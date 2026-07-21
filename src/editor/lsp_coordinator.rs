@@ -1,7 +1,7 @@
 //! LSP client coordination and document synchronization tracking for the Red editor.
 
-use std::collections::{HashMap, HashSet};
 use crate::buffer::BufferId;
+use std::collections::{HashMap, HashSet};
 
 /// Coordinates LSP client state, opened workspace document tracking, and buffer revision delivery.
 #[derive(Debug, Default)]

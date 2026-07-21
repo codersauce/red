@@ -15,9 +15,9 @@
 //! `display_layout` and `rendering`, while `render_buffer` owns the terminal-cell
 //! model.
 
-mod display_layout;
 pub mod agent_manager;
 pub mod buffer_manager;
+mod display_layout;
 pub mod lsp_coordinator;
 pub(crate) mod perf;
 pub mod render_buffer;
