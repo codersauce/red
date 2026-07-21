@@ -2735,7 +2735,7 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
         );
         let permissions = config.plugin_permissions.get("project_search").unwrap();
         assert_eq!(permissions.process, vec!["rg".to_string()]);
-        assert_eq!(config.log_file.as_deref(), Some("/tmp/red.log"));
+        assert_eq!(config.log_file.as_deref(), Some("red.log"));
     }
 
     #[test]

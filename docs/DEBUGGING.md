@@ -8,7 +8,10 @@ Run `red --check-config` before debugging downstream behavior. It prints every r
 
 Run `red --runtime-files` when a plugin or theme is absent or unexpectedly old. Resolution order is user configuration, `RED_RUNTIME`, then embedded assets. The listing marks shadowed sources, so a user copy or development runtime can be identified without guessing which bytes were loaded.
 
-The default log is `/tmp/red.log`. A configured `log_file` replaces that destination. Failure to open the configured path becomes a configuration diagnostic and disables logging rather than preventing startup.
+The default log is `red.log` in Red's configuration directory. Relative
+`log_file` values resolve from that directory, while absolute and `~/...`
+paths remain supported. Failure to open the configured path becomes a
+configuration diagnostic and disables logging rather than preventing startup.
 
 ## Input, editing, undo, and rendering
 

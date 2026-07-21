@@ -35,10 +35,10 @@ sidescrolloff = 0
 # disappears on the first edit, file open, or window split.
 splash = true
 
-# The full path to the log file. If the log file is not present, red will
-# create it. If the log file is present, red will append to it.
-# This setting is optional, if not present, red will not log anything.
-log_file = "/tmp/red.log"
+# Path to the log file. Relative paths are resolved from Red's config
+# directory. If the log file is not present, Red will create it; if it is
+# present, Red will append to it.
+log_file = "red.log"
 
 # Built-in plugins are enabled through the [plugins] table below. Add plugin
 # names here to disable defaults without copying or editing bundled plugin files.

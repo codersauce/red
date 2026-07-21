@@ -10,6 +10,7 @@ use std::{
     fs,
     io::{stdout, Write as _},
     panic,
+    path::{Path, PathBuf},
 };
 
 #[cfg(unix)]
@@ -36,6 +37,7 @@ use red::onboarding;
 use red::preferences::PreferencesStore;
 use red::session::SessionStore;
 use red::theme::{parse_vscode_theme, parse_vscode_theme_contents, Theme};
+use red::utils::expand_user_path;
 use red::{log, run_self_check, LOGGER};
 
 #[cfg(unix)]
@@ -666,21 +668,30 @@ fn finalize_runtime_config(
         }
     };
 
-    let logger = match loaded.config.log_file.as_deref() {
-        Some(path) => match Logger::try_new(path) {
-            Ok(logger) => Some(logger),
-            Err(error) => {
-                loaded.add_runtime_diagnostic(
-                    "CFG303",
-                    ConfigDiagnosticSeverity::Error,
-                    &["log_file".to_string()],
-                    format!("configured log file could not be opened: {error}"),
-                    "disabled logging",
-                );
-                loaded.config.log_file = None;
-                None
+    let logger = match loaded.config.log_file.clone() {
+        Some(configured_path) => {
+            match resolve_log_path(&config_dir, &configured_path).and_then(|path| {
+                Logger::try_new(&path)
+                    .map(|logger| (path, logger))
+                    .map_err(anyhow::Error::from)
+            }) {
+                Ok((path, logger)) => {
+                    loaded.config.log_file = Some(path.to_string_lossy().into_owned());
+                    Some(logger)
+                }
+                Err(error) => {
+                    loaded.add_runtime_diagnostic(
+                        "CFG303",
+                        ConfigDiagnosticSeverity::Error,
+                        &["log_file".to_string()],
+                        format!("configured log file could not be opened: {error}"),
+                        "disabled logging",
+                    );
+                    loaded.config.log_file = None;
+                    None
+                }
             }
-        },
+        }
         None => None,
     };
 
@@ -694,6 +705,15 @@ fn finalize_runtime_config(
     }
 
     Ok((loaded, theme, logger))
+}
+
+fn resolve_log_path(config_dir: &Path, configured_path: &str) -> anyhow::Result<PathBuf> {
+    let path = expand_user_path(configured_path)?;
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(config_dir.join(path))
+    }
 }
 
 #[cfg(test)]
@@ -723,6 +743,26 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "CFG303"));
+    }
+
+    #[test]
+    fn relative_log_paths_resolve_from_the_config_directory() {
+        let config_dir = Path::new("config-root");
+
+        assert_eq!(
+            resolve_log_path(config_dir, "logs/red.log").unwrap(),
+            config_dir.join("logs").join("red.log")
+        );
+    }
+
+    #[test]
+    fn absolute_log_paths_are_preserved() {
+        let absolute = std::env::current_dir().unwrap().join("red.log");
+
+        assert_eq!(
+            resolve_log_path(Path::new("ignored"), &absolute.to_string_lossy()).unwrap(),
+            absolute
+        );
     }
 
     #[test]
