@@ -104,7 +104,22 @@ Generate deterministic WIT and Rust glue only for items accepted by the
 inspection report. Preserve the report in the generated artifact so no API is
 silently omitted.
 
-Status: not started.
+Status: deterministic WIT proposal implemented; Rust glue is next.
+
+```shell
+red husk crate interface regex \
+  --include regex::Regex::new \
+  --include regex::Regex::is_match \
+  --include regex::escape
+```
+
+- Selection uses exact public API paths from `crate inspect`.
+- Incompatible or unknown selections fail with an explicit reason.
+- Resource constructors, methods, free functions, and dependent resource
+  types are emitted in stable order.
+- Generated proposals are covered by the same WIT parser used by the component
+  runtime.
+- No crate code is compiled during proposal generation.
 
 ### 6. Build in a sandbox
 
@@ -146,7 +161,6 @@ unsupported native code or capabilities fail with an explicit report.
 
 ## Next milestone
 
-Let users select the compatible API surface, then generate deterministic WIT
-for that selection. The milestone is complete when the inspection report for
-`regex` can become a reviewable interface containing `Regex::new`,
-`Regex::is_match`, and `regex::escape` without compiling the crate.
+Generate deterministic Rust adapter glue from the selected WIT proposal. The
+milestone is complete when the `regex` selection produces a reviewable adapter
+crate whose source can be built only inside the future sandbox.

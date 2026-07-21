@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     ffi::OsString,
+    fmt::Write as _,
     fs,
     io::{self, BufRead, IsTerminal, Read, Write},
     path::{Path, PathBuf},
@@ -9,7 +10,7 @@ use std::{
 };
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use husk::{
     CallContext, CompiledModule, Engine, MainArguments, MainResult, NativeError, NativeModule,
     OwnedValue, PackageLimits, ReplOutcome, ResolvedPackage, TestExpectation, WasmCompileOptions,
@@ -108,26 +109,40 @@ enum ExtensionCommand {
 enum CrateCommand {
     /// Resolve a crate and report whether it can proceed to API analysis.
     Inspect {
-        crate_name: String,
-        /// Cargo version requirement. Defaults to `*`.
-        #[arg(long)]
-        version: Option<String>,
-        /// Cargo features to enable.
-        #[arg(long, value_delimiter = ',')]
-        features: Vec<String>,
-        /// Disable the crate's default feature set.
-        #[arg(long)]
-        no_default_features: bool,
-        /// Inspect a local crate directory instead of crates.io.
-        #[arg(long)]
-        path: Option<PathBuf>,
-        /// Require all Cargo metadata to be available locally.
-        #[arg(long)]
-        offline: bool,
+        #[command(flatten)]
+        request: CrateRequest,
         /// Emit the report as JSON.
         #[arg(long)]
         json: bool,
     },
+    /// Generate a reviewable WIT proposal for selected compatible items.
+    Interface {
+        #[command(flatten)]
+        request: CrateRequest,
+        /// Exact public API path to include. Repeat for each selected item.
+        #[arg(long = "include", required = true)]
+        includes: Vec<String>,
+    },
+}
+
+#[derive(Debug, Args)]
+struct CrateRequest {
+    crate_name: String,
+    /// Cargo version requirement. Defaults to `*`.
+    #[arg(long)]
+    version: Option<String>,
+    /// Cargo features to enable.
+    #[arg(long, value_delimiter = ',')]
+    features: Vec<String>,
+    /// Disable the crate's default feature set.
+    #[arg(long)]
+    no_default_features: bool,
+    /// Inspect a local crate directory instead of crates.io.
+    #[arg(long)]
+    path: Option<PathBuf>,
+    /// Require all Cargo metadata to be available locally.
+    #[arg(long)]
+    offline: bool,
 }
 
 #[derive(Default)]
@@ -546,32 +561,31 @@ struct ApiItemInspection {
     signature: String,
     compatibility: &'static str,
     reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wit: Option<WitCallableInspection>,
+}
+
+#[derive(Debug, Serialize)]
+struct WitCallableInspection {
+    owner_resource: Option<String>,
+    declaration: String,
+    resources: Vec<String>,
 }
 
 fn execute_crate(command: CrateCommand) -> anyhow::Result<ExitCode> {
     match command {
-        CrateCommand::Inspect {
-            crate_name,
-            version,
-            features,
-            no_default_features,
-            path,
-            offline,
-            json,
-        } => {
-            let report = inspect_crate(CrateInspectOptions {
-                crate_name,
-                version,
-                features,
-                no_default_features,
-                path,
-                offline,
-            })?;
+        CrateCommand::Inspect { request, json } => {
+            let report = inspect_crate(request.into())?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 print_crate_inspection(&report);
             }
+            Ok(ExitCode::SUCCESS)
+        }
+        CrateCommand::Interface { request, includes } => {
+            let report = inspect_crate(request.into())?;
+            println!("{}", generate_wit_interface(&report, &includes)?);
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -584,6 +598,19 @@ struct CrateInspectOptions {
     no_default_features: bool,
     path: Option<PathBuf>,
     offline: bool,
+}
+
+impl From<CrateRequest> for CrateInspectOptions {
+    fn from(request: CrateRequest) -> Self {
+        Self {
+            crate_name: request.crate_name,
+            version: request.version,
+            features: request.features,
+            no_default_features: request.no_default_features,
+            path: request.path,
+            offline: request.offline,
+        }
+    }
 }
 
 fn inspect_crate(options: CrateInspectOptions) -> anyhow::Result<CrateInspection> {
@@ -890,6 +917,7 @@ fn analyze_rustdoc_json(
         &mut visited_modules,
         &mut exports,
     );
+    let resource_names = build_wit_resource_names(&document, root_namespace, &exports);
 
     let mut resources = BTreeSet::new();
     let mut items = Vec::new();
@@ -909,11 +937,13 @@ fn analyze_rustdoc_json(
                         &exported.path,
                         "function",
                         None,
+                        None,
+                        &resource_names,
                     ));
                 }
             }
             "struct" | "enum" | "union" => {
-                collect_inherent_methods(&document, exported, &mut items);
+                collect_inherent_methods(&document, exported, &resource_names, &mut items);
             }
             _ => {}
         }
@@ -937,6 +967,42 @@ fn analyze_rustdoc_json(
         incompatible_items,
         items,
     })
+}
+
+fn build_wit_resource_names(
+    document: &serde_json::Value,
+    root_namespace: &str,
+    exports: &BTreeMap<(String, String), ExportedRustItem>,
+) -> BTreeMap<String, String> {
+    let mut names = BTreeMap::new();
+    for exported in exports.values() {
+        if !matches!(exported.kind.as_str(), "struct" | "enum" | "union") {
+            continue;
+        }
+        let Some(item) = rustdoc_index_item(document, &exported.id) else {
+            continue;
+        };
+        if rustdoc_item_has_generics(item, &exported.kind) {
+            continue;
+        }
+        let public_path = exported
+            .path
+            .strip_prefix(root_namespace)
+            .and_then(|path| path.strip_prefix("::"))
+            .unwrap_or(&exported.path);
+        let candidate = wit_identifier(&public_path.replace("::", "-"));
+        names
+            .entry(exported.id.clone())
+            .and_modify(|current: &mut String| {
+                if candidate.len() < current.len()
+                    || (candidate.len() == current.len() && candidate < *current)
+                {
+                    current.clone_from(&candidate);
+                }
+            })
+            .or_insert(candidate);
+    }
+    names
 }
 
 fn collect_module_exports(
@@ -1038,6 +1104,7 @@ fn collect_exported_target(
 fn collect_inherent_methods(
     document: &serde_json::Value,
     exported: &ExportedRustItem,
+    resource_names: &BTreeMap<String, String>,
     items: &mut Vec<ApiItemInspection>,
 ) {
     let Some(definition) = rustdoc_index_item(document, &exported.id) else {
@@ -1090,11 +1157,14 @@ fn collect_inherent_methods(
                 &format!("{}::{name}", exported.path),
                 "associated-function",
                 Some(&exported.id),
+                Some(&exported.path),
+                resource_names,
             );
             if owner_has_generics {
                 classified.compatibility = "incompatible";
                 classified.reason =
                     Some("the owning resource type has generic or lifetime parameters".to_string());
+                classified.wit = None;
             }
             items.push(classified);
         }
@@ -1107,6 +1177,8 @@ fn classify_callable(
     path: &str,
     default_kind: &'static str,
     owner_id: Option<&str>,
+    owner_path: Option<&str>,
+    resource_names: &BTreeMap<String, String>,
 ) -> ApiItemInspection {
     let Some(function) = item.pointer("/inner/function") else {
         return incompatible_api_item(path, default_kind, String::new(), "not a Rust function");
@@ -1126,7 +1198,9 @@ fn classify_callable(
     });
     let kind = if has_receiver {
         "method"
-    } else if owner_id.is_some_and(|id| output.is_some_and(|output| type_contains_id(output, id))) {
+    } else if owner_id
+        .is_some_and(|id| output.is_some_and(|output| is_constructor_output(output, id)))
+    {
         "constructor"
     } else {
         default_kind
@@ -1186,12 +1260,16 @@ fn classify_callable(
         return incompatible_api_item(path, kind, signature, &format!("return type: {reason}"));
     }
 
-    ApiItemInspection {
-        path: path.to_string(),
-        kind,
-        signature,
-        compatibility: "compatible",
-        reason: None,
+    match render_wit_callable(function, path, kind, owner_id, owner_path, resource_names) {
+        Ok(wit) => ApiItemInspection {
+            path: path.to_string(),
+            kind,
+            signature,
+            compatibility: "compatible",
+            reason: None,
+            wit: Some(wit),
+        },
+        Err(reason) => incompatible_api_item(path, kind, signature, &reason),
     }
 }
 
@@ -1207,6 +1285,7 @@ fn incompatible_api_item(
         signature,
         compatibility: "incompatible",
         reason: Some(reason.to_string()),
+        wit: None,
     }
 }
 
@@ -1297,6 +1376,202 @@ fn rust_type_compatibility(
     Err("this Rust type shape is not supported".to_string())
 }
 
+fn render_wit_callable(
+    function: &serde_json::Value,
+    path: &str,
+    kind: &'static str,
+    owner_id: Option<&str>,
+    owner_path: Option<&str>,
+    resource_names: &BTreeMap<String, String>,
+) -> Result<WitCallableInspection, String> {
+    let owner_resource = owner_id
+        .and_then(|id| resource_names.get(id))
+        .cloned()
+        .or_else(|| owner_path.map(wit_path_leaf));
+    let mut resources = BTreeSet::new();
+    if let Some(owner) = &owner_resource {
+        resources.insert(owner.clone());
+    }
+    let inputs = function
+        .pointer("/sig/inputs")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let parameters = inputs
+        .iter()
+        .filter_map(serde_json::Value::as_array)
+        .filter(|parts| parts.first().and_then(serde_json::Value::as_str) != Some("self"))
+        .map(|parts| {
+            let name = parts
+                .first()
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("argument");
+            let ty = parts
+                .get(1)
+                .ok_or_else(|| "Rustdoc input omitted its type".to_string())?;
+            Ok(format!(
+                "{}: {}",
+                wit_identifier(name),
+                rust_type_to_wit(ty, false, resource_names, &mut resources)?
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .join(", ");
+    let output = function
+        .pointer("/sig/output")
+        .filter(|output| !output.is_null())
+        .map(|output| rust_type_to_wit(output, false, resource_names, &mut resources))
+        .transpose()?;
+    let result = output
+        .as_deref()
+        .map(|output| format!(" -> {output}"))
+        .unwrap_or_default();
+    let name = wit_identifier(path.rsplit("::").next().unwrap_or("call"));
+    let declaration = match kind {
+        "constructor" => {
+            let owner = owner_resource
+                .as_deref()
+                .ok_or_else(|| "constructor has no owning resource".to_string())?;
+            let Some(output) = output.as_deref() else {
+                return Err("constructor has no resource return type".to_string());
+            };
+            if output != owner && !output.starts_with(&format!("result<{owner},")) {
+                return Err(format!(
+                    "constructor return `{output}` is not `{owner}` or `result<{owner}, ...>`"
+                ));
+            }
+            if output == owner {
+                format!("constructor({parameters});")
+            } else {
+                format!("constructor({parameters}) -> {output};")
+            }
+        }
+        "method" => format!("{name}: func({parameters}){result};"),
+        "associated-function" => format!("{name}: static func({parameters}){result};"),
+        "function" => format!("{name}: func({parameters}){result};"),
+        _ => return Err(format!("unsupported callable kind `{kind}`")),
+    };
+
+    Ok(WitCallableInspection {
+        owner_resource,
+        declaration,
+        resources: resources.into_iter().collect(),
+    })
+}
+
+fn rust_type_to_wit(
+    ty: &serde_json::Value,
+    borrowed: bool,
+    resource_names: &BTreeMap<String, String>,
+    resources: &mut BTreeSet<String>,
+) -> Result<String, String> {
+    if let Some(primitive) = ty.get("primitive").and_then(serde_json::Value::as_str) {
+        return match primitive {
+            "bool" | "u8" => Ok(primitive.to_string()),
+            "i32" => Ok("s32".to_string()),
+            "i64" => Ok("s64".to_string()),
+            "f64" => Ok("f64".to_string()),
+            "str" => Ok("string".to_string()),
+            _ => Err(format!("primitive `{primitive}` has no WIT mapping")),
+        };
+    }
+    if let Some(reference) = ty.get("borrowed_ref") {
+        return reference
+            .get("type")
+            .ok_or_else(|| "borrowed type is missing".to_string())
+            .and_then(|ty| rust_type_to_wit(ty, true, resource_names, resources));
+    }
+    if let Some(path) = ty.get("resolved_path") {
+        let rust_name = path
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let leaf = rust_name.rsplit("::").next().unwrap_or(rust_name);
+        if leaf == "String" {
+            return Ok("string".to_string());
+        }
+        let arguments = rustdoc_type_arguments(path)
+            .map(|argument| rust_type_to_wit(argument, false, resource_names, resources))
+            .collect::<Result<Vec<_>, String>>()?;
+        match leaf {
+            "Vec" => {
+                let [element] = arguments.as_slice() else {
+                    return Err("Vec must have one type argument".to_string());
+                };
+                return Ok(format!("list<{element}>"));
+            }
+            "Option" => {
+                let [element] = arguments.as_slice() else {
+                    return Err("Option must have one type argument".to_string());
+                };
+                return Ok(format!("option<{element}>"));
+            }
+            "Result" => {
+                let [ok, error] = arguments.as_slice() else {
+                    return Err("Result must have two type arguments".to_string());
+                };
+                return Ok(format!("result<{ok}, {error}>"));
+            }
+            _ => {}
+        }
+        if let Some(resource) = path
+            .get("id")
+            .and_then(rustdoc_id)
+            .and_then(|id| resource_names.get(&id))
+        {
+            let resource = resource.clone();
+            resources.insert(resource.clone());
+            return if borrowed {
+                Ok(format!("borrow<{resource}>"))
+            } else {
+                Ok(resource)
+            };
+        }
+        return Err(format!("external type `{rust_name}` has no WIT mapping"));
+    }
+    if let Some(tuple) = ty.get("tuple").and_then(serde_json::Value::as_array) {
+        let elements = tuple
+            .iter()
+            .map(|element| rust_type_to_wit(element, false, resource_names, resources))
+            .collect::<Result<Vec<_>, String>>()?;
+        return Ok(format!("tuple<{}>", elements.join(", ")));
+    }
+    if let Some(slice) = ty.get("slice") {
+        return Ok(format!(
+            "list<{}>",
+            rust_type_to_wit(slice, false, resource_names, resources)?
+        ));
+    }
+    Err("this Rust type shape has no WIT mapping".to_string())
+}
+
+fn is_constructor_output(output: &serde_json::Value, owner_id: &str) -> bool {
+    if resolved_path_has_id(output, owner_id) {
+        return true;
+    }
+    let Some(path) = output.get("resolved_path") else {
+        return false;
+    };
+    if path
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|path| path.rsplit("::").next())
+        != Some("Result")
+    {
+        return false;
+    }
+    rustdoc_type_arguments(path)
+        .next()
+        .is_some_and(|ok| resolved_path_has_id(ok, owner_id))
+}
+
+fn resolved_path_has_id(ty: &serde_json::Value, expected_id: &str) -> bool {
+    ty.get("resolved_path")
+        .and_then(|path| path.get("id"))
+        .and_then(rustdoc_id)
+        .is_some_and(|id| id == expected_id)
+}
+
 fn rustdoc_type_arguments(path: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
     path.pointer("/args/angle_bracketed/args")
         .and_then(serde_json::Value::as_array)
@@ -1309,6 +1584,89 @@ fn rustdoc_item_has_generics(item: &serde_json::Value, kind: &str) -> bool {
     item.pointer(&format!("/inner/{kind}/generics/params"))
         .and_then(serde_json::Value::as_array)
         .is_some_and(|parameters| !parameters.is_empty())
+}
+
+fn wit_path_leaf(path: &str) -> String {
+    wit_identifier(path.rsplit("::").next().unwrap_or(path))
+}
+
+fn wit_identifier(name: &str) -> String {
+    let mut identifier = String::with_capacity(name.len());
+    let mut previous_was_separator = true;
+    let mut previous_was_lowercase = false;
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() {
+            if character.is_ascii_uppercase() && previous_was_lowercase {
+                identifier.push('-');
+            }
+            identifier.push(character.to_ascii_lowercase());
+            previous_was_separator = false;
+            previous_was_lowercase = character.is_ascii_lowercase();
+        } else if !previous_was_separator && !identifier.is_empty() {
+            identifier.push('-');
+            previous_was_separator = true;
+            previous_was_lowercase = false;
+        }
+    }
+    while identifier.ends_with('-') {
+        identifier.pop();
+    }
+    if identifier.is_empty() {
+        identifier.push_str("item");
+    }
+    if identifier.starts_with(|character: char| character.is_ascii_digit()) {
+        identifier.insert_str(0, "item-");
+    }
+    if is_wit_keyword(&identifier) {
+        identifier.insert(0, '%');
+    }
+    identifier
+}
+
+fn is_wit_keyword(identifier: &str) -> bool {
+    matches!(
+        identifier,
+        "as" | "async"
+            | "bool"
+            | "borrow"
+            | "char"
+            | "constructor"
+            | "enum"
+            | "export"
+            | "f32"
+            | "f64"
+            | "flags"
+            | "from"
+            | "func"
+            | "future"
+            | "import"
+            | "include"
+            | "interface"
+            | "list"
+            | "map"
+            | "option"
+            | "own"
+            | "record"
+            | "resource"
+            | "result"
+            | "s16"
+            | "s32"
+            | "s64"
+            | "s8"
+            | "static"
+            | "stream"
+            | "string"
+            | "tuple"
+            | "type"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u8"
+            | "use"
+            | "variant"
+            | "with"
+            | "world"
+    )
 }
 
 fn render_signature(
@@ -1391,23 +1749,6 @@ fn render_rust_type(ty: &serde_json::Value) -> String {
     "?".to_string()
 }
 
-fn type_contains_id(ty: &serde_json::Value, expected_id: &str) -> bool {
-    ty.get("resolved_path")
-        .and_then(|path| path.get("id"))
-        .and_then(rustdoc_id)
-        .is_some_and(|id| id == expected_id)
-        || ty.as_object().is_some_and(|object| {
-            object
-                .values()
-                .any(|value| type_contains_id(value, expected_id))
-        })
-        || ty.as_array().is_some_and(|array| {
-            array
-                .iter()
-                .any(|value| type_contains_id(value, expected_id))
-        })
-}
-
 fn rustdoc_index_item<'a>(
     document: &'a serde_json::Value,
     id: &str,
@@ -1483,6 +1824,118 @@ fn print_crate_inspection(report: &CrateInspection) {
         }
     }
     println!("next: {}", report.next_step);
+}
+
+fn generate_wit_interface(report: &CrateInspection, includes: &[String]) -> anyhow::Result<String> {
+    render_wit_interface(&report.name, &report.version, &report.public_api, includes)
+}
+
+fn render_wit_interface(
+    crate_name: &str,
+    crate_version: &str,
+    public_api: &PublicApiInspection,
+    includes: &[String],
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        public_api.status == "available",
+        "public API analysis is unavailable: {}",
+        public_api
+            .unavailable_reason
+            .as_deref()
+            .unwrap_or("unknown reason")
+    );
+
+    let requested = includes.iter().collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        requested.len() == includes.len(),
+        "the interface selection contains duplicate API paths"
+    );
+    let items_by_path = public_api
+        .items
+        .iter()
+        .map(|item| (item.path.as_str(), item))
+        .collect::<BTreeMap<_, _>>();
+    let mut selected = Vec::with_capacity(requested.len());
+    for path in requested {
+        let item = items_by_path
+            .get(path.as_str())
+            .ok_or_else(|| anyhow::anyhow!("public API item `{path}` was not found"))?;
+        anyhow::ensure!(
+            item.compatibility == "compatible",
+            "public API item `{path}` is incompatible: {}",
+            item.reason.as_deref().unwrap_or("unknown reason")
+        );
+        selected.push(*item);
+    }
+
+    let mut resources = BTreeSet::new();
+    let mut resource_members: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut functions = BTreeMap::new();
+    for item in selected {
+        let mapping = item
+            .wit
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("public API item `{}` has no WIT mapping", item.path))?;
+        resources.extend(mapping.resources.iter().cloned());
+        if let Some(owner) = &mapping.owner_resource {
+            let member_name = wit_declaration_name(&mapping.declaration);
+            let existing = resource_members
+                .entry(owner.clone())
+                .or_default()
+                .insert(member_name.to_string(), mapping.declaration.clone());
+            anyhow::ensure!(
+                existing.is_none(),
+                "selected APIs produce duplicate WIT member `{owner}.{member_name}`"
+            );
+        } else {
+            let function_name = wit_declaration_name(&mapping.declaration);
+            let existing = functions.insert(function_name.to_string(), mapping.declaration.clone());
+            anyhow::ensure!(
+                existing.is_none(),
+                "selected APIs produce duplicate WIT function `{function_name}`"
+            );
+        }
+    }
+
+    let package = wit_identifier(crate_name);
+    let interface = package.clone();
+    let world = wit_identifier(&format!("{crate_name}-adapter"));
+    let mut wit = String::new();
+    writeln!(wit, "package husk:{package}@{crate_version};\n")?;
+    writeln!(wit, "interface {interface} {{")?;
+    for resource in &resources {
+        if let Some(members) = resource_members.get(resource) {
+            writeln!(wit, "  resource {resource} {{")?;
+            for declaration in members.values() {
+                writeln!(wit, "    {declaration}")?;
+            }
+            writeln!(wit, "  }}")?;
+        } else {
+            writeln!(wit, "  resource {resource};")?;
+        }
+    }
+    if !resources.is_empty() && !functions.is_empty() {
+        writeln!(wit)?;
+    }
+    for declaration in functions.values() {
+        writeln!(wit, "  {declaration}")?;
+    }
+    writeln!(wit, "}}\n")?;
+    writeln!(wit, "world {world} {{")?;
+    writeln!(wit, "  export {interface};")?;
+    writeln!(wit, "}}")?;
+    wit_parser::Resolve::default()
+        .push_str("husk-generated.wit", &wit)
+        .context("generated WIT proposal is invalid")?;
+    Ok(wit)
+}
+
+fn wit_declaration_name(declaration: &str) -> &str {
+    if declaration.starts_with("constructor(") {
+        "constructor"
+    } else {
+        declaration.split(':').next().unwrap_or(declaration)
+    }
 }
 
 fn compile_input(engine: &Engine<CliState>, input: &Input) -> anyhow::Result<CompiledModule> {
@@ -1870,7 +2323,7 @@ mod tests {
                     "crate_id": 0,
                     "name": "any_crate",
                     "visibility": "public",
-                    "inner": {"module": {"items": [1]}}
+                    "inner": {"module": {"items": [1, 6]}}
                 },
                 "1": {
                     "id": 1,
@@ -1972,7 +2425,10 @@ mod tests {
         let report = analyze_rustdoc_json("any-crate", "1.2.3", document).unwrap();
 
         assert_eq!(report.status, "available");
-        assert_eq!(report.resources, ["any_crate::Widget"]);
+        assert_eq!(
+            report.resources,
+            ["any_crate::OpenError", "any_crate::Widget"]
+        );
         assert_eq!(report.compatible_items, 2);
         assert_eq!(report.incompatible_items, 1);
         assert!(report.items.iter().any(|item| {
@@ -1985,5 +2441,51 @@ mod tests {
                 && item.kind == "method"
                 && item.compatibility == "compatible"
         }));
+
+        let wit = render_wit_interface(
+            "any-crate",
+            "1.2.3",
+            &report,
+            &[
+                "any_crate::Widget::matches".to_string(),
+                "any_crate::Widget::open".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            wit,
+            "\
+package husk:any-crate@1.2.3;
+
+interface any-crate {
+  resource open-error;
+  resource widget {
+    constructor(name: string) -> result<widget, open-error>;
+    matches: func(input: string) -> bool;
+  }
+}
+
+world any-crate-adapter {
+  export any-crate;
+}
+"
+        );
+        wit_parser::Resolve::default()
+            .push_str("proposal.wit", &wit)
+            .unwrap();
+
+        let error = render_wit_interface(
+            "any-crate",
+            "1.2.3",
+            &report,
+            &["any_crate::Widget::convert".to_string()],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("generic or lifetime parameters are not supported"),
+            "{error:#}"
+        );
     }
 }
