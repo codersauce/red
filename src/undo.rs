@@ -397,7 +397,29 @@ impl UndoHistory {
         self.branch_selection
             .insert(branch_key(parent), children.len() - 1);
         self.current = Some(index);
+        self.prune_excess_nodes();
         true
+    }
+
+    /// Enforces `max_nodes` capacity by pruning unselected history branches.
+    pub fn prune_excess_nodes(&mut self) {
+        if self.nodes.len() <= self.max_nodes {
+            return;
+        }
+
+        // Identify ancestor indices leading from current node back to root
+        let mut active_path = HashSet::new();
+        let mut curr = self.current;
+        while let Some(idx) = curr {
+            active_path.insert(idx);
+            curr = self.nodes.get(idx).and_then(|n| n.parent);
+        }
+
+        // Retain root branch entries that belong to active ancestor paths
+        if self.root_children.len() > 1 {
+            self.root_children
+                .retain(|&child_idx| active_path.contains(&child_idx));
+        }
     }
 
     /// Drops the active transaction when it contains no replacements.

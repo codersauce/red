@@ -25,13 +25,17 @@ pub fn display_width_with_tabs(s: &str, tab_width: usize) -> usize {
     display_width_with_tabs_from_column(s, 0, tab_width)
 }
 
+pub fn is_printable_ascii(s: &str) -> bool {
+    s.bytes().all(|b| (0x20..=0x7E).contains(&b))
+}
+
 /// Calculate terminal display width from an existing display column.
 pub fn display_width_with_tabs_from_column(
     s: &str,
     start_column: usize,
     tab_width: usize,
 ) -> usize {
-    if s.is_ascii() && !s.as_bytes().contains(&b'\t') {
+    if is_printable_ascii(s) {
         return s.len();
     }
     let tab_width = tab_width.max(1);
@@ -71,7 +75,7 @@ pub fn byte_to_column(line: &str, byte_offset: usize) -> usize {
 /// Convert a display column position to a byte offset
 /// Returns the byte offset of the character that contains the given column
 pub fn column_to_byte(line: &str, target_column: usize) -> usize {
-    if line.is_ascii() {
+    if is_printable_ascii(line) {
         return target_column.min(line.len());
     }
     let mut current_column = 0;
