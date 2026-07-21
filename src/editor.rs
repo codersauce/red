@@ -1694,6 +1694,18 @@ impl ActionOnSelection {
 /// persistence, and agent proposals. External tasks communicate through
 /// messages; they do not mutate this state directly.
 pub struct Editor {
+    /// Domain sub-controller managing open buffers and tab selection
+    pub buffer_manager: buffer_manager::BufferManager,
+
+    /// Domain sub-controller managing session recovery and snapshots
+    pub session_manager: session_manager::SessionManager,
+
+    /// Domain sub-controller coordinating LSP document state and notifications
+    pub lsp_coordinator: lsp_coordinator::LspCoordinator,
+
+    /// Domain sub-controller managing background AI agent state and tool channels
+    pub agent_manager: agent_manager::AgentManager,
+
     /// LSP client for code intelligence features
     lsp: Box<dyn LspClient>,
 
@@ -2904,7 +2916,16 @@ impl Editor {
             .map(|buffer| (buffer.id(), buffer.revision()))
             .collect();
 
+        let buffer_manager = buffer_manager::BufferManager::new();
+        let session_manager = session_manager::SessionManager::new();
+        let lsp_coordinator = lsp_coordinator::LspCoordinator::new();
+        let agent_manager = agent_manager::AgentManager::new();
+
         Ok(Editor {
+            buffer_manager,
+            session_manager,
+            lsp_coordinator,
+            agent_manager,
             lsp,
             lsp_opened_documents: HashSet::new(),
             config,
