@@ -16,6 +16,7 @@
 //! model.
 
 mod display_layout;
+pub mod buffer_manager;
 pub(crate) mod perf;
 pub mod render_buffer;
 pub mod rendering;

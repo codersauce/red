@@ -31,6 +31,9 @@ pub fn display_width_with_tabs_from_column(
     start_column: usize,
     tab_width: usize,
 ) -> usize {
+    if s.is_ascii() && !s.as_bytes().contains(&b'\t') {
+        return s.len();
+    }
     let tab_width = tab_width.max(1);
     let mut column = start_column;
     for grapheme in s.graphemes(true) {
@@ -68,6 +71,9 @@ pub fn byte_to_column(line: &str, byte_offset: usize) -> usize {
 /// Convert a display column position to a byte offset
 /// Returns the byte offset of the character that contains the given column
 pub fn column_to_byte(line: &str, target_column: usize) -> usize {
+    if line.is_ascii() {
+        return target_column.min(line.len());
+    }
     let mut current_column = 0;
 
     for (idx, ch) in line.char_indices() {
@@ -85,6 +91,9 @@ pub fn column_to_byte(line: &str, target_column: usize) -> usize {
 
 /// Convert a character index to a byte offset
 pub fn char_to_byte(line: &str, char_idx: usize) -> usize {
+    if line.is_ascii() {
+        return char_idx.min(line.len());
+    }
     line.char_indices()
         .nth(char_idx)
         .map(|(idx, _)| idx)
@@ -93,6 +102,9 @@ pub fn char_to_byte(line: &str, char_idx: usize) -> usize {
 
 /// Convert a grapheme cluster index to a byte offset.
 pub fn grapheme_to_byte(line: &str, grapheme_idx: usize) -> usize {
+    if line.is_ascii() {
+        return grapheme_idx.min(line.len());
+    }
     line.grapheme_indices(true)
         .nth(grapheme_idx)
         .map(|(idx, _)| idx)
@@ -102,6 +114,9 @@ pub fn grapheme_to_byte(line: &str, grapheme_idx: usize) -> usize {
 /// Convert a byte offset to a grapheme cluster index.
 pub fn byte_to_grapheme(line: &str, byte_offset: usize) -> usize {
     let byte_offset = byte_offset.min(line.len());
+    if line.is_ascii() {
+        return byte_offset;
+    }
     line[..byte_offset].graphemes(true).count()
 }
 
