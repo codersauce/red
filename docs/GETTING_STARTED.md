@@ -291,8 +291,9 @@ Use `red --help` for the complete generated command-line reference.
 
 ## Troubleshooting
 
-Red logs to `/tmp/red.log` by default. Override `log_file` in your config when
-another location is preferable.
+Red logs to `red.log` in its configuration directory by default. Relative
+`log_file` values are resolved from that directory; absolute paths and `~/...`
+paths are also supported.
 
 - **LSP is not working:** confirm the language server is installed and on
   `PATH`.

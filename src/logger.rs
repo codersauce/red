@@ -10,6 +10,7 @@ use std::{
     fmt,
     fs::{File, OpenOptions},
     io::Write,
+    path::Path,
     sync::Mutex,
     time::SystemTime,
 };
@@ -51,7 +52,7 @@ pub struct Logger {
 }
 
 impl Logger {
-    pub fn try_new(file: &str) -> std::io::Result<Self> {
+    pub fn try_new(file: impl AsRef<Path>) -> std::io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .append(true) // implies .write(true)
@@ -63,7 +64,7 @@ impl Logger {
         })
     }
 
-    pub fn new(file: &str) -> Self {
+    pub fn new(file: impl AsRef<Path>) -> Self {
         Self::try_new(file).expect("log file opens fine")
     }
 
