@@ -340,13 +340,29 @@ impl RenderBuffer {
     }
 
     pub fn diff(&self, other: &RenderBuffer) -> Vec<Change<'_>> {
-        let mut changes = vec![];
-        for (pos, cell) in self.cells.iter().enumerate() {
-            if *cell != other.cells[pos] {
-                let y = pos / self.width;
-                let x = pos % self.width;
+        if self.width != other.width || self.height != other.height {
+            let mut changes = vec![];
+            for (pos, cell) in self.cells.iter().enumerate() {
+                if pos < other.cells.len() && *cell != other.cells[pos] {
+                    let y = pos / self.width;
+                    let x = pos % self.width;
+                    changes.push(Change { x, y, cell });
+                }
+            }
+            return changes;
+        }
 
-                changes.push(Change { x, y, cell });
+        let mut changes = vec![];
+        for y in 0..self.height {
+            let start = y * self.width;
+            let end = start + self.width;
+            if self.cells[start..end] != other.cells[start..end] {
+                for x in 0..self.width {
+                    let cell = &self.cells[start + x];
+                    if *cell != other.cells[start + x] {
+                        changes.push(Change { x, y, cell });
+                    }
+                }
             }
         }
 

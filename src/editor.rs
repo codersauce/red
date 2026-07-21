@@ -20,6 +20,7 @@ pub mod buffer_manager;
 pub(crate) mod perf;
 pub mod render_buffer;
 pub mod rendering;
+pub mod session_manager;
 
 use std::{
     cmp::Ordering,

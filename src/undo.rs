@@ -229,6 +229,12 @@ pub struct UndoTreeEntry {
     pub edits: Vec<TextEdit>,
 }
 
+pub const DEFAULT_MAX_UNDO_NODES: usize = 10_000;
+
+fn default_max_undo_nodes() -> usize {
+    DEFAULT_MAX_UNDO_NODES
+}
+
 /// Buffer-local branching transaction history and saved-revision marker.
 ///
 /// Mutation is single-owner through the editor. While a transaction is active,
@@ -244,6 +250,8 @@ pub struct UndoHistory {
     current_revision: u64,
     saved_revision: u64,
     next_revision: u64,
+    #[serde(default = "default_max_undo_nodes")]
+    max_nodes: usize,
 }
 
 impl Default for UndoHistory {
@@ -257,11 +265,27 @@ impl Default for UndoHistory {
             current_revision: 0,
             saved_revision: 0,
             next_revision: 1,
+            max_nodes: DEFAULT_MAX_UNDO_NODES,
         }
     }
 }
 
 impl UndoHistory {
+    /// Returns the total number of undo transactions retained in history.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Returns the configured maximum undo transaction nodes.
+    pub fn max_nodes(&self) -> usize {
+        self.max_nodes
+    }
+
+    /// Sets the maximum undo transaction node capacity.
+    pub fn set_max_nodes(&mut self, max: usize) {
+        self.max_nodes = max.max(100);
+    }
+
     /// Begins a user transaction unless another transaction is already active.
     pub fn begin_transaction(&mut self, label: impl Into<String>, before_cursor: CursorSnapshot) {
         self.begin_transaction_with_origin(label, before_cursor, EditOrigin::User);
