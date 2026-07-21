@@ -343,7 +343,7 @@ impl RenderBuffer {
         if self.width != other.width || self.height != other.height {
             let mut changes = vec![];
             for (pos, cell) in self.cells.iter().enumerate() {
-                if pos < other.cells.len() && *cell != other.cells[pos] {
+                if other.cells.get(pos) != Some(cell) {
                     let y = pos / self.width;
                     let x = pos % self.width;
                     changes.push(Change { x, y, cell });
@@ -471,6 +471,32 @@ mod tests {
 
         assert_eq!(previous.cells[0], next.cells[0]);
         assert_eq!(previous.cells[0].text.capacity(), capacity);
+    }
+
+    #[test]
+    fn diff_reports_only_cells_from_changed_rows() {
+        let style = Style::default();
+        let previous = RenderBuffer::new(4, 3, &style);
+        let mut next = RenderBuffer::new(4, 3, &style);
+        next.set_text(2, 1, "x", &style);
+
+        let changes = next.diff(&previous);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!((changes[0].x, changes[0].y), (2, 1));
+        assert_eq!(changes[0].cell.text, "x");
+    }
+
+    #[test]
+    fn diff_reports_new_cells_when_dimensions_grow() {
+        let style = Style::default();
+        let previous = RenderBuffer::new(1, 1, &style);
+        let next = RenderBuffer::new(2, 1, &style);
+
+        let changes = next.diff(&previous);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!((changes[0].x, changes[0].y), (1, 0));
     }
 
     #[test]

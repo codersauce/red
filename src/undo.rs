@@ -244,6 +244,8 @@ fn default_max_undo_nodes() -> usize {
 pub struct UndoHistory {
     nodes: Vec<UndoNode>,
     root_children: Vec<usize>,
+    #[serde(default)]
+    root_revision: u64,
     current: Option<usize>,
     branch_selection: HashMap<usize, usize>,
     active_transaction: Option<EditTransaction>,
@@ -259,6 +261,7 @@ impl Default for UndoHistory {
         Self {
             nodes: Vec::new(),
             root_children: Vec::new(),
+            root_revision: 0,
             current: None,
             branch_selection: HashMap::new(),
             active_transaction: None,
@@ -283,7 +286,8 @@ impl UndoHistory {
 
     /// Sets the maximum undo transaction node capacity.
     pub fn set_max_nodes(&mut self, max: usize) {
-        self.max_nodes = max.max(100);
+        self.max_nodes = max.max(1);
+        self.prune_excess_nodes();
     }
 
     /// Begins a user transaction unless another transaction is already active.
@@ -401,24 +405,51 @@ impl UndoHistory {
         true
     }
 
-    /// Enforces `max_nodes` capacity by pruning unselected history branches.
+    /// Enforces `max_nodes` by retaining the newest part of the active branch.
+    ///
+    /// Once history exceeds the cap, alternate branches are discarded and the
+    /// retained active path is compacted so every stored index remains valid.
     pub fn prune_excess_nodes(&mut self) {
         if self.nodes.len() <= self.max_nodes {
             return;
         }
 
-        // Identify ancestor indices leading from current node back to root
-        let mut active_path = HashSet::new();
-        let mut curr = self.current;
-        while let Some(idx) = curr {
-            active_path.insert(idx);
-            curr = self.nodes.get(idx).and_then(|n| n.parent);
+        let mut active_path = Vec::new();
+        let mut cursor = self.current;
+        while let Some(index) = cursor {
+            active_path.push(index);
+            cursor = self.nodes[index].parent;
+        }
+        active_path.reverse();
+
+        let retained_start = active_path.len().saturating_sub(self.max_nodes);
+        let retained = &active_path[retained_start..];
+        let new_root_revision = retained.first().map_or(self.root_revision, |&index| {
+            self.nodes[index].transaction.before_revision
+        });
+
+        let mut nodes = Vec::with_capacity(retained.len());
+        for (new_index, &old_index) in retained.iter().enumerate() {
+            let mut node = self.nodes[old_index].clone();
+            node.parent = new_index.checked_sub(1);
+            node.children = if new_index + 1 < retained.len() {
+                vec![new_index + 1]
+            } else {
+                Vec::new()
+            };
+            nodes.push(node);
         }
 
-        // Retain root branch entries that belong to active ancestor paths
-        if self.root_children.len() > 1 {
-            self.root_children
-                .retain(|&child_idx| active_path.contains(&child_idx));
+        self.nodes = nodes;
+        self.root_revision = new_root_revision;
+        self.root_children = (!self.nodes.is_empty()).then_some(0).into_iter().collect();
+        self.current = self.nodes.len().checked_sub(1);
+        self.branch_selection.clear();
+        for parent in 0..self.nodes.len().saturating_sub(1) {
+            self.branch_selection.insert(parent, 0);
+        }
+        if !self.root_children.is_empty() {
+            self.branch_selection.insert(branch_key(None), 0);
         }
     }
 
@@ -452,7 +483,7 @@ impl UndoHistory {
         let node_count = self.nodes.len();
         let mut greatest_revision = self.current_revision.max(self.saved_revision);
         let mut transaction_ids = HashSet::with_capacity(node_count);
-        let root_revision = 0;
+        let root_revision = self.root_revision;
         if let Some(current) = self.current {
             anyhow::ensure!(
                 current < node_count,
@@ -566,13 +597,10 @@ impl UndoHistory {
             self.current_revision
         );
         anyhow::ensure!(
-            self.saved_revision == root_revision
-                || self
-                    .nodes
-                    .iter()
-                    .any(|node| node.transaction.after_revision == self.saved_revision),
-            "undo-tree saved revision {} does not belong to the tree",
-            self.saved_revision
+            self.saved_revision < self.next_revision,
+            "undo-tree saved revision {} is not older than next revision {}",
+            self.saved_revision,
+            self.next_revision
         );
 
         if let Some(transaction) = &self.active_transaction {
@@ -873,6 +901,7 @@ fn transform_char_index(
 #[cfg(test)]
 mod tests {
     use super::{CursorSnapshot, TextPosition, TextRange, UndoHistory};
+    use crate::buffer::Buffer;
 
     fn commit_insertion(history: &mut UndoHistory, character: usize, text: &str) {
         history.begin_transaction("insert", CursorSnapshot::default());
@@ -906,8 +935,7 @@ mod tests {
         assert!(invalid_transaction.validate().is_err());
 
         let mut invalid_saved = history.clone();
-        invalid_saved.saved_revision = 3;
-        invalid_saved.next_revision = 4;
+        invalid_saved.saved_revision = invalid_saved.next_revision;
         assert!(invalid_saved.validate().is_err());
 
         let mut active = history.clone();
@@ -939,5 +967,86 @@ mod tests {
         history.nodes[1].transaction.after_revision = 1;
         history.current_revision = 1;
         assert!(history.validate().is_err());
+    }
+
+    #[test]
+    fn capacity_compacts_the_newest_active_history() {
+        let mut history = UndoHistory::default();
+        for (character, text) in ["a", "b", "c", "d", "e"].into_iter().enumerate() {
+            commit_insertion(&mut history, character, text);
+        }
+
+        history.set_max_nodes(3);
+
+        assert_eq!(history.node_count(), 3);
+        assert_eq!(history.root_revision, 2);
+        assert_eq!(history.current, Some(2));
+        assert_eq!(history.root_children, vec![0]);
+        assert_eq!(history.nodes[0].parent, None);
+        assert_eq!(history.nodes[0].children, vec![1]);
+        assert_eq!(history.nodes[1].parent, Some(0));
+        assert_eq!(history.nodes[1].children, vec![2]);
+        assert_eq!(history.nodes[2].parent, Some(1));
+        assert!(history.nodes[2].children.is_empty());
+        history.validate().unwrap();
+    }
+
+    #[test]
+    fn capacity_is_enforced_as_transactions_are_committed() {
+        let mut history = UndoHistory::default();
+        history.set_max_nodes(2);
+
+        for (character, text) in ["a", "b", "c", "d"].into_iter().enumerate() {
+            commit_insertion(&mut history, character, text);
+            assert!(history.node_count() <= 2);
+            history.validate().unwrap();
+        }
+
+        let revisions = history
+            .undo_tree()
+            .into_iter()
+            .map(|entry| entry.index)
+            .collect::<Vec<_>>();
+        assert_eq!(revisions, vec![0, 1]);
+        assert_eq!(history.root_revision, 2);
+    }
+
+    #[test]
+    fn compacted_history_round_trips_through_serde() {
+        let mut history = UndoHistory::default();
+        for (character, text) in ["a", "b", "c"].into_iter().enumerate() {
+            commit_insertion(&mut history, character, text);
+        }
+        history.set_max_nodes(2);
+
+        let encoded = serde_json::to_string(&history).unwrap();
+        let decoded: UndoHistory = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(decoded.node_count(), 2);
+        assert_eq!(decoded.root_revision, 1);
+        decoded.validate().unwrap();
+    }
+
+    #[test]
+    fn capacity_keeps_the_active_branch_undoable_and_redoable() {
+        let mut history = UndoHistory::default();
+        history.set_max_nodes(3);
+        for (character, text) in ["a", "b", "c"].into_iter().enumerate() {
+            commit_insertion(&mut history, character, text);
+        }
+        let mut buffer = Buffer::new(None, "abc".to_string());
+
+        history.undo(&mut buffer).unwrap();
+        buffer.replace_range_raw(TextRange::insertion(TextPosition::new(0, 2)), "x");
+        commit_insertion(&mut history, 2, "x");
+
+        assert_eq!(history.node_count(), 3);
+        assert_eq!(buffer.contents(), "abx");
+        history.validate().unwrap();
+
+        history.undo(&mut buffer).unwrap();
+        assert_eq!(buffer.contents(), "ab");
+        history.redo(&mut buffer).unwrap();
+        assert_eq!(buffer.contents(), "abx");
     }
 }

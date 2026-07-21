@@ -43,6 +43,8 @@ pub fn display_width_with_tabs_from_column(
     for grapheme in s.graphemes(true) {
         if grapheme == "\t" {
             column += tab_width - (column % tab_width);
+        } else if grapheme.chars().all(char::is_control) {
+            // Terminal control sequences do not occupy display cells.
         } else {
             column += display_width(grapheme);
         }
@@ -337,6 +339,16 @@ mod tests {
         assert_eq!(column_to_grapheme_with_tabs(line, 4, 4), 1);
         assert_eq!(column_to_grapheme_with_tabs(line, 7, 4), 2);
         assert_eq!(column_to_grapheme_with_tabs(line, 8, 4), 3);
+    }
+
+    #[test]
+    fn printable_ascii_fast_path_excludes_control_characters() {
+        assert!(is_printable_ascii("plain ASCII ~"));
+        assert!(!is_printable_ascii("line\r"));
+        assert!(!is_printable_ascii("line\n"));
+        assert!(!is_printable_ascii("left\tright"));
+        assert_eq!(display_width_with_tabs("line\r", 4), 4);
+        assert_eq!(display_width_with_tabs("left\tright", 4), 13);
     }
 
     #[test]

@@ -15,14 +15,14 @@
 //! `display_layout` and `rendering`, while `render_buffer` owns the terminal-cell
 //! model.
 
-pub mod agent_manager;
-pub mod buffer_manager;
+mod agent_manager;
+mod buffer_manager;
 mod display_layout;
-pub mod lsp_coordinator;
+mod lsp_coordinator;
 pub(crate) mod perf;
 pub mod render_buffer;
 pub mod rendering;
-pub mod session_manager;
+mod session_manager;
 
 use std::{
     cmp::Ordering,
@@ -66,7 +66,7 @@ pub use render_buffer::RenderBuffer;
 use crate::{
     agent_tools::{
         editor_tool_channel, utf16_byte_offset, EditorActionName, EditorOpenTarget,
-        EditorSelectionKind, EditorToolCall, EditorToolRequest, PendingEditorTool,
+        EditorSelectionKind, EditorToolCall, EditorToolRequest,
     },
     agent_workspace::{
         ProposalDisposition, ProposalToolHost, ProposalWorkspace, StagedProposalAcceptance,
@@ -133,11 +133,8 @@ const MAX_DIRECTORY_LISTING_ENTRIES: usize = 160;
 const AGENT_BRIDGE_CAPACITY: usize = 64;
 const MACRO_MAX_REPLAY_DEPTH: usize = 20;
 const MACRO_MAX_REPLAY_EVENTS: usize = 10_000;
-const SESSION_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5);
 const SESSION_SNAPSHOT_WARNING: &str =
     "Crash recovery is not being saved; check free space and permissions or reduce open-buffer size";
-type SessionSnapshotGeneration = (u64, Option<u64>);
-type SessionSnapshotWriter = std::thread::JoinHandle<anyhow::Result<SessionSnapshotGeneration>>;
 
 fn normalize_terminal_paste(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
@@ -1694,23 +1691,20 @@ impl ActionOnSelection {
 /// persistence, and agent proposals. External tasks communicate through
 /// messages; they do not mutate this state directly.
 pub struct Editor {
-    /// Domain sub-controller managing open buffers and tab selection
-    pub buffer_manager: buffer_manager::BufferManager,
+    /// Domain sub-controller managing open buffers and tab selection.
+    buffer_manager: buffer_manager::BufferManager,
 
     /// Domain sub-controller managing session recovery and snapshots
-    pub session_manager: session_manager::SessionManager,
+    session_manager: session_manager::SessionManager,
 
     /// Domain sub-controller coordinating LSP document state and notifications
-    pub lsp_coordinator: lsp_coordinator::LspCoordinator,
+    lsp_coordinator: lsp_coordinator::LspCoordinator,
 
     /// Domain sub-controller managing background AI agent state and tool channels
-    pub agent_manager: agent_manager::AgentManager,
+    agent_manager: agent_manager::AgentManager,
 
     /// LSP client for code intelligence features
     lsp: Box<dyn LspClient>,
-
-    /// Documents already opened through LSP for this editor session.
-    lsp_opened_documents: HashSet<String>,
 
     /// Editor configuration settings
     config: Config,
@@ -1725,22 +1719,6 @@ pub struct Editor {
     /// Plugin system registry
     plugin_registry: PluginRegistry,
 
-    /// Direct Codex app-server owner connected to the bundled Husk agent surface.
-    agent_bridge: Option<CodexBridge>,
-    agent_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
-    agent_workspace: Option<Arc<Mutex<ProposalWorkspace>>>,
-    agent_tool_requests: Option<tokio::sync::mpsc::Receiver<PendingEditorTool>>,
-    agent_active_sessions: HashSet<String>,
-    /// Prompt dispatch times used to report per-turn elapsed durations.
-    agent_turn_started: HashMap<String, Instant>,
-
-    /// Core-owned crash recovery store. It is optional in tests and embedded uses.
-    session_store: Option<SessionStore>,
-    last_session_snapshot: Instant,
-    last_session_snapshot_generation: Option<SessionSnapshotGeneration>,
-    session_snapshot_writer: Option<SessionSnapshotWriter>,
-    session_snapshot_warning: Option<&'static str>,
-
     /// Syntax highlighting engine
     highlighter: Highlighter,
 
@@ -1750,19 +1728,6 @@ pub struct Editor {
 
     /// Memoized display layout, shared by the many per-frame layout queries.
     layout_cache: std::cell::RefCell<HashMap<LayoutCacheKey, std::sync::Arc<DisplayLayout>>>,
-
-    /// All open buffers
-    buffers: Vec<Buffer>,
-
-    /// Latest buffer revision successfully delivered to LSP and plugins.
-    ///
-    /// Action handlers still flush eagerly when UI ordering requires it. The production
-    /// dispatcher compares this map with the buffer revision after every action so a new
-    /// edit path cannot accidentally omit external change notification.
-    notified_buffer_revisions: HashMap<BufferId, u64>,
-
-    /// Index of the currently active buffer
-    current_buffer_index: usize,
 
     /// Window manager handling splits and layout
     window_manager: WindowManager,
@@ -2911,14 +2876,9 @@ impl Editor {
         let completion_ui = CompletionUI::with_theme(&theme);
         let clipboard = Self::clipboard_provider_for_config(&config);
 
-        let notified_buffer_revisions = buffers
-            .iter()
-            .map(|buffer| (buffer.id(), buffer.revision()))
-            .collect();
-
-        let buffer_manager = buffer_manager::BufferManager::new();
+        let lsp_coordinator = lsp_coordinator::LspCoordinator::with_buffers(&buffers);
+        let buffer_manager = buffer_manager::BufferManager::with_buffers(buffers);
         let session_manager = session_manager::SessionManager::new();
-        let lsp_coordinator = lsp_coordinator::LspCoordinator::new();
         let agent_manager = agent_manager::AgentManager::new();
 
         Ok(Editor {
@@ -2927,29 +2887,14 @@ impl Editor {
             lsp_coordinator,
             agent_manager,
             lsp,
-            lsp_opened_documents: HashSet::new(),
             config,
             config_diagnostics: Vec::new(),
             config_diagnostics_acknowledged: true,
             theme,
             plugin_registry,
-            agent_bridge: None,
-            agent_task: None,
-            agent_workspace: None,
-            agent_tool_requests: None,
-            agent_active_sessions: HashSet::new(),
-            agent_turn_started: HashMap::new(),
-            session_store: None,
-            last_session_snapshot: Instant::now(),
-            last_session_snapshot_generation: None,
-            session_snapshot_writer: None,
-            session_snapshot_warning: None,
             highlighter,
             highlight_cache: HashMap::new(),
             layout_cache: std::cell::RefCell::new(HashMap::new()),
-            buffers,
-            notified_buffer_revisions,
-            current_buffer_index: 0,
             window_manager,
             stdout,
             terminal_output_enabled: true,
@@ -3086,7 +3031,7 @@ impl Editor {
     /// Synchronizes the editor's state with the active window
     fn sync_with_window(&mut self) {
         if let Some(window) = self.window_manager.active_window() {
-            self.current_buffer_index = window.buffer_index;
+            self.buffer_manager.set_active_index(window.buffer_index);
             self.vtop = window.vtop;
             self.vleft = window.vleft;
             self.skipcol = window.skipcol;
@@ -3101,7 +3046,7 @@ impl Editor {
     /// Synchronizes the active window with the editor's state
     fn sync_to_window(&mut self) {
         if let Some(window) = self.window_manager.active_window_mut() {
-            window.buffer_index = self.current_buffer_index;
+            window.buffer_index = self.buffer_manager.active_index();
             window.vtop = self.vtop;
             window.vleft = self.vleft;
             window.skipcol = self.skipcol;
@@ -3125,7 +3070,7 @@ impl Editor {
 
     fn active_window_with_editor_view(&self) -> Option<crate::window::Window> {
         let mut window = self.window_manager.active_window()?.clone();
-        window.buffer_index = self.current_buffer_index;
+        window.buffer_index = self.buffer_manager.active_index();
         window.vtop = self.vtop;
         window.vleft = self.vleft;
         window.skipcol = self.skipcol;
@@ -3349,12 +3294,12 @@ impl Editor {
     }
 
     fn indentation(&self) -> Indentation {
-        self.indentation_for_buffer_index(self.current_buffer_index)
+        self.indentation_for_buffer_index(self.buffer_manager.active_index())
     }
 
     fn indentation_for_buffer_index(&self, buffer_index: usize) -> Indentation {
         let file_type = self
-            .buffers
+            .buffer_manager
             .get(buffer_index)
             .and_then(|buffer| buffer.file_type());
 
@@ -3375,7 +3320,7 @@ impl Editor {
     }
 
     fn active_tab_width(&self) -> usize {
-        self.tab_width_for_buffer_index(self.current_buffer_index)
+        self.tab_width_for_buffer_index(self.buffer_manager.active_index())
     }
 
     fn break_indent_options_for_buffer_index(&self, buffer_index: usize) -> BreakIndentOptions {
@@ -3425,7 +3370,7 @@ impl Editor {
         buf_x: usize,
         buf_y: usize,
     ) -> Option<(usize, usize)> {
-        let line = self.buffers.get(window.buffer_index)?.get(buf_y)?;
+        let line = self.buffer_manager.get(window.buffer_index)?.get(buf_y)?;
         let display_col = grapheme_to_column_with_tabs(
             line.trim_end_matches('\n'),
             buf_x,
@@ -3468,7 +3413,7 @@ impl Editor {
     }
 
     fn layout_for_window(&self, window: &crate::window::Window) -> std::sync::Arc<DisplayLayout> {
-        let Some(buffer) = self.buffers.get(window.buffer_index) else {
+        let Some(buffer) = self.buffer_manager.get(window.buffer_index) else {
             return std::sync::Arc::new(DisplayLayout { rows: Vec::new() });
         };
         let mut line_count = buffer.navigable_line_count();
@@ -3530,13 +3475,13 @@ impl Editor {
     fn plugin_viewport_layout_payload(&self) -> Value {
         let Some(window) = self.active_window_with_editor_view() else {
             return json!({
-                "buffer_index": self.current_buffer_index,
+                "buffer_index": self.buffer_manager.active_index(),
                 "window_id": self.window_manager.active_stable_window_id().map(|id| id.0),
                 "rows": [],
             });
         };
         let layout = self.layout_for_window(&window);
-        let buffer = &self.buffers[window.buffer_index];
+        let buffer = &self.buffer_manager[window.buffer_index];
         let gutter_width = self.gutter_width_for_window(&window);
         let content_start = gutter_width + 1;
         let content_width = self.window_content_width(&window);
@@ -3627,7 +3572,7 @@ impl Editor {
             .windows()
             .into_iter()
             .filter_map(|window| {
-                let buffer = self.buffers.get(window.buffer_index)?;
+                let buffer = self.buffer_manager.get(window.buffer_index)?;
                 let cursor_y = window.vtop + window.cy;
                 let lsp_character =
                     self.lsp_character_for_cursor(window.buffer_index, cursor_y, window.cx);
@@ -3689,7 +3634,7 @@ impl Editor {
         line: usize,
         grapheme_index: usize,
     ) -> usize {
-        self.buffers
+        self.buffer_manager
             .get(buffer_index)
             .and_then(|buffer| buffer.get(line))
             .map(|text| {
@@ -3812,7 +3757,7 @@ impl Editor {
     }
 
     fn gutter_width_for_buffer_index(&self, buffer_index: usize) -> usize {
-        self.buffers
+        self.buffer_manager
             .get(buffer_index)
             .map(|buffer| {
                 GUTTER_SIGN_COLUMN_WIDTH + buffer.len().saturating_add(1).to_string().len()
@@ -3855,7 +3800,7 @@ impl Editor {
         vtop: usize,
         height: usize,
     ) -> anyhow::Result<Vec<HighlightSpan>> {
-        let Some(buffer) = self.buffers.get(buffer_index) else {
+        let Some(buffer) = self.buffer_manager.get(buffer_index) else {
             return Ok(Vec::new());
         };
         let revision = buffer.revision();
@@ -4247,7 +4192,7 @@ impl Editor {
             line_index,
             width,
             0,
-            self.break_indent_options_for_buffer_index(self.current_buffer_index),
+            self.break_indent_options_for_buffer_index(self.buffer_manager.active_index()),
         )
     }
 
@@ -4531,7 +4476,7 @@ impl Editor {
     }
 
     fn recompute_window_cursor_goals(&mut self) {
-        let buffers = &self.buffers;
+        let buffers = &self.buffer_manager;
         let tab_widths = (0..buffers.len())
             .map(|buffer_index| self.tab_width_for_buffer_index(buffer_index))
             .collect::<Vec<_>>();
@@ -4606,7 +4551,7 @@ impl Editor {
             wrap: self.wrap,
             width,
             height,
-            buffer_index: self.current_buffer_index,
+            buffer_index: self.buffer_manager.active_index(),
             window_id: self.window_manager.active_stable_window_id(),
             window_ids: self
                 .window_manager
@@ -4872,7 +4817,7 @@ impl Editor {
             .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
         let root = workspace.root().to_path_buf();
         let mut skipped = 0;
-        let files = self.buffers.iter().filter_map(|buffer| {
+        let files = self.buffer_manager.iter().filter_map(|buffer| {
             let file = buffer.file.as_deref()?;
             let path = match Path::new(file).absolutize() {
                 Ok(path) => path.to_path_buf(),
@@ -4907,8 +4852,8 @@ impl Editor {
 
         let buffer = self.current_buffer();
         let root = self
-            .agent_workspace
-            .as_ref()
+            .agent_manager
+            .workspace()
             .and_then(|workspace| {
                 workspace
                     .lock()
@@ -5055,12 +5000,12 @@ impl Editor {
             .unwrap_or(false);
         let selection = self.selection.map(|selection| {
             let start_character = self.lsp_character_for_cursor(
-                self.current_buffer_index,
+                self.buffer_manager.active_index(),
                 selection.y0,
                 selection.x0,
             );
             let end_character = self.lsp_character_for_cursor(
-                self.current_buffer_index,
+                self.buffer_manager.active_index(),
                 selection.y1,
                 selection.x1.saturating_add(1),
             );
@@ -5076,13 +5021,14 @@ impl Editor {
             })
         });
         let line = self.buffer_line();
-        let character = self.lsp_character_for_cursor(self.current_buffer_index, line, self.cx);
+        let character =
+            self.lsp_character_for_cursor(self.buffer_manager.active_index(), line, self.cx);
         let buffer = self.current_buffer();
         let mut windows = self.plugin_windows_payload()["windows"]
             .as_array()
             .cloned()
             .unwrap_or_default();
-        if let Some(workspace) = &self.agent_workspace {
+        if let Some(workspace) = self.agent_manager.workspace() {
             if let Ok(workspace) = workspace.lock() {
                 windows.retain(|window| {
                     window
@@ -5118,12 +5064,12 @@ impl Editor {
         runtime: &mut Runtime,
     ) -> anyhow::Result<Value> {
         anyhow::ensure!(
-            self.agent_active_sessions.contains(&request.session_id),
+            self.agent_manager.is_session_active(&request.session_id),
             "editor tool references an inactive session"
         );
         let workspace = self
-            .agent_workspace
-            .clone()
+            .agent_manager
+            .workspace_cloned()
             .ok_or_else(|| anyhow::anyhow!("no proposal workspace is active"))?;
         self.sync_agent_visible_buffers(&workspace)?;
 
@@ -5299,12 +5245,7 @@ impl Editor {
         text: String,
         context: Option<(String, String)>,
     ) -> anyhow::Result<bool> {
-        if self.agent_bridge.is_none()
-            || self
-                .agent_task
-                .as_ref()
-                .is_some_and(tokio::task::JoinHandle::is_finished)
-        {
+        if !self.agent_manager.has_bridge() || self.agent_manager.is_task_finished() {
             self.abort_agent_bridge();
             self.plugin_registry
                 .notify(
@@ -5319,12 +5260,12 @@ impl Editor {
                 .await?;
             return Ok(false);
         }
-        if self.agent_active_sessions.contains(&session_id) {
+        if self.agent_manager.is_session_active(&session_id) {
             self.last_error = Some("a Codex prompt is already active for this session".to_string());
             return Ok(true);
         }
         let turn_id = uuid::Uuid::new_v4().to_string();
-        if let Some(workspace) = self.agent_workspace.clone() {
+        if let Some(workspace) = self.agent_manager.workspace_cloned() {
             if let Err(error) = self.sync_agent_visible_buffers(&workspace) {
                 self.plugin_registry
                     .notify(
@@ -5347,10 +5288,9 @@ impl Editor {
                 json!({ "session_id": session_id, "turn_id": turn_id }),
             )
             .await?;
-        self.agent_active_sessions.insert(session_id.clone());
-        self.agent_turn_started
-            .insert(session_id.clone(), Instant::now());
-        let Some(bridge) = &self.agent_bridge else {
+        self.agent_manager.mark_session_active(session_id.clone());
+        self.agent_manager.record_turn_start(session_id.clone());
+        let Some(bridge) = self.agent_manager.bridge() else {
             return Ok(false);
         };
         let command = context.map_or_else(
@@ -5388,7 +5328,7 @@ impl Editor {
         path: &Path,
     ) -> anyhow::Result<(u64, String)> {
         let normalized = path.absolutize()?.to_path_buf();
-        if let Some(buffer) = self.buffers.iter().find(|buffer| {
+        if let Some(buffer) = self.buffer_manager.iter().find(|buffer| {
             buffer.file.as_deref().is_some_and(|file| {
                 Path::new(file)
                     .absolutize()
@@ -5406,7 +5346,7 @@ impl Editor {
     }
 
     fn agent_proposals_payload(&mut self, session_id: &str) -> anyhow::Result<Value> {
-        let Some(workspace) = self.agent_workspace.clone() else {
+        let Some(workspace) = self.agent_manager.workspace_cloned() else {
             self.gutter_sign_manager.clear("agent-proposals");
             self.decoration_manager.clear("agent-proposals");
             return Ok(json!({ "files": [] }));
@@ -5437,7 +5377,7 @@ impl Editor {
                 };
                 match workspace.hunks(&proposal_session, &path, &contents) {
                     Ok(hunks) => {
-                        if let Some(buffer_index) = self.buffers.iter().position(|buffer| {
+                        if let Some(buffer_index) = self.buffer_manager.iter().position(|buffer| {
                             buffer.file.as_deref().is_some_and(|file| {
                                 Path::new(file)
                                     .absolutize()
@@ -5445,7 +5385,7 @@ impl Editor {
                             })
                         }) {
                             for hunk in &hunks {
-                                let line = self.buffers[buffer_index]
+                                let line = self.buffer_manager[buffer_index]
                                     .char_idx_to_position(hunk.old_start)
                                     .line;
                                 signs.push(plugin::GutterSign {
@@ -5478,7 +5418,7 @@ impl Editor {
                         }));
                     }
                     Err(error) => {
-                        if let Some(buffer_index) = self.buffers.iter().position(|buffer| {
+                        if let Some(buffer_index) = self.buffer_manager.iter().position(|buffer| {
                             buffer.file.as_deref().is_some_and(|file| {
                                 Path::new(file)
                                     .absolutize()
@@ -5530,7 +5470,7 @@ impl Editor {
                 ..
             } => {
                 let normalized = path.absolutize()?.to_path_buf();
-                let index = self.buffers.iter().position(|buffer| {
+                let index = self.buffer_manager.iter().position(|buffer| {
                     buffer.file.as_deref().is_some_and(|file| {
                         Path::new(file)
                             .absolutize()
@@ -5540,13 +5480,13 @@ impl Editor {
                 let index = if let Some(index) = index {
                     index
                 } else {
-                    self.buffers.push(Buffer::new(
+                    self.buffer_manager.push_buffer(Buffer::new(
                         Some(normalized.to_string_lossy().into_owned()),
                         current_contents,
                     ));
-                    self.buffers.len() - 1
+                    self.buffer_manager.len() - 1
                 };
-                if index != self.current_buffer_index {
+                if index != self.buffer_manager.active_index() {
                     self.set_current_buffer(render_buffer, index).await?;
                 }
                 self.commit_agent_acceptance(acceptance)?;
@@ -5569,7 +5509,7 @@ impl Editor {
                 if let Err(error) = self.render(render_buffer) {
                     self.warn_agent_proposal_post_apply("render", &error.to_string());
                 }
-                if let Some(workspace) = self.agent_workspace.clone() {
+                if let Some(workspace) = self.agent_manager.workspace_cloned() {
                     if let Err(error) = self.sync_agent_visible_buffers(&workspace) {
                         self.warn_agent_proposal_post_apply("workspace_sync", &error.to_string());
                     }
@@ -5645,8 +5585,8 @@ impl Editor {
 
     fn commit_agent_acceptance(&self, acceptance: StagedProposalAcceptance) -> anyhow::Result<()> {
         let workspace = self
-            .agent_workspace
-            .as_ref()
+            .agent_manager
+            .workspace()
             .ok_or_else(|| anyhow::anyhow!("no proposal workspace is active"))?;
         workspace
             .lock()
@@ -5771,8 +5711,8 @@ impl Editor {
     }
 
     async fn shutdown_services(&mut self, runtime: &mut Runtime) {
-        drop(self.agent_bridge.take());
-        if let Some(task) = self.agent_task.take() {
+        drop(self.agent_manager.take_bridge());
+        if let Some(task) = self.agent_manager.take_task() {
             match task.await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => log!("Codex app-server shutdown failed: {error}"),
@@ -5807,13 +5747,13 @@ impl Editor {
     }
 
     fn abort_agent_bridge(&mut self) {
-        drop(self.agent_bridge.take());
-        if let Some(task) = self.agent_task.take() {
+        drop(self.agent_manager.take_bridge());
+        if let Some(task) = self.agent_manager.take_task() {
             task.abort();
         }
-        self.agent_active_sessions.clear();
-        self.agent_turn_started.clear();
-        self.agent_tool_requests = None;
+        self.agent_manager.clear_active_sessions();
+        self.agent_manager.clear_turns();
+        self.agent_manager.clear_tool_requests();
     }
 
     async fn service_background(
@@ -5822,11 +5762,7 @@ impl Editor {
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
         for _ in 0..AGENT_EVENTS_PER_TICK {
-            let Some(pending) = self
-                .agent_tool_requests
-                .as_mut()
-                .and_then(|requests| requests.try_recv().ok())
-            else {
+            let Some(pending) = self.agent_manager.try_recv_tool_request() else {
                 break;
             };
             let result = self
@@ -5864,7 +5800,11 @@ impl Editor {
 
         let mut proposal_sessions = Vec::new();
         for _ in 0..AGENT_EVENTS_PER_TICK {
-            let Some(event) = self.agent_bridge.as_mut().and_then(CodexBridge::try_recv) else {
+            let Some(event) = self
+                .agent_manager
+                .bridge_mut()
+                .and_then(CodexBridge::try_recv)
+            else {
                 break;
             };
             if let CodexEvent::Completed { session_id, .. }
@@ -5873,11 +5813,11 @@ impl Editor {
                 ..
             } = &event
             {
-                self.agent_active_sessions.remove(session_id);
+                self.agent_manager.mark_session_inactive(session_id);
             }
             match &event {
                 CodexEvent::Update { session_id, .. } | CodexEvent::Activity { session_id, .. }
-                    if !self.agent_active_sessions.contains(session_id) =>
+                    if !self.agent_manager.is_session_active(session_id) =>
                 {
                     continue;
                 }
@@ -5885,8 +5825,8 @@ impl Editor {
                     request_id,
                     session_id,
                     ..
-                } if !self.agent_active_sessions.contains(session_id) => {
-                    if let Some(bridge) = &self.agent_bridge {
+                } if !self.agent_manager.is_session_active(session_id) => {
+                    if let Some(bridge) = self.agent_manager.bridge() {
                         let _ = bridge.try_send(CodexCommand::PermissionResponse {
                             request_id: request_id.clone(),
                             option_id: None,
@@ -5911,14 +5851,14 @@ impl Editor {
             }
             let turn_elapsed_ms = match &event {
                 CodexEvent::Completed { session_id, .. } => self
-                    .agent_turn_started
-                    .remove(session_id)
-                    .map(|started| started.elapsed().as_millis() as u64),
+                    .agent_manager
+                    .elapsed_turn_duration(session_id)
+                    .map(|elapsed| elapsed.as_millis() as u64),
                 CodexEvent::Failed {
                     session_id: Some(session_id),
                     ..
                 } => {
-                    self.agent_turn_started.remove(session_id);
+                    self.agent_manager.discard_turn(session_id);
                     None
                 }
                 _ => None,
@@ -5938,23 +5878,20 @@ impl Editor {
                 )
                 .await?;
         }
-        if self
-            .agent_task
-            .as_ref()
-            .is_some_and(tokio::task::JoinHandle::is_finished)
+        if self.agent_manager.is_task_finished()
             && self
-                .agent_bridge
-                .as_ref()
+                .agent_manager
+                .bridge()
                 .is_none_or(|bridge| !bridge.has_pending_events())
         {
             let _ = self
-                .agent_task
-                .take()
+                .agent_manager
+                .take_task()
                 .expect("finished Codex task must exist")
                 .await;
-            self.agent_bridge = None;
-            self.agent_active_sessions.clear();
-            self.agent_tool_requests = None;
+            self.agent_manager.take_bridge();
+            self.agent_manager.clear_active_sessions();
+            self.agent_manager.clear_tool_requests();
             self.plugin_registry
                 .notify(
                     runtime,
@@ -6031,13 +5968,10 @@ impl Editor {
         // Startup refreshes form short request chains. Drain a bounded batch so each
         // operation does not wait for a separate 10 ms editor tick.
         for _ in 0..PLUGIN_REQUESTS_PER_TICK {
-            if self
-                .agent_task
-                .as_ref()
-                .is_some_and(tokio::task::JoinHandle::is_finished)
+            if self.agent_manager.is_task_finished()
                 && self
-                    .agent_bridge
-                    .as_ref()
+                    .agent_manager
+                    .bridge()
                     .is_some_and(CodexBridge::has_pending_events)
             {
                 break;
@@ -6054,18 +5988,14 @@ impl Editor {
                     // self.redraw(runtime, &current_buffer, buffer).await?;
                 }
                 PluginRequest::AgentNewSession { cwd } => {
-                    if self
-                        .agent_task
-                        .as_ref()
-                        .is_some_and(tokio::task::JoinHandle::is_finished)
-                    {
+                    if self.agent_manager.is_task_finished() {
                         let _ = self
-                            .agent_task
-                            .take()
+                            .agent_manager
+                            .take_task()
                             .expect("finished Codex task must exist")
                             .await;
-                        self.agent_bridge = None;
-                        self.agent_active_sessions.clear();
+                        self.agent_manager.take_bridge();
+                        self.agent_manager.clear_active_sessions();
                         self.plugin_registry
                             .notify(
                                 runtime,
@@ -6079,8 +6009,8 @@ impl Editor {
                             "agent support is disabled by `disable_ai = true`"
                         ))
                     } else if let Some(error) = self
-                        .agent_workspace
-                        .as_ref()
+                        .agent_manager
+                        .workspace()
                         .and_then(|workspace| match workspace.lock() {
                             Ok(workspace) => match cwd.absolutize() {
                                 Ok(cwd) if workspace.root() == cwd.as_ref() => None,
@@ -6097,7 +6027,7 @@ impl Editor {
                         })
                     {
                         Err(error)
-                    } else if self.agent_bridge.is_none() {
+                    } else if !self.agent_manager.has_bridge() {
                             let configured = self
                                 .config
                                 .agent
@@ -6112,7 +6042,7 @@ impl Editor {
                             match command {
                                 Ok(command) => {
                                     let start = (|| -> anyhow::Result<_> {
-                                        let workspace = match &self.agent_workspace {
+                                        let workspace = match self.agent_manager.workspace() {
                                             Some(workspace) => Arc::clone(workspace),
                                             None => {
                                                 Arc::new(Mutex::new(ProposalWorkspace::new(&cwd)?))
@@ -6136,14 +6066,14 @@ impl Editor {
                                         let host = ProposalToolHost::new(Arc::clone(&workspace))
                                             .with_editor_tools(tool_sender);
                                         let spawned = start_codex(spec, host, capacity)?;
-                                        self.agent_workspace = Some(workspace);
+                                        self.agent_manager.set_workspace(Some(workspace));
                                         Ok((spawned, tool_requests))
                                     })();
                                     match start {
                                         Ok(((bridge, task), tool_requests)) => {
-                                            self.agent_bridge = Some(bridge);
-                                            self.agent_task = Some(task);
-                                            self.agent_tool_requests = Some(tool_requests);
+                                            self.agent_manager.set_bridge(bridge);
+                                            self.agent_manager.set_task(task);
+                                            self.agent_manager.set_tool_requests(tool_requests);
                                             Ok(())
                                         }
                                         Err(error) => Err(error),
@@ -6164,7 +6094,7 @@ impl Editor {
                             .await?;
                         continue;
                     }
-                    let Some(bridge) = &self.agent_bridge else {
+                    let Some(bridge) = self.agent_manager.bridge() else {
                         continue;
                     };
                     if bridge.send(CodexCommand::NewSession { cwd }).await.is_err() {
@@ -6200,7 +6130,7 @@ impl Editor {
                         .await?;
                 }
                 PluginRequest::AgentCancel { session_id } => {
-                    let Some(bridge) = &self.agent_bridge else {
+                    let Some(bridge) = self.agent_manager.bridge() else {
                         continue;
                     };
                     if bridge
@@ -6218,14 +6148,14 @@ impl Editor {
                     }
                 }
                 PluginRequest::AgentCloseSession { session_id } => {
-                    self.agent_active_sessions.remove(&session_id);
-                    if let Some(workspace) = &self.agent_workspace {
+                    self.agent_manager.mark_session_inactive(&session_id);
+                    if let Some(workspace) = self.agent_manager.workspace() {
                         workspace
                             .lock()
                             .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?
                             .archive_session(&session_id);
                     }
-                    let Some(bridge) = &self.agent_bridge else {
+                    let Some(bridge) = self.agent_manager.bridge() else {
                         continue;
                     };
                     if bridge
@@ -6243,8 +6173,8 @@ impl Editor {
                     }
                 }
                 PluginRequest::AgentArchiveSession { session_id } => {
-                    self.agent_active_sessions.remove(&session_id);
-                    if let Some(workspace) = &self.agent_workspace {
+                    self.agent_manager.mark_session_inactive(&session_id);
+                    if let Some(workspace) = self.agent_manager.workspace() {
                         workspace
                             .lock()
                             .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?
@@ -6277,8 +6207,8 @@ impl Editor {
                 } => {
                     let acceptance = (|| -> anyhow::Result<_> {
                         let workspace = self
-                            .agent_workspace
-                            .clone()
+                            .agent_manager
+                            .workspace_cloned()
                             .ok_or_else(|| anyhow::anyhow!("no proposal workspace is active"))?;
                         self.sync_agent_visible_buffers(&workspace)?;
                         let workspace = workspace
@@ -6333,8 +6263,8 @@ impl Editor {
                 } => {
                     let rejected = (|| -> anyhow::Result<()> {
                         let workspace = self
-                            .agent_workspace
-                            .clone()
+                            .agent_manager
+                            .workspace_cloned()
                             .ok_or_else(|| anyhow::anyhow!("no proposal workspace is active"))?;
                         self.sync_agent_visible_buffers(&workspace)?;
                         let mut workspace = workspace
@@ -6374,7 +6304,7 @@ impl Editor {
                     request_id,
                     option_id,
                 } => {
-                    let Some(bridge) = &self.agent_bridge else {
+                    let Some(bridge) = self.agent_manager.bridge() else {
                         continue;
                     };
                     if bridge
@@ -6666,7 +6596,7 @@ impl Editor {
                         json!({
                             "start": { "x": selection.x0, "y": selection.y0 },
                             "end": { "x": selection.x1, "y": selection.y1 },
-                            "buffer_index": self.current_buffer_index,
+                            "buffer_index": self.buffer_manager.active_index(),
                             "mode": format!("{:?}", self.mode),
                         })
                     });
@@ -6684,8 +6614,9 @@ impl Editor {
                     name,
                     text,
                 } => {
-                    self.buffers.push(Buffer::new(Some(name), text));
-                    let buffer_index = self.buffers.len() - 1;
+                    self.buffer_manager
+                        .push_buffer(Buffer::new(Some(name), text));
+                    let buffer_index = self.buffer_manager.len() - 1;
                     self.set_current_buffer(buffer, buffer_index).await?;
                     self.plugin_registry
                         .resolve_request(
@@ -6697,7 +6628,7 @@ impl Editor {
                     needs_render = true;
                 }
                 PluginRequest::CloseScratchBuffer { buffer_index } => {
-                    if buffer_index == self.current_buffer_index {
+                    if buffer_index == self.buffer_manager.active_index() {
                         self.delete_current_buffer(buffer, true).await?;
                         needs_render = true;
                     }
@@ -6719,7 +6650,7 @@ impl Editor {
                     namespace,
                     decorations,
                 } => {
-                    let current_buffer_index = self.current_buffer_index;
+                    let current_buffer_index = self.buffer_manager.active_index();
                     let active_buffer_only = decorations.iter().all(|decoration| {
                         decoration
                             .buffer_index
@@ -6869,8 +6800,8 @@ impl Editor {
                     request_id,
                     buffer_index,
                 } => {
-                    let buffer_index = buffer_index.unwrap_or(self.current_buffer_index);
-                    let Some(target_buffer) = self.buffers.get(buffer_index) else {
+                    let buffer_index = buffer_index.unwrap_or(self.buffer_manager.active_index());
+                    let Some(target_buffer) = self.buffer_manager.get(buffer_index) else {
                         self.plugin_registry
                             .resolve_request(
                                 runtime,
@@ -8256,7 +8187,7 @@ impl Editor {
     }
 
     fn pending_lsp_edit_is_current(&self, pending: &PendingLspEdit) -> bool {
-        self.buffers.iter().any(|buffer| {
+        self.buffer_manager.iter().any(|buffer| {
             buffer.id() == pending.buffer_id
                 && buffer.revision() == pending.revision
                 && buffer
@@ -8327,7 +8258,7 @@ impl Editor {
         if let Some(error) = save.as_ref().and_then(|save| {
             save.save_as.as_ref()?;
             let contents = self
-                .buffers
+                .buffer_manager
                 .iter()
                 .find(|buffer| buffer.id() == pending.buffer_id)?
                 .contents();
@@ -8570,7 +8501,7 @@ impl Editor {
     }
 
     fn open_buffer_revision_snapshot(&self) -> Vec<(String, u64)> {
-        self.buffers
+        self.buffer_manager
             .iter()
             .filter_map(|buffer| Some((buffer.uri().ok().flatten()?, buffer.revision())))
             .collect()
@@ -8585,7 +8516,7 @@ impl Editor {
             .filter_map(LspWorkspaceEditOperation::document)
             .filter_map(|document| {
                 let target = lsp_normalized_file_path(&document.uri).ok()?;
-                self.buffers
+                self.buffer_manager
                     .iter()
                     .find(|buffer| {
                         buffer
@@ -8647,7 +8578,7 @@ impl Editor {
             .filter_map(LspWorkspaceEditOperation::document)
             .filter_map(|document| {
                 let path = lsp_normalized_file_path(&document.uri).ok()?;
-                let open = self.buffers.iter().any(|buffer| {
+                let open = self.buffer_manager.iter().any(|buffer| {
                     buffer
                         .uri()
                         .ok()
@@ -8670,7 +8601,7 @@ impl Editor {
                 }
                 if requesting_path.as_deref() == Some(path.as_str()) {
                     return self
-                        .buffers
+                        .buffer_manager
                         .iter()
                         .find_map(|buffer| {
                             let candidate = buffer
@@ -9511,7 +9442,7 @@ impl Editor {
     fn open_buffer_name_for_path(&self, path: &str) -> Option<String> {
         let expanded = expanded_path_string(path).ok()?;
         let absolute = Path::new(&expanded).absolutize().ok()?;
-        self.buffers
+        self.buffer_manager
             .iter()
             .find(|buffer| {
                 Path::new(buffer.name())
@@ -12199,9 +12130,8 @@ impl Editor {
         let mut add_to_history = tracking;
         let action_buffer_id = self.current_buffer().id();
         let action_buffer_revision = self.current_buffer().revision();
-        self.notified_buffer_revisions
-            .entry(action_buffer_id)
-            .or_insert(action_buffer_revision);
+        self.lsp_coordinator
+            .ensure_notified_revision(action_buffer_id, action_buffer_revision);
         let event_snapshot_before_action = self.event_snapshot();
         let action_cause = Self::action_cause(action);
         let history_entry_before_action = self.current_history_entry();
@@ -13007,11 +12937,11 @@ impl Editor {
                     };
 
                     if let Some(index) = self
-                        .buffers
+                        .buffer_manager
                         .iter()
                         .position(|candidate| candidate.id() == anchor.buffer_id)
                     {
-                        if index != self.current_buffer_index {
+                        if index != self.buffer_manager.active_index() {
                             self.set_current_buffer(buffer, index).await?;
                         }
                         anchor.fallback = self
@@ -13381,7 +13311,10 @@ impl Editor {
                     let log_file = path.to_string_lossy().into_owned();
                     if path.exists() {
                         // Check if the log file is already open
-                        if let Some(index) = self.buffers.iter().position(|b| b.name() == log_file)
+                        if let Some(index) = self
+                            .buffer_manager
+                            .iter()
+                            .position(|b| b.name() == log_file)
                         {
                             self.set_current_buffer(buffer, index).await?;
                         } else {
@@ -13393,8 +13326,8 @@ impl Editor {
                                     return Ok(false);
                                 }
                             };
-                            self.buffers.push(new_buffer);
-                            self.set_current_buffer(buffer, self.buffers.len() - 1)
+                            self.buffer_manager.push_buffer(new_buffer);
+                            self.set_current_buffer(buffer, self.buffer_manager.len() - 1)
                                 .await?;
                         }
                     } else {
@@ -13482,8 +13415,7 @@ impl Editor {
 
                 // Create a new buffer with the plugin list
                 let plugin_list_buffer = Buffer::new(Some("[Plugin List]".to_string()), content);
-                self.buffers.push(plugin_list_buffer);
-                self.current_buffer_index = self.buffers.len() - 1;
+                self.buffer_manager.add_buffer(plugin_list_buffer);
                 self.cx = 0;
                 self.cy = 0;
                 self.vtop = 0;
@@ -13783,7 +13715,7 @@ impl Editor {
                         return Ok(false);
                     }
                 };
-                let existing_index = self.buffers.iter().position(|item| {
+                let existing_index = self.buffer_manager.iter().position(|item| {
                     Path::new(item.name())
                         .absolutize()
                         .is_ok_and(|candidate| candidate == Path::new(&path))
@@ -13798,8 +13730,8 @@ impl Editor {
                             return Ok(false);
                         }
                     };
-                    self.buffers.push(new_buffer);
-                    (self.buffers.len() - 1, true)
+                    self.buffer_manager.push_buffer(new_buffer);
+                    (self.buffer_manager.len() - 1, true)
                 };
 
                 let opened =
@@ -13815,7 +13747,7 @@ impl Editor {
                     };
                 if !opened {
                     if added_buffer {
-                        self.buffers.pop();
+                        self.buffer_manager.pop_buffer();
                     }
                     self.last_error =
                         Some("Unable to open location in requested target".to_string());
@@ -14126,7 +14058,7 @@ impl Editor {
                         if let Some(file) = &self.current_buffer().file {
                             let save_info = serde_json::json!({
                                 "file": file,
-                                "buffer_index": self.current_buffer_index
+                                "buffer_index": self.buffer_manager.active_index()
                             });
                             self.plugin_registry
                                 .notify(runtime, "file:saved", save_info)
@@ -14177,7 +14109,7 @@ impl Editor {
                         if let Err(error) = self
                             .sync_lsp_document_identity(
                                 previous_uri.as_deref(),
-                                self.current_buffer_index,
+                                self.buffer_manager.active_index(),
                             )
                             .await
                         {
@@ -14215,7 +14147,7 @@ impl Editor {
                         // Notify plugins about file save
                         let save_info = serde_json::json!({
                             "file": saved_file,
-                            "buffer_index": self.current_buffer_index
+                            "buffer_index": self.buffer_manager.active_index()
                         });
                         self.plugin_registry
                             .notify(runtime, "file:saved", save_info)
@@ -14358,23 +14290,24 @@ impl Editor {
                 self.draw_line(buffer);
             }
             Action::NextBuffer => {
-                let new_index = if self.current_buffer_index < self.buffers.len() - 1 {
-                    self.current_buffer_index + 1
-                } else {
-                    0
-                };
+                let new_index =
+                    if self.buffer_manager.active_index() < self.buffer_manager.len() - 1 {
+                        self.buffer_manager.active_index() + 1
+                    } else {
+                        0
+                    };
                 self.set_current_buffer(buffer, new_index).await?;
             }
             Action::PreviousBuffer => {
-                let new_index = if self.current_buffer_index > 0 {
-                    self.current_buffer_index - 1
+                let new_index = if self.buffer_manager.active_index() > 0 {
+                    self.buffer_manager.active_index() - 1
                 } else {
-                    self.buffers.len() - 1
+                    self.buffer_manager.len() - 1
                 };
                 self.set_current_buffer(buffer, new_index).await?;
             }
             Action::OpenBuffer(name) => {
-                if let Some(index) = self.buffers.iter().position(|b| b.name() == *name) {
+                if let Some(index) = self.buffer_manager.iter().position(|b| b.name() == *name) {
                     self.set_current_buffer(buffer, index).await?;
                 }
             }
@@ -14389,7 +14322,7 @@ impl Editor {
                         return Ok(false);
                     }
                 };
-                if let Some(index) = self.buffers.iter().position(|b| b.name() == path) {
+                if let Some(index) = self.buffer_manager.iter().position(|b| b.name() == path) {
                     self.set_current_buffer(buffer, index).await?;
                 } else {
                     let new_buffer = match Buffer::load_or_create(Some(path.clone())).await {
@@ -14399,14 +14332,14 @@ impl Editor {
                             return Ok(false);
                         }
                     };
-                    self.buffers.push(new_buffer);
-                    self.set_current_buffer(buffer, self.buffers.len() - 1)
+                    self.buffer_manager.push_buffer(new_buffer);
+                    self.set_current_buffer(buffer, self.buffer_manager.len() - 1)
                         .await?;
 
                     // Notify plugins about file open
                     let open_info = serde_json::json!({
                         "file": path,
-                        "buffer_index": self.buffers.len() - 1
+                        "buffer_index": self.buffer_manager.len() - 1
                     });
                     self.plugin_registry
                         .notify(runtime, "file:opened", open_info)
@@ -14803,7 +14736,7 @@ impl Editor {
             // Window management actions
             Action::SplitHorizontal => {
                 log!("SplitHorizontal action triggered");
-                let current_buffer = self.current_buffer_index;
+                let current_buffer = self.buffer_manager.active_index();
                 if self.update_window_layout(|windows| windows.split_horizontal(current_buffer)) {
                     log!("Window split successful");
                     self.render(buffer)?;
@@ -14813,7 +14746,7 @@ impl Editor {
             }
             Action::SplitVertical => {
                 log!("SplitVertical action triggered");
-                let current_buffer = self.current_buffer_index;
+                let current_buffer = self.buffer_manager.active_index();
                 if self.update_window_layout(|windows| windows.split_vertical(current_buffer)) {
                     log!("Vertical split successful");
                     self.render(buffer)?;
@@ -14836,8 +14769,8 @@ impl Editor {
                 // Load or create the buffer for the file
                 match Buffer::load_or_create(Some(file.clone())).await {
                     Ok(new_buffer) => {
-                        self.buffers.push(new_buffer);
-                        let new_buffer_index = self.buffers.len() - 1;
+                        self.buffer_manager.push_buffer(new_buffer);
+                        let new_buffer_index = self.buffer_manager.len() - 1;
                         if self.update_window_layout(|windows| {
                             windows.split_horizontal(new_buffer_index)
                         }) {
@@ -14847,7 +14780,7 @@ impl Editor {
                         } else {
                             log!("Window split failed");
                             // Remove the buffer we just added
-                            self.buffers.pop();
+                            self.buffer_manager.pop_buffer();
                         }
                     }
                     Err(e) => {
@@ -14867,8 +14800,8 @@ impl Editor {
                 // Load or create the buffer for the file
                 match Buffer::load_or_create(Some(file.clone())).await {
                     Ok(new_buffer) => {
-                        self.buffers.push(new_buffer);
-                        let new_buffer_index = self.buffers.len() - 1;
+                        self.buffer_manager.push_buffer(new_buffer);
+                        let new_buffer_index = self.buffer_manager.len() - 1;
                         if self.update_window_layout(|windows| {
                             windows.split_vertical(new_buffer_index)
                         }) {
@@ -14878,7 +14811,7 @@ impl Editor {
                         } else {
                             log!("Vertical split failed");
                             // Remove the buffer we just added
-                            self.buffers.pop();
+                            self.buffer_manager.pop_buffer();
                         }
                     }
                     Err(e) => {
@@ -15903,7 +15836,7 @@ impl Editor {
 
         // Notify plugins about buffer change
         let buffer_info = serde_json::json!({
-            "buffer_id": self.current_buffer_index,
+            "buffer_id": self.buffer_manager.active_index(),
             "buffer_name": self.current_buffer().name(),
             "file_path": file,
             "revision": self.current_buffer().revision(),
@@ -15918,8 +15851,8 @@ impl Editor {
             .notify(runtime, "buffer:changed", buffer_info)
             .await?;
 
-        self.notified_buffer_revisions
-            .insert(self.current_buffer().id(), self.current_buffer().revision());
+        self.lsp_coordinator
+            .record_notified_revision(self.current_buffer().id(), self.current_buffer().revision());
 
         Ok(())
     }
@@ -15927,9 +15860,8 @@ impl Editor {
     async fn flush_change_notification(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
         let revision = self.current_buffer().revision();
         if self
-            .notified_buffer_revisions
-            .get(&self.current_buffer().id())
-            .is_some_and(|notified| *notified == revision)
+            .lsp_coordinator
+            .is_revision_notified(self.current_buffer().id(), revision)
         {
             return Ok(());
         }
@@ -15949,7 +15881,7 @@ impl Editor {
         buffer.vtop = vtop;
         buffer.pos = pos;
 
-        self.current_buffer_index = index;
+        self.buffer_manager.set_active_index(index);
 
         let (cx, cy) = self.current_buffer().pos;
         let vtop = self.current_buffer().vtop;
@@ -15988,22 +15920,26 @@ impl Editor {
         let removed_id = self.current_buffer().id();
         let removed_uri = self.current_buffer().uri()?;
         if let Some(uri) = removed_uri.as_deref() {
-            let still_open = self.buffers.iter().enumerate().any(|(index, buffer)| {
-                index != self.current_buffer_index
-                    && buffer.uri().ok().flatten().as_deref() == Some(uri)
-            });
-            if !still_open && self.lsp_opened_documents.remove(uri) {
+            let still_open = self
+                .buffer_manager
+                .iter()
+                .enumerate()
+                .any(|(index, buffer)| {
+                    index != self.buffer_manager.active_index()
+                        && buffer.uri().ok().flatten().as_deref() == Some(uri)
+                });
+            if !still_open && self.lsp_coordinator.mark_document_closed(uri) {
                 if let Ok(file) = lsp_file_path(uri) {
                     self.lsp.did_close(&file).await?;
                 }
                 self.diagnostics.remove(uri);
             }
         }
-        self.notified_buffer_revisions.remove(&removed_id);
+        self.lsp_coordinator.forget_buffer(removed_id);
 
-        if self.buffers.len() == 1 {
-            self.buffers[0] = Buffer::new(None, String::new());
-            self.current_buffer_index = 0;
+        if self.buffer_manager.len() == 1 {
+            self.buffer_manager[0] = Buffer::new(None, String::new());
+            self.buffer_manager.set_active_index(0);
             self.cx = 0;
             self.cy = 0;
             self.vtop = 0;
@@ -16028,21 +15964,21 @@ impl Editor {
             return self.render(render_buffer);
         }
 
-        let removed_index = self.current_buffer_index;
-        let target_old_index = if removed_index + 1 < self.buffers.len() {
+        let removed_index = self.buffer_manager.active_index();
+        let target_old_index = if removed_index + 1 < self.buffer_manager.len() {
             removed_index + 1
         } else {
             removed_index - 1
         };
 
-        self.buffers.remove(removed_index);
+        self.buffer_manager.remove_buffer(removed_index);
 
         let target_index = if target_old_index > removed_index {
             target_old_index - 1
         } else {
             target_old_index
         };
-        self.current_buffer_index = target_index;
+        self.buffer_manager.set_active_index(target_index);
 
         let (target_cx, target_cy) = self.current_buffer().pos;
         let target_vtop = self.current_buffer().vtop;
@@ -16079,12 +16015,12 @@ impl Editor {
     }
 
     async fn ensure_current_buffer_lsp_opened(&mut self) -> anyhow::Result<()> {
-        self.ensure_buffer_lsp_opened(self.current_buffer_index)
+        self.ensure_buffer_lsp_opened(self.buffer_manager.active_index())
             .await
     }
 
     async fn ensure_buffer_lsp_opened(&mut self, buffer_index: usize) -> anyhow::Result<()> {
-        let Some(buffer) = self.buffers.get(buffer_index) else {
+        let Some(buffer) = self.buffer_manager.get(buffer_index) else {
             return Ok(());
         };
         let Some(file) = buffer.file.clone() else {
@@ -16093,12 +16029,12 @@ impl Editor {
         let Some(uri) = buffer.uri()? else {
             return Ok(());
         };
-        if self.lsp_opened_documents.contains(&uri) {
+        if self.lsp_coordinator.is_document_opened(&uri) {
             return Ok(());
         }
         let contents = buffer.contents();
         self.lsp.did_open(&file, &contents).await?;
-        self.lsp_opened_documents.insert(uri);
+        self.lsp_coordinator.mark_document_opened(uri);
         Ok(())
     }
 
@@ -16108,14 +16044,14 @@ impl Editor {
         buffer_index: usize,
     ) -> anyhow::Result<()> {
         let current_uri = self
-            .buffers
+            .buffer_manager
             .get(buffer_index)
             .and_then(|buffer| buffer.uri().ok().flatten());
         if previous_uri == current_uri.as_deref() {
             return Ok(());
         }
         if let Some(previous_uri) = previous_uri {
-            if self.lsp_opened_documents.remove(previous_uri) {
+            if self.lsp_coordinator.mark_document_closed(previous_uri) {
                 if let Ok(file) = lsp_file_path(previous_uri) {
                     self.lsp.did_close(&file).await?;
                 }
@@ -16546,7 +16482,7 @@ impl Editor {
                                     // snap to the row's first character.
                                     let display_col = segment.start_col
                                         + content_x.saturating_sub(segment.visual_offset);
-                                    let line = self.buffers[window_buffer_index]
+                                    let line = self.buffer_manager[window_buffer_index]
                                         .get(segment.line)
                                         .unwrap_or_default();
                                     (
@@ -16562,7 +16498,7 @@ impl Editor {
                                 };
 
                                 // Ensure y is within buffer bounds
-                                let window_buffer = &self.buffers[window_buffer_index];
+                                let window_buffer = &self.buffer_manager[window_buffer_index];
                                 let y = if buffer_y >= window_buffer.len() {
                                     window_buffer.len().saturating_sub(1)
                                 } else {
@@ -16681,11 +16617,15 @@ impl Editor {
     }
 
     fn current_buffer(&self) -> &Buffer {
-        &self.buffers[self.current_buffer_index]
+        self.buffer_manager
+            .active_buffer()
+            .expect("editor must always retain an active buffer")
     }
 
     fn current_buffer_mut(&mut self) -> &mut Buffer {
-        &mut self.buffers[self.current_buffer_index]
+        self.buffer_manager
+            .active_buffer_mut()
+            .expect("editor must always retain an active buffer")
     }
 
     fn cursor_snapshot(&self) -> CursorSnapshot {
@@ -17336,7 +17276,7 @@ impl Editor {
     }
 
     fn modified_buffers(&self) -> Vec<&str> {
-        self.buffers
+        self.buffer_manager
             .iter()
             .filter(|b| b.is_dirty())
             .map(|b| b.name())
@@ -17344,15 +17284,13 @@ impl Editor {
     }
 
     pub fn set_session_store(&mut self, store: SessionStore) {
-        self.session_store = Some(store);
-        self.last_session_snapshot = Instant::now();
-        self.last_session_snapshot_generation = None;
+        self.session_manager.set_store(store);
     }
 
     #[doc(hidden)]
     pub fn test_persist_session_snapshot(&mut self, force: bool, due: bool) {
         if due {
-            self.last_session_snapshot = Instant::now() - SESSION_SNAPSHOT_INTERVAL;
+            self.session_manager.force_snapshot_due();
         }
         self.persist_session_snapshot(force);
     }
@@ -17360,12 +17298,12 @@ impl Editor {
     #[doc(hidden)]
     #[must_use]
     pub fn test_session_snapshot_is_backing_off(&self) -> bool {
-        self.last_session_snapshot.elapsed() < SESSION_SNAPSHOT_INTERVAL
+        self.session_manager.is_backing_off()
     }
 
     #[doc(hidden)]
     pub fn test_finish_session_snapshot(&mut self) {
-        if let Some(writer) = self.session_snapshot_writer.take() {
+        if let Some(writer) = self.session_manager.take_writer() {
             self.finish_session_snapshot(writer);
         }
     }
@@ -17401,7 +17339,7 @@ impl Editor {
             "session snapshot was not migrated to the current schema"
         );
         anyhow::ensure!(
-            self.buffers.len() == snapshot.buffers.len(),
+            self.buffer_manager.len() == snapshot.buffers.len(),
             "session buffer count does not match the reconstructed editor"
         );
         let divergences = detect_disk_divergence(snapshot);
@@ -17411,10 +17349,12 @@ impl Editor {
             .enumerate()
             .map(|(position, buffer)| (buffer.index, position))
             .collect::<HashMap<_, _>>();
-        self.current_buffer_index = buffer_map
-            .get(&snapshot.current_buffer_index)
-            .copied()
-            .unwrap_or_default();
+        self.buffer_manager.set_active_index(
+            buffer_map
+                .get(&snapshot.current_buffer_index)
+                .copied()
+                .unwrap_or_default(),
+        );
         self.window_manager = WindowManager::from_snapshot(
             &snapshot.window_layout,
             (self.size.0 as usize, self.size.1 as usize),
@@ -17422,7 +17362,7 @@ impl Editor {
         )
         .unwrap_or_else(|| {
             WindowManager::new(
-                self.current_buffer_index,
+                self.buffer_manager.active_index(),
                 (self.size.0 as usize, self.size.1 as usize),
             )
         });
@@ -17459,10 +17399,12 @@ impl Editor {
                     .insert((anchor.buffer_id, mark.name), anchor);
             }
         }
-        self.agent_workspace = snapshot
-            .agent_workspace
-            .clone()
-            .map(|workspace| Arc::new(Mutex::new(ProposalWorkspace::from_snapshot(workspace))));
+        self.agent_manager.set_workspace(
+            snapshot
+                .agent_workspace
+                .clone()
+                .map(|workspace| Arc::new(Mutex::new(ProposalWorkspace::from_snapshot(workspace)))),
+        );
         if let Some(transcript) = &snapshot.agent_transcript {
             let transcript_persisted = if let Err(error) = self.preferences.set_plugin_storage(
                 "agent",
@@ -17523,7 +17465,7 @@ impl Editor {
         buffer_map: &HashMap<usize, usize>,
     ) -> Option<EditAnchor> {
         let buffer_index = *buffer_map.get(&mark.buffer_index)?;
-        let buffer_id = self.buffers.get(buffer_index)?.id();
+        let buffer_id = self.buffer_manager.get(buffer_index)?.id();
         Some(EditAnchor {
             buffer_id,
             file: mark.file.clone(),
@@ -17557,7 +17499,7 @@ impl Editor {
             );
         }
         let (buffers, disk_fingerprints) = self
-            .buffers
+            .buffer_manager
             .iter()
             .enumerate()
             .map(|(index, buffer)| {
@@ -17608,7 +17550,7 @@ impl Editor {
             })
             .unzip();
         let buffer_indices = self
-            .buffers
+            .buffer_manager
             .iter()
             .enumerate()
             .map(|(index, buffer)| (buffer.id(), index))
@@ -17630,8 +17572,8 @@ impl Editor {
             .filter_map(|((_, name), anchor)| self.snapshot_mark(*name, anchor, &buffer_indices))
             .collect();
         let agent_workspace = self
-            .agent_workspace
-            .as_ref()
+            .agent_manager
+            .workspace()
             .and_then(|workspace| workspace.lock().ok().map(|workspace| workspace.snapshot()));
         let agent_transcript = self
             .preferences
@@ -17646,7 +17588,7 @@ impl Editor {
                 cwd,
                 saved_at_ms,
                 buffers,
-                current_buffer_index: self.current_buffer_index,
+                current_buffer_index: self.buffer_manager.active_index(),
                 window_layout: self.window_manager.snapshot(),
                 registers: self.registers.clone(),
                 jumps: self
@@ -17690,37 +17632,41 @@ impl Editor {
     }
 
     fn persist_session_snapshot(&mut self, force: bool) -> bool {
-        let Some(store) = self.session_store.clone() else {
+        let Some(store) = self.session_manager.store().cloned() else {
             return false;
         };
         let mut warning_changed = false;
-        if let Some(writer) = self.session_snapshot_writer.take() {
+        if let Some(writer) = self.session_manager.take_writer() {
             if force || writer.is_finished() {
                 warning_changed = self.finish_session_snapshot(writer);
             } else {
-                self.session_snapshot_writer = Some(writer);
+                self.session_manager.set_writer(writer);
                 return false;
             }
         }
-        if !force && self.last_session_snapshot.elapsed() < SESSION_SNAPSHOT_INTERVAL {
+        if !force && !self.session_manager.should_snapshot() {
             return warning_changed;
         }
-        self.last_session_snapshot = Instant::now();
+        self.session_manager.mark_snapshot_taken();
         let snapshot_generation = (
             self.render_generation,
-            self.agent_workspace.as_ref().and_then(|workspace| {
+            self.agent_manager.workspace().and_then(|workspace| {
                 workspace
                     .lock()
                     .ok()
                     .map(|workspace| workspace.generation())
             }),
         );
-        if !force && self.last_session_snapshot_generation == Some(snapshot_generation) {
+        if !force
+            && self
+                .session_manager
+                .generation_is_current(snapshot_generation)
+        {
             return warning_changed;
         }
         let _span = perf::PerfSpan::start("session:snapshot");
         let content_snapshots = self
-            .buffers
+            .buffer_manager
             .iter()
             .map(Buffer::contents_snapshot)
             .collect::<Vec<_>>();
@@ -17749,20 +17695,21 @@ impl Editor {
         if force {
             warning_changed |= self.finish_session_snapshot(writer);
         } else {
-            self.session_snapshot_writer = Some(writer);
+            self.session_manager.set_writer(writer);
         }
         warning_changed
     }
 
-    fn finish_session_snapshot(&mut self, writer: SessionSnapshotWriter) -> bool {
-        let previous_warning = self.session_snapshot_warning;
+    fn finish_session_snapshot(&mut self, writer: session_manager::SessionSnapshotWriter) -> bool {
+        let previous_warning = self.session_manager.warning();
         match writer.join() {
             Ok(Ok(snapshot_generation)) => {
-                self.last_session_snapshot_generation = Some(snapshot_generation);
-                self.session_snapshot_warning = None;
+                self.session_manager.record_generation(snapshot_generation);
+                self.session_manager.set_warning(None);
             }
             Ok(Err(error)) => {
-                self.session_snapshot_warning = Some(SESSION_SNAPSHOT_WARNING);
+                self.session_manager
+                    .set_warning(Some(SESSION_SNAPSHOT_WARNING));
                 log!(
                     "{}",
                     json!({
@@ -17775,7 +17722,8 @@ impl Editor {
                 );
             }
             Err(_) => {
-                self.session_snapshot_warning = Some(SESSION_SNAPSHOT_WARNING);
+                self.session_manager
+                    .set_warning(Some(SESSION_SNAPSHOT_WARNING));
                 log!(
                     "{}",
                     json!({
@@ -17788,7 +17736,7 @@ impl Editor {
                 );
             }
         }
-        previous_warning != self.session_snapshot_warning
+        previous_warning != self.session_manager.warning()
     }
 
     fn editor_state_snapshot(&mut self) -> EditorStateSnapshot {
@@ -17817,7 +17765,7 @@ impl Editor {
         }
 
         let buffers = self
-            .buffers
+            .buffer_manager
             .iter()
             .enumerate()
             .filter_map(|(index, buffer)| {
@@ -17841,7 +17789,7 @@ impl Editor {
             cwd,
             saved_at,
             buffers,
-            current_buffer_index: self.current_buffer_index,
+            current_buffer_index: self.buffer_manager.active_index(),
             window_layout: self.window_manager.snapshot(),
         }
     }
@@ -17913,12 +17861,14 @@ impl Editor {
             });
         }
 
-        self.buffers = restored_buffers;
-        self.lsp_opened_documents.clear();
-        self.current_buffer_index = buffer_map
-            .get(&snapshot.current_buffer_index)
-            .copied()
-            .unwrap_or(0);
+        self.buffer_manager.replace_buffers(restored_buffers);
+        self.lsp_coordinator.clear_opened_documents();
+        self.buffer_manager.set_active_index(
+            buffer_map
+                .get(&snapshot.current_buffer_index)
+                .copied()
+                .unwrap_or(0),
+        );
 
         self.window_manager = WindowManager::from_snapshot(
             &snapshot.window_layout,
@@ -17927,7 +17877,7 @@ impl Editor {
         )
         .unwrap_or_else(|| {
             WindowManager::new(
-                self.current_buffer_index,
+                self.buffer_manager.active_index(),
                 (self.size.0 as usize, self.size.1 as usize),
             )
         });
@@ -17935,7 +17885,8 @@ impl Editor {
         self.recompute_window_cursor_goals();
 
         if let Some(active_window) = self.window_manager.active_window() {
-            self.current_buffer_index = active_window.buffer_index;
+            self.buffer_manager
+                .set_active_index(active_window.buffer_index);
         }
         self.sync_with_window();
         self.check_bounds();
@@ -18351,7 +18302,7 @@ impl Editor {
             .map(lsp_normalized_file_path)
             .collect::<Result<HashSet<_>, _>>()?;
         let touched_bytes = self
-            .buffers
+            .buffer_manager
             .iter()
             .filter(|buffer| {
                 buffer
@@ -18384,7 +18335,7 @@ impl Editor {
             return Ok(());
         }
         let open_documents = self
-            .buffers
+            .buffer_manager
             .iter()
             .enumerate()
             .filter_map(|(index, buffer)| {
@@ -18492,7 +18443,7 @@ impl Editor {
             return Ok(());
         }
 
-        let original_index = self.current_buffer_index;
+        let original_index = self.buffer_manager.active_index();
         let original_view = (self.cx, self.cy, self.vtop, self.vleft, self.skipcol);
         let mut changed = Vec::new();
         let mut renamed = Vec::new();
@@ -18500,18 +18451,18 @@ impl Editor {
         for (document, file) in prepared.documents.into_iter().zip(buffer_paths) {
             let index = document.index.unwrap_or_else(|| {
                 newly_opened += 1;
-                self.buffers.push(Buffer::new(
+                self.buffer_manager.push_buffer(Buffer::new(
                     Some(file.clone()),
                     document.original_contents.clone(),
                 ));
-                self.buffers.len() - 1
+                self.buffer_manager.len() - 1
             });
             if let Some(original_uri) = &document.original_uri {
                 if original_uri != &document.uri {
                     renamed.push((original_uri.clone(), file.clone(), index));
                 }
             }
-            self.buffers[index].file = Some(file);
+            self.buffer_manager[index].file = Some(file);
             if !document.text_changed {
                 continue;
             }
@@ -18541,7 +18492,7 @@ impl Editor {
                         Some(format!("failed to close renamed LSP document: {error}"));
                 }
             }
-            self.lsp_opened_documents.remove(uri);
+            self.lsp_coordinator.mark_document_closed(uri);
             let new_uri = crate::lsp::file_uri(file).ok();
             if let Some(new_uri) = &new_uri {
                 if let Some(diagnostics) = self.diagnostics.remove(uri) {
@@ -18550,12 +18501,12 @@ impl Editor {
             }
             if let Err(error) = self
                 .lsp
-                .did_open(file, &self.buffers[*index].contents())
+                .did_open(file, &self.buffer_manager[*index].contents())
                 .await
             {
                 self.last_error = Some(format!("failed to open renamed LSP document: {error}"));
             } else if let Some(new_uri) = new_uri {
-                self.lsp_opened_documents.insert(new_uri);
+                self.lsp_coordinator.mark_document_opened(new_uri);
             }
         }
         for index in changed {
@@ -18585,7 +18536,7 @@ impl Editor {
                 .await?;
         }
         if let Some(uri) = save_after_uri {
-            if let Some(buffer_id) = self.buffers.iter().find_map(|buffer| {
+            if let Some(buffer_id) = self.buffer_manager.iter().find_map(|buffer| {
                 (buffer.uri().ok().flatten().as_deref() == Some(uri)).then_some(buffer.id())
             }) {
                 self.complete_lsp_format_save(
@@ -18612,12 +18563,12 @@ impl Editor {
     }
 
     fn select_buffer_for_lsp_edit(&mut self, index: usize) {
-        let previous = self.current_buffer_index;
-        self.buffers[previous].pos = (self.cx, self.cy);
-        self.buffers[previous].vtop = self.vtop;
-        self.current_buffer_index = index;
-        (self.cx, self.cy) = self.buffers[index].pos;
-        self.vtop = self.buffers[index].vtop;
+        let previous = self.buffer_manager.active_index();
+        self.buffer_manager[previous].pos = (self.cx, self.cy);
+        self.buffer_manager[previous].vtop = self.vtop;
+        self.buffer_manager.set_active_index(index);
+        (self.cx, self.cy) = self.buffer_manager[index].pos;
+        self.vtop = self.buffer_manager[index].vtop;
         self.vleft = 0;
         self.skipcol = 0;
     }
@@ -18631,7 +18582,7 @@ impl Editor {
         warning: Option<&str>,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
-        let Some(index) = self.buffers.iter().position(|buffer| {
+        let Some(index) = self.buffer_manager.iter().position(|buffer| {
             buffer.id() == buffer_id
                 && buffer
                     .uri()
@@ -18644,7 +18595,7 @@ impl Editor {
                 Some("formatted buffer is no longer open; save cancelled".to_string());
             return Ok(());
         };
-        let original = self.current_buffer_index;
+        let original = self.buffer_manager.active_index();
         let original_view = (self.cx, self.cy, self.vtop, self.vleft, self.skipcol);
         self.select_buffer_for_lsp_edit(index);
         let previous_uri = self.current_buffer().uri()?;
@@ -18688,13 +18639,13 @@ impl Editor {
         previous_file: Option<String>,
     ) {
         let Some(index) = self
-            .buffers
+            .buffer_manager
             .iter()
             .position(|buffer| buffer.id() == buffer_id)
         else {
             return;
         };
-        self.buffers[index].file = previous_file;
+        self.buffer_manager[index].file = previous_file;
         if let Err(error) = self
             .sync_lsp_document_identity(Some(target_uri), index)
             .await
@@ -18723,7 +18674,7 @@ impl Editor {
         let Some(uri) = uri else {
             return Ok(());
         };
-        let Some(buffer_id) = self.buffers.iter().find_map(|buffer| {
+        let Some(buffer_id) = self.buffer_manager.iter().find_map(|buffer| {
             (buffer.uri().ok().flatten().as_deref() == Some(uri)).then_some(buffer.id())
         }) else {
             return Ok(());
@@ -18769,14 +18720,18 @@ impl Editor {
             Some(save_as) => {
                 let file = expand_user_path(save_as)?.to_string_lossy().into_owned();
                 let target = Path::new(&file).absolutize()?.to_path_buf();
-                let already_open = self.buffers.iter().enumerate().any(|(index, buffer)| {
-                    index != self.current_buffer_index
-                        && buffer.file.as_deref().is_some_and(|file| {
-                            Path::new(file)
-                                .absolutize()
-                                .is_ok_and(|candidate| candidate == target)
-                        })
-                });
+                let already_open = self
+                    .buffer_manager
+                    .iter()
+                    .enumerate()
+                    .any(|(index, buffer)| {
+                        index != self.buffer_manager.active_index()
+                            && buffer.file.as_deref().is_some_and(|file| {
+                                Path::new(file)
+                                    .absolutize()
+                                    .is_ok_and(|candidate| candidate == target)
+                            })
+                    });
                 if already_open {
                     self.last_error = Some(format!(
                         "Save As cancelled; destination is already open in another buffer: {}",
@@ -18815,8 +18770,11 @@ impl Editor {
             uri,
         };
         let open_result = if save_as.is_some() {
-            self.sync_lsp_document_identity(previous_uri.as_deref(), self.current_buffer_index)
-                .await
+            self.sync_lsp_document_identity(
+                previous_uri.as_deref(),
+                self.buffer_manager.active_index(),
+            )
+            .await
         } else {
             self.ensure_current_buffer_lsp_opened().await
         };
@@ -19371,7 +19329,7 @@ pub struct BufferInfo {
 
 impl From<&Editor> for EditorInfo {
     fn from(editor: &Editor) -> Self {
-        let buffers = editor.buffers.iter().map(|b| b.into()).collect();
+        let buffers = editor.buffer_manager.iter().map(|b| b.into()).collect();
         let theme = editor.theme.clone();
         Self {
             buffers,
@@ -19809,7 +19767,7 @@ impl Editor {
 
     #[doc(hidden)]
     pub fn test_buffer_names(&self) -> Vec<String> {
-        self.buffers
+        self.buffer_manager
             .iter()
             .map(|buffer| buffer.name().to_string())
             .collect()
@@ -19817,7 +19775,7 @@ impl Editor {
 
     #[doc(hidden)]
     pub fn test_current_buffer_index(&self) -> usize {
-        self.current_buffer_index
+        self.buffer_manager.active_index()
     }
 
     #[doc(hidden)]
@@ -19863,7 +19821,7 @@ impl Editor {
 
     #[doc(hidden)]
     pub fn test_set_agent_workspace(&mut self, workspace: Arc<Mutex<ProposalWorkspace>>) {
-        self.agent_workspace = Some(workspace);
+        self.agent_manager.set_workspace(Some(workspace));
     }
 
     #[doc(hidden)]
@@ -19871,8 +19829,8 @@ impl Editor {
         &mut self,
         request: EditorToolRequest,
     ) -> anyhow::Result<Value> {
-        self.agent_active_sessions
-            .insert(request.session_id.clone());
+        self.agent_manager
+            .mark_session_active(request.session_id.clone());
         let mut render_buffer = RenderBuffer::new(
             self.size.0 as usize,
             self.size.1 as usize,
@@ -19891,7 +19849,7 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_agent_gutter_sign(&self, line: usize) -> Option<&str> {
         self.gutter_sign_manager
-            .visible_sign(self.current_buffer_index, line)
+            .visible_sign(self.buffer_manager.active_index(), line)
             .map(|sign| sign.text.as_str())
     }
 
@@ -19903,8 +19861,8 @@ impl Editor {
         hunk_id: Option<&str>,
     ) -> anyhow::Result<()> {
         let workspace = self
-            .agent_workspace
-            .clone()
+            .agent_manager
+            .workspace_cloned()
             .ok_or_else(|| anyhow::anyhow!("no proposal workspace is active"))?;
         self.sync_agent_visible_buffers(&workspace)?;
         let acceptance = {
@@ -19936,8 +19894,8 @@ impl Editor {
         hunk_id: Option<&str>,
     ) -> anyhow::Result<()> {
         let workspace = self
-            .agent_workspace
-            .clone()
+            .agent_manager
+            .workspace_cloned()
             .ok_or_else(|| anyhow::anyhow!("no proposal workspace is active"))?;
         self.sync_agent_visible_buffers(&workspace)?;
         let mut workspace = workspace
@@ -20281,13 +20239,13 @@ mod test {
         let path = root.path().join("src.rs");
         std::fs::write(&path, "first\nselected value\nlast\n").unwrap();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
-        editor.buffers = vec![Buffer::new(
+        editor.buffer_manager.replace_buffers(vec![Buffer::new(
             Some(path.to_string_lossy().into_owned()),
             "first\nselected value\nlast\n".to_string(),
-        )];
-        editor.agent_workspace = Some(Arc::new(Mutex::new(
+        )]);
+        editor.agent_manager.set_workspace(Some(Arc::new(Mutex::new(
             ProposalWorkspace::new(root.path()).unwrap(),
-        )));
+        ))));
         editor.mode = Mode::Visual;
         editor.selection = Some(Rect::new(
             /*x0*/ 0, /*y0*/ 1, /*x1*/ 7, /*y1*/ 1,
@@ -20356,11 +20314,13 @@ mod test {
             (root.path().join("binary.bin"), "text\0binary", "binary"),
         ] {
             let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
-            editor.buffers = vec![Buffer::new(
+            editor.buffer_manager.replace_buffers(vec![Buffer::new(
                 Some(path.to_string_lossy().into_owned()),
                 contents.to_string(),
-            )];
-            editor.agent_workspace = Some(Arc::clone(&workspace));
+            )]);
+            editor
+                .agent_manager
+                .set_workspace(Some(Arc::clone(&workspace)));
 
             let context = editor.agent_context_payload();
 
@@ -20382,11 +20342,13 @@ mod test {
             let link = root.path().join("linked.txt");
             std::os::unix::fs::symlink(&target, &link).unwrap();
             let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
-            editor.buffers = vec![Buffer::new(
+            editor.buffer_manager.replace_buffers(vec![Buffer::new(
                 Some(link.to_string_lossy().into_owned()),
                 "linked outside contents".to_string(),
-            )];
-            editor.agent_workspace = Some(Arc::clone(&workspace));
+            )]);
+            editor
+                .agent_manager
+                .set_workspace(Some(Arc::clone(&workspace)));
 
             let context = editor.agent_context_payload();
 
@@ -21151,7 +21113,7 @@ mod test {
             .unwrap();
         core.tick().await.unwrap();
         core.editor.current_dialog = Some(Box::new(FailingDialog));
-        core.editor.last_session_snapshot = Instant::now() - SESSION_SNAPSHOT_INTERVAL;
+        core.editor.session_manager.force_snapshot_due();
         ACTION_DISPATCHER.send_request(PluginRequest::AgentAcceptProposal {
             session_id: "session-1".to_string(),
             path: path.clone(),
@@ -21389,7 +21351,7 @@ mod test {
                 .await
                 .unwrap();
         }
-        core.editor.agent_bridge = Some(bridge);
+        core.editor.agent_manager.set_bridge(bridge);
 
         core.input(crate::headless::InputEvent::Key {
             code: crate::headless::KeyCode::Character('l'),
@@ -21399,7 +21361,10 @@ mod test {
         .unwrap();
 
         assert!(matches!(
-            core.editor.agent_bridge.as_mut().and_then(CodexBridge::try_recv),
+            core.editor
+                .agent_manager
+                .bridge_mut()
+                .and_then(CodexBridge::try_recv),
             Some(CodexEvent::Update { text, .. }) if text == AGENT_EVENTS_PER_TICK.to_string()
         ));
         drain_plugin_requests();
@@ -21465,16 +21430,12 @@ mod test {
             .await
             .unwrap();
         drop(worker);
-        editor.agent_bridge = Some(bridge);
-        editor.agent_active_sessions.insert("session-1".to_string());
-        editor.agent_task = Some(tokio::spawn(async move {
+        editor.agent_manager.set_bridge(bridge);
+        editor.agent_manager.mark_session_active("session-1");
+        editor.agent_manager.set_task(tokio::spawn(async move {
             anyhow::bail!("fixture adapter exited")
         }));
-        while !editor
-            .agent_task
-            .as_ref()
-            .is_some_and(tokio::task::JoinHandle::is_finished)
-        {
+        while !editor.agent_manager.is_task_finished() {
             tokio::task::yield_now().await;
         }
         let mut buffer =
@@ -21492,9 +21453,9 @@ mod test {
             .await
             .unwrap();
 
-        assert!(editor.agent_bridge.is_some());
-        assert!(editor.agent_task.is_some());
-        assert!(editor.agent_active_sessions.contains("session-1"));
+        assert!(editor.agent_manager.has_bridge());
+        assert!(editor.agent_manager.is_task_finished());
+        assert!(editor.agent_manager.is_session_active("session-1"));
         assert!(editor.last_error.is_none());
         assert!(matches!(
             ACTION_DISPATCHER.try_recv_request(),
@@ -21517,9 +21478,9 @@ mod test {
             .collect::<String>();
         expected.push_str("completed,lost");
         assert_eq!(editor.last_error.as_deref(), Some(expected.as_str()));
-        assert!(editor.agent_bridge.is_none());
-        assert!(editor.agent_task.is_none());
-        assert!(editor.agent_active_sessions.is_empty());
+        assert!(!editor.agent_manager.has_bridge());
+        assert!(!editor.agent_manager.is_task_finished());
+        assert!(!editor.agent_manager.is_session_active("session-1"));
         drain_plugin_requests();
     }
 
@@ -21576,9 +21537,7 @@ mod test {
             .await
             .unwrap();
         core.tick().await.unwrap();
-        core.editor
-            .agent_active_sessions
-            .insert("session-1".to_string());
+        core.editor.agent_manager.mark_session_active("session-1");
         let (bridge, mut worker) = CodexBridge::channel(NonZeroUsize::new(8).unwrap());
         for event in [
             CodexEvent::Update {
@@ -21605,11 +21564,11 @@ mod test {
         ] {
             worker.send(event).await.unwrap();
         }
-        core.editor.agent_bridge = Some(bridge);
+        core.editor.agent_manager.set_bridge(bridge);
 
         core.tick().await.unwrap();
 
-        assert!(!core.editor.agent_active_sessions.contains("session-1"));
+        assert!(!core.editor.agent_manager.is_session_active("session-1"));
         assert!(matches!(
             worker.recv().await,
             Some(CodexCommand::PermissionResponse { request_id, option_id })
@@ -21663,7 +21622,7 @@ mod test {
             })
             .await
             .unwrap();
-        core.editor.agent_bridge = Some(bridge);
+        core.editor.agent_manager.set_bridge(bridge);
 
         tokio::time::timeout(
             Duration::from_secs(1),
@@ -21704,9 +21663,11 @@ mod test {
             .unwrap();
         let workspace = Arc::new(Mutex::new(workspace));
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
-        editor.agent_workspace = Some(Arc::clone(&workspace));
+        editor
+            .agent_manager
+            .set_workspace(Some(Arc::clone(&workspace)));
         let (bridge, mut worker) = CodexBridge::channel(NonZeroUsize::new(8).unwrap());
-        editor.agent_bridge = Some(bridge);
+        editor.agent_manager.set_bridge(bridge);
         let mut buffer =
             RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
         let mut runtime = Runtime::new();
@@ -21726,7 +21687,7 @@ mod test {
                     && uri == "red-buffer://active"
                     && context.contains("Active file: [No Name]")
         ));
-        assert!(editor.agent_active_sessions.contains("session-1"));
+        assert!(editor.agent_manager.is_session_active("session-1"));
         let first_turn = {
             let mut workspace = workspace.lock().unwrap();
             workspace
@@ -21766,7 +21727,7 @@ mod test {
             .service_background(&mut buffer, &mut runtime)
             .await
             .unwrap();
-        assert!(editor.agent_active_sessions.contains("session-1"));
+        assert!(editor.agent_manager.is_session_active("session-1"));
 
         let generation = workspace.lock().unwrap().generation();
         ACTION_DISPATCHER.send_request(PluginRequest::AgentPrompt {
@@ -21814,7 +21775,7 @@ mod test {
             .service_background(&mut buffer, &mut runtime)
             .await
             .unwrap();
-        assert!(!editor.agent_active_sessions.contains("session-1"));
+        assert!(!editor.agent_manager.is_session_active("session-1"));
         ACTION_DISPATCHER.send_request(PluginRequest::AgentPrompt {
             session_id: "session-1".to_string(),
             text: "next prompt".to_string(),
@@ -22094,12 +22055,12 @@ mod test {
         let mut editor = splash_test_editor(100, 30, Config::default());
         assert!(rendered_dump(&mut editor, 100, 30).contains("red v"));
 
-        editor.buffers[0].insert_str(0, 0, "x");
+        editor.buffer_manager[0].insert_str(0, 0, "x");
         assert!(!rendered_dump(&mut editor, 100, 30).contains("red v"));
         assert!(editor.splash_dismissed);
 
         // Returning to a pristine-looking buffer must not resurrect it.
-        editor.buffers[0] = Buffer::new(None, String::new());
+        editor.buffer_manager[0] = Buffer::new(None, String::new());
         assert!(!rendered_dump(&mut editor, 100, 30).contains("red v"));
     }
 
@@ -22240,9 +22201,8 @@ mod test {
         let first = editor.search_matches("hello").unwrap();
 
         editor
-            .buffers
-            .push(Buffer::new(None, "hello hello".to_string()));
-        editor.current_buffer_index = 1;
+            .buffer_manager
+            .add_buffer(Buffer::new(None, "hello hello".to_string()));
         let second = editor.search_matches("hello").unwrap();
 
         assert!(!Arc::ptr_eq(&first, &second));
@@ -22252,7 +22212,7 @@ mod test {
     #[test]
     fn incremental_search_on_an_oversized_line_only_finds_the_next_match() {
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
-        editor.buffers[0] = Buffer::new(
+        editor.buffer_manager[0] = Buffer::new(
             Some("large.txt".to_string()),
             format!("{}\n", "x".repeat(MAX_HIGHLIGHT_SLICE_BYTES + 1)),
         );
@@ -22319,9 +22279,9 @@ mod test {
         assert_eq!(collect_print_requests(), vec!["changed"]);
         assert_eq!(
             editor
-                .notified_buffer_revisions
-                .get(&editor.current_buffer().id()),
-            Some(&revision)
+                .lsp_coordinator
+                .last_notified_revision(editor.current_buffer().id()),
+            Some(revision)
         );
     }
 
@@ -22439,7 +22399,7 @@ mod test {
             "// {}\nfn visible() {{ let value = \"highlighted\"; }}\n",
             "x".repeat(MAX_HIGHLIGHT_SLICE_BYTES)
         );
-        editor.buffers[0] = Buffer::new(Some("margin.rs".to_string()), contents);
+        editor.buffer_manager[0] = Buffer::new(Some("margin.rs".to_string()), contents);
 
         let spans = editor.viewport_highlight_spans(0, 1, 1).unwrap();
 
@@ -23715,12 +23675,12 @@ mod test {
             Some(path.to_string_lossy().into_owned()),
             "👋   value".to_string(),
         )]);
-        let uri = editor.buffers[0].uri().unwrap().unwrap();
-        let revision = editor.buffers[0].revision();
+        let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
+        let revision = editor.buffer_manager[0].revision();
         editor.pending_lsp_edit_requests.insert(
             41,
             PendingLspEdit {
-                buffer_id: editor.buffers[0].id(),
+                buffer_id: editor.buffer_manager[0].id(),
                 revision,
                 uri: uri.clone(),
             },
@@ -23759,17 +23719,17 @@ mod test {
             Some(path.to_string_lossy().into_owned()),
             "value".to_string(),
         )]);
-        let uri = editor.buffers[0].uri().unwrap().unwrap();
-        let revision = editor.buffers[0].revision();
+        let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
+        let revision = editor.buffer_manager[0].revision();
         editor.pending_lsp_edit_requests.insert(
             42,
             PendingLspEdit {
-                buffer_id: editor.buffers[0].id(),
+                buffer_id: editor.buffer_manager[0].id(),
                 revision,
                 uri: uri.clone(),
             },
         );
-        editor.buffers[0]
+        editor.buffer_manager[0]
             .replace_range_raw(TextRange::insertion(TextPosition::new(0, 0)), "dirty ");
         let message = InboundMessage::Message(ResponseMessage {
             id: 42,
@@ -23784,7 +23744,7 @@ mod test {
             editor.handle_lsp_message(&message, Some("textDocument/formatting".to_string()));
 
         assert!(action.is_none());
-        assert_eq!(editor.buffers[0].contents(), "dirty value");
+        assert_eq!(editor.buffer_manager[0].contents(), "dirty value");
         assert!(editor
             .last_error
             .as_deref()
@@ -23797,12 +23757,12 @@ mod test {
         std::fs::write(root.path().join(".red-root"), "").unwrap();
         let path = root.path().join("red code-action café.rs");
         let mut editor = workspace_lsp_test_editor(root.path(), &path, "let unused = 1;");
-        let uri = editor.buffers[0].uri().unwrap().unwrap();
-        let revision = editor.buffers[0].revision();
+        let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
+        let revision = editor.buffer_manager[0].revision();
         editor.pending_lsp_edit_requests.insert(
             43,
             PendingLspEdit {
-                buffer_id: editor.buffers[0].id(),
+                buffer_id: editor.buffer_manager[0].id(),
                 revision,
                 uri: uri.clone(),
             },
@@ -23891,11 +23851,11 @@ mod test {
             "second value".to_string(),
         );
         let mut editor = lsp_test_editor(vec![first, second]);
-        let first_uri = editor.buffers[0].uri().unwrap().unwrap();
-        let second_uri = editor.buffers[1].uri().unwrap().unwrap();
+        let first_uri = editor.buffer_manager[0].uri().unwrap().unwrap();
+        let second_uri = editor.buffer_manager[1].uri().unwrap().unwrap();
         let revisions = vec![
-            (first_uri.clone(), editor.buffers[0].revision()),
-            (second_uri.clone(), editor.buffers[1].revision()),
+            (first_uri.clone(), editor.buffer_manager[0].revision()),
+            (second_uri.clone(), editor.buffer_manager[1].revision()),
         ];
         let documents = vec![
             LspDocumentEdit {
@@ -23920,19 +23880,19 @@ mod test {
             .await
             .unwrap();
 
-        assert_eq!(editor.buffers[0].contents(), "dirty 👋 first\r\n");
-        assert_eq!(editor.buffers[1].contents(), "second updated");
-        assert!(editor.buffers[0].is_dirty());
-        assert!(editor.buffers[1].is_dirty());
+        assert_eq!(editor.buffer_manager[0].contents(), "dirty 👋 first\r\n");
+        assert_eq!(editor.buffer_manager[1].contents(), "second updated");
+        assert!(editor.buffer_manager[0].is_dirty());
+        assert!(editor.buffer_manager[1].is_dirty());
         assert!(matches!(
-            editor.buffers[0]
+            editor.buffer_manager[0]
                 .undo_history
                 .latest_transaction()
                 .map(|tx| &tx.origin),
             Some(EditOrigin::Lsp { .. })
         ));
         assert!(matches!(
-            editor.buffers[1]
+            editor.buffer_manager[1]
                 .undo_history
                 .latest_transaction()
                 .map(|tx| &tx.origin),
@@ -23954,11 +23914,11 @@ mod test {
                 "👋 second".to_string(),
             ),
         ]);
-        let first_uri = editor.buffers[0].uri().unwrap().unwrap();
-        let second_uri = editor.buffers[1].uri().unwrap().unwrap();
+        let first_uri = editor.buffer_manager[0].uri().unwrap().unwrap();
+        let second_uri = editor.buffer_manager[1].uri().unwrap().unwrap();
         let revisions = vec![
-            (first_uri.clone(), editor.buffers[0].revision()),
-            (second_uri.clone(), editor.buffers[1].revision()),
+            (first_uri.clone(), editor.buffer_manager[0].revision()),
+            (second_uri.clone(), editor.buffer_manager[1].revision()),
         ];
         let documents = vec![
             LspDocumentEdit {
@@ -23983,8 +23943,8 @@ mod test {
             .await
             .unwrap();
 
-        assert_eq!(editor.buffers[0].contents(), "first");
-        assert_eq!(editor.buffers[1].contents(), "👋 second");
+        assert_eq!(editor.buffer_manager[0].contents(), "first");
+        assert_eq!(editor.buffer_manager[1].contents(), "👋 second");
         assert!(editor
             .last_error
             .as_deref()
@@ -24015,15 +23975,15 @@ mod test {
             .await
             .unwrap();
 
-        assert_eq!(editor.buffers[0].contents(), "first");
-        assert_eq!(editor.buffers[1].contents(), "👋 second");
+        assert_eq!(editor.buffer_manager[0].contents(), "first");
+        assert_eq!(editor.buffer_manager[1].contents(), "👋 second");
         assert!(editor
             .last_error
             .as_deref()
             .is_some_and(|error| error.contains("overlap")));
 
         editor.last_error = None;
-        editor.buffers[1]
+        editor.buffer_manager[1]
             .replace_range_raw(TextRange::insertion(TextPosition::new(0, 0)), "dirty ");
         editor
             .test_execute_production_action(Action::ApplyLspWorkspaceEdit {
@@ -24046,8 +24006,8 @@ mod test {
             .await
             .unwrap();
 
-        assert_eq!(editor.buffers[0].contents(), "first");
-        assert_eq!(editor.buffers[1].contents(), "dirty 👋 second");
+        assert_eq!(editor.buffer_manager[0].contents(), "first");
+        assert_eq!(editor.buffer_manager[1].contents(), "dirty 👋 second");
         assert!(editor
             .last_error
             .as_deref()
@@ -24061,8 +24021,8 @@ mod test {
             Some(path.to_string_lossy().into_owned()),
             "value".to_string(),
         )]);
-        let uri = editor.buffers[0].uri().unwrap().unwrap();
-        let revision = editor.buffers[0].revision();
+        let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
+        let revision = editor.buffer_manager[0].revision();
 
         editor
             .test_execute_production_action(Action::ApplyLspWorkspaceEdit {
@@ -24078,7 +24038,7 @@ mod test {
             .await
             .unwrap();
 
-        assert_eq!(editor.buffers[0].contents(), "value");
+        assert_eq!(editor.buffer_manager[0].contents(), "value");
         assert!(editor
             .last_error
             .as_deref()
@@ -24128,12 +24088,12 @@ mod test {
         std::fs::write(root.path().join(".red-root"), "").unwrap();
         let path = root.path().join("red rename café.rs");
         let mut editor = workspace_lsp_test_editor(root.path(), &path, "let old_name = 1;");
-        let uri = editor.buffers[0].uri().unwrap().unwrap();
-        let revision = editor.buffers[0].revision();
+        let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
+        let revision = editor.buffer_manager[0].revision();
         editor.pending_lsp_edit_requests.insert(
             51,
             PendingLspEdit {
-                buffer_id: editor.buffers[0].id(),
+                buffer_id: editor.buffer_manager[0].id(),
                 revision,
                 uri: uri.clone(),
             },
@@ -24170,16 +24130,16 @@ mod test {
             Some(path.to_string_lossy().into_owned()),
             "old_name".to_string(),
         )]);
-        let uri = editor.buffers[0].uri().unwrap().unwrap();
+        let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
         editor.pending_lsp_edit_requests.insert(
             52,
             PendingLspEdit {
-                buffer_id: editor.buffers[0].id(),
-                revision: editor.buffers[0].revision(),
+                buffer_id: editor.buffer_manager[0].id(),
+                revision: editor.buffer_manager[0].revision(),
                 uri: uri.clone(),
             },
         );
-        editor.buffers[0]
+        editor.buffer_manager[0]
             .replace_range_raw(TextRange::insertion(TextPosition::new(0, 0)), "dirty ");
         let response = InboundMessage::Message(ResponseMessage {
             id: 52,
@@ -24193,7 +24153,7 @@ mod test {
         assert!(editor
             .handle_lsp_message(&response, Some("textDocument/rename".to_string()))
             .is_none());
-        assert_eq!(editor.buffers[0].contents(), "dirty old_name");
+        assert_eq!(editor.buffer_manager[0].contents(), "dirty old_name");
         assert!(editor
             .last_error
             .as_deref()
@@ -24211,13 +24171,13 @@ mod test {
         std::fs::write(&source, "source").unwrap();
         std::fs::write(&target, "target").unwrap();
         let mut editor = workspace_lsp_test_editor(root_a.path(), &source, "source");
-        let source_uri = editor.buffers[0].uri().unwrap().unwrap();
+        let source_uri = editor.buffer_manager[0].uri().unwrap().unwrap();
         let target_uri = crate::lsp::file_uri(&target).unwrap();
-        let revision = editor.buffers[0].revision();
+        let revision = editor.buffer_manager[0].revision();
         editor.pending_lsp_edit_requests.insert(
             59,
             PendingLspEdit {
-                buffer_id: editor.buffers[0].id(),
+                buffer_id: editor.buffer_manager[0].id(),
                 revision,
                 uri: source_uri.clone(),
             },
@@ -24284,18 +24244,18 @@ mod test {
         let second_path = root.path().join("red-rename-secondary.rs");
         std::fs::create_dir(root.path().join("src")).unwrap();
         let mut editor = workspace_lsp_test_editor(root.path(), &first_path, "let source = 1;");
-        editor.buffers.push(Buffer::new(
+        editor.buffer_manager.push_buffer(Buffer::new(
             Some(second_path.to_string_lossy().into_owned()),
             "let source = 2;".to_string(),
         ));
-        let first_uri = editor.buffers[0].uri().unwrap().unwrap();
-        let second_uri = editor.buffers[1].uri().unwrap().unwrap();
-        let first_revision = editor.buffers[0].revision();
-        let second_revision = editor.buffers[1].revision();
+        let first_uri = editor.buffer_manager[0].uri().unwrap().unwrap();
+        let second_uri = editor.buffer_manager[1].uri().unwrap().unwrap();
+        let first_revision = editor.buffer_manager[0].revision();
+        let second_revision = editor.buffer_manager[1].revision();
         editor.pending_lsp_edit_requests.insert(
             53,
             PendingLspEdit {
-                buffer_id: editor.buffers[0].id(),
+                buffer_id: editor.buffer_manager[0].id(),
                 revision: first_revision,
                 uri: first_uri.clone(),
             },
@@ -24307,7 +24267,7 @@ mod test {
                 (second_uri.clone(), second_revision),
             ],
         );
-        editor.buffers[1]
+        editor.buffer_manager[1]
             .replace_range_raw(TextRange::insertion(TextPosition::new(0, 0)), "dirty ");
         let aliased_second_uri = format!(
             "{}/src/../red-rename-secondary.rs",
@@ -24340,8 +24300,8 @@ mod test {
 
         editor.test_execute_production_action(action).await.unwrap();
 
-        assert_eq!(editor.buffers[0].contents(), "let source = 1;");
-        assert_eq!(editor.buffers[1].contents(), "dirty let source = 2;");
+        assert_eq!(editor.buffer_manager[0].contents(), "let source = 1;");
+        assert_eq!(editor.buffer_manager[1].contents(), "dirty let source = 2;");
         assert!(editor
             .last_error
             .as_deref()
@@ -24356,7 +24316,7 @@ mod test {
             Some(path.to_string_lossy().into_owned()),
             "value".to_string(),
         )]);
-        let uri = editor.buffers[0].uri().unwrap().unwrap();
+        let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
         let message = InboundMessage::ServerRequest(LspServerRequest {
             id: serde_json::json!("server-1"),
             method: "workspace/applyEdit".to_string(),
@@ -24427,11 +24387,11 @@ mod test {
             .unwrap();
 
         assert_eq!(std::fs::read_to_string(&closed).unwrap(), "👋 old\r\n");
-        assert_eq!(editor.buffers.len(), 2);
-        assert_eq!(editor.buffers[1].contents(), "👋 new\r\n");
-        assert!(editor.buffers[1].is_dirty());
+        assert_eq!(editor.buffer_manager.len(), 2);
+        assert_eq!(editor.buffer_manager[1].contents(), "👋 new\r\n");
+        assert!(editor.buffer_manager[1].is_dirty());
         assert!(matches!(
-            editor.buffers[1]
+            editor.buffer_manager[1]
                 .undo_history
                 .latest_transaction()
                 .map(|transaction| &transaction.origin),
@@ -24448,7 +24408,7 @@ mod test {
         let new = root.path().join("new.rs");
         std::fs::write(&old, "disk contents\n").unwrap();
         let mut editor = workspace_lsp_test_editor(root.path(), &old, "unsaved contents\n");
-        editor.buffers[0].dirty = true;
+        editor.buffer_manager[0].dirty = true;
         let operations = workspace_edit_operations(&serde_json::json!({
             "documentChanges": [{ "kind": "rename", "oldUri": crate::lsp::file_uri(&old).unwrap(), "newUri": crate::lsp::file_uri(&new).unwrap() }]
         }))
@@ -24471,11 +24431,11 @@ mod test {
         assert!(!old.exists());
         assert_eq!(std::fs::read_to_string(&new).unwrap(), "disk contents\n");
         assert_eq!(
-            editor.buffers[0].file.as_deref(),
+            editor.buffer_manager[0].file.as_deref(),
             Some(new.to_str().unwrap())
         );
-        assert_eq!(editor.buffers[0].contents(), "unsaved contents\n");
-        assert!(editor.buffers[0].is_dirty());
+        assert_eq!(editor.buffer_manager[0].contents(), "unsaved contents\n");
+        assert!(editor.buffer_manager[0].is_dirty());
     }
 
     #[cfg(not(unix))]
@@ -24489,7 +24449,7 @@ mod test {
         std::fs::write(&active, "disk contents\n").unwrap();
         std::fs::write(&closed, "👋 old\r\n").unwrap();
         let mut editor = workspace_lsp_test_editor(root.path(), &active, "unsaved contents\n");
-        editor.buffers[0].dirty = true;
+        editor.buffer_manager[0].dirty = true;
         let operations = workspace_edit_operations(&serde_json::json!({
             "changes": { (crate::lsp::file_uri(&closed).unwrap()): [{
                 "range": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 6 } },
@@ -24513,9 +24473,9 @@ mod test {
             .unwrap();
 
         assert_eq!(std::fs::read_to_string(&closed).unwrap(), "👋 old\r\n");
-        assert_eq!(editor.buffers.len(), 1);
-        assert_eq!(editor.buffers[0].contents(), "unsaved contents\n");
-        assert!(editor.buffers[0].is_dirty());
+        assert_eq!(editor.buffer_manager.len(), 1);
+        assert_eq!(editor.buffer_manager[0].contents(), "unsaved contents\n");
+        assert!(editor.buffer_manager[0].is_dirty());
         assert!(editor
             .last_error
             .as_deref()
@@ -24547,11 +24507,11 @@ mod test {
         assert_eq!(std::fs::read_to_string(&active).unwrap(), "disk contents\n");
         assert!(!renamed.exists());
         assert_eq!(
-            editor.buffers[0].file.as_deref(),
+            editor.buffer_manager[0].file.as_deref(),
             Some(active.to_str().unwrap())
         );
-        assert_eq!(editor.buffers[0].contents(), "unsaved contents\n");
-        assert!(editor.buffers[0].is_dirty());
+        assert_eq!(editor.buffer_manager[0].contents(), "unsaved contents\n");
+        assert!(editor.buffer_manager[0].is_dirty());
         assert!(editor
             .last_error
             .as_deref()
@@ -24568,12 +24528,12 @@ mod test {
             "value   \n".to_string(),
         )]);
         editor.config.lsp.format_on_save = true;
-        let uri = editor.buffers[0].uri().unwrap().unwrap();
+        let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
         editor.pending_lsp_edit_requests.insert(
             61,
             PendingLspEdit {
-                buffer_id: editor.buffers[0].id(),
-                revision: editor.buffers[0].revision(),
+                buffer_id: editor.buffer_manager[0].id(),
+                revision: editor.buffer_manager[0].revision(),
                 uri: uri.clone(),
             },
         );
@@ -24602,8 +24562,8 @@ mod test {
         editor.test_execute_production_action(action).await.unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "value\n");
-        assert_eq!(editor.buffers[0].contents(), "value\n");
-        assert!(!editor.buffers[0].is_dirty());
+        assert_eq!(editor.buffer_manager[0].contents(), "value\n");
+        assert!(!editor.buffer_manager[0].is_dirty());
         assert!(editor.pending_lsp_edit_requests.is_empty());
         assert!(editor.pending_lsp_format_saves.is_empty());
     }
@@ -24617,12 +24577,12 @@ mod test {
             "value   \n".to_string(),
         )]);
         editor.config.lsp.format_on_save = true;
-        let uri = editor.buffers[0].uri().unwrap().unwrap();
+        let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
         editor.pending_lsp_edit_requests.insert(
             64,
             PendingLspEdit {
-                buffer_id: editor.buffers[0].id(),
-                revision: editor.buffers[0].revision(),
+                buffer_id: editor.buffer_manager[0].id(),
+                revision: editor.buffer_manager[0].revision(),
                 uri: uri.clone(),
             },
         );
@@ -24651,8 +24611,8 @@ mod test {
         editor.test_execute_production_action(action).await.unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "value\n");
-        assert_eq!(editor.buffers[0].contents(), "value\n");
-        assert!(!editor.buffers[0].is_dirty());
+        assert_eq!(editor.buffer_manager[0].contents(), "value\n");
+        assert!(!editor.buffer_manager[0].is_dirty());
     }
 
     #[cfg(unix)]
@@ -24898,8 +24858,8 @@ while True:
         assert_eq!(events.matches("textDocument/formatting ").count(), 1);
         assert!(events.contains(&format!("textDocument/didOpen {uri}")));
         assert!(events.contains(&format!("textDocument/formatting {uri}")));
-        assert_eq!(editor.buffers[0].contents(), "value\n");
-        assert!(!editor.buffers[0].is_dirty());
+        assert_eq!(editor.buffer_manager[0].contents(), "value\n");
+        assert!(!editor.buffer_manager[0].is_dirty());
     }
 
     #[cfg(unix)]
@@ -24927,9 +24887,12 @@ while True:
         assert_eq!(events.matches("textDocument/formatting ").count(), 1);
         assert!(events.contains(&format!("textDocument/didOpen {uri}")));
         assert!(events.contains(&format!("textDocument/formatting {uri}")));
-        assert_eq!(editor.buffers[0].file.as_deref(), Some(file.as_str()));
-        assert_eq!(editor.buffers[0].contents(), "value\n");
-        assert!(!editor.buffers[0].is_dirty());
+        assert_eq!(
+            editor.buffer_manager[0].file.as_deref(),
+            Some(file.as_str())
+        );
+        assert_eq!(editor.buffer_manager[0].contents(), "value\n");
+        assert!(!editor.buffer_manager[0].is_dirty());
     }
 
     #[cfg(unix)]
@@ -25004,7 +24967,7 @@ while True:
             Buffer::new(Some(source_file.clone()), "unsaved source\n".to_string()),
         ]);
         editor.config.lsp.format_on_save = true;
-        editor.current_buffer_index = 1;
+        editor.buffer_manager.set_active_index(1);
         editor.mode = Mode::Insert;
         editor.begin_transaction("insert");
 
@@ -25019,7 +24982,7 @@ while True:
             Some(source_file.as_str())
         );
         assert_eq!(editor.current_buffer().contents(), "unsaved source\n");
-        assert_eq!(editor.buffers[0].contents(), "open target\n");
+        assert_eq!(editor.buffer_manager[0].contents(), "open target\n");
         assert_eq!(std::fs::read_to_string(&source).unwrap(), "disk source\n");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "disk target\n");
         assert!(editor.pending_lsp_edit_requests.is_empty());
@@ -25066,8 +25029,8 @@ while True:
             .expect("failed formatter initialization should fall back to an unformatted save");
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "value   \n");
-        assert_eq!(editor.buffers[0].contents(), "value   \n");
-        assert!(!editor.buffers[0].is_dirty());
+        assert_eq!(editor.buffer_manager[0].contents(), "value   \n");
+        assert!(!editor.buffer_manager[0].is_dirty());
         assert!(editor.pending_lsp_edit_requests.is_empty());
         assert!(editor.pending_lsp_format_saves.is_empty());
         assert!(editor.last_error.as_deref().is_some_and(|error| {
@@ -25119,11 +25082,13 @@ while True:
             if !save_as {
                 std::fs::write(&target, "disk value\n").unwrap();
             }
-            editor.buffers.push(Buffer::new(
+            editor.buffer_manager.push_buffer(Buffer::new(
                 (!save_as).then(|| target.to_string_lossy().into_owned()),
                 "value   \n".to_string(),
             ));
-            editor.current_buffer_index = editor.buffers.len() - 1;
+            editor
+                .buffer_manager
+                .set_active_index(editor.buffer_manager.len() - 1);
 
             let action = if save_as {
                 Action::SaveAs(target.to_string_lossy().into_owned())
@@ -25159,12 +25124,12 @@ while True:
                 Some(path.to_string_lossy().into_owned()),
                 "value\n".to_string(),
             )]);
-            let uri = editor.buffers[0].uri().unwrap().unwrap();
+            let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
             editor.pending_lsp_edit_requests.insert(
                 66,
                 PendingLspEdit {
-                    buffer_id: editor.buffers[0].id(),
-                    revision: editor.buffers[0].revision(),
+                    buffer_id: editor.buffer_manager[0].id(),
+                    revision: editor.buffer_manager[0].revision(),
                     uri: uri.clone(),
                 },
             );
@@ -25224,12 +25189,12 @@ while True:
                 Buffer::new(Some(target_file.clone()), "decoy buffer\n".to_string()),
                 Buffer::new(Some(target_file.clone()), "unsaved source\n".to_string()),
             ]);
-            let buffer_id = editor.buffers[1].id();
+            let buffer_id = editor.buffer_manager[1].id();
             editor.pending_lsp_edit_requests.insert(
                 71,
                 PendingLspEdit {
                     buffer_id,
-                    revision: editor.buffers[1].revision(),
+                    revision: editor.buffer_manager[1].revision(),
                     uri: target_uri.clone(),
                 },
             );
@@ -25277,9 +25242,9 @@ while True:
                 std::fs::read_to_string(&target).unwrap(),
                 "unsaved source\n"
             );
-            assert_eq!(editor.buffers[0].contents(), "decoy buffer\n");
-            assert_eq!(editor.buffers[1].contents(), "unsaved source\n");
-            assert!(!editor.buffers[1].is_dirty());
+            assert_eq!(editor.buffer_manager[0].contents(), "decoy buffer\n");
+            assert_eq!(editor.buffer_manager[1].contents(), "unsaved source\n");
+            assert!(!editor.buffer_manager[1].is_dirty());
             assert!(editor.pending_lsp_edit_requests.is_empty());
             assert!(editor.pending_lsp_format_saves.is_empty());
             assert!(editor.last_error.as_deref().is_some_and(|error| {
@@ -25302,11 +25267,11 @@ while True:
                 Some(target_file.clone()),
                 "unsaved source\n".to_string(),
             )]);
-            let revision = editor.buffers[0].revision();
+            let revision = editor.buffer_manager[0].revision();
             editor.pending_lsp_edit_requests.insert(
                 72,
                 PendingLspEdit {
-                    buffer_id: editor.buffers[0].id(),
+                    buffer_id: editor.buffer_manager[0].id(),
                     revision,
                     uri: target_uri,
                 },
@@ -25319,7 +25284,7 @@ while True:
                 },
             );
             if failure == "stale" || failure == "stale-request" {
-                editor.buffers[0]
+                editor.buffer_manager[0]
                     .replace_range_raw(TextRange::insertion(TextPosition::new(0, 0)), "new ");
             }
             let message = if failure == "stale-request" {
@@ -25405,7 +25370,7 @@ while True:
                         }],
                     },
                 }],
-                expected_revisions: vec![(target_uri.clone(), editor.buffers[0].revision())],
+                expected_revisions: vec![(target_uri.clone(), editor.buffer_manager[0].revision())],
                 command: None,
                 label: "format document".to_string(),
                 response: None,
@@ -25440,7 +25405,7 @@ while True:
             Some(target_file.clone()),
             "value   \n".to_string(),
         )]);
-        let revision = editor.buffers[0].revision();
+        let revision = editor.buffer_manager[0].revision();
 
         editor
             .test_execute_production_action(Action::ApplyLspWorkspaceEditOperations {
@@ -25516,12 +25481,12 @@ while True:
             Some(path.to_string_lossy().into_owned()),
             "value\n".to_string(),
         )]);
-        let uri = editor.buffers[0].uri().unwrap().unwrap();
+        let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
         editor.pending_lsp_edit_requests.insert(
             62,
             PendingLspEdit {
-                buffer_id: editor.buffers[0].id(),
-                revision: editor.buffers[0].revision(),
+                buffer_id: editor.buffer_manager[0].id(),
+                revision: editor.buffer_manager[0].revision(),
                 uri,
             },
         );
@@ -25532,7 +25497,7 @@ while True:
                 previous_file: None,
             },
         );
-        editor.buffers[0]
+        editor.buffer_manager[0]
             .replace_range_raw(TextRange::insertion(TextPosition::new(0, 0)), "dirty ");
         let response = InboundMessage::Message(ResponseMessage {
             id: 62,
@@ -25547,7 +25512,7 @@ while True:
             .handle_lsp_message(&response, Some("textDocument/formatting".to_string()))
             .is_none());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "value\n");
-        assert_eq!(editor.buffers[0].contents(), "dirty value\n");
+        assert_eq!(editor.buffer_manager[0].contents(), "dirty value\n");
         assert!(editor.pending_lsp_format_saves.is_empty());
         assert!(editor
             .last_error
@@ -25564,12 +25529,12 @@ while True:
             Some(path.to_string_lossy().into_owned()),
             "unsaved value\n".to_string(),
         )]);
-        let uri = editor.buffers[0].uri().unwrap().unwrap();
+        let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
         editor.pending_lsp_edit_requests.insert(
             63,
             PendingLspEdit {
-                buffer_id: editor.buffers[0].id(),
-                revision: editor.buffers[0].revision(),
+                buffer_id: editor.buffer_manager[0].id(),
+                revision: editor.buffer_manager[0].revision(),
                 uri,
             },
         );
@@ -25591,7 +25556,7 @@ while True:
             .handle_lsp_message(&message, Some("textDocument/formatting".to_string()))
             .is_none());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "disk value\n");
-        assert_eq!(editor.buffers[0].contents(), "unsaved value\n");
+        assert_eq!(editor.buffer_manager[0].contents(), "unsaved value\n");
         assert!(editor.pending_lsp_edit_requests.is_empty());
         assert!(editor.pending_lsp_format_saves.is_empty());
         assert_eq!(editor.last_error.as_deref(), Some("formatter failed"));
@@ -25841,7 +25806,7 @@ while True:
             editor.current_buffer().file,
             Some(file.to_string_lossy().into_owned())
         );
-        assert_eq!(editor.buffers.len(), 2);
+        assert_eq!(editor.buffer_manager.len(), 2);
 
         editor
             .execute(
@@ -25852,7 +25817,7 @@ while True:
             .await
             .unwrap();
 
-        assert_eq!(editor.buffers.len(), 2);
+        assert_eq!(editor.buffer_manager.len(), 2);
 
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -25975,7 +25940,7 @@ while True:
 
         assert_eq!(editor.buffer_line(), 1);
         assert_eq!(editor.cx, 2);
-        assert_eq!(editor.buffers.len(), 2);
+        assert_eq!(editor.buffer_manager.len(), 2);
         assert!(!editor.jump_list.is_empty());
 
         editor
@@ -26007,7 +25972,7 @@ while True:
             .await
             .unwrap();
 
-        assert_eq!(editor.buffers.len(), 2);
+        assert_eq!(editor.buffer_manager.len(), 2);
         assert_eq!(editor.test_window_count(), 2);
 
         std::fs::remove_file(file).unwrap();
