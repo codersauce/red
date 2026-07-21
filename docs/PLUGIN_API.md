@@ -1,6 +1,6 @@
 # Husk plugin compatibility
 
-Red host API version `0.2.0` is defined by
+Red host API version `0.3.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -32,11 +32,54 @@ create alternate colon commands. The palette shows the exact, case-sensitive
 `:Name` invocation when it is available and resolves keymaps from the user's
 effective configuration. Existing two-argument registrations continue to work.
 
+## Callback-scoped pickers
+
+New pickers should use
+`OpenPicker(title: String, items: [PickerItem], options: PickerOptions, handlers: PickerHandlers)`.
+The host returns an opaque integer handle that may be passed to `UpdatePickerItems`,
+`UpdatePickerQuery`, `UpdatePickerStatus`, and `ClosePicker`. Plugins
+must not assign or interpret this handle.
+
+```husk
+red::execute("OpenPicker", "Themes", items, PickerOptions {
+    placeholder: "Filter themes",
+}, PickerHandlers {
+    changed: theme_changed,
+    cancelled: theme_cancelled,
+    selected: theme_selected,
+});
+```
+
+`PickerHandlers` accepts `selected`, `cancelled`, `changed`, `query`, and `action`
+callbacks; unused handlers may be omitted. `changed`, `query`, and `action` can run
+repeatedly. Selection and cancellation are terminal: the host consumes every handler for
+that picker before invoking the terminal callback. Closing or replacing the dialog,
+reloading its plugin, or unloading its plugin also releases the handlers. Stale handles
+are ignored.
+
+Callbacks are retained by the runtime and delivered only to the plugin that opened the
+picker. They do not use global `picker:*:<id>` subscriptions. Picker items and callback
+payloads use the declared `PickerItem`, `PickerCancelled`, and `PickerActionEvent` records;
+the `PickerItem.data` field remains `Json` so a plugin can attach its own payload.
+
+`OpenPicker` was added in host API `0.3.0`. Plugins using it should declare
+`"red_api_version": "^0.3.0"`. The numeric-ID `OpenDynamicPicker` API remains
+available for compatibility, but new plugins should not use it.
+
 ## Agent composer
 
-Plugins that collect an agent request should call `OpenAgentComposer(title: String, id: i32, query: String, history: [String])`. The host owns multiline editing, wrapping, cursor movement, and history navigation; it does not send a callback for each keystroke. On submit it emits `composer:submitted:<id>` with the complete prompt as a JSON string, and on cancellation it emits `composer:cancelled:<id>`. These callbacks are delivered only to the plugin that opened the composer. Input is limited to 128 KiB so an escaping-heavy prompt remains within the Codex app-server frame limit; an oversized paste leaves the current draft intact and shows a validation message. Enter submits, `Ctrl-j` or Shift-Enter inserts a newline, Escape or `Ctrl-c` cancels, and `Ctrl-p` / `Ctrl-n` moves through the supplied history while preserving the current draft.
+Plugins that collect a multiline request should call `OpenComposer(title: String, query: String, history: [String], handlers: ComposerHandlers)`. `submitted` receives the complete prompt as a `String`; `cancelled` receives a `ComposerCancelled` record. Both are terminal one-shot callbacks scoped to the plugin that opened the composer, so plugins do not allocate IDs or register synthetic event names.
 
-`OpenAgentComposer` and its composer events were introduced in host API `0.2.0`. Plugins migrating from a picker-based prompt should declare `"red_api_version": "^0.2.0"`, replace the one-item `OpenDynamicPicker` call and its per-keystroke query callback with `OpenAgentComposer`, and handle the complete `composer:submitted:<id>` payload. A `^0.1.0` requirement intentionally does not match the new pre-1.0 minor API.
+```husk
+red::execute("OpenComposer", "Agent prompt", draft, history, ComposerHandlers {
+    submitted: prompt_submitted,
+    cancelled: prompt_cancelled,
+});
+```
+
+The host owns multiline editing, wrapping, cursor movement, and history navigation; it does not send a callback for each keystroke. Input is limited to 128 KiB so an escaping-heavy prompt remains within the Codex app-server frame limit; an oversized paste leaves the current draft intact and shows a validation message. Enter submits, `Ctrl-j` or Shift-Enter inserts a newline, Escape or `Ctrl-c` cancels, and `Ctrl-p` / `Ctrl-n` moves through the supplied history while preserving the current draft.
+
+`OpenComposer` was introduced in host API `0.3.0`. The numeric-ID `OpenAgentComposer` API and its `composer:submitted:<id>` / `composer:cancelled:<id>` events remain available for compatibility with `0.2.0` plugins.
 
 `AgentArchiveSession(session_id: String)` was also introduced in host API `0.2.0`. Use it when Codex app-server has already stopped: pending proposals remain reviewable, and the host does not send an interrupt to a replacement process that may reuse the same session ID. Use `AgentCloseSession(session_id: String)` for a live session that should be closed normally.
 
@@ -63,6 +106,14 @@ allowlisted. Process stdin is limited to 16 MiB, raw output to 2 MiB, individual
 streaming lines to 256 KiB, and pending process events to 16 (at most roughly 32 MiB
 of payload); oversized output is
 reported without letting an untrusted process grow editor memory indefinitely.
+
+## Dynamic JSON boundary
+
+`Json` remains intentional for persisted plugin state, arbitrary user configuration,
+external process data, and plugin-defined payloads such as `PickerItem.data`. Values with
+a host-defined shape should use nominal records instead. Picker callbacks are the first
+migrated slice; request results, editor events, styles, panel values, and the remaining
+bundled-plugin helpers will move incrementally as their host schemas become canonical.
 
 ## Transactional reload and state
 

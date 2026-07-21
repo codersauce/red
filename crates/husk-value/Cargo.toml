@@ -1,0 +1,10 @@
+[package]
+name = "husk-value"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Backend-neutral owned values crossing Husk host boundaries"
+
+[dependencies]
+serde_json = "1.0.113"

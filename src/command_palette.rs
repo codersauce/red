@@ -1014,9 +1014,8 @@ fn humanize_identifier(identifier: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use husk::CommandMetadata;
-
     use super::*;
+    use crate::plugin::CommandMetadata;
 
     fn default_keys() -> Keys {
         let config: crate::config::Config =

@@ -1,5 +1,5 @@
 {
-  "version": "0.2.0",
+  "version": "0.3.0",
   "calls": [
     { "name": "Print", "kind": "execute", "signature": "(message: String)", "introduced": "0.1.0" },
     { "name": "FilePicker", "kind": "execute", "signature": "()", "introduced": "0.1.0" },
@@ -31,6 +31,8 @@
     { "name": "ClearDecorations", "kind": "execute", "signature": "(namespace: String)", "introduced": "0.1.0" },
     { "name": "SetGutterSigns", "kind": "execute", "signature": "(namespace: String, signs: [GutterSign])", "introduced": "0.1.0" },
     { "name": "ClearGutterSigns", "kind": "execute", "signature": "(namespace: String)", "introduced": "0.1.0" },
+    { "name": "OpenPicker", "kind": "execute", "signature": "(title: String, items: [PickerItem], options: PickerOptions, handlers: PickerHandlers)", "introduced": "0.3.0" },
+    { "name": "OpenComposer", "kind": "execute", "signature": "(title: String, query: String, history: [String], handlers: ComposerHandlers)", "introduced": "0.3.0" },
     { "name": "OpenDynamicPicker", "kind": "execute", "signature": "(title: String, id: i32, items: [PickerItem], options: PickerOptions)", "introduced": "0.1.0" },
     { "name": "OpenAgentComposer", "kind": "execute", "signature": "(title: String, id: i32, query: String, history: [String])", "introduced": "0.2.0" },
     { "name": "UpdatePickerItems", "kind": "execute", "signature": "(id: i32, items: [PickerItem])", "introduced": "0.1.0" },

@@ -11,16 +11,13 @@ pub fn activate() {
         description: "Find text across the workspace",
         aliases: ["ripgrep", "find text"],
     });
-    red::on("picker:query:301", search_query);
-    red::on("picker:action:301", picker_action);
-    red::on("picker:selected:301", open_current);
-    red::on("picker:cancelled:301", picker_cancelled);
     red::on("panel:event:project-search-results", export_panel_event);
     red::on("timeout:callback", timeout_callback);
     reset_state();
 }
 
 fn project_search() {
+    close_search_picker();
     cancel_process();
     reset_state();
     red::request("GetConfig", cwd_loaded, "cwd");
@@ -28,6 +25,7 @@ fn project_search() {
 
 fn reset_state() {
     cancel_timers();
+    red::state_set("project_search_picker", red::null());
     red::state_set("project_search_cwd", ".");
     red::state_set("project_search_history_by_cwd", Json {});
     red::state_set("project_search_history", []);
@@ -65,7 +63,7 @@ fn history_loaded(event: Json) {
     let history = history_by_cwd[red::string(red::state("project_search_cwd"), ".")];
     if history == red::null() { history = []; }
     red::state_set("project_search_history", history);
-    red::execute("OpenDynamicPicker", "Find in Files", 301, [], PickerOptions {
+    let handle = red::execute("OpenPicker", "Find in Files", [], PickerOptions {
         external_filter: true,
         placeholder: "Search with ripgrep",
         status: status_text(),
@@ -82,14 +80,19 @@ fn history_loaded(event: Json) {
             PickerAction { action: "history_back", key: "Ctrl-h", label: "Previous search" },
             PickerAction { action: "history_forward", key: "Ctrl-l", label: "Next search" },
         ],
+    }, PickerHandlers {
+        query: search_query,
+        action: picker_action,
+        selected: open_current,
+        cancelled: picker_cancelled,
     });
+    red::state_set("project_search_picker", handle);
 }
 
-fn search_query(query: Json) {
-    let text = red::string(query, "");
-    red::state_set("project_search_query", text);
+fn search_query(query: String) {
+    red::state_set("project_search_query", query);
     red::state_set("project_search_history_index", -1);
-    red::state_set("project_search_history_draft", text);
+    red::state_set("project_search_history_draft", query);
     schedule_run();
 }
 
@@ -256,8 +259,12 @@ fn schedule_refresh() {
 }
 
 fn refresh_picker() {
-    red::execute("UpdatePickerItems", 301, red::state("project_search_items"));
-    red::execute("UpdatePickerStatus", 301, status_text());
+    let handle = red::state("project_search_picker");
+    if handle == red::null() {
+        return;
+    }
+    red::execute("UpdatePickerItems", handle, red::state("project_search_items"));
+    red::execute("UpdatePickerStatus", handle, status_text());
 }
 
 fn status_text() -> String {
@@ -306,7 +313,7 @@ fn append_flag(flags: String, flag: String) -> String {
     return flags + " " + flag;
 }
 
-fn match_item(data: Json, index: i32) -> Json {
+fn match_item(data: Json, index: i32) -> PickerItem {
     let path = red::text_field(data.path);
     let normalized_path = red::replace_all(path, "\\", "/");
     let path_parts = red::split(normalized_path, "/");
@@ -371,7 +378,7 @@ fn match_item(data: Json, index: i32) -> Json {
     };
 }
 
-fn picker_action(event: Json) {
+fn picker_action(event: PickerActionEvent) {
     if event.action == "open_horizontal" {
         open_item(event.item, "horizontal");
     } else if event.action == "open_vertical" {
@@ -405,7 +412,7 @@ fn picker_action(event: Json) {
     }
 }
 
-fn open_current(item: Json) {
+fn open_current(item: PickerItem) {
     open_item(item, "current");
 }
 
@@ -416,7 +423,7 @@ fn open_item(item: Json, target: String) {
     remember_query();
     cancel_process();
     cancel_timers();
-    red::execute("ClosePicker", 301);
+    close_search_picker();
     red::execute("OpenLocation", item.data.location, target);
 }
 
@@ -459,7 +466,11 @@ fn move_history(delta: i32) {
     if index >= 0 {
         query = red::string(history[index], "");
     }
-    red::execute("UpdatePickerQuery", 301, query);
+    let handle = red::state("project_search_picker");
+    if handle == red::null() {
+        return;
+    }
+    red::execute("UpdatePickerQuery", handle, query);
     run_search(query);
 }
 
@@ -519,12 +530,23 @@ fn export_panel_event(event: Json) {
     }
 }
 
-fn picker_cancelled(event: Json) {
+fn picker_cancelled(event: PickerCancelled) {
+    red::state_set("project_search_picker", red::null());
     cancel_process();
     cancel_timers();
 }
 
+fn close_search_picker() {
+    let handle = red::state("project_search_picker");
+    if handle == red::null() {
+        return;
+    }
+    red::state_set("project_search_picker", red::null());
+    red::execute("ClosePicker", handle);
+}
+
 fn deactivate() {
+    close_search_picker();
     cancel_process();
     cancel_timers();
     red::execute("ClosePanel", "project-search-results");

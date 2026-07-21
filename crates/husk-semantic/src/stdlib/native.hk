@@ -1,0 +1,151 @@
+// Backend-neutral Husk declarations.
+//
+// Runtime implementations are supplied by language primitives or registered
+// native `std` modules. This file deliberately contains no JavaScript ABI,
+// JavaScript globals, or codegen-placeholder bodies.
+
+enum Option<T> {
+    None,
+    Some(T),
+}
+
+enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+
+use Option::*;
+use Result::*;
+
+trait PartialEq {}
+trait Eq: PartialEq {}
+
+impl PartialEq for i32 {}
+impl PartialEq for i64 {}
+impl PartialEq for f64 {}
+impl PartialEq for bool {}
+impl PartialEq for String {}
+impl PartialEq for Option {}
+impl PartialEq for Result {}
+
+impl Eq for i32 {}
+impl Eq for i64 {}
+impl Eq for bool {}
+impl Eq for String {}
+
+extern "husk" {
+    // Explicit dynamic boundary for JSON-shaped host data.
+    struct Json;
+
+    // Language/stdlib primitives. The native runtime supplies implementations.
+    fn println(value: String);
+    fn assert(condition: bool);
+    fn assert_msg(condition: bool, message: String);
+}
+
+// `#[intrinsic]` marks declarations whose bodies are supplied by every native
+// Husk runtime. Empty bodies are never lowered into user HIR.
+impl String {
+    #[intrinsic]
+    fn len(&self) -> i32 {}
+    #[intrinsic]
+    fn trim(&self) -> String {}
+    #[intrinsic]
+    fn split(&self, separator: String) -> [String] {}
+    #[intrinsic]
+    fn char_at(&self, index: i32) -> String {}
+    #[intrinsic]
+    fn slice(&self, start: i32, end: i32) -> String {}
+    #[intrinsic]
+    fn substring(&self, start: i32, end: i32) -> String {}
+    #[intrinsic]
+    fn index_of(&self, search: String) -> i32 {}
+    #[intrinsic]
+    fn last_index_of(&self, search: String) -> i32 {}
+    #[intrinsic]
+    fn starts_with(&self, prefix: String) -> bool {}
+    #[intrinsic]
+    fn ends_with(&self, suffix: String) -> bool {}
+    #[intrinsic]
+    fn includes(&self, search: String) -> bool {}
+    #[intrinsic]
+    fn to_upper_case(&self) -> String {}
+    #[intrinsic]
+    fn to_lower_case(&self) -> String {}
+    #[intrinsic]
+    fn split_once(&self, delimiter: String) -> Option<(String, String)> {}
+    #[intrinsic]
+    fn iter(&self) -> [String] {}
+    #[intrinsic]
+    fn into_iter(self) -> [String] {}
+}
+
+impl i32 {
+    #[intrinsic]
+    fn to_string(&self) -> String {}
+}
+
+impl i64 {
+    #[intrinsic]
+    fn to_string(&self) -> String {}
+}
+
+impl f64 {
+    #[intrinsic]
+    fn to_string(&self) -> String {}
+    #[intrinsic]
+    fn floor(&self) -> f64 {}
+    #[intrinsic]
+    fn ceil(&self) -> f64 {}
+    #[intrinsic]
+    fn round(&self) -> f64 {}
+    #[intrinsic]
+    fn abs(&self) -> f64 {}
+}
+
+impl bool {
+    #[intrinsic]
+    fn to_string(&self) -> String {}
+}
+
+impl<T> [T] {
+    #[intrinsic]
+    fn len(&self) -> i32 {}
+    #[intrinsic]
+    fn push(&mut self, value: T) {}
+    #[intrinsic]
+    fn slice(&self, start: i32, end: i32) -> [T] {}
+    #[intrinsic]
+    fn join(&self, separator: String) -> String {}
+    #[intrinsic]
+    fn sort(&mut self) -> [T] {}
+    #[intrinsic]
+    fn reverse(&mut self) -> [T] {}
+    #[intrinsic]
+    fn index_of(&self, value: T) -> i32 {}
+    #[intrinsic]
+    fn last_index_of(&self, value: T) -> i32 {}
+    #[intrinsic]
+    fn includes(&self, value: T) -> bool {}
+    #[intrinsic]
+    fn pop(&mut self) -> T {}
+    #[intrinsic]
+    fn shift(&mut self) -> T {}
+    #[intrinsic]
+    fn unshift(&mut self, value: T) -> i32 {}
+    #[intrinsic]
+    fn iter(&self) -> [T] {}
+    #[intrinsic]
+    fn into_iter(self) -> [T] {}
+}
+
+impl<T> Range<T> {
+    #[intrinsic]
+    fn contains(&self, value: T) -> bool {}
+    #[intrinsic]
+    fn is_empty(&self) -> bool {}
+    #[intrinsic]
+    fn iter(&self) -> Range<T> {}
+    #[intrinsic]
+    fn into_iter(self) -> Range<T> {}
+}

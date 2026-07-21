@@ -1,0 +1,27 @@
+[package]
+name = "husk-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sandboxed WebAssembly Component modules for Husk"
+
+[dependencies]
+anyhow = "1.0.79"
+husk-extension.workspace = true
+husk-types.workspace = true
+husk-value.workspace = true
+semver = "1.0"
+serde_json = "1.0.113"
+thiserror = "1.0"
+wasmtime = { version = "46.0.1", default-features = false, features = [
+    "anyhow",
+    "component-model",
+    "cranelift",
+    "runtime",
+    "std",
+    "wat",
+] }
+
+[dev-dependencies]
+tempfile = "3.15.0"

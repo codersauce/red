@@ -1,0 +1,17 @@
+[package]
+name = "husk-extension"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Portable Husk extension manifests and validated directory bundles"
+
+[dependencies]
+husk-types.workspace = true
+semver = { version = "1.0", features = ["serde"] }
+serde = { version = "1.0.196", features = ["derive"] }
+sha2 = "0.10"
+toml = "0.8.10"
+
+[dev-dependencies]
+tempfile = "3.15.0"

@@ -6,7 +6,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     config::KeyAction,
-    editor::{Action, Editor, RenderBuffer},
+    editor::{Action, ComposerCallback, Editor, RenderBuffer},
+    plugin::ComposerHandle,
     theme::{Style, Theme},
     unicode_utils::{display_width, grapheme_len, grapheme_to_byte, truncate_display_width},
 };
@@ -30,8 +31,7 @@ pub(crate) struct WrappedText {
 
 /// A cursor-aware, multiline composer that submits its complete contents atomically.
 pub struct AgentComposer {
-    id: i32,
-    owner: String,
+    target: ComposerTarget,
     dialog: Dialog,
     query: String,
     cursor: usize,
@@ -47,6 +47,12 @@ pub struct AgentComposer {
     theme: Theme,
 }
 
+#[derive(Debug)]
+enum ComposerTarget {
+    Legacy { owner: String, id: i32 },
+    Callback(ComposerHandle),
+}
+
 impl AgentComposer {
     /// Creates a right-aligned composer with the cursor at the end of `query`.
     pub fn new(
@@ -56,6 +62,39 @@ impl AgentComposer {
         query: String,
         history: Vec<String>,
         owner: String,
+    ) -> Self {
+        Self::with_target(
+            editor,
+            title,
+            query,
+            history,
+            ComposerTarget::Legacy { owner, id },
+        )
+    }
+
+    /// Creates a composer whose result is delivered through a scoped callback.
+    pub fn new_callback(
+        editor: &Editor,
+        title: Option<String>,
+        query: String,
+        history: Vec<String>,
+        handle: ComposerHandle,
+    ) -> Self {
+        Self::with_target(
+            editor,
+            title,
+            query,
+            history,
+            ComposerTarget::Callback(handle),
+        )
+    }
+
+    fn with_target(
+        editor: &Editor,
+        title: Option<String>,
+        query: String,
+        history: Vec<String>,
+        target: ComposerTarget,
     ) -> Self {
         let theme = editor.theme.clone();
         let style = theme.ui_style.popup.clone();
@@ -79,8 +118,7 @@ impl AgentComposer {
         let cursor = grapheme_len(&query);
 
         Self {
-            id,
-            owner,
+            target,
             dialog: Dialog::new(
                 title,
                 x,
@@ -105,6 +143,43 @@ impl AgentComposer {
             style,
             muted_style: theme.ui_style.muted.clone(),
             theme,
+        }
+    }
+
+    fn cancel_action(&self) -> KeyAction {
+        match &self.target {
+            ComposerTarget::Legacy { owner, id } => KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::NotifyPlugin(
+                    owner.clone(),
+                    format!("composer:cancelled:{id}"),
+                    json!(null),
+                ),
+            ]),
+            ComposerTarget::Callback(handle) => KeyAction::Multiple(vec![
+                Action::NotifyComposer(*handle, Box::new(ComposerCallback::Cancelled)),
+                Action::CloseDialog,
+            ]),
+        }
+    }
+
+    fn submit_action(&self) -> KeyAction {
+        match &self.target {
+            ComposerTarget::Legacy { owner, id } => KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::NotifyPlugin(
+                    owner.clone(),
+                    format!("composer:submitted:{id}"),
+                    json!(self.query),
+                ),
+            ]),
+            ComposerTarget::Callback(handle) => KeyAction::Multiple(vec![
+                Action::NotifyComposer(
+                    *handle,
+                    Box::new(ComposerCallback::Submitted(self.query.clone())),
+                ),
+                Action::CloseDialog,
+            ]),
         }
     }
 
@@ -282,6 +357,13 @@ impl AgentComposer {
 }
 
 impl Component for AgentComposer {
+    fn composer_handle(&self) -> Option<ComposerHandle> {
+        match &self.target {
+            ComposerTarget::Legacy { .. } => None,
+            ComposerTarget::Callback(handle) => Some(*handle),
+        }
+    }
+
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.dialog.draw(buffer)?;
         let right = self.dialog.x + self.dialog.width + 1;
@@ -359,25 +441,11 @@ impl Component for AgentComposer {
                 Self::redraw()
             }
             Event::Key(key) => match (key.code, key.modifiers) {
-                (KeyCode::Esc, _) => Some(KeyAction::Multiple(vec![
-                    Action::CloseDialog,
-                    Action::NotifyPlugin(
-                        self.owner.clone(),
-                        format!("composer:cancelled:{}", self.id),
-                        json!(null),
-                    ),
-                ])),
+                (KeyCode::Esc, _) => Some(self.cancel_action()),
                 (KeyCode::Char('c' | 'C'), modifiers)
                     if modifiers.contains(KeyModifiers::CONTROL) =>
                 {
-                    Some(KeyAction::Multiple(vec![
-                        Action::CloseDialog,
-                        Action::NotifyPlugin(
-                            self.owner.clone(),
-                            format!("composer:cancelled:{}", self.id),
-                            json!(null),
-                        ),
-                    ]))
+                    Some(self.cancel_action())
                 }
                 (KeyCode::Enter, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
                     self.insert("\n");
@@ -392,14 +460,7 @@ impl Component for AgentComposer {
                         self.validation_status = Some(EMPTY_STATUS);
                         return Self::redraw();
                     }
-                    Some(KeyAction::Multiple(vec![
-                        Action::CloseDialog,
-                        Action::NotifyPlugin(
-                            self.owner.clone(),
-                            format!("composer:submitted:{}", self.id),
-                            json!(self.query),
-                        ),
-                    ]))
+                    Some(self.submit_action())
                 }
                 (KeyCode::Char('j' | 'J'), modifiers)
                     if modifiers.contains(KeyModifiers::CONTROL) =>
@@ -839,6 +900,46 @@ mod tests {
                     "composer:cancelled:802".to_string(),
                     json!(null)
                 )
+            ]))
+        );
+    }
+
+    #[test]
+    fn callback_composer_delivers_terminal_results_before_closing() {
+        let editor = editor(60, 18);
+        let handle = ComposerHandle::from_raw(42);
+        let mut submitted = AgentComposer::new_callback(
+            &editor,
+            Some("Prompt".to_string()),
+            "exact text".to_string(),
+            vec![],
+            handle,
+        );
+
+        assert_eq!(submitted.composer_handle(), Some(handle));
+        assert_eq!(
+            submit(&mut submitted),
+            Some(KeyAction::Multiple(vec![
+                Action::NotifyComposer(
+                    handle,
+                    Box::new(ComposerCallback::Submitted("exact text".to_string()))
+                ),
+                Action::CloseDialog,
+            ]))
+        );
+
+        let mut cancelled = AgentComposer::new_callback(
+            &editor,
+            Some("Prompt".to_string()),
+            String::new(),
+            vec![],
+            handle,
+        );
+        assert_eq!(
+            cancelled.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(KeyAction::Multiple(vec![
+                Action::NotifyComposer(handle, Box::new(ComposerCallback::Cancelled)),
+                Action::CloseDialog,
             ]))
         );
     }

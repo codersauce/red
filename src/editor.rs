@@ -46,7 +46,6 @@ use crossterm::{
     },
     terminal, ExecutableCommand,
 };
-use husk::RequestId;
 #[cfg(unix)]
 use nix::sys::signal::{self, Signal};
 #[cfg(unix)]
@@ -89,7 +88,7 @@ use crate::{
         WorkspaceEditOperation as LspWorkspaceEditOperation, MAX_WORKSPACE_EDIT_TOTAL_BYTES,
     },
     matchit::{self, MatchDirection, MatchMotion},
-    plugin::{self, PluginRegistry, Runtime},
+    plugin::{self, ComposerHandle, PickerHandle, PluginRegistry, RequestId, Runtime},
     preferences::PreferencesStore,
     session::{
         capture_session_disk_fingerprint, detect_disk_divergence, read_session_disk_contents,
@@ -641,9 +640,23 @@ pub enum PluginRequest {
         query: String,
         history: Vec<String>,
     },
+    OpenCallbackComposer {
+        owner: String,
+        handle: ComposerHandle,
+        title: Option<String>,
+        query: String,
+        history: Vec<String>,
+    },
     OpenDynamicPicker {
         title: Option<String>,
         id: i32,
+        items: Vec<PickerItem>,
+        options: PickerOptions,
+    },
+    OpenCallbackPicker {
+        owner: String,
+        handle: PickerHandle,
+        title: Option<String>,
         items: Vec<PickerItem>,
         options: PickerOptions,
     },
@@ -926,7 +939,9 @@ impl PluginRequest {
             Self::OpenLivePicker(..) => "OpenLivePicker",
             Self::OpenLocation { .. } => "OpenLocation",
             Self::OpenAgentComposer { .. } => "OpenAgentComposer",
+            Self::OpenCallbackComposer { .. } => "OpenCallbackComposer",
             Self::OpenDynamicPicker { .. } => "OpenDynamicPicker",
+            Self::OpenCallbackPicker { .. } => "OpenCallbackPicker",
             Self::UpdatePickerItems { .. } => "UpdatePickerItems",
             Self::UpdatePickerQuery { .. } => "UpdatePickerQuery",
             Self::UpdatePickerStatus { .. } => "UpdatePickerStatus",
@@ -1050,6 +1065,67 @@ impl SearchDirection {
         match self {
             Self::Forward => Self::Backward,
             Self::Backward => Self::Forward,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum PickerCallbackKind {
+    Selected,
+    Cancelled,
+    Changed,
+    Query,
+    Action,
+}
+
+impl PickerCallbackKind {
+    pub(crate) const fn is_terminal(self) -> bool {
+        matches!(self, Self::Selected | Self::Cancelled)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub enum PickerCallback {
+    Selected(PickerItem),
+    Cancelled,
+    Changed(PickerItem),
+    Query(String),
+    Action {
+        action: String,
+        item: Option<PickerItem>,
+        query: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum ComposerCallbackKind {
+    Submitted,
+    Cancelled,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum ComposerCallback {
+    Submitted(String),
+    Cancelled,
+}
+
+impl ComposerCallback {
+    pub(crate) const fn kind(&self) -> ComposerCallbackKind {
+        match self {
+            Self::Submitted(_) => ComposerCallbackKind::Submitted,
+            Self::Cancelled => ComposerCallbackKind::Cancelled,
+        }
+    }
+}
+
+impl PickerCallback {
+    pub(crate) const fn kind(&self) -> PickerCallbackKind {
+        match self {
+            Self::Selected(_) => PickerCallbackKind::Selected,
+            Self::Cancelled => PickerCallbackKind::Cancelled,
+            Self::Changed(_) => PickerCallbackKind::Changed,
+            Self::Query(_) => PickerCallbackKind::Query,
+            Self::Action { .. } => PickerCallbackKind::Action,
         }
     }
 }
@@ -1333,6 +1409,8 @@ pub enum Action {
     ShowProgress(ProgressParams),
     NotifyPlugins(String, Value),
     NotifyPlugin(String, String, Value),
+    NotifyPicker(PickerHandle, Box<PickerCallback>),
+    NotifyComposer(ComposerHandle, Box<ComposerCallback>),
     ResolvePluginRequest(i64, Value),
     ViewLogs,
     ListPlugins,
@@ -4477,6 +4555,8 @@ impl Editor {
                 | Action::ShowProgress(_)
                 | Action::NotifyPlugins(_, _)
                 | Action::NotifyPlugin(_, _, _)
+                | Action::NotifyPicker(_, _)
+                | Action::NotifyComposer(_, _)
                 | Action::ResolvePluginRequest(_, _)
                 | Action::ViewLogs
                 | Action::SetCursor(_, _)
@@ -4513,8 +4593,10 @@ impl Editor {
     }
 
     fn action_cause(action: &Action) -> String {
-        if matches!(action, Action::NotifyPlugin(_, _, _))
-            || matches!(action, Action::NotifyPlugins(method, _) if method.starts_with("composer:"))
+        if matches!(
+            action,
+            Action::NotifyPlugin(_, _, _) | Action::NotifyComposer(_, _)
+        ) || matches!(action, Action::NotifyPlugins(method, _) if method.starts_with("composer:"))
         {
             return "AgentComposer".to_string();
         }
@@ -6343,12 +6425,35 @@ impl Editor {
                     history,
                 } => {
                     if id == 802 {
-                        if let Err(error) = self.preferences.remove_picker_history("picker:802") {
-                            log!("failed to remove legacy agent picker history: {error}");
-                        }
+                        self.remove_legacy_agent_picker_history();
                     }
+                    self.release_current_dialog_callbacks(runtime);
                     self.current_dialog = Some(Box::new(AgentComposer::new(
                         self, title, id, query, history, owner,
+                    )));
+                    needs_render = true;
+                }
+                PluginRequest::OpenCallbackComposer {
+                    owner,
+                    handle,
+                    title,
+                    query,
+                    history,
+                } => {
+                    if runtime.composer_plugin(handle).as_deref() != Some(owner.as_str()) {
+                        runtime.release_composer(handle);
+                        self.last_error = Some(
+                            "ignored a composer whose callback owner no longer exists".to_string(),
+                        );
+                        needs_render = true;
+                        continue;
+                    }
+                    if owner == "agent" {
+                        self.remove_legacy_agent_picker_history();
+                    }
+                    self.release_current_dialog_callbacks(runtime);
+                    self.current_dialog = Some(Box::new(AgentComposer::new_callback(
+                        self, title, query, history, handle,
                     )));
                     needs_render = true;
                 }
@@ -6364,6 +6469,32 @@ impl Editor {
                         let history = self.picker_history(&history_key).to_vec();
                         picker.set_history(history_key, history);
                     }
+                    self.release_current_dialog_callbacks(runtime);
+                    self.current_dialog = Some(Box::new(picker));
+                    needs_render = true;
+                }
+                PluginRequest::OpenCallbackPicker {
+                    owner,
+                    handle,
+                    title,
+                    items,
+                    options,
+                } => {
+                    if runtime.picker_plugin(handle).as_deref() != Some(owner.as_str()) {
+                        runtime.release_picker(handle);
+                        self.last_error = Some(
+                            "ignored a picker whose callback owner no longer exists".to_string(),
+                        );
+                        needs_render = true;
+                        continue;
+                    }
+                    let history_key = Self::picker_history_key(&title, None);
+                    let mut picker = Picker::new_callback(title, self, items, handle, options);
+                    if let Some(history_key) = history_key {
+                        let history = self.picker_history(&history_key).to_vec();
+                        picker.set_history(history_key, history);
+                    }
+                    self.release_current_dialog_callbacks(runtime);
                     self.current_dialog = Some(Box::new(picker));
                     needs_render = true;
                 }
@@ -6397,6 +6528,7 @@ impl Editor {
                         .as_ref()
                         .is_some_and(|dialog| dialog.picker_id() == Some(id))
                     {
+                        self.release_current_dialog_callbacks(runtime);
                         self.current_dialog = None;
                         needs_render = true;
                     }
@@ -10389,6 +10521,29 @@ impl Editor {
         })
     }
 
+    fn release_current_dialog_callbacks(&mut self, runtime: &mut Runtime) {
+        if let Some(handle) = self
+            .current_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.picker_handle())
+        {
+            runtime.release_picker(handle);
+        }
+        if let Some(handle) = self
+            .current_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.composer_handle())
+        {
+            runtime.release_composer(handle);
+        }
+    }
+
+    fn remove_legacy_agent_picker_history(&mut self) {
+        if let Err(error) = self.preferences.remove_picker_history("picker:802") {
+            log!("failed to remove legacy agent picker history: {error}");
+        }
+    }
+
     fn record_picker_history(&mut self, key: &str, query: &str) {
         if let Err(error) = self.preferences.record_picker_query(key, query) {
             log!("failed to save picker history: {error}");
@@ -11989,6 +12144,14 @@ impl Editor {
         let event_snapshot_before_action = self.event_snapshot();
         let action_cause = Self::action_cause(action);
         let history_entry_before_action = self.current_history_entry();
+        let picker_handle_before_action = self
+            .current_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.picker_handle());
+        let composer_handle_before_action = self
+            .current_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.composer_handle());
 
         match action {
             Action::Quit(force) => {
@@ -14214,6 +14377,7 @@ impl Editor {
                 self.notify_change(runtime).await?;
             }
             Action::FilePicker => {
+                self.release_current_dialog_callbacks(runtime);
                 self.current_dialog =
                     Some(Box::new(FilePicker::new(self, std::env::current_dir()?)?));
             }
@@ -14237,10 +14401,12 @@ impl Editor {
                         })
                     })
                     .build(self);
+                self.release_current_dialog_callbacks(runtime);
                 self.current_dialog = Some(Box::new(picker));
                 self.render(buffer)?;
             }
             Action::ConfigDiagnostics => {
+                self.release_current_dialog_callbacks(runtime);
                 self.open_config_diagnostics();
                 self.render(buffer)?;
             }
@@ -14248,6 +14414,7 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::CloseDialog => {
+                self.release_current_dialog_callbacks(runtime);
                 self.current_dialog = None;
                 self.render(buffer)?;
             }
@@ -14270,6 +14437,7 @@ impl Editor {
                     let history = self.picker_history(&history_key).to_vec();
                     picker.set_history(history_key, history);
                 }
+                self.release_current_dialog_callbacks(runtime);
                 self.current_dialog = Some(Box::new(picker));
                 self.render(buffer)?;
             }
@@ -14281,6 +14449,7 @@ impl Editor {
                     let history = self.picker_history(&history_key).to_vec();
                     picker.set_history(history_key, history);
                 }
+                self.release_current_dialog_callbacks(runtime);
                 self.current_dialog = Some(Box::new(picker));
                 self.render(buffer)?;
             }
@@ -14554,6 +14723,16 @@ impl Editor {
                     .notify_plugin(runtime, plugin, method, params.clone())
                     .await?;
             }
+            Action::NotifyPicker(handle, event) => {
+                self.plugin_registry
+                    .notify_picker(runtime, *handle, event.as_ref().clone())
+                    .await?;
+            }
+            Action::NotifyComposer(handle, event) => {
+                self.plugin_registry
+                    .notify_composer(runtime, *handle, event.as_ref().clone())
+                    .await?;
+            }
             Action::ResolvePluginRequest(request_id, payload) => {
                 self.plugin_registry
                     .resolve_request(runtime, RequestId::from_raw(*request_id), payload.clone())
@@ -14733,6 +14912,25 @@ impl Editor {
                     self.sync_with_window();
                     self.render(buffer)?;
                 }
+            }
+        }
+
+        let picker_handle_after_action = self
+            .current_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.picker_handle());
+        if picker_handle_before_action != picker_handle_after_action {
+            if let Some(handle) = picker_handle_before_action {
+                runtime.release_picker(handle);
+            }
+        }
+        let composer_handle_after_action = self
+            .current_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.composer_handle());
+        if composer_handle_before_action != composer_handle_after_action {
+            if let Some(handle) = composer_handle_before_action {
+                runtime.release_composer(handle);
             }
         }
 

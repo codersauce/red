@@ -11,9 +11,6 @@ pub fn activate() {
         description: "Preview and select an editor theme",
         aliases: ["colorscheme", "theme"],
     });
-    red::on("picker:changed:601", theme_changed);
-    red::on("picker:cancelled:601", theme_cancelled);
-    red::on("picker:selected:601", theme_selected);
 
     red::state_set("theme_original", "");
     red::state_set("theme_config_loaded", false);
@@ -69,15 +66,19 @@ fn open_picker_if_ready() {
     if index < red::len(entries) {
         status = status + " (results truncated)";
     }
-    red::execute("OpenDynamicPicker", "Themes", 601, items, PickerOptions {
+    red::execute("OpenPicker", "Themes", items, PickerOptions {
         placeholder: "Filter themes",
         status: status,
         initial_selection: red::string(red::state("theme_original"), ""),
         presentation: "compact",
+    }, PickerHandlers {
+        changed: theme_changed,
+        cancelled: theme_cancelled,
+        selected: theme_selected,
     });
 }
 
-fn theme_item(entry: Json) -> Json {
+fn theme_item(entry: RuntimeAssetEntry) -> PickerItem {
     let name = red::string(entry.name, entry.file);
 
     let detail = entry.source;
@@ -97,17 +98,17 @@ fn theme_item(entry: Json) -> Json {
     };
 }
 
-fn theme_changed(item: Json) {
+fn theme_changed(item: PickerItem) {
     red::execute("PreviewTheme", item.data.theme);
 }
 
-fn theme_cancelled(event: Json) {
+fn theme_cancelled(event: PickerCancelled) {
     let original = red::string(red::state("theme_original"), "");
     if original != "" {
         red::execute("PreviewTheme", original);
     }
 }
 
-fn theme_selected(item: Json) {
+fn theme_selected(item: PickerItem) {
     red::execute("SetTheme", item.data.theme);
 }

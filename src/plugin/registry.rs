@@ -16,11 +16,10 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::editor::EditorStateSnapshot;
-use husk::RequestId;
 use semver::{Version, VersionReq};
 use serde::Serialize;
 
-use super::{PluginMetadata, Runtime};
+use super::{PluginMetadata, RequestId, Runtime};
 
 /// Lifecycle authority for configured Husk plugins.
 pub struct PluginRegistry {
@@ -33,7 +32,7 @@ pub struct PluginRegistry {
 }
 
 /// Host API version used for plugin compatibility checks.
-pub const RED_HOST_API_VERSION: &str = "0.2.0";
+pub const RED_HOST_API_VERSION: &str = "0.3.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PluginModification {
@@ -346,6 +345,79 @@ impl PluginRegistry {
             self.quarantine(runtime, &failed_plugin, &path, "runtime", error.to_string());
         }
         Ok(())
+    }
+
+    /// Delivers a callback-scoped picker event only to the plugin that opened it.
+    ///
+    /// Terminal callbacks are consumed even when the callback fails.
+    pub async fn notify_picker(
+        &mut self,
+        runtime: &mut Runtime,
+        handle: super::PickerHandle,
+        event: crate::editor::PickerCallback,
+    ) -> anyhow::Result<bool> {
+        let owner = runtime.picker_plugin(handle);
+        match runtime.notify_picker(handle, event) {
+            Ok(resolved) => Ok(resolved),
+            Err(error) => {
+                crate::log!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "plugin_picker_callback_failed",
+                        "plugin": owner.as_deref(),
+                        "picker_handle": handle.get(),
+                        "error": error.to_string(),
+                    })
+                );
+                if let Some(owner) = owner {
+                    let path = self
+                        .plugins
+                        .iter()
+                        .find(|(name, _)| name == &owner)
+                        .map(|(_, path)| path.clone())
+                        .unwrap_or_default();
+                    self.quarantine(runtime, &owner, &path, "runtime", error.to_string());
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    /// Delivers a terminal composer result only to the plugin that opened it.
+    ///
+    /// The callback is consumed even when it fails, so submissions cannot be
+    /// replayed accidentally.
+    pub async fn notify_composer(
+        &mut self,
+        runtime: &mut Runtime,
+        handle: super::ComposerHandle,
+        event: crate::editor::ComposerCallback,
+    ) -> anyhow::Result<bool> {
+        let owner = runtime.composer_plugin(handle);
+        match runtime.notify_composer(handle, event) {
+            Ok(resolved) => Ok(resolved),
+            Err(error) => {
+                crate::log!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "plugin_composer_callback_failed",
+                        "plugin": owner.as_deref(),
+                        "composer_handle": handle.get(),
+                        "error": error.to_string(),
+                    })
+                );
+                if let Some(owner) = owner {
+                    let path = self
+                        .plugins
+                        .iter()
+                        .find(|(name, _)| name == &owner)
+                        .map(|(_, path)| path.clone())
+                        .unwrap_or_default();
+                    self.quarantine(runtime, &owner, &path, "runtime", error.to_string());
+                }
+                Ok(true)
+            }
+        }
     }
 
     /// Resolves a one-shot plugin request and quarantines a failing callback.
@@ -829,10 +901,14 @@ mod tests {
         registry.initialize(&mut runtime).await.unwrap();
 
         registry.execute(&mut runtime, "Fail").await.unwrap();
-        assert!(matches!(
-            registry.statuses().get("test"),
-            Some(PluginStatus::Quarantined { stage, .. }) if stage == "runtime"
-        ));
+        assert!(
+            matches!(
+                registry.statuses().get("test"),
+                Some(PluginStatus::Quarantined { stage, .. }) if stage == "runtime"
+            ),
+            "{:?}",
+            registry.statuses()
+        );
     }
 
     #[tokio::test]
@@ -1110,14 +1186,14 @@ mod tests {
     #[test]
     fn pre_one_minor_host_api_requirements_do_not_cross_minor_versions() {
         let mut metadata = PluginMetadata::minimal("composer-plugin".to_string());
-        metadata.red_api_version = Some("^0.2.0".to_string());
+        metadata.red_api_version = Some("^0.3.0".to_string());
         check_api_compatibility(&metadata).unwrap();
 
-        metadata.red_api_version = Some("^0.1.0".to_string());
+        metadata.red_api_version = Some("^0.2.0".to_string());
         let error = check_api_compatibility(&metadata).unwrap_err().to_string();
 
-        assert!(error.contains("^0.1.0"));
-        assert!(error.contains("0.2.0"));
+        assert!(error.contains("^0.2.0"));
+        assert!(error.contains(RED_HOST_API_VERSION));
         assert!(error.contains("docs/PLUGIN_API.md"));
     }
 
@@ -1328,7 +1404,7 @@ mod tests {
         ));
         assert_eq!(runtime.command_plugin("FutureCommand"), None);
 
-        fs::write(&metadata, r#"{"name":"future","red_api_version":"^0.2.0"}"#).unwrap();
+        fs::write(&metadata, r#"{"name":"future","red_api_version":"^0.3.0"}"#).unwrap();
         registry.reload(&mut runtime).await.unwrap();
 
         assert_eq!(
@@ -1581,7 +1657,7 @@ mod tests {
         .unwrap();
         fs::write(
             &metadata,
-            r#"{"name":"metadata","red_api_version":"^0.2.0"}"#,
+            r#"{"name":"metadata","red_api_version":"^0.3.0"}"#,
         )
         .unwrap();
         let mut registry = PluginRegistry::new();

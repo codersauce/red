@@ -1,0 +1,26 @@
+[package]
+name = "husk-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Backend-neutral compiler and runtime implementation for Husk"
+
+[features]
+default = ["wasm-extensions"]
+wasm-extensions = ["dep:husk-wasm"]
+
+[dependencies]
+anyhow = "1.0.79"
+husk-ast.workspace = true
+husk-diagnostics.workspace = true
+husk-hir.workspace = true
+husk-parser.workspace = true
+husk-package.workspace = true
+husk-semantic.workspace = true
+husk-types.workspace = true
+husk-value.workspace = true
+husk-wasm = { workspace = true, optional = true }
+serde = { version = "1.0.196", features = ["derive"] }
+serde_json = "1.0.113"
+thiserror = "1.0"

@@ -37,7 +37,10 @@ pub use panel::{
     TextPanelStatus,
 };
 pub use registry::{PluginRegistry, PluginStatus, RED_HOST_API_VERSION};
-pub use runtime::{poll_timer_callbacks, RegisteredPluginCommand, Runtime};
+pub use runtime::{
+    poll_timer_callbacks, CommandMetadata, ComposerHandle, PickerHandle, RegisteredPluginCommand,
+    RequestId, Runtime,
+};
 #[cfg(test)]
 pub(crate) use text_link::TextPanelFileLocation;
 pub(crate) use text_link::TextPanelLinkTarget;

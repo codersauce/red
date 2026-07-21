@@ -1,6 +1,6 @@
 //! Red-specific Husk VM host, request translation, snapshots, timers, and reload staging.
 //!
-//! [`Runtime`] wraps the Red-agnostic `husk::Vm` with a host that translates Husk calls
+//! [`Runtime`] wraps the Red-agnostic `husk_runtime::Vm` with a host that translates Husk calls
 //! into [`PluginRequest`] values. The editor consumes those
 //! requests and remains the sole mutator of buffers and UI state. Snapshot requests read
 //! editor-produced JSON captured at defined service points rather than borrowing editor
@@ -13,20 +13,26 @@
 //! editor loop indefinitely.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     time::{Duration, Instant},
 };
 
-use husk::{CommandMetadata, Host, RequestId, Value};
-use husk_diagnostics::{Diagnostic as HuskDiagnostic, Report as HuskReport, SourceFile};
+use husk_runtime::{Callback, CompileOptions, CompiledProgram, Host, SemanticProfile, Value};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
     assets::RuntimeAssetKind,
     config::{Config, PluginPermissions},
-    editor::{Action, PluginRequest, ACTION_DISPATCHER},
+    editor::{
+        Action, ComposerCallback, ComposerCallbackKind, PickerCallback, PickerCallbackKind,
+        PluginRequest, ACTION_DISPATCHER,
+    },
     log,
     plugin::process::{ProcessManager, ProcessSpawnOptions},
     ui::{PickerItem, PickerOptions},
@@ -49,9 +55,97 @@ lazy_static::lazy_static! {
 }
 
 const PLUGIN_INSTRUCTION_BUDGET: usize = 100_000;
+static NEXT_PLUGIN_VM_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// User-facing metadata attached to a registered Red plugin command.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CommandMetadata {
+    pub title: Option<String>,
+    pub category: Option<String>,
+    pub description: Option<String>,
+    pub aliases: Vec<String>,
+}
+
+/// Opaque identifier for a one-shot request issued by a Red plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RequestId(i64);
+
+impl RequestId {
+    #[must_use]
+    pub const fn from_raw(value: i64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+/// Opaque host-generated identity for a callback-scoped picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PickerHandle(i32);
+
+impl PickerHandle {
+    #[must_use]
+    pub const fn from_raw(value: i32) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// Opaque host-generated identity for a callback-scoped composer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ComposerHandle(i32);
+
+impl ComposerHandle {
+    #[must_use]
+    pub const fn from_raw(value: i32) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
 
 const RED_HOST_DECLARATIONS: &str = r#"
 type Json = JsValue;
+struct PickerItem {
+    id: String,
+    label: String,
+    data: Json,
+}
+struct PickerCancelled {}
+struct PickerActionEvent {
+    action: String,
+    item: Json,
+    query: String,
+}
+struct PickerHandlers {
+    selected: fn(PickerItem),
+    cancelled: fn(PickerCancelled),
+    changed: fn(PickerItem),
+    query: fn(String),
+    action: fn(PickerActionEvent),
+}
+struct ComposerCancelled {}
+struct ComposerHandlers {
+    submitted: fn(String),
+    cancelled: fn(ComposerCancelled),
+}
+struct RuntimeAssetEntry {
+    file: String,
+    name: String,
+    source: String,
+    shadows: [String],
+}
 extern "red" {
     mod global red {
         fn add_command();
@@ -122,9 +216,176 @@ pub fn poll_timer_callbacks() -> Vec<PluginRequest> {
 struct RedHost {
     process_manager: ProcessManager,
     snapshots: HashMap<String, Value>,
+    policy: RedPluginPolicy,
+    staged_policy: Option<RedPluginPolicy>,
+    teardown_policy: Option<RedPluginPolicy>,
+    policy_phase: PolicyPhase,
     staged_effects: Option<Vec<StagedHostEffect>>,
     staged_replacement_start: Option<usize>,
     staged_teardown_start: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct RedCommand {
+    callback: Callback,
+    metadata: CommandMetadata,
+}
+
+#[derive(Debug, Clone)]
+struct RedPluginPolicy {
+    commands: HashMap<String, RedCommand>,
+    event_listeners: HashMap<String, Vec<Callback>>,
+    pending_requests: HashMap<RequestId, Callback>,
+    picker_handlers: HashMap<PickerHandle, PickerRegistration>,
+    composer_handlers: HashMap<ComposerHandle, ComposerRegistration>,
+    plugin_states: HashMap<String, HashMap<String, Value>>,
+    next_request_id: i64,
+    next_picker_handle: i32,
+    next_composer_handle: i32,
+}
+
+impl Default for RedPluginPolicy {
+    fn default() -> Self {
+        Self {
+            commands: HashMap::new(),
+            event_listeners: HashMap::new(),
+            pending_requests: HashMap::new(),
+            picker_handlers: HashMap::new(),
+            composer_handlers: HashMap::new(),
+            plugin_states: HashMap::new(),
+            next_request_id: 1,
+            next_picker_handle: 1,
+            next_composer_handle: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct PickerHandlers {
+    selected: Option<Callback>,
+    cancelled: Option<Callback>,
+    changed: Option<Callback>,
+    query: Option<Callback>,
+    action: Option<Callback>,
+}
+
+impl PickerHandlers {
+    fn callback(&self, kind: PickerCallbackKind) -> Option<&Callback> {
+        match kind {
+            PickerCallbackKind::Selected => self.selected.as_ref(),
+            PickerCallbackKind::Cancelled => self.cancelled.as_ref(),
+            PickerCallbackKind::Changed => self.changed.as_ref(),
+            PickerCallbackKind::Query => self.query.as_ref(),
+            PickerCallbackKind::Action => self.action.as_ref(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.selected.is_none()
+            && self.cancelled.is_none()
+            && self.changed.is_none()
+            && self.query.is_none()
+            && self.action.is_none()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PickerRegistration {
+    plugin: String,
+    handlers: PickerHandlers,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ComposerHandlers {
+    submitted: Option<Callback>,
+    cancelled: Option<Callback>,
+}
+
+impl ComposerHandlers {
+    fn callback(&self, kind: ComposerCallbackKind) -> Option<&Callback> {
+        match kind {
+            ComposerCallbackKind::Submitted => self.submitted.as_ref(),
+            ComposerCallbackKind::Cancelled => self.cancelled.as_ref(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.submitted.is_none() && self.cancelled.is_none()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ComposerRegistration {
+    plugin: String,
+    handlers: ComposerHandlers,
+}
+
+impl RedPluginPolicy {
+    fn remove_plugin(&mut self, plugin: &str) {
+        self.commands
+            .retain(|_, command| command.callback.plugin() != plugin);
+        self.event_listeners.retain(|_, callbacks| {
+            callbacks.retain(|callback| callback.plugin() != plugin);
+            !callbacks.is_empty()
+        });
+        self.pending_requests
+            .retain(|_, callback| callback.plugin() != plugin);
+        self.picker_handlers
+            .retain(|_, registration| registration.plugin != plugin);
+        self.composer_handlers
+            .retain(|_, registration| registration.plugin != plugin);
+        self.plugin_states.remove(plugin);
+    }
+
+    fn allocate_request_id(&mut self) -> RequestId {
+        loop {
+            let request_id = RequestId::from_raw(self.next_request_id);
+            self.next_request_id = if self.next_request_id == i64::MAX {
+                1
+            } else {
+                self.next_request_id + 1
+            };
+            if !self.pending_requests.contains_key(&request_id) {
+                return request_id;
+            }
+        }
+    }
+
+    fn allocate_picker_handle(&mut self) -> PickerHandle {
+        loop {
+            let handle = PickerHandle::from_raw(self.next_picker_handle);
+            self.next_picker_handle = if self.next_picker_handle == i32::MAX {
+                1
+            } else {
+                self.next_picker_handle + 1
+            };
+            if !self.picker_handlers.contains_key(&handle) {
+                return handle;
+            }
+        }
+    }
+
+    fn allocate_composer_handle(&mut self) -> ComposerHandle {
+        loop {
+            let handle = ComposerHandle::from_raw(self.next_composer_handle);
+            self.next_composer_handle = if self.next_composer_handle == i32::MAX {
+                1
+            } else {
+                self.next_composer_handle + 1
+            };
+            if !self.composer_handlers.contains_key(&handle) {
+                return handle;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum PolicyPhase {
+    #[default]
+    Active,
+    Replacement,
+    Teardown,
 }
 
 enum StagedHostEffect {
@@ -139,6 +400,10 @@ impl RedHost {
         Self {
             process_manager: ProcessManager::new(process_permissions),
             snapshots: HashMap::new(),
+            policy: RedPluginPolicy::default(),
+            staged_policy: None,
+            teardown_policy: None,
+            policy_phase: PolicyPhase::Active,
             staged_effects: None,
             staged_replacement_start: None,
             staged_teardown_start: None,
@@ -158,12 +423,23 @@ impl RedHost {
     }
 
     fn begin_reload(&mut self) {
+        self.staged_policy = Some(self.policy.clone());
+        // State export runs against a cloned previous-policy snapshot, just as
+        // the compatibility VM evaluates it on a cloned previous VM. This
+        // keeps export-time state mutations transactional when export fails.
+        self.teardown_policy = Some(self.policy.clone());
+        self.policy_phase = PolicyPhase::Teardown;
         self.staged_effects = Some(Vec::new());
         self.staged_replacement_start = None;
         self.staged_teardown_start = None;
     }
 
     fn commit_reload(&mut self) {
+        if let Some(policy) = self.staged_policy.take() {
+            self.policy = policy;
+        }
+        self.teardown_policy = None;
+        self.policy_phase = PolicyPhase::Active;
         let mut effects = self.staged_effects.take().unwrap_or_default();
         if let (Some(replacement), Some(teardown)) = (
             self.staged_replacement_start.take(),
@@ -186,9 +462,45 @@ impl RedHost {
     }
 
     fn rollback_reload(&mut self) {
+        self.staged_policy = None;
+        self.teardown_policy = None;
+        self.policy_phase = PolicyPhase::Active;
         self.staged_effects = None;
         self.staged_replacement_start = None;
         self.staged_teardown_start = None;
+    }
+
+    fn policy(&self) -> &RedPluginPolicy {
+        match self.policy_phase {
+            PolicyPhase::Active => &self.policy,
+            PolicyPhase::Replacement => self.staged_policy.as_ref().unwrap_or(&self.policy),
+            PolicyPhase::Teardown => self.teardown_policy.as_ref().unwrap_or(&self.policy),
+        }
+    }
+
+    fn policy_mut(&mut self) -> &mut RedPluginPolicy {
+        match self.policy_phase {
+            PolicyPhase::Active => &mut self.policy,
+            PolicyPhase::Replacement => self.staged_policy.as_mut().unwrap_or(&mut self.policy),
+            PolicyPhase::Teardown => self.teardown_policy.as_mut().unwrap_or(&mut self.policy),
+        }
+    }
+
+    fn remove_plugin(&mut self, plugin: &str) {
+        self.policy.remove_plugin(plugin);
+        if let Some(policy) = &mut self.staged_policy {
+            policy.remove_plugin(plugin);
+        }
+        if let Some(policy) = &mut self.teardown_policy {
+            policy.remove_plugin(plugin);
+        }
+    }
+
+    fn clear_policy(&mut self) {
+        self.policy = RedPluginPolicy::default();
+        self.staged_policy = None;
+        self.teardown_policy = None;
+        self.policy_phase = PolicyPhase::Active;
     }
 
     fn send_request(&mut self, request: PluginRequest) {
@@ -221,7 +533,7 @@ impl RedHost {
     }
 }
 
-impl Host for RedHost {
+impl RedHost {
     fn log(&mut self, message: &str) {
         if let Some(effects) = &mut self.staged_effects {
             effects.push(StagedHostEffect::Log(message.to_string()));
@@ -230,12 +542,31 @@ impl Host for RedHost {
         }
     }
 
-    fn begin_reload_replacement(&mut self) {
+    fn begin_reload_replacement(&mut self, plugin: &str) {
         self.staged_replacement_start = self.staged_effects.as_ref().map(Vec::len);
+        let staged = self
+            .staged_policy
+            .get_or_insert_with(|| self.policy.clone());
+        staged.remove_plugin(plugin);
+        self.policy_phase = PolicyPhase::Replacement;
     }
 
-    fn begin_reload_teardown(&mut self) {
+    fn begin_reload_teardown(&mut self, _plugin: &str) {
         self.staged_teardown_start = self.staged_effects.as_ref().map(Vec::len);
+        self.teardown_policy = Some(self.policy.clone());
+        self.policy_phase = PolicyPhase::Teardown;
+    }
+
+    fn ensure_picker_owner(&self, plugin: &str, id: i32, action: &str) -> anyhow::Result<()> {
+        let handle = PickerHandle::from_raw(id);
+        if let Some(registration) = self.policy().picker_handlers.get(&handle) {
+            anyhow::ensure!(
+                registration.plugin == plugin,
+                "`{action}` cannot mutate picker {id} owned by plugin `{}`",
+                registration.plugin
+            );
+        }
+        Ok(())
     }
 
     fn execute(&mut self, plugin: &str, action: &str, args: &[Value]) -> anyhow::Result<Value> {
@@ -482,6 +813,41 @@ impl Host for RedHost {
                     .map_or_else(|| "default".to_string(), str::to_string);
                 self.send_request(PluginRequest::ClearGutterSigns { namespace });
             }
+            "OpenPicker" => {
+                let title = Some(red_required_string(args, 0, "OpenPicker")?.to_string());
+                let values = red_required_value_array(args, 1, "OpenPicker")?;
+                let items = values
+                    .iter()
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<PickerItem>)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let options = args
+                    .get(2)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<PickerOptions>)
+                    .transpose()?
+                    .unwrap_or_default();
+                let handlers = args
+                    .get(3)
+                    .ok_or_else(|| anyhow::anyhow!("OpenPicker requires PickerHandlers"))
+                    .and_then(|value| red_picker_handlers(plugin, value, "OpenPicker"))?;
+                let handle = self.policy_mut().allocate_picker_handle();
+                self.policy_mut().picker_handlers.insert(
+                    handle,
+                    PickerRegistration {
+                        plugin: plugin.to_string(),
+                        handlers,
+                    },
+                );
+                self.send_request(PluginRequest::OpenCallbackPicker {
+                    owner: plugin.to_string(),
+                    handle,
+                    title,
+                    items,
+                    options,
+                });
+                return Ok(Value::Int(i64::from(handle.get())));
+            }
             "OpenDynamicPicker" => {
                 let title = args.first().and_then(Value::as_str).map(str::to_string);
                 let id = args.get(1).and_then(value_to_i32).unwrap_or(1);
@@ -522,8 +888,39 @@ impl Host for RedHost {
                     history,
                 });
             }
+            "OpenComposer" => {
+                let title = Some(red_required_string(args, 0, "OpenComposer")?.to_string());
+                let query = red_required_string(args, 1, "OpenComposer")?.to_string();
+                let history = args
+                    .get(2)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<Vec<String>>)
+                    .transpose()?
+                    .unwrap_or_default();
+                let handlers = args
+                    .get(3)
+                    .ok_or_else(|| anyhow::anyhow!("OpenComposer requires ComposerHandlers"))
+                    .and_then(|value| red_composer_handlers(plugin, value, "OpenComposer"))?;
+                let handle = self.policy_mut().allocate_composer_handle();
+                self.policy_mut().composer_handlers.insert(
+                    handle,
+                    ComposerRegistration {
+                        plugin: plugin.to_string(),
+                        handlers,
+                    },
+                );
+                self.send_request(PluginRequest::OpenCallbackComposer {
+                    owner: plugin.to_string(),
+                    handle,
+                    title,
+                    query,
+                    history,
+                });
+                return Ok(Value::Int(i64::from(handle.get())));
+            }
             "UpdatePickerItems" => {
                 let id = args.first().and_then(value_to_i32).unwrap_or(1);
+                self.ensure_picker_owner(plugin, id, "UpdatePickerItems")?;
                 let items = args
                     .get(1)
                     .map(value_to_json)
@@ -534,16 +931,19 @@ impl Host for RedHost {
             }
             "UpdatePickerQuery" => {
                 let id = args.first().and_then(value_to_i32).unwrap_or(1);
+                self.ensure_picker_owner(plugin, id, "UpdatePickerQuery")?;
                 let query = args.get(1).map(value_to_string).unwrap_or_default();
                 self.send_request(PluginRequest::UpdatePickerQuery { id, query });
             }
             "UpdatePickerStatus" => {
                 let id = args.first().and_then(value_to_i32).unwrap_or(1);
+                self.ensure_picker_owner(plugin, id, "UpdatePickerStatus")?;
                 let status = args.get(1).map(value_to_string);
                 self.send_request(PluginRequest::UpdatePickerStatus { id, status });
             }
             "ClosePicker" => {
                 let id = args.first().and_then(value_to_i32).unwrap_or(1);
+                self.ensure_picker_owner(plugin, id, "ClosePicker")?;
                 self.send_request(PluginRequest::ClosePicker { id });
             }
             "OpenLocation" => {
@@ -1108,6 +1508,676 @@ impl Host for RedHost {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Husk host snapshot `{query}` is unavailable"))
     }
+
+    fn call_module(
+        &mut self,
+        plugin: &str,
+        path: &str,
+        args: &[Value],
+    ) -> Option<anyhow::Result<Value>> {
+        if !path.starts_with("red::") {
+            return None;
+        }
+        Some((|| match path {
+            "red::add_command" => {
+                let command = red_required_string(args, 0, path)?;
+                let callback = red_required_callback(args, 1, path)?.clone();
+                let metadata = args
+                    .get(2)
+                    .map(Value::to_json)
+                    .map(serde_json::from_value::<CommandMetadata>)
+                    .transpose()
+                    .map_err(|error| {
+                        anyhow::anyhow!("invalid metadata for command `{command}`: {error}")
+                    })?
+                    .unwrap_or_default();
+                if let Some(existing) = self.policy().commands.get(command) {
+                    if existing.callback.plugin() != plugin {
+                        anyhow::bail!(
+                            "command `{command}` is already registered by plugin `{}`",
+                            existing.callback.plugin()
+                        );
+                    }
+                }
+                self.policy_mut()
+                    .commands
+                    .insert(command.to_string(), RedCommand { callback, metadata });
+                Ok(Value::Unit)
+            }
+            "red::on" => {
+                let event = red_required_string(args, 0, path)?;
+                let callback = red_required_callback(args, 1, path)?.clone();
+                self.policy_mut()
+                    .event_listeners
+                    .entry(event.to_string())
+                    .or_default()
+                    .push(callback);
+                Ok(Value::Unit)
+            }
+            "red::execute" => {
+                let action = red_required_string(args, 0, path)?;
+                self.execute(plugin, action, &args[1..])
+            }
+            "red::request" => {
+                let action = red_required_string(args, 0, path)?;
+                let callback = red_required_callback(args, 1, path)?.clone();
+                let request_id = self.policy_mut().allocate_request_id();
+                self.policy_mut()
+                    .pending_requests
+                    .insert(request_id, callback);
+                if let Err(error) = self.request(plugin, request_id, action, &args[2..]) {
+                    self.policy_mut().pending_requests.remove(&request_id);
+                    return Err(error);
+                }
+                Ok(Value::Int(request_id.get()))
+            }
+            "red::viewport_layout" => self.query(plugin, "viewport_layout"),
+            "red::windows" => self.query(plugin, "windows"),
+            "red::editor_info" => self.query(plugin, "editor_info"),
+            "red::log" => {
+                let message = args
+                    .iter()
+                    .map(red_value_to_log_string)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                self.log(&message);
+                Ok(Value::Unit)
+            }
+            "red::state_bool" => {
+                let key = red_required_string(args, 0, path)?;
+                Ok(Value::Bool(
+                    self.policy()
+                        .plugin_states
+                        .get(plugin)
+                        .and_then(|state| state.get(key))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                ))
+            }
+            "red::state_set" => {
+                let key = red_required_string(args, 0, path)?.to_string();
+                let value = args.get(1).cloned().unwrap_or(Value::Unit);
+                self.policy_mut()
+                    .plugin_states
+                    .entry(plugin.to_string())
+                    .or_default()
+                    .insert(key, value);
+                Ok(Value::Unit)
+            }
+            "red::state" => {
+                let key = red_required_string(args, 0, path)?;
+                Ok(self
+                    .policy()
+                    .plugin_states
+                    .get(plugin)
+                    .and_then(|state| state.get(key))
+                    .cloned()
+                    .unwrap_or(Value::Unit))
+            }
+            "red::push" => {
+                let mut values = red_required_value_array(args, 0, path)?;
+                Arc::make_mut(&mut values).push(args.get(1).cloned().unwrap_or(Value::Null));
+                Ok(Value::Array(values))
+            }
+            "red::unshift" => {
+                let mut values = red_required_value_array(args, 0, path)?;
+                Arc::make_mut(&mut values).insert(0, args.get(1).cloned().unwrap_or(Value::Null));
+                Ok(Value::Array(values))
+            }
+            "red::contains" => {
+                let values = red_required_value_array(args, 0, path)?;
+                let needle = args.get(1).cloned().unwrap_or(Value::Null);
+                Ok(Value::Bool(values.contains(&needle)))
+            }
+            "red::remove" => {
+                let values = red_required_value_array(args, 0, path)?;
+                let needle = args.get(1).cloned().unwrap_or(Value::Null);
+                Ok(Value::Array(Arc::new(
+                    values
+                        .iter()
+                        .filter(|value| **value != needle)
+                        .cloned()
+                        .collect(),
+                )))
+            }
+            "red::reverse" => {
+                let values = red_required_value_array(args, 0, path)?;
+                Ok(Value::Array(Arc::new(
+                    values.iter().rev().cloned().collect(),
+                )))
+            }
+            "red::join" => {
+                let values = red_required_value_array(args, 0, path)?;
+                let separator = args.get(1).and_then(Value::as_str).unwrap_or("");
+                Ok(Value::String(
+                    values
+                        .iter()
+                        .map(red_value_to_log_string)
+                        .collect::<Vec<_>>()
+                        .join(separator),
+                ))
+            }
+            "red::range" => {
+                let end = args.first().and_then(red_value_to_i64).unwrap_or(0).max(0);
+                Ok(Value::Array(Arc::new((0..end).map(Value::Int).collect())))
+            }
+            "red::len" => {
+                let length = match args.first() {
+                    Some(Value::String(value)) => value.chars().count(),
+                    Some(Value::Array(values)) => values.len(),
+                    Some(Value::Object(values)) => values.len(),
+                    Some(Value::Json(serde_json::Value::Array(values))) => values.len(),
+                    Some(Value::Json(serde_json::Value::Object(values))) => values.len(),
+                    Some(Value::Unit | Value::Null | Value::Missing(_)) | None => 0,
+                    Some(value) => {
+                        anyhow::bail!("`{path}` argument 0 has no length: {value:?}")
+                    }
+                };
+                Ok(Value::Int(i64::try_from(length).unwrap_or(i64::MAX)))
+            }
+            "red::int" => {
+                let fallback = args.get(1).and_then(red_value_to_i64).unwrap_or(0);
+                Ok(Value::Int(
+                    args.first().and_then(red_value_to_i64).unwrap_or(fallback),
+                ))
+            }
+            "red::bool" => {
+                let fallback = args.get(1).and_then(Value::as_bool).unwrap_or(false);
+                Ok(Value::Bool(
+                    args.first().and_then(red_value_to_bool).unwrap_or(fallback),
+                ))
+            }
+            "red::string" => {
+                let fallback = args.get(1).map(red_value_to_log_string).unwrap_or_default();
+                Ok(Value::String(
+                    args.first()
+                        .and_then(red_value_to_plain_string)
+                        .unwrap_or(fallback),
+                ))
+            }
+            "red::text_field" => {
+                let text = args
+                    .first()
+                    .and_then(red_text_field_value)
+                    .unwrap_or_default();
+                Ok(Value::String(text))
+            }
+            "red::utf8_byte_to_char_index" => {
+                let text = red_required_string(args, 0, path)?;
+                let offset = args.get(1).and_then(red_value_to_i64).unwrap_or(0);
+                let offset = usize::try_from(offset).unwrap_or(0);
+                let index = text
+                    .char_indices()
+                    .take_while(|(byte_index, _)| *byte_index < offset)
+                    .count();
+                Ok(Value::Int(i64::try_from(index).unwrap_or(i64::MAX)))
+            }
+            "red::blend_color" => {
+                let foreground = args.first().and_then(red_color_channels);
+                let background = args.get(1).and_then(red_color_channels);
+                let opacity = args.get(2).and_then(red_value_to_f64).unwrap_or(0.42);
+                let Some((fr, fg, fb)) = foreground else {
+                    return Ok(args.first().cloned().unwrap_or(Value::Unit));
+                };
+                let Some((br, bg, bb)) = background else {
+                    return Ok(args.first().cloned().unwrap_or(Value::Unit));
+                };
+                let opacity = opacity.clamp(0.0, 1.0);
+                let blend = |foreground: u8, background: u8| {
+                    (f64::from(background)
+                        + (f64::from(foreground) - f64::from(background)) * opacity)
+                        .round()
+                        .clamp(0.0, 255.0) as u8
+                };
+                Ok(Value::Json(serde_json::json!({
+                    "Rgb": {
+                        "r": blend(fr, br),
+                        "g": blend(fg, bg),
+                        "b": blend(fb, bb),
+                    }
+                })))
+            }
+            "red::is_light_color" => {
+                let Some((red, green, blue)) = args.first().and_then(red_color_channels) else {
+                    return Ok(Value::Bool(false));
+                };
+                let linear = |channel: u8| {
+                    let value = f64::from(channel) / 255.0;
+                    if value <= 0.04045 {
+                        value / 12.92
+                    } else {
+                        ((value + 0.055) / 1.055).powf(2.4)
+                    }
+                };
+                let luminance =
+                    0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue);
+                Ok(Value::Bool(luminance > 0.5))
+            }
+            "red::char_at" => {
+                let value = red_required_string(args, 0, path)?;
+                let index = args.get(1).and_then(red_value_to_i64).unwrap_or(0);
+                let character = usize::try_from(index)
+                    .ok()
+                    .and_then(|index| value.chars().nth(index))
+                    .map_or_else(String::new, |character| character.to_string());
+                Ok(Value::String(character))
+            }
+            "red::trim" => {
+                let value = red_required_string(args, 0, path)?;
+                Ok(Value::String(value.trim().to_string()))
+            }
+            "red::lower" => {
+                let value = red_required_string(args, 0, path)?;
+                Ok(Value::String(value.to_lowercase()))
+            }
+            "red::split" => {
+                let value = red_required_string(args, 0, path)?;
+                let delimiter = red_required_string(args, 1, path)?;
+                Ok(Value::Json(serde_json::Value::Array(
+                    value
+                        .split(delimiter)
+                        .map(|part| serde_json::Value::String(part.to_string()))
+                        .collect(),
+                )))
+            }
+            "red::starts_with" => {
+                let value = red_required_string(args, 0, path)?;
+                let prefix = red_required_string(args, 1, path)?;
+                Ok(Value::Bool(value.starts_with(prefix)))
+            }
+            "red::ends_with" => {
+                let value = red_required_string(args, 0, path)?;
+                let suffix = red_required_string(args, 1, path)?;
+                Ok(Value::Bool(value.ends_with(suffix)))
+            }
+            "red::replace_all" => {
+                let value = red_required_string(args, 0, path)?;
+                let from = red_required_string(args, 1, path)?;
+                let to = red_required_string(args, 2, path)?;
+                Ok(Value::String(value.replace(from, to)))
+            }
+            "red::trim_line_end" => {
+                let value = red_required_string(args, 0, path)?;
+                Ok(Value::String(
+                    value
+                        .strip_suffix("\r\n")
+                        .or_else(|| value.strip_suffix('\n'))
+                        .unwrap_or(value)
+                        .to_string(),
+                ))
+            }
+            "red::slice" => {
+                let value = red_required_string(args, 0, path)?;
+                let len = i64::try_from(value.chars().count()).unwrap_or(i64::MAX);
+                let start = args.get(1).and_then(red_value_to_i64).unwrap_or(0);
+                let end = args.get(2).and_then(red_value_to_i64).unwrap_or(len);
+                let start = red_normalize_string_index(start, len);
+                let end = red_normalize_string_index(end, len);
+                let count = end.saturating_sub(start);
+                Ok(Value::String(
+                    value
+                        .chars()
+                        .skip(usize::try_from(start).unwrap_or(0))
+                        .take(usize::try_from(count).unwrap_or(0))
+                        .collect(),
+                ))
+            }
+            "red::is_whitespace" => {
+                let value = red_required_string(args, 0, path)?;
+                Ok(Value::Bool(value.chars().all(char::is_whitespace)))
+            }
+            "red::char" => {
+                let codepoint = args.first().and_then(red_value_to_i64).unwrap_or(0);
+                let value = u32::try_from(codepoint)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .map_or_else(String::new, |character| character.to_string());
+                Ok(Value::String(value))
+            }
+            "red::null" => Ok(Value::Null),
+            "red::parse_json" => {
+                let value = red_required_string(args, 0, path)?;
+                Ok(serde_json::from_str(value)
+                    .map(Value::Json)
+                    .unwrap_or(Value::Unit))
+            }
+            _ => anyhow::bail!("unknown Red host function `{path}`"),
+        })())
+    }
+}
+
+impl Host for RedHost {
+    fn log(&mut self, message: &str) {
+        RedHost::log(self, message);
+    }
+
+    fn call_module(
+        &mut self,
+        plugin: &str,
+        path: &str,
+        args: &[Value],
+    ) -> Option<anyhow::Result<Value>> {
+        RedHost::call_module(self, plugin, path, args)
+    }
+
+    fn begin_reload_replacement(&mut self, plugin: &str) {
+        RedHost::begin_reload_replacement(self, plugin);
+    }
+
+    fn begin_reload_teardown(&mut self, plugin: &str) {
+        RedHost::begin_reload_teardown(self, plugin);
+    }
+}
+
+fn red_required_string<'a>(
+    args: &'a [Value],
+    index: usize,
+    function: &str,
+) -> anyhow::Result<&'a str> {
+    args.get(index)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("`{function}` argument {index} must be a string"))
+}
+
+fn red_required_callback<'a>(
+    args: &'a [Value],
+    index: usize,
+    function: &str,
+) -> anyhow::Result<&'a Callback> {
+    match args.get(index) {
+        Some(Value::Callback(callback)) => Ok(callback),
+        _ => anyhow::bail!("`{function}` argument {index} must be a function callback"),
+    }
+}
+
+fn red_picker_handlers(
+    plugin: &str,
+    value: &Value,
+    function: &str,
+) -> anyhow::Result<PickerHandlers> {
+    let fields = match value {
+        Value::Struct { type_name, fields } => {
+            anyhow::ensure!(
+                type_name == "PickerHandlers",
+                "`{function}` handlers must be PickerHandlers, found {type_name}"
+            );
+            fields
+        }
+        // Red still compiles plugins under the legacy semantic profile, which erases
+        // nominal struct identity at runtime. Static checking has already established
+        // the PickerHandlers type before this adapter receives the native object.
+        Value::Object(fields) => fields,
+        _ => anyhow::bail!("`{function}` handlers must be a PickerHandlers value"),
+    };
+
+    let callback = |name: &str| -> anyhow::Result<Option<Callback>> {
+        match fields.get(name) {
+            None | Some(Value::Unit | Value::Null | Value::Missing(_)) => Ok(None),
+            Some(Value::Callback(callback)) => {
+                anyhow::ensure!(
+                    callback.plugin() == plugin,
+                    "`{function}` handler `{name}` belongs to plugin `{}`, not `{plugin}`",
+                    callback.plugin()
+                );
+                Ok(Some(callback.clone()))
+            }
+            Some(_) => anyhow::bail!("`{function}` handler `{name}` must be a function callback"),
+        }
+    };
+
+    let handlers = PickerHandlers {
+        selected: callback("selected")?,
+        cancelled: callback("cancelled")?,
+        changed: callback("changed")?,
+        query: callback("query")?,
+        action: callback("action")?,
+    };
+    anyhow::ensure!(
+        !handlers.is_empty(),
+        "`{function}` requires at least one picker handler"
+    );
+    Ok(handlers)
+}
+
+fn red_composer_handlers(
+    plugin: &str,
+    value: &Value,
+    function: &str,
+) -> anyhow::Result<ComposerHandlers> {
+    let fields = match value {
+        Value::Struct { type_name, fields } => {
+            anyhow::ensure!(
+                type_name == "ComposerHandlers",
+                "`{function}` handlers must be ComposerHandlers, found {type_name}"
+            );
+            fields
+        }
+        Value::Object(fields) => fields,
+        _ => anyhow::bail!("`{function}` handlers must be a ComposerHandlers value"),
+    };
+
+    let callback = |name: &str| -> anyhow::Result<Option<Callback>> {
+        match fields.get(name) {
+            None | Some(Value::Unit | Value::Null | Value::Missing(_)) => Ok(None),
+            Some(Value::Callback(callback)) => {
+                anyhow::ensure!(
+                    callback.plugin() == plugin,
+                    "`{function}` handler `{name}` belongs to plugin `{}`, not `{plugin}`",
+                    callback.plugin()
+                );
+                Ok(Some(callback.clone()))
+            }
+            Some(_) => anyhow::bail!("`{function}` handler `{name}` must be a function callback"),
+        }
+    };
+
+    let handlers = ComposerHandlers {
+        submitted: callback("submitted")?,
+        cancelled: callback("cancelled")?,
+    };
+    anyhow::ensure!(
+        !handlers.is_empty(),
+        "`{function}` requires at least one composer handler"
+    );
+    Ok(handlers)
+}
+
+fn red_required_value_array(
+    args: &[Value],
+    index: usize,
+    function: &str,
+) -> anyhow::Result<Arc<Vec<Value>>> {
+    match args.get(index) {
+        Some(Value::Array(values)) => Ok(values.clone()),
+        Some(Value::Json(serde_json::Value::Array(values))) => Ok(Arc::new(
+            values
+                .iter()
+                .cloned()
+                .map(Value::from_json)
+                .collect::<Vec<_>>(),
+        )),
+        _ => anyhow::bail!("`{function}` argument {index} must be an array"),
+    }
+}
+
+fn red_value_to_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Int(value) => Some(*value as f64),
+        Value::Float(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn red_value_to_i64(value: &Value) -> Option<i64> {
+    match value {
+        Value::Int(value) => Some(*value),
+        Value::Float(value) => Some(*value as i64),
+        Value::String(value) => value.parse().ok(),
+        Value::Json(serde_json::Value::Number(value)) => value.as_i64(),
+        Value::Json(serde_json::Value::String(value)) => value.parse().ok(),
+        _ => None,
+    }
+}
+
+fn red_value_to_bool(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(value) => Some(*value),
+        Value::Json(serde_json::Value::Bool(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+fn red_value_to_plain_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Json(serde_json::Value::String(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn red_text_field_value(value: &Value) -> Option<String> {
+    let object = value.to_json();
+    object
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            object
+                .get("bytes")
+                .and_then(serde_json::Value::as_str)
+                .and_then(red_decode_base64)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        })
+}
+
+fn red_decode_base64(encoded: &str) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut quartet = [0_u8; 4];
+    let mut count = 0;
+    for byte in encoded.bytes().filter(|byte| !byte.is_ascii_whitespace()) {
+        if byte == b'=' {
+            break;
+        }
+        quartet[count] = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        count += 1;
+        if count == 4 {
+            output.push((quartet[0] << 2) | (quartet[1] >> 4));
+            output.push((quartet[1] << 4) | (quartet[2] >> 2));
+            output.push((quartet[2] << 6) | quartet[3]);
+            count = 0;
+        }
+    }
+    match count {
+        0 => Some(output),
+        2 => {
+            output.push((quartet[0] << 2) | (quartet[1] >> 4));
+            Some(output)
+        }
+        3 => {
+            output.push((quartet[0] << 2) | (quartet[1] >> 4));
+            output.push((quartet[1] << 4) | (quartet[2] >> 2));
+            Some(output)
+        }
+        _ => None,
+    }
+}
+
+fn red_color_channels(value: &Value) -> Option<(u8, u8, u8)> {
+    if let Value::String(value) = value {
+        let hex = value.strip_prefix('#')?;
+        if hex.len() < 6 {
+            return None;
+        }
+        return Some((
+            u8::from_str_radix(&hex[0..2], 16).ok()?,
+            u8::from_str_radix(&hex[2..4], 16).ok()?,
+            u8::from_str_radix(&hex[4..6], 16).ok()?,
+        ));
+    }
+    let value = value.to_json();
+    let channels = value.get("Rgb").or_else(|| value.get("Rgba"))?;
+    Some((
+        u8::try_from(channels.get("r")?.as_u64()?).ok()?,
+        u8::try_from(channels.get("g")?.as_u64()?).ok()?,
+        u8::try_from(channels.get("b")?.as_u64()?).ok()?,
+    ))
+}
+
+fn red_normalize_string_index(index: i64, len: i64) -> i64 {
+    if index < 0 {
+        (len + index).clamp(0, len)
+    } else {
+        index.clamp(0, len)
+    }
+}
+
+fn red_value_to_log_string(value: &Value) -> String {
+    match value {
+        Value::Unit => "()".to_string(),
+        Value::Null | Value::Missing(_) => "null".to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Int(value) => value.to_string(),
+        Value::Float(value) => value.to_string(),
+        Value::String(value) => value.clone(),
+        Value::Array(value) | Value::Tuple(value) => {
+            serde_json::Value::Array(value.iter().map(Value::to_json).collect()).to_string()
+        }
+        Value::Range {
+            start,
+            end,
+            inclusive,
+        } => {
+            if *inclusive {
+                format!("{start}..={end}")
+            } else {
+                format!("{start}..{end}")
+            }
+        }
+        Value::Object(value) => serde_json::Value::Object(
+            value
+                .iter()
+                .map(|(key, value)| (key.clone(), value.to_json()))
+                .collect(),
+        )
+        .to_string(),
+        Value::Struct { type_name, fields } => format!(
+            "{type_name} {}",
+            serde_json::Value::Object(
+                fields
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.to_json()))
+                    .collect(),
+            )
+        ),
+        Value::Variant {
+            type_name,
+            case,
+            fields,
+        } => {
+            let payload = fields
+                .iter()
+                .map(red_value_to_log_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            if fields.is_empty() {
+                format!("{type_name}::{case}")
+            } else {
+                format!("{type_name}::{case}({payload})")
+            }
+        }
+        Value::Json(value) => value.to_string(),
+        Value::Callback(callback) => {
+            format!("{}::{}", callback.plugin(), callback.function())
+        }
+        Value::Closure(_) => "<closure>".to_string(),
+    }
 }
 
 fn first_json(args: &[Value]) -> anyhow::Result<serde_json::Value> {
@@ -1163,9 +2233,15 @@ fn value_to_string(value: &Value) -> String {
         Value::Int(value) => value.to_string(),
         Value::Float(value) => value.to_string(),
         Value::String(value) => value.clone(),
-        Value::Array(_) | Value::Object(_) => value.to_json().to_string(),
+        Value::Array(_)
+        | Value::Tuple(_)
+        | Value::Range { .. }
+        | Value::Object(_)
+        | Value::Struct { .. }
+        | Value::Variant { .. } => value.to_json().to_string(),
         Value::Json(value) => value.to_string(),
         Value::Callback(_) => "<callback>".to_string(),
+        Value::Closure(_) => "<closure>".to_string(),
     }
 }
 
@@ -1186,9 +2262,14 @@ fn value_to_json(value: &Value) -> serde_json::Value {
         Value::Float(value) => serde_json::Number::from_f64(*value)
             .map_or(serde_json::Value::Null, serde_json::Value::Number),
         Value::String(value) => serde_json::Value::String(value.clone()),
-        Value::Array(_) | Value::Object(_) => value.to_json(),
+        Value::Array(_)
+        | Value::Tuple(_)
+        | Value::Range { .. }
+        | Value::Object(_)
+        | Value::Struct { .. }
+        | Value::Variant { .. } => value.to_json(),
         Value::Json(value) => value.clone(),
-        Value::Callback(_) => serde_json::Value::Null,
+        Value::Callback(_) | Value::Closure(_) => serde_json::Value::Null,
     }
 }
 
@@ -1229,7 +2310,7 @@ pub struct RegisteredPluginCommand {
 }
 
 struct RuntimeInner {
-    vm: husk::Vm,
+    plugins: HashMap<String, husk_runtime::Vm>,
     host: RedHost,
     anonymous_module_count: usize,
     typecheck_enabled: bool,
@@ -1258,11 +2339,9 @@ impl Runtime {
     pub fn try_new_with_permissions(
         process_permissions: HashMap<String, PluginPermissions>,
     ) -> anyhow::Result<Self> {
-        let mut vm = husk::Vm::new();
-        vm.set_instruction_budget(PLUGIN_INSTRUCTION_BUDGET);
         Ok(Self {
             inner: Arc::new(Mutex::new(RuntimeInner {
-                vm,
+                plugins: HashMap::new(),
                 host: RedHost::new(process_permissions),
                 anonymous_module_count: 0,
                 typecheck_enabled: true,
@@ -1288,24 +2367,41 @@ impl Runtime {
         let _span = crate::editor::perf::PerfSpan::with_detail("husk:load", name);
         let mut inner = self.inner.lock().unwrap();
         let path = path.into();
-        if inner.typecheck_enabled {
-            validate_plugin_source(name, &path, source)?;
-        }
-        let RuntimeInner { vm, host, .. } = &mut *inner;
+        let program = if inner.typecheck_enabled {
+            compile_plugin_source(name, &path, source)?
+        } else {
+            CompiledProgram::compile_at(
+                name,
+                &path,
+                source,
+                &CompileOptions::legacy_runtime_compatibility(),
+            )?
+        };
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
         host.begin_reload();
-        let result = vm.reload_plugin_at(name, path, source, host);
+        let was_loaded = plugins.contains_key(name);
+        let vm = plugins
+            .entry(name.to_string())
+            .or_insert_with(new_plugin_vm);
+        let result = vm.reload_compiled_plugin(name, program, host);
         if result.is_ok() {
             host.commit_reload();
         } else {
             host.rollback_reload();
+            if !was_loaded {
+                plugins.remove(name);
+            }
         }
         result
     }
 
     pub fn unload_plugin(&mut self, name: &str) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { vm, host, .. } = &mut *inner;
-        let result = vm.deactivate_plugin(name, host);
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let result = plugins
+            .remove(name)
+            .map_or(Ok(()), |mut vm| vm.deactivate_plugin(name, host));
+        host.remove_plugin(name);
         host.process_manager.shutdown_plugin(name);
         result
     }
@@ -1315,10 +2411,11 @@ impl Runtime {
         self.inner
             .lock()
             .unwrap()
-            .vm
-            .commands()
+            .host
+            .policy()
+            .commands
             .get(command)
-            .map(|callback| callback.plugin().to_string())
+            .map(|command| command.callback.plugin().to_string())
     }
 
     /// Returns the active plugin commands in a stable order for discovery UI.
@@ -1326,13 +2423,14 @@ impl Runtime {
     pub fn registered_commands(&self) -> Vec<RegisteredPluginCommand> {
         let inner = self.inner.lock().unwrap();
         let mut commands = inner
-            .vm
-            .commands()
+            .host
+            .policy()
+            .commands
             .iter()
-            .map(|(name, callback)| RegisteredPluginCommand {
+            .map(|(name, command)| RegisteredPluginCommand {
                 name: name.clone(),
-                plugin: callback.plugin().to_string(),
-                metadata: inner.vm.command_metadata(name).cloned().unwrap_or_default(),
+                plugin: command.callback.plugin().to_string(),
+                metadata: command.metadata.clone(),
             })
             .collect::<Vec<_>>();
         commands.sort_unstable_by(|left, right| left.name.cmp(&right.name));
@@ -1355,15 +2453,35 @@ impl Runtime {
     pub async fn execute_command(&mut self, command: &str) -> anyhow::Result<()> {
         let _span = crate::editor::perf::PerfSpan::with_detail("husk:command", command);
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { vm, host, .. } = &mut *inner;
-        vm.execute_command(command, host)
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let callback = host
+            .policy()
+            .commands
+            .get(command)
+            .map(|command| command.callback.clone())
+            .ok_or_else(|| anyhow::anyhow!("unknown Husk plugin command `{command}`"))?;
+        call_plugin_callback(plugins, host, &callback, Vec::new()).map(drop)
     }
 
     pub async fn notify(&mut self, event: &str, args: serde_json::Value) -> anyhow::Result<()> {
         let _span = crate::editor::perf::PerfSpan::with_detail("husk:notify", event);
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { vm, host, .. } = &mut *inner;
-        vm.notify(event, args, host)
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let callbacks = host
+            .policy()
+            .event_listeners
+            .get(event)
+            .cloned()
+            .unwrap_or_default();
+        for callback in callbacks {
+            call_plugin_callback(
+                plugins,
+                host,
+                &callback,
+                vec![Value::from_json(args.clone())],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn notify_isolated(
@@ -1372,8 +2490,27 @@ impl Runtime {
         args: serde_json::Value,
     ) -> Vec<(String, anyhow::Error)> {
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { vm, host, .. } = &mut *inner;
-        vm.notify_isolated(event, args, host)
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let callbacks = host
+            .policy()
+            .event_listeners
+            .get(event)
+            .cloned()
+            .unwrap_or_default();
+        callbacks
+            .into_iter()
+            .filter_map(|callback| {
+                let plugin = callback.plugin().to_string();
+                call_plugin_callback(
+                    plugins,
+                    host,
+                    &callback,
+                    vec![Value::from_json(args.clone())],
+                )
+                .err()
+                .map(|error| (plugin, error))
+            })
+            .collect()
     }
 
     pub fn notify_plugin_isolated(
@@ -1383,8 +2520,119 @@ impl Runtime {
         args: serde_json::Value,
     ) -> Vec<(String, anyhow::Error)> {
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { vm, host, .. } = &mut *inner;
-        vm.notify_plugin_isolated(plugin, event, args, host)
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let callbacks = host
+            .policy()
+            .event_listeners
+            .get(event)
+            .cloned()
+            .unwrap_or_default();
+        callbacks
+            .into_iter()
+            .filter(|callback| callback.plugin() == plugin)
+            .filter_map(|callback| {
+                call_plugin_callback(
+                    plugins,
+                    host,
+                    &callback,
+                    vec![Value::from_json(args.clone())],
+                )
+                .err()
+                .map(|error| (plugin.to_string(), error))
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn picker_plugin(&self, handle: PickerHandle) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .host
+            .policy()
+            .picker_handlers
+            .get(&handle)
+            .map(|registration| registration.plugin.clone())
+    }
+
+    pub fn notify_picker(
+        &mut self,
+        handle: PickerHandle,
+        event: PickerCallback,
+    ) -> anyhow::Result<bool> {
+        let mut inner = self.inner.lock().unwrap();
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let kind = event.kind();
+        let registration = if kind.is_terminal() {
+            host.policy_mut().picker_handlers.remove(&handle)
+        } else {
+            host.policy().picker_handlers.get(&handle).cloned()
+        };
+        let Some(registration) = registration else {
+            return Ok(false);
+        };
+        let Some(callback) = registration.handlers.callback(kind).cloned() else {
+            return Ok(true);
+        };
+        call_plugin_callback(plugins, host, &callback, vec![picker_callback_value(event)])?;
+        Ok(true)
+    }
+
+    pub fn release_picker(&mut self, handle: PickerHandle) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .host
+            .policy_mut()
+            .picker_handlers
+            .remove(&handle)
+            .is_some()
+    }
+
+    #[must_use]
+    pub fn composer_plugin(&self, handle: ComposerHandle) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .host
+            .policy()
+            .composer_handlers
+            .get(&handle)
+            .map(|registration| registration.plugin.clone())
+    }
+
+    pub fn notify_composer(
+        &mut self,
+        handle: ComposerHandle,
+        event: ComposerCallback,
+    ) -> anyhow::Result<bool> {
+        let mut inner = self.inner.lock().unwrap();
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let registration = host.policy_mut().composer_handlers.remove(&handle);
+        let Some(registration) = registration else {
+            return Ok(false);
+        };
+        let Some(callback) = registration.handlers.callback(event.kind()).cloned() else {
+            return Ok(true);
+        };
+        call_plugin_callback(
+            plugins,
+            host,
+            &callback,
+            vec![composer_callback_value(event)],
+        )?;
+        Ok(true)
+    }
+
+    pub fn release_composer(&mut self, handle: ComposerHandle) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .host
+            .policy_mut()
+            .composer_handlers
+            .remove(&handle)
+            .is_some()
     }
 
     pub async fn resolve_request(
@@ -1393,8 +2641,17 @@ impl Runtime {
         payload: serde_json::Value,
     ) -> anyhow::Result<bool> {
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { vm, host, .. } = &mut *inner;
-        vm.resolve_request(request_id, payload, host)
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let Some(callback) = host.policy_mut().pending_requests.remove(&request_id) else {
+            return Ok(false);
+        };
+        call_plugin_callback(
+            plugins,
+            host,
+            &callback,
+            vec![Value::from_json(payload), Value::Int(request_id.get())],
+        )?;
+        Ok(true)
     }
 
     #[must_use]
@@ -1402,9 +2659,11 @@ impl Runtime {
         self.inner
             .lock()
             .unwrap()
-            .vm
-            .request_plugin(request_id)
-            .map(str::to_string)
+            .host
+            .policy()
+            .pending_requests
+            .get(&request_id)
+            .map(|callback| callback.plugin().to_string())
     }
 
     pub fn set_snapshot(&mut self, name: impl Into<String>, value: serde_json::Value) {
@@ -1419,57 +2678,139 @@ impl Runtime {
 
     pub async fn before_exit(&mut self, snapshot: serde_json::Value) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { vm, host, .. } = &mut *inner;
-        vm.before_exit(snapshot, host)
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let mut names = plugins.keys().cloned().collect::<Vec<_>>();
+        names.sort_unstable();
+        for name in names {
+            if let Some(vm) = plugins.get_mut(&name) {
+                vm.before_exit(snapshot.clone(), host)?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn deactivate_all(&mut self) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        let RuntimeInner { vm, host, .. } = &mut *inner;
-        vm.deactivate_all(host)
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let mut names = plugins.keys().cloned().collect::<Vec<_>>();
+        names.sort_unstable();
+        let mut first_error = None;
+        for name in names {
+            let Some(mut vm) = plugins.remove(&name) else {
+                continue;
+            };
+            if let Err(error) = vm.deactivate_all(host) {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        host.clear_policy();
+        first_error.map_or(Ok(()), Err)
     }
 }
 
-fn validate_plugin_source(name: &str, path: &str, source: &str) -> anyhow::Result<()> {
-    let parsed = husk_parser::parse_str(source);
-    let Some(file) = parsed.file.as_ref() else {
-        return Ok(());
-    };
-    super::api::validate_parsed_source(name, path, source, file)?;
-    if !parsed.errors.is_empty() {
-        // The VM parser produces the canonical parse diagnostic and error code.
-        return Ok(());
+fn new_plugin_vm() -> husk_runtime::Vm {
+    let mut vm = husk_runtime::Vm::new();
+    vm.set_instruction_budget(PLUGIN_INSTRUCTION_BUDGET);
+    vm.set_instance_generation(NEXT_PLUGIN_VM_GENERATION.fetch_add(1, Ordering::Relaxed));
+    vm
+}
+
+fn call_plugin_callback(
+    plugins: &mut HashMap<String, husk_runtime::Vm>,
+    host: &mut RedHost,
+    callback: &Callback,
+    args: Vec<Value>,
+) -> anyhow::Result<Value> {
+    let vm = plugins.get_mut(callback.plugin()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Husk callback references unloaded plugin `{}`",
+            callback.plugin()
+        )
+    })?;
+    vm.call_callback(callback, args, host)
+}
+
+fn picker_callback_value(event: PickerCallback) -> Value {
+    match event {
+        PickerCallback::Selected(item) | PickerCallback::Changed(item) => {
+            typed_json_value("PickerItem", serde_json::to_value(item).unwrap_or_default())
+        }
+        PickerCallback::Cancelled => Value::Struct {
+            type_name: "PickerCancelled".to_string(),
+            fields: Arc::new(BTreeMap::new()),
+        },
+        PickerCallback::Query(query) => Value::String(query),
+        PickerCallback::Action {
+            action,
+            item,
+            query,
+        } => {
+            let mut fields = BTreeMap::new();
+            fields.insert("action".to_string(), Value::String(action));
+            fields.insert(
+                "item".to_string(),
+                item.map_or(Value::Null, |item| {
+                    typed_json_value("PickerItem", serde_json::to_value(item).unwrap_or_default())
+                }),
+            );
+            fields.insert("query".to_string(), Value::String(query));
+            Value::Struct {
+                type_name: "PickerActionEvent".to_string(),
+                fields: Arc::new(fields),
+            }
+        }
     }
+}
+
+fn composer_callback_value(event: ComposerCallback) -> Value {
+    match event {
+        ComposerCallback::Submitted(prompt) => Value::String(prompt),
+        ComposerCallback::Cancelled => Value::Struct {
+            type_name: "ComposerCancelled".to_string(),
+            fields: Arc::new(BTreeMap::new()),
+        },
+    }
+}
+
+fn typed_json_value(type_name: &str, value: serde_json::Value) -> Value {
+    let fields = value.as_object().map_or_else(BTreeMap::new, |object| {
+        object
+            .iter()
+            .map(|(name, value)| (name.clone(), Value::from_json(value.clone())))
+            .collect()
+    });
+    Value::Struct {
+        type_name: type_name.to_string(),
+        fields: Arc::new(fields),
+    }
+}
+
+fn compile_plugin_source(name: &str, path: &str, source: &str) -> anyhow::Result<CompiledProgram> {
     let host = RED_HOST_AST.get_or_init(|| {
         let parsed = husk_parser::parse_str(RED_HOST_DECLARATIONS);
-        assert!(parsed.errors.is_empty(), "Red host declarations must parse");
+        assert!(
+            parsed.errors.is_empty(),
+            "Red host declarations must parse: {:?}",
+            parsed.errors
+        );
         parsed
             .file
             .expect("Red host declarations must produce an AST")
     });
-    let result = husk_semantic::analyze_file_with_declarations(file, std::slice::from_ref(host));
-    let mut errors = result.symbols.errors.into_iter().chain(result.type_errors);
-    let Some(first_error) = errors.next() else {
-        return Ok(());
-    };
+    let options = CompileOptions::legacy_runtime_compatibility()
+        .with_typecheck(true)
+        .with_profile(SemanticProfile::LegacyJavaScript)
+        .with_declaration(host.clone());
+    let program = CompiledProgram::compile_at(name, path, source, &options)?;
+    super::api::validate_parsed_source(name, path, source, program.syntax())?;
+    Ok(program)
+}
 
-    let source_file = SourceFile::new(path, source);
-    let diagnostics = std::iter::once(first_error)
-        .chain(errors)
-        .map(|error| {
-            HuskDiagnostic::new(
-                "HUSK-T0001",
-                error.message,
-                source_file.clone(),
-                error.span,
-                "incompatible plugin expression",
-            )
-            .with_note(format!("while typechecking plugin `{name}`"))
-        })
-        .collect::<Vec<_>>();
-    Err(anyhow::Error::new(HuskReport::from_diagnostics(
-        diagnostics,
-    )))
+#[cfg(test)]
+fn validate_plugin_source(name: &str, path: &str, source: &str) -> anyhow::Result<()> {
+    compile_plugin_source(name, path, source).map(drop)
 }
 
 #[allow(dead_code)]
@@ -1494,6 +2835,91 @@ mod tests {
 
     fn drain_requests() {
         while ACTION_DISPATCHER.try_recv_request().is_some() {}
+    }
+
+    fn recv_agent_composer() -> (ComposerHandle, Option<String>, String, Vec<String>) {
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer {
+                owner,
+                handle,
+                title,
+                query,
+                history,
+            } => {
+                assert_eq!(owner, "agent");
+                (handle, title, query, history)
+            }
+            _ => panic!("expected callback-scoped agent composer"),
+        }
+    }
+
+    fn recv_agent_picker(expected_title: &str) -> (PickerHandle, Vec<PickerItem>) {
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                owner,
+                handle,
+                title,
+                items,
+                ..
+            } => {
+                assert_eq!(owner, "agent");
+                assert_eq!(title.as_deref(), Some(expected_title));
+                (handle, items)
+            }
+            _ => panic!("expected callback-scoped agent picker"),
+        }
+    }
+
+    async fn open_agent_composer(runtime: &mut Runtime) -> ComposerHandle {
+        runtime.execute_command("AgentPrompt").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetPluginStorage {
+                plugin,
+                key,
+                request_id,
+            } => {
+                assert_eq!(plugin, "agent");
+                assert_eq!(key, "prompt_history");
+                request_id
+            }
+            _ => panic!("expected agent prompt-history request"),
+        };
+        runtime
+            .resolve_request(request_id, serde_json::json!({ "value": [] }))
+            .await
+            .unwrap();
+        recv_agent_composer().0
+    }
+
+    async fn submit_agent_prompt(runtime: &mut Runtime, prompt: &str) {
+        let handle = open_agent_composer(runtime).await;
+        assert!(runtime
+            .notify_composer(handle, ComposerCallback::Submitted(prompt.to_string()))
+            .unwrap());
+    }
+
+    async fn open_agent_setup_picker(runtime: &mut Runtime) -> (PickerHandle, Vec<PickerItem>) {
+        runtime
+            .notify(
+                "agent:error",
+                serde_json::json!({ "message": "Codex login required" }),
+            )
+            .await
+            .unwrap();
+        loop {
+            if let PluginRequest::OpenCallbackPicker {
+                owner,
+                handle,
+                title,
+                items,
+                ..
+            } = ACTION_DISPATCHER.recv_request()
+            {
+                assert_eq!(owner, "agent");
+                assert_eq!(title.as_deref(), Some("Retry Codex"));
+                return (handle, items);
+            }
+        }
     }
 
     fn sample_indent_layout() -> serde_json::Value {
@@ -1620,6 +3046,36 @@ mod tests {
         })
     }
 
+    async fn load_lsp_symbols(runtime: &mut Runtime) {
+        runtime
+            .load_plugin("lsp_symbols", include_str!("../../plugins/lsp_symbols.hk"))
+            .await
+            .unwrap();
+        let config_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(key.as_deref(), Some("plugin_config"));
+                request_id
+            }
+            _ => panic!("unexpected plugin request"),
+        };
+        runtime
+            .resolve_request(
+                config_request_id,
+                serde_json::json!({
+                    "value": {
+                        "lsp_symbols": {
+                            "icons": {
+                                "enabled": true,
+                                "overrides": {}
+                            }
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
     async fn pump_process_events(runtime: &mut Runtime) -> anyhow::Result<()> {
         for event in runtime.poll_process_events() {
             let Some(process_id) = event
@@ -1634,6 +3090,58 @@ mod tests {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn open_project_search_picker(runtime: &mut Runtime) -> PickerHandle {
+        runtime.execute_command("ProjectSearch").await.unwrap();
+
+        let cwd_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(key.as_deref(), Some("cwd"));
+                request_id
+            }
+            _ => panic!("unexpected plugin request"),
+        };
+        runtime
+            .resolve_request(cwd_request_id, serde_json::json!({ "value": "." }))
+            .await
+            .unwrap();
+        let storage_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetPluginStorage {
+                plugin,
+                key,
+                request_id,
+            } => {
+                assert_eq!(plugin, "project_search");
+                assert_eq!(key, "history_by_cwd");
+                request_id
+            }
+            _ => panic!("unexpected plugin request"),
+        };
+        runtime
+            .resolve_request(storage_request_id, serde_json::json!({ "value": {} }))
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                owner,
+                handle,
+                title,
+                items,
+                options,
+            } => {
+                assert_eq!(owner, "project_search");
+                assert_eq!(title.as_deref(), Some("Find in Files"));
+                assert!(items.is_empty());
+                assert!(options.external_filter);
+                assert!(options
+                    .actions
+                    .iter()
+                    .any(|action| action.action == "export"));
+                handle
+            }
+            _ => panic!("unexpected plugin request"),
+        }
     }
 
     #[tokio::test]
@@ -1814,16 +3322,12 @@ mod tests {
             .resolve_request(history_request_id, serde_json::json!({ "value": [] }))
             .await
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenAgentComposer { id: 802, .. }
-        ));
+        let composer = recv_agent_composer().0;
         runtime
-            .notify(
-                "composer:submitted:802",
-                serde_json::json!("explain the workspace"),
+            .notify_composer(
+                composer,
+                ComposerCallback::Submitted("explain the workspace".to_string()),
             )
-            .await
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -1980,26 +3484,17 @@ mod tests {
             )
             .await
             .unwrap();
-        let (owner, title, query, history) = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenAgentComposer {
-                owner,
-                title,
-                id: 802,
-                query,
-                history,
-            } => (owner, title, query, history),
-            _ => panic!("expected agent composer"),
-        };
-        assert_eq!(owner, "agent");
+        let (composer, title, query, history) = recv_agent_composer();
         assert_eq!(title.as_deref(), Some("Agent prompt"));
         assert!(query.is_empty());
         assert_eq!(history, ["previous prompt"]);
         runtime
-            .notify(
-                "composer:submitted:802",
-                serde_json::json!("  inspect the workspace\ninclude all unsaved changes  "),
+            .notify_composer(
+                composer,
+                ComposerCallback::Submitted(
+                    "  inspect the workspace\ninclude all unsaved changes  ".to_string(),
+                ),
             )
-            .await
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -2270,18 +3765,12 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenDynamicPicker { id: 801, .. }
-        ));
+        let (permission_picker, permission_items) = recv_agent_picker("Agent permission");
         runtime
-            .notify(
-                "picker:selected:801",
-                serde_json::json!({
-                    "data": { "option_id": "allow-once-exact" }
-                }),
+            .notify_picker(
+                permission_picker,
+                PickerCallback::Selected(permission_items[0].clone()),
             )
-            .await
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -2328,10 +3817,7 @@ mod tests {
             .unwrap();
         drain_requests();
 
-        runtime
-            .notify("composer:submitted:802", serde_json::json!("first prompt"))
-            .await
-            .unwrap();
+        submit_agent_prompt(&mut runtime, "first prompt").await;
         let mut first_prompt = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             first_prompt |= matches!(
@@ -2403,13 +3889,7 @@ mod tests {
         }
         assert!(setup_status);
 
-        runtime
-            .notify(
-                "composer:submitted:802",
-                serde_json::json!("concurrent prompt"),
-            )
-            .await
-            .unwrap();
+        submit_agent_prompt(&mut runtime, "concurrent prompt").await;
         let mut history_saved = false;
         let mut status = false;
         let mut queued_visible = false;
@@ -2945,10 +4425,7 @@ mod tests {
             .resolve_request(history_request_id, serde_json::json!({ "value": [] }))
             .await
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenAgentComposer { id: 802, .. }
-        ));
+        recv_agent_composer();
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
 
         runtime.execute_command("AgentNew").await.unwrap();
@@ -3052,10 +4529,7 @@ mod tests {
             .unwrap();
         drain_requests();
 
-        runtime
-            .notify("composer:submitted:802", serde_json::json!("first prompt"))
-            .await
-            .unwrap();
+        submit_agent_prompt(&mut runtime, "first prompt").await;
         drain_requests();
         runtime
             .notify(
@@ -3076,10 +4550,7 @@ mod tests {
             "cancelled session must be closed so proposals are archived"
         );
 
-        runtime
-            .notify("composer:submitted:802", serde_json::json!("next prompt"))
-            .await
-            .unwrap();
+        submit_agent_prompt(&mut runtime, "next prompt").await;
         let mut config_request = None;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             if let PluginRequest::GetConfig { request_id, key } = request {
@@ -3136,10 +4607,7 @@ mod tests {
             .unwrap();
         drain_requests();
 
-        runtime
-            .notify("composer:submitted:802", serde_json::json!("first prompt"))
-            .await
-            .unwrap();
+        submit_agent_prompt(&mut runtime, "first prompt").await;
         drain_requests();
         runtime
             .notify(
@@ -3166,10 +4634,7 @@ mod tests {
         }
         assert!(closed, "late cancellation must close the unusable session");
 
-        runtime
-            .notify("composer:submitted:802", serde_json::json!("next prompt"))
-            .await
-            .unwrap();
+        submit_agent_prompt(&mut runtime, "next prompt").await;
         let mut config_request = None;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             if let PluginRequest::GetConfig { request_id, key } = request {
@@ -3226,10 +4691,7 @@ mod tests {
             .unwrap();
         drain_requests();
 
-        runtime
-            .notify("composer:submitted:802", serde_json::json!("first prompt"))
-            .await
-            .unwrap();
+        submit_agent_prompt(&mut runtime, "first prompt").await;
         drain_requests();
         runtime
             .notify(
@@ -3279,10 +4741,7 @@ mod tests {
         assert!(closed, "completed turn must close the cancelled session");
         assert!(transcript_saved, "completed stream must remain in history");
 
-        runtime
-            .notify("composer:submitted:802", serde_json::json!("next prompt"))
-            .await
-            .unwrap();
+        submit_agent_prompt(&mut runtime, "next prompt").await;
         let mut config_request = None;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             if let PluginRequest::GetConfig { request_id, key } = request {
@@ -3351,10 +4810,7 @@ mod tests {
                 .await
                 .unwrap();
             drain_requests();
-            runtime
-                .notify("composer:submitted:802", serde_json::json!("first prompt"))
-                .await
-                .unwrap();
+            submit_agent_prompt(&mut runtime, "first prompt").await;
             drain_requests();
             runtime
                 .notify(
@@ -3478,13 +4934,7 @@ mod tests {
             .unwrap();
         drain_requests();
 
-        runtime
-            .notify(
-                "composer:submitted:802",
-                serde_json::json!("retry this exact prompt"),
-            )
-            .await
-            .unwrap();
+        submit_agent_prompt(&mut runtime, "retry this exact prompt").await;
         let mut saw_prompt = false;
         while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
             if let PluginRequest::AgentPrompt { session_id, text } = request {
@@ -3562,10 +5012,7 @@ mod tests {
             PluginRequest::Action(Action::Print(message))
                 if message.contains("prompt is preserved")
         ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenDynamicPicker { id: 803, .. }
-        ));
+        recv_agent_picker("Retry Codex");
 
         runtime
             .notify(
@@ -3619,16 +5066,12 @@ mod tests {
             .resolve_request(history_request_id, serde_json::json!({ "value": [] }))
             .await
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenAgentComposer { id: 802, .. }
-        ));
+        let composer = recv_agent_composer().0;
         runtime
-            .notify(
-                "composer:submitted:802",
-                serde_json::json!("keep this prompt"),
+            .notify_composer(
+                composer,
+                ComposerCallback::Submitted("keep this prompt".to_string()),
             )
-            .await
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -3682,10 +5125,7 @@ mod tests {
             PluginRequest::Action(Action::Print(message))
                 if message.contains("prompt is preserved")
         ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenDynamicPicker { id: 803, .. }
-        ));
+        recv_agent_picker("Retry Codex");
 
         runtime.execute_command("Agent").await.unwrap();
         let history_request_id = match ACTION_DISPATCHER.recv_request() {
@@ -3699,10 +5139,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenAgentComposer { query, .. } if query == "keep this prompt"
-        ));
+        let (_, _, query, _) = recv_agent_composer();
+        assert_eq!(query, "keep this prompt");
     }
 
     #[tokio::test]
@@ -4055,19 +5493,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenAgentComposer {
-                owner,
-                id: 802,
-                title,
-                query,
-                history,
-            } if owner == "agent"
-                && title.as_deref() == Some("Agent prompt")
-                && query.is_empty()
-                && history == expected_history
-        ));
+        let (composer, title, query, history) = recv_agent_composer();
+        assert_eq!(title.as_deref(), Some("Agent prompt"));
+        assert!(query.is_empty());
+        assert_eq!(history, expected_history);
 
         for (event, payload) in [
             ("picker:query:802", serde_json::json!("do not round-trip")),
@@ -4084,11 +5513,7 @@ mod tests {
 
         let submitted = expected_history[10].clone();
         runtime
-            .notify(
-                "composer:submitted:802",
-                serde_json::json!(submitted.clone()),
-            )
-            .await
+            .notify_composer(composer, ComposerCallback::Submitted(submitted.clone()))
             .unwrap();
         let mut expected_saved = vec![submitted.clone()];
         expected_saved.extend(
@@ -4134,26 +5559,16 @@ mod tests {
             .resolve_request(history_request_id, serde_json::json!({ "value": [] }))
             .await
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenAgentComposer {
-                owner,
-                id: 802,
-                title,
-                query,
-                history,
-            } if owner == "agent"
-                && title.as_deref() == Some("Agent prompt")
-                && query.is_empty()
-                && history.is_empty()
-        ));
+        let (composer, title, query, history) = recv_agent_composer();
+        assert_eq!(title.as_deref(), Some("Agent prompt"));
+        assert!(query.is_empty());
+        assert!(history.is_empty());
 
         runtime
-            .notify(
-                "composer:submitted:802",
-                serde_json::json!("inspect unsaved changes"),
+            .notify_composer(
+                composer,
+                ComposerCallback::Submitted("inspect unsaved changes".to_string()),
             )
-            .await
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -4204,18 +5619,7 @@ mod tests {
             PluginRequest::Action(Action::Print(message))
                 if message.contains("prompt is preserved")
         ));
-        let items = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenDynamicPicker {
-                title,
-                id: 803,
-                items,
-                ..
-            } => {
-                assert_eq!(title.as_deref(), Some("Retry Codex"));
-                items
-            }
-            _ => panic!("expected agent setup picker"),
-        };
+        let (setup_picker, items) = recv_agent_picker("Retry Codex");
         assert_eq!(
             items
                 .iter()
@@ -4232,8 +5636,7 @@ mod tests {
         );
 
         runtime
-            .notify("picker:cancelled:803", serde_json::json!({}))
-            .await
+            .notify_picker(setup_picker, PickerCallback::Cancelled)
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -4260,25 +5663,22 @@ mod tests {
             )
             .await
             .unwrap();
-        let (owner, title, query, history) = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenAgentComposer {
-                owner,
-                title,
-                id: 802,
-                query,
-                history,
-            } => (owner, title, query, history),
-            _ => panic!("expected saved agent composer"),
-        };
-        assert_eq!(owner, "agent");
+        let (composer, title, query, history) = recv_agent_composer();
         assert_eq!(title.as_deref(), Some("Agent prompt"));
         assert_eq!(query, "inspect unsaved changes");
         assert_eq!(history, ["inspect unsaved changes"]);
 
         runtime
-            .notify("picker:selected:803", serde_json::json!({ "id": "retry" }))
-            .await
+            .notify_composer(
+                composer,
+                ComposerCallback::Submitted("inspect unsaved changes".to_string()),
+            )
             .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, .. }
+                if plugin == "agent" && key == "prompt_history"
+        ));
         let cwd_request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::GetConfig { request_id, key } => {
                 assert_eq!(key.as_deref(), Some("cwd"));
@@ -4388,18 +5788,19 @@ mod tests {
             .await
             .unwrap();
 
+        let (setup_picker, items) = open_agent_setup_picker(&mut runtime).await;
         runtime
-            .notify("picker:selected:803", serde_json::json!({ "id": "retry" }))
-            .await
+            .notify_picker(setup_picker, PickerCallback::Selected(items[0].clone()))
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::GetConfig { key, .. } if key.as_deref() == Some("cwd")
         ));
 
+        drain_requests();
+        let (setup_picker, _) = open_agent_setup_picker(&mut runtime).await;
         runtime
-            .notify("picker:cancelled:803", serde_json::json!({}))
-            .await
+            .notify_picker(setup_picker, PickerCallback::Cancelled)
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -4460,10 +5861,7 @@ mod tests {
             PluginRequest::Action(Action::Print(message))
                 if message.contains("prompt is preserved")
         ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenDynamicPicker { id: 803, .. }
-        ));
+        recv_agent_picker("Retry Codex");
     }
 
     #[tokio::test]
@@ -4547,12 +5945,15 @@ mod tests {
         assert!(semantic_error.contains("HUSK-T0001"));
         assert!(semantic_error.contains("invalid-type"));
 
-        assert!(validate_plugin_source(
+        let parse_error = validate_plugin_source(
             "invalid-parse",
             "plugins/invalid-parse.hk",
-            "fn activate( {"
+            "fn activate( {",
         )
-        .is_ok());
+        .unwrap_err()
+        .to_string();
+        assert!(parse_error.contains("HUSK-P0001"));
+        assert!(parse_error.contains("plugins/invalid-parse.hk:1:"));
     }
 
     #[tokio::test]
@@ -5004,25 +6405,25 @@ mod tests {
             .await
             .unwrap();
 
-        let items = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenDynamicPicker {
-                title, id, items, ..
+        let (handle, items) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                owner,
+                handle,
+                title,
+                items,
+                ..
             } => {
+                assert_eq!(owner, "buffer_picker");
                 assert_eq!(title.as_deref(), Some("Buffers"));
-                assert_eq!(id, 701);
                 assert_eq!(items[0].label, "src/main.rs");
                 assert_eq!(items[1].label, "[No Name]");
-                items
+                (handle, items)
             }
             _ => panic!("unexpected plugin request"),
         };
 
         runtime
-            .notify(
-                "picker:selected:701",
-                serde_json::to_value(&items[1]).unwrap(),
-            )
-            .await
+            .notify_picker(handle, PickerCallback::Selected(items[1].clone()))
             .unwrap();
 
         match ACTION_DISPATCHER.recv_request() {
@@ -5792,12 +7193,6 @@ mod tests {
                 "buffer:changed",
                 serde_json::json!({}),
             ),
-            (
-                "project_search",
-                include_str!("../../plugins/project_search.hk"),
-                "picker:query:301",
-                serde_json::json!("needle"),
-            ),
         ] {
             let timeout_count = PENDING_TIMEOUTS.lock().unwrap().len();
             let mut runtime = Runtime::new();
@@ -5836,18 +7231,50 @@ mod tests {
             .await
             .unwrap();
 
+        let handle = open_project_search_picker(&mut runtime).await;
+
         runtime
-            .notify("picker:query:301", serde_json::json!("needle"))
-            .await
+            .notify_picker(handle, PickerCallback::Query("needle".to_string()))
             .unwrap();
         assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count + 1);
 
         runtime
-            .notify("picker:cancelled:301", serde_json::Value::Null)
-            .await
+            .notify_picker(handle, PickerCallback::Cancelled)
             .unwrap();
 
         assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count);
+        assert!(runtime.picker_plugin(handle).is_none());
+        assert!(!runtime
+            .notify_picker(handle, PickerCallback::Query("stale".to_string()))
+            .unwrap());
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn project_search_deactivation_cancels_debounce_and_releases_picker() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let timeout_count = PENDING_TIMEOUTS.lock().unwrap().len();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "project_search",
+                include_str!("../../plugins/project_search.hk"),
+            )
+            .await
+            .unwrap();
+
+        let handle = open_project_search_picker(&mut runtime).await;
+        runtime
+            .notify_picker(handle, PickerCallback::Query("needle".to_string()))
+            .unwrap();
+        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count + 1);
+
+        runtime.deactivate_all().await.unwrap();
+
+        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count);
+        assert!(runtime.picker_plugin(handle).is_none());
+        drain_requests();
     }
 
     #[tokio::test]
@@ -6144,6 +7571,126 @@ mod tests {
                 "git dashboard did not render the bounded status"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn git_menus_and_prompts_use_scoped_picker_callbacks() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new_with_permissions(HashMap::from([(
+            "git".to_string(),
+            PluginPermissions {
+                process: vec!["git".to_string()],
+            },
+        )]));
+        runtime
+            .load_plugin("git", include_str!("../../plugins/git.hk"))
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime
+            .notify(
+                "workspace:event:git-dashboard",
+                serde_json::json!({ "action": "b", "row": null }),
+            )
+            .await
+            .unwrap();
+        let (menu_handle, create_item) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                owner,
+                handle,
+                title,
+                items,
+                ..
+            } => {
+                assert_eq!(owner, "git");
+                assert_eq!(title.as_deref(), Some("Branch"));
+                let create_item = items
+                    .into_iter()
+                    .find(|item| item.id == "Create")
+                    .expect("branch picker should contain Create");
+                (handle, create_item)
+            }
+            _ => panic!("expected callback-backed branch picker"),
+        };
+
+        runtime
+            .notify_picker(menu_handle, PickerCallback::Selected(create_item))
+            .unwrap();
+        let prompt_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                owner,
+                handle,
+                title,
+                items,
+                options,
+            } => {
+                assert_eq!(owner, "git");
+                assert_eq!(title.as_deref(), Some("New branch name"));
+                assert!(options.external_filter);
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].id, "submit");
+                handle
+            }
+            _ => panic!("expected callback-backed branch prompt"),
+        };
+
+        runtime
+            .notify_picker(
+                prompt_handle,
+                PickerCallback::Query("feature/readable-pickers".to_string()),
+            )
+            .unwrap();
+        let submit_item = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerItems { id, items } => {
+                assert_eq!(id, prompt_handle.get());
+                assert_eq!(items.len(), 1);
+                assert_eq!(
+                    items[0]
+                        .data
+                        .get("query")
+                        .and_then(serde_json::Value::as_str),
+                    Some("feature/readable-pickers")
+                );
+                assert_eq!(
+                    items[0]
+                        .data
+                        .get("prompt_kind")
+                        .and_then(serde_json::Value::as_str),
+                    Some("branch-create")
+                );
+                items[0].clone()
+            }
+            _ => panic!("expected prompt item update"),
+        };
+
+        runtime
+            .notify_picker(prompt_handle, PickerCallback::Selected(submit_item))
+            .unwrap();
+        runtime
+            .notify(
+                "workspace:event:git-dashboard",
+                serde_json::json!({ "action": "$", "row": null }),
+            )
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                owner,
+                title,
+                items,
+                ..
+            } => {
+                assert_eq!(owner, "git");
+                assert_eq!(title.as_deref(), Some("Git command log"));
+                assert!(items
+                    .iter()
+                    .any(|item| item.label == "git switch -c feature/readable-pickers"));
+            }
+            _ => panic!("expected callback-backed command log"),
         }
     }
 
@@ -6533,54 +8080,11 @@ mod tests {
             .await
             .unwrap();
 
-        runtime.execute_command("ProjectSearch").await.unwrap();
-
-        let cwd_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(key.as_deref(), Some("cwd"));
-                request_id
-            }
-            _ => panic!("unexpected plugin request"),
-        };
-        runtime
-            .resolve_request(cwd_request_id, serde_json::json!({ "value": "." }))
-            .await
-            .unwrap();
-        let storage_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetPluginStorage {
-                plugin,
-                key,
-                request_id,
-            } => {
-                assert_eq!(plugin, "project_search");
-                assert_eq!(key, "history_by_cwd");
-                request_id
-            }
-            _ => panic!("unexpected plugin request"),
-        };
-        runtime
-            .resolve_request(storage_request_id, serde_json::json!({ "value": {} }))
-            .await
-            .unwrap();
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenDynamicPicker {
-                title, id, options, ..
-            } => {
-                assert_eq!(title.as_deref(), Some("Find in Files"));
-                assert_eq!(id, 301);
-                assert!(options.external_filter);
-                assert!(options
-                    .actions
-                    .iter()
-                    .any(|action| action.action == "export"));
-            }
-            _ => panic!("unexpected plugin request"),
-        }
+        let handle = open_project_search_picker(&mut runtime).await;
 
         let query = ["project_search_", "process"].concat();
         runtime
-            .notify("picker:query:301", serde_json::json!(query))
-            .await
+            .notify_picker(handle, PickerCallback::Query(query.clone()))
             .unwrap();
 
         tokio::time::sleep(Duration::from_millis(120)).await;
@@ -6598,14 +8102,14 @@ mod tests {
 
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdatePickerItems { id, items } => {
-                assert_eq!(id, 301);
+                assert_eq!(id, handle.get());
                 assert!(items.is_empty());
             }
             _ => panic!("unexpected plugin request"),
         }
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdatePickerStatus { id, status } => {
-                assert_eq!(id, 301);
+                assert_eq!(id, handle.get());
                 assert!(status
                     .as_deref()
                     .is_some_and(|status| status.starts_with("Searching (0/500)")));
@@ -6630,7 +8134,7 @@ mod tests {
             let mut found = None;
             while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
                 if let PluginRequest::UpdatePickerItems { id, items } = request {
-                    assert_eq!(id, 301);
+                    assert_eq!(id, handle.get());
                     if let Some(item) = items.first() {
                         found = Some(item.clone());
                         break;
@@ -6660,8 +8164,29 @@ mod tests {
 
         drain_requests();
         runtime
-            .notify("picker:selected:301", serde_json::to_value(item).unwrap())
-            .await
+            .notify_picker(
+                handle,
+                PickerCallback::Action {
+                    action: "toggle_preview".to_string(),
+                    item: Some(item.clone()),
+                    query: query.clone(),
+                },
+            )
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerItems { id, items } => {
+                assert_eq!(id, handle.get());
+                assert!(items.iter().all(|item| item.preview.is_none()));
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdatePickerStatus { id, .. } => assert_eq!(id, handle.get()),
+            _ => panic!("unexpected plugin request"),
+        }
+
+        runtime
+            .notify_picker(handle, PickerCallback::Selected(item))
             .unwrap();
 
         match ACTION_DISPATCHER.recv_request() {
@@ -6675,7 +8200,7 @@ mod tests {
             _ => panic!("unexpected plugin request"),
         }
         match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::ClosePicker { id } => assert_eq!(id, 301),
+            PluginRequest::ClosePicker { id } => assert_eq!(id, handle.get()),
             _ => panic!("unexpected plugin request"),
         }
         match ACTION_DISPATCHER.recv_request() {
@@ -6688,6 +8213,10 @@ mod tests {
             }
             _ => panic!("unexpected plugin request"),
         }
+        assert!(runtime.picker_plugin(handle).is_none());
+        assert!(!runtime
+            .notify_picker(handle, PickerCallback::Query("stale".to_string()))
+            .unwrap());
     }
 
     #[tokio::test]
@@ -7449,46 +8978,45 @@ mod tests {
             .unwrap();
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
 
+        let listing = serde_json::json!({
+            "kind": "themes",
+            "entries": [
+                {
+                    "file": "mocha.json",
+                    "name": "Mocha",
+                    "source": "embedded",
+                    "shadows": [],
+                },
+                {
+                    "file": "custom.json",
+                    "name": "Custom",
+                    "source": "user",
+                    "shadows": ["embedded"],
+                },
+                {
+                    "file": "custom-dark.json",
+                    "name": "Custom",
+                    "source": "embedded",
+                    "shadows": [],
+                }
+            ],
+            "error": null,
+        });
         runtime
-            .resolve_request(
-                assets_request_id,
-                serde_json::json!({
-                    "kind": "themes",
-                    "entries": [
-                        {
-                            "file": "mocha.json",
-                            "name": "Mocha",
-                            "source": "embedded",
-                            "shadows": [],
-                        },
-                        {
-                            "file": "custom.json",
-                            "name": "Custom",
-                            "source": "user",
-                            "shadows": ["embedded"],
-                        },
-                        {
-                            "file": "custom-dark.json",
-                            "name": "Custom",
-                            "source": "embedded",
-                            "shadows": [],
-                        }
-                    ],
-                    "error": null,
-                }),
-            )
+            .resolve_request(assets_request_id, listing.clone())
             .await
             .unwrap();
 
-        let items = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenDynamicPicker {
+        let (handle, items) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                owner,
+                handle,
                 title,
-                id,
                 items,
                 options,
             } => {
+                assert_eq!(owner, "theme_browser");
                 assert_eq!(title.as_deref(), Some("Themes"));
-                assert_eq!(id, 601);
                 assert_eq!(options.initial_selection.as_deref(), Some("custom.json"));
                 assert_eq!(options.presentation, PickerPresentation::Compact);
                 assert_eq!(items[0].label, "Mocha");
@@ -7496,17 +9024,13 @@ mod tests {
                 assert_eq!(items[1].label, "Custom");
                 assert_eq!(items[2].label, "Custom");
                 assert_eq!(items[1].annotation.as_deref(), Some("custom.json"));
-                items
+                (handle, items)
             }
             _ => panic!("unexpected plugin request"),
         };
 
         runtime
-            .notify(
-                "picker:changed:601",
-                serde_json::to_value(&items[0]).unwrap(),
-            )
-            .await
+            .notify_picker(handle, PickerCallback::Changed(items[0].clone()))
             .unwrap();
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::Action(Action::PreviewTheme(theme)) => {
@@ -7516,8 +9040,7 @@ mod tests {
         }
 
         runtime
-            .notify("picker:cancelled:601", serde_json::Value::Null)
-            .await
+            .notify_picker(handle, PickerCallback::Cancelled)
             .unwrap();
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::Action(Action::PreviewTheme(theme)) => {
@@ -7526,12 +9049,39 @@ mod tests {
             _ => panic!("unexpected plugin request"),
         }
 
+        assert!(!runtime
+            .notify_picker(handle, PickerCallback::Selected(items[1].clone()))
+            .unwrap());
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime.execute_command("ThemeBrowser").await.unwrap();
+        let config_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, .. } => request_id,
+            _ => panic!("unexpected plugin request"),
+        };
+        let assets_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ListRuntimeAssets { request_id, .. } => request_id,
+            _ => panic!("unexpected plugin request"),
+        };
         runtime
-            .notify(
-                "picker:selected:601",
-                serde_json::to_value(&items[1]).unwrap(),
+            .resolve_request(
+                config_request_id,
+                serde_json::json!({ "value": "custom.json" }),
             )
             .await
+            .unwrap();
+        runtime
+            .resolve_request(assets_request_id, listing)
+            .await
+            .unwrap();
+        let (handle, item) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                handle, mut items, ..
+            } => (handle, items.remove(1)),
+            _ => panic!("unexpected plugin request"),
+        };
+        runtime
+            .notify_picker(handle, PickerCallback::Selected(item))
             .unwrap();
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::Action(Action::SetTheme(theme)) => {
@@ -7542,38 +9092,247 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn callback_pickers_are_owner_isolated_and_cleaned_up() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let source = |command: &str, prefix: &str| {
+            format!(
+                r#"
+                    pub fn activate() {{ red::add_command("{command}", open); }}
+                    fn open() {{
+                        red::execute("OpenPicker", "Items", [
+                            PickerItem {{ id: "one", label: "One", data: Json {{}} }},
+                        ], PickerOptions {{}}, PickerHandlers {{
+                            selected: selected,
+                        }});
+                    }}
+                    fn selected(item: PickerItem) {{
+                        red::execute("Print", "{prefix}:" + item.id);
+                    }}
+                "#
+            )
+        };
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("first", &source("FirstPicker", "first"))
+            .await
+            .unwrap();
+        runtime
+            .load_plugin("second", &source("SecondPicker", "second"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("FirstPicker").await.unwrap();
+        let (first_handle, first_item) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, items, .. } => (handle, items[0].clone()),
+            _ => panic!("expected first callback picker"),
+        };
+        runtime.execute_command("SecondPicker").await.unwrap();
+        let (second_handle, second_item) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, items, .. } => (handle, items[0].clone()),
+            _ => panic!("expected second callback picker"),
+        };
+        assert_ne!(first_handle, second_handle);
+
+        runtime
+            .notify_picker(second_handle, PickerCallback::Selected(second_item))
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "second:one"
+        ));
+        runtime
+            .notify_picker(first_handle, PickerCallback::Selected(first_item))
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "first:one"
+        ));
+
+        runtime.execute_command("FirstPicker").await.unwrap();
+        let stale_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, .. } => handle,
+            _ => panic!("expected callback picker before unload"),
+        };
+        runtime.unload_plugin("first").unwrap();
+        assert!(!runtime
+            .notify_picker(stale_handle, PickerCallback::Cancelled)
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn callback_composers_are_typed_one_shot_and_cleaned_up() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let source = r#"
+            pub fn activate() { red::add_command("ScopedComposer", open); }
+            fn open() {
+                red::execute("OpenComposer", "Prompt", "draft", ["recent"], ComposerHandlers {
+                    submitted: submitted,
+                    cancelled: cancelled,
+                });
+            }
+            fn submitted(prompt: String) { red::execute("Print", "submitted:" + prompt); }
+            fn cancelled(event: ComposerCancelled) { red::execute("Print", "cancelled"); }
+        "#;
+        let mut runtime = Runtime::new();
+        runtime.load_plugin("owner", source).await.unwrap();
+
+        runtime.execute_command("ScopedComposer").await.unwrap();
+        let submitted_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer {
+                owner,
+                handle,
+                title,
+                query,
+                history,
+            } => {
+                assert_eq!(owner, "owner");
+                assert_eq!(title.as_deref(), Some("Prompt"));
+                assert_eq!(query, "draft");
+                assert_eq!(history, ["recent"]);
+                handle
+            }
+            _ => panic!("expected callback composer"),
+        };
+        assert!(runtime
+            .notify_composer(
+                submitted_handle,
+                ComposerCallback::Submitted("exact".to_string()),
+            )
+            .unwrap());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "submitted:exact"
+        ));
+        assert!(!runtime
+            .notify_composer(submitted_handle, ComposerCallback::Cancelled)
+            .unwrap());
+
+        runtime.execute_command("ScopedComposer").await.unwrap();
+        let cancelled_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer { handle, .. } => handle,
+            _ => panic!("expected callback composer"),
+        };
+        assert!(runtime
+            .notify_composer(cancelled_handle, ComposerCallback::Cancelled)
+            .unwrap());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "cancelled"
+        ));
+
+        runtime.execute_command("ScopedComposer").await.unwrap();
+        let stale_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer { handle, .. } => handle,
+            _ => panic!("expected callback composer"),
+        };
+        runtime.unload_plugin("owner").unwrap();
+        assert!(!runtime
+            .notify_composer(stale_handle, ComposerCallback::Cancelled)
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn callback_picker_handles_from_an_old_plugin_generation_are_stale() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let source = r#"
+            pub fn activate() { red::add_command("OpenGenerationPicker", open); }
+            fn open() {
+                red::execute("OpenPicker", "Items", [
+                    PickerItem { id: "one", label: "One", data: Json {} },
+                ], PickerOptions {}, PickerHandlers { cancelled: cancelled });
+            }
+            fn cancelled(event: PickerCancelled) {
+                red::execute("Print", "cancelled");
+            }
+        "#;
+        let mut runtime = Runtime::new();
+        runtime.load_plugin("owner", source).await.unwrap();
+        runtime
+            .execute_command("OpenGenerationPicker")
+            .await
+            .unwrap();
+        let stale_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, .. } => handle,
+            _ => panic!("expected callback picker"),
+        };
+
+        runtime.load_plugin("owner", source).await.unwrap();
+        assert!(!runtime
+            .notify_picker(stale_handle, PickerCallback::Cancelled)
+            .unwrap());
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn callback_picker_rejects_non_function_handlers_before_publishing_dialog() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let error = runtime
+            .load_plugin(
+                "invalid-picker",
+                r#"
+                    pub fn activate() {
+                        red::execute("OpenPicker", "Items", [
+                            PickerItem { id: "one", label: "One", data: Json {} },
+                        ], PickerOptions {}, PickerHandlers { selected: "not a callback" });
+                    }
+                "#,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("handler `selected` must be a function callback"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_picker_handler_is_consumed_before_callback_failure() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "failing-picker",
+                r#"
+                    pub fn activate() { red::add_command("FailingPicker", open); }
+                    fn open() {
+                        red::execute("OpenPicker", "Items", [
+                            PickerItem { id: "one", label: "One", data: Json {} },
+                        ], PickerOptions {}, PickerHandlers { selected: selected });
+                    }
+                    fn selected(item: PickerItem) { let value = 1 / 0; }
+                "#,
+            )
+            .await
+            .unwrap();
+        runtime.execute_command("FailingPicker").await.unwrap();
+        let (handle, item) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, items, .. } => (handle, items[0].clone()),
+            _ => panic!("expected callback picker"),
+        };
+
+        assert!(runtime
+            .notify_picker(handle, PickerCallback::Selected(item.clone()))
+            .is_err());
+        assert!(!runtime
+            .notify_picker(handle, PickerCallback::Selected(item))
+            .unwrap());
+    }
+
+    #[tokio::test]
     async fn lsp_symbols_requests_document_symbols_and_opens_picker() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
-        runtime
-            .load_plugin("lsp_symbols", include_str!("../../plugins/lsp_symbols.hk"))
-            .await
-            .unwrap();
-        let config_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(key.as_deref(), Some("plugin_config"));
-                request_id
-            }
-            _ => panic!("unexpected plugin request"),
-        };
-        runtime
-            .resolve_request(
-                config_request_id,
-                serde_json::json!({
-                    "value": {
-                        "lsp_symbols": {
-                            "icons": {
-                                "enabled": true,
-                                "overrides": {}
-                            }
-                        }
-                    }
-                }),
-            )
-            .await
-            .unwrap();
+        load_lsp_symbols(&mut runtime).await;
 
         runtime.execute_command("LspDocumentSymbols").await.unwrap();
 
@@ -7593,17 +9352,26 @@ mod tests {
             .await
             .unwrap();
 
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenDynamicPicker {
-                title, id, items, ..
+        let handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                owner,
+                handle,
+                title,
+                items,
+                ..
             } => {
+                assert_eq!(owner, "lsp_symbols");
                 assert_eq!(title.as_deref(), Some("Document Symbols"));
-                assert_eq!(id, 201);
                 assert_eq!(items[0].label, "main");
                 assert_eq!(items[0].kind.as_deref(), Some("Function"));
+                handle
             }
             _ => panic!("unexpected plugin request"),
-        }
+        };
+        assert_eq!(
+            runtime.picker_plugin(handle).as_deref(),
+            Some("lsp_symbols")
+        );
     }
 
     #[tokio::test]
@@ -7612,30 +9380,7 @@ mod tests {
         drain_requests();
 
         let mut runtime = Runtime::new();
-        runtime
-            .load_plugin("lsp_symbols", include_str!("../../plugins/lsp_symbols.hk"))
-            .await
-            .unwrap();
-        let config_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, .. } => request_id,
-            _ => panic!("expected lsp_symbols config request"),
-        };
-        runtime
-            .resolve_request(
-                config_request_id,
-                serde_json::json!({
-                    "value": {
-                        "lsp_symbols": {
-                            "icons": {
-                                "enabled": true,
-                                "overrides": {}
-                            }
-                        }
-                    }
-                }),
-            )
-            .await
-            .unwrap();
+        load_lsp_symbols(&mut runtime).await;
 
         runtime.execute_command("LspDocumentSymbols").await.unwrap();
         let request_id = match ACTION_DISPATCHER.recv_request() {
@@ -7647,16 +9392,19 @@ mod tests {
             .await
             .unwrap();
 
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenDynamicPicker {
-                id, items, options, ..
+        let first_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                handle,
+                items,
+                options,
+                ..
             } => {
-                assert_eq!(id, 201);
                 assert!(items.is_empty());
                 assert_eq!(options.status.as_deref(), Some("Loading 0/4097 symbols"));
+                handle
             }
             _ => panic!("expected empty document-symbol picker"),
-        }
+        };
 
         let mut final_items = Vec::new();
         let mut final_status = None;
@@ -7677,11 +9425,11 @@ mod tests {
             while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
                 match request {
                     PluginRequest::UpdatePickerItems { id, items } => {
-                        assert_eq!(id, 201);
+                        assert_eq!(id, first_handle.get());
                         final_items = items;
                     }
                     PluginRequest::UpdatePickerStatus { id, status } => {
-                        assert_eq!(id, 201);
+                        assert_eq!(id, first_handle.get());
                         final_status = status;
                     }
                     _ => panic!("unexpected request while batching document symbols"),
@@ -7701,6 +9449,10 @@ mod tests {
 
         let timeout_count = PENDING_TIMEOUTS.lock().unwrap().len();
         runtime.execute_command("LspDocumentSymbols").await.unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ClosePicker { id } => assert_eq!(id, first_handle.get()),
+            _ => panic!("expected the previous document-symbol picker to close"),
+        }
         let request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::DocumentSymbols { request_id, .. } => request_id,
             _ => panic!("expected another document-symbol request"),
@@ -7709,17 +9461,20 @@ mod tests {
             .resolve_request(request_id, sample_symbol_payload_with_count(65))
             .await
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenDynamicPicker { id: 201, .. }
-        ));
+        let second_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, .. } => handle,
+            _ => panic!("expected another document-symbol picker"),
+        };
         assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count + 1);
 
         runtime
-            .notify("picker:cancelled:201", serde_json::Value::Null)
-            .await
+            .notify_picker(second_handle, PickerCallback::Cancelled)
             .unwrap();
         assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count);
+        assert!(runtime.picker_plugin(second_handle).is_none());
+        assert!(!runtime
+            .notify_picker(second_handle, PickerCallback::Cancelled)
+            .unwrap());
     }
 
     #[tokio::test]
@@ -7728,30 +9483,7 @@ mod tests {
         drain_requests();
 
         let mut runtime = Runtime::new();
-        runtime
-            .load_plugin("lsp_symbols", include_str!("../../plugins/lsp_symbols.hk"))
-            .await
-            .unwrap();
-        let config_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, .. } => request_id,
-            _ => panic!("expected lsp_symbols config request"),
-        };
-        runtime
-            .resolve_request(
-                config_request_id,
-                serde_json::json!({
-                    "value": {
-                        "lsp_symbols": {
-                            "icons": {
-                                "enabled": true,
-                                "overrides": {}
-                            }
-                        }
-                    }
-                }),
-            )
-            .await
-            .unwrap();
+        load_lsp_symbols(&mut runtime).await;
 
         runtime.execute_command("LspReferences").await.unwrap();
         let request_id = match ACTION_DISPATCHER.recv_request() {
@@ -7769,16 +9501,19 @@ mod tests {
             .await
             .unwrap();
 
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenDynamicPicker {
-                id, items, options, ..
+        let reference_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                handle,
+                items,
+                options,
+                ..
             } => {
-                assert_eq!(id, 203);
                 assert!(items.is_empty());
                 assert_eq!(options.status.as_deref(), Some("Loading 0/4097 references"));
+                handle
             }
             _ => panic!("expected empty references picker"),
-        }
+        };
 
         let mut final_items = Vec::new();
         let mut final_status = None;
@@ -7799,11 +9534,11 @@ mod tests {
             while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
                 match request {
                     PluginRequest::UpdatePickerItems { id, items } => {
-                        assert_eq!(id, 203);
+                        assert_eq!(id, reference_handle.get());
                         final_items = items;
                     }
                     PluginRequest::UpdatePickerStatus { id, status } => {
-                        assert_eq!(id, 203);
+                        assert_eq!(id, reference_handle.get());
                         final_status = status;
                     }
                     _ => panic!("unexpected request while batching references"),
@@ -7820,6 +9555,10 @@ mod tests {
             final_status.as_deref(),
             Some("4096 references (results truncated)")
         );
+        assert!(poll_timer_callbacks().is_empty());
+        assert!(runtime
+            .notify_picker(reference_handle, PickerCallback::Cancelled)
+            .unwrap());
     }
 
     #[tokio::test]
@@ -7828,47 +9567,21 @@ mod tests {
         drain_requests();
 
         let mut runtime = Runtime::new();
-        runtime
-            .load_plugin("lsp_symbols", include_str!("../../plugins/lsp_symbols.hk"))
-            .await
-            .unwrap();
-        let config_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(key.as_deref(), Some("plugin_config"));
-                request_id
-            }
-            _ => panic!("unexpected plugin request"),
-        };
-        runtime
-            .resolve_request(
-                config_request_id,
-                serde_json::json!({
-                    "value": {
-                        "lsp_symbols": {
-                            "icons": {
-                                "enabled": true,
-                                "overrides": {}
-                            }
-                        }
-                    }
-                }),
-            )
-            .await
-            .unwrap();
+        load_lsp_symbols(&mut runtime).await;
 
         runtime
             .execute_command("LspWorkspaceSymbols")
             .await
             .unwrap();
 
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenDynamicPicker { title, id, .. } => {
+        let handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, title, .. } => {
                 assert_eq!(title.as_deref(), Some("Workspace Symbols"));
-                assert_eq!(id, 202);
+                handle
             }
             _ => panic!("unexpected plugin request"),
-        }
-        let _initial_request_id = match ACTION_DISPATCHER.recv_request() {
+        };
+        let initial_request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::WorkspaceSymbols { request_id, query } => {
                 assert_eq!(query, "");
                 request_id
@@ -7877,8 +9590,7 @@ mod tests {
         };
 
         runtime
-            .notify("picker:query:202", serde_json::json!("main"))
-            .await
+            .notify_picker(handle, PickerCallback::Query("main".to_string()))
             .unwrap();
 
         let query_request_id = match ACTION_DISPATCHER.recv_request() {
@@ -7890,13 +9602,19 @@ mod tests {
         };
 
         runtime
+            .resolve_request(initial_request_id, sample_symbol_payload_with_count(2))
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime
             .resolve_request(query_request_id, sample_symbol_payload())
             .await
             .unwrap();
 
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdatePickerItems { id, items } => {
-                assert_eq!(id, 202);
+                assert_eq!(id, handle.get());
                 assert_eq!(items[0].label, "main");
                 assert_eq!(items[0].kind.as_deref(), Some("Function"));
             }
@@ -7904,11 +9622,31 @@ mod tests {
         }
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdatePickerStatus { id, status } => {
-                assert_eq!(id, 202);
+                assert_eq!(id, handle.get());
                 assert_eq!(status.as_deref(), Some("1 symbols"));
             }
             _ => panic!("unexpected plugin request"),
         }
+
+        runtime
+            .notify_picker(handle, PickerCallback::Query("later".to_string()))
+            .unwrap();
+        let late_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::WorkspaceSymbols { request_id, query } => {
+                assert_eq!(query, "later");
+                request_id
+            }
+            _ => panic!("unexpected plugin request"),
+        };
+        runtime
+            .notify_picker(handle, PickerCallback::Cancelled)
+            .unwrap();
+        runtime
+            .resolve_request(late_request_id, sample_symbol_payload())
+            .await
+            .unwrap();
+        assert!(runtime.picker_plugin(handle).is_none());
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
     #[tokio::test]
@@ -7917,33 +9655,7 @@ mod tests {
         drain_requests();
 
         let mut runtime = Runtime::new();
-        runtime
-            .load_plugin("lsp_symbols", include_str!("../../plugins/lsp_symbols.hk"))
-            .await
-            .unwrap();
-        let config_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(key.as_deref(), Some("plugin_config"));
-                request_id
-            }
-            _ => panic!("unexpected plugin request"),
-        };
-        runtime
-            .resolve_request(
-                config_request_id,
-                serde_json::json!({
-                    "value": {
-                        "lsp_symbols": {
-                            "icons": {
-                                "enabled": true,
-                                "overrides": {}
-                            }
-                        }
-                    }
-                }),
-            )
-            .await
-            .unwrap();
+        load_lsp_symbols(&mut runtime).await;
         runtime.execute_command("LspDocumentSymbols").await.unwrap();
         let request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::DocumentSymbols { request_id, .. } => request_id,
@@ -7953,14 +9665,14 @@ mod tests {
             .resolve_request(request_id, sample_symbol_payload())
             .await
             .unwrap();
-        let item = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenDynamicPicker { items, .. } => {
-                serde_json::to_value(&items[0]).unwrap()
-            }
+        let (handle, item) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, items, .. } => (handle, items[0].clone()),
             _ => panic!("unexpected plugin request"),
         };
 
-        runtime.notify("picker:selected:201", item).await.unwrap();
+        runtime
+            .notify_picker(handle, PickerCallback::Selected(item))
+            .unwrap();
 
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::OpenLocation { location, target } => {
@@ -7975,5 +9687,100 @@ mod tests {
             }
             _ => panic!("unexpected plugin request"),
         }
+        assert!(runtime.picker_plugin(handle).is_none());
+    }
+
+    #[tokio::test]
+    async fn lsp_symbols_reference_picker_ignores_replaced_request_and_opens_selection() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        load_lsp_symbols(&mut runtime).await;
+
+        runtime.execute_command("LspReferences").await.unwrap();
+        let stale_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::References {
+                request_id,
+                include_declaration,
+            } => {
+                assert!(include_declaration);
+                request_id
+            }
+            _ => panic!("unexpected plugin request"),
+        };
+        runtime.execute_command("LspReferences").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::References { request_id, .. } => request_id,
+            _ => panic!("unexpected plugin request"),
+        };
+
+        let payload = serde_json::json!({
+            "ok": true,
+            "file": "src/main.rs",
+            "position": { "line": 4, "character": 3 },
+            "references": [
+                {
+                    "file": "src/main.rs",
+                    "range": {
+                        "start": { "line": 4, "character": 3 },
+                        "end": { "line": 4, "character": 7 }
+                    }
+                },
+                {
+                    "file": "src/lib.rs",
+                    "range": {
+                        "start": { "line": 8, "character": 2 },
+                        "end": { "line": 8, "character": 6 }
+                    }
+                },
+                {
+                    "file": "tests/example.rs",
+                    "range": {
+                        "start": { "line": 12, "character": 1 },
+                        "end": { "line": 12, "character": 5 }
+                    }
+                }
+            ]
+        });
+        runtime
+            .resolve_request(stale_request_id, payload.clone())
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        runtime.resolve_request(request_id, payload).await.unwrap();
+
+        let (handle, item) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                handle,
+                title,
+                items,
+                ..
+            } => {
+                assert_eq!(title.as_deref(), Some("References"));
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].label, "src/lib.rs");
+                (handle, items[0].clone())
+            }
+            _ => panic!("unexpected plugin request"),
+        };
+        runtime
+            .notify_picker(handle, PickerCallback::Selected(item))
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenLocation { location, target } => {
+                assert_eq!(location.path, "src/lib.rs");
+                assert_eq!(location.line, 8);
+                assert_eq!(location.column, 2);
+                assert_eq!(
+                    location.column_encoding,
+                    crate::plugin::LocationColumnEncoding::Utf16
+                );
+                assert_eq!(target, crate::plugin::OpenLocationTarget::Current);
+            }
+            _ => panic!("unexpected plugin request"),
+        }
+        assert!(runtime.picker_plugin(handle).is_none());
     }
 }

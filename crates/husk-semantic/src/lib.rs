@@ -27,6 +27,7 @@ pub struct SymbolId(pub u32);
 /// Kinds of symbols that can be defined at the top level.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SymbolKind {
+    Module,
     Function,
     Struct,
     Enum,
@@ -175,6 +176,10 @@ pub struct SemanticOptions {
     pub prelude: bool,
     /// Cfg flags that are currently enabled (e.g., "test" for test mode).
     pub cfg_flags: HashSet<String>,
+    /// Language compatibility rules to apply while resolving and checking.
+    pub profile: SemanticProfile,
+    /// Source-module path relative to the package root.
+    pub module_path: Vec<String>,
 }
 
 impl SemanticOptions {
@@ -183,6 +188,18 @@ impl SemanticOptions {
         Self {
             prelude: true,
             cfg_flags: HashSet::new(),
+            profile: SemanticProfile::LegacyJavaScript,
+            module_path: Vec::new(),
+        }
+    }
+
+    /// Create backend-neutral native Husk options with the prelude enabled.
+    pub fn native() -> Self {
+        Self {
+            prelude: true,
+            cfg_flags: HashSet::new(),
+            profile: SemanticProfile::Native,
+            module_path: Vec::new(),
         }
     }
 
@@ -193,6 +210,8 @@ impl SemanticOptions {
         Self {
             prelude: true,
             cfg_flags: flags,
+            profile: SemanticProfile::LegacyJavaScript,
+            module_path: Vec::new(),
         }
     }
 }
@@ -236,6 +255,58 @@ pub fn filter_items_by_cfg(file: &File, flags: &HashSet<String>) -> File {
     }
 }
 
+fn native_profile_errors(file: &File) -> Vec<SemanticError> {
+    let mut errors = Vec::new();
+    for item in &file.items {
+        match &item.kind {
+            ItemKind::ExternBlock { abi, .. } if abi == "js" => {
+                errors.push(SemanticError {
+                    message: "`extern \"js\"` is only available in the legacy JavaScript profile"
+                        .to_string(),
+                    span: item.span.clone(),
+                });
+            }
+            ItemKind::Trait(definition) => {
+                for trait_item in &definition.items {
+                    let husk_ast::TraitItemKind::Method(method) = &trait_item.kind;
+                    if method.is_extern {
+                        errors.push(SemanticError {
+                            message:
+                                "`extern \"js\"` methods are only available in the legacy JavaScript profile"
+                                    .to_string(),
+                            span: trait_item.span.clone(),
+                        });
+                    }
+                }
+            }
+            ItemKind::Impl(block) => {
+                for impl_item in &block.items {
+                    let is_javascript = match &impl_item.kind {
+                        husk_ast::ImplItemKind::Method(method) => method.is_extern,
+                        husk_ast::ImplItemKind::Property(_) => true,
+                    };
+                    if is_javascript {
+                        errors.push(SemanticError {
+                            message:
+                                "`extern \"js\"` members are only available in the legacy JavaScript profile"
+                                    .to_string(),
+                            span: impl_item.span.clone(),
+                        });
+                    }
+                }
+            }
+            ItemKind::Fn { .. }
+            | ItemKind::Mod { .. }
+            | ItemKind::Struct { .. }
+            | ItemKind::Enum { .. }
+            | ItemKind::TypeAlias { .. }
+            | ItemKind::ExternBlock { .. }
+            | ItemKind::Use { .. } => {}
+        }
+    }
+    errors
+}
+
 /// Format a Type for display in error messages.
 fn format_type(ty: &Type) -> String {
     match ty {
@@ -276,8 +347,20 @@ fn format_type(ty: &Type) -> String {
     }
 }
 
-fn is_dynamic_type(ty: &Type) -> bool {
-    matches!(ty, Type::Named { name, args } if name == "JsValue" && args.is_empty())
+fn is_dynamic_type(profile: SemanticProfile, ty: &Type) -> bool {
+    profile == SemanticProfile::LegacyJavaScript
+        && matches!(ty, Type::Named { name, args } if name == "JsValue" && args.is_empty())
+}
+
+/// Source-level semantics selected for one compilation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum SemanticProfile {
+    /// Backend-neutral Husk. JavaScript globals and dynamic `JsValue`
+    /// compatibility are unavailable.
+    Native,
+    /// Compatibility profile for the historical JavaScript code generator.
+    #[default]
+    LegacyJavaScript,
 }
 
 /// Run semantic analysis (name resolution + type checking) over the given file with options.
@@ -287,11 +370,13 @@ pub fn analyze_file_with_options(file: &File, opts: SemanticOptions) -> Semantic
 
     let symbols = ModuleSymbols::from_file(&filtered_file);
 
-    let mut checker = TypeChecker::new();
+    let mut checker = TypeChecker::new(opts.profile, opts.module_path.clone());
     if opts.prelude {
-        let prelude = get_prelude_file();
+        let prelude = prelude_file(opts.profile);
         checker.build_type_env(prelude);
-        checker.build_type_env(js_globals_file());
+        if opts.profile == SemanticProfile::LegacyJavaScript {
+            checker.build_type_env(js_globals_file());
+        }
     }
     checker.build_type_env(&filtered_file);
     let (
@@ -303,7 +388,7 @@ pub fn analyze_file_with_options(file: &File, opts: SemanticOptions) -> Semantic
         hover_info,
         references,
     ) = checker.check_file(&filtered_file);
-    SemanticResult {
+    let mut result = SemanticResult {
         symbols,
         type_errors,
         name_resolution,
@@ -312,7 +397,13 @@ pub fn analyze_file_with_options(file: &File, opts: SemanticOptions) -> Semantic
         variant_patterns,
         hover_info,
         references,
+    };
+    if opts.profile == SemanticProfile::Native {
+        result
+            .type_errors
+            .extend(native_profile_errors(&filtered_file));
     }
+    result
 }
 
 /// Run full semantic analysis with the stdlib prelude enabled (default).
@@ -323,14 +414,28 @@ pub fn analyze_file(file: &File) -> SemanticResult {
 /// Analyze a file with trusted declaration files loaded before the user file.
 /// Embedders use this to describe host modules without shifting user source spans.
 pub fn analyze_file_with_declarations(file: &File, declarations: &[File]) -> SemanticResult {
-    let symbols = ModuleSymbols::from_file(file);
-    let mut checker = TypeChecker::new();
-    checker.build_type_env(get_prelude_file());
-    checker.build_type_env(js_globals_file());
+    analyze_file_with_declarations_and_options(file, declarations, SemanticOptions::with_prelude())
+}
+
+/// Analyze a file with trusted declarations and explicit semantic options.
+pub fn analyze_file_with_declarations_and_options(
+    file: &File,
+    declarations: &[File],
+    opts: SemanticOptions,
+) -> SemanticResult {
+    let filtered_file = filter_items_by_cfg(file, &opts.cfg_flags);
+    let symbols = ModuleSymbols::from_file(&filtered_file);
+    let mut checker = TypeChecker::new(opts.profile, opts.module_path.clone());
+    if opts.prelude {
+        checker.build_type_env(prelude_file(opts.profile));
+        if opts.profile == SemanticProfile::LegacyJavaScript {
+            checker.build_type_env(js_globals_file());
+        }
+    }
     for declaration in declarations {
         checker.build_type_env(declaration);
     }
-    checker.build_type_env(file);
+    checker.build_type_env(&filtered_file);
     let (
         type_errors,
         name_resolution,
@@ -339,8 +444,8 @@ pub fn analyze_file_with_declarations(file: &File, declarations: &[File]) -> Sem
         variant_patterns,
         hover_info,
         references,
-    ) = checker.check_file(file);
-    SemanticResult {
+    ) = checker.check_file(&filtered_file);
+    let mut result = SemanticResult {
         symbols,
         type_errors,
         name_resolution,
@@ -349,7 +454,13 @@ pub fn analyze_file_with_declarations(file: &File, declarations: &[File]) -> Sem
         variant_patterns,
         hover_info,
         references,
+    };
+    if opts.profile == SemanticProfile::Native {
+        result
+            .type_errors
+            .extend(native_profile_errors(&filtered_file));
     }
+    result
 }
 
 /// Run semantic analysis without injecting the stdlib prelude.
@@ -359,12 +470,16 @@ pub fn analyze_file_without_prelude(file: &File) -> SemanticResult {
         SemanticOptions {
             prelude: false,
             cfg_flags: HashSet::new(),
+            profile: SemanticProfile::LegacyJavaScript,
+            module_path: Vec::new(),
         },
     )
 }
 
 static PRELUDE_SRC: &str = include_str!("stdlib/core.hk");
 static PRELUDE_AST: OnceLock<File> = OnceLock::new();
+static NATIVE_PRELUDE_SRC: &str = include_str!("stdlib/native.hk");
+static NATIVE_PRELUDE_AST: OnceLock<File> = OnceLock::new();
 static STDLIB_INDEX: OnceLock<StdlibIndex> = OnceLock::new();
 
 /// Returns the standard-library prelude used to collect code-generation name mappings.
@@ -378,6 +493,26 @@ pub fn get_prelude_file() -> &'static File {
         }
         parsed.file.expect("stdlib prelude parse produced no AST")
     })
+}
+
+/// Returns the backend-neutral native prelude.
+pub fn get_native_prelude_file() -> &'static File {
+    NATIVE_PRELUDE_AST.get_or_init(|| {
+        let parsed = parse_str(NATIVE_PRELUDE_SRC);
+        if !parsed.errors.is_empty() {
+            panic!("failed to parse native stdlib prelude: {:?}", parsed.errors);
+        }
+        parsed
+            .file
+            .expect("native stdlib prelude parse produced no AST")
+    })
+}
+
+fn prelude_file(profile: SemanticProfile) -> &'static File {
+    match profile {
+        SemanticProfile::Native => get_native_prelude_file(),
+        SemanticProfile::LegacyJavaScript => get_prelude_file(),
+    }
 }
 
 /// Returns the global stdlib index for method lookups.
@@ -510,6 +645,7 @@ struct MethodSig {
     params: Vec<Param>,
     #[allow(dead_code)]
     ret_type: Option<TypeExpr>,
+    default_body: Option<Vec<Stmt>>,
 }
 
 /// Information about an impl block.
@@ -735,7 +871,33 @@ fn substitute_type_param(ty: &Type, param: &str, replacement: &Type) -> Type {
     }
 }
 
+fn resolve_impl_member_type(
+    checker: &mut TypeChecker,
+    type_expr: &TypeExpr,
+    receiver: &Type,
+) -> Type {
+    match receiver {
+        Type::Array(element) => {
+            let resolved = checker.resolve_type_expr(type_expr, &["T".to_string()]);
+            substitute_type_param(&resolved, "T", element)
+        }
+        Type::Named { args, .. } if args.len() == 1 => {
+            let resolved = checker.resolve_type_expr(type_expr, &["T".to_string()]);
+            substitute_type_param(&resolved, "T", &args[0])
+        }
+        Type::Named { args, .. } if args.len() == 2 => {
+            let resolved =
+                checker.resolve_type_expr(type_expr, &["K".to_string(), "V".to_string()]);
+            let resolved = substitute_type_param(&resolved, "K", &args[0]);
+            substitute_type_param(&resolved, "V", &args[1])
+        }
+        _ => checker.resolve_type_expr(type_expr, &[]),
+    }
+}
+
 struct TypeChecker {
+    profile: SemanticProfile,
+    module_path: Vec<String>,
     env: TypeEnv,
     errors: Vec<SemanticError>,
     /// Maps variable spans to their resolved unique names for codegen.
@@ -763,8 +925,10 @@ struct IteratorMethodArgs<'a> {
 }
 
 impl TypeChecker {
-    fn new() -> Self {
+    fn new(profile: SemanticProfile, module_path: Vec<String>) -> Self {
         Self {
+            profile,
+            module_path,
             env: TypeEnv::default(),
             errors: Vec::new(),
             name_resolution: HashMap::new(),
@@ -1169,7 +1333,9 @@ impl TypeChecker {
                 }
                 ItemKind::Use { path, kind } => {
                     self.process_variant_import(path, kind);
+                    self.process_item_import(path, kind);
                 }
+                ItemKind::Mod { .. } => {}
                 ItemKind::Trait(trait_def) => {
                     let mut methods = HashMap::new();
                     for item in &trait_def.items {
@@ -1181,6 +1347,7 @@ impl TypeChecker {
                                 receiver: method.receiver,
                                 params: method.params.clone(),
                                 ret_type: method.ret_type.clone(),
+                                default_body: method.default_body.clone(),
                             },
                         );
                     }
@@ -1300,6 +1467,66 @@ impl TypeChecker {
         }
     }
 
+    fn process_item_import(&mut self, path: &[Ident], kind: &husk_ast::UseKind) {
+        if !matches!(kind, husk_ast::UseKind::Item) {
+            return;
+        }
+        let Some(alias) = path.last() else {
+            return;
+        };
+        if let Some(function) = self.resolve_module_function(path).cloned() {
+            self.env.functions.insert(alias.name.clone(), function);
+        }
+    }
+
+    fn normalized_module_path(&self, path: &[Ident]) -> Vec<String> {
+        let mut segments = path
+            .iter()
+            .map(|segment| segment.name.clone())
+            .collect::<Vec<_>>();
+        match segments.first().map(String::as_str) {
+            Some("crate") => {
+                segments.remove(0);
+            }
+            Some("self") => {
+                segments.remove(0);
+                let mut resolved = self.module_path.clone();
+                resolved.extend(segments);
+                segments = resolved;
+            }
+            Some("super") => {
+                let mut resolved = self.module_path.clone();
+                while segments.first().is_some_and(|segment| segment == "super") {
+                    segments.remove(0);
+                    resolved.pop();
+                }
+                resolved.extend(segments);
+                segments = resolved;
+            }
+            Some(root) if self.env.modules.contains_key(root) => {}
+            Some(_) if !self.module_path.is_empty() => {
+                let mut resolved = self.module_path.clone();
+                resolved.extend(segments);
+                segments = resolved;
+            }
+            _ => {}
+        }
+        segments
+    }
+
+    fn resolve_module_function(&self, path: &[Ident]) -> Option<&FnDef> {
+        let segments = self.normalized_module_path(path);
+        let module = segments.first()?;
+        let function = segments.last()?;
+        if module == function {
+            return None;
+        }
+        self.env
+            .modules
+            .get(module)
+            .and_then(|module| module.functions.get(function))
+    }
+
     /// Verify that all trait implementations provide required methods and supertraits.
     fn verify_trait_impls(&mut self) {
         // Collect supertrait errors separately to avoid borrow issues
@@ -1317,8 +1544,8 @@ impl TypeChecker {
             };
 
             // Check all required trait methods are implemented
-            for method_name in trait_info.methods.keys() {
-                if !impl_info.methods.contains_key(method_name) {
+            for (method_name, method) in &trait_info.methods {
+                if !impl_info.methods.contains_key(method_name) && method.default_body.is_none() {
                     self.errors.push(SemanticError {
                         message: format!(
                             "impl of trait `{}` for `{}` is missing method `{}`",
@@ -1395,14 +1622,78 @@ impl TypeChecker {
                     item.span.clone(),
                 );
             }
+            if let ItemKind::Impl(impl_block) = &item.kind {
+                for impl_item in &impl_block.items {
+                    let husk_ast::ImplItemKind::Method(method) = &impl_item.kind else {
+                        continue;
+                    };
+                    if method.is_extern {
+                        continue;
+                    }
+                    let mut parameters = method.params.clone();
+                    if method.receiver.is_some() {
+                        parameters.insert(
+                            0,
+                            Param {
+                                attributes: Vec::new(),
+                                name: Ident {
+                                    name: "self".to_string(),
+                                    span: method.name.span.clone(),
+                                },
+                                ty: impl_block.self_ty.clone(),
+                            },
+                        );
+                    }
+                    self.check_fn(
+                        &method.name,
+                        &impl_block.type_params,
+                        &parameters,
+                        method.ret_type.as_ref(),
+                        &method.body,
+                        impl_item.span.clone(),
+                    );
+                }
+            }
         }
 
         // Validate main() return type - must implement Termination trait
-        // Currently only () and Result<T, E> are allowed
+        // Standalone Husk accepts (), i32, and Result<T, E>.
         for item in &file.items {
-            if let ItemKind::Fn { name, ret_type, .. } = &item.kind
+            if let ItemKind::Fn {
+                name,
+                params,
+                ret_type,
+                ..
+            } = &item.kind
                 && name.name == "main"
             {
+                let valid_parameters = params.is_empty()
+                    || matches!(
+                        params.as_slice(),
+                        [Param {
+                            ty: TypeExpr {
+                                kind: TypeExprKind::Array(element),
+                                ..
+                            },
+                            ..
+                        }] if matches!(
+                            &element.kind,
+                            TypeExprKind::Named(name) if name.name == "String"
+                        )
+                    );
+                if !valid_parameters {
+                    let span = params
+                        .first()
+                        .map(|parameter| parameter.name.span.clone())
+                        .unwrap_or_else(|| name.span.clone());
+                    self.errors.push(SemanticError {
+                        message:
+                            "`main` must accept no arguments or exactly one `[String]` argument"
+                                .to_string(),
+                        span,
+                    });
+                }
+
                 let return_type = ret_type
                     .as_ref()
                     .map(|ty| self.resolve_type_expr(ty, &[]))
@@ -1410,10 +1701,16 @@ impl TypeChecker {
 
                 let is_valid_termination = match &return_type {
                     // () implements Termination
-                    Type::Primitive(PrimitiveType::Unit) => true,
+                    Type::Primitive(PrimitiveType::Unit | PrimitiveType::I32) => true,
                     // Result<T, E> implements Termination (where T: Termination, E: Debug)
                     // For now, we accept any Result type
-                    Type::Named { name, args } if name == "Result" && args.len() == 2 => true,
+                    Type::Named { name, args }
+                        if name == "Result"
+                            && args.len() == 2
+                            && matches!(args[0], Type::Primitive(PrimitiveType::Unit)) =>
+                    {
+                        true
+                    }
                     _ => false,
                 };
 
@@ -1426,7 +1723,7 @@ impl TypeChecker {
                         message: format!(
                             "`main` has invalid return type `{}`\n\
                                  `main` can only return types that implement `Termination`\n\
-                                 help: consider using `()`, or a `Result`",
+                                 help: consider using `()`, `i32`, or `Result<(), E>`",
                             format_type(&return_type)
                         ),
                         span,
@@ -1898,14 +2195,7 @@ impl<'a> FnContext<'a> {
             let enum_name = &segments[0].name;
             let variant_name = &segments[segments.len() - 1].name;
 
-            if let Some(function) = self
-                .tcx
-                .env
-                .modules
-                .get(enum_name)
-                .and_then(|module| module.functions.get(variant_name))
-                .cloned()
-            {
+            if let Some(function) = self.tcx.resolve_module_function(segments).cloned() {
                 return Type::Function {
                     params: function
                         .params
@@ -1914,6 +2204,36 @@ impl<'a> FnContext<'a> {
                         .collect(),
                     ret: Box::new(
                         function
+                            .ret_type
+                            .as_ref()
+                            .map(|ty| self.tcx.resolve_type_expr(ty, &[]))
+                            .unwrap_or_else(Type::unit),
+                    ),
+                };
+            }
+
+            let associated_method = self
+                .tcx
+                .env
+                .impls
+                .iter()
+                .filter(|implementation| implementation.self_ty_name == *enum_name)
+                .find_map(|implementation| {
+                    implementation
+                        .methods
+                        .get(variant_name)
+                        .filter(|method| method.receiver.is_none())
+                        .cloned()
+                });
+            if let Some(method) = associated_method {
+                return Type::Function {
+                    params: method
+                        .params
+                        .iter()
+                        .map(|parameter| self.tcx.resolve_type_expr(&parameter.ty, &[]))
+                        .collect(),
+                    ret: Box::new(
+                        method
                             .ret_type
                             .as_ref()
                             .map(|ty| self.tcx.resolve_type_expr(ty, &[]))
@@ -2089,7 +2409,9 @@ impl<'a> FnContext<'a> {
                         has_catch_all = true;
                     }
                 }
-                PatternKind::EnumUnit { path } | PatternKind::EnumTuple { path, .. } => {
+                PatternKind::EnumUnit { path }
+                | PatternKind::EnumTuple { path, .. }
+                | PatternKind::EnumStruct { path, .. } => {
                     if let Some((enum_name, variant_names)) = &enum_info {
                         // Check for single-segment imported variant (e.g., `Some`, `None`)
                         if path.len() == 1 {
@@ -2170,8 +2492,6 @@ impl<'a> FnContext<'a> {
                         }
                     }
                 }
-                // Struct patterns not yet used in exhaustiveness.
-                PatternKind::EnumStruct { .. } => {}
                 // Tuple patterns - treat as irrefutable for now (they always match if types match)
                 PatternKind::Tuple { .. } => {
                     has_catch_all = true;
@@ -2265,26 +2585,77 @@ impl<'a> FnContext<'a> {
             }
             PatternKind::EnumUnit { .. } => {}
             PatternKind::EnumTuple { fields, .. } => {
-                // Extract bindings from each field in the tuple pattern.
-                // For Option::Some(x), the scrutinee type is Option<T>, so x has type T.
-                // For multi-field variants, we'd need the full enum definition to get field types.
-                // For now, handle the common single-field case (Option, Result).
-                if fields.len() == 1 {
-                    // Extract inner type from Option<T> or Result<T, E>
-                    let inner_ty = match scrut_ty {
-                        Type::Named { args, .. } if !args.is_empty() => args[0].clone(),
-                        _ => scrut_ty.clone(),
-                    };
-                    self.bind_pattern_locals(&fields[0], &inner_ty, pattern_bindings);
-                } else {
-                    // Multi-field: bind each to the scrutinee type (imprecise but functional)
-                    for field in fields {
-                        self.bind_pattern_locals(field, scrut_ty, pattern_bindings);
-                    }
+                let (declared_types, type_parameters) = match (&pat.kind, scrut_ty) {
+                    (PatternKind::EnumTuple { path, .. }, Type::Named { name, .. }) => self
+                        .tcx
+                        .env
+                        .enums
+                        .get(name)
+                        .and_then(|definition| {
+                            let variant_name = path.last().map(|segment| &segment.name)?;
+                            let types = definition
+                                .variants
+                                .iter()
+                                .find(|variant| &variant.name == variant_name)
+                                .and_then(|variant| match &variant.fields {
+                                    EnumVariantFields::Tuple(types) => Some(types.clone()),
+                                    _ => None,
+                                })?;
+                            Some((types, definition.type_params.clone()))
+                        })
+                        .unwrap_or_default(),
+                    _ => (Vec::new(), Vec::new()),
+                };
+                for (index, field) in fields.iter().enumerate() {
+                    let field_ty = declared_types
+                        .get(index)
+                        .map(|ty| {
+                            let mut resolved = self.tcx.resolve_type_expr(ty, &type_parameters);
+                            if let Type::Named { args, .. } = scrut_ty {
+                                for (parameter, argument) in type_parameters.iter().zip(args) {
+                                    resolved =
+                                        substitute_type_param(&resolved, parameter, argument);
+                                }
+                            }
+                            resolved
+                        })
+                        .or_else(|| match scrut_ty {
+                            Type::Named { args, .. } => args.get(index).cloned(),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| scrut_ty.clone());
+                    self.bind_pattern_locals(field, &field_ty, pattern_bindings);
                 }
             }
-            PatternKind::EnumStruct { .. } => {
-                // Not yet supported for bindings.
+            PatternKind::EnumStruct { path, fields } => {
+                let field_types = match scrut_ty {
+                    Type::Named { name, .. } => self
+                        .tcx
+                        .env
+                        .enums
+                        .get(name)
+                        .and_then(|definition| {
+                            let variant_name = path.last().map(|segment| &segment.name)?;
+                            definition
+                                .variants
+                                .iter()
+                                .find(|variant| &variant.name == variant_name)
+                        })
+                        .and_then(|variant| match &variant.fields {
+                            EnumVariantFields::Struct(fields) => Some(fields.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                };
+                for (name, pattern) in fields {
+                    let ty = field_types
+                        .iter()
+                        .find(|field| field.name.name == name.name)
+                        .map(|field| self.tcx.resolve_type_expr(&field.ty, &[]))
+                        .unwrap_or_else(Type::unit);
+                    self.bind_pattern_locals(pattern, &ty, pattern_bindings);
+                }
             }
             PatternKind::Tuple { fields } => {
                 // For tuple patterns, bind each field to the corresponding element type
@@ -2482,7 +2853,7 @@ impl<'a> FnContext<'a> {
             } => {
                 let cond_ty = self.check_expr(cond);
                 if !matches!(cond_ty, Type::Primitive(PrimitiveType::Bool))
-                    && !is_dynamic_type(&cond_ty)
+                    && !is_dynamic_type(self.tcx.profile, &cond_ty)
                 {
                     self.tcx.errors.push(SemanticError {
                         message: "if condition must have type `bool`".to_string(),
@@ -2884,12 +3255,18 @@ impl<'a> FnContext<'a> {
                 type_args: _,
                 args,
             } => {
-                // Check if the callee is a module import (which accepts any arguments)
-                let is_module_call = match &callee.kind {
+                // A bare imported module is a legacy JavaScript callable with
+                // no known signature. Qualified module functions have an
+                // explicit descriptor/declaration signature and are checked.
+                let is_untyped_module_call = match &callee.kind {
                     ExprKind::Ident(id) => self.tcx.env.modules.contains_key(&id.name),
-                    ExprKind::Path { segments } => segments
-                        .first()
-                        .is_some_and(|segment| self.tcx.env.modules.contains_key(&segment.name)),
+                    ExprKind::Path { segments }
+                        if self.tcx.profile == SemanticProfile::LegacyJavaScript =>
+                    {
+                        segments
+                            .first()
+                            .is_some_and(|segment| self.tcx.env.modules.contains_key(&segment.name))
+                    }
                     _ => false,
                 };
 
@@ -2932,7 +3309,7 @@ impl<'a> FnContext<'a> {
                 };
 
                 // Skip arity checking for module imports - they accept any number of args
-                if !is_module_call && param_tys.len() != args.len() {
+                if !is_untyped_module_call && param_tys.len() != args.len() {
                     self.tcx.errors.push(SemanticError {
                         message: format!(
                             "function expects {} argument(s), got {}",
@@ -2952,7 +3329,7 @@ impl<'a> FnContext<'a> {
 
                 // Type-check arguments with expected types for closure inference
                 // (skip for module calls since we don't know the signature)
-                if !is_module_call {
+                if !is_untyped_module_call {
                     for (i, arg) in args.iter().enumerate() {
                         let expected = param_tys.get(i);
                         // Use check_expr_with_expected to enable closure parameter inference
@@ -3384,11 +3761,6 @@ impl<'a> FnContext<'a> {
                     return result_ty;
                 }
 
-                // Type-check remaining arguments without expected types
-                for arg in args {
-                    let _ = self.check_expr(arg);
-                }
-
                 // Handle tuple.to_array() specially
                 if let Type::Tuple(elements) = &receiver_ty
                     && method_name == "to_array"
@@ -3472,66 +3844,105 @@ impl<'a> FnContext<'a> {
                     _ => None,
                 };
 
-                // Look up the method in impl blocks and get its return type.
-                // Use Option<Option<TypeExpr>> to distinguish "method not found" from "method found with no return type"
-                let method_lookup_result: Option<Option<TypeExpr>> = if let Some(ref type_name) =
-                    receiver_type_name
-                {
-                    let mut found = None;
-                    for impl_info in &self.tcx.env.impls {
-                        // Match either the exact type name or the generic form
-                        let matches = impl_info.self_ty_name == *type_name
-                            || generic_type_name
-                                .as_ref()
-                                .is_some_and(|g| impl_info.self_ty_name == *g);
-                        if matches && let Some(method_info) = impl_info.methods.get(method_name) {
-                            // Found the method - wrap ret_type in Some to indicate success
-                            found = Some(method_info.ret_type.clone());
-                            break;
+                // Look up the complete method signature in impl blocks so
+                // argument checking and return inference consume one source of
+                // truth.
+                let method_lookup_result: Option<MethodInfo> =
+                    if let Some(ref type_name) = receiver_type_name {
+                        let mut found = None;
+                        let mut ambiguous = false;
+                        for impl_info in &self.tcx.env.impls {
+                            // Match either the exact type name or the generic form
+                            let matches = impl_info.self_ty_name == *type_name
+                                || generic_type_name
+                                    .as_ref()
+                                    .is_some_and(|g| impl_info.self_ty_name == *g);
+                            let candidate = if matches {
+                                impl_info.methods.get(method_name).cloned().or_else(|| {
+                                    let trait_name = impl_info.trait_name.as_ref()?;
+                                    let method = self
+                                        .tcx
+                                        .env
+                                        .traits
+                                        .get(trait_name)?
+                                        .methods
+                                        .get(method_name)?;
+                                    method.default_body.as_ref()?;
+                                    Some(MethodInfo {
+                                        receiver: method.receiver,
+                                        params: method.params.clone(),
+                                        ret_type: method.ret_type.clone(),
+                                    })
+                                })
+                            } else {
+                                None
+                            };
+                            if let Some(candidate) = candidate {
+                                if found.is_some() {
+                                    ambiguous = true;
+                                } else {
+                                    found = Some(candidate);
+                                }
+                            }
                         }
+                        if ambiguous {
+                            self.tcx.errors.push(SemanticError {
+                                message: format!(
+                                    "method `{}` is ambiguous for type `{}`",
+                                    method_name,
+                                    self.format_type(&receiver_ty)
+                                ),
+                                span: method.span.clone(),
+                            });
+                        }
+                        found
+                    } else {
+                        None
+                    };
+
+                if let Some(method_info) = &method_lookup_result {
+                    if self.tcx.profile == SemanticProfile::Native
+                        && method_info.params.len() != args.len()
+                    {
+                        self.tcx.errors.push(SemanticError {
+                            message: format!(
+                                "method `{}` expects {} argument{}, got {}",
+                                method_name,
+                                method_info.params.len(),
+                                if method_info.params.len() == 1 {
+                                    ""
+                                } else {
+                                    "s"
+                                },
+                                args.len()
+                            ),
+                            span: method.span.clone(),
+                        });
                     }
-                    found
+                    for (argument, parameter) in args.iter().zip(&method_info.params) {
+                        let expected =
+                            resolve_impl_member_type(self.tcx, &parameter.ty, &receiver_ty);
+                        let _ = self.check_expr_with_expected(argument, Some(&expected));
+                    }
+                    for argument in args.iter().skip(method_info.params.len()) {
+                        let _ = self.check_expr(argument);
+                    }
                 } else {
-                    None
-                };
+                    for argument in args {
+                        let _ = self.check_expr(argument);
+                    }
+                }
 
                 // Resolve the return type
                 match method_lookup_result {
-                    Some(Some(ret_type_expr)) => {
+                    Some(MethodInfo {
+                        ret_type: Some(ret_type_expr),
+                        ..
+                    }) => {
                         // Method found with explicit return type
-                        // For generic methods from `impl<T> [T]`, `impl<T> Set<T>`, or
-                        // `impl<K, V> Map<K, V>`, we need to substitute type params.
-                        if let Type::Array(elem_ty) = &receiver_ty {
-                            // Resolve using "T" as a generic param, then substitute
-                            let resolved = self
-                                .tcx
-                                .resolve_type_expr(&ret_type_expr, &["T".to_string()]);
-                            substitute_type_param(&resolved, "T", elem_ty)
-                        } else if let Type::Named { args, .. } = &receiver_ty {
-                            match args.len() {
-                                1 => {
-                                    // Single-param generic like Set<i32> - substitute T
-                                    let resolved = self
-                                        .tcx
-                                        .resolve_type_expr(&ret_type_expr, &["T".to_string()]);
-                                    substitute_type_param(&resolved, "T", &args[0])
-                                }
-                                2 => {
-                                    // Two-param generic like Map<String, i32> - substitute K and V
-                                    let resolved = self.tcx.resolve_type_expr(
-                                        &ret_type_expr,
-                                        &["K".to_string(), "V".to_string()],
-                                    );
-                                    let resolved = substitute_type_param(&resolved, "K", &args[0]);
-                                    substitute_type_param(&resolved, "V", &args[1])
-                                }
-                                _ => self.tcx.resolve_type_expr(&ret_type_expr, &[]),
-                            }
-                        } else {
-                            self.tcx.resolve_type_expr(&ret_type_expr, &[])
-                        }
+                        resolve_impl_member_type(self.tcx, &ret_type_expr, &receiver_ty)
                     }
-                    Some(None) => {
+                    Some(MethodInfo { ret_type: None, .. }) => {
                         // Method found but returns unit (no explicit return type)
                         Type::Primitive(PrimitiveType::Unit)
                     }
@@ -3558,7 +3969,7 @@ impl<'a> FnContext<'a> {
                 match op {
                     husk_ast::UnaryOp::Not => {
                         if !matches!(inner_ty, Type::Primitive(PrimitiveType::Bool))
-                            && !is_dynamic_type(&inner_ty)
+                            && !is_dynamic_type(self.tcx.profile, &inner_ty)
                         {
                             self.tcx.errors.push(SemanticError {
                                 message: "operator `!` expects operand of type `bool`".to_string(),
@@ -3585,7 +3996,9 @@ impl<'a> FnContext<'a> {
                 match op {
                     Add => {
                         // Add supports i32 + i32, i64 + i64, and String + String
-                        if is_dynamic_type(&left_ty) || is_dynamic_type(&right_ty) {
+                        if is_dynamic_type(self.tcx.profile, &left_ty)
+                            || is_dynamic_type(self.tcx.profile, &right_ty)
+                        {
                             if matches!(left_ty, Type::Primitive(PrimitiveType::String))
                                 || matches!(right_ty, Type::Primitive(PrimitiveType::String))
                             {
@@ -3620,7 +4033,9 @@ impl<'a> FnContext<'a> {
                     }
                     Sub | Mul | Div | Mod => {
                         // Arithmetic supports i32 and i64, operands must match
-                        if is_dynamic_type(&left_ty) || is_dynamic_type(&right_ty) {
+                        if is_dynamic_type(self.tcx.profile, &left_ty)
+                            || is_dynamic_type(self.tcx.profile, &right_ty)
+                        {
                             Type::Named {
                                 name: "JsValue".to_string(),
                                 args: Vec::new(),
@@ -3657,9 +4072,9 @@ impl<'a> FnContext<'a> {
                     }
                     And | Or => {
                         if !matches!(left_ty, Type::Primitive(PrimitiveType::Bool))
-                            && !is_dynamic_type(&left_ty)
+                            && !is_dynamic_type(self.tcx.profile, &left_ty)
                             || !matches!(right_ty, Type::Primitive(PrimitiveType::Bool))
-                                && !is_dynamic_type(&right_ty)
+                                && !is_dynamic_type(self.tcx.profile, &right_ty)
                         {
                             self.tcx.errors.push(SemanticError {
                                 message: "logical operators expect operands of type `bool`"
@@ -3678,7 +4093,7 @@ impl<'a> FnContext<'a> {
             } => {
                 let cond_ty = self.check_expr(cond);
                 if !matches!(cond_ty, Type::Primitive(PrimitiveType::Bool))
-                    && !is_dynamic_type(&cond_ty)
+                    && !is_dynamic_type(self.tcx.profile, &cond_ty)
                 {
                     self.tcx.errors.push(SemanticError {
                         message: "if condition must be bool".to_string(),
@@ -3962,14 +4377,21 @@ impl<'a> FnContext<'a> {
                     // Slicing an array returns an array of the same element type
                     match base_ty {
                         Type::Array(_) => base_ty,
+                        Type::Primitive(PrimitiveType::String) => {
+                            Type::Primitive(PrimitiveType::String)
+                        }
                         Type::Named { ref name, ref args } if name == "Vec" && !args.is_empty() => {
                             // Vec slice returns Vec
                             base_ty
                         }
-                        Type::Named { .. } => Type::Named {
-                            name: "JsValue".to_string(),
-                            args: vec![],
-                        },
+                        Type::Named { .. }
+                            if self.tcx.profile == SemanticProfile::LegacyJavaScript =>
+                        {
+                            Type::Named {
+                                name: "JsValue".to_string(),
+                                args: vec![],
+                            }
+                        }
                         _ => {
                             self.tcx.errors.push(SemanticError {
                                 message: format!(
@@ -3990,7 +4412,7 @@ impl<'a> FnContext<'a> {
                         &base_ty,
                         Type::Array(element)
                             if matches!(element.as_ref(), Type::Primitive(PrimitiveType::Unit))
-                    ) || is_dynamic_type(&base_ty);
+                    ) || is_dynamic_type(self.tcx.profile, &base_ty);
                     let is_valid_index = dynamic_collection
                         || matches!(index_ty, Type::Primitive(PrimitiveType::I32))
                         || matches!(&index_ty, Type::Named { name, .. } if name == "number");
@@ -4107,6 +4529,14 @@ impl<'a> FnContext<'a> {
                 self.check_expr(value)
             }
             ExprKind::JsLiteral { .. } => {
+                if self.tcx.profile == SemanticProfile::Native {
+                    self.tcx.errors.push(SemanticError {
+                        message: "`js { ... }` is only available in the legacy JavaScript profile"
+                            .to_string(),
+                        span: expr.span.clone(),
+                    });
+                    return Type::Primitive(PrimitiveType::Unit);
+                }
                 // Raw JavaScript literals are treated as dynamically typed (JsValue)
                 // They can evaluate to any JavaScript value at runtime.
                 Type::Named {
@@ -5099,7 +5529,8 @@ impl<'a> FnContext<'a> {
     fn types_compatible_inner(&self, expected: &Type, actual: &Type) -> bool {
         // JsValue is compatible with any type (it's JavaScript's dynamic "any" type)
         // This allows passing primitives to functions expecting JsValue (e.g., assert_eq)
-        if is_dynamic_type(expected) || is_dynamic_type(actual) {
+        if is_dynamic_type(self.tcx.profile, expected) || is_dynamic_type(self.tcx.profile, actual)
+        {
             return true;
         }
 
@@ -5767,6 +6198,7 @@ impl Resolver {
 
     fn collect_item(&mut self, item: &Item) {
         match &item.kind {
+            ItemKind::Mod { name } => self.add_symbol(name, SymbolKind::Module),
             ItemKind::Fn { name, .. } => self.add_symbol(name, SymbolKind::Function),
             ItemKind::Struct { name, .. } => self.add_symbol(name, SymbolKind::Struct),
             ItemKind::Enum { name, .. } => self.add_symbol(name, SymbolKind::Enum),
@@ -6661,6 +7093,33 @@ mod tests {
     }
 
     #[test]
+    fn qualified_legacy_module_calls_keep_dynamic_arity() {
+        let source = r#"
+            extern "red" {
+                mod global red {
+                    fn execute();
+                }
+            }
+
+            fn main() {
+                red::execute("Print", 42);
+            }
+        "#;
+        let parsed = parse_str(source);
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let result = analyze_file(&parsed.file.expect("parser produced no AST"));
+        assert!(
+            result.type_errors.is_empty(),
+            "expected a dynamically typed legacy call, got {:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
     fn prelude_option_available_by_default() {
         let src = r#"
 fn main() {
@@ -7055,6 +7514,47 @@ trait Eq: PartialEq {}
         assert!(
             result.type_errors.is_empty(),
             "unexpected type errors: {:?}",
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn trait_default_method_does_not_require_an_override() {
+        let parsed = parse_str(
+            r#"
+                trait Label {
+                    fn label(&self) -> String { "default" }
+                }
+                struct Item {}
+                impl Label for Item {}
+                fn render(item: Item) -> String { item.label() }
+            "#,
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let result = analyze_file(&parsed.file.unwrap());
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn ambiguous_trait_methods_are_rejected_at_the_call() {
+        let parsed = parse_str(
+            r#"
+                trait Left { fn value(&self) -> i32; }
+                trait Right { fn value(&self) -> i32; }
+                struct Item {}
+                impl Left for Item { fn value(&self) -> i32 { 1 } }
+                impl Right for Item { fn value(&self) -> i32 { 2 } }
+                fn read(item: Item) -> i32 { item.value() }
+            "#,
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let result = analyze_file(&parsed.file.unwrap());
+        assert!(
+            result
+                .type_errors
+                .iter()
+                .any(|error| error.message.contains("method `value` is ambiguous")),
+            "{:?}",
             result.type_errors
         );
     }
@@ -9187,7 +9687,7 @@ fn main() -> Result<(), String> {
     }
 
     #[test]
-    fn main_returning_i32_is_invalid() {
+    fn main_returning_i32_is_valid() {
         let src = r#"
 fn main() -> i32 {
     42
@@ -9197,13 +9697,9 @@ fn main() -> i32 {
         let file = parsed.file.expect("parser produced no AST");
         let result = analyze_file(&file);
         assert!(
-            !result.type_errors.is_empty(),
-            "main() returning i32 should be invalid"
-        );
-        assert!(
-            result.type_errors[0].message.contains("Termination"),
-            "error should mention Termination trait, got: {}",
-            result.type_errors[0].message
+            result.type_errors.is_empty(),
+            "main() returning i32 should be valid, got: {:?}",
+            result.type_errors
         );
     }
 
@@ -9327,5 +9823,83 @@ fn main() -> Result<i32, String> {
             "error message should mention Option/Result mismatch, got: {:?}",
             result.type_errors
         );
+    }
+
+    #[test]
+    fn native_profile_rejects_javascript_globals_and_literals() {
+        let parsed = parse_str(
+            r#"
+                fn demo() {
+                    let value: JsValue;
+                    let raw = js { ({ answer: 42 }) };
+                }
+            "#,
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let result =
+            analyze_file_with_options(parsed.file.as_ref().unwrap(), SemanticOptions::native());
+
+        assert!(
+            result
+                .type_errors
+                .iter()
+                .any(|error| error.message.contains("unknown type `JsValue`"))
+        );
+        assert!(result.type_errors.iter().any(|error| {
+            error
+                .message
+                .contains("only available in the legacy JavaScript profile")
+        }));
+    }
+
+    #[test]
+    fn legacy_javascript_profile_keeps_dynamic_interop() {
+        let parsed = parse_str(
+            r#"
+                fn demo() {
+                    let value: JsValue;
+                    let raw = js { ({ answer: 42 }) };
+                }
+            "#,
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let result = analyze_file_with_options(
+            parsed.file.as_ref().unwrap(),
+            SemanticOptions::with_prelude(),
+        );
+
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
+    }
+
+    #[test]
+    fn native_profile_rejects_javascript_extern_blocks() {
+        let parsed = parse_str(
+            r#"
+                extern "js" {
+                    fn browser_only() -> String;
+                }
+            "#,
+        );
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let result =
+            analyze_file_with_options(parsed.file.as_ref().unwrap(), SemanticOptions::native());
+
+        assert!(
+            result
+                .type_errors
+                .iter()
+                .any(|error| error.message.contains("`extern \"js\"` is only available"))
+        );
+    }
+
+    #[test]
+    fn native_prelude_is_backend_neutral_and_defines_json() {
+        assert!(!NATIVE_PRELUDE_SRC.contains("extern \"js\""));
+        assert!(!NATIVE_PRELUDE_SRC.contains("JsValue"));
+        let parsed = parse_str("fn accepts(value: Json) {}");
+        let result =
+            analyze_file_with_options(parsed.file.as_ref().unwrap(), SemanticOptions::native());
+
+        assert!(result.type_errors.is_empty(), "{:?}", result.type_errors);
     }
 }
