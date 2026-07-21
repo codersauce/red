@@ -461,7 +461,7 @@ impl Editor {
         local_rows: &[usize],
     ) {
         let layout = self.layout_for_window(window);
-        let window_buffer = &self.buffers[window.buffer_index];
+        let window_buffer = &self.buffer_manager[window.buffer_index];
         let mut line_count = window_buffer.navigable_line_count();
         if self.window_manager.active_window_id() == window_id && self.is_insert() {
             line_count = line_count.max(window.vtop + window.cy + 1);
@@ -543,7 +543,7 @@ impl Editor {
                 continue;
             };
             if cached_line.as_ref().map(|(line, _)| *line) != Some(segment.line) {
-                cached_line = self.buffers[window.buffer_index]
+                cached_line = self.buffer_manager[window.buffer_index]
                     .get(segment.line)
                     .map(|line| (segment.line, line));
             }
@@ -648,10 +648,10 @@ impl Editor {
             return false;
         }
         let pristine = self.window_manager.windows().len() == 1
-            && self.buffers.len() == 1
-            && self.buffers[0].is_unnamed()
-            && self.buffers[0].is_blank()
-            && !self.buffers[0].is_dirty();
+            && self.buffer_manager.len() == 1
+            && self.buffer_manager[0].is_unnamed()
+            && self.buffer_manager[0].is_blank()
+            && !self.buffer_manager[0].is_dirty();
         if !pristine {
             if self.splash_shown {
                 self.splash_dismissed = true;
@@ -985,7 +985,7 @@ impl Editor {
             self.fill_line_in_window(buffer, term_x, term_y, content_width, &theme_style);
 
             if cached_line.as_ref().map(|(line, _)| *line) != Some(segment.line) {
-                cached_line = self.buffers[window.buffer_index]
+                cached_line = self.buffer_manager[window.buffer_index]
                     .get(segment.line)
                     .map(|line| (segment.line, line));
             }
@@ -1217,10 +1217,15 @@ impl Editor {
         let Some(visible_end) = layout.rows.last().map(|segment| segment.line) else {
             return Ok(());
         };
-        if self.buffers.get(window.buffer_index).is_some_and(|buffer| {
-            (visible_start..=visible_end)
-                .any(|line| buffer.line_range_byte_len(line, line + 1) > MAX_HIGHLIGHT_SLICE_BYTES)
-        }) {
+        if self
+            .buffer_manager
+            .get(window.buffer_index)
+            .is_some_and(|buffer| {
+                (visible_start..=visible_end).any(|line| {
+                    buffer.line_range_byte_len(line, line + 1) > MAX_HIGHLIGHT_SLICE_BYTES
+                })
+            })
+        {
             return Ok(());
         }
 
@@ -1263,7 +1268,7 @@ impl Editor {
 
             for line_index in start_y..=end_y {
                 let line = self
-                    .buffers
+                    .buffer_manager
                     .get(window.buffer_index)
                     .and_then(|buffer| buffer.get(line_index))
                     .unwrap_or_default();
@@ -1371,7 +1376,7 @@ impl Editor {
         window: &crate::window::Window,
     ) -> anyhow::Result<()> {
         // Get the buffer for this window
-        let window_buffer = &self.buffers[window.buffer_index];
+        let window_buffer = &self.buffer_manager[window.buffer_index];
 
         // Get current buffer URI
         let Some(uri) = window_buffer.uri()? else {
@@ -1489,7 +1494,7 @@ impl Editor {
                 _ => unreachable!(),
             };
 
-            let Some(line) = self.buffers[window.buffer_index].get(y) else {
+            let Some(line) = self.buffer_manager[window.buffer_index].get(y) else {
                 continue;
             };
             let line = trim_line_ending(&line);
@@ -1621,7 +1626,7 @@ impl Editor {
         // Get information from the active window
         let active_window = self.window_manager.active_window();
         let (file, pos, window_indicator) = if let Some(window) = active_window {
-            let window_buffer = &self.buffers[window.buffer_index];
+            let window_buffer = &self.buffer_manager[window.buffer_index];
             let dirty = if window_buffer.is_dirty() {
                 " [+] "
             } else {
@@ -1741,7 +1746,7 @@ impl Editor {
             if let Some(error) = self.last_error.as_deref() {
                 messages.push(error.to_string());
             }
-            if let Some(warning) = self.session_snapshot_warning {
+            if let Some(warning) = self.session_manager.warning() {
                 messages.push(warning.to_string());
             }
             if let Some(warning) = self.config_diagnostics_banner() {
@@ -1785,7 +1790,7 @@ impl Editor {
         window_id: usize,
     ) -> anyhow::Result<()> {
         let layout = self.layout_for_window(window);
-        let window_buffer = &self.buffers[window.buffer_index];
+        let window_buffer = &self.buffer_manager[window.buffer_index];
         let mut line_count = window_buffer.navigable_line_count();
         if self.window_manager.active_window_id() == window_id && self.is_insert() {
             line_count = line_count.max(window.vtop + window.cy + 1);
@@ -1869,7 +1874,7 @@ impl Editor {
 
                 // Calculate the actual display column for the cursor
                 let display_col =
-                    if let Some(line) = self.buffers[window.buffer_index].get(buffer_y) {
+                    if let Some(line) = self.buffer_manager[window.buffer_index].get(buffer_y) {
                         let line = trim_line_ending(&line);
                         self.display_col_for_cursor_goal(line, window.cursor_goal)
                     } else {
