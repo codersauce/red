@@ -1,3 +1,5 @@
+mod adapter_build;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     ffi::OsString,
@@ -143,6 +145,20 @@ enum CrateCommand {
         /// New directory that will receive the generated adapter crate.
         #[arg(long)]
         output: PathBuf,
+    },
+    /// Build a generated adapter inside the dedicated Cargo sandbox.
+    BuildAdapter {
+        /// Directory previously created by `husk crate adapter`.
+        adapter: PathBuf,
+        /// Permit Cargo dependency resolution to access the network.
+        #[arg(long)]
+        allow_network: bool,
+        /// Maximum seconds for each Cargo operation.
+        #[arg(long, default_value_t = 300)]
+        timeout_seconds: u64,
+        /// Maximum combined stdout and stderr bytes for each Cargo operation.
+        #[arg(long, default_value_t = 1024 * 1024)]
+        max_output_bytes: u64,
     },
 }
 
@@ -537,12 +553,155 @@ fn componentize_core_module(path: &Path) -> anyhow::Result<Vec<u8>> {
     );
     let module =
         fs::read(path).with_context(|| format!("read core module `{}`", path.display()))?;
+    componentize_core_bytes(&module)
+}
+
+fn componentize_core_bytes(module: &[u8]) -> anyhow::Result<Vec<u8>> {
     wit_component::ComponentEncoder::default()
-        .module(&module)
+        .module(module)
         .context("read embedded component metadata from core module")?
         .validate(true)
         .encode()
         .context("encode WebAssembly component")
+}
+
+fn verify_adapter_component(report: &[u8], bytes: &[u8]) -> anyhow::Result<()> {
+    let report: serde_json::Value =
+        serde_json::from_slice(report).context("parse copied adapter report")?;
+    let crate_name = report
+        .get("crate")
+        .and_then(serde_json::Value::as_str)
+        .context("adapter report omitted its crate name")?;
+    let component = WasmComponent::compile_bytes(
+        crate_name,
+        Version::new(0, 0, 0),
+        bytes,
+        WasmCompileOptions::default(),
+    )
+    .context("verify adapter component")?;
+    anyhow::ensure!(
+        component.raw_imports().is_empty(),
+        "adapter component unexpectedly imports: {}",
+        component.raw_imports().join(", ")
+    );
+
+    let expected_interface = husk::normalize_wit_name(&wit_identifier(crate_name))?;
+    let expected = report
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .context("adapter report omitted its selected items")?
+        .iter()
+        .map(expected_adapter_export)
+        .collect::<anyhow::Result<BTreeSet<_>>>()?;
+    anyhow::ensure!(
+        component.descriptor().functions.is_empty(),
+        "adapter component unexpectedly exports root functions"
+    );
+    let interfaces = &component.descriptor().interfaces;
+    anyhow::ensure!(
+        interfaces.len() == 1 && interfaces[0].name == expected_interface,
+        "adapter component exports an unexpected interface set"
+    );
+    let actual = interfaces[0]
+        .functions
+        .iter()
+        .map(|function| function.name.clone())
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        actual == expected,
+        "adapter component exports do not match the proposal: expected {expected:?}, got {actual:?}"
+    );
+    Ok(())
+}
+
+fn expected_adapter_export(item: &serde_json::Value) -> anyhow::Result<String> {
+    let mapping = item
+        .get("wit")
+        .context("selected adapter item omitted its WIT mapping")?;
+    let declaration = mapping
+        .get("declaration")
+        .and_then(serde_json::Value::as_str)
+        .context("selected adapter item omitted its WIT declaration")?;
+    let member = wit_declaration_name(declaration);
+    let owner = mapping
+        .get("owner_resource")
+        .and_then(serde_json::Value::as_str);
+    let wit_name = match (member, owner) {
+        ("constructor", Some(owner)) => format!("{owner}-new"),
+        (_, Some(owner)) => format!("{owner}-{member}"),
+        (_, None) => member.to_string(),
+    };
+    husk::normalize_wit_name(&wit_name).map_err(Into::into)
+}
+
+fn publish_adapter_build(
+    adapter: &Path,
+    expected_report: &[u8],
+    lockfile: &[u8],
+    component: &[u8],
+) -> anyhow::Result<()> {
+    let lock_path = adapter.join("Cargo.lock");
+    let wrote_lock = if lock_path.exists() {
+        let existing = fs::read(&lock_path)
+            .with_context(|| format!("read adapter lockfile `{}`", lock_path.display()))?;
+        anyhow::ensure!(
+            existing == lockfile,
+            "sandbox resolved a different Cargo.lock than `{}`",
+            lock_path.display()
+        );
+        false
+    } else {
+        write_new_file(&lock_path, lockfile)?;
+        true
+    };
+    let report_path = adapter.join("husk-adapter.json");
+    let original_report = fs::read(&report_path)
+        .with_context(|| format!("read adapter report `{}`", report_path.display()))?;
+    anyhow::ensure!(
+        original_report == expected_report,
+        "adapter report changed during the sandboxed build"
+    );
+    let mut report: serde_json::Value = serde_json::from_slice(&original_report)
+        .context("parse adapter report for build update")?;
+    let report_object = report
+        .as_object_mut()
+        .context("adapter report root is not an object")?;
+    report_object.insert(
+        "build_status".to_string(),
+        serde_json::Value::String("verified".to_string()),
+    );
+    report_object.insert(
+        "build_target".to_string(),
+        serde_json::Value::String("wasm32-unknown-unknown".to_string()),
+    );
+    report_object.insert(
+        "artifact".to_string(),
+        serde_json::Value::String("component.wasm".to_string()),
+    );
+    let updated_report = serde_json::to_vec_pretty(&report).context("serialize build report")?;
+    replace_file(&report_path, &[updated_report.as_slice(), b"\n"].concat())?;
+    if let Err(error) = write_new_file(&adapter.join("component.wasm"), component) {
+        replace_file(&report_path, &original_report).ok();
+        if wrote_lock {
+            fs::remove_file(&lock_path).ok();
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn replace_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create replacement for `{}`", path.display()))?;
+    temporary
+        .write_all(contents)
+        .with_context(|| format!("write replacement for `{}`", path.display()))?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("replace `{}`", path.display()))?;
+    Ok(())
 }
 
 fn write_new_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
@@ -700,6 +859,40 @@ fn execute_crate(command: CrateCommand) -> anyhow::Result<ExitCode> {
             let report = inspect_crate(request.into())?;
             write_adapter_package(&report, &includes, &output)?;
             println!("generated adapter source at {}", output.display());
+            Ok(ExitCode::SUCCESS)
+        }
+        CrateCommand::BuildAdapter {
+            adapter,
+            allow_network,
+            timeout_seconds,
+            max_output_bytes,
+        } => {
+            anyhow::ensure!(timeout_seconds > 0, "timeout must be greater than zero");
+            anyhow::ensure!(
+                max_output_bytes > 0,
+                "output limit must be greater than zero"
+            );
+            let component_path = adapter.join("component.wasm");
+            anyhow::ensure!(
+                !component_path.exists(),
+                "adapter component `{}` already exists",
+                component_path.display()
+            );
+            let output = adapter_build::build(
+                &adapter,
+                &adapter_build::BuildOptions {
+                    allow_network,
+                    timeout: Duration::from_secs(timeout_seconds),
+                    max_output_bytes,
+                },
+            )?;
+            let component = componentize_core_bytes(&output.core_module)?;
+            verify_adapter_component(&output.report, &component)?;
+            publish_adapter_build(&adapter, &output.report, &output.lockfile, &component)?;
+            println!(
+                "built and verified adapter component at {}",
+                component_path.display()
+            );
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -2917,6 +3110,32 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+
+    #[test]
+    fn derives_exact_component_exports_from_selected_wit_items() {
+        let constructor = serde_json::json!({
+            "wit": {
+                "owner_resource": "regex",
+                "declaration": "constructor(pattern: string) -> result<regex, error>;"
+            }
+        });
+        let method = serde_json::json!({
+            "wit": {
+                "owner_resource": "regex",
+                "declaration": "is-match: func(input: string) -> bool;"
+            }
+        });
+        let function = serde_json::json!({
+            "wit": {
+                "owner_resource": null,
+                "declaration": "escape: func(pattern: string) -> string;"
+            }
+        });
+
+        assert_eq!(expected_adapter_export(&constructor).unwrap(), "regex_new");
+        assert_eq!(expected_adapter_export(&method).unwrap(), "regex_is_match");
+        assert_eq!(expected_adapter_export(&function).unwrap(), "escape");
+    }
 
     #[test]
     fn repl_runs_multiline_definitions_and_preserves_locals() {

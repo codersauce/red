@@ -145,8 +145,9 @@ time/output/resources, minimal environment inheritance, and no network unless
 explicitly authorized. Componentize it on the trusted host, then verify exports
 and actual capability imports.
 
-Status: host-side componentization and verification implemented; the isolated
-Cargo runner is next.
+Status: initial macOS build sandbox, host-side componentization, and exact
+export/capability verification implemented. Explicit memory and process-count
+limits are still required before installation is enabled.
 
 `wasm32-wasip2` was rejected for the default path after a real `regex` build
 introduced ambient WASI CLI, I/O, environment, process, and random imports.
@@ -162,6 +163,21 @@ red husk extension componentize \
 Componentization rejects oversized or invalid inputs, refuses to overwrite its
 output, validates the encoded component, checks every export through Husk's
 runtime descriptor, and rejects all capability imports.
+
+Generated adapter source can now be built explicitly:
+
+```shell
+red husk crate build-adapter ./regex-adapter
+```
+
+This dedicated command is offline by default. Dependency resolution may use the
+network only with `--allow-network`; compilation is always offline and
+network-denied. The build runs against a copied source tree with a minimal
+environment, bounded time and output, read-only toolchain and registry access,
+and writes confined to a disposable directory. Only the lockfile, verified
+`component.wasm`, and verified build status are published back. The first
+sandbox backend is macOS; other operating systems fail closed until their
+backends are implemented.
 
 ### 7. Implement `husk add`
 
@@ -195,7 +211,6 @@ unsupported native code or capabilities fail with an explicit report.
 
 ## Next milestone
 
-Compile a generated adapter to a `wasm32-unknown-unknown` core module inside a
-constrained Cargo sandbox. The existing trusted componentization step must then
-verify that its exports match the proposal and that it imports no capabilities.
-Ordinary Husk commands must still never invoke Cargo.
+Add explicit memory and process-count limits plus equivalent fail-closed build
+sandbox backends for Linux and Windows, then connect the verified artifact to
+transactional `husk add`. Ordinary Husk commands must still never invoke Cargo.

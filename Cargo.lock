@@ -1151,6 +1151,7 @@ dependencies = [
  "flate2",
  "husk",
  "husk-extension",
+ "nix",
  "reqwest",
  "semver",
  "serde",
