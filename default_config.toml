@@ -128,6 +128,38 @@ waiting = "steady_underscore"
 # language_id = "javascript"
 # file_extensions = ["js", "mjs", "cjs"]
 
+# Comment templates use Neovim's commentstring format. The single %s is
+# replaced with each selected line. Add or override languages and extensions
+# here without installing or starting a language server.
+[commenting.languages]
+bash = "# %s"
+c = "// %s"
+cc = "// %s"
+cpp = "// %s"
+css = "/* %s */"
+cxx = "// %s"
+go = "// %s"
+h = "// %s"
+hpp = "// %s"
+html = "<!-- %s -->"
+husk = "// %s"
+java = "// %s"
+javascript = "// %s"
+jsonc = "// %s"
+jsx = "// %s"
+lua = "-- %s"
+markdown = "<!-- %s -->"
+powershell = "# %s"
+python = "# %s"
+rust = "// %s"
+scss = "/* %s */"
+sql = "-- %s"
+toml = "# %s"
+tsx = "// %s"
+typescript = "// %s"
+xml = "<!-- %s -->"
+yaml = "# %s"
+
 [keys.insert]
 Enter = "InsertNewLine"
 Backspace = "DeletePreviousChar"
@@ -145,7 +177,7 @@ Esc = { EnterMode = "Normal" }
 "o" = [ { EnterMode = "Insert" }, "InsertLineBelowCursor" ]
 "O" = [ { EnterMode = "Insert" }, "InsertLineAtCursor" ]
 "G" = "MoveToBottom"
-"g" = { "g" = "MoveToTop", "%" = "MatchitBackward", "d" = "GoToDefinition", "j" = "MoveScreenLineDown", "k" = "MoveScreenLineUp", "0" = "MoveToScreenLineStart", "^" = "MoveToScreenLineFirstNonBlank", "$" = "MoveToScreenLineEnd", "e" = "MoveToPreviousWordEnd", "E" = "MoveToPreviousBigWordEnd", "J" = { JoinLinesKeepSpaces = 2 }, "u" = { StartLowercaseOperator = 1 }, "U" = { StartUppercaseOperator = 1 }, "~" = { StartToggleCaseOperator = 1 }, "-" = "SelectPreviousUndoBranch", "+" = "SelectNextUndoBranch" }
+"g" = { "g" = "MoveToTop", "%" = "MatchitBackward", "c" = { StartCommentOperator = 1 }, "d" = "GoToDefinition", "j" = "MoveScreenLineDown", "k" = "MoveScreenLineUp", "0" = "MoveToScreenLineStart", "^" = "MoveToScreenLineFirstNonBlank", "$" = "MoveToScreenLineEnd", "e" = "MoveToPreviousWordEnd", "E" = "MoveToPreviousBigWordEnd", "J" = { JoinLinesKeepSpaces = 2 }, "u" = { StartLowercaseOperator = 1 }, "U" = { StartUppercaseOperator = 1 }, "~" = { StartToggleCaseOperator = 1 }, "-" = "SelectPreviousUndoBranch", "+" = "SelectNextUndoBranch" }
 "u" = "Undo"
 "U" = "Redo"
 "Ctrl-r" = "Redo"
@@ -297,7 +329,7 @@ Esc = { EnterMode = "Normal" }
 "P" = [ "PasteBefore", { EnterMode = "Normal" } ]
 "I" = "InsertBlock"
 "J" = [ { JoinLines = 2 }, { EnterMode = "Normal" } ]
-"g" = { "J" = [ { JoinLinesKeepSpaces = 2 }, { EnterMode = "Normal" } ] }
+"g" = { "c" = [ "ToggleCommentSelection", { EnterMode = "Normal" } ], "J" = [ { JoinLinesKeepSpaces = 2 }, { EnterMode = "Normal" } ] }
 "u" = [ { TransformSelection = "Lower" }, { EnterMode = "Normal" } ]
 "U" = [ { TransformSelection = "Upper" }, { EnterMode = "Normal" } ]
 "~" = [ { TransformSelection = "Toggle" }, { EnterMode = "Normal" } ]

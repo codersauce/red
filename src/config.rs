@@ -209,6 +209,9 @@ pub struct Config {
     /// Language-server routing and behavior.
     #[serde(default)]
     pub lsp: LspConfig,
+    /// Language-specific templates used by Vim-style line commenting.
+    #[serde(default)]
+    pub commenting: CommentingConfig,
     /// Matching-token navigation.
     #[serde(default)]
     pub matchit: MatchitConfig,
@@ -350,6 +353,58 @@ impl Default for ClipboardConfig {
             sync_on_paste: true,
         }
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+/// Language-specific comment templates keyed by canonical language or extension.
+pub struct CommentingConfig {
+    /// Templates containing one placeholder for the original line contents.
+    #[serde(default = "default_comment_templates")]
+    pub languages: HashMap<String, String>,
+}
+
+impl Default for CommentingConfig {
+    fn default() -> Self {
+        Self {
+            languages: default_comment_templates(),
+        }
+    }
+}
+
+fn default_comment_templates() -> HashMap<String, String> {
+    [
+        ("bash", "# %s"),
+        ("c", "// %s"),
+        ("cc", "// %s"),
+        ("cpp", "// %s"),
+        ("css", "/* %s */"),
+        ("cxx", "// %s"),
+        ("go", "// %s"),
+        ("h", "// %s"),
+        ("hpp", "// %s"),
+        ("html", "<!-- %s -->"),
+        ("husk", "// %s"),
+        ("java", "// %s"),
+        ("javascript", "// %s"),
+        ("jsonc", "// %s"),
+        ("jsx", "// %s"),
+        ("lua", "-- %s"),
+        ("markdown", "<!-- %s -->"),
+        ("powershell", "# %s"),
+        ("python", "# %s"),
+        ("rust", "// %s"),
+        ("scss", "/* %s */"),
+        ("sql", "-- %s"),
+        ("toml", "# %s"),
+        ("tsx", "// %s"),
+        ("typescript", "// %s"),
+        ("xml", "<!-- %s -->"),
+        ("yaml", "# %s"),
+    ]
+    .into_iter()
+    .map(|(language, template)| (language.to_string(), template.to_string()))
+    .collect()
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -1138,6 +1193,7 @@ fn known_top_level_field(field: &str) -> bool {
             | "key_hints"
             | "clipboard"
             | "lsp"
+            | "commenting"
             | "matchit"
             | "disable_ai"
             | "agent"
@@ -1299,6 +1355,7 @@ fn known_schema_path(path: &[String]) -> bool {
         ["lsp", "servers", _, "env", _] | ["lsp", "servers", _, "initialization_options", ..] => {
             true
         }
+        ["commenting", "languages"] | ["commenting", "languages", _] => true,
         ["matchit", field] => matches!(*field, "enabled" | "pairs" | "languages"),
         ["matchit", "languages", _] | ["matchit", "languages", _, "groups"] => true,
         _ => false,
@@ -1741,6 +1798,7 @@ fn render_path(path: &[String]) -> String {
             Some("keys") => index >= 2,
             Some("plugins" | "plugin_permissions" | "plugin_config") => index >= 1,
             Some("lsp") if path.get(1).is_some_and(|part| part == "servers") => index >= 2,
+            Some("commenting") if path.get(1).is_some_and(|part| part == "languages") => index >= 2,
             Some("matchit") if path.get(1).is_some_and(|part| part == "languages") => index >= 2,
             _ => false,
         };
@@ -2496,6 +2554,84 @@ input_position = "left"
             g.get("%"),
             Some(&KeyAction::Single(Action::MatchitBackward))
         );
+    }
+
+    #[test]
+    fn default_config_maps_normal_and_visual_comment_operators() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+
+        let Some(KeyAction::Nested(normal_g)) = config.keys.normal.get("g") else {
+            panic!("default config should map normal g to nested actions");
+        };
+        assert_eq!(
+            normal_g.get("c"),
+            Some(&KeyAction::Single(Action::StartCommentOperator(1)))
+        );
+
+        let Some(KeyAction::Nested(visual_g)) = config.keys.visual.get("g") else {
+            panic!("default config should map visual g to nested actions");
+        };
+        assert_eq!(
+            visual_g.get("c"),
+            Some(&KeyAction::Multiple(vec![
+                Action::ToggleCommentSelection,
+                Action::EnterMode(Mode::Normal),
+            ]))
+        );
+    }
+
+    #[test]
+    fn comment_configuration_defaults_cover_line_and_wrapping_comments() {
+        let config = Config::default();
+
+        assert_eq!(config.commenting.languages["rust"], "// %s");
+        assert_eq!(config.commenting.languages["python"], "# %s");
+        assert_eq!(config.commenting.languages["lua"], "-- %s");
+        assert_eq!(config.commenting.languages["html"], "<!-- %s -->");
+        assert_eq!(config.commenting.languages["css"], "/* %s */");
+        assert!(!config.commenting.languages.contains_key("json"));
+    }
+
+    #[test]
+    fn user_comment_templates_merge_without_discarding_language_defaults() {
+        let loaded = Config::load_user_toml(
+            "[commenting.languages]\nrust = \"/* %s */\"\ncustom = \"; %s\"\n",
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(loaded.config.commenting.languages["rust"], "/* %s */");
+        assert_eq!(loaded.config.commenting.languages["custom"], "; %s");
+        assert_eq!(loaded.config.commenting.languages["python"], "# %s");
+    }
+
+    #[test]
+    fn invalid_comment_template_type_recovers_independently() {
+        let loaded = Config::load_user_toml(
+            "[commenting.languages]\nrust = 42\npython = \"## %s\"\n",
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(loaded.config.commenting.languages["rust"], "// %s");
+        assert_eq!(loaded.config.commenting.languages["python"], "## %s");
+        assert!(loaded.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "CFG102" && diagnostic.path == r#"commenting.languages["rust"]"#
+        }));
+    }
+
+    #[test]
+    fn strict_overrides_accept_comment_template_paths() {
+        let loaded = Config::load_user_toml(
+            "",
+            Path::new("/tmp/config.toml"),
+            &["commenting.languages.rust = \"/* %s */\"".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(loaded.config.commenting.languages["rust"], "/* %s */");
     }
 
     #[test]

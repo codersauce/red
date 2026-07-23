@@ -24,6 +24,7 @@ pub mod codex;
 pub mod color;
 pub mod command;
 pub mod command_palette;
+mod comment;
 pub mod config;
 pub mod dispatcher;
 pub mod editor;

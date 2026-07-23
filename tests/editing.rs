@@ -288,6 +288,274 @@ fn default_key_config() -> Config {
     toml::from_str(include_str!("../default_config.toml")).unwrap()
 }
 
+fn comment_harness(file: &str, contents: &str) -> EditorHarness {
+    let buffer = Buffer::new(Some(file.to_string()), contents.to_string());
+    EditorHarness::with_config(buffer, default_key_config())
+}
+
+#[tokio::test]
+async fn comment_gcc_toggles_the_current_line() {
+    let mut harness = comment_harness("main.rs", "    let value = 1;");
+
+    type_normal_keys(&mut harness, "gcc").await;
+    harness.assert_buffer_contents("    // let value = 1;");
+
+    type_normal_keys(&mut harness, "gcc").await;
+    harness.assert_buffer_contents("    let value = 1;");
+}
+
+#[tokio::test]
+async fn comment_gcc_honors_a_line_count() {
+    let mut harness = comment_harness("main.rs", "alpha\nbeta\ngamma\ndelta");
+
+    type_normal_keys(&mut harness, "3gcc").await;
+
+    harness.assert_buffer_contents("// alpha\n// beta\n// gamma\ndelta");
+}
+
+#[tokio::test]
+async fn comment_operator_covers_vertical_motions() {
+    let mut harness = comment_harness("main.rs", "alpha\nbeta\ngamma");
+
+    type_normal_keys(&mut harness, "gcj").await;
+
+    harness.assert_buffer_contents("// alpha\n// beta\ngamma");
+}
+
+#[tokio::test]
+async fn comment_operator_honors_a_motion_count() {
+    let mut harness = comment_harness("main.rs", "alpha\nbeta\ngamma\ndelta");
+
+    type_normal_keys(&mut harness, "gc2j").await;
+
+    harness.assert_buffer_contents("// alpha\n// beta\n// gamma\ndelta");
+}
+
+#[tokio::test]
+async fn comment_operator_covers_a_word_text_object_linewise() {
+    let mut harness = comment_harness("main.rs", "alpha beta\ngamma");
+
+    type_normal_keys(&mut harness, "gciw").await;
+
+    harness.assert_buffer_contents("// alpha beta\ngamma");
+}
+
+#[tokio::test]
+async fn comment_range_aligns_at_the_least_indented_nonblank_line() {
+    let mut harness = comment_harness("main.rs", "    alpha\n      beta\n\n    gamma");
+
+    type_normal_keys(&mut harness, "4gcc").await;
+
+    harness.assert_buffer_contents("    // alpha\n    //   beta\n    //\n    // gamma");
+}
+
+#[tokio::test]
+async fn comment_range_uncomments_only_when_every_nonblank_line_is_commented() {
+    let mut harness = comment_harness("main.rs", "    // alpha\n    // beta");
+
+    type_normal_keys(&mut harness, "2gcc").await;
+
+    harness.assert_buffer_contents("    alpha\n    beta");
+}
+
+#[tokio::test]
+async fn comment_range_comments_mixed_comment_states_together() {
+    let mut harness = comment_harness("main.rs", "    // alpha\n    beta");
+
+    type_normal_keys(&mut harness, "2gcc").await;
+
+    harness.assert_buffer_contents("    // // alpha\n    // beta");
+}
+
+#[tokio::test]
+async fn comment_characterwise_visual_selection_toggles_whole_lines() {
+    let mut harness = comment_harness("main.rs", "alpha\n  beta\ngamma");
+
+    type_normal_keys(&mut harness, "vjgc").await;
+
+    harness.assert_buffer_contents("// alpha\n//   beta\ngamma");
+    harness.assert_mode(Mode::Normal);
+}
+
+#[tokio::test]
+async fn comment_linewise_visual_selection_toggles_whole_lines() {
+    let mut harness = comment_harness("main.rs", "alpha\n  beta\ngamma");
+
+    type_normal_keys(&mut harness, "Vjgc").await;
+
+    harness.assert_buffer_contents("// alpha\n//   beta\ngamma");
+    harness.assert_mode(Mode::Normal);
+}
+
+#[tokio::test]
+async fn comment_blockwise_visual_selection_toggles_whole_lines() {
+    let mut harness = comment_harness("main.rs", "alpha\n  beta\ngamma");
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "jgc").await;
+
+    harness.assert_buffer_contents("// alpha\n//   beta\ngamma");
+    harness.assert_mode(Mode::Normal);
+}
+
+#[tokio::test]
+async fn comment_templates_follow_the_active_language() {
+    for (file, contents, commented) in [
+        ("main.py", "    value = 1", "    # value = 1"),
+        ("main.lua", "    local value = 1", "    -- local value = 1"),
+        (
+            "index.html",
+            "    <div>hello</div>",
+            "    <!-- <div>hello</div> -->",
+        ),
+        ("site.css", "    color: red;", "    /* color: red; */"),
+        ("plugin.hk", "    let value = 1;", "    // let value = 1;"),
+    ] {
+        let mut harness = comment_harness(file, contents);
+
+        type_normal_keys(&mut harness, "gcc").await;
+        harness.assert_buffer_contents(commented);
+
+        type_normal_keys(&mut harness, "gcc").await;
+        harness.assert_buffer_contents(contents);
+    }
+}
+
+#[tokio::test]
+async fn comment_configuration_supports_language_overrides() {
+    let mut config = default_key_config();
+    config
+        .commenting
+        .languages
+        .insert("rust".to_string(), "/* %s */".to_string());
+    let buffer = Buffer::new(Some("main.rs".to_string()), "alpha".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "gcc").await;
+
+    harness.assert_buffer_contents("/* alpha */");
+}
+
+#[tokio::test]
+async fn comment_configuration_prefers_extension_specific_overrides() {
+    let mut config = default_key_config();
+    config
+        .commenting
+        .languages
+        .insert("rs".to_string(), "/* %s */".to_string());
+    let buffer = Buffer::new(Some("main.rs".to_string()), "alpha".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "gcc").await;
+
+    harness.assert_buffer_contents("/* alpha */");
+}
+
+#[tokio::test]
+async fn comment_operation_is_one_undoable_and_redoable_transaction() {
+    let mut harness = comment_harness("main.rs", "alpha\nbeta\ngamma");
+
+    type_normal_keys(&mut harness, "3gcc").await;
+    harness.assert_buffer_contents("// alpha\n// beta\n// gamma");
+
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents("alpha\nbeta\ngamma");
+
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("// alpha\n// beta\n// gamma");
+}
+
+#[tokio::test]
+async fn comment_gcc_is_repeatable_at_the_current_cursor() {
+    let mut harness = comment_harness("main.rs", "alpha\nbeta\ngamma");
+
+    type_normal_keys(&mut harness, "gccj.").await;
+
+    harness.assert_buffer_contents("// alpha\n// beta\ngamma");
+}
+
+#[tokio::test]
+async fn comment_text_object_uncomments_the_contiguous_comment_block() {
+    let mut harness = comment_harness("main.rs", "// alpha\n// beta\ngamma");
+
+    type_normal_keys(&mut harness, "gcgc").await;
+
+    harness.assert_buffer_contents("alpha\nbeta\ngamma");
+}
+
+#[tokio::test]
+async fn comment_text_object_can_be_deleted() {
+    let mut harness = comment_harness("main.rs", "// alpha\n// beta\ngamma");
+
+    type_normal_keys(&mut harness, "dgc").await;
+
+    harness.assert_buffer_contents("gamma");
+}
+
+#[tokio::test]
+async fn comment_operation_preserves_windows_line_endings() {
+    let mut harness = comment_harness("main.rs", "alpha\r\nbeta\r\n");
+
+    type_normal_keys(&mut harness, "2gcc").await;
+
+    harness.assert_buffer_contents("// alpha\r\n// beta\r\n");
+}
+
+#[tokio::test]
+async fn comment_unknown_language_leaves_the_buffer_unchanged() {
+    let mut harness = comment_harness("data.json", "{\"value\": 1}");
+
+    type_normal_keys(&mut harness, "gcc").await;
+
+    harness.assert_buffer_contents("{\"value\": 1}");
+    assert_eq!(
+        harness.last_error(),
+        Some("no comment syntax configured for json")
+    );
+    assert!(!harness.is_dirty());
+}
+
+#[tokio::test]
+async fn comment_unnamed_buffer_fails_without_changing_the_buffer() {
+    let buffer = Buffer::new(None, "alpha".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "gcc").await;
+
+    harness.assert_buffer_contents("alpha");
+    assert_eq!(
+        harness.last_error(),
+        Some("no comment syntax configured for unnamed buffer")
+    );
+    assert!(!harness.is_dirty());
+}
+
+#[tokio::test]
+async fn comment_invalid_template_fails_without_changing_the_buffer() {
+    let mut config = default_key_config();
+    config
+        .commenting
+        .languages
+        .insert("rust".to_string(), "// missing placeholder".to_string());
+    let buffer = Buffer::new(Some("main.rs".to_string()), "alpha".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "gcc").await;
+
+    harness.assert_buffer_contents("alpha");
+    assert_eq!(
+        harness.last_error(),
+        Some("invalid comment syntax configured for rust: expected exactly one %s placeholder")
+    );
+    assert!(!harness.is_dirty());
+}
+
 #[tokio::test]
 async fn dot_repeats_a_direct_change_at_the_current_cursor() {
     let buffer = Buffer::new(None, "abc\ndef".to_string());
