@@ -78,6 +78,9 @@ pub(crate) fn install(
             "vendored extension `{name}` declares package `{}`",
             source.manifest().name
         );
+        if let Some(expected) = &locked.report_sha256 {
+            verify_adapter_report(&artifact, name, expected)?;
+        }
         let destination = staged_extensions.join(format!("{}.huskext", locked.sha256));
         copy_adapter_bundle(&artifact, &destination)?;
         let installed = ExtensionBundle::open(&destination, BundleLimits::default())
@@ -86,11 +89,42 @@ pub(crate) fn install(
             installed.digest().to_string() == locked.sha256,
             "staged extension `{name}` changed during installation"
         );
+        if let Some(expected) = &locked.report_sha256 {
+            verify_adapter_report(&destination, name, expected)?;
+        }
         extension_count += 1;
     }
 
     publish_extensions(root, manifest_path, &staged_extensions)?;
     Ok(InstallOutput { extension_count })
+}
+
+fn verify_adapter_report(bundle: &Path, name: &str, expected: &str) -> anyhow::Result<()> {
+    const MAX_ADAPTER_REPORT_BYTES: u64 = 16 * 1024 * 1024;
+
+    let report_path = bundle.join("husk-adapter.json");
+    let metadata = fs::symlink_metadata(&report_path)
+        .with_context(|| format!("inspect extension `{name}` adapter selection report"))?;
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "extension `{name}` adapter selection report is not a regular file"
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_ADAPTER_REPORT_BYTES,
+        "extension `{name}` adapter selection report exceeds the 16 MiB install limit"
+    );
+    let report = fs::read(&report_path)
+        .with_context(|| format!("read extension `{name}` adapter selection report"))?;
+    anyhow::ensure!(
+        report.len() as u64 <= MAX_ADAPTER_REPORT_BYTES,
+        "extension `{name}` adapter selection report exceeds the 16 MiB install limit"
+    );
+    let actual = crate::adapter_install::hex_digest(&report);
+    anyhow::ensure!(
+        actual == expected,
+        "extension `{name}` adapter selection report has digest {actual}, expected {expected}"
+    );
+    Ok(())
 }
 
 fn publish_extensions(

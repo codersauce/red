@@ -76,6 +76,23 @@ fn package_compiles_once_and_dispatches_across_relative_and_absolute_modules() {
 }
 
 #[test]
+fn grouped_source_module_imports_resolve_and_dispatch_each_function() {
+    let directory = write_package(
+        "mod util;\nuse crate::util::{answer, offset};\nfn main() -> i32 { answer() + offset() }",
+        &[(
+            "util.hk",
+            "pub fn answer() -> i32 { 40 }\npub fn offset() -> i32 { 2 }",
+        )],
+    );
+    let package = resolve(directory.path());
+    let engine = Engine::<()>::builder().build().unwrap();
+    let compiled = engine.compile_package(&package).unwrap();
+    let mut instance = engine.instantiate(compiled, ()).unwrap();
+
+    assert_eq!(instance.call("main", &[]).unwrap(), OwnedValue::I64(42));
+}
+
+#[test]
 fn private_functions_do_not_cross_source_module_boundaries() {
     let directory = write_package(
         "mod util;\nfn main() -> i32 { util::secret() }",

@@ -155,7 +155,30 @@ const MATH_COMPONENT: &str = r#"
             (canon lift (core func $i "add"))))
 "#;
 
+const SAME_NAMED_MATH_COMPONENT: &str = r#"
+    (component
+        (core module $m
+            (func (export "add") (param i32 i32) (result i32)
+                local.get 0 local.get 1 i32.add))
+        (core instance $i (instantiate $m))
+        (func $add
+            (param "left" s32)
+            (param "right" s32)
+            (result s32)
+            (canon lift (core func $i "add")))
+        (instance $math
+            (export "add" (func $add)))
+        (export "example:math/math@1.0.0" (instance $math)))
+"#;
+
 fn write_extension_source(directory: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+    write_extension_source_with_component(directory, MATH_COMPONENT)
+}
+
+fn write_extension_source_with_component(
+    directory: &TempDir,
+    component_source: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
     let manifest = directory.path().join("math.toml");
     let component = directory.path().join("math.wasm");
     fs::write(
@@ -174,7 +197,7 @@ fn write_extension_source(directory: &TempDir) -> (std::path::PathBuf, std::path
         "#,
     )
     .unwrap();
-    fs::write(&component, MATH_COMPONENT).unwrap();
+    fs::write(&component, component_source).unwrap();
     (manifest, component)
 }
 
@@ -217,6 +240,63 @@ fn extension_pack_inspect_and_run_work_end_to_end() {
         .output()
         .unwrap();
     assert_eq!(run.status.code(), Some(42), "{run:?}");
+}
+
+#[test]
+fn extension_inspection_and_execution_flatten_same_named_interfaces() {
+    let directory = TempDir::new().unwrap();
+    let (manifest, component) =
+        write_extension_source_with_component(&directory, SAME_NAMED_MATH_COMPONENT);
+    let bundle = directory.path().join("math.huskext");
+    let pack = Command::new(env!("CARGO_BIN_EXE_husk"))
+        .args(["extension", "pack", "--manifest"])
+        .arg(&manifest)
+        .arg("--component")
+        .arg(&component)
+        .arg("--output")
+        .arg(&bundle)
+        .output()
+        .unwrap();
+    assert!(pack.status.success(), "{pack:?}");
+
+    let inspect = Command::new(env!("CARGO_BIN_EXE_husk"))
+        .args(["extension", "inspect"])
+        .arg(&bundle)
+        .output()
+        .unwrap();
+    assert!(inspect.status.success(), "{inspect:?}");
+    let stdout = String::from_utf8(inspect.stdout).unwrap();
+    assert!(stdout.lines().any(|line| line == "export: math::add"));
+    assert!(!stdout.lines().any(|line| line == "export: math::math::add"));
+
+    let script = directory.path().join("script.hk");
+    fs::write(
+        &script,
+        "use math::{add};\nfn main() -> i32 { add(20, 22) }",
+    )
+    .unwrap();
+    let run = Command::new(env!("CARGO_BIN_EXE_husk"))
+        .arg("run")
+        .arg("--extension")
+        .arg(&bundle)
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert_eq!(run.status.code(), Some(42), "{run:?}");
+
+    fs::write(
+        &script,
+        "use math::math::add;\nfn main() -> i32 { add(20, 22) }",
+    )
+    .unwrap();
+    let duplicated = Command::new(env!("CARGO_BIN_EXE_husk"))
+        .arg("run")
+        .arg("--extension")
+        .arg(&bundle)
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(!duplicated.status.success(), "{duplicated:?}");
 }
 
 fn write_package(directory: &TempDir) {

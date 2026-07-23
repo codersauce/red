@@ -1,5 +1,6 @@
 mod adapter_build;
 mod adapter_install;
+mod generic_specialization;
 mod package_install;
 mod package_new;
 
@@ -16,6 +17,7 @@ use std::{
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
+use generic_specialization::GenericSpecialization;
 use husk::{
     CallContext, CompiledModule, Engine, MainArguments, MainResult, NativeError, NativeModule,
     OwnedValue, PackageLimits, ReplOutcome, ResolvedPackage, TestExpectation, Version,
@@ -224,6 +226,9 @@ struct CrateRequest {
     /// Cargo features to enable.
     #[arg(long, value_delimiter = ',')]
     features: Vec<String>,
+    /// Instantiate a public generic Rust function with concrete types.
+    #[arg(long = "specialize", value_name = "FUNCTION<T>")]
+    specializations: Vec<String>,
     /// Disable the crate's default feature set.
     #[arg(long)]
     no_default_features: bool,
@@ -579,10 +584,14 @@ fn execute_extension(command: ExtensionCommand) -> anyhow::Result<ExitCode> {
             }
             for interface in &descriptor.interfaces {
                 for function in &interface.functions {
-                    println!(
-                        "export: {}::{}::{}",
-                        descriptor.name, interface.name, function.name
-                    );
+                    if interface.name == descriptor.name.as_str() {
+                        println!("export: {}::{}", descriptor.name, function.name);
+                    } else {
+                        println!(
+                            "export: {}::{}::{}",
+                            descriptor.name, interface.name, function.name
+                        );
+                    }
                 }
             }
             Ok(ExitCode::SUCCESS)
@@ -882,6 +891,10 @@ struct CrateInspection {
     blockers: Vec<String>,
     warnings: Vec<String>,
     next_step: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    specialization_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    specializations: Vec<String>,
     public_api: PublicApiInspection,
 }
 
@@ -893,6 +906,7 @@ struct PublicApiInspection {
     unavailable_reason: Option<String>,
     resources: Vec<String>,
     compatible_items: usize,
+    specializable_items: usize,
     incompatible_items: usize,
     items: Vec<ApiItemInspection>,
 }
@@ -904,6 +918,8 @@ struct ApiItemInspection {
     signature: String,
     compatibility: &'static str,
     reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    specialization: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     wit: Option<WitCallableInspection>,
 }
@@ -957,14 +973,23 @@ fn execute_add(
     let mut include = includes.to_vec();
     include.sort();
     include.dedup();
+    let report = inspect_crate(CrateInspectOptions {
+        crate_name: request.crate_name.clone(),
+        version: request.version.clone(),
+        features: request.features.clone(),
+        specializations: request.specializations.clone(),
+        no_default_features: request.no_default_features,
+        path: request.path.clone(),
+        offline,
+    })?;
     let source = husk::CrateExtensionSource {
         package: request.crate_name.clone(),
         version: request.version.clone().unwrap_or_else(|| "*".to_string()),
         features,
         default_features: !request.no_default_features,
         include,
+        specializations: report.specializations.clone(),
     };
-    let report = inspect_crate(request.into())?;
     let generated = tempfile::tempdir().context("create temporary adapter workspace")?;
     let adapter = generated.path().join("adapter");
     write_adapter_package(&report, includes, &adapter)?;
@@ -1143,6 +1168,7 @@ struct CrateInspectOptions {
     crate_name: String,
     version: Option<String>,
     features: Vec<String>,
+    specializations: Vec<String>,
     no_default_features: bool,
     path: Option<PathBuf>,
     offline: bool,
@@ -1154,6 +1180,7 @@ impl From<CrateRequest> for CrateInspectOptions {
             crate_name: request.crate_name,
             version: request.version,
             features: request.features,
+            specializations: request.specializations,
             no_default_features: request.no_default_features,
             path: request.path,
             offline: request.offline,
@@ -1293,10 +1320,21 @@ fn inspect_crate(options: CrateInspectOptions) -> anyhow::Result<CrateInspection
             "the crate links native library `{links}`; portable wasm compatibility is unproven"
         ));
     }
-    let public_api = inspect_public_api(package, options.offline, options.path.is_some());
+    let mut public_api = inspect_public_api(package, options.offline, options.path.is_some());
     if let Some(reason) = &public_api.unavailable_reason {
         warnings.push(format!("public API analysis is unavailable: {reason}"));
     }
+    let specializations = generic_specialization::select_specializations(
+        &package.name,
+        &package.version,
+        &options.specializations,
+    )?;
+    let specialization_profile = generic_specialization::apply_specializations(
+        &mut public_api,
+        &package.name,
+        &package.version,
+        &specializations,
+    )?;
     let api_analyzed = public_api.status == "available";
 
     Ok(CrateInspection {
@@ -1329,6 +1367,11 @@ fn inspect_crate(options: CrateInspectOptions) -> anyhow::Result<CrateInspection
         } else {
             "extract and classify the crate's public Rust API"
         },
+        specialization_profile,
+        specializations: specializations
+            .iter()
+            .map(GenericSpecialization::canonical)
+            .collect(),
         public_api,
     })
 }
@@ -1440,6 +1483,7 @@ fn unavailable_public_api(reason: &str) -> PublicApiInspection {
         unavailable_reason: Some(reason.to_string()),
         resources: Vec::new(),
         compatible_items: 0,
+        specializable_items: 0,
         incompatible_items: 0,
         items: Vec::new(),
     }
@@ -1576,7 +1620,11 @@ fn analyze_rustdoc_json(
         .iter()
         .filter(|item| item.compatibility == "compatible")
         .count();
-    let incompatible_items = items.len() - compatible_items;
+    let specializable_items = items
+        .iter()
+        .filter(|item| item.compatibility == "specializable")
+        .count();
+    let incompatible_items = items.len() - compatible_items - specializable_items;
 
     Ok(PublicApiInspection {
         status: "available",
@@ -1587,6 +1635,7 @@ fn analyze_rustdoc_json(
         unavailable_reason: None,
         resources: resources.into_iter().collect(),
         compatible_items,
+        specializable_items,
         incompatible_items,
         items,
     })
@@ -1848,12 +1897,17 @@ fn classify_callable(
         .and_then(serde_json::Value::as_array)
         .is_some_and(|params| !params.is_empty())
     {
-        return incompatible_api_item(
-            path,
+        return ApiItemInspection {
+            path: path.to_string(),
             kind,
             signature,
-            "generic or lifetime parameters are not supported",
-        );
+            compatibility: "specializable",
+            reason: Some(
+                "generic Rust API requires a concrete --specialize instantiation".to_string(),
+            ),
+            specialization: None,
+            wit: None,
+        };
     }
     for input in inputs {
         let Some(parts) = input.as_array() else {
@@ -1896,6 +1950,7 @@ fn classify_callable(
             signature,
             compatibility: "compatible",
             reason: None,
+            specialization: None,
             wit: Some(wit),
         },
         Err(reason) => incompatible_api_item(path, kind, signature, &reason),
@@ -1914,6 +1969,7 @@ fn incompatible_api_item(
         signature,
         compatibility: "incompatible",
         reason: Some(reason.to_string()),
+        specialization: None,
         wit: None,
     }
 }
@@ -2750,12 +2806,22 @@ fn print_crate_inspection(report: &CrateInspection) {
     for warning in &report.warnings {
         println!("warning: {warning}");
     }
+    if let Some(profile) = &report.specialization_profile {
+        println!("specialization-profile: {profile}");
+    }
+    for specialization in &report.specializations {
+        println!("specialization: {specialization}");
+    }
     println!("public-api: {}", report.public_api.status);
     if let Some(source) = &report.public_api.source {
         println!("public-api-source: {source}");
         println!(
             "compatible-api-items: {}",
             report.public_api.compatible_items
+        );
+        println!(
+            "specializable-api-items: {}",
+            report.public_api.specializable_items
         );
         println!(
             "incompatible-api-items: {}",
@@ -2913,10 +2979,12 @@ fn render_adapter_package(
             .items
             .iter()
             .filter(|item| {
-                item.wit
-                    .as_ref()
-                    .and_then(|mapping| mapping.adapter.as_ref())
-                    .is_some()
+                (report.specialization_profile.is_none() || item.specialization.is_some())
+                    && item
+                        .wit
+                        .as_ref()
+                        .and_then(|mapping| mapping.adapter.as_ref())
+                        .is_some()
             })
             .collect::<Vec<_>>();
         selected.sort_unstable_by(|left, right| left.path.cmp(&right.path));
@@ -3078,6 +3146,8 @@ fn render_adapter_package(
         "crate": report.name,
         "version": report.version,
         "features": report.enabled_features,
+        "specialization_profile": report.specialization_profile,
+        "specializations": report.specializations,
         "selection": if includes.is_empty() { "automatic" } else { "explicit" },
         "items": selected,
         "skipped": skipped,
@@ -3524,6 +3594,7 @@ mod tests {
             crate_name: "inspect-me".to_string(),
             version: None,
             features: Vec::new(),
+            specializations: Vec::new(),
             no_default_features: false,
             path: Some(crate_directory.path().to_path_buf()),
             offline: true,
@@ -3676,7 +3747,8 @@ mod tests {
             ["any_crate::OpenError", "any_crate::Widget"]
         );
         assert_eq!(report.compatible_items, 2);
-        assert_eq!(report.incompatible_items, 1);
+        assert_eq!(report.specializable_items, 1);
+        assert_eq!(report.incompatible_items, 0);
         assert!(report.items.iter().any(|item| {
             item.path == "any_crate::Widget::open"
                 && item.kind == "constructor"
@@ -3730,7 +3802,7 @@ world any-crate-adapter {
         assert!(
             error
                 .to_string()
-                .contains("generic or lifetime parameters are not supported"),
+                .contains("requires a concrete --specialize instantiation"),
             "{error:#}"
         );
 
@@ -3751,6 +3823,8 @@ world any-crate-adapter {
             blockers: Vec::new(),
             warnings: Vec::new(),
             next_step: "generate adapter",
+            specialization_profile: None,
+            specializations: Vec::new(),
             public_api: report,
         };
         let package = render_adapter_package(

@@ -73,6 +73,7 @@ pub(crate) fn install(
             version: identity.version.clone(),
             source: relative_bundle.clone(),
             sha256: digest.clone(),
+            report_sha256: Some(hex_digest(report)),
             crate_source: Some(LockedCrateExtension {
                 package: source.declaration.package.clone(),
                 version: identity.version.clone(),
@@ -80,6 +81,7 @@ pub(crate) fn install(
                 features: source.declaration.features.clone(),
                 default_features: source.declaration.default_features,
                 include: source.declaration.include.clone(),
+                specializations: source.declaration.specializations.clone(),
                 checksum: source.checksum.clone(),
             }),
             artifact: Some(vendored_bundle.clone()),
@@ -273,6 +275,15 @@ fn updated_manifest_source(
             .collect::<toml_edit::Array>();
         extension.insert("include", value(include));
     }
+    if !source.specializations.is_empty() {
+        let specializations = source
+            .specializations
+            .iter()
+            .cloned()
+            .map(toml_edit::Value::from)
+            .collect::<toml_edit::Array>();
+        extension.insert("specializations", value(specializations));
+    }
     extensions.insert(name, Item::Table(extension));
     Ok(document.to_string())
 }
@@ -426,7 +437,7 @@ fn package_lock_from_source(source: &str) -> anyhow::Result<PackageLock> {
     PackageLock::parse(source).context("parse Husk.lock")
 }
 
-fn hex_digest(component: &[u8]) -> String {
+pub(crate) fn hex_digest(component: &[u8]) -> String {
     let digest = Sha256::digest(component);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -473,6 +484,7 @@ mod tests {
                 features: vec!["fast".to_string()],
                 default_features: false,
                 include: vec!["sample_crate::run".to_string()],
+                specializations: vec!["sample_crate::run<sample_crate::Payload>".to_string()],
             },
             checksum: Some("crate-checksum".to_string()),
         }
@@ -500,6 +512,10 @@ mod tests {
         assert!(manifest.contains("[extensions.sample-crate]"), "{manifest}");
         assert!(manifest.contains("crate = \"sample-crate\""), "{manifest}");
         assert!(manifest.contains("version = \"^1.2\""), "{manifest}");
+        assert!(
+            manifest.contains("sample_crate::run<sample_crate::Payload>"),
+            "{manifest}"
+        );
         assert!(!manifest.contains(&installed.digest), "{manifest}");
         assert!(
             directory
@@ -511,6 +527,11 @@ mod tests {
         let lock = fs::read_to_string(directory.path().join("Husk.lock")).unwrap();
         assert!(lock.contains("[extensions.sample-crate]"), "{lock}");
         assert!(lock.contains(&installed.digest), "{lock}");
+        assert!(lock.contains("report_sha256"), "{lock}");
+        assert!(
+            lock.contains("sample_crate::run<sample_crate::Payload>"),
+            "{lock}"
+        );
         let package =
             ResolvedPackage::open(directory.path().join("Husk.toml"), PackageLimits::default())
                 .unwrap();
@@ -636,6 +657,45 @@ mod tests {
             .unwrap(),
             original_component
         );
+    }
+
+    #[test]
+    fn install_rejects_a_tampered_adapter_report_without_replacing_working_state() {
+        let directory = package();
+        let installed = install(
+            &directory.path().join("Husk.toml"),
+            &identity(),
+            b"verified component",
+            b"{\"selection\":\"automatic\"}\n",
+            &source(),
+            false,
+        )
+        .unwrap();
+        let installed_report_path = directory
+            .path()
+            .join(&installed.bundle)
+            .join("husk-adapter.json");
+        let original_report = fs::read(&installed_report_path).unwrap();
+        let vendored_report = directory
+            .path()
+            .join("vendor/husk")
+            .join(format!("{}.huskext/husk-adapter.json", installed.digest));
+        fs::write(vendored_report, b"{\"selection\":\"tampered\"}\n").unwrap();
+
+        let error = crate::package_install::install(
+            &directory.path().join("Husk.toml"),
+            &crate::package_install::InstallOptions {
+                locked: true,
+                offline: true,
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("adapter selection report"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read(installed_report_path).unwrap(), original_report);
     }
 
     #[test]
