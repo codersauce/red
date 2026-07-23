@@ -241,6 +241,75 @@ version = "*"
 under `vendor/husk/`, and installs it under `.husk/extensions/`. Commit the
 manifest, lock file, and vendored bundle; do not commit `.husk/`.
 
+Generic Rust functions are not component exports by themselves: Husk must
+instantiate them with concrete Rust types while building the adapter. For
+`serde_json` 1.x, Husk automatically selects a versioned `serde_json::Value`
+profile:
+
+```shell
+red husk new json-example
+cd json-example
+red husk add serde_json --features preserve_order
+```
+
+The generated adapter provides parsing, compact serialization, and pretty
+serialization. `preserve_order` stays enabled inside the WebAssembly guest, so
+JSON object keys retain their input order. The selected instantiations are
+recorded in `Husk.toml` and `Husk.lock`:
+
+```toml
+[extensions.serde_json]
+crate = "serde_json"
+version = "*"
+features = ["preserve_order"]
+specializations = [
+  "serde_json::from_str<serde_json::Value>",
+  "serde_json::to_string<serde_json::Value>",
+  "serde_json::to_string_pretty<serde_json::Value>",
+]
+```
+
+A crate-backed extension exposes its adapter functions directly under the
+declared extension module. An internal Component interface with the same name
+does not add another Husk path segment. Import the specialized adapter
+functions individually or as a group from `src/main.hk`:
+
+```husk
+use serde_json::{
+    from_str_value,
+    value_to_string,
+    value_to_string_pretty,
+};
+
+fn main() -> Result<(), String> {
+    let value = from_str_value("{\"z\":1,\"a\":2}")?;
+    std::println(value_to_string(value)?);
+    std::println(value_to_string_pretty(value)?);
+    Ok(())
+}
+```
+
+Individual imports such as `use serde_json::from_str_value;` are also valid.
+The duplicated `serde_json::serde_json::from_str_value` path is not a public
+Husk export. Distinct, explicitly named interfaces remain qualified, such as
+`regex::api::is_match`.
+
+Run the locked package with `red husk run --locked .`. For an explicitly
+selected profile operation, repeat `--specialize` as needed:
+
+```shell
+red husk add serde_json \
+  --specialize 'serde_json::from_str<serde_json::Value>' \
+  --specialize 'serde_json::to_string<serde_json::Value>'
+```
+
+Only supported, versioned concrete lowerings are accepted; arbitrary generic
+Rust APIs are reported as `specializable` and are not silently exported.
+
+Adapter build process and memory limits apply only to the adapter's own
+process tree. Unrelated applications and background processes do not consume
+the adapter's resource budget.
+
 After cloning a package, recreate its installed state without Cargo or network
 access:
 
@@ -249,9 +318,11 @@ red husk install --locked --offline
 red husk run --locked .
 ```
 
-Installation verifies the locked digest and bundle metadata, stages the full
-extension set, atomically replaces `.husk/extensions/`, and removes stale
-installed bundles. Path-based extensions under `vendor/` remain supported.
+Installation verifies the locked component digest, adapter-report digest, and
+bundle metadata, stages the full extension set, atomically replaces
+`.husk/extensions/`, and removes stale installed bundles. Path-based extensions
+under `vendor/` and older locks without an adapter-report digest remain
+supported.
 
 ## Tests
 

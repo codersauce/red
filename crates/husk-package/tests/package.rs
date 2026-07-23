@@ -1,6 +1,9 @@
 use std::fs;
 
-use husk_package::{LOCK_FILE, PackageError, PackageLimits, ResolvedPackage, discover_manifest};
+use husk_package::{
+    LOCK_FILE, PackageError, PackageLimits, PackageLock, PackageManifest, ResolvedPackage,
+    discover_manifest,
+};
 use tempfile::TempDir;
 
 fn package(manifest_extensions: &str) -> TempDir {
@@ -195,4 +198,96 @@ fn lock_reads_use_the_package_specific_limit() {
 
     let error = resolved.enforce_lock().unwrap_err().to_string();
     assert!(error.contains("maximum is 4"), "{error}");
+}
+
+#[test]
+fn crate_lock_rejects_changed_generic_specializations() {
+    let manifest = PackageManifest::parse(
+        r#"
+        schema_version = 1
+
+        [package]
+        name = "example"
+        version = "0.1.0"
+        entry = "src/main.hk"
+
+        [extensions.serde_json]
+        crate = "serde_json"
+        version = "^1"
+        specializations = ["serde_json::from_str<serde_json::Value>"]
+        "#,
+    )
+    .unwrap();
+    let lock = PackageLock::parse(
+        r#"
+        schema_version = 1
+
+        [package]
+        name = "example"
+        version = "0.1.0"
+
+        [extensions.serde_json]
+        module = "serde_json"
+        version = "1.0.151"
+        source = ".husk/extensions/fixture-digest.huskext"
+        sha256 = "fixture-digest"
+        artifact = "vendor/husk/fixture-digest.huskext"
+        report_sha256 = "fixture-report-digest"
+
+        [extensions.serde_json.crate]
+        package = "serde_json"
+        version = "1.0.151"
+        requirement = "^1"
+        default_features = true
+        specializations = ["serde_json::to_string<serde_json::Value>"]
+        "#,
+    )
+    .unwrap();
+
+    let error = lock.validate_manifest(&manifest).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("differs between Husk.toml and Husk.lock"),
+        "{error}"
+    );
+}
+
+#[test]
+fn existing_locks_without_specialization_or_report_provenance_remain_readable() {
+    let lock = PackageLock::parse(
+        r#"
+        schema_version = 1
+
+        [package]
+        name = "example"
+        version = "0.1.0"
+
+        [extensions.serde_json]
+        module = "serde_json"
+        version = "1.0.151"
+        source = ".husk/extensions/fixture-digest.huskext"
+        sha256 = "fixture-digest"
+        artifact = "vendor/husk/fixture-digest.huskext"
+
+        [extensions.serde_json.crate]
+        package = "serde_json"
+        version = "1.0.151"
+        requirement = "^1"
+        default_features = true
+        "#,
+    )
+    .unwrap();
+
+    let extension = &lock.extensions["serde_json"];
+    assert!(extension.report_sha256.is_none());
+    assert!(
+        extension
+            .crate_source
+            .as_ref()
+            .unwrap()
+            .specializations
+            .is_empty()
+    );
 }

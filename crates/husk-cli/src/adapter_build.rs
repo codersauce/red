@@ -9,9 +9,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::collections::{HashMap, HashSet, VecDeque};
+
 use anyhow::Context;
-#[cfg(target_os = "linux")]
-use nix::sys::resource::{Resource, setrlimit};
 #[cfg(unix)]
 use nix::{
     sys::signal::{Signal, killpg},
@@ -532,6 +533,7 @@ fn configure_environment(
     command
         .current_dir(build)
         .env_clear()
+        .env("CARGO_BUILD_JOBS", "1")
         .env("CARGO_HOME", cargo_home)
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_NET_OFFLINE", (!allow_network).to_string())
@@ -541,6 +543,29 @@ fn configure_environment(
         .env("RUSTC", &toolchain.rustc)
         .env("SOURCE_DATE_EPOCH", "1")
         .env("TMPDIR", build.join("tmp"));
+
+    #[cfg(target_os = "macos")]
+    configure_macos_toolchain(command);
+}
+
+#[cfg(target_os = "macos")]
+fn configure_macos_toolchain(command: &mut Command) {
+    let sdk = env::var_os("SDKROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"));
+    if sdk.is_dir() {
+        command.env("SDKROOT", sdk);
+    }
+
+    // The `/usr/bin/cc` shim invokes xcrun, whose global cache is intentionally
+    // outside the adapter sandbox. Invoke the installed compiler directly.
+    let clang = Path::new("/Library/Developer/CommandLineTools/usr/bin/clang");
+    if clang.is_file() {
+        command
+            .env("CC", clang)
+            .env("CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER", clang)
+            .env("CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER", clang);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -679,19 +704,10 @@ fn run_bounded(
     let stderr_path = directory.join("command.stderr");
     let stdout = File::create(&stdout_path).context("create bounded command stdout")?;
     let stderr = File::create(&stderr_path).context("create bounded command stderr")?;
-    let baseline = user_resource_usage()?;
-    let process_ceiling = baseline.processes.saturating_add(options.max_processes);
     command
         .process_group(0)
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    // SAFETY: the closure only performs the async-signal-safe setrlimit syscall.
-    unsafe {
-        command.pre_exec(move || {
-            set_process_ceiling(process_ceiling)?;
-            Ok(())
-        });
-    }
     let mut child = command
         .spawn()
         .with_context(|| format!("{description}: launch process"))?;
@@ -711,19 +727,22 @@ fn run_bounded(
                 options.max_output_bytes
             );
         }
-        let usage = user_resource_usage()?;
-        if usage.resident_bytes
-            > baseline
-                .resident_bytes
-                .saturating_add(options.max_memory_bytes)
-        {
+        let usage = match process_tree_resource_usage(child.id()) {
+            Ok(usage) => usage,
+            Err(error) => {
+                terminate(&mut child);
+                return Err(error)
+                    .with_context(|| format!("{description}: inspect build process tree"));
+            }
+        };
+        if usage.resident_bytes > options.max_memory_bytes {
             terminate(&mut child);
             anyhow::bail!(
                 "{description} exceeded the {} byte aggregate resident memory limit",
                 options.max_memory_bytes
             );
         }
-        if usage.processes > baseline.processes.saturating_add(options.max_processes) {
+        if usage.processes > options.max_processes {
             terminate(&mut child);
             anyhow::bail!(
                 "{description} exceeded the {} process limit",
@@ -820,65 +839,106 @@ fn run_bounded_windows(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-struct UserResourceUsage {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessSnapshot {
+    pid: u32,
+    parent_pid: u32,
+    process_group: u32,
+    resident_bytes: u64,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ProcessTreeResourceUsage {
     processes: u64,
     resident_bytes: u64,
 }
 
-#[cfg(target_os = "linux")]
-fn user_resource_usage() -> anyhow::Result<UserResourceUsage> {
-    // SAFETY: getuid has no preconditions.
-    let user = unsafe { nix::libc::getuid() }.to_string();
-    let mut tasks = 0u64;
-    let mut resident_bytes = 0u64;
-    for entry in fs::read_dir("/proc").context("inspect Linux process table")? {
-        let entry = entry.context("read Linux process table entry")?;
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .bytes()
-            .all(|byte| byte.is_ascii_digit())
-        {
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn process_tree_resource_usage(root_pid: u32) -> anyhow::Result<ProcessTreeResourceUsage> {
+    let snapshots = process_snapshots()?;
+    Ok(measure_process_tree(root_pid, &snapshots))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn measure_process_tree(root_pid: u32, snapshots: &[ProcessSnapshot]) -> ProcessTreeResourceUsage {
+    let mut children: HashMap<u32, Vec<&ProcessSnapshot>> = HashMap::new();
+    let mut pending = VecDeque::new();
+    for snapshot in snapshots {
+        children
+            .entry(snapshot.parent_pid)
+            .or_default()
+            .push(snapshot);
+        if snapshot.pid == root_pid || snapshot.process_group == root_pid {
+            pending.push_back(snapshot);
+        }
+    }
+
+    let mut visited = HashSet::new();
+    let mut usage = ProcessTreeResourceUsage::default();
+    while let Some(snapshot) = pending.pop_front() {
+        if !visited.insert(snapshot.pid) {
             continue;
         }
+        usage.processes = usage.processes.saturating_add(1);
+        usage.resident_bytes = usage.resident_bytes.saturating_add(snapshot.resident_bytes);
+        if let Some(descendants) = children.get(&snapshot.pid) {
+            pending.extend(descendants.iter().copied());
+        }
+    }
+    usage
+}
+
+#[cfg(target_os = "linux")]
+fn process_snapshots() -> anyhow::Result<Vec<ProcessSnapshot>> {
+    let mut snapshots = Vec::new();
+    for entry in fs::read_dir("/proc").context("inspect Linux process table")? {
+        let entry = entry.context("read Linux process table entry")?;
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let stat = match fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(_) => continue,
+        };
+        let Some((parent_pid, process_group)) = linux_process_identity(&stat) else {
+            continue;
+        };
         let status = match fs::read_to_string(entry.path().join("status")) {
             Ok(status) => status,
             Err(_) => continue,
         };
-        let owned = status
+        let resident_bytes = status
             .lines()
-            .find_map(|line| line.strip_prefix("Uid:"))
-            .and_then(|uids| uids.split_whitespace().next())
-            == Some(user.as_str());
-        if owned {
-            for line in status.lines() {
-                if let Some(value) = line.strip_prefix("Threads:") {
-                    tasks = tasks.saturating_add(value.trim().parse::<u64>().unwrap_or(1));
-                } else if let Some(value) = line.strip_prefix("VmRSS:") {
-                    let kibibytes = value
-                        .split_whitespace()
-                        .next()
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .unwrap_or(0);
-                    resident_bytes = resident_bytes.saturating_add(kibibytes.saturating_mul(1024));
-                }
-            }
-        }
+            .find_map(|line| line.strip_prefix("VmRSS:"))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+            .saturating_mul(1024);
+        snapshots.push(ProcessSnapshot {
+            pid,
+            parent_pid,
+            process_group,
+            resident_bytes,
+        });
     }
-    Ok(UserResourceUsage {
-        processes: tasks,
-        resident_bytes,
-    })
+    Ok(snapshots)
 }
 
-#[cfg(target_os = "linux")]
-fn set_process_ceiling(process_ceiling: u64) -> std::io::Result<()> {
-    setrlimit(Resource::RLIMIT_NPROC, process_ceiling, process_ceiling)
-        .map_err(std::io::Error::other)
+#[cfg(any(target_os = "linux", test))]
+fn linux_process_identity(stat: &str) -> Option<(u32, u32)> {
+    // Linux permits spaces and parentheses in `comm`, so split after the last
+    // closing parenthesis before reading state, parent PID, and process group.
+    let (_, fields) = stat.rsplit_once(')')?;
+    let mut fields = fields.split_whitespace();
+    fields.next()?;
+    let parent_pid = fields.next()?.parse().ok()?;
+    let process_group = fields.next()?.parse().ok()?;
+    Some((parent_pid, process_group))
 }
 
 #[cfg(target_os = "macos")]
-fn user_resource_usage() -> anyhow::Result<UserResourceUsage> {
+fn process_snapshots() -> anyhow::Result<Vec<ProcessSnapshot>> {
     const PROC_UID_ONLY: u32 = 4;
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { nix::libc::getuid() };
@@ -899,16 +959,15 @@ fn user_resource_usage() -> anyhow::Result<UserResourceUsage> {
     anyhow::ensure!(bytes >= 0, "read macOS process table");
     pids.truncate(usize::try_from(bytes).unwrap_or(0) / pid_size);
 
-    let mut processes = 0u64;
-    let mut resident_bytes = 0u64;
+    let mut snapshots = Vec::with_capacity(pids.len());
     for pid in pids.into_iter().filter(|pid| *pid > 0) {
-        let mut task = std::mem::MaybeUninit::<nix::libc::proc_taskinfo>::uninit();
+        let mut task = std::mem::MaybeUninit::<nix::libc::proc_taskallinfo>::uninit();
         let task_size = i32::try_from(std::mem::size_of_val(&task)).unwrap_or(i32::MAX);
-        // SAFETY: `task` points to writable storage for one proc_taskinfo.
+        // SAFETY: `task` points to writable storage for one proc_taskallinfo.
         let read = unsafe {
             nix::libc::proc_pidinfo(
                 pid,
-                nix::libc::PROC_PIDTASKINFO,
+                nix::libc::PROC_PIDTASKALLINFO,
                 0,
                 task.as_mut_ptr().cast(),
                 task_size,
@@ -917,29 +976,15 @@ fn user_resource_usage() -> anyhow::Result<UserResourceUsage> {
         if read == task_size {
             // SAFETY: proc_pidinfo initialized the complete structure.
             let task = unsafe { task.assume_init() };
-            processes = processes.saturating_add(1);
-            resident_bytes = resident_bytes.saturating_add(task.pti_resident_size);
+            snapshots.push(ProcessSnapshot {
+                pid: task.pbsd.pbi_pid,
+                parent_pid: task.pbsd.pbi_ppid,
+                process_group: task.pbsd.pbi_pgid,
+                resident_bytes: task.ptinfo.pti_resident_size,
+            });
         }
     }
-    Ok(UserResourceUsage {
-        processes,
-        resident_bytes,
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn set_process_ceiling(process_ceiling: u64) -> std::io::Result<()> {
-    let limit = nix::libc::rlimit {
-        rlim_cur: process_ceiling,
-        rlim_max: process_ceiling,
-    };
-    // SAFETY: `limit` is a valid rlimit value and setrlimit does not retain it.
-    let status = unsafe { nix::libc::setrlimit(nix::libc::RLIMIT_NPROC, &limit) };
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+    Ok(snapshots)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -992,10 +1037,173 @@ fn display_status(status: ExitStatus) -> String {
     )
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
 
+    fn snapshot(
+        pid: u32,
+        parent_pid: u32,
+        process_group: u32,
+        resident_bytes: u64,
+    ) -> ProcessSnapshot {
+        ProcessSnapshot {
+            pid,
+            parent_pid,
+            process_group,
+            resident_bytes,
+        }
+    }
+
+    fn bounded_test_options(max_processes: u64) -> BuildOptions {
+        BuildOptions {
+            allow_network: false,
+            timeout: Duration::from_secs(5),
+            max_output_bytes: 1024,
+            max_memory_bytes: 64 * 1024 * 1024,
+            max_processes,
+        }
+    }
+
+    struct BackgroundProcess(std::process::Child);
+
+    impl BackgroundProcess {
+        fn spawn() -> Self {
+            let child = Command::new("/bin/sleep")
+                .arg("5")
+                .process_group(0)
+                .spawn()
+                .expect("start isolated background process");
+            Self(child)
+        }
+    }
+
+    impl Drop for BackgroundProcess {
+        fn drop(&mut self) {
+            terminate(&mut self.0);
+        }
+    }
+
+    #[test]
+    fn process_tree_excludes_unrelated_user_processes_and_resident_memory() {
+        let snapshots = [
+            snapshot(91, 1, 91, u64::MAX),
+            snapshot(43, 42, 42, 30),
+            snapshot(42, 1, 42, 20),
+            snapshot(92, 91, 91, u64::MAX),
+        ];
+
+        assert_eq!(
+            measure_process_tree(42, &snapshots),
+            ProcessTreeResourceUsage {
+                processes: 2,
+                resident_bytes: 50,
+            }
+        );
+    }
+
+    #[test]
+    fn process_tree_includes_descendants_that_create_a_new_process_group() {
+        let snapshots = [
+            snapshot(44, 43, 43, 40),
+            snapshot(43, 42, 43, 30),
+            snapshot(42, 1, 42, 20),
+            snapshot(99, 1, 99, 1_000_000),
+        ];
+
+        assert_eq!(
+            measure_process_tree(42, &snapshots),
+            ProcessTreeResourceUsage {
+                processes: 3,
+                resident_bytes: 90,
+            }
+        );
+    }
+
+    #[test]
+    fn process_tree_keeps_tracking_reparented_members_of_the_build_group() {
+        let snapshots = [snapshot(43, 1, 42, 30), snapshot(42, 1, 42, 20)];
+
+        assert_eq!(
+            measure_process_tree(42, &snapshots),
+            ProcessTreeResourceUsage {
+                processes: 2,
+                resident_bytes: 50,
+            }
+        );
+    }
+
+    #[test]
+    fn bounded_build_ignores_unrelated_processes_owned_by_the_same_user() {
+        let _first_unrelated_process = BackgroundProcess::spawn();
+        let _second_unrelated_process = BackgroundProcess::spawn();
+        let directory = tempfile::tempdir().unwrap();
+        let mut command = Command::new("/bin/sleep");
+        command.arg("0.1");
+
+        run_bounded(
+            &mut command,
+            directory.path(),
+            &bounded_test_options(1),
+            "run process-tree isolation fixture",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn bounded_build_rejects_extra_processes_in_its_own_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "/bin/sleep 5 & wait"]);
+
+        let error = run_bounded(
+            &mut command,
+            directory.path(),
+            &bounded_test_options(1),
+            "run process limit fixture",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("process limit"), "{error:#}");
+    }
+
+    #[test]
+    fn bounded_build_rejects_memory_used_by_its_own_process_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut command = Command::new("/bin/sleep");
+        command.arg("1");
+        let options = BuildOptions {
+            max_memory_bytes: 1,
+            ..bounded_test_options(1)
+        };
+
+        let error = run_bounded(
+            &mut command,
+            directory.path(),
+            &options,
+            "run memory limit fixture",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("memory limit"), "{error:#}");
+    }
+
+    #[test]
+    fn linux_process_identity_handles_spaces_and_parentheses_in_command_names() {
+        assert_eq!(
+            linux_process_identity("42 (cargo (build script)) S 12 34 56"),
+            Some((12, 34))
+        );
+    }
+
+    #[test]
+    fn linux_process_identity_rejects_malformed_process_table_entries() {
+        for stat in ["", "42 cargo S 12 34", "42 (cargo) S", "42 (cargo) S x 34"] {
+            assert!(linux_process_identity(stat).is_none(), "{stat}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn sandbox_profile_denies_network_and_limits_writes_to_build_root() {
         let profile = sandbox_profile(

@@ -89,6 +89,9 @@ pub struct CrateExtensionSource {
     pub default_features: bool,
     #[serde(default)]
     pub include: Vec<String>,
+    /// Canonical, ahead-of-time Rust generic instantiations for this adapter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub specializations: Vec<String>,
 }
 
 const fn default_true() -> bool {
@@ -134,6 +137,17 @@ impl PackageManifest {
                             ),
                         });
                     }
+                    if extension
+                        .specializations
+                        .iter()
+                        .any(|specialization| specialization.is_empty())
+                    {
+                        return Err(PackageError::InvalidManifest {
+                            message: format!(
+                                "crate extension `{name}` contains an empty generic specialization"
+                            ),
+                        });
+                    }
                 }
             }
         }
@@ -157,6 +171,7 @@ pub struct ResolvedExtension {
     pub bundle: ExtensionBundle,
     pub crate_source: Option<LockedCrateExtension>,
     pub artifact: Option<PathBuf>,
+    pub report_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -246,8 +261,8 @@ impl ResolvedPackage {
 
         let mut extensions = Vec::new();
         for (name, declaration) in &manifest.extensions {
-            let (source, crate_source, artifact) = match declaration {
-                ExtensionSource::Path(extension) => (extension.path.clone(), None, None),
+            let (source, crate_source, artifact, report_sha256) = match declaration {
+                ExtensionSource::Path(extension) => (extension.path.clone(), None, None, None),
                 ExtensionSource::Crate(_) => {
                     let locked_extension = locked
                         .as_ref()
@@ -261,6 +276,7 @@ impl ResolvedPackage {
                         locked_extension.source.clone(),
                         locked_extension.crate_source.clone(),
                         locked_extension.artifact.clone(),
+                        locked_extension.report_sha256.clone(),
                     )
                 }
             };
@@ -295,6 +311,7 @@ impl ResolvedPackage {
                 bundle,
                 crate_source,
                 artifact,
+                report_sha256,
             });
         }
         extensions.sort_unstable_by(|left, right| left.manifest_name.cmp(&right.manifest_name));
@@ -396,6 +413,9 @@ pub struct LockedExtension {
     pub crate_source: Option<LockedCrateExtension>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<PathBuf>,
+    /// SHA-256 of the exact adapter selection and specialization report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -409,6 +429,8 @@ pub struct LockedCrateExtension {
     pub default_features: bool,
     #[serde(default)]
     pub include: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub specializations: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum: Option<String>,
 }
@@ -433,6 +455,7 @@ impl PackageLock {
                             sha256: extension.bundle.digest().to_string(),
                             crate_source: extension.crate_source.clone(),
                             artifact: extension.artifact.clone(),
+                            report_sha256: extension.report_sha256.clone(),
                         },
                     )
                 })
@@ -504,6 +527,7 @@ impl PackageLock {
                         || crate_source.features != extension.features
                         || crate_source.default_features != extension.default_features
                         || crate_source.include != extension.include
+                        || crate_source.specializations != extension.specializations
                         || locked.source != expected_source
                         || locked.artifact.is_none()
                     {

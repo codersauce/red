@@ -2355,24 +2355,40 @@ fn runtime_type_name(ty: &TypeExpr) -> anyhow::Result<String> {
 }
 
 fn collect_function_imports(file: &File, module_path: &[String]) -> HashMap<String, String> {
-    file.items
-        .iter()
-        .filter_map(|item| {
-            let ItemKind::Use {
-                path,
-                kind: husk_ast::UseKind::Item,
-            } = &item.kind
-            else {
-                return None;
-            };
-            let alias = path.last()?.name.clone();
-            let segments = path
-                .iter()
-                .map(|segment| segment.name.clone())
-                .collect::<Vec<_>>();
-            normalize_source_path(&segments, module_path).map(|path| (alias, path))
-        })
-        .collect()
+    let mut imports = HashMap::new();
+
+    for item in &file.items {
+        let ItemKind::Use { path, kind } = &item.kind else {
+            continue;
+        };
+
+        let mut segments = path
+            .iter()
+            .map(|segment| segment.name.clone())
+            .collect::<Vec<_>>();
+
+        match kind {
+            husk_ast::UseKind::Item => {
+                if let (Some(alias), Some(path)) =
+                    (path.last(), normalize_source_path(&segments, module_path))
+                {
+                    imports.insert(alias.name.clone(), path);
+                }
+            }
+            husk_ast::UseKind::Variants(items) => {
+                for item in items {
+                    segments.push(item.name.clone());
+                    if let Some(path) = normalize_source_path(&segments, module_path) {
+                        imports.insert(item.name.clone(), path);
+                    }
+                    segments.pop();
+                }
+            }
+            husk_ast::UseKind::Glob => {}
+        }
+    }
+
+    imports
 }
 
 fn normalize_source_path(segments: &[String], module_path: &[String]) -> Option<String> {
@@ -2450,26 +2466,36 @@ fn finalize_function_table(
     let mut module_paths = Vec::new();
     for module in modules {
         for function in &module.functions {
-            module_paths.push(format!("{}::{}", module.name, function.name));
+            let path = format!("{}::{}", module.name, function.name);
+            module_paths.push((path.clone(), path));
         }
         for interface in &module.interfaces {
             for function in &interface.functions {
-                module_paths.push(format!(
-                    "{}::{}::{}",
-                    module.name, interface.name, function.name
-                ));
+                let target = format!("{}::{}::{}", module.name, interface.name, function.name);
+                let path = if interface.name == module.name.as_str() {
+                    format!("{}::{}", module.name, function.name)
+                } else {
+                    target.clone()
+                };
+                module_paths.push((path, target));
             }
         }
     }
     module_paths.sort_unstable();
-    module_paths.dedup();
+    for paths in module_paths.windows(2) {
+        anyhow::ensure!(
+            paths[0].0 != paths[1].0,
+            "duplicate Husk module-function path `{}` targets both `{}` and `{}`",
+            paths[0].0,
+            paths[0].1,
+            paths[1].1
+        );
+    }
     let mut module_functions = HashMap::with_capacity(module_paths.len());
     let mut module_ids = HashMap::with_capacity(module_paths.len());
-    for path in module_paths {
+    for (path, target) in module_paths {
         let id = ModuleFunctionId::from_raw(stable_callable_id("module", &path));
-        if let Some(previous) =
-            module_functions.insert(id, ModuleFunctionTarget { path: path.clone() })
-        {
+        if let Some(previous) = module_functions.insert(id, ModuleFunctionTarget { path: target }) {
             anyhow::bail!(
                 "stable Husk module-function ID collision between `{}` and `{path}`",
                 previous.path
@@ -6465,6 +6491,30 @@ mod tests {
 
     impl Host for TestHost {
         fn log(&mut self, _message: &str) {}
+    }
+
+    #[test]
+    fn same_named_interface_rejects_colliding_root_function() {
+        let function = FunctionDescriptor::new("add", Vec::new(), TypeDescriptor::I32).unwrap();
+        let interface = InterfaceDescriptor::new("math", vec![function.clone()]).unwrap();
+        let module = ModuleDescriptor::new(
+            "math",
+            Version::new(1, 0, 0),
+            vec![function],
+            vec![interface],
+        )
+        .unwrap();
+
+        let error = finalize_function_table(HashMap::new(), &[module], SemanticProfile::Native)
+            .err()
+            .unwrap();
+
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate Husk module-function path `math::add`"),
+            "{error}"
+        );
     }
 
     #[test]

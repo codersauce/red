@@ -1468,9 +1468,21 @@ impl TypeChecker {
     }
 
     fn process_item_import(&mut self, path: &[Ident], kind: &husk_ast::UseKind) {
-        if !matches!(kind, husk_ast::UseKind::Item) {
-            return;
+        match kind {
+            husk_ast::UseKind::Item => self.import_module_function(path),
+            husk_ast::UseKind::Variants(items) => {
+                let mut item_path = path.to_vec();
+                for item in items {
+                    item_path.push(item.clone());
+                    self.import_module_function(&item_path);
+                    item_path.pop();
+                }
+            }
+            husk_ast::UseKind::Glob => {}
         }
+    }
+
+    fn import_module_function(&mut self, path: &[Ident]) {
         let Some(alias) = path.last() else {
             return;
         };
@@ -7134,6 +7146,36 @@ fn main() {
         );
         let file = parsed.file.expect("parser produced no AST");
         let result = analyze_file(&file);
+        assert!(
+            result.symbols.errors.is_empty() && result.type_errors.is_empty(),
+            "semantic errors: symbols={:?}, types={:?}",
+            result.symbols.errors,
+            result.type_errors
+        );
+    }
+
+    #[test]
+    fn grouped_enum_variant_imports_remain_available() {
+        let source = r#"
+            use Option::{None, Some};
+
+            fn main() -> i32 {
+                let value: Option<i32> = Some(42);
+                match value {
+                    Some(value) => value,
+                    None => 0,
+                }
+            }
+        "#;
+        let parsed = parse_str(source);
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let file = parsed.file.expect("parser produced no AST");
+        let result = analyze_file(&file);
+
         assert!(
             result.symbols.errors.is_empty() && result.type_errors.is_empty(),
             "semantic errors: symbols={:?}, types={:?}",

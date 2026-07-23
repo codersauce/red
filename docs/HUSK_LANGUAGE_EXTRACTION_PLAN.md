@@ -390,8 +390,11 @@ source is parsed and no `RED_HOST_DECLARATIONS` equivalent exists.
 
 Module construction rejects duplicate names, invalid identifiers, unsupported
 types, normalized interface/function collisions, and conflicting versions
-before any script is compiled. Root functions use `module::function`; functions
-inside a WIT-style interface use `module::interface::function`.
+before any script is compiled. Root functions use `module::function`. A
+WIT-style interface with the same name as its module also exposes its functions
+as `module::function`; its repeated interface name is an internal Component
+detail, not a public Husk namespace. Distinct WIT-style interfaces continue to
+use `module::interface::function`.
 
 ### Typed Rust adapters
 
