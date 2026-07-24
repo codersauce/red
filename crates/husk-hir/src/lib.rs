@@ -86,6 +86,12 @@ pub enum IntrinsicFunction {
     Println,
     Assert,
     AssertMessage,
+    FromString,
+    FromI64,
+    FromF64,
+    TryFromI32,
+    TryFromI64,
+    TryFromF64,
 }
 
 /// Resolved target for a function-call expression.

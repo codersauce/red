@@ -1,0 +1,317 @@
+// Backend-neutral Husk declarations. Runtime implementations are supplied by
+// language primitives or registered native modules; no JavaScript ABI or
+// codegen-placeholder bodies are part of this prelude.
+
+enum Option<T> {
+    None,
+    Some(T),
+}
+
+enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+
+use Option::*;
+use Result::*;
+
+trait From<T> {
+    fn from(value: T) -> Self;
+}
+
+trait Into<T> {
+    fn into(self) -> T;
+}
+
+trait TryFrom<T> {
+    fn try_from(value: T) -> Result<Self, String>;
+}
+
+trait TryInto<T> {
+    fn try_into(self) -> Result<T, String>;
+}
+
+trait PartialEq {}
+trait Eq: PartialEq {}
+
+impl PartialEq for i32 {}
+impl PartialEq for i64 {}
+impl PartialEq for f64 {}
+impl PartialEq for bool {}
+impl PartialEq for String {}
+impl PartialEq for Option {}
+impl PartialEq for Result {}
+impl PartialEq for Range {}
+
+impl Eq for i32 {}
+impl Eq for i64 {}
+impl Eq for bool {}
+impl Eq for String {}
+impl Eq for Range {}
+
+impl From<i32> for String {
+    #[intrinsic]
+    fn from(value: i32) -> String {}
+}
+impl From<i64> for String {
+    #[intrinsic]
+    fn from(value: i64) -> String {}
+}
+impl From<f64> for String {
+    #[intrinsic]
+    fn from(value: f64) -> String {}
+}
+impl From<bool> for String {
+    #[intrinsic]
+    fn from(value: bool) -> String {}
+}
+impl From<i32> for i64 {
+    #[intrinsic]
+    fn from(value: i32) -> i64 {}
+}
+impl From<i32> for f64 {
+    #[intrinsic]
+    fn from(value: i32) -> f64 {}
+}
+impl From<i64> for f64 {
+    #[intrinsic]
+    fn from(value: i64) -> f64 {}
+}
+
+impl TryFrom<String> for i32 {
+    #[intrinsic]
+    fn try_from(value: String) -> Result<i32, String> {}
+}
+impl TryFrom<String> for i64 {
+    #[intrinsic]
+    fn try_from(value: String) -> Result<i64, String> {}
+}
+impl TryFrom<String> for f64 {
+    #[intrinsic]
+    fn try_from(value: String) -> Result<f64, String> {}
+}
+impl TryFrom<i64> for i32 {
+    #[intrinsic]
+    fn try_from(value: i64) -> Result<i32, String> {}
+}
+
+extern "husk" {
+    struct Json;
+
+    fn println(value: String);
+    fn assert(condition: bool);
+    fn assert_msg(condition: bool, message: String);
+}
+
+impl<T> Option<T> {
+    #[intrinsic]
+    fn is_some(&self) -> bool {}
+    #[intrinsic]
+    fn is_none(&self) -> bool {}
+    #[intrinsic]
+    fn unwrap_or(self, fallback: T) -> T {}
+}
+
+impl<T, E> Result<T, E> {
+    #[intrinsic]
+    fn is_ok(&self) -> bool {}
+    #[intrinsic]
+    fn is_err(&self) -> bool {}
+    #[intrinsic]
+    fn unwrap_or(self, fallback: T) -> T {}
+    #[intrinsic]
+    fn ok(self) -> Option<T> {}
+    #[intrinsic]
+    fn err(self) -> Option<E> {}
+}
+
+impl String {
+    #[intrinsic]
+    fn len(&self) -> i32 {}
+    #[intrinsic]
+    fn is_empty(&self) -> bool {}
+    #[intrinsic]
+    fn trim(&self) -> String {}
+    #[intrinsic]
+    fn trim_start(&self) -> String {}
+    #[intrinsic]
+    fn trim_end(&self) -> String {}
+    #[intrinsic]
+    fn split(&self, separator: String) -> [String] {}
+    #[intrinsic]
+    fn split_once(&self, delimiter: String) -> Option<(String, String)> {}
+    #[intrinsic]
+    fn rsplit_once(&self, delimiter: String) -> Option<(String, String)> {}
+    #[intrinsic]
+    fn split_whitespace(&self) -> [String] {}
+    #[intrinsic]
+    fn lines(&self) -> [String] {}
+    #[intrinsic]
+    fn char_at(&self, index: i32) -> String {}
+    #[intrinsic]
+    fn slice(&self, start: i32, end: i32) -> String {}
+    #[intrinsic]
+    fn substring(&self, start: i32, end: i32) -> String {}
+    #[intrinsic]
+    fn index_of(&self, search: String) -> i32 {}
+    #[intrinsic]
+    fn last_index_of(&self, search: String) -> i32 {}
+    #[intrinsic]
+    fn starts_with(&self, prefix: String) -> bool {}
+    #[intrinsic]
+    fn ends_with(&self, suffix: String) -> bool {}
+    #[intrinsic]
+    fn contains(&self, search: String) -> bool {}
+    #[intrinsic]
+    fn includes(&self, search: String) -> bool {}
+    #[intrinsic]
+    fn strip_prefix(&self, prefix: String) -> Option<String> {}
+    #[intrinsic]
+    fn strip_suffix(&self, suffix: String) -> Option<String> {}
+    #[intrinsic]
+    fn replace(&self, pattern: String, replacement: String) -> String {}
+    #[intrinsic]
+    fn repeat(&self, count: i32) -> String {}
+    #[intrinsic]
+    fn to_lowercase(&self) -> String {}
+    #[intrinsic]
+    fn to_uppercase(&self) -> String {}
+    #[intrinsic]
+    fn to_lower_case(&self) -> String {}
+    #[intrinsic]
+    fn to_upper_case(&self) -> String {}
+    #[intrinsic]
+    fn is_ascii_digit(&self) -> bool {}
+    #[intrinsic]
+    fn to_digit(&self, radix: i32) -> Option<i32> {}
+    #[intrinsic]
+    fn iter(&self) -> [String] {}
+    #[intrinsic]
+    fn into_iter(self) -> [String] {}
+}
+
+impl i32 {
+    #[intrinsic]
+    fn to_string(&self) -> String {}
+    #[intrinsic]
+    fn abs(&self) -> i32 {}
+    #[intrinsic]
+    fn min(&self, other: i32) -> i32 {}
+    #[intrinsic]
+    fn max(&self, other: i32) -> i32 {}
+    #[intrinsic]
+    fn clamp(&self, minimum: i32, maximum: i32) -> i32 {}
+    #[intrinsic]
+    fn checked_add(&self, other: i32) -> Option<i32> {}
+    #[intrinsic]
+    fn checked_sub(&self, other: i32) -> Option<i32> {}
+    #[intrinsic]
+    fn checked_mul(&self, other: i32) -> Option<i32> {}
+    #[intrinsic]
+    fn saturating_add(&self, other: i32) -> i32 {}
+    #[intrinsic]
+    fn saturating_sub(&self, other: i32) -> i32 {}
+    #[intrinsic]
+    fn saturating_mul(&self, other: i32) -> i32 {}
+}
+
+impl i64 {
+    #[intrinsic]
+    fn to_string(&self) -> String {}
+    #[intrinsic]
+    fn abs(&self) -> i64 {}
+    #[intrinsic]
+    fn min(&self, other: i64) -> i64 {}
+    #[intrinsic]
+    fn max(&self, other: i64) -> i64 {}
+    #[intrinsic]
+    fn clamp(&self, minimum: i64, maximum: i64) -> i64 {}
+    #[intrinsic]
+    fn checked_add(&self, other: i64) -> Option<i64> {}
+    #[intrinsic]
+    fn checked_sub(&self, other: i64) -> Option<i64> {}
+    #[intrinsic]
+    fn checked_mul(&self, other: i64) -> Option<i64> {}
+    #[intrinsic]
+    fn saturating_add(&self, other: i64) -> i64 {}
+    #[intrinsic]
+    fn saturating_sub(&self, other: i64) -> i64 {}
+    #[intrinsic]
+    fn saturating_mul(&self, other: i64) -> i64 {}
+}
+
+impl f64 {
+    #[intrinsic]
+    fn to_string(&self) -> String {}
+    #[intrinsic]
+    fn floor(&self) -> f64 {}
+    #[intrinsic]
+    fn ceil(&self) -> f64 {}
+    #[intrinsic]
+    fn round(&self) -> f64 {}
+    #[intrinsic]
+    fn abs(&self) -> f64 {}
+    #[intrinsic]
+    fn min(&self, other: f64) -> f64 {}
+    #[intrinsic]
+    fn max(&self, other: f64) -> f64 {}
+    #[intrinsic]
+    fn clamp(&self, minimum: f64, maximum: f64) -> f64 {}
+}
+
+impl bool {
+    #[intrinsic]
+    fn to_string(&self) -> String {}
+}
+
+impl<T> [T] {
+    #[intrinsic]
+    fn len(&self) -> i32 {}
+    #[intrinsic]
+    fn is_empty(&self) -> bool {}
+    #[intrinsic]
+    fn get(&self, index: i32) -> Option<T> {}
+    #[intrinsic]
+    fn first(&self) -> Option<T> {}
+    #[intrinsic]
+    fn last(&self) -> Option<T> {}
+    #[intrinsic]
+    fn push(&mut self, value: T) {}
+    #[intrinsic]
+    fn slice(&self, start: i32, end: i32) -> [T] {}
+    #[intrinsic]
+    fn join(&self, separator: String) -> String {}
+    #[intrinsic]
+    fn sort(&mut self) -> [T] {}
+    #[intrinsic]
+    fn reverse(&mut self) -> [T] {}
+    #[intrinsic]
+    fn index_of(&self, value: T) -> i32 {}
+    #[intrinsic]
+    fn last_index_of(&self, value: T) -> i32 {}
+    #[intrinsic]
+    fn contains(&self, value: T) -> bool {}
+    #[intrinsic]
+    fn includes(&self, value: T) -> bool {}
+    #[intrinsic]
+    fn pop(&mut self) -> T {}
+    #[intrinsic]
+    fn shift(&mut self) -> T {}
+    #[intrinsic]
+    fn unshift(&mut self, value: T) -> i32 {}
+    #[intrinsic]
+    fn iter(&self) -> [T] {}
+    #[intrinsic]
+    fn into_iter(self) -> [T] {}
+}
+
+impl<T> Range<T> {
+    #[intrinsic]
+    fn contains(&self, value: T) -> bool {}
+    #[intrinsic]
+    fn is_empty(&self) -> bool {}
+    #[intrinsic]
+    fn iter(&self) -> Range<T> {}
+    #[intrinsic]
+    fn into_iter(self) -> Range<T> {}
+}

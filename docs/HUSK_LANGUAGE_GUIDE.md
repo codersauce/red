@@ -77,6 +77,52 @@ std::println(value: String)
 The CLI does not grant ambient filesystem, network, environment, process,
 clock, or random access.
 
+## Native standard library
+
+Native Husk programs automatically receive a small, backend-neutral prelude.
+It is distinct from the CLI's capability-bearing `std` module: the prelude
+provides values and pure operations, not filesystem, process, or network
+access.
+
+Parse complete numeric strings with an explicit target or an inferred return
+type:
+
+```husk
+fn required(value: String) -> Result<i32, String> {
+    value.trim().parse()
+}
+
+fn optional(value: String) -> i32 {
+    value.parse::<i32>().unwrap_or(0)
+}
+```
+
+`parse::<i32>()`, `parse::<i64>()`, and `parse::<f64>()` return
+`Result<T, String>`. Integer parsing accepts an optional sign and rejects
+whitespace, trailing characters, and overflow; floating-point parsing also
+rejects `NaN` and infinities. Use `trim()` deliberately when surrounding
+whitespace is valid input. Fallible narrowing is available as
+`value.try_into::<i32>()`. The equivalent trait forms, including
+`i32::try_from(value)` and `String::from(value)`, are also available.
+
+The initial prelude also provides:
+
+- `Option`: `is_some`, `is_none`, and `unwrap_or`; `Result`: `is_ok`,
+  `is_err`, `unwrap_or`, `ok`, and `err`.
+- Strings: `is_empty`, `trim_start`, `trim_end`, `split_once`, `rsplit_once`,
+  `split_whitespace`, `lines`, `contains`, `strip_prefix`, `strip_suffix`,
+  `replace`, `repeat`, `to_lowercase`, `to_uppercase`, `is_ascii_digit`, and
+  `to_digit`, alongside the existing string operations. `repeat` rejects
+  negative counts, and `repeat`/`replace` reject outputs larger than 16 MiB.
+- Arrays: `is_empty`, `get`, `first`, `last`, and `contains`, alongside the
+  existing array operations. Out-of-bounds `get` returns `None`.
+- Integers: `abs`, `min`, `max`, `clamp`, checked arithmetic returning
+  `Option`, and saturating arithmetic at the declared integer width. Floats
+  support `abs`, rounding, `min`, `max`, and `clamp`.
+
+Compatibility spellings such as `includes`, `to_lower_case`, and
+`to_upper_case` remain accepted, while new code can use the Rust-like names.
+
 ## Interactive use
 
 Start:

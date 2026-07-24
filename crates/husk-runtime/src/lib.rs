@@ -24,6 +24,9 @@ use husk_hir::{
     lower_function,
 };
 use husk_semantic::{SemanticOptions, SemanticResult};
+use husk_stdlib::number::{parse_f64, parse_i32, parse_i64};
+
+const MAX_STDLIB_STRING_BYTES: usize = 16 * 1024 * 1024;
 
 pub use embedding::{
     CallContext, CompiledModule, ConversionError, Engine, EngineBuilder, FromHusk, HuskType,
@@ -3064,6 +3067,12 @@ fn resolve_call_target(
         "println" => Some(IntrinsicFunction::Println),
         "assert" => Some(IntrinsicFunction::Assert),
         "assert_msg" => Some(IntrinsicFunction::AssertMessage),
+        "String::from" => Some(IntrinsicFunction::FromString),
+        "i64::from" => Some(IntrinsicFunction::FromI64),
+        "f64::from" => Some(IntrinsicFunction::FromF64),
+        "i32::try_from" => Some(IntrinsicFunction::TryFromI32),
+        "i64::try_from" => Some(IntrinsicFunction::TryFromI64),
+        "f64::try_from" => Some(IntrinsicFunction::TryFromF64),
         _ => None,
     };
     if let Some(intrinsic) = intrinsic {
@@ -4421,7 +4430,7 @@ impl Vm {
                     }
                     MethodTarget::Intrinsic(intrinsic) => self.call_intrinsic_method(
                         *intrinsic,
-                        receiver,
+                        expr,
                         &receiver_value,
                         &argument_values,
                         frame,
@@ -4987,18 +4996,32 @@ impl Vm {
                     anyhow::bail!("{message}")
                 }
             }
+            IntrinsicFunction::FromString
+            | IntrinsicFunction::FromI64
+            | IntrinsicFunction::FromF64
+            | IntrinsicFunction::TryFromI32
+            | IntrinsicFunction::TryFromI64
+            | IntrinsicFunction::TryFromF64 => call_conversion_function(function, args),
         }
     }
 
     fn call_intrinsic_method<H: Host>(
         &mut self,
         intrinsic: IntrinsicMethodId,
-        receiver_expr: &Expr,
+        expr: &Expr,
         receiver: &Value,
         args: &[Value],
         frame: &mut Frame,
         host: &mut H,
     ) -> anyhow::Result<Value> {
+        let ExprKind::MethodCall {
+            receiver: receiver_expr,
+            type_args,
+            ..
+        } = &expr.kind
+        else {
+            anyhow::bail!("intrinsic method dispatch requires a method-call expression");
+        };
         let target = self
             .programs
             .get(&frame.plugin)
@@ -5022,7 +5045,14 @@ impl Vm {
         {
             return Ok(value);
         }
-        if let Some(value) = call_builtin_method(receiver, &target.method, args)? {
+        if let Some(value) = call_builtin_method(
+            receiver,
+            Some(&target.receiver_type),
+            &target.method,
+            args,
+            type_args,
+            expr.ty.as_deref(),
+        )? {
             return Ok(value);
         }
         anyhow::bail!(
@@ -5056,7 +5086,7 @@ impl Vm {
         {
             return Ok(value);
         }
-        if let Some(value) = call_builtin_method(&receiver, method, &args)? {
+        if let Some(value) = call_builtin_method(&receiver, None, method, &args, &[], None)? {
             return Ok(value);
         }
         let type_name = match &receiver {
@@ -6067,17 +6097,32 @@ fn format_integer(value: &Value) -> anyhow::Result<i64> {
 
 fn call_builtin_method(
     receiver: &Value,
+    receiver_type: Option<&str>,
     method: &str,
     args: &[Value],
+    type_args: &[String],
+    result_type: Option<&str>,
 ) -> anyhow::Result<Option<Value>> {
     let result = match (receiver, method) {
         (Value::String(value), "len") => {
             expect_method_arity("String", method, args, 0)?;
             Ok(Value::Int(saturating_i64(value.chars().count())))
         }
+        (Value::String(value), "is_empty") => {
+            expect_method_arity("String", method, args, 0)?;
+            Ok(Value::Bool(value.is_empty()))
+        }
         (Value::String(value), "trim") => {
             expect_method_arity("String", method, args, 0)?;
             Ok(Value::String(value.trim().to_string()))
+        }
+        (Value::String(value), "trim_start" | "trim_end") => {
+            expect_method_arity("String", method, args, 0)?;
+            Ok(Value::String(if method == "trim_start" {
+                value.trim_start().to_string()
+            } else {
+                value.trim_end().to_string()
+            }))
         }
         (Value::String(value), "split") => {
             expect_method_arity("String", method, args, 1)?;
@@ -6104,6 +6149,21 @@ fn call_builtin_method(
                 .map_or_else(String::new, |character| character.to_string());
             Ok(Value::String(character))
         }
+        (Value::String(value), "split_whitespace" | "lines") => {
+            expect_method_arity("String", method, args, 0)?;
+            let values = if method == "split_whitespace" {
+                value
+                    .split_whitespace()
+                    .map(|part| Value::String(part.to_string()))
+                    .collect()
+            } else {
+                value
+                    .lines()
+                    .map(|line| Value::String(line.to_string()))
+                    .collect()
+            };
+            Ok(Value::Array(Arc::new(values)))
+        }
         (Value::String(value), "slice" | "substring") => {
             expect_method_arity("String", method, args, 2)?;
             let start = method_integer_arg("String", method, args, 0)?;
@@ -6123,29 +6183,34 @@ fn call_builtin_method(
             });
             Ok(Value::Int(index))
         }
-        (Value::String(value), "starts_with" | "ends_with" | "includes") => {
+        (Value::String(value), "starts_with" | "ends_with" | "contains" | "includes") => {
             expect_method_arity("String", method, args, 1)?;
             let needle = method_string_arg("String", method, args, 0)?;
             let found = match method {
                 "starts_with" => value.starts_with(needle),
                 "ends_with" => value.ends_with(needle),
-                "includes" => value.contains(needle),
+                "contains" | "includes" => value.contains(needle),
                 _ => unreachable!(),
             };
             Ok(Value::Bool(found))
         }
-        (Value::String(value), "to_upper_case") => {
+        (Value::String(value), "to_uppercase" | "to_upper_case") => {
             expect_method_arity("String", method, args, 0)?;
             Ok(Value::String(value.to_uppercase()))
         }
-        (Value::String(value), "to_lower_case") => {
+        (Value::String(value), "to_lowercase" | "to_lower_case") => {
             expect_method_arity("String", method, args, 0)?;
             Ok(Value::String(value.to_lowercase()))
         }
-        (Value::String(value), "split_once") => {
+        (Value::String(value), "split_once" | "rsplit_once") => {
             expect_method_arity("String", method, args, 1)?;
             let delimiter = method_string_arg("String", method, args, 0)?;
-            Ok(match value.split_once(delimiter) {
+            let parts = if method == "split_once" {
+                value.split_once(delimiter)
+            } else {
+                value.rsplit_once(delimiter)
+            };
+            Ok(match parts {
                 Some((before, after)) => enum_variant_value(
                     "Option",
                     "Some",
@@ -6156,6 +6221,90 @@ fn call_builtin_method(
                 ),
                 None => enum_variant_value("Option", "None", Vec::new()),
             })
+        }
+        (Value::String(value), "strip_prefix" | "strip_suffix") => {
+            expect_method_arity("String", method, args, 1)?;
+            let pattern = method_string_arg("String", method, args, 0)?;
+            let stripped = if method == "strip_prefix" {
+                value.strip_prefix(pattern)
+            } else {
+                value.strip_suffix(pattern)
+            };
+            Ok(option_value(
+                stripped.map(|value| Value::String(value.to_string())),
+            ))
+        }
+        (Value::String(value), "replace") => {
+            expect_method_arity("String", method, args, 2)?;
+            let pattern = method_string_arg("String", method, args, 0)?;
+            let replacement = method_string_arg("String", method, args, 1)?;
+            let occurrences = value.matches(pattern).count();
+            let removed_bytes = pattern
+                .len()
+                .checked_mul(occurrences)
+                .ok_or_else(|| anyhow::anyhow!("String::replace output size overflowed"))?;
+            let inserted_bytes = replacement
+                .len()
+                .checked_mul(occurrences)
+                .ok_or_else(|| anyhow::anyhow!("String::replace output size overflowed"))?;
+            let output_bytes = value
+                .len()
+                .checked_sub(removed_bytes)
+                .and_then(|retained| retained.checked_add(inserted_bytes))
+                .ok_or_else(|| anyhow::anyhow!("String::replace output size overflowed"))?;
+            if output_bytes > MAX_STDLIB_STRING_BYTES {
+                anyhow::bail!("String::replace output exceeds {MAX_STDLIB_STRING_BYTES} bytes");
+            }
+            Ok(Value::String(value.replace(pattern, replacement)))
+        }
+        (Value::String(value), "repeat") => {
+            expect_method_arity("String", method, args, 1)?;
+            let count = method_integer_arg("String", method, args, 0)?;
+            let count = usize::try_from(count)
+                .map_err(|_| anyhow::anyhow!("String::repeat requires a non-negative count"))?;
+            let output_bytes = value
+                .len()
+                .checked_mul(count)
+                .ok_or_else(|| anyhow::anyhow!("String::repeat output size overflowed"))?;
+            if output_bytes > MAX_STDLIB_STRING_BYTES {
+                anyhow::bail!("String::repeat output exceeds {MAX_STDLIB_STRING_BYTES} bytes");
+            }
+            Ok(Value::String(value.repeat(count)))
+        }
+        (Value::String(value), "is_ascii_digit") => {
+            expect_method_arity("String", method, args, 0)?;
+            let mut characters = value.chars();
+            Ok(Value::Bool(matches!(
+                (characters.next(), characters.next()),
+                (Some(character), None) if character.is_ascii_digit()
+            )))
+        }
+        (Value::String(value), "to_digit") => {
+            expect_method_arity("String", method, args, 1)?;
+            let radix = method_integer_arg("String", method, args, 0)?;
+            let radix = u32::try_from(radix)
+                .ok()
+                .filter(|radix| (2..=36).contains(radix));
+            let mut characters = value.chars();
+            let digit = match (characters.next(), characters.next(), radix) {
+                (Some(character), None, Some(radix)) => character.to_digit(radix),
+                _ => None,
+            };
+            Ok(option_value(
+                digit.map(|digit| Value::Int(i64::from(digit))),
+            ))
+        }
+        (Value::String(value), "parse") => {
+            expect_method_arity("String", method, args, 0)?;
+            let target = parse_target(type_args, result_type)
+                .ok_or_else(|| anyhow::anyhow!("String::parse has no resolved target type"))?;
+            let parsed = match target.as_str() {
+                "i32" => parse_i32(value).map(|value| Value::Int(i64::from(value))),
+                "i64" => parse_i64(value).map(Value::Int),
+                "f64" => parse_f64(value).map(Value::Float),
+                target => anyhow::bail!("String::parse does not support target `{target}`"),
+            };
+            Ok(result_value(parsed.map_err(|error| error.to_string())))
         }
         (Value::String(value), "iter" | "into_iter") => {
             expect_method_arity("String", method, args, 0)?;
@@ -6181,9 +6330,81 @@ fn call_builtin_method(
             };
             Ok(Value::Float(value))
         }
+        (Value::Float(value), "min" | "max" | "clamp") => {
+            let expected = if method == "clamp" { 2 } else { 1 };
+            expect_method_arity("f64", method, args, expected)?;
+            let number = |index| match args.get(index) {
+                Some(Value::Float(value)) => Ok(*value),
+                _ => anyhow::bail!("f64::{method} expects floating-point arguments"),
+            };
+            let result = if method == "min" {
+                value.min(number(0)?)
+            } else if method == "max" {
+                value.max(number(0)?)
+            } else {
+                let minimum = number(0)?;
+                let maximum = number(1)?;
+                if minimum.is_nan() || maximum.is_nan() {
+                    anyhow::bail!("f64::clamp bounds must not be NaN");
+                }
+                if minimum > maximum {
+                    anyhow::bail!("f64::clamp minimum exceeds maximum");
+                }
+                value.clamp(minimum, maximum)
+            };
+            Ok(Value::Float(result))
+        }
+        (
+            Value::Int(value),
+            "abs" | "min" | "max" | "clamp" | "checked_add" | "checked_sub" | "checked_mul"
+            | "saturating_add" | "saturating_sub" | "saturating_mul",
+        ) => call_integer_method(*value, receiver_type, method, args),
+        (Value::Int(value), "try_into") => {
+            expect_method_arity("integer", method, args, 0)?;
+            let target = parse_target(type_args, result_type)
+                .ok_or_else(|| anyhow::anyhow!("integer::try_into has no resolved target type"))?;
+            if target != "i32" {
+                anyhow::bail!("integer::try_into does not support target `{target}`");
+            }
+            let converted = i32::try_from(*value)
+                .map(|value| Value::Int(i64::from(value)))
+                .map_err(|_| "number is outside the target range".to_string());
+            Ok(result_value(converted))
+        }
+        (Value::Int(_) | Value::Float(_) | Value::Bool(_), "into") => {
+            expect_method_arity(receiver.kind_name(), method, args, 0)?;
+            let target = type_args
+                .first()
+                .map(String::as_str)
+                .or(result_type)
+                .ok_or_else(|| anyhow::anyhow!("conversion has no resolved target type"))?;
+            cast_value(receiver.clone(), target)
+        }
         (Value::Array(values) | Value::Tuple(values), "len") => {
             expect_method_arity(receiver.kind_name(), method, args, 0)?;
             Ok(Value::Int(saturating_i64(values.len())))
+        }
+        (Value::Array(values), "is_empty") => {
+            expect_method_arity("array", method, args, 0)?;
+            Ok(Value::Bool(values.is_empty()))
+        }
+        (Value::Array(values), "get") => {
+            expect_method_arity("array", method, args, 1)?;
+            let index = method_integer_arg("array", method, args, 0)?;
+            let value = usize::try_from(index)
+                .ok()
+                .and_then(|index| values.get(index))
+                .cloned();
+            Ok(option_value(value))
+        }
+        (Value::Array(values), "first" | "last") => {
+            expect_method_arity("array", method, args, 0)?;
+            let value = if method == "first" {
+                values.first()
+            } else {
+                values.last()
+            };
+            Ok(option_value(value.cloned()))
         }
         (Value::Array(values), "slice") => {
             expect_method_arity("array", method, args, 2)?;
@@ -6216,9 +6437,72 @@ fn call_builtin_method(
             };
             Ok(Value::Int(index.map_or(-1, saturating_i64)))
         }
-        (Value::Array(values), "includes") => {
+        (Value::Array(values), "contains" | "includes") => {
             expect_method_arity("array", method, args, 1)?;
             Ok(Value::Bool(values.contains(&args[0])))
+        }
+        (
+            Value::Variant {
+                type_name,
+                case,
+                fields,
+            },
+            "is_some" | "is_none",
+        ) if type_name == "Option" => {
+            expect_method_arity("Option", method, args, 0)?;
+            let is_some = case == "Some" && fields.len() == 1;
+            Ok(Value::Bool(if method == "is_some" {
+                is_some
+            } else {
+                !is_some
+            }))
+        }
+        (
+            Value::Variant {
+                type_name,
+                case,
+                fields,
+            },
+            "is_ok" | "is_err",
+        ) if type_name == "Result" => {
+            expect_method_arity("Result", method, args, 0)?;
+            let is_ok = case == "Ok" && fields.len() == 1;
+            Ok(Value::Bool(if method == "is_ok" { is_ok } else { !is_ok }))
+        }
+        (
+            Value::Variant {
+                type_name,
+                case,
+                fields,
+            },
+            "unwrap_or",
+        ) if type_name == "Option" || type_name == "Result" => {
+            expect_method_arity(type_name, method, args, 1)?;
+            let present = (type_name == "Option" && case == "Some")
+                || (type_name == "Result" && case == "Ok");
+            Ok(if present {
+                fields.first().cloned().ok_or_else(|| {
+                    anyhow::anyhow!("{type_name}::{case} has no payload for unwrap_or")
+                })?
+            } else {
+                args[0].clone()
+            })
+        }
+        (
+            Value::Variant {
+                type_name,
+                case,
+                fields,
+            },
+            "ok" | "err",
+        ) if type_name == "Result" => {
+            expect_method_arity("Result", method, args, 0)?;
+            let selected = (method == "ok" && case == "Ok") || (method == "err" && case == "Err");
+            Ok(option_value(if selected {
+                fields.first().cloned()
+            } else {
+                None
+            }))
         }
         (Value::Array(values), "iter" | "into_iter") => {
             expect_method_arity("array", method, args, 0)?;
@@ -6277,6 +6561,168 @@ fn call_builtin_method(
         _ => return Ok(None),
     };
     result.map(Some)
+}
+
+fn call_conversion_function(function: IntrinsicFunction, args: &[Value]) -> anyhow::Result<Value> {
+    if args.len() != 1 {
+        anyhow::bail!("Husk conversion function expects one argument");
+    }
+    let value = args[0].clone();
+    match function {
+        IntrinsicFunction::FromString => cast_value(value, "String"),
+        IntrinsicFunction::FromI64 => cast_value(value, "i64"),
+        IntrinsicFunction::FromF64 => cast_value(value, "f64"),
+        IntrinsicFunction::TryFromI32 => {
+            let converted = match value {
+                Value::String(value) => parse_i32(&value)
+                    .map(|value| Value::Int(i64::from(value)))
+                    .map_err(|error| error.to_string()),
+                Value::Int(value) => i32::try_from(value)
+                    .map(|value| Value::Int(i64::from(value)))
+                    .map_err(|_| "number is outside the target range".to_string()),
+                _ => anyhow::bail!("i32::try_from expects a String or i64"),
+            };
+            Ok(result_value(converted))
+        }
+        IntrinsicFunction::TryFromI64 => {
+            let Value::String(value) = value else {
+                anyhow::bail!("i64::try_from expects a String");
+            };
+            Ok(result_value(
+                parse_i64(&value)
+                    .map(Value::Int)
+                    .map_err(|error| error.to_string()),
+            ))
+        }
+        IntrinsicFunction::TryFromF64 => {
+            let Value::String(value) = value else {
+                anyhow::bail!("f64::try_from expects a String");
+            };
+            Ok(result_value(
+                parse_f64(&value)
+                    .map(Value::Float)
+                    .map_err(|error| error.to_string()),
+            ))
+        }
+        _ => anyhow::bail!("unsupported Husk conversion function"),
+    }
+}
+
+fn option_value(value: Option<Value>) -> Value {
+    match value {
+        Some(value) => enum_variant_value("Option", "Some", vec![value]),
+        None => enum_variant_value("Option", "None", Vec::new()),
+    }
+}
+
+fn result_value(value: Result<Value, String>) -> Value {
+    match value {
+        Ok(value) => enum_variant_value("Result", "Ok", vec![value]),
+        Err(error) => enum_variant_value("Result", "Err", vec![Value::String(error)]),
+    }
+}
+
+fn parse_target(type_args: &[String], result_type: Option<&str>) -> Option<String> {
+    type_args.first().cloned().or_else(|| {
+        result_type.and_then(|result| {
+            if matches!(result, "i32" | "i64" | "f64") {
+                return Some(result.to_string());
+            }
+            result
+                .strip_prefix("Result<")
+                .and_then(|result| result.split_once(','))
+                .map(|(target, _)| target.trim().to_string())
+        })
+    })
+}
+
+fn call_integer_method(
+    value: i64,
+    receiver_type: Option<&str>,
+    method: &str,
+    args: &[Value],
+) -> anyhow::Result<Value> {
+    let expected = match method {
+        "abs" => 0,
+        "clamp" => 2,
+        _ => 1,
+    };
+    expect_method_arity(receiver_type.unwrap_or("integer"), method, args, expected)?;
+    let argument =
+        |index| method_integer_arg(receiver_type.unwrap_or("integer"), method, args, index);
+    if receiver_type == Some("i32") {
+        let value = i32::try_from(value)
+            .map_err(|_| anyhow::anyhow!("i32::{method} receiver is outside the i32 range"))?;
+        let argument = |index| {
+            i32::try_from(argument(index)?)
+                .map_err(|_| anyhow::anyhow!("i32::{method} argument is outside the i32 range"))
+        };
+        return match method {
+            "abs" => value
+                .checked_abs()
+                .map(|value| Value::Int(i64::from(value)))
+                .ok_or_else(|| anyhow::anyhow!("i32::abs overflowed")),
+            "min" => Ok(Value::Int(i64::from(value.min(argument(0)?)))),
+            "max" => Ok(Value::Int(i64::from(value.max(argument(0)?)))),
+            "clamp" => {
+                let minimum = argument(0)?;
+                let maximum = argument(1)?;
+                if minimum > maximum {
+                    anyhow::bail!("i32::clamp minimum exceeds maximum");
+                }
+                Ok(Value::Int(i64::from(value.clamp(minimum, maximum))))
+            }
+            "checked_add" => Ok(option_value(
+                value
+                    .checked_add(argument(0)?)
+                    .map(|value| Value::Int(i64::from(value))),
+            )),
+            "checked_sub" => Ok(option_value(
+                value
+                    .checked_sub(argument(0)?)
+                    .map(|value| Value::Int(i64::from(value))),
+            )),
+            "checked_mul" => Ok(option_value(
+                value
+                    .checked_mul(argument(0)?)
+                    .map(|value| Value::Int(i64::from(value))),
+            )),
+            "saturating_add" => Ok(Value::Int(i64::from(value.saturating_add(argument(0)?)))),
+            "saturating_sub" => Ok(Value::Int(i64::from(value.saturating_sub(argument(0)?)))),
+            "saturating_mul" => Ok(Value::Int(i64::from(value.saturating_mul(argument(0)?)))),
+            _ => anyhow::bail!("unsupported i32 method `{method}`"),
+        };
+    }
+
+    match method {
+        "abs" => value
+            .checked_abs()
+            .map(Value::Int)
+            .ok_or_else(|| anyhow::anyhow!("i64::abs overflowed")),
+        "min" => Ok(Value::Int(value.min(argument(0)?))),
+        "max" => Ok(Value::Int(value.max(argument(0)?))),
+        "clamp" => {
+            let minimum = argument(0)?;
+            let maximum = argument(1)?;
+            if minimum > maximum {
+                anyhow::bail!("i64::clamp minimum exceeds maximum");
+            }
+            Ok(Value::Int(value.clamp(minimum, maximum)))
+        }
+        "checked_add" => Ok(option_value(
+            value.checked_add(argument(0)?).map(Value::Int),
+        )),
+        "checked_sub" => Ok(option_value(
+            value.checked_sub(argument(0)?).map(Value::Int),
+        )),
+        "checked_mul" => Ok(option_value(
+            value.checked_mul(argument(0)?).map(Value::Int),
+        )),
+        "saturating_add" => Ok(Value::Int(value.saturating_add(argument(0)?))),
+        "saturating_sub" => Ok(Value::Int(value.saturating_sub(argument(0)?))),
+        "saturating_mul" => Ok(Value::Int(value.saturating_mul(argument(0)?))),
+        _ => anyhow::bail!("unsupported i64 method `{method}`"),
+    }
 }
 
 fn receiver_local_cell(receiver: &Expr, frame: &Frame) -> anyhow::Result<CellHandle> {
@@ -6566,7 +7012,7 @@ mod tests {
                 return [39 / 4, -39 / 4, 39.0 / 4.0];
             }
         "#;
-        let mut host = TestHost::default();
+        let mut host = TestHost;
         let mut vm = Vm::new();
 
         vm.load_plugin("division", source, &mut host).unwrap();
@@ -6588,7 +7034,7 @@ mod tests {
                 return 1 / 0;
             }
         "#;
-        let mut host = TestHost::default();
+        let mut host = TestHost;
         let mut vm = Vm::new();
 
         vm.load_plugin("division", source, &mut host).unwrap();
@@ -6757,7 +7203,7 @@ mod tests {
                 recurse();
             }
         "#;
-        let mut host = TestHost::default();
+        let mut host = TestHost;
         let mut vm = Vm::new();
         vm.set_instruction_budget(32);
 
@@ -6795,7 +7241,7 @@ mod tests {
                 let style = event.theme.uiStyle.popupTitle;
             }
         "#;
-        let mut host = TestHost::default();
+        let mut host = TestHost;
         let mut vm = Vm::new();
         vm.load_plugin("fidget", source, &mut host).unwrap();
 
@@ -6825,7 +7271,7 @@ mod tests {
 
     #[test]
     fn heap_collects_unreachable_recursive_closure_cycles() {
-        let mut host = TestHost::default();
+        let mut host = TestHost;
         let mut vm = Vm::new();
         vm.set_heap_limits(2, 1024 * 1024);
         vm.load_plugin(
@@ -6852,7 +7298,7 @@ mod tests {
 
     #[test]
     fn stale_closure_handle_is_rejected_after_collection_and_slot_reuse() {
-        let mut host = TestHost::default();
+        let mut host = TestHost;
         let mut vm = Vm::new();
         vm.set_instance_generation(7);
         vm.load_plugin(

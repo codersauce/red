@@ -13,6 +13,7 @@ members = [
     "crates/husk-parser",
     "crates/husk-runtime",
     "crates/husk-semantic",
+    "crates/husk-stdlib",
     "crates/husk-types",
     "crates/husk-value",
     "crates/husk-wasm",
@@ -38,6 +39,7 @@ husk-package = { version = "0.1.0", path = "crates/husk-package" }
 husk-parser = { version = "0.1.0", path = "crates/husk-parser" }
 husk-runtime = { version = "0.1.0", path = "crates/husk-runtime", default-features = false }
 husk-semantic = { version = "0.1.0", path = "crates/husk-semantic" }
+husk-stdlib = { version = "0.1.0", path = "crates/husk-stdlib" }
 husk-types = { version = "0.1.0", path = "crates/husk-types" }
 husk-value = { version = "0.1.0", path = "crates/husk-value" }
 husk-wasm = { version = "0.1.0", path = "crates/husk-wasm" }

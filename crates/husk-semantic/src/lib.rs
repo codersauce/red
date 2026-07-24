@@ -478,7 +478,7 @@ pub fn analyze_file_without_prelude(file: &File) -> SemanticResult {
 
 static PRELUDE_SRC: &str = include_str!("stdlib/core.hk");
 static PRELUDE_AST: OnceLock<File> = OnceLock::new();
-static NATIVE_PRELUDE_SRC: &str = include_str!("stdlib/native.hk");
+static NATIVE_PRELUDE_SRC: &str = husk_stdlib::NATIVE_PRELUDE;
 static NATIVE_PRELUDE_AST: OnceLock<File> = OnceLock::new();
 static STDLIB_INDEX: OnceLock<StdlibIndex> = OnceLock::new();
 
@@ -885,11 +885,16 @@ fn resolve_impl_member_type(
             let resolved = checker.resolve_type_expr(type_expr, &["T".to_string()]);
             substitute_type_param(&resolved, "T", &args[0])
         }
-        Type::Named { args, .. } if args.len() == 2 => {
+        Type::Named { name, args } if args.len() == 2 => {
+            let (first, second) = if name == "Result" {
+                ("T", "E")
+            } else {
+                ("K", "V")
+            };
             let resolved =
-                checker.resolve_type_expr(type_expr, &["K".to_string(), "V".to_string()]);
-            let resolved = substitute_type_param(&resolved, "K", &args[0]);
-            substitute_type_param(&resolved, "V", &args[1])
+                checker.resolve_type_expr(type_expr, &[first.to_string(), second.to_string()]);
+            let resolved = substitute_type_param(&resolved, first, &args[0]);
+            substitute_type_param(&resolved, second, &args[1])
         }
         _ => checker.resolve_type_expr(type_expr, &[]),
     }
@@ -2834,16 +2839,18 @@ impl<'a> FnContext<'a> {
                 }
                 None
             }
-            StmtKind::Expr(expr) | StmtKind::Semi(expr) => {
-                let ty = self.check_expr(expr);
-                if matches!(stmt.kind, StmtKind::Semi(_)) {
-                    return Some(Type::Primitive(PrimitiveType::Unit));
-                }
-                Some(ty)
+            StmtKind::Expr(expr) => {
+                let expected = self.ret_ty.clone();
+                Some(self.check_expr_with_expected(expr, Some(&expected)))
+            }
+            StmtKind::Semi(expr) => {
+                self.check_expr(expr);
+                Some(Type::Primitive(PrimitiveType::Unit))
             }
             StmtKind::Return { value } => {
                 let actual_ty = if let Some(expr) = value {
-                    self.check_expr(expr)
+                    let expected = self.ret_ty.clone();
+                    self.check_expr_with_expected(expr, Some(&expected))
                 } else {
                     Type::Primitive(PrimitiveType::Unit)
                 };
@@ -3305,7 +3312,69 @@ impl<'a> FnContext<'a> {
                     .as_ref()
                     .and_then(|name| self.tcx.env.functions.get(name).cloned());
 
-                let callee_ty = self.check_expr(callee);
+                let mut prechecked_arg_tys = None;
+                let callee_ty = if let ExprKind::Path { segments } = &callee.kind
+                    && segments.len() >= 2
+                {
+                    let type_name = &segments[0].name;
+                    let method_name = &segments[segments.len() - 1].name;
+                    let overloads: Vec<_> = self
+                        .tcx
+                        .env
+                        .impls
+                        .iter()
+                        .filter(|implementation| implementation.self_ty_name == *type_name)
+                        .filter_map(|implementation| {
+                            implementation
+                                .methods
+                                .get(method_name)
+                                .filter(|method| method.receiver.is_none())
+                                .cloned()
+                        })
+                        .collect();
+
+                    if overloads.len() > 1 {
+                        let arg_tys: Vec<_> = args
+                            .iter()
+                            .map(|argument| self.check_expr(argument))
+                            .collect();
+                        let matching =
+                            overloads.into_iter().find(|method| {
+                                method.params.len() == arg_tys.len()
+                                    && method.params.iter().zip(&arg_tys).all(
+                                        |(parameter, actual)| {
+                                            let expected =
+                                                self.tcx.resolve_type_expr(&parameter.ty, &[]);
+                                            self.types_compatible(&expected, actual)
+                                        },
+                                    )
+                            });
+
+                        if let Some(method) = matching {
+                            let params = method
+                                .params
+                                .iter()
+                                .map(|parameter| self.tcx.resolve_type_expr(&parameter.ty, &[]))
+                                .collect();
+                            let ret = method
+                                .ret_type
+                                .as_ref()
+                                .map(|ty| self.tcx.resolve_type_expr(ty, &[]))
+                                .unwrap_or_else(Type::unit);
+                            prechecked_arg_tys = Some(arg_tys);
+                            Type::Function {
+                                params,
+                                ret: Box::new(ret),
+                            }
+                        } else {
+                            self.check_expr(callee)
+                        }
+                    } else {
+                        self.check_expr(callee)
+                    }
+                } else {
+                    self.check_expr(callee)
+                };
                 let (param_tys, ret_ty) = match callee_ty {
                     Type::Function { params, ret } => (params, *ret),
                     other => {
@@ -3345,7 +3414,11 @@ impl<'a> FnContext<'a> {
                     for (i, arg) in args.iter().enumerate() {
                         let expected = param_tys.get(i);
                         // Use check_expr_with_expected to enable closure parameter inference
-                        let arg_ty = self.check_expr_with_expected(arg, expected);
+                        let arg_ty = prechecked_arg_tys
+                            .as_ref()
+                            .and_then(|types| types.get(i))
+                            .cloned()
+                            .unwrap_or_else(|| self.check_expr_with_expected(arg, expected));
 
                         // Collect substitutions for generic type parameters
                         if let Some(param_ty) = expected {
@@ -3621,6 +3694,22 @@ impl<'a> FnContext<'a> {
                     receiver_type_name,
                 );
 
+                if args.is_empty() {
+                    match method_name.as_str() {
+                        "into" => {
+                            return self.check_into_method(receiver, type_args, None, &expr.span);
+                        }
+                        "parse" => {
+                            return self.check_parse_method(receiver, type_args, None, &expr.span);
+                        }
+                        "try_into" => {
+                            return self
+                                .check_try_into_method(receiver, type_args, None, &expr.span);
+                        }
+                        _ => {}
+                    }
+                }
+
                 // Handle closure-taking array methods that require special type inference.
                 // These methods need the element type to construct expected closure types,
                 // enabling parameter inference for closures like `|x| x * 2`.
@@ -3866,6 +3955,11 @@ impl<'a> FnContext<'a> {
                         for impl_info in &self.tcx.env.impls {
                             // Match either the exact type name or the generic form
                             let matches = impl_info.self_ty_name == *type_name
+                                || impl_info
+                                    .self_ty_name
+                                    .split('<')
+                                    .next()
+                                    .is_some_and(|base| base == type_name)
                                 || generic_type_name
                                     .as_ref()
                                     .is_some_and(|g| impl_info.self_ty_name == *g);
@@ -7282,14 +7376,11 @@ fn main() {
         );
 
         // Check that the variant call was recorded correctly
-        let mut found_some = false;
-        for (_span, (enum_name, variant_name)) in &result.variant_calls {
-            if enum_name == "Option" && variant_name == "Some" {
-                found_some = true;
-            }
-        }
         assert!(
-            found_some,
+            result
+                .variant_calls
+                .values()
+                .any(|(enum_name, variant_name)| enum_name == "Option" && variant_name == "Some"),
             "Should have recorded Some as a variant call for Option enum"
         );
     }

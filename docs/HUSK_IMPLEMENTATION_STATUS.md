@@ -1,6 +1,6 @@
 # Husk extraction implementation status
 
-Checkpoint: 2026-07-19
+Checkpoint: 2026-07-24
 
 This document records what was actually implemented from the
 [Husk extraction plan](HUSK_LANGUAGE_EXTRACTION_PLAN.md). It is deliberately
@@ -77,6 +77,7 @@ This is not yet a release-complete extraction. The main remaining work is:
 | `husk-analysis` | Recovered document analysis, UTF-16 positions, workspace symbols, references, and formatting. |
 | `husk-runtime` | Compiler orchestration, resolved HIR interpreter, heap, embedding ownership, limits, and an internal compatibility VM used by Red during migration. |
 | `husk-value` | Detached, backend-neutral host boundary values. |
+| `husk-stdlib` | Backend-neutral native-prelude declarations and strict, reusable standard-library primitives. |
 | `husk-types` | Validated module/type/function descriptors and stable hashes. |
 | `husk-extension` | Strict `.huskext` manifests, bounded directory bundles, hashes, and capability-set validation. |
 | `husk-wasm` | Wasmtime Component inspection, descriptor derivation, dynamic calls, conversion, fuel, and store limits. |
@@ -98,6 +99,7 @@ husk-extension ──> husk-package         └──> husk-wasm (optional featu
 husk-analysis ──> frontend/package/runtime crates
 husk-lsp ──> husk-analysis + package/extension/runtime crates
 husk-cli ──> husk facade + husk-lsp
+husk-stdlib ──> husk-semantic + husk-runtime
 Red ──────> husk-runtime compatibility API (one VM per plugin)
 ```
 
@@ -124,7 +126,7 @@ No Husk crate depends on the Red root package.
 | Card | Status | Evidence and remaining work |
 | --- | --- | --- |
 | P2-01 explicit profiles | Complete | `SemanticProfile::{Native, LegacyJavaScript}` is explicit. The native profile rejects JavaScript-only constructs and does not receive JS globals. |
-| P2-02 neutral prelude | Mostly complete | `crates/husk-semantic/src/stdlib/native.hk` is a neutral native prelude and runtime primitives implement its supported behavior. The proposed separate `husk-stdlib` crate/index was not created; descriptor generation should replace the remaining declaration-file duplication before release. |
+| P2-02 neutral prelude | Complete | `crates/husk-stdlib/prelude/native.hk` is the canonical backend-neutral native prelude. `husk-stdlib` supplies strict numeric parsing, and native conformance tests cover parsing/conversions, `Option`/`Result`, strings, arrays, numeric helpers, and allocation limits without a JavaScript ABI. |
 
 ### Phase 3 — generic modules and Red separation
 

@@ -1279,6 +1279,7 @@ dependencies = [
  "husk-package",
  "husk-parser",
  "husk-semantic",
+ "husk-stdlib",
  "husk-types",
  "husk-value",
  "husk-wasm",
@@ -1293,8 +1294,13 @@ version = "0.1.0"
 dependencies = [
  "husk-ast",
  "husk-parser",
+ "husk-stdlib",
  "husk-types",
 ]
+
+[[package]]
+name = "husk-stdlib"
+version = "0.1.0"
 
 [[package]]
 name = "husk-types"

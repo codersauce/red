@@ -18,6 +18,7 @@ husk-hir.workspace = true
 husk-parser.workspace = true
 husk-package.workspace = true
 husk-semantic.workspace = true
+husk-stdlib.workspace = true
 husk-types.workspace = true
 husk-value.workspace = true
 husk-wasm = { workspace = true, optional = true }
