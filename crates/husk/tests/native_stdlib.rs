@@ -1,4 +1,4 @@
-use husk::{Engine, OwnedValue};
+use husk::{Engine, Limits, OwnedValue};
 
 fn instance(source: &str) -> husk::Instance<()> {
     let engine = Engine::<()>::builder().build().unwrap();
@@ -86,12 +86,24 @@ fn parses_complete_signed_numbers_and_exposes_result_helpers() {
                 (i64::from(value), f64::from(value), String::from(value))
             }
 
+            fn converted_bool(value: bool) -> String {
+                String::from(value)
+            }
+
             fn parsed_static(value: String) -> (Result<i32, String>, Result<i64, String>, Result<f64, String>) {
                 (i32::try_from(value), i64::try_from(value), f64::try_from(value))
             }
 
             fn narrowed_static(value: i64) -> Result<i32, String> {
                 i32::try_from(value)
+            }
+
+            fn exact_float(value: i64) -> Result<f64, String> {
+                f64::try_from(value)
+            }
+
+            fn exact_float_method(value: i64) -> Result<f64, String> {
+                value.try_into::<f64>()
             }
         "#,
     );
@@ -202,6 +214,12 @@ fn parses_complete_signed_numbers_and_exposes_result_helpers() {
     );
     assert_eq!(
         instance
+            .call("converted_bool", &[OwnedValue::Bool(true)])
+            .unwrap(),
+        OwnedValue::String("true".to_string())
+    );
+    assert_eq!(
+        instance
             .call("parsed_static", &[OwnedValue::String("42".to_string())])
             .unwrap(),
         OwnedValue::Tuple(vec![
@@ -218,6 +236,56 @@ fn parses_complete_signed_numbers_and_exposes_result_helpers() {
             )
             .unwrap(),
         err("number is outside the target range")
+    );
+    assert_eq!(
+        instance
+            .call("exact_float", &[OwnedValue::I64(9_007_199_254_740_992)])
+            .unwrap(),
+        ok(OwnedValue::F64(9_007_199_254_740_992.0))
+    );
+    assert_eq!(
+        instance
+            .call(
+                "exact_float_method",
+                &[OwnedValue::I64(9_007_199_254_740_993)]
+            )
+            .unwrap(),
+        err("number cannot be represented exactly as f64")
+    );
+}
+
+#[test]
+fn inexact_i64_to_f64_is_not_declared_as_an_infallible_conversion() {
+    let engine = Engine::<()>::builder().build().unwrap();
+    let error = engine
+        .compile_source(
+            "stdlib",
+            "stdlib.hk",
+            "fn invalid(value: i64) -> f64 { value.into::<f64>() }",
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("the trait `From<i64>` is not implemented for `f64`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn native_array_sort_is_in_place_and_does_not_return_a_cloned_array() {
+    let mut instance =
+        instance("fn sorted(values: [i32]) { let mut values = values; values.sort() }");
+    assert_eq!(
+        instance
+            .call(
+                "sorted",
+                &[OwnedValue::List(vec![
+                    OwnedValue::I32(2),
+                    OwnedValue::I32(1),
+                ])],
+            )
+            .unwrap(),
+        OwnedValue::Unit
     );
 }
 
@@ -238,6 +306,18 @@ fn option_helpers_and_array_access_are_safe_and_typed() {
                     values.contains(4),
                 )
             }
+
+            fn mutation_state() -> (Option<i32>, Option<i32>, Option<i32>, Option<i32>, String) {
+                let mut values = [3, 1, 2];
+                values.sort();
+                let last = values.pop();
+                values.reverse();
+                let first = values.shift();
+                let final_value = values.shift();
+                let empty = values.shift();
+                values.unshift(4);
+                (last, first, final_value, empty, values.join(","))
+            }
         "#,
     );
 
@@ -257,6 +337,16 @@ fn option_helpers_and_array_access_are_safe_and_typed() {
             OwnedValue::Bool(true),
             OwnedValue::Bool(false),
             OwnedValue::I64(4),
+        ])
+    );
+    assert_eq!(
+        instance.call("mutation_state", &[]).unwrap(),
+        OwnedValue::Tuple(vec![
+            some(OwnedValue::I64(3)),
+            some(OwnedValue::I64(2)),
+            some(OwnedValue::I64(1)),
+            none(),
+            OwnedValue::String("4".to_string()),
         ])
     );
     assert_eq!(
@@ -496,7 +586,7 @@ fn allocation_limits_and_invalid_numeric_bounds_fail_cleanly() {
         .unwrap_err()
         .to_string();
     assert!(
-        oversized_replace.contains("String::replace output exceeds 16777216 bytes"),
+        oversized_replace.contains("replace output exceeds 16777216 bytes"),
         "{oversized_replace}"
     );
 
@@ -508,4 +598,30 @@ fn allocation_limits_and_invalid_numeric_bounds_fail_cleanly() {
         invalid_clamp.contains("f64::clamp bounds must not be NaN"),
         "{invalid_clamp}"
     );
+}
+
+#[test]
+fn configured_value_limit_applies_to_native_string_allocations() {
+    let limits = Limits {
+        max_value_bytes: 256,
+        ..Limits::default()
+    };
+    let engine = Engine::<()>::builder().limits(limits).build().unwrap();
+    let compiled = engine
+        .compile_source(
+            "stdlib",
+            "stdlib.hk",
+            "fn repeated(value: String, count: i32) -> String { value.repeat(count) }",
+        )
+        .unwrap();
+    let mut instance = engine.instantiate(compiled, ()).unwrap();
+
+    let error = instance
+        .call(
+            "repeated",
+            &[OwnedValue::String("ab".to_string()), OwnedValue::I32(129)],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("repeat output exceeds 256 bytes"), "{error}");
 }

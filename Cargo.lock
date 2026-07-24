@@ -1219,6 +1219,7 @@ version = "0.1.0"
 dependencies = [
  "husk-ast",
  "husk-parser",
+ "husk-stdlib",
 ]
 
 [[package]]

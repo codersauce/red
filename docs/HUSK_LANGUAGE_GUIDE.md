@@ -101,8 +101,9 @@ fn optional(value: String) -> i32 {
 `Result<T, String>`. Integer parsing accepts an optional sign and rejects
 whitespace, trailing characters, and overflow; floating-point parsing also
 rejects `NaN` and infinities. Use `trim()` deliberately when surrounding
-whitespace is valid input. Fallible narrowing is available as
-`value.try_into::<i32>()`. The equivalent trait forms, including
+whitespace is valid input. Fallible narrowing and exact `i64`-to-`f64`
+conversion are available as `value.try_into::<i32>()` and
+`value.try_into::<f64>()`. The equivalent trait forms, including
 `i32::try_from(value)` and `String::from(value)`, are also available.
 
 The initial prelude also provides:
@@ -113,9 +114,12 @@ The initial prelude also provides:
   `split_whitespace`, `lines`, `contains`, `strip_prefix`, `strip_suffix`,
   `replace`, `repeat`, `to_lowercase`, `to_uppercase`, `is_ascii_digit`, and
   `to_digit`, alongside the existing string operations. `repeat` rejects
-  negative counts, and `repeat`/`replace` reject outputs larger than 16 MiB.
+  negative counts, and `repeat`/`replace` reject outputs larger than the
+  configured value-size limit (16 MiB by default).
 - Arrays: `is_empty`, `get`, `first`, `last`, and `contains`, alongside the
-  existing array operations. Out-of-bounds `get` returns `None`.
+  existing array operations. Out-of-bounds `get`, `pop` on an empty array,
+  and `shift` on an empty array return `None`. `sort`, `reverse`, and
+  `unshift` mutate in place and return `()`.
 - Integers: `abs`, `min`, `max`, `clamp`, checked arithmetic returning
   `Option`, and saturating arithmetic at the declared integer width. Floats
   support `abs`, rounding, `min`, `max`, and `clamp`.

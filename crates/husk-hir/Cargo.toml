@@ -8,6 +8,7 @@ description = "Runtime-neutral high-level intermediate representation for Husk"
 
 [dependencies]
 husk-ast.workspace = true
+husk-stdlib.workspace = true
 
 [dev-dependencies]
 husk-parser.workspace = true

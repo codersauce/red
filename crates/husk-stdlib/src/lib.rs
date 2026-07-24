@@ -4,7 +4,11 @@
 //! signatures. Pure helpers in this crate are shared by runtime backends and
 //! deliberately have no dependency on the interpreter or host application.
 
+pub mod intrinsic;
 pub mod number;
 
-/// Canonical declarations injected into every native Husk compilation.
-pub const NATIVE_PRELUDE: &str = include_str!("../prelude/native.hk");
+pub use intrinsic::{
+    ArrayHigherOrderIntrinsic, ArrayIntrinsic, FloatIntrinsic, FunctionIntrinsic,
+    FunctionResolution, IntegerIntrinsic, IntegerWidth, OptionIntrinsic, RangeIntrinsic,
+    ReceiverKind, ReceiverMode, ResultIntrinsic, StdIntrinsic, StringIntrinsic, native_prelude,
+};

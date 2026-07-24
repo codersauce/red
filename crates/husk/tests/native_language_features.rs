@@ -340,7 +340,7 @@ fn mutable_array_methods_update_the_receiver_cell() {
                 let mut values = [3, 1, 2];
                 values.push(4);
                 values.sort();
-                let last = values.pop();
+                let last = values.pop().unwrap_or(0);
                 values.reverse();
                 (last, values.join(","))
             }

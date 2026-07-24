@@ -478,7 +478,6 @@ pub fn analyze_file_without_prelude(file: &File) -> SemanticResult {
 
 static PRELUDE_SRC: &str = include_str!("stdlib/core.hk");
 static PRELUDE_AST: OnceLock<File> = OnceLock::new();
-static NATIVE_PRELUDE_SRC: &str = husk_stdlib::NATIVE_PRELUDE;
 static NATIVE_PRELUDE_AST: OnceLock<File> = OnceLock::new();
 static STDLIB_INDEX: OnceLock<StdlibIndex> = OnceLock::new();
 
@@ -498,7 +497,7 @@ pub fn get_prelude_file() -> &'static File {
 /// Returns the backend-neutral native prelude.
 pub fn get_native_prelude_file() -> &'static File {
     NATIVE_PRELUDE_AST.get_or_init(|| {
-        let parsed = parse_str(NATIVE_PRELUDE_SRC);
+        let parsed = parse_str(husk_stdlib::native_prelude());
         if !parsed.errors.is_empty() {
             panic!("failed to parse native stdlib prelude: {:?}", parsed.errors);
         }
@@ -3338,6 +3337,12 @@ impl<'a> FnContext<'a> {
                             .iter()
                             .map(|argument| self.check_expr(argument))
                             .collect();
+                        for (argument, ty) in args.iter().zip(&arg_tys) {
+                            self.tcx.type_resolution.insert(
+                                (argument.span.range.start, argument.span.range.end),
+                                self.format_type(ty),
+                            );
+                        }
                         let matching =
                             overloads.into_iter().find(|method| {
                                 method.params.len() == arg_tys.len()
@@ -3817,7 +3822,13 @@ impl<'a> FnContext<'a> {
                                 let _ = self
                                     .check_expr_with_expected(closure_arg, Some(&expected_closure));
                             }
-                            return receiver_ty.clone();
+                            return if method_name == "sort"
+                                && self.tcx.profile == SemanticProfile::Native
+                            {
+                                Type::Primitive(PrimitiveType::Unit)
+                            } else {
+                                receiver_ty.clone()
+                            };
                         }
                         _ => {}
                     }
@@ -10027,8 +10038,9 @@ fn main() -> Result<i32, String> {
 
     #[test]
     fn native_prelude_is_backend_neutral_and_defines_json() {
-        assert!(!NATIVE_PRELUDE_SRC.contains("extern \"js\""));
-        assert!(!NATIVE_PRELUDE_SRC.contains("JsValue"));
+        let native_prelude = husk_stdlib::native_prelude();
+        assert!(!native_prelude.contains("extern \"js\""));
+        assert!(!native_prelude.contains("JsValue"));
         let parsed = parse_str("fn accepts(value: Json) {}");
         let result =
             analyze_file_with_options(parsed.file.as_ref().unwrap(), SemanticOptions::native());
