@@ -3867,6 +3867,7 @@ impl Editor {
         };
         let revision = buffer.revision();
         let file = buffer.file.clone();
+        let requires_document_prefix = self.highlighter.requires_document_prefix(file.as_deref());
         let line_count = buffer.len();
         if vtop >= line_count {
             return Ok(Vec::new());
@@ -3892,11 +3893,15 @@ impl Editor {
             } else {
                 8
             };
-            let mut parse_start = vtop.saturating_sub(margin);
+            let mut parse_start = if requires_document_prefix {
+                0
+            } else {
+                vtop.saturating_sub(margin)
+            };
             let mut parse_end = (vtop + height + margin).min(line_count);
 
             if buffer.line_range_byte_len(parse_start, parse_end) > MAX_HIGHLIGHT_SLICE_BYTES {
-                parse_start = vtop;
+                parse_start = if requires_document_prefix { 0 } else { vtop };
                 parse_end = viewport_end;
                 if buffer.line_range_byte_len(parse_start, parse_end) > MAX_HIGHLIGHT_SLICE_BYTES {
                     self.highlight_cache.remove(&buffer_index);
@@ -22757,6 +22762,17 @@ mod test {
         editor
     }
 
+    fn yaml_test_editor(contents: String, width: usize, height: usize) -> Editor {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+        let buffer = Buffer::new(Some("/tmp/red-highlight-test.yml".to_string()), contents);
+        let mut editor =
+            Editor::with_size(lsp, width, height, config, theme, vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        editor
+    }
+
     fn span_shape(spans: &[HighlightSpan]) -> Vec<(usize, usize, Style)> {
         spans
             .iter()
@@ -22791,6 +22807,90 @@ mod test {
         editor.current_buffer_mut().insert_str(0, 10, "// ");
         let after = editor.viewport_highlight_spans(0, 10, 20).unwrap();
         assert_ne!(span_shape(&before), span_shape(&after));
+    }
+
+    #[test]
+    fn yaml_highlighting_keeps_document_context_after_an_edit() {
+        let contents = r#"jobs:
+  test:
+    name: Test Suite
+    runs-on: >-
+      ${{
+        (
+          github.event_name != 'pull_request'
+        ) && matrix.platform.warp || matrix.platform.standard
+      }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - standard: ubuntu-latest
+            warp: warp-ubuntu-latest-x64-32x
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run tests
+        run: cargo test
+"#
+        .to_string();
+        let (vtop, height) = (12, 10);
+        let mut editor = yaml_test_editor(contents, 120, height + 2);
+
+        editor
+            .viewport_highlight_spans(0, 0, editor.current_buffer().len())
+            .unwrap();
+        let before = editor.viewport_highlight_spans(0, vtop, height).unwrap();
+        assert!(!before.is_empty());
+
+        let edit_line = 17;
+        let edit_column = editor
+            .current_buffer()
+            .get(edit_line)
+            .unwrap()
+            .trim_end_matches(['\r', '\n'])
+            .chars()
+            .count();
+        editor
+            .current_buffer_mut()
+            .insert_str(edit_column, edit_line, " ");
+        let edited_contents = editor.current_buffer().contents();
+        let after = editor.viewport_highlight_spans(0, vtop, height).unwrap();
+
+        let mut fresh = yaml_test_editor(edited_contents, 120, height + 2);
+        fresh
+            .viewport_highlight_spans(0, 0, fresh.current_buffer().len())
+            .unwrap();
+        let expected = fresh.viewport_highlight_spans(0, vtop, height).unwrap();
+
+        assert!(!after.is_empty());
+        assert_eq!(span_shape(&after), span_shape(&expected));
+        assert_eq!(editor.highlight_cache[&0].start_line, 0);
+    }
+
+    #[test]
+    fn context_independent_highlighting_keeps_the_small_edit_margin() {
+        let (vtop, height) = (30, 20);
+        let mut editor = rust_test_editor(100, 120, height + 2);
+        editor.viewport_highlight_spans(0, vtop, height).unwrap();
+
+        editor.current_buffer_mut().insert_str(0, vtop, "// ");
+        editor.viewport_highlight_spans(0, vtop, height).unwrap();
+
+        assert_eq!(editor.highlight_cache[&0].start_line, vtop - 8);
+    }
+
+    #[test]
+    fn yaml_highlighting_skips_an_oversized_required_prefix() {
+        let contents = format!(
+            "root:\n  oversized: {}\n  visible: value\n",
+            "x".repeat(MAX_HIGHLIGHT_SLICE_BYTES)
+        );
+        let mut editor = yaml_test_editor(contents, 80, 3);
+
+        assert!(editor.viewport_highlight_spans(0, 2, 1).unwrap().is_empty());
+        assert!(!editor.highlight_cache.contains_key(&0));
     }
 
     #[test]

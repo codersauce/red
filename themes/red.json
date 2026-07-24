@@ -150,6 +150,16 @@
       "settings": { "foreground": "#D8D8DE" }
     },
     {
+      "scope": [
+        "property",
+        "support.type.property-name",
+        "entity.name.tag.yaml",
+        "variable.other.member",
+        "variable.other.property"
+      ],
+      "settings": { "foreground": "#8FA8C8" }
+    },
+    {
       "scope": ["variable.parameter"],
       "settings": { "foreground": "#C8C8D2", "fontStyle": "italic" }
     },
