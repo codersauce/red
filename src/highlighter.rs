@@ -79,6 +79,37 @@ impl HuskStyles {
 
 const MAX_INJECTION_DEPTH: usize = 3;
 
+const LANGUAGE_NAMES: &[(&str, &str)] = &[
+    ("rs", "rust"),
+    ("rust", "rust"),
+    ("js", "javascript"),
+    ("javascript", "javascript"),
+    ("mjs", "javascript"),
+    ("cjs", "javascript"),
+    ("jsx", "jsx"),
+    ("ts", "typescript"),
+    ("typescript", "typescript"),
+    ("tsx", "tsx"),
+    ("json", "json"),
+    ("toml", "toml"),
+    ("yaml", "yaml"),
+    ("yml", "yaml"),
+    ("py", "python"),
+    ("python", "python"),
+    ("md", "markdown"),
+    ("markdown", "markdown"),
+    ("bash", "bash"),
+    ("sh", "bash"),
+    ("shell", "bash"),
+    ("zsh", "bash"),
+    ("powershell", "powershell"),
+    ("pwsh", "powershell"),
+    ("ps1", "powershell"),
+    ("lua", "lua"),
+    ("hk", "husk"),
+    ("husk", "husk"),
+];
+
 const YAML_ADDITIONAL_HIGHLIGHTS_QUERY: &str = r#"
 (escape_sequence) @escape
 
@@ -119,12 +150,12 @@ impl Highlighter {
         self.language_id_for_extension(&extension)
     }
 
-    /// Whether highlighting a file requires all text before the visible slice.
+    /// Whether highlighting a language requires all text before the visible slice.
     ///
     /// YAML structure is indentation-sensitive, so parsing an arbitrary indented
     /// viewport can lose the mapping and scalar context that determines its nodes.
-    pub(crate) fn requires_document_prefix(&self, file: Option<&str>) -> bool {
-        matches!(self.language_id_for_file(file), Some("yaml"))
+    pub(crate) fn requires_document_prefix(&self, language_id: Option<&str>) -> bool {
+        matches!(language_id, Some("yaml"))
     }
 
     pub fn language_id_for_extension(&self, extension: &str) -> Option<&'static str> {
@@ -134,6 +165,39 @@ impl Highlighter {
 
     pub fn language_id_for_name(&self, name: &str) -> Option<&'static str> {
         language_id_for_name(name).or_else(|| self.language_id_for_extension(name))
+    }
+
+    /// Returns the bundled canonical language identifiers in display order.
+    pub fn language_ids(&self) -> Vec<&'static str> {
+        let mut language_ids = self.languages.keys().copied().collect::<Vec<_>>();
+        language_ids.sort_unstable();
+        language_ids
+    }
+
+    /// Returns canonical language identifiers matching a name or extension prefix.
+    pub fn matching_language_ids(&self, prefix: &str) -> Vec<&'static str> {
+        let prefix = prefix.trim_start_matches('.').to_ascii_lowercase();
+        let mut language_ids = self
+            .languages
+            .keys()
+            .copied()
+            .filter(|language| language.starts_with(&prefix))
+            .chain(
+                self.extensions
+                    .iter()
+                    .filter(|(extension, _)| extension.starts_with(&prefix))
+                    .map(|(_, language)| *language),
+            )
+            .chain(
+                LANGUAGE_NAMES
+                    .iter()
+                    .filter(|(name, _)| name.starts_with(&prefix))
+                    .map(|(_, language)| *language),
+            )
+            .collect::<Vec<_>>();
+        language_ids.sort_unstable();
+        language_ids.dedup();
+        language_ids
     }
 
     pub fn highlight_for_file(
@@ -323,23 +387,10 @@ fn language_id_for_name(name: &str) -> Option<&'static str> {
     let name = name.trim().to_ascii_lowercase();
     let name = name.split_whitespace().next().unwrap_or_default();
 
-    match name {
-        "rs" | "rust" => Some("rust"),
-        "js" | "javascript" | "mjs" | "cjs" => Some("javascript"),
-        "jsx" => Some("jsx"),
-        "ts" | "typescript" => Some("typescript"),
-        "tsx" => Some("tsx"),
-        "json" => Some("json"),
-        "toml" => Some("toml"),
-        "yaml" | "yml" => Some("yaml"),
-        "py" | "python" => Some("python"),
-        "md" | "markdown" => Some("markdown"),
-        "bash" | "sh" | "shell" | "zsh" => Some("bash"),
-        "powershell" | "pwsh" | "ps1" => Some("powershell"),
-        "lua" => Some("lua"),
-        "hk" | "husk" => Some("husk"),
-        _ => None,
-    }
+    LANGUAGE_NAMES
+        .iter()
+        .find(|(candidate, _)| *candidate == name)
+        .map(|(_, language)| *language)
 }
 
 fn file_extension(file: &str) -> Option<String> {
@@ -850,10 +901,10 @@ mod tests {
     fn yaml_requires_document_prefix_for_highlighting() {
         let highlighter = highlighter();
 
-        assert!(highlighter.requires_document_prefix(Some("workflow.yml")));
-        assert!(highlighter.requires_document_prefix(Some("config.yaml")));
-        assert!(!highlighter.requires_document_prefix(Some("main.rs")));
-        assert!(!highlighter.requires_document_prefix(Some("README.md")));
+        assert!(highlighter.requires_document_prefix(Some("yaml")));
+        assert!(!highlighter.requires_document_prefix(Some("rust")));
+        assert!(!highlighter.requires_document_prefix(Some("markdown")));
+        assert!(!highlighter.requires_document_prefix(None));
     }
 
     #[test]
@@ -938,6 +989,45 @@ mod tests {
         assert_eq!(highlighter.language_id_for_name("hk"), Some("husk"));
         assert_eq!(highlighter.language_id_for_name("husk"), Some("husk"));
         assert_eq!(highlighter.language_id_for_name("unknown"), None);
+    }
+
+    #[test]
+    fn lists_bundled_language_ids_in_display_order() {
+        let highlighter = highlighter();
+
+        assert_eq!(
+            highlighter.language_ids(),
+            vec![
+                "bash",
+                "husk",
+                "javascript",
+                "json",
+                "jsx",
+                "lua",
+                "markdown",
+                "powershell",
+                "python",
+                "rust",
+                "toml",
+                "tsx",
+                "typescript",
+                "yaml",
+            ]
+        );
+    }
+
+    #[test]
+    fn matches_language_ids_by_name_and_extension_prefix() {
+        let highlighter = highlighter();
+
+        assert_eq!(highlighter.matching_language_ids("ru"), vec!["rust"]);
+        assert_eq!(highlighter.matching_language_ids("ym"), vec!["yaml"]);
+        assert_eq!(highlighter.matching_language_ids(".rs"), vec!["rust"]);
+        assert_eq!(
+            highlighter.matching_language_ids("ts"),
+            vec!["tsx", "typescript"]
+        );
+        assert!(highlighter.matching_language_ids("unknown").is_empty());
     }
 
     #[test]

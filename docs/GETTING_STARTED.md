@@ -165,6 +165,7 @@ Enter Command mode with `:` or `;`.
 | `:sp [file]` / `:vs [file]` | Open a horizontal or vertical split |
 | `:close` / `:only` | Close the window or keep only the current window |
 | `:wrap` / `:nowrap` | Enable or disable wrapping |
+| `:syntax [language]` / `:syn [language]` / `:ft [language]` | Choose buffer-local syntax; use `auto` to reset or `off` to disable |
 | `:join [count]` / `:join! [count]` | Join with normalized or preserved spacing |
 | `:commands` | Open the command palette |
 

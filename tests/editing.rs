@@ -10,10 +10,10 @@ use red::{
         EditorToolCall, EditorToolRequest,
     },
     agent_workspace::ProposalWorkspace,
-    buffer::Buffer,
+    buffer::{Buffer, SyntaxSelection},
     clipboard::MemoryClipboardProvider,
     color::Color,
-    config::{Config, KeyAction},
+    config::{Config, KeyAction, MatchitLanguageConfig},
     editor::{Action, Content, Editor, Mode, SearchDirection},
     lsp::LspClient,
     plugin::{
@@ -534,6 +534,59 @@ async fn comment_unnamed_buffer_fails_without_changing_the_buffer() {
         Some("no comment syntax configured for unnamed buffer")
     );
     assert!(!harness.is_dirty());
+}
+
+#[tokio::test]
+async fn forced_syntax_controls_commenting_for_the_current_buffer() {
+    let mut config = default_key_config();
+    config
+        .commenting
+        .languages
+        .insert("txt".to_string(), "; %s".to_string());
+    let buffer = Buffer::new(Some("notes.txt".to_string()), "alpha".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    let revision = harness.editor.test_current_buffer().revision();
+
+    harness
+        .execute_action(Action::Command("syntax rs".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.editor.test_current_buffer().syntax_selection(),
+        &SyntaxSelection::Language("rust".to_string())
+    );
+    assert_eq!(harness.editor.test_current_buffer().revision(), revision);
+    assert!(!harness.is_dirty());
+    assert_eq!(harness.last_error(), Some("syntax: rust"));
+
+    type_normal_keys(&mut harness, "gcc").await;
+
+    harness.assert_buffer_contents("// alpha");
+}
+
+#[tokio::test]
+async fn forced_syntax_controls_language_specific_matchit_groups() {
+    let mut config = default_key_config();
+    config.matchit.languages.insert(
+        "rust".to_string(),
+        MatchitLanguageConfig {
+            groups: vec![vec!["\\bbegin\\b".to_string(), "\\bend\\b".to_string()]],
+        },
+    );
+    let buffer = Buffer::new(Some("notes.txt".to_string()), "begin value end".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    harness
+        .execute_action(Action::Command("syntax rust".to_string()))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::MatchitForward)
+        .await
+        .unwrap();
+
+    assert_eq!(harness.cursor_position(), (12, 0));
 }
 
 #[tokio::test]
@@ -2005,6 +2058,33 @@ fn command_tab_ignores_non_file_commands() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn command_tab_completes_syntax_names_and_aliases() {
+    for (command, expected) in [
+        ("syntax ru", "syntax rust"),
+        ("syn ym", "syn yaml"),
+        ("ft rs", "ft rust"),
+        ("syntax ", "syntax auto"),
+    ] {
+        let mut harness = EditorHarness::with_content("");
+        harness.set_commandline(Mode::Command, command);
+
+        harness.editor.test_complete_command_path_next();
+
+        assert_eq!(harness.commandline_text(), expected);
+    }
+}
+
+#[test]
+fn command_tab_does_not_complete_a_second_syntax_argument() {
+    let mut harness = EditorHarness::with_content("");
+    harness.set_commandline(Mode::Command, "syntax rust extra");
+
+    harness.editor.test_complete_command_path_next();
+
+    assert_eq!(harness.commandline_text(), "syntax rust extra");
+}
+
 #[tokio::test]
 async fn command_tab_key_event_completes_file_argument() {
     let root = env::temp_dir().join(format!(
@@ -2065,6 +2145,80 @@ async fn wrap_commands_toggle_line_wrapping() {
         .await
         .unwrap();
     assert!(harness.wrap());
+}
+
+#[tokio::test]
+async fn syntax_commands_set_reset_and_disable_buffer_local_syntax() {
+    let buffer = Buffer::new(Some("notes.txt".to_string()), "fn main() {}".to_string());
+    let mut harness = EditorHarness::with_buffer(buffer);
+
+    harness
+        .execute_action(Action::Command("ft RS".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.editor.test_current_buffer().syntax_selection(),
+        &SyntaxSelection::Language("rust".to_string())
+    );
+    assert_eq!(harness.last_error(), Some("syntax: rust"));
+    assert!(!harness.is_dirty());
+
+    harness
+        .execute_action(Action::Command("syn off".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.editor.test_current_buffer().syntax_selection(),
+        &SyntaxSelection::Off
+    );
+    assert_eq!(harness.last_error(), Some("syntax: off"));
+
+    harness
+        .execute_action(Action::Command("syntax auto".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.editor.test_current_buffer().syntax_selection(),
+        &SyntaxSelection::Auto
+    );
+    assert_eq!(harness.last_error(), Some("syntax: auto"));
+}
+
+#[tokio::test]
+async fn invalid_syntax_commands_leave_the_existing_selection_unchanged() {
+    let buffer = Buffer::new(Some("notes.txt".to_string()), "fn main() {}".to_string());
+    let mut harness = EditorHarness::with_buffer(buffer);
+    harness
+        .execute_action(Action::Command("syntax rust".to_string()))
+        .await
+        .unwrap();
+
+    harness
+        .execute_action(Action::Command("syntax madeup".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.editor.test_current_buffer().syntax_selection(),
+        &SyntaxSelection::Language("rust".to_string())
+    );
+    assert_eq!(
+        harness.last_error(),
+        Some("unknown syntax \"madeup\" (try :syntax)")
+    );
+
+    harness
+        .execute_action(Action::Command("syntax rust yaml".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.editor.test_current_buffer().syntax_selection(),
+        &SyntaxSelection::Language("rust".to_string())
+    );
+    assert_eq!(
+        harness.last_error(),
+        Some("usage: syntax [language|auto|off]")
+    );
+    assert!(!harness.is_dirty());
 }
 
 #[tokio::test]

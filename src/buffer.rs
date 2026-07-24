@@ -51,6 +51,18 @@ pub struct SearchMatch {
     pub end_y: usize,
 }
 
+/// Buffer-local syntax-highlighting selection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SyntaxSelection {
+    /// Detect syntax from the buffer's file name.
+    #[default]
+    Auto,
+    /// Disable syntax highlighting.
+    Off,
+    /// Highlight using the selected canonical language identifier.
+    Language(String),
+}
+
 /// Buffer represents an editable text buffer, which may be associated with a file.
 /// It maintains the text content as a rope data structure for efficient editing operations.
 #[derive(Debug)]
@@ -78,6 +90,9 @@ pub struct Buffer {
 
     /// Monotonic content revision used by render caches.
     revision: u64,
+
+    /// Buffer-local syntax-highlighting selection.
+    syntax_selection: SyntaxSelection,
 }
 
 impl Buffer {
@@ -98,6 +113,7 @@ impl Buffer {
             vtop: 0,
             undo_history: UndoHistory::default(),
             revision: 0,
+            syntax_selection: SyntaxSelection::Auto,
         }
     }
 
@@ -195,6 +211,16 @@ impl Buffer {
                 .next_back()
                 .map(|ext| ext.to_string().to_lowercase())
         })
+    }
+
+    /// Returns the buffer-local syntax-highlighting selection.
+    pub fn syntax_selection(&self) -> &SyntaxSelection {
+        &self.syntax_selection
+    }
+
+    /// Sets the buffer-local syntax-highlighting selection without changing the text.
+    pub fn set_syntax_selection(&mut self, selection: SyntaxSelection) {
+        self.syntax_selection = selection;
     }
 
     /// Gets the full contents of the buffer as a single string
@@ -1148,6 +1174,25 @@ mod test {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
+    #[test]
+    fn syntax_selection_is_buffer_local_and_does_not_change_revision() {
+        let mut buffer = Buffer::new(Some("notes.txt".to_string()), "fn main() {}".to_string());
+        let revision = buffer.revision();
+
+        assert_eq!(buffer.syntax_selection(), &SyntaxSelection::Auto);
+
+        buffer.set_syntax_selection(SyntaxSelection::Language("rust".to_string()));
+        assert_eq!(
+            buffer.syntax_selection(),
+            &SyntaxSelection::Language("rust".to_string())
+        );
+        assert_eq!(buffer.revision(), revision);
+        assert!(!buffer.is_dirty());
+
+        buffer.set_syntax_selection(SyntaxSelection::Off);
+        assert_eq!(buffer.syntax_selection(), &SyntaxSelection::Off);
+        assert_eq!(buffer.revision(), revision);
+    }
     fn unique_temp_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("red-{name}-{}", uuid::Uuid::new_v4()))
     }

@@ -71,7 +71,7 @@ use crate::{
     agent_workspace::{
         ProposalDisposition, ProposalToolHost, ProposalWorkspace, StagedProposalAcceptance,
     },
-    buffer::{Buffer, BufferId, SearchMatch},
+    buffer::{Buffer, BufferId, SearchMatch, SyntaxSelection},
     clipboard::{ClipboardProvider, DisabledClipboardProvider, NativeClipboardProvider},
     codex::{start_codex, CodexBridge, CodexCommand, CodexEvent, CodexProcessSpec},
     color::Color,
@@ -1345,6 +1345,8 @@ pub enum Action {
     DeleteBuffer(bool),
     FilePicker,
     CommandPalette,
+    OpenSyntaxPicker,
+    SetSyntax(String),
     ConfigDiagnostics,
     ShowDialog,
     CloseDialog,
@@ -1546,6 +1548,7 @@ pub struct HighlightSpan {
 struct ViewportHighlightEntry {
     revision: u64,
     file: Option<String>,
+    language_id: Option<&'static str>,
     /// First buffer line included in the parse.
     start_line: usize,
     /// Byte offset of each parsed line within the parsed text, plus a final
@@ -3840,13 +3843,28 @@ impl Editor {
         self.highlighter.highlight_for_file(file, code)
     }
 
-    fn highlight_spans(
+    fn highlight_spans_for_language(
         &mut self,
-        file: Option<&str>,
+        language_id: Option<&str>,
         code: &str,
     ) -> anyhow::Result<Vec<HighlightSpan>> {
-        self.highlight(file, code)
+        let Some(language_id) = language_id else {
+            return Ok(Vec::new());
+        };
+        self.highlighter
+            .highlight(language_id, code)
             .map(style_info_to_highlight_spans)
+    }
+
+    fn highlight_language_id_for_buffer_index(&self, buffer_index: usize) -> Option<&'static str> {
+        let buffer = self.buffer_manager.get(buffer_index)?;
+        match buffer.syntax_selection() {
+            SyntaxSelection::Auto => self
+                .highlighter
+                .language_id_for_file(buffer.file.as_deref()),
+            SyntaxSelection::Off => None,
+            SyntaxSelection::Language(language) => self.highlighter.language_id_for_name(language),
+        }
     }
 
     /// Returns highlight spans positioned relative to the viewport text
@@ -3867,7 +3885,8 @@ impl Editor {
         };
         let revision = buffer.revision();
         let file = buffer.file.clone();
-        let requires_document_prefix = self.highlighter.requires_document_prefix(file.as_deref());
+        let language_id = self.highlight_language_id_for_buffer_index(buffer_index);
+        let requires_document_prefix = self.highlighter.requires_document_prefix(language_id);
         let line_count = buffer.len();
         if vtop >= line_count {
             return Ok(Vec::new());
@@ -3875,8 +3894,9 @@ impl Editor {
         let viewport_end = (vtop + height).min(line_count);
 
         let cached = self.highlight_cache.get(&buffer_index);
-        let same_document =
-            cached.is_some_and(|entry| entry.revision == revision && entry.file == file);
+        let same_document = cached.is_some_and(|entry| {
+            entry.revision == revision && entry.file == file && entry.language_id == language_id
+        });
         let covered = same_document
             && cached.is_some_and(|entry| {
                 let parse_end = entry.start_line + entry.line_offsets.len().saturating_sub(1);
@@ -3919,7 +3939,7 @@ impl Editor {
             }
             line_offsets.push(text.len());
 
-            let spans = self.highlight_spans(file.as_deref(), &text)?;
+            let spans = self.highlight_spans_for_language(language_id, &text)?;
             if self.highlight_cache.len() >= 32 {
                 self.highlight_cache.clear();
             }
@@ -3928,6 +3948,7 @@ impl Editor {
                 ViewportHighlightEntry {
                     revision,
                     file,
+                    language_id,
                     start_line: parse_start,
                     line_offsets,
                     spans,
@@ -3962,11 +3983,12 @@ impl Editor {
 
     fn draw_line(&mut self, buffer: &mut RenderBuffer) {
         let line = self.viewport_line(self.cy).unwrap_or_default();
-        let file = self.current_buffer().file.clone();
+        let language_id =
+            self.highlight_language_id_for_buffer_index(self.buffer_manager.active_index());
         let style_info = if line.len() > MAX_HIGHLIGHT_SLICE_BYTES {
             Vec::new()
         } else {
-            self.highlight_spans(file.as_deref(), &line)
+            self.highlight_spans_for_language(language_id, &line)
                 .unwrap_or_default()
         };
         let default_style = self.theme.style.clone();
@@ -9922,6 +9944,18 @@ impl Editor {
             }];
         }
 
+        if matches!(name, "syntax" | "syn" | "ft") {
+            let mut arguments = arguments.split_whitespace();
+            let Some(syntax) = arguments.next() else {
+                return vec![Action::OpenSyntaxPicker];
+            };
+            if arguments.next().is_some() {
+                self.last_error = Some("usage: syntax [language|auto|off]".to_string());
+                return Vec::new();
+            }
+            return vec![Action::SetSyntax(syntax.to_string())];
+        }
+
         let parsed = command::parse(command_palette::BUILTIN_COLON_COMMANDS, cmd);
 
         let Some(parsed) = parsed else {
@@ -10463,7 +10497,14 @@ impl Editor {
         )
     }
 
-    fn command_completion_context(command: &str) -> Option<CommandCompletionContext> {
+    fn command_accepts_syntax_completion(command: &str) -> bool {
+        matches!(command.trim_end_matches('!'), "syntax" | "syn" | "ft")
+    }
+
+    fn command_completion_context(
+        command: &str,
+        accepts_completion: fn(&str) -> bool,
+    ) -> Option<CommandCompletionContext> {
         let command_start = command
             .char_indices()
             .find_map(|(index, ch)| (!ch.is_whitespace()).then_some(index))?;
@@ -10473,7 +10514,7 @@ impl Editor {
             .find_map(|(index, ch)| ch.is_whitespace().then_some(command_start + index))
             .unwrap_or(command.len());
         let command_name = &command[command_start..command_end];
-        if !Self::command_accepts_file_completion(command_name) {
+        if !accepts_completion(command_name) {
             return None;
         }
 
@@ -10608,38 +10649,61 @@ impl Editor {
             }
         }
 
-        let (context, candidates) =
-            if let Some(context) = Self::command_completion_context(&self.command) {
-                let candidates = Self::path_completion_candidates(&context.fragment)
-                    .into_iter()
-                    .map(|candidate| candidate.replacement)
-                    .collect::<Vec<_>>();
-                (context, candidates)
+        let (context, candidates) = if let Some(context) =
+            Self::command_completion_context(&self.command, Self::command_accepts_file_completion)
+        {
+            let candidates = Self::path_completion_candidates(&context.fragment)
+                .into_iter()
+                .map(|candidate| candidate.replacement)
+                .collect::<Vec<_>>();
+            (context, candidates)
+        } else if let Some(context) =
+            Self::command_completion_context(&self.command, Self::command_accepts_syntax_completion)
+        {
+            let fragment = context.fragment.to_ascii_lowercase();
+            let mut candidates = if fragment.chars().any(char::is_whitespace) {
+                Vec::new()
             } else {
-                let command_start = self
-                    .command
-                    .char_indices()
-                    .find_map(|(index, ch)| (!ch.is_whitespace()).then_some(index))
-                    .unwrap_or(self.command.len());
-                let fragment = &self.command[command_start..];
-                if fragment.is_empty() || fragment.chars().any(char::is_whitespace) {
-                    self.command_completion = None;
-                    return;
-                }
-                let candidates = command_palette::colon_completion_names(plugin_commands)
+                ["auto", "off"]
                     .into_iter()
-                    .filter(|command| command.starts_with(fragment))
-                    .collect::<Vec<_>>();
-                (
-                    CommandCompletionContext {
-                        replacement_start: command_start,
-                        replacement_end: self.command.len(),
-                        fragment: fragment.to_string(),
-                        needs_leading_space: false,
-                    },
-                    candidates,
-                )
+                    .filter(|language| language.starts_with(&fragment))
+                    .map(str::to_string)
+                    .chain(
+                        self.highlighter
+                            .matching_language_ids(&fragment)
+                            .into_iter()
+                            .map(str::to_string),
+                    )
+                    .collect::<Vec<_>>()
             };
+            candidates.sort_unstable();
+            candidates.dedup();
+            (context, candidates)
+        } else {
+            let command_start = self
+                .command
+                .char_indices()
+                .find_map(|(index, ch)| (!ch.is_whitespace()).then_some(index))
+                .unwrap_or(self.command.len());
+            let fragment = &self.command[command_start..];
+            if fragment.is_empty() || fragment.chars().any(char::is_whitespace) {
+                self.command_completion = None;
+                return;
+            }
+            let candidates = command_palette::colon_completion_names(plugin_commands)
+                .into_iter()
+                .filter(|command| command.starts_with(fragment))
+                .collect::<Vec<_>>();
+            (
+                CommandCompletionContext {
+                    replacement_start: command_start,
+                    replacement_end: self.command.len(),
+                    fragment: fragment.to_string(),
+                    needs_leading_space: false,
+                },
+                candidates,
+            )
+        };
         if candidates.is_empty() {
             self.command_completion = None;
             return;
@@ -12019,6 +12083,10 @@ impl Editor {
     }
 
     fn current_language_id(&self) -> Option<String> {
+        if let SyntaxSelection::Language(language) = self.current_buffer().syntax_selection() {
+            return Some(language.clone());
+        }
+
         self.highlighter
             .language_id_for_file(self.current_buffer().file.as_deref())
             .map(str::to_string)
@@ -14631,6 +14699,49 @@ impl Editor {
                 self.current_dialog = Some(Box::new(picker));
                 self.render(buffer)?;
             }
+            Action::OpenSyntaxPicker => {
+                let items = ["auto", "off"]
+                    .into_iter()
+                    .chain(self.highlighter.language_ids())
+                    .map(str::to_string)
+                    .collect();
+                let picker = Picker::builder()
+                    .title("Syntax")
+                    .items(items)
+                    .placeholder("Select a syntax or choose auto/off")
+                    .select_action(Action::SetSyntax)
+                    .build(self);
+                self.release_current_dialog_callbacks(runtime);
+                self.current_dialog = Some(Box::new(picker));
+                self.render(buffer)?;
+            }
+            Action::SetSyntax(syntax) => {
+                let syntax = syntax.trim();
+                let (selection, label) = match syntax.to_ascii_lowercase().as_str() {
+                    "auto" => (SyntaxSelection::Auto, "auto"),
+                    "off" => (SyntaxSelection::Off, "off"),
+                    _ => {
+                        let Some(language_id) = self.highlighter.language_id_for_name(syntax)
+                        else {
+                            self.last_error =
+                                Some(format!("unknown syntax {syntax:?} (try :syntax)"));
+                            self.render(buffer)?;
+                            return Ok(false);
+                        };
+                        (
+                            SyntaxSelection::Language(language_id.to_string()),
+                            language_id,
+                        )
+                    }
+                };
+                self.current_buffer_mut().set_syntax_selection(selection);
+                self.highlight_cache
+                    .remove(&self.buffer_manager.active_index());
+                self.bracket_match_cache = None;
+                self.force_full_redraw = true;
+                self.last_error = Some(format!("syntax: {label}"));
+                self.render(buffer)?;
+            }
             Action::ConfigDiagnostics => {
                 self.release_current_dialog_callbacks(runtime);
                 self.open_config_diagnostics();
@@ -17175,10 +17286,21 @@ impl Editor {
             return None;
         };
         let extension = self.current_buffer().file_type();
-        let template = extension
-            .as_deref()
-            .and_then(|extension| self.config.commenting.languages.get(extension))
-            .or_else(|| self.config.commenting.languages.get(&language));
+        let template = if matches!(
+            self.current_buffer().syntax_selection(),
+            SyntaxSelection::Language(_)
+        ) {
+            self.config.commenting.languages.get(&language).or_else(|| {
+                extension
+                    .as_deref()
+                    .and_then(|extension| self.config.commenting.languages.get(extension))
+            })
+        } else {
+            extension
+                .as_deref()
+                .and_then(|extension| self.config.commenting.languages.get(extension))
+                .or_else(|| self.config.commenting.languages.get(&language))
+        };
         let Some(template) = template else {
             self.last_error = Some(format!("no comment syntax configured for {language}"));
             return None;
@@ -20990,6 +21112,55 @@ mod test {
     }
 
     #[tokio::test]
+    async fn syntax_picker_opens_from_colon_command_and_applies_selected_language() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 14);
+        editor.buffer_manager.replace_buffers(vec![Buffer::new(
+            Some("notes.txt".to_string()),
+            "fn main() {}".to_string(),
+        )]);
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 14, &Style::default());
+        let mut runtime = Runtime::new();
+
+        enter_colon_command(&mut editor, &mut buffer, &mut runtime, "syntax").await;
+
+        let frame = render_text_rows(&buffer).join("\n");
+        assert!(editor.current_dialog.is_some());
+        assert!(frame.contains("Syntax"));
+        assert!(frame.contains("auto"));
+        assert!(frame.contains("off"));
+
+        editor
+            .process_editor_event(
+                Event::Paste("rust".to_string()),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+        assert!(render_text_rows(&buffer).join("\n").contains("rust"));
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &mut buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert!(editor.current_dialog.is_none());
+        assert_eq!(
+            editor.current_buffer().syntax_selection(),
+            &SyntaxSelection::Language("rust".to_string())
+        );
+        assert_eq!(editor.last_error.as_deref(), Some("syntax: rust"));
+    }
+
+    #[tokio::test]
     async fn command_palette_searches_and_runs_a_registered_plugin_command() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
@@ -22810,6 +22981,30 @@ mod test {
     }
 
     #[test]
+    fn viewport_highlight_cache_follows_buffer_syntax_selection() {
+        let mut editor = rust_test_editor(100, 120, 22);
+        editor.current_buffer_mut().file = Some("notes.txt".to_string());
+
+        let automatic = editor.viewport_highlight_spans(0, 10, 20).unwrap();
+        assert!(automatic.is_empty());
+        assert_eq!(editor.highlight_cache[&0].language_id, None);
+
+        editor
+            .current_buffer_mut()
+            .set_syntax_selection(SyntaxSelection::Language("rust".to_string()));
+        let forced = editor.viewport_highlight_spans(0, 10, 20).unwrap();
+        assert!(!forced.is_empty());
+        assert_eq!(editor.highlight_cache[&0].language_id, Some("rust"));
+
+        editor
+            .current_buffer_mut()
+            .set_syntax_selection(SyntaxSelection::Off);
+        let disabled = editor.viewport_highlight_spans(0, 10, 20).unwrap();
+        assert!(disabled.is_empty());
+        assert_eq!(editor.highlight_cache[&0].language_id, None);
+    }
+
+    #[test]
     fn yaml_highlighting_keeps_document_context_after_an_edit() {
         let contents = r#"jobs:
   test:
@@ -22866,6 +23061,24 @@ mod test {
 
         assert!(!after.is_empty());
         assert_eq!(span_shape(&after), span_shape(&expected));
+        assert_eq!(editor.highlight_cache[&0].start_line, 0);
+    }
+
+    #[test]
+    fn forced_yaml_highlighting_keeps_required_document_prefix() {
+        let contents = (0..80)
+            .map(|line| format!("  key_{line}: value_{line}\n"))
+            .collect::<String>();
+        let mut editor = yaml_test_editor(format!("root:\n{contents}"), 120, 22);
+        editor.current_buffer_mut().file = Some("notes.txt".to_string());
+        editor
+            .current_buffer_mut()
+            .set_syntax_selection(SyntaxSelection::Language("yaml".to_string()));
+
+        let spans = editor.viewport_highlight_spans(0, 30, 20).unwrap();
+
+        assert!(!spans.is_empty());
+        assert_eq!(editor.highlight_cache[&0].language_id, Some("yaml"));
         assert_eq!(editor.highlight_cache[&0].start_line, 0);
     }
 
