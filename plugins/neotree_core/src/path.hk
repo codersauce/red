@@ -1,0 +1,123 @@
+// Pure, normalized project-path operations shared by Neo-tree actions and rendering.
+
+pub fn normalize(value: String) -> String {
+    let mut value = value.replace("\\", "/");
+    while value.len() > 1 && value.ends_with("/") {
+        value = value.strip_suffix("/").unwrap_or(value);
+    }
+    value
+}
+
+pub fn name(path: String) -> String {
+    let path = normalize(path);
+    if let Some(parts) = path.rsplit_once("/") {
+        return parts.1;
+    }
+    path
+}
+
+pub fn parent(path: String) -> String {
+    let path = normalize(path);
+    let Some(parts) = path.rsplit_once("/") else {
+        return ".";
+    };
+    if parts.0.is_empty() || parts.0 == "." {
+        return ".";
+    }
+    parts.0
+}
+
+pub fn join(parent: String, child: String) -> String {
+    let child = normalize(child);
+    if child.starts_with("./") || child.starts_with("/") {
+        return child;
+    }
+    if parent == "." {
+        return "./" + child;
+    }
+    normalize(parent) + "/" + child
+}
+
+pub fn workspace(path: String) -> String {
+    let path = normalize(path);
+    if path.starts_with("./") || path.starts_with("/") {
+        return path;
+    }
+    "./" + path
+}
+
+pub fn extension(name: String) -> String {
+    let Some(parts) = name.rsplit_once(".") else {
+        return "";
+    };
+    if parts.0.is_empty() {
+        return "";
+    }
+    "." + parts.1
+}
+
+pub fn basename(name: String) -> String {
+    let suffix = extension(name);
+    name.strip_suffix(suffix).unwrap_or(name)
+}
+
+pub fn tree_path(file: String, cwd: String) -> String {
+    if file.is_empty() {
+        return "";
+    }
+    let file = normalize(file);
+    let cwd = normalize(cwd);
+    let mut prefix = cwd + "/";
+    if cwd == "/" {
+        prefix = "/";
+    }
+    if let Some(relative) = file.strip_prefix(prefix) {
+        return "./" + relative;
+    }
+    if file.starts_with("/") {
+        return "";
+    }
+    if file.starts_with("./") {
+        return file;
+    }
+    "./" + file
+}
+
+pub fn reveal_parts(path: String) -> [String] {
+    let path = normalize(path);
+    let path = path.strip_prefix("./").unwrap_or(path);
+    if path.is_empty() || path == "." {
+        return [];
+    }
+    path.split("/")
+}
+
+#[test]
+fn normalizes_and_joins_workspace_paths() {
+    assert(normalize(".\\src\\main.rs/") == "./src/main.rs");
+    assert(name("./src/main.rs") == "main.rs");
+    assert(parent("./src/main.rs") == "./src");
+    assert(parent("./main.rs") == ".");
+    assert(join("./src/", "main.rs") == "./src/main.rs");
+    assert(join(".", "./other.rs") == "./other.rs");
+    assert(workspace("src/main.rs") == "./src/main.rs");
+}
+
+#[test]
+fn preserves_dotfiles_and_multi_part_extensions() {
+    assert(extension("main.test.rs") == ".rs");
+    assert(basename("main.test.rs") == "main.test");
+    assert(extension(".gitignore") == "");
+    assert(basename(".gitignore") == ".gitignore");
+    assert(extension("README") == "");
+}
+
+#[test]
+fn confines_reveal_paths_to_the_workspace() {
+    assert(tree_path("/repo/src/main.rs", "/repo") == "./src/main.rs");
+    assert(tree_path("/src/main.rs", "/") == "./src/main.rs");
+    assert(tree_path("/outside/main.rs", "/repo") == "");
+    assert(tree_path("src/main.rs", "/repo") == "./src/main.rs");
+    assert(reveal_parts("./src/main.rs").join("/") == "src/main.rs");
+    assert(reveal_parts(".").is_empty());
+}

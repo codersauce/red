@@ -1,0 +1,345 @@
+// Typed, bounded Neo-tree row construction. Host-provided strings are parsed
+// once at the boundary and all presentation work stays in this pure core.
+
+struct DirectoryEntry {
+    name: String,
+    path: String,
+    kind: String,
+}
+
+struct Children {
+    path: String,
+    entries: [DirectoryEntry],
+    truncated: bool,
+}
+
+struct ClipboardEntry {
+    path: String,
+    action: String,
+}
+
+pub struct PathStatus {
+    path: String,
+    status: String,
+}
+
+struct Ancestor {
+    last: bool,
+    visible: bool,
+}
+
+struct ThemeStyleSpec {
+    foreground: [String],
+    bold: bool,
+}
+
+struct PanelSegment {
+    text: String,
+    semantic: ThemeStyleSpec,
+}
+
+pub struct PanelRow {
+    id: String,
+    path: Option<String>,
+    expanded: bool,
+    kind: String,
+    segments: [PanelSegment],
+    right_segments: [PanelSegment],
+}
+
+enum EntryKind {
+    File,
+    Directory,
+    Unknown,
+}
+
+enum ClipboardAction {
+    Copy,
+    Move,
+    Unknown,
+}
+
+fn entry_kind(value: String) -> EntryKind {
+    if value == "file" { return EntryKind::File; }
+    if value == "directory" { return EntryKind::Directory; }
+    EntryKind::Unknown
+}
+
+fn clipboard_action(value: String) -> ClipboardAction {
+    if value == "copy" { return ClipboardAction::Copy; }
+    if value == "move" { return ClipboardAction::Move; }
+    ClipboardAction::Unknown
+}
+
+pub fn build_rows(
+    cwd: String,
+    children: [Children],
+    expanded: [String],
+    selected: [String],
+    clipboard: [ClipboardEntry],
+    status_root: String,
+    statuses: [PathStatus]
+) -> [PanelRow] {
+    let root = ".";
+    let root_status = status_for_path(root, status_root, statuses);
+    let mut rows = [PanelRow {
+        id: root,
+        path: Some(root),
+        expanded: expanded.contains(root),
+        kind: "directory",
+        segments: [
+            segment(" ", [], false),
+            segment(" ", ["symbolIcon.folderForeground", "sideBarTitle.foreground", "list.highlightForeground"], false),
+            segment(path::name(cwd), ["sideBarTitle.foreground", "symbolIcon.folderForeground", "list.highlightForeground"], true),
+        ],
+        right_segments: status_segments(root_status),
+    }];
+
+    if expanded.contains(root) {
+        rows = append_rows(root, [], rows, children, expanded, selected, clipboard, status_root, statuses);
+    }
+    if rows.len() >= 200 {
+        rows.push(truncation_row("tree-limit", "… tree limited to 200 rows"));
+    }
+    rows
+}
+
+fn append_rows(
+    path: String,
+    ancestors: [Ancestor],
+    rows: [PanelRow],
+    children: [Children],
+    expanded: [String],
+    selected: [String],
+    clipboard: [ClipboardEntry],
+    status_root: String,
+    statuses: [PathStatus]
+) -> [PanelRow] {
+    let entries = children_for(path, children);
+    let mut visible: [DirectoryEntry] = [];
+    for entry in entries {
+        match entry_kind(entry.kind) {
+            EntryKind::File => visible.push(entry),
+            EntryKind::Directory => visible.push(entry),
+            EntryKind::Unknown => {},
+        };
+    }
+
+    let mut rows = rows;
+    let mut index = 0;
+    while index < visible.len() && rows.len() < 200 {
+        let entry = visible[index];
+        let directory = entry.kind == "directory";
+        let open = directory && expanded.contains(entry.path);
+        let last = index == visible.len() - 1;
+        let status = status_for_path(entry.path, status_root, statuses);
+        let mut segments = [segment(selection_marker(entry.path, selected, clipboard), ["list.highlightForeground"], true)];
+        for prefix in branch_prefix(ancestors, last) {
+            segments.push(prefix);
+        }
+        let style = status::entry_style_keys(status, directory);
+        segments.push(segment(entry_icon(entry.name, directory, open) + " ", style, false));
+        segments.push(segment(entry.name, style, false));
+        rows.push(PanelRow {
+            id: entry.path,
+            path: Some(entry.path),
+            expanded: open,
+            kind: entry.kind,
+            segments: segments,
+            right_segments: status_segments(status),
+        });
+
+        if open {
+            let mut next_ancestors = ancestors;
+            next_ancestors.push(Ancestor { last: last, visible: !ancestors.is_empty() });
+            rows = append_rows(entry.path, next_ancestors, rows, children, expanded, selected, clipboard, status_root, statuses);
+        }
+        index += 1;
+    }
+    if children_truncated(path, children) && rows.len() < 200 {
+        rows.push(truncation_row("directory-limit:" + path, "… directory listing truncated"));
+    }
+    rows
+}
+
+fn children_for(path: String, children: [Children]) -> [DirectoryEntry] {
+    for child in children {
+        if child.path == path {
+            return child.entries;
+        }
+    }
+    []
+}
+
+fn children_truncated(path: String, children: [Children]) -> bool {
+    for child in children {
+        if child.path == path {
+            return child.truncated;
+        }
+    }
+    false
+}
+
+fn status_for_path(path: String, root: String, statuses: [PathStatus]) -> String {
+    let root = path::normalize(root);
+    if root.is_empty() {
+        return "";
+    }
+    let path = path::normalize(path);
+    let relative = path.strip_prefix("./").unwrap_or(path);
+    let mut absolute = root;
+    if !relative.is_empty() && relative != "." {
+        if root == "/" {
+            absolute = root + relative;
+        } else {
+            absolute = root + "/" + relative;
+        }
+    }
+
+    let mut low = 0;
+    let mut high = statuses.len();
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let candidate = statuses[middle];
+        if candidate.path == absolute {
+            return candidate.status;
+        }
+        if candidate.path < absolute {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    ""
+}
+
+fn selection_marker(path: String, selected: [String], clipboard: [ClipboardEntry]) -> String {
+    if selected.contains(path) {
+        return "✓ ";
+    }
+    for entry in clipboard {
+        if entry.path == path {
+            return match clipboard_action(entry.action) {
+                ClipboardAction::Move => "✂ ",
+                ClipboardAction::Copy => "⧉ ",
+                ClipboardAction::Unknown => "  ",
+            };
+        }
+    }
+    "  "
+}
+
+fn branch_prefix(ancestors: [Ancestor], last: bool) -> [PanelSegment] {
+    let mut segments = [];
+    for ancestor in ancestors {
+        if ancestor.visible && !ancestor.last {
+            segments.push(segment("│ ", ["tree.indentGuidesStroke"], false));
+        } else {
+            segments.push(segment("  ", ["tree.indentGuidesStroke"], false));
+        }
+    }
+    if ancestors.is_empty() {
+        segments.push(segment("  ", ["tree.indentGuidesStroke"], false));
+    } else if last {
+        segments.push(segment("└ ", ["tree.indentGuidesStroke"], false));
+    } else {
+        segments.push(segment("├ ", ["tree.indentGuidesStroke"], false));
+    }
+    segments
+}
+
+fn entry_icon(name: String, directory: bool, expanded: bool) -> String {
+    if directory {
+        if expanded {
+            return "";
+        }
+        return "";
+    }
+    let name = name.to_lowercase();
+    let extension = name.rsplit_once(".").unwrap_or(("", name)).1;
+    if extension == "js" || extension == "mjs" || extension == "cjs" { return ""; }
+    if extension == "ts" { return ""; }
+    if extension == "tsx" || extension == "jsx" { return ""; }
+    if extension == "json" { return ""; }
+    if extension == "toml" { return ""; }
+    if extension == "rs" { return ""; }
+    if extension == "lua" { return ""; }
+    if extension == "md" || extension == "markdown" { return ""; }
+    if extension == "lock" { return ""; }
+    if extension == "sh" || extension == "zsh" || extension == "fish" { return ""; }
+    "󰈙"
+}
+
+fn status_segments(value: String) -> [PanelSegment] {
+    let symbol = status::symbol(value);
+    if symbol.is_empty() {
+        return [];
+    }
+    [segment(symbol, status::style_keys(value), status::is_conflict(value))]
+}
+
+fn truncation_row(id: String, text: String) -> PanelRow {
+    PanelRow {
+        id: id,
+        path: None,
+        expanded: false,
+        kind: "file",
+        segments: [
+            segment("  ", ["tree.indentGuidesStroke"], false),
+            segment(text, ["gitDecoration.ignoredResourceForeground"], false),
+        ],
+        right_segments: [],
+    }
+}
+
+fn segment(text: String, foreground: [String], bold: bool) -> PanelSegment {
+    PanelSegment {
+        text: text,
+        semantic: ThemeStyleSpec { foreground: foreground, bold: bold },
+    }
+}
+
+#[test]
+fn renders_typed_rows_with_status_and_selection_markers() {
+    assert(selection_marker("./src", [], [ClipboardEntry { path: "./src", action: "move" }]) == "✂ ");
+    let rows = build_rows(
+        "/repo",
+        [Children {
+            path: ".",
+            entries: [
+                DirectoryEntry { name: "src", path: "./src", kind: "directory" },
+                DirectoryEntry { name: "main.rs", path: "./main.rs", kind: "file" },
+            ],
+            truncated: false,
+        }],
+        ["."],
+        ["./main.rs"],
+        [ClipboardEntry { path: "./src", action: "move" }],
+        "/repo",
+        [
+            PathStatus { path: "/repo", status: "modified" },
+            PathStatus { path: "/repo/main.rs", status: "modified" },
+            PathStatus { path: "/repo/src", status: "conflict" },
+        ]
+    );
+
+    assert(rows.len() == 3);
+    assert(rows[0].right_segments[0].text == "");
+    assert_msg(rows[1].segments[0].text == "✂ ", "unexpected first row marker for " + rows[1].id + ": " + rows[1].segments[0].text);
+    assert(rows[1].right_segments[0].text == "");
+    assert(rows[2].segments[0].text == "✓ ");
+    assert(rows[2].segments[2].text == " ");
+}
+
+#[test]
+fn caps_pathological_visible_listings() {
+    let mut entries: [DirectoryEntry] = [];
+    for index in 0..1000 {
+        entries.push(DirectoryEntry { name: "file-" + index + ".rs", path: "./file-" + index + ".rs", kind: "file" });
+    }
+    let rows = build_rows("/repo", [Children { path: ".", entries: entries, truncated: true }], ["."], [], [], "", []);
+
+    assert(rows.len() == 201);
+    assert(rows[200].path == None);
+    assert(rows[200].segments[1].text == "… tree limited to 200 rows");
+}
