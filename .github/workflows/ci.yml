@@ -35,12 +35,28 @@ jobs:
         run: python3 scripts/readme_release.py --check
 
   test:
-    name: Test Suite
-    runs-on: ${{ matrix.os }}
+    name: Test Suite (${{ matrix.platform.standard }}, ${{ matrix.rust }})
+    runs-on: >-
+      ${{
+        (
+          github.event_name != 'pull_request' ||
+          contains(
+            fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+            github.event.pull_request.author_association
+          )
+        ) && matrix.platform.warp || matrix.platform.standard
+      }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        platform:
+          - standard: ubuntu-latest
+            warp: warp-ubuntu-latest-x64-32x
+          - standard: macos-latest
+            warp: warp-macos-latest-arm64-12x
+          - standard: windows-latest
+            warp: warp-windows-latest-x64-32x
         rust: [stable, nightly]
     steps:
       - name: Checkout repository
