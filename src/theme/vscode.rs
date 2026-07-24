@@ -110,6 +110,21 @@ pub fn parse_vscode_theme_contents(contents: &str) -> anyhow::Result<Theme> {
     let selection_style =
         vscode_theme.style_from("editor.selectionForeground", "editor.selectionBackground");
 
+    let bracket_match_style = vscode_theme
+        .style_from(
+            "editorBracketMatch.foreground",
+            "editorBracketMatch.background",
+        )
+        .map(|mut style| {
+            style.fg = style
+                .fg
+                .or_else(|| vscode_theme.color_from("editorBracketMatch.border"));
+            style
+        })
+        .or_else(|| {
+            vscode_theme.style_from("editorBracketMatch.border", "editorBracketMatch.background")
+        });
+
     let find_match_style = vscode_theme
         .colors
         .iter()
@@ -196,6 +211,7 @@ pub fn parse_vscode_theme_contents(contents: &str) -> anyhow::Result<Theme> {
         gutter_style,
         statusline_style,
         line_highlight_style,
+        bracket_match_style,
         find_match_style,
         find_match_highlight_style,
         selection_style,
@@ -696,6 +712,30 @@ mod test {
                 r: 62,
                 g: 87,
                 b: 103,
+            })
+        );
+    }
+
+    #[test]
+    fn test_bracket_match_style_uses_vscode_bracket_colors() {
+        let theme = parse_vscode_theme("./src/fixtures/mocha.json").unwrap();
+        let style = theme.bracket_match_style.unwrap();
+
+        assert_eq!(
+            style.bg,
+            Some(Color::Rgba {
+                r: 147,
+                g: 153,
+                b: 178,
+                a: 26,
+            })
+        );
+        assert_eq!(
+            style.fg,
+            Some(Color::Rgb {
+                r: 147,
+                g: 153,
+                b: 178,
             })
         );
     }

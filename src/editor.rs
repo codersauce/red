@@ -1750,6 +1750,9 @@ pub struct Editor {
     /// viewport-plus-margin slice.
     highlight_cache: HashMap<usize, ViewportHighlightEntry>,
 
+    /// Delimiter partners indexed only after the cursor lands on a configured bracket.
+    bracket_match_cache: Option<matchit::BracketMatchCache>,
+
     /// Memoized display layout, shared by the many per-frame layout queries.
     layout_cache: std::cell::RefCell<HashMap<LayoutCacheKey, std::sync::Arc<DisplayLayout>>>,
 
@@ -1789,6 +1792,9 @@ pub struct Editor {
 
     /// Last terminal cursor cell painted into the render buffer.
     last_rendered_cursor_position: Option<(usize, usize)>,
+
+    /// Terminal rows containing the previously rendered matching delimiter pair.
+    last_rendered_bracket_rows: Vec<usize>,
 
     /// Last rendered surface under the terminal-owned cursor.
     ///
@@ -2921,6 +2927,7 @@ impl Editor {
             plugin_registry,
             highlighter,
             highlight_cache: HashMap::new(),
+            bracket_match_cache: None,
             layout_cache: std::cell::RefCell::new(HashMap::new()),
             window_manager,
             stdout,
@@ -2933,6 +2940,7 @@ impl Editor {
             previous_render_buffer: None,
             force_full_redraw: false,
             last_rendered_cursor_position: None,
+            last_rendered_bracket_rows: Vec::new(),
             last_rendered_cursor_surface: None,
             defer_motion_render: false,
             deferred_motion_needs_full_render: false,
@@ -3136,7 +3144,10 @@ impl Editor {
             self.render(buffer)
         } else if self.can_render_cursor_motion_delta() {
             self.render_cursor_motion_delta(buffer)
-        } else if self.uses_synthetic_block_cursor() {
+        } else if self.uses_synthetic_block_cursor()
+            || !self.last_rendered_bracket_rows.is_empty()
+            || self.matching_bracket_positions().is_some()
+        {
             self.render_motion_frame(buffer)
         } else {
             self.draw_cursor_preserving_cursor_goal()
@@ -7651,7 +7662,10 @@ impl Editor {
             self.render(buffer)
         } else if self.can_render_cursor_motion_delta() {
             self.render_cursor_motion_delta(buffer)
-        } else if self.uses_synthetic_block_cursor() {
+        } else if self.uses_synthetic_block_cursor()
+            || !self.last_rendered_bracket_rows.is_empty()
+            || self.matching_bracket_positions().is_some()
+        {
             self.render_motion_frame(buffer)
         } else {
             self.draw_cursor_preserving_cursor_goal()
@@ -12146,6 +12160,7 @@ impl Editor {
             &Style::default(),
         );
         self.last_rendered_cursor_position = None;
+        self.last_rendered_bracket_rows.clear();
         self.last_rendered_cursor_surface = None;
     }
 
@@ -22322,6 +22337,27 @@ mod test {
         editor
     }
 
+    fn bracket_test_editor(contents: &str, width: usize, height: usize) -> Editor {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, contents.to_string());
+        let theme = Theme {
+            bracket_match_style: Some(Style {
+                bg: Some(Color::Rgb {
+                    r: 110,
+                    g: 90,
+                    b: 145,
+                }),
+                ..Style::default()
+            }),
+            ..Theme::default()
+        };
+        let mut editor =
+            Editor::with_size(lsp, width, height, config, theme, vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        editor
+    }
+
     fn splash_test_editor(width: usize, height: usize, config: Config) -> Editor {
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
         let buffer = Buffer::new(None, String::new());
@@ -22938,6 +22974,110 @@ mod test {
         assert_eq!(
             render_buffer.cells[row5].style.fg, styled,
             "upward delta render must keep highlighting"
+        );
+    }
+
+    #[test]
+    fn bracket_matching_highlights_multiline_partner_in_active_window() {
+        let mut editor = bracket_test_editor("if ready {\n    work();\n}", 40, 8);
+        editor.cx = 9;
+        let mut render_buffer = RenderBuffer::new(40, 8, &Style::default());
+
+        editor.render(&mut render_buffer).unwrap();
+
+        let window = editor.window_manager.active_window().unwrap();
+        let (partner_x, partner_y) = editor.buffer_to_window_coords(window, 0, 2).unwrap();
+        let partner_y = editor.window_to_terminal_y(window, partner_y);
+        let partner_x = editor.window_to_terminal_x(window, partner_x);
+        let partner = &render_buffer.cells[partner_y * render_buffer.width + partner_x];
+        let expected = editor.theme.selected_style(
+            &editor.theme.style,
+            &editor.theme.editor_bracket_match_style(),
+            crate::theme::SelectionForegroundPriority::Content,
+        );
+
+        assert_eq!(partner.c, '}');
+        assert_eq!(partner.style.bg, expected.bg);
+    }
+
+    #[test]
+    fn bracket_matching_respects_tabs_and_wrapped_lines() {
+        let mut editor = bracket_test_editor("\t[abcdefghijklmnopqrstuvwxyz0123456789]", 18, 8);
+        editor.cx = 1;
+        let mut render_buffer = RenderBuffer::new(18, 8, &Style::default());
+
+        editor.render(&mut render_buffer).unwrap();
+
+        let window = editor.window_manager.active_window().unwrap();
+        let closer = editor.current_buffer().get(0).unwrap().chars().count() - 1;
+        let (partner_x, partner_y) = editor.buffer_to_window_coords(window, closer, 0).unwrap();
+        let partner_y = editor.window_to_terminal_y(window, partner_y);
+        let partner_x = editor.window_to_terminal_x(window, partner_x);
+        let partner = &render_buffer.cells[partner_y * render_buffer.width + partner_x];
+
+        assert!(
+            partner_y > 0,
+            "the matching bracket should wrap onto another row"
+        );
+        assert_eq!(partner.c, ']');
+        assert_ne!(partner.style.bg, editor.theme.style.bg);
+    }
+
+    #[test]
+    fn cursor_motion_delta_clears_old_matching_bracket_rows() {
+        let mut editor = bracket_test_editor("{\n    value\n}", 30, 8);
+        let mut render_buffer = RenderBuffer::new(30, 8, &Style::default());
+        editor.render(&mut render_buffer).unwrap();
+
+        let window = editor.window_manager.active_window().unwrap();
+        let (partner_x, partner_y) = editor.buffer_to_window_coords(window, 0, 2).unwrap();
+        let partner_y = editor.window_to_terminal_y(window, partner_y);
+        let partner_x = editor.window_to_terminal_x(window, partner_x);
+        let partner_index = partner_y * render_buffer.width + partner_x;
+        let highlighted = render_buffer.cells[partner_index].style.bg;
+        assert_ne!(highlighted, editor.theme.style.bg);
+
+        editor.cy = 1;
+        editor.cx = 4;
+        editor
+            .render_cursor_motion_delta(&mut render_buffer)
+            .unwrap();
+
+        assert_eq!(render_buffer.cells[partner_index].c, '}');
+        assert_eq!(
+            render_buffer.cells[partner_index].style.bg,
+            editor.theme.style.bg
+        );
+        assert!(editor.last_rendered_bracket_rows.is_empty());
+    }
+
+    #[test]
+    fn cursor_motion_delta_moves_matching_bracket_highlight_to_new_partner() {
+        let mut editor = bracket_test_editor("(\n)\n[\n]", 30, 8);
+        let mut render_buffer = RenderBuffer::new(30, 8, &Style::default());
+        editor.render(&mut render_buffer).unwrap();
+
+        let window = editor.window_manager.active_window().unwrap();
+        let first = editor.buffer_to_window_coords(window, 0, 1).unwrap();
+        let second = editor.buffer_to_window_coords(window, 0, 3).unwrap();
+        let first_index = editor.window_to_terminal_y(window, first.1) * render_buffer.width
+            + editor.window_to_terminal_x(window, first.0);
+        let second_index = editor.window_to_terminal_y(window, second.1) * render_buffer.width
+            + editor.window_to_terminal_x(window, second.0);
+
+        editor.cy = 2;
+        editor.cx = 0;
+        editor
+            .render_cursor_motion_delta(&mut render_buffer)
+            .unwrap();
+
+        assert_eq!(
+            render_buffer.cells[first_index].style.bg,
+            editor.theme.style.bg
+        );
+        assert_ne!(
+            render_buffer.cells[second_index].style.bg,
+            editor.theme.style.bg
         );
     }
 
