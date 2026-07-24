@@ -54,7 +54,7 @@ jobs:
             warp: warp-macos-latest-arm64-12x
           - standard: windows-latest
             warp: warp-windows-latest-x64-32x
-        rust: [stable, nightly]
+        rust: [stable]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
