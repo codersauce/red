@@ -13,7 +13,7 @@ use husk::{
 use husk_extension::{BundleLimits, ExtensionBundle};
 use semver::Version;
 use sha2::{Digest, Sha256};
-use toml_edit::{Document, Item, Table, value};
+use toml_edit::{DocumentMut, Item, Table, value};
 
 pub(crate) struct AdapterIdentity {
     pub(crate) name: String,
@@ -239,7 +239,7 @@ fn updated_manifest_source(
     let manifest_source = fs::read_to_string(manifest_path)
         .with_context(|| format!("read `{}`", manifest_path.display()))?;
     let mut document = manifest_source
-        .parse::<Document>()
+        .parse::<DocumentMut>()
         .context("parse Husk.toml for editing")?;
     if !document.contains_key("extensions") {
         document.insert("extensions", Item::Table(Table::new()));

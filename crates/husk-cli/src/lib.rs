@@ -1042,7 +1042,7 @@ fn cargo_package_checksum(
 ) -> anyhow::Result<Option<String>> {
     let source = std::str::from_utf8(lockfile).context("Cargo.lock is not UTF-8")?;
     let document = source
-        .parse::<toml_edit::Document>()
+        .parse::<toml_edit::DocumentMut>()
         .context("parse generated Cargo.lock")?;
     let packages = document
         .get("package")
