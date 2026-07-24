@@ -161,7 +161,7 @@ fn parse_patch(text: String) -> Patch {
 }
 
 fn hunk_ranges(header: String) -> (LineRange, LineRange) {
-    let fields = header.split(" ");
+    let fields = header.split_whitespace();
     if fields.len() < 3 {
         return (LineRange { start: 0, count: 0 }, LineRange { start: 0, count: 0 });
     }
@@ -169,43 +169,25 @@ fn hunk_ranges(header: String) -> (LineRange, LineRange) {
 }
 
 fn parse_range(field: String) -> LineRange {
-    if field.len() < 2 {
-        return LineRange { start: 0, count: 0 };
+    let field = field.strip_prefix("-").unwrap_or(field);
+    let field = field.strip_prefix("+").unwrap_or(field);
+    if let Some(fields) = field.split_once(",") {
+        return LineRange {
+            start: parse_number(fields.0),
+            count: parse_number(fields.1),
+        };
     }
-    let fields = field.slice(1, field.len()).split(",");
-    let start = parse_number(fields[0]);
-    let mut count = 1;
-    if fields.len() > 1 {
-        count = parse_number(fields[1]);
-    }
-    LineRange { start: start, count: count }
+    LineRange { start: parse_number(field), count: 1 }
 }
 
 fn parse_number(value: String) -> i32 {
     let mut result = 0;
     for character in value {
-        if character >= "0" && character <= "9" {
-            let value = digit(character);
-            if result > 214748364 || (result == 214748364 && value > 7) {
-                return 2147483647;
-            }
-            result = result * 10 + value;
+        if let Some(digit) = character.to_digit(10) {
+            result = result.saturating_mul(10).saturating_add(digit);
         }
     }
     result
-}
-
-fn digit(value: String) -> i32 {
-    if value == "0" { return 0; }
-    if value == "1" { return 1; }
-    if value == "2" { return 2; }
-    if value == "3" { return 3; }
-    if value == "4" { return 4; }
-    if value == "5" { return 5; }
-    if value == "6" { return 6; }
-    if value == "7" { return 7; }
-    if value == "8" { return 8; }
-    9
 }
 
 fn line_kind(raw: String) -> DiffLineKind {
@@ -232,7 +214,7 @@ pub fn sign_hunks(text: String, buffers: [SignBuffer]) -> [SignHunk] {
         if result.len() >= 1000 {
             break;
         }
-        if file.header.len() == 0 {
+        if file.header.is_empty() {
             continue;
         }
         let buffer_index = buffer_for_header(file.header[0], buffers);
@@ -316,23 +298,23 @@ pub fn detail_document(text: String, path: String, section: String) -> Workspace
                 match line.kind {
                     DiffLineKind::Added => {
                         kind = "added";
-                        text = line.raw.slice(1, line.raw.len());
+                        text = line.raw.strip_prefix("+").unwrap_or(line.raw);
                         new_value = Some(new_line);
-                        new_line += 1;
+                        new_line = new_line.saturating_add(1);
                     },
                     DiffLineKind::Removed => {
                         kind = "removed";
-                        text = line.raw.slice(1, line.raw.len());
+                        text = line.raw.strip_prefix("-").unwrap_or(line.raw);
                         old_value = Some(old_line);
-                        old_line += 1;
+                        old_line = old_line.saturating_add(1);
                     },
                     DiffLineKind::Context => {
                         kind = "context";
-                        text = line.raw.slice(1, line.raw.len());
+                        text = line.raw.strip_prefix(" ").unwrap_or(line.raw);
                         old_value = Some(old_line);
                         new_value = Some(new_line);
-                        old_line += 1;
-                        new_line += 1;
+                        old_line = old_line.saturating_add(1);
+                        new_line = new_line.saturating_add(1);
                     },
                     DiffLineKind::NoNewlineMarker => {},
                     DiffLineKind::Metadata => {},
@@ -420,7 +402,7 @@ pub fn dashboard_range(text: String, start_index: i32, end_index: i32) -> String
                 selected.push(selection);
             }
         }
-        if selected.len() > 0 {
+        if !selected.is_empty() {
             found = true;
             for raw in file.header {
                 output.push(raw);
@@ -453,7 +435,7 @@ fn dashboard_selected_hunk(hunk: Hunk, first: i32, last: i32) -> String {
                     output.push(line.raw);
                     changed = true;
                 } else {
-                    output.push(" " + line.raw.slice(1, line.raw.len()));
+                    output.push(" " + line.raw.strip_prefix("-").unwrap_or(line.raw));
                 }
             },
             DiffLineKind::Context => {
@@ -478,7 +460,7 @@ pub fn hunk_starts(text: String) -> [i32] {
     let mut starts = [];
     for file in patch.files {
         for hunk in file.hunks {
-            starts.push(hunk.new.start - 1);
+            starts.push(hunk.new.start.saturating_sub(1));
         }
     }
     starts
@@ -492,8 +474,8 @@ pub fn editor_hunk(text: String, cursor_line: i32) -> String {
             output.push(raw);
         }
         for hunk in file.hunks {
-            let start = hunk.new.start - 1;
-            let end = start + hunk.new.count - 1;
+            let start = hunk.new.start.saturating_sub(1);
+            let end = start.saturating_add(hunk.new.count.saturating_sub(1));
             if cursor_line >= start && cursor_line <= end {
                 output.push(hunk.header);
                 for line in hunk.lines {
@@ -519,7 +501,7 @@ pub fn editor_range(text: String, start_line: i32, end_line: i32) -> String {
                 selected.push(result);
             }
         }
-        if selected.len() > 0 {
+        if !selected.is_empty() {
             found = true;
             for raw in file.header {
                 output.push(raw);
@@ -537,7 +519,7 @@ pub fn editor_range(text: String, start_line: i32, end_line: i32) -> String {
 
 fn editor_selected_hunk(hunk: Hunk, start_line: i32, end_line: i32) -> String {
     let mut output = [];
-    let mut new_line = hunk.new.start - 1;
+    let mut new_line = hunk.new.start.saturating_sub(1);
     let lines = hunk.lines;
     let mut index = 0;
 
@@ -558,7 +540,7 @@ fn editor_selected_hunk(hunk: Hunk, start_line: i32, end_line: i32) -> String {
         if !is_change {
             output.push(current.raw);
             if current.raw.starts_with(" ") {
-                new_line += 1;
+                new_line = new_line.saturating_add(1);
             }
             index += 1;
             continue;
@@ -573,15 +555,15 @@ fn editor_selected_hunk(hunk: Hunk, start_line: i32, end_line: i32) -> String {
         let mut added: [String] = [];
         while index < lines.len() && lines[index].raw.starts_with("+") {
             added.push(lines[index].raw);
-            new_line += 1;
+            new_line = new_line.saturating_add(1);
             index += 1;
         }
         let mut addition_end = addition_start;
-        if added.len() > 0 {
-            addition_end = addition_start + added.len() - 1;
+        if !added.is_empty() {
+            addition_end = addition_start.saturating_add(added.len().saturating_sub(1));
         }
-        let mut selected = addition_start >= start_line && addition_start <= end_line + 1;
-        if added.len() > 0 {
+        let mut selected = addition_start >= start_line && addition_start <= end_line.saturating_add(1);
+        if !added.is_empty() {
             selected = addition_start <= end_line && addition_end >= start_line;
         }
         if selected {
@@ -589,7 +571,7 @@ fn editor_selected_hunk(hunk: Hunk, start_line: i32, end_line: i32) -> String {
             for raw in added { output.push(raw); }
         } else {
             for raw in removed {
-                output.push(" " + raw.slice(1, raw.len()));
+                output.push(" " + raw.strip_prefix("-").unwrap_or(raw));
             }
         }
     }
@@ -674,9 +656,9 @@ fn renders_structured_detail_and_selects_one_dashboard_line() {
     assert(document.lines[5].kind == "added");
     assert(document.lines[5].data.patch_index == 5);
     let selected = dashboard_range(text, 4, 5);
-    assert(selected.includes("-one\n+ONE"));
-    assert(!selected.includes("-three"));
-    assert(!selected.includes("+THREE"));
+    assert(selected.contains("-one\n+ONE"));
+    assert(!selected.contains("-three"));
+    assert(!selected.contains("+THREE"));
 }
 
 #[test]
@@ -686,28 +668,37 @@ fn selects_editor_hunks_and_preserves_unselected_removed_context() {
     assert(starts.len() == 2);
     assert(starts[0] == 0);
     assert(starts[1] == 7);
-    assert(editor_hunk(text, 7).includes("-old\n+new"));
+    assert(editor_hunk(text, 7).contains("-old\n+new"));
     let selected = editor_range(text, 0, 0);
-    assert(selected.includes("-one\n+ONE"));
-    assert(selected.includes(" three"));
-    assert(!selected.includes("+THREE"));
+    assert(selected.contains("-one\n+ONE"));
+    assert(selected.contains(" three"));
+    assert(!selected.contains("+THREE"));
 }
 
 #[test]
 fn normalizes_unsaved_patch_paths_without_rewriting_content() {
-    let text = "diff --git /private/tmp/file -\n--- /private/tmp/file\n+++ -\n@@ -1 +1 @@\n-before\n+after";
+    let text = "diff --git /private/tmp/file -\n--- /private/tmp/file\n+++ -\n@@ -1 +1 @@\n-before\n+after\n";
     let normalized = normalize_unsaved(text, "src/file.rs");
-    assert(normalized.includes("diff --git a/src/file.rs b/src/file.rs"));
-    assert(normalized.includes("--- a/src/file.rs"));
-    assert(normalized.includes("+++ b/src/file.rs"));
-    assert(normalized.includes("-before\n+after"));
+    assert(normalized.contains("diff --git a/src/file.rs b/src/file.rs"));
+    assert(normalized.contains("--- a/src/file.rs"));
+    assert(normalized.contains("+++ b/src/file.rs"));
+    assert(normalized.contains("-before\n+after\n"));
 }
 
 #[test]
 fn saturates_pathological_diff_range_values() {
-    let text = "diff --git a.rs a.rs\n@@ -999999999999999999999,1 +999999999999999999999,1 @@\n-old\n+new";
+    let text = "diff --git a.rs a.rs\n@@ -999999999999999999999,999999999999999999999 +999999999999999999999,999999999999999999999 @@\n-one\n-two\n+ONE\n+TWO";
     let hunks = sign_hunks(text, [SignBuffer { path: "a.rs", buffer_index: 1 }]);
     assert(hunks.len() == 1);
     assert(hunks[0].old_start == 2147483647);
+    assert(hunks[0].old_count == 2147483647);
     assert(hunks[0].new_start == 2147483647);
+    assert(hunks[0].new_count == 2147483647);
+
+    let document = detail_document(text, "a.rs", "unstaged");
+    assert(document.lines[2].old_line == Some(2147483647));
+    assert(document.lines[3].old_line == Some(2147483647));
+    assert(document.lines[4].new_line == Some(2147483647));
+    assert(document.lines[5].new_line == Some(2147483647));
+    assert(editor_hunk(text, 2147483647).contains("-one\n-two\n+ONE\n+TWO"));
 }

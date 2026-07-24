@@ -165,7 +165,7 @@ fn builds_explicit_apply_modes() {
     assert(apply_hunk_args("stage").join(" ") == "apply --cached --unidiff-zero -");
     assert(apply_hunk_args("unstage").join(" ") == "apply --cached --reverse --unidiff-zero -");
     assert(apply_hunk_args("reset").join(" ") == "apply --reverse --unidiff-zero -");
-    assert(apply_hunk_args("unknown").len() == 0);
+    assert(apply_hunk_args("unknown").is_empty());
 }
 
 #[test]
