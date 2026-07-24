@@ -10313,6 +10313,20 @@ impl Editor {
         self.last_error = None;
     }
 
+    fn finish_search_with_error(&mut self, session: SearchSession, error: String) {
+        self.restore_search_origin(&session.origin, session.origin_vtop);
+        self.search_term = session.draft;
+        self.search_direction = session.direction;
+        self.search_highlights_suppressed = false;
+        self.active_search = None;
+        self.mode = Mode::Normal;
+        self.last_error = Some(error);
+    }
+
+    fn pattern_not_found_message(pattern: &str) -> String {
+        format!("Pattern not found: {pattern}")
+    }
+
     fn active_search_text(&self) -> Option<&str> {
         self.active_search
             .as_ref()
@@ -10374,7 +10388,7 @@ impl Editor {
             self.render(buffer)?;
             return Ok(true);
         } else {
-            self.last_error = Some(format!("pattern not found: {pattern}"));
+            self.last_error = Some(Self::pattern_not_found_message(&pattern));
             self.render(buffer)?;
         }
 
@@ -14394,8 +14408,7 @@ impl Editor {
                     let matches = match self.search_matches(&session.draft) {
                         Ok(matches) => matches,
                         Err(err) => {
-                            self.restore_search_origin(&session.origin, session.origin_vtop);
-                            self.last_error = Some(err.to_string());
+                            self.finish_search_with_error(session, err.to_string());
                             self.render(buffer)?;
                             return Ok(false);
                         }
@@ -14406,8 +14419,8 @@ impl Editor {
                         session.direction,
                         self.config.search.wrapscan,
                     ) else {
-                        self.restore_search_origin(&session.origin, session.origin_vtop);
-                        self.last_error = Some(format!("pattern not found: {}", session.draft));
+                        let error = Self::pattern_not_found_message(&session.draft);
+                        self.finish_search_with_error(session, error);
                         self.render(buffer)?;
                         return Ok(false);
                     };

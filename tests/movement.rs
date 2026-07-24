@@ -762,6 +762,99 @@ async fn search_enter_commits_preview_and_n_repeats_direction() {
 }
 
 #[tokio::test]
+async fn search_enter_without_match_exits_and_reports_error() {
+    let mut harness = EditorHarness::with_content("alpha\nbeta");
+    harness
+        .execute_action(Action::SetCursor(0, 1))
+        .await
+        .unwrap();
+
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "missing").await;
+    harness.assert_mode(Mode::Search);
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+
+    harness.assert_mode(Mode::Normal);
+    harness.assert_cursor_at(0, 1);
+    assert!(harness
+        .commandline_row()
+        .starts_with("Pattern not found: missing"));
+}
+
+#[tokio::test]
+async fn failed_search_becomes_the_most_recent_search() {
+    let mut harness = EditorHarness::with_content("alpha\nbeta\nalpha");
+
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "alpha").await;
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 2);
+
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "missing").await;
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+
+    harness.execute_action(Action::RepeatSearch).await.unwrap();
+
+    harness.assert_cursor_at(0, 2);
+    assert!(harness
+        .commandline_row()
+        .starts_with("Pattern not found: missing"));
+}
+
+#[tokio::test]
+async fn invalid_search_pattern_exits_and_reports_error() {
+    let mut harness = EditorHarness::with_content("alpha\nbeta");
+
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "[").await;
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+
+    harness.assert_mode(Mode::Normal);
+    harness.assert_cursor_at(0, 0);
+    assert!(harness
+        .commandline_row()
+        .starts_with("invalid search pattern:"));
+}
+
+#[tokio::test]
 async fn backward_search_previews_previous_match() {
     let mut harness = EditorHarness::with_content("alpha\nbeta\nalpha\nbeta\nalpha");
     harness
