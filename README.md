@@ -146,8 +146,8 @@ The current release includes:
   expanding Vim motion and editing compatibility
 - tree-sitter highlighting for Rust, Markdown, JavaScript, TypeScript/TSX,
   JSON, TOML, YAML, Python, Bash, PowerShell, Lua, and Husk
-- built-in LSP defaults for Rust, TypeScript/JavaScript, Python, Markdown, JSON,
-  TOML, YAML, and Lua
+- a first-party Husk language server plus built-in LSP defaults for Rust,
+  TypeScript/JavaScript, Python, Markdown, JSON, TOML, YAML, and Lua
 - command and keymap discovery, fuzzy files, buffer navigation, symbols,
   references, project search, and diagnostics
 - native Git gutter signs, hunk actions, and a full-screen workspace for
@@ -224,6 +224,7 @@ platform details.
 | Guide | Covers |
 | --- | --- |
 | [Getting started](docs/GETTING_STARTED.md) | Editing, keymaps, LSP, Git, CLI, and troubleshooting |
+| [Husk language server](docs/HUSK_LSP.md) | Husk editor features, external crates, configuration, and safety boundaries |
 | [Vim compatibility](docs/VIM_COMPATIBILITY.md) | Supported behavior and intentional differences |
 | [Agent workflow](docs/AGENT_WORKFLOW.md) | Codex prerequisites, review model, commands, and safety |
 | [Plugin system](docs/PLUGIN_SYSTEM.md) | Husk lifecycle, runtime architecture, and validation |

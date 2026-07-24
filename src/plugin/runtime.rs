@@ -115,7 +115,7 @@ impl ComposerHandle {
     }
 }
 
-const RED_HOST_DECLARATIONS: &str = r#"
+pub(super) const RED_HOST_DECLARATIONS: &str = r#"
 type Json = JsValue;
 struct PickerItem {
     id: String,

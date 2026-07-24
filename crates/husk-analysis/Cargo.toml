@@ -1,0 +1,20 @@
+[package]
+name = "husk-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Incremental source analysis for the Husk language"
+
+[dependencies]
+anyhow = "1.0.79"
+husk-ast.workspace = true
+husk-lexer.workspace = true
+husk-package.workspace = true
+husk-parser.workspace = true
+husk-runtime.workspace = true
+husk-semantic.workspace = true
+husk-types.workspace = true
+
+[dev-dependencies]
+tempfile = "3.15.0"

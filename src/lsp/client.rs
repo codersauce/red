@@ -11,9 +11,13 @@
 //! within the documented queue budgets.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::PathBuf,
     process::Stdio,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -39,6 +43,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_LSP_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LSP_HEADER_BYTES: usize = 16 * 1024;
 const MAX_LSP_STDERR_LINE_BYTES: usize = 64 * 1024;
+const MAX_LSP_STDERR_TAIL_LINES: usize = 8;
 const MAX_PENDING_LSP_MESSAGES: usize = 512;
 const MAX_PENDING_LSP_BYTES: usize = 16 * 1024 * 1024;
 const SHUTDOWN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -167,6 +172,39 @@ async fn spawn_lsp_process(
     Ok(command.spawn()?)
 }
 
+struct LspProcessMonitor {
+    stdout_closed: Arc<AtomicBool>,
+    stderr_closed: Arc<AtomicBool>,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    failure_reported: bool,
+}
+
+impl LspProcessMonitor {
+    fn stderr_summary(&self) -> Option<String> {
+        let stderr_tail = self
+            .stderr_tail
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        stderr_tail
+            .iter()
+            .find(|line| {
+                let lower = line.to_ascii_lowercase();
+                lower.starts_with("error:")
+                    || lower.starts_with("fatal")
+                    || lower.contains("panicked")
+            })
+            .or_else(|| stderr_tail.back())
+            .cloned()
+    }
+}
+
+fn lsp_command_display(config: &LanguageServerConfig) -> String {
+    std::iter::once(config.command.as_str())
+        .chain(config.args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 impl RealLspClient {
     #[cfg(test)]
     pub(super) fn with_test_channels(
@@ -184,12 +222,14 @@ impl RealLspClient {
             initialize_id: None,
             initialized: true,
             initialize_failed: false,
+            failure_reason: None,
             pending_messages: Vec::new(),
             pending_message_bytes: 0,
             failed_pending_requests: Vec::new(),
             server_capabilities: None,
             pending_diagnostics: HashMap::new(),
             child: None,
+            process_monitor: None,
             config,
             workspace_root,
         }
@@ -206,6 +246,9 @@ impl RealLspClient {
 
         let (request_tx, mut request_rx) = mpsc::channel::<OutboundMessage>(512);
         let (response_tx, response_rx) = mpsc::channel::<InboundMessage>(512);
+        let stdout_closed = Arc::new(AtomicBool::new(false));
+        let stderr_closed = Arc::new(AtomicBool::new(false));
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
 
         // Sends requests from the editor into LSP's stdin
         let rtx = response_tx.clone();
@@ -234,6 +277,7 @@ impl RealLspClient {
 
         // Sends responses from LSP's stdout to the editor
         let rtx = response_tx.clone();
+        let stdout_closed_task = Arc::clone(&stdout_closed);
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
 
@@ -254,11 +298,14 @@ impl RealLspClient {
                     break;
                 }
             }
+            stdout_closed_task.store(true, Ordering::Release);
         });
 
         // Language servers commonly write operational logs to stderr. Keep
         // those in the log file, and only surface panic/fatal-looking lines.
         let rtx = response_tx.clone();
+        let stderr_closed_task = Arc::clone(&stderr_closed);
+        let stderr_tail_task = Arc::clone(&stderr_tail);
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr);
             loop {
@@ -277,6 +324,13 @@ impl RealLspClient {
 
                 if !message.is_empty() {
                     log!("[lsp] incoming stderr: {:?}", message);
+                    let mut tail = stderr_tail_task
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if tail.len() == MAX_LSP_STDERR_TAIL_LINES {
+                        tail.pop_front();
+                    }
+                    tail.push_back(message.clone());
                 }
 
                 if should_surface_server_stderr(&message) {
@@ -293,6 +347,7 @@ impl RealLspClient {
                     }
                 }
             }
+            stderr_closed_task.store(true, Ordering::Release);
         });
 
         Ok(RealLspClient {
@@ -307,9 +362,16 @@ impl RealLspClient {
             initialize_id: None,
             initialized: false,
             initialize_failed: false,
+            failure_reason: None,
             pending_diagnostics: HashMap::new(),
             server_capabilities: None,
             child: Some(child),
+            process_monitor: Some(LspProcessMonitor {
+                stdout_closed,
+                stderr_closed,
+                stderr_tail,
+                failure_reported: false,
+            }),
             config,
             workspace_root,
         })
@@ -541,6 +603,7 @@ pub struct RealLspClient {
     initialize_id: Option<i64>,
     initialized: bool,
     initialize_failed: bool,
+    failure_reason: Option<String>,
     pending_messages: Vec<OutboundMessage>,
     pending_message_bytes: usize,
     failed_pending_requests: Vec<(i64, String)>,
@@ -548,13 +611,25 @@ pub struct RealLspClient {
     /// Debounced diagnostics requests keyed by normalized document URI.
     pending_diagnostics: HashMap<String, Instant>,
     child: Option<tokio::process::Child>,
+    process_monitor: Option<LspProcessMonitor>,
     config: LanguageServerConfig,
     workspace_root: PathBuf,
 }
 
 impl RealLspClient {
-    fn fail_initialization(&mut self) {
+    fn fail_server(&mut self, reason: impl Into<String>) {
         self.initialize_failed = true;
+        self.initialized = false;
+        if self.failure_reason.is_none() {
+            self.failure_reason = Some(reason.into());
+        }
+        self.initialize_id = None;
+        self.failed_pending_requests.extend(
+            self.pending_responses
+                .drain()
+                .filter(|(_, request)| request.method != "initialize")
+                .map(|(id, request)| (id, request.method)),
+        );
         self.failed_pending_requests
             .extend(
                 self.pending_messages
@@ -565,23 +640,67 @@ impl RealLspClient {
                     }),
             );
         self.pending_message_bytes = 0;
+        self.pending_diagnostics.clear();
+    }
+
+    fn poll_process_failure(&mut self) -> Option<LspError> {
+        let monitor = self.process_monitor.as_mut()?;
+        if monitor.failure_reported {
+            return None;
+        }
+
+        let command = lsp_command_display(&self.config);
+        let status = match self.child.as_mut()?.try_wait() {
+            Ok(status) => status,
+            Err(error) => {
+                monitor.failure_reported = true;
+                return Some(LspError::IoError(error));
+            }
+        };
+
+        if let Some(status) = status {
+            if !monitor.stderr_closed.load(Ordering::Acquire) {
+                return None;
+            }
+            monitor.failure_reported = true;
+            let mut reason = format!("{command} exited unexpectedly with {status}");
+            if let Some(stderr) = monitor.stderr_summary() {
+                reason.push_str(": ");
+                reason.push_str(&stderr);
+            }
+            return Some(LspError::ServerError(reason));
+        }
+
+        if monitor.stdout_closed.load(Ordering::Acquire) {
+            monitor.failure_reported = true;
+            return Some(LspError::ProtocolError(format!(
+                "{command} closed its stdout stream unexpectedly"
+            )));
+        }
+
+        None
     }
 
     fn queue_pending(&mut self, message: OutboundMessage) -> Result<(), LspError> {
         if self.initialize_failed {
-            return Err(LspError::ProtocolError(
-                "language server initialization has failed".to_string(),
-            ));
+            let reason = self
+                .failure_reason
+                .as_deref()
+                .unwrap_or("language server initialization has failed");
+            return Err(LspError::ProtocolError(format!(
+                "language server unavailable: {reason}"
+            )));
         }
 
         let bytes = outbound_message_size(&message);
         let total = self.pending_message_bytes.saturating_add(bytes);
         if self.pending_messages.len() >= MAX_PENDING_LSP_MESSAGES || total > MAX_PENDING_LSP_BYTES
         {
-            self.fail_initialization();
-            return Err(LspError::ProtocolError(format!(
+            let error = LspError::ProtocolError(format!(
                 "language server did not initialize before its pending queue exceeded {MAX_PENDING_LSP_MESSAGES} messages or {MAX_PENDING_LSP_BYTES} bytes"
-            )));
+            ));
+            self.fail_server(error.to_string());
+            return Err(error);
         }
 
         self.pending_message_bytes = total;
@@ -730,6 +849,14 @@ impl LspClient for RealLspClient {
     ) -> Result<(), LspError> {
         log!("[lsp] send_notification: method={} force={force}", method);
 
+        if self.initialize_failed && !force {
+            log!(
+                "[lsp] skipping notification for unavailable server: {}",
+                method
+            );
+            return Ok(());
+        }
+
         let msg = OutboundMessage::Notification(NotificationRequest {
             method: method.to_string(),
             params,
@@ -802,13 +929,16 @@ impl LspClient for RealLspClient {
         &mut self,
     ) -> Result<Option<(InboundMessage, Option<String>)>, LspError> {
         if let Some((id, method)) = self.failed_pending_requests.pop() {
+            let reason = self
+                .failure_reason
+                .as_deref()
+                .unwrap_or("language server initialization or transport failed");
             return Ok(Some((
                 InboundMessage::RequestError {
                     id,
-                    error: LspError::ProtocolError(
-                        "language server initialization or transport failed before this request completed"
-                            .to_string(),
-                    ),
+                    error: LspError::ProtocolError(format!(
+                        "language server unavailable before this request completed: {reason}"
+                    )),
                 },
                 Some(method),
             )));
@@ -840,13 +970,19 @@ impl LspClient for RealLspClient {
 
         for id in timed_out {
             if let Some(request) = self.pending_responses.remove(&id) {
+                let elapsed = now.duration_since(request.timestamp);
                 if request.method == "initialize" {
-                    self.fail_initialization();
+                    let error = LspError::RequestTimeout(elapsed);
+                    self.fail_server(error.to_string());
+                    return Ok(Some((
+                        InboundMessage::ProcessingError(error),
+                        Some(request.method),
+                    )));
                 }
                 return Ok(Some((
                     InboundMessage::RequestError {
                         id,
-                        error: LspError::RequestTimeout(now.duration_since(request.timestamp)),
+                        error: LspError::RequestTimeout(elapsed),
                     },
                     Some(request.method),
                 )));
@@ -855,6 +991,11 @@ impl LspClient for RealLspClient {
 
         match self.response_rx.try_recv() {
             Ok(mut msg) => {
+                if matches!(msg, InboundMessage::ProcessingError(_)) {
+                    if let Some(error) = self.poll_process_failure() {
+                        msg = InboundMessage::ProcessingError(error);
+                    }
+                }
                 match &mut msg {
                     InboundMessage::Message(msg) => {
                         if let Some(req) = self.pending_responses.remove(&msg.id) {
@@ -865,8 +1006,19 @@ impl LspClient for RealLspClient {
                                 // Parse the initialize result
                                 // https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#initialized
                                 let init_result: InitializeResult =
-                                    serde_json::from_value(msg.result.clone())
-                                        .map_err(LspError::JsonError)?;
+                                    match serde_json::from_value(msg.result.clone()) {
+                                        Ok(init_result) => init_result,
+                                        Err(error) => {
+                                            let error = LspError::ProtocolError(format!(
+                                                "invalid initialize response: {error}"
+                                            ));
+                                            self.fail_server(error.to_string());
+                                            return Ok(Some((
+                                                InboundMessage::ProcessingError(error),
+                                                Some(req.method),
+                                            )));
+                                        }
+                                    };
 
                                 // log!("[lsp] server capabilities: {:#?}", init_result.capabilities);
                                 self.server_capabilities = Some(init_result.capabilities);
@@ -923,7 +1075,15 @@ impl LspClient for RealLspClient {
 
                                 self.pending_responses.remove(&id);
                                 if method == "initialize" {
-                                    self.fail_initialization();
+                                    let error = LspError::ServerError(format!(
+                                        "language server rejected initialization: {}",
+                                        error.message
+                                    ));
+                                    self.fail_server(error.to_string());
+                                    return Ok(Some((
+                                        InboundMessage::ProcessingError(error),
+                                        Some(method),
+                                    )));
                                 }
 
                                 return Ok(Some((msg, Some(method))));
@@ -947,19 +1107,21 @@ impl LspClient for RealLspClient {
                     }
                     _ => {}
                 }
-                if matches!(msg, InboundMessage::ProcessingError(_)) {
-                    self.failed_pending_requests.extend(
-                        self.pending_responses
-                            .drain()
-                            .map(|(id, request)| (id, request.method)),
-                    );
-                    if !self.initialized {
-                        self.fail_initialization();
+                if let InboundMessage::ProcessingError(error) = &msg {
+                    if let Some(monitor) = self.process_monitor.as_mut() {
+                        monitor.failure_reported = true;
                     }
+                    self.fail_server(error.to_string());
                 }
                 Ok(Some((msg, None)))
             }
-            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Empty) => {
+                if let Some(error) = self.poll_process_failure() {
+                    self.fail_server(error.to_string());
+                    return Ok(Some((InboundMessage::ProcessingError(error), None)));
+                }
+                Ok(None)
+            }
             Err(err) => Err(LspError::ProtocolError(err.to_string())),
         }
     }
@@ -1470,6 +1632,44 @@ impl LspClient for RealLspClient {
     }
 
     async fn shutdown(&mut self) -> Result<(), LspError> {
+        if self.initialize_failed {
+            let Some(mut child) = self.child.take() else {
+                return Ok(());
+            };
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    log!(
+                        "[lsp] {} was already stopped during shutdown: {}",
+                        self.config.command,
+                        status
+                    );
+                }
+                Ok(None) => {
+                    log!(
+                        "[lsp] terminating unavailable language server: {}",
+                        self.config.command
+                    );
+                    if let Err(error) = child.start_kill() {
+                        log!(
+                            "[lsp] failed to terminate {}: {}",
+                            self.config.command,
+                            error
+                        );
+                    } else if let Err(error) = child.wait().await {
+                        log!("[lsp] error reaping {}: {}", self.config.command, error);
+                    }
+                }
+                Err(error) => {
+                    log!(
+                        "[lsp] failed to query {} during shutdown: {}",
+                        self.config.command,
+                        error
+                    );
+                }
+            }
+            return Ok(());
+        }
+
         let shutdown_id = self
             .send_request("shutdown", serde_json::Value::Null, true)
             .await?;
@@ -1629,6 +1829,78 @@ mod test {
         client.initialize().await.unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exited_server_fails_initialization_with_stderr_and_preserves_editor_cleanup() {
+        let config = LanguageServerConfig {
+            command: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "printf 'error: husk lsp is unavailable\\n' >&2; exit 23".to_string(),
+            ],
+            language_id: "husk".to_string(),
+            file_extensions: vec!["hk".to_string()],
+            documents: Vec::new(),
+            root_markers: Vec::new(),
+            env: HashMap::new(),
+            initialization_options: None,
+            workspace_name: None,
+        };
+        let mut client = RealLspClient::start(config, std::env::current_dir().unwrap())
+            .await
+            .unwrap();
+        client.initialize().await.unwrap();
+        let request_id = client
+            .send_request("textDocument/documentSymbol", json!({}), false)
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let process_monitor = client
+                    .process_monitor
+                    .as_ref()
+                    .expect("real LSP client must monitor its child process");
+                if process_monitor.stdout_closed.load(Ordering::Acquire)
+                    && process_monitor.stderr_closed.load(Ordering::Acquire)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("exited language server pipes must close");
+
+        let (message, method) = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(message) = client.recv_response().await.unwrap() {
+                    break message;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("exited language server must report its failure");
+        let InboundMessage::ProcessingError(error) = message else {
+            panic!("expected exited server to produce a processing error");
+        };
+        assert!(method.is_none());
+        assert!(error.to_string().contains("exit status: 23"));
+        assert!(error.to_string().contains("error: husk lsp is unavailable"));
+
+        let (message, method) = client.recv_response().await.unwrap().unwrap();
+        let InboundMessage::RequestError { id, error } = message else {
+            panic!("expected queued request to fail");
+        };
+        assert_eq!(id, request_id);
+        assert_eq!(method.as_deref(), Some("textDocument/documentSymbol"));
+        assert!(error.to_string().contains("error: husk lsp is unavailable"));
+
+        client.did_close("/tmp/unavailable.hk").await.unwrap();
+        client.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_parse_publish_diagnostics() {
         let msg = std::fs::read_to_string("src/lsp/fixtures/publish-diagnostics.json").unwrap();
@@ -1687,8 +1959,10 @@ mod test {
             pending_message_bytes: 0,
             failed_pending_requests: Vec::new(),
             initialize_failed: false,
+            failure_reason: None,
             server_capabilities: None,
             child: None,
+            process_monitor: None,
             config: default_language_servers()
                 .remove("rust")
                 .expect("default Rust LSP config must exist"),
@@ -1860,8 +2134,10 @@ mod test {
             pending_message_bytes: 0,
             failed_pending_requests: Vec::new(),
             initialize_failed: false,
+            failure_reason: None,
             server_capabilities: None,
             child: None,
+            process_monitor: None,
             config: default_language_servers()
                 .remove("rust")
                 .expect("default Rust LSP config must exist"),
@@ -1931,8 +2207,10 @@ mod test {
             pending_message_bytes: 0,
             failed_pending_requests: Vec::new(),
             initialize_failed: false,
+            failure_reason: None,
             server_capabilities: None,
             child: None,
+            process_monitor: None,
             config: default_language_servers()
                 .remove("rust")
                 .expect("default Rust LSP config must exist"),
@@ -2033,8 +2311,10 @@ mod test {
             pending_message_bytes: 0,
             failed_pending_requests: Vec::new(),
             initialize_failed: false,
+            failure_reason: None,
             server_capabilities: None,
             child: None,
+            process_monitor: None,
             config: default_language_servers()
                 .remove("rust")
                 .expect("default Rust LSP config must exist"),
@@ -2091,8 +2371,10 @@ mod test {
             pending_message_bytes: 0,
             failed_pending_requests: Vec::new(),
             initialize_failed: false,
+            failure_reason: None,
             server_capabilities: None,
             child: None,
+            process_monitor: None,
             config: default_language_servers()
                 .remove("rust")
                 .expect("default Rust LSP config must exist"),
@@ -2149,8 +2431,10 @@ mod test {
             pending_message_bytes: 0,
             failed_pending_requests: Vec::new(),
             initialize_failed: false,
+            failure_reason: None,
             server_capabilities: None,
             child: None,
+            process_monitor: None,
             config: default_language_servers()
                 .remove("rust")
                 .expect("default Rust LSP config must exist"),
@@ -2187,6 +2471,74 @@ mod test {
     }
 
     #[tokio::test]
+    async fn invalid_initialize_response_fails_queued_requests_immediately() {
+        let (request_tx, _request_rx) = mpsc::channel(4);
+        let (response_tx, response_rx) = mpsc::channel(4);
+        let initialize = Request {
+            id: 800,
+            method: "initialize".to_string(),
+            params: json!({}),
+            timestamp: Instant::now(),
+        };
+        let mut client = RealLspClient {
+            request_tx,
+            response_rx,
+            files_versions: HashMap::new(),
+            files_content: HashMap::new(),
+            pending_responses: HashMap::from([(initialize.id, initialize)]),
+            initialize_id: Some(800),
+            initialized: false,
+            pending_diagnostics: HashMap::new(),
+            pending_messages: Vec::new(),
+            pending_message_bytes: 0,
+            failed_pending_requests: Vec::new(),
+            initialize_failed: false,
+            failure_reason: None,
+            server_capabilities: None,
+            child: None,
+            process_monitor: None,
+            config: default_language_servers()
+                .remove("rust")
+                .expect("default Rust LSP config must exist"),
+            workspace_root: std::env::current_dir().unwrap(),
+        };
+        let queued_id = client
+            .send_request("textDocument/documentSymbol", json!({}), false)
+            .await
+            .unwrap();
+        response_tx
+            .send(InboundMessage::Message(ResponseMessage {
+                id: 800,
+                result: json!({
+                    "capabilities": {
+                        "textDocumentSync": {
+                            "change": "incremental"
+                        }
+                    }
+                }),
+                request: None,
+            }))
+            .await
+            .unwrap();
+
+        let (message, method) = client.recv_response().await.unwrap().unwrap();
+        let InboundMessage::ProcessingError(error) = message else {
+            panic!("expected invalid initialize response to fail the server");
+        };
+        assert_eq!(method.as_deref(), Some("initialize"));
+        assert!(error.to_string().contains("invalid initialize response"));
+        assert!(client.initialize_failed);
+
+        let (message, method) = client.recv_response().await.unwrap().unwrap();
+        let InboundMessage::RequestError { id, error } = message else {
+            panic!("expected queued request to fail");
+        };
+        assert_eq!(id, queued_id);
+        assert_eq!(method.as_deref(), Some("textDocument/documentSymbol"));
+        assert!(error.to_string().contains("invalid initialize response"));
+    }
+
+    #[tokio::test]
     async fn failed_or_overflowed_initialization_fails_each_queued_request_and_bounds_memory() {
         let (request_tx, _request_rx) = mpsc::channel(1);
         let (_response_tx, response_rx) = mpsc::channel(1);
@@ -2203,8 +2555,10 @@ mod test {
             pending_message_bytes: 0,
             failed_pending_requests: Vec::new(),
             initialize_failed: false,
+            failure_reason: None,
             server_capabilities: None,
             child: None,
+            process_monitor: None,
             config: default_language_servers()
                 .remove("rust")
                 .expect("default Rust LSP config must exist"),
@@ -2232,9 +2586,7 @@ mod test {
         };
         assert_eq!(id, request_id);
         assert_eq!(method.as_deref(), Some("textDocument/formatting"));
-        assert!(error
-            .to_string()
-            .contains("initialization or transport failed"));
+        assert!(error.to_string().contains("pending queue exceeded"));
         assert!(client
             .send_request("textDocument/rename", json!({}), false)
             .await
@@ -2264,8 +2616,10 @@ mod test {
             pending_message_bytes: 0,
             failed_pending_requests: Vec::new(),
             initialize_failed: false,
+            failure_reason: None,
             server_capabilities: None,
             child: None,
+            process_monitor: None,
             config: default_language_servers()
                 .remove("rust")
                 .expect("default Rust LSP config must exist"),
@@ -2291,7 +2645,7 @@ mod test {
         };
         assert_eq!(id, 801);
         assert_eq!(method.as_deref(), Some("textDocument/formatting"));
-        assert!(error.to_string().contains("transport failed"));
+        assert!(error.to_string().contains("invalid stdout frame"));
     }
 
     #[tokio::test]
@@ -2320,6 +2674,7 @@ mod test {
             pending_message_bytes: 0,
             failed_pending_requests: Vec::new(),
             initialize_failed: false,
+            failure_reason: None,
             server_capabilities: Some(
                 serde_json::from_value(json!({
                     "diagnosticProvider": {
@@ -2330,6 +2685,7 @@ mod test {
                 .unwrap(),
             ),
             child: None,
+            process_monitor: None,
             config: default_language_servers()
                 .remove("rust")
                 .expect("default Rust LSP config must exist"),
@@ -2372,10 +2728,12 @@ mod test {
             pending_message_bytes: 0,
             failed_pending_requests: Vec::new(),
             initialize_failed: false,
+            failure_reason: None,
             server_capabilities: Some(
                 serde_json::from_value(json!({ "textDocumentSync": 2 })).unwrap(),
             ),
             child: None,
+            process_monitor: None,
             config: default_language_servers()
                 .remove("rust")
                 .expect("default Rust LSP config must exist"),

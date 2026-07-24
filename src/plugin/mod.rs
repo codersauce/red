@@ -42,6 +42,10 @@ pub use runtime::{
     poll_timer_callbacks, CommandMetadata, ComposerHandle, PickerHandle, RegisteredPluginCommand,
     RequestId, Runtime,
 };
+
+pub(crate) fn husk_lsp_declarations() -> &'static str {
+    runtime::RED_HOST_DECLARATIONS
+}
 #[cfg(test)]
 pub(crate) use text_link::TextPanelFileLocation;
 pub(crate) use text_link::TextPanelLinkTarget;

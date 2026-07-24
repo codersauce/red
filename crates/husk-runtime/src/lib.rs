@@ -1182,7 +1182,13 @@ struct SourceInterfaceDescriptorBuilder {
     types: Vec<TypeDefinitionDescriptor>,
 }
 
-fn source_module_descriptors(package: &ResolvedPackage) -> anyhow::Result<Vec<ModuleDescriptor>> {
+/// Derive typed descriptors for every public source module in a resolved package.
+///
+/// Language tooling uses the same descriptors as runtime compilation so that
+/// cross-file analysis cannot drift from executable package semantics.
+pub fn source_module_descriptors(
+    package: &ResolvedPackage,
+) -> anyhow::Result<Vec<ModuleDescriptor>> {
     let mut named_types = HashMap::new();
     for module in package
         .modules
@@ -1472,7 +1478,8 @@ fn source_type_descriptor(
     }
 }
 
-fn module_declaration_ast(module: &ModuleDescriptor) -> anyhow::Result<File> {
+/// Render a typed module descriptor as a trusted Husk declaration source.
+pub fn module_declaration_source(module: &ModuleDescriptor) -> anyhow::Result<String> {
     let mut source = String::new();
     for definition in module.types.iter().chain(
         module
@@ -1486,6 +1493,7 @@ fn module_declaration_ast(module: &ModuleDescriptor) -> anyhow::Result<File> {
     if module_uses_json(module) {
         source.push_str("    struct Json;\n");
     }
+    push_doc_comments(&mut source, "    ", module.documentation.as_deref());
     source.push_str("    mod global ");
     source.push_str(module.name.as_str());
     source.push_str(" {\n");
@@ -1514,7 +1522,12 @@ fn module_declaration_ast(module: &ModuleDescriptor) -> anyhow::Result<File> {
         }
     }
     source.push_str("    }\n}\n");
+    Ok(source)
+}
 
+/// Parse a typed module descriptor into the declaration AST used by semantic analysis.
+pub fn module_declaration_ast(module: &ModuleDescriptor) -> anyhow::Result<File> {
+    let source = module_declaration_source(module)?;
     let parsed = husk_parser::parse_str(&source);
     if !parsed.errors.is_empty() {
         let messages = parsed
@@ -1591,6 +1604,7 @@ fn push_type_definition(source: &mut String, definition: &TypeDefinitionDescript
 }
 
 fn push_function_declaration(source: &mut String, function: &FunctionDescriptor) {
+    push_doc_comments(source, "        ", function.documentation.as_deref());
     source.push_str("        fn ");
     source.push_str(&function.name);
     source.push('(');
@@ -1605,6 +1619,21 @@ fn push_function_declaration(source: &mut String, function: &FunctionDescriptor)
     source.push_str(") -> ");
     push_type_declaration(source, &function.result);
     source.push_str(";\n");
+}
+
+fn push_doc_comments(source: &mut String, indent: &str, documentation: Option<&str>) {
+    let Some(documentation) = documentation else {
+        return;
+    };
+    for line in documentation.lines() {
+        source.push_str(indent);
+        source.push_str("///");
+        if !line.is_empty() {
+            source.push(' ');
+            source.push_str(line);
+        }
+        source.push('\n');
+    }
 }
 
 fn push_type_declaration(source: &mut String, ty: &TypeDescriptor) {

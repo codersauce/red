@@ -9,12 +9,14 @@ default-run = "red"
 members = [
     ".",
     "crates/husk",
+    "crates/husk-analysis",
     "crates/husk-ast",
     "crates/husk-cli",
     "crates/husk-diagnostics",
     "crates/husk-extension",
     "crates/husk-hir",
     "crates/husk-lexer",
+    "crates/husk-lsp",
     "crates/husk-parser",
     "crates/husk-package",
     "crates/husk-runtime",
@@ -32,12 +34,14 @@ license = "MIT"
 repository = "https://github.com/codersauce/red"
 
 [workspace.dependencies]
+husk-analysis = { version = "0.1.0", path = "crates/husk-analysis" }
 husk-ast = { version = "0.1.0", path = "crates/husk-ast" }
 husk-cli = { version = "0.1.0", path = "crates/husk-cli" }
 husk-diagnostics = { version = "0.1.0", path = "crates/husk-diagnostics" }
 husk-extension = { version = "0.1.0", path = "crates/husk-extension" }
 husk-hir = { version = "0.1.0", path = "crates/husk-hir" }
 husk-lexer = { version = "0.1.0", path = "crates/husk-lexer" }
+husk-lsp = { version = "0.1.0", path = "crates/husk-lsp" }
 husk-parser = { version = "0.1.0", path = "crates/husk-parser" }
 husk-package = { version = "0.1.0", path = "crates/husk-package" }
 husk-runtime = { version = "0.1.0", path = "crates/husk-runtime", default-features = false }

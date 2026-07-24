@@ -1,10 +1,13 @@
 # Husk language and embedding guide
 
-This guide describes the interfaces implemented at the 2026-07-19 extraction
-checkpoint. For architecture rationale, see
+This guide describes the interfaces implemented through the 2026-07-24
+language-server checkpoint. For architecture rationale, see
 [HUSK_LANGUAGE_EXTRACTION_PLAN.md](HUSK_LANGUAGE_EXTRACTION_PLAN.md). For known
 gaps and exact remaining work, see
 [HUSK_IMPLEMENTATION_STATUS.md](HUSK_IMPLEMENTATION_STATUS.md).
+
+For editor setup, supported language features, and locked external-crate
+indexing, see [HUSK_LSP.md](HUSK_LSP.md).
 
 ## Build and run the CLI
 
@@ -602,11 +605,14 @@ The following are rejected by v1:
 - `s8`, `s16`, `u16`, `u32`, and `u64`;
 - `float32` and `char`;
 - maps and flags;
-- owned or borrowed resources;
 - futures, streams, async functions, and error contexts;
 - anonymous record/variant/enum types where nominal identity is required;
-- core-module, nested-component, resource, or other non-function exports in a
+- core-module, nested-component, or other unsupported component exports in a
   callable position.
+
+Named resources, owned handles, borrowed handles, constructors, methods, and
+resource-consuming calls are supported. Handles are instance-scoped and
+generation checked; borrowed resources cannot escape a component call.
 
 ### Capability behavior
 

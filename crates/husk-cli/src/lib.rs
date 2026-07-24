@@ -83,6 +83,12 @@ enum Command {
         #[arg(long = "extension", value_name = "BUNDLE")]
         extensions: Vec<PathBuf>,
     },
+    /// Run the Husk language server.
+    Lsp {
+        /// Communicate with an editor over standard input and output.
+        #[arg(long)]
+        stdio: bool,
+    },
     /// Parse and type-check a Husk script.
     Check {
         /// Portable extension bundle to expose while checking.
@@ -320,6 +326,14 @@ fn execute(cli: Cli) -> anyhow::Result<ExitCode> {
             let stdin = io::stdin();
             let stdout = io::stdout();
             run_repl(&engine, stdin.lock(), stdout.lock(), interactive)
+        }
+        Command::Lsp { stdio } => {
+            anyhow::ensure!(
+                stdio,
+                "the Husk language server currently requires `--stdio`"
+            );
+            husk_lsp::run_stdio(husk_lsp::ServerOptions::default())?;
+            Ok(ExitCode::SUCCESS)
         }
         Command::Check {
             extensions,
@@ -916,6 +930,8 @@ struct ApiItemInspection {
     path: String,
     kind: &'static str,
     signature: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    documentation: Option<String>,
     compatibility: &'static str,
     reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1851,6 +1867,12 @@ fn classify_callable(
     owner_path: Option<&str>,
     resource_mappings: &ApiResourceMappings,
 ) -> ApiItemInspection {
+    let documentation = item
+        .get("docs")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|docs| !docs.is_empty())
+        .map(ToString::to_string);
     let Some(function) = item.pointer("/inner/function") else {
         return incompatible_api_item(path, default_kind, String::new(), "not a Rust function");
     };
@@ -1901,6 +1923,7 @@ fn classify_callable(
             path: path.to_string(),
             kind,
             signature,
+            documentation,
             compatibility: "specializable",
             reason: Some(
                 "generic Rust API requires a concrete --specialize instantiation".to_string(),
@@ -1948,6 +1971,7 @@ fn classify_callable(
             path: path.to_string(),
             kind,
             signature,
+            documentation,
             compatibility: "compatible",
             reason: None,
             specialization: None,
@@ -1967,6 +1991,7 @@ fn incompatible_api_item(
         path: path.to_string(),
         kind,
         signature,
+        documentation: None,
         compatibility: "incompatible",
         reason: Some(reason.to_string()),
         specialization: None,
@@ -3491,6 +3516,13 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+
+    #[test]
+    fn parses_the_stdio_language_server_entrypoint() {
+        let cli = Cli::try_parse_from(["husk", "lsp", "--stdio"]).expect("parse LSP command");
+
+        assert!(matches!(cli.command, Command::Lsp { stdio: true }));
+    }
 
     #[test]
     fn derives_exact_component_exports_from_selected_wit_items() {
