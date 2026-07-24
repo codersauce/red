@@ -125,6 +125,7 @@ pub(crate) static PLUGIN_DISPATCHER_TEST_LOCK: Lazy<tokio::sync::Mutex<()>> =
 pub const DEFAULT_REGISTER: char = '"';
 const JUMPLIST_SIZE: usize = 100;
 const REPEATED_MOTION_DRAIN_BUDGET_MS: u64 = 50;
+const TERMINAL_SIZE_RECONCILE_INTERVAL: Duration = Duration::from_millis(100);
 const PLUGIN_REQUESTS_PER_TICK: usize = 64;
 const AGENT_EVENTS_PER_TICK: usize = 64;
 const GUTTER_SIGN_COLUMN_WIDTH: usize = 2;
@@ -3311,6 +3312,25 @@ impl Editor {
         self.sync_with_window();
     }
 
+    fn resize_terminal_surface(&mut self, width: u16, height: u16, buffer: &mut RenderBuffer) {
+        self.size = (width, height);
+        let max_y = (height as usize).saturating_sub(2);
+        self.cy = self.cy.min(max_y.saturating_sub(1));
+        self.resize_window_layout((width as usize, height as usize));
+        self.invalidate_terminal_render_state(buffer);
+
+        let viewport_width = self.vwidth();
+        let viewport_height = self.vheight();
+        let dialog_resized = if let Some(dialog) = &mut self.current_dialog {
+            dialog.resize(viewport_width, viewport_height)
+        } else {
+            false
+        };
+        if self.current_dialog.is_some() && !dialog_resized {
+            self.current_dialog = None;
+        }
+    }
+
     fn apply_panel_layout(&mut self) {
         self.sync_to_window();
         let (reserved_left, reserved_right) = self.reserved_panel_widths(self.size.0 as usize);
@@ -5662,6 +5682,11 @@ impl Editor {
         self.stdout
             .execute(terminal::Clear(terminal::ClearType::All))?;
 
+        // Crossterm installs its SIGWINCH listener lazily on the first poll.
+        // Register it before plugin startup so pane resizes during awaited
+        // initialization are not lost.
+        event::poll(Duration::from_millis(0))?;
+
         let mut runtime;
         {
             let plugin_startup = perf::PerfSpan::start("startup:plugins");
@@ -5698,9 +5723,12 @@ impl Editor {
             &Style::default(),
         );
         self.ensure_current_buffer_lsp_opened().await?;
+        let (columns, rows) = terminal::size()?;
+        self.resize_terminal_surface(columns, rows, &mut buffer);
         self.render(&mut buffer)?;
         drop(interactive_startup);
         let mut pending_events = VecDeque::new();
+        let mut last_terminal_size_reconciliation = Instant::now();
 
         'editor_loop: loop {
             // Wait for input, but at most 10ms so LSP messages, timers, and
@@ -5740,6 +5768,13 @@ impl Editor {
                 }
             }
             self.suppress_reactivation_click = false;
+
+            if last_terminal_size_reconciliation.elapsed() >= TERMINAL_SIZE_RECONCILE_INTERVAL {
+                last_terminal_size_reconciliation = Instant::now();
+                let observed_size = terminal::size()?;
+                self.reconcile_observed_terminal_size(observed_size, &mut buffer, &mut runtime)
+                    .await?;
+            }
 
             self.service_background(&mut buffer, &mut runtime).await?;
             if self.persist_session_snapshot(/*force*/ false) {
@@ -7452,25 +7487,7 @@ impl Editor {
         drop(initial_bounds_span);
 
         if let event::Event::Resize(width, height) = ev {
-            self.size = (width, height);
-            let max_y = (height as usize).saturating_sub(2);
-            self.cy = self.cy.min(max_y.saturating_sub(1));
-            self.resize_window_layout((width as usize, height as usize));
-            *buffer = RenderBuffer::new(
-                self.size.0 as usize,
-                self.size.1 as usize,
-                &Style::default(),
-            );
-            let viewport_width = self.vwidth();
-            let viewport_height = self.vheight();
-            let dialog_resized = if let Some(dialog) = &mut self.current_dialog {
-                dialog.resize(viewport_width, viewport_height)
-            } else {
-                false
-            };
-            if self.current_dialog.is_some() && !dialog_resized {
-                self.current_dialog = None;
-            }
+            self.resize_terminal_surface(width, height, buffer);
             self.render(buffer)?;
 
             let action = Action::NotifyPlugins(
@@ -7546,6 +7563,32 @@ impl Editor {
             drain_repeated_motion,
             repeat_signature,
         })
+    }
+
+    /// Reconciles the render surface with the tty's authoritative dimensions.
+    ///
+    /// Resize events remain the immediate path, but terminal multiplexers can
+    /// change the tty geometry without Crossterm yielding a corresponding
+    /// event. Periodic reconciliation prevents Red from indefinitely retaining
+    /// a clipped frame after such a missed notification.
+    async fn reconcile_observed_terminal_size(
+        &mut self,
+        observed_size: (u16, u16),
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<bool> {
+        if observed_size == self.size {
+            return Ok(false);
+        }
+
+        self.process_editor_event(
+            Event::Resize(observed_size.0, observed_size.1),
+            buffer,
+            runtime,
+            EventRenderMode::Immediate,
+        )
+        .await?;
+        Ok(true)
     }
 
     async fn drain_repeated_motion_events(
@@ -12156,7 +12199,6 @@ impl Editor {
         TextPosition::new(last_line, self.length_for_line(last_line))
     }
 
-    #[cfg(any(unix, test))]
     fn invalidate_terminal_render_state(&mut self, buffer: &mut RenderBuffer) {
         *buffer = RenderBuffer::new(
             self.size.0 as usize,
@@ -12166,6 +12208,7 @@ impl Editor {
         self.last_rendered_cursor_position = None;
         self.last_rendered_bracket_rows.clear();
         self.last_rendered_cursor_surface = None;
+        self.force_full_redraw = true;
     }
 
     pub fn cleanup(&mut self) -> anyhow::Result<()> {
@@ -21320,6 +21363,64 @@ mod test {
         }
     }
 
+    #[tokio::test]
+    async fn terminal_size_reconciliation_recovers_a_missed_resize_event() {
+        let mut editor = test_editor(88, 22);
+        let mut buffer = RenderBuffer::new(88, 22, &Style::default());
+        let mut runtime = Runtime::new();
+
+        assert!(editor
+            .reconcile_observed_terminal_size((44, 21), &mut buffer, &mut runtime)
+            .await
+            .unwrap());
+        assert_eq!(editor.size, (44, 21));
+        assert_eq!((buffer.width, buffer.height), (44, 21));
+        assert!(render_row(&buffer, buffer.height - 2).contains("1:1"));
+
+        let render_generation = editor.render_generation;
+        assert!(!editor
+            .reconcile_observed_terminal_size((44, 21), &mut buffer, &mut runtime)
+            .await
+            .unwrap());
+        assert_eq!(editor.render_generation, render_generation);
+    }
+
+    #[test]
+    fn startup_size_refresh_rebuilds_and_repaints_the_terminal_surface() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let source = Buffer::new(None, String::new());
+        let mut editor =
+            Editor::with_size(lsp, 160, 46, config, Theme::default(), vec![source]).unwrap();
+        editor.test_disable_terminal_output();
+        let mut buffer = RenderBuffer::new(160, 46, &Style::default());
+
+        editor.render(&mut buffer).unwrap();
+        editor.resize_terminal_surface(/*width*/ 80, /*height*/ 24, &mut buffer);
+
+        assert_eq!(editor.size, (80, 24));
+        assert_eq!((buffer.width, buffer.height), (80, 24));
+        assert!(editor.force_full_redraw);
+
+        editor.render(&mut buffer).unwrap();
+
+        let rendered = (0..buffer.height)
+            .map(|row| render_row(&buffer, row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let version_label = format!("red v{}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(rendered.matches(version_label.as_str()).count(), 1);
+        assert!(render_row(&buffer, buffer.height - 2).contains("NORMAL"));
+        assert!(!editor.force_full_redraw);
+        assert_eq!(
+            editor
+                .previous_render_buffer
+                .as_ref()
+                .map(|previous| (previous.width, previous.height)),
+            Some((80, 24))
+        );
+    }
+
     #[test]
     fn detached_mouse_input_preserves_the_terminal_mouse_event() {
         let mouse = MouseEvent {
@@ -22497,10 +22598,12 @@ mod test {
             .all(|cell| cell.text == " " && cell.style == Style::default()));
         assert_eq!(editor.last_rendered_cursor_position, None);
         assert_eq!(editor.last_rendered_cursor_surface, None);
+        assert!(editor.force_full_redraw);
 
         editor.render(&mut buffer).unwrap();
         assert!(buffer.cells.iter().any(|cell| cell.text != " "));
         assert!(editor.last_rendered_cursor_position.is_some());
+        assert!(!editor.force_full_redraw);
     }
 
     #[test]
