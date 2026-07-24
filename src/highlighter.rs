@@ -79,6 +79,16 @@ impl HuskStyles {
 
 const MAX_INJECTION_DEPTH: usize = 3;
 
+const YAML_ADDITIONAL_HIGHLIGHTS_QUERY: &str = r#"
+(escape_sequence) @escape
+
+[
+  (yaml_directive)
+  (tag_directive)
+  (reserved_directive)
+] @keyword.directive
+"#;
+
 impl Highlighter {
     pub fn new(theme: &Theme) -> anyhow::Result<Self> {
         let languages = language_definitions()
@@ -107,6 +117,14 @@ impl Highlighter {
     pub fn language_id_for_file(&self, file: Option<&str>) -> Option<&'static str> {
         let extension = file_extension(file?)?;
         self.language_id_for_extension(&extension)
+    }
+
+    /// Whether highlighting a file requires all text before the visible slice.
+    ///
+    /// YAML structure is indentation-sensitive, so parsing an arbitrary indented
+    /// viewport can lose the mapping and scalar context that determines its nodes.
+    pub(crate) fn requires_document_prefix(&self, file: Option<&str>) -> bool {
+        matches!(self.language_id_for_file(file), Some("yaml"))
     }
 
     pub fn language_id_for_extension(&self, extension: &str) -> Option<&'static str> {
@@ -186,21 +204,34 @@ impl Highlighter {
 
             let mut cursor = QueryCursor::new();
             let mut matches = cursor.matches(&highlighter.query, tree.root_node(), code.as_bytes());
+            let mut refinement_colors = Vec::new();
 
             while let Some(mat) = matches.next() {
                 for cap in mat.captures {
                     let node = cap.node;
                     let start = node.start_byte();
                     let end = node.end_byte();
+                    let capture_name = highlighter.query.capture_names()[cap.index as usize];
                     if let Some(style) = highlighter.capture_styles[cap.index as usize].as_ref() {
-                        colors.push(StyleInfo {
+                        let captured = StyleInfo {
                             start,
                             end,
                             style: style.clone(),
-                        });
+                        };
+                        if capture_refines_equal_range(capture_name) {
+                            refinement_colors.push(captured);
+                        } else {
+                            colors.push(captured);
+                        }
                     }
                 }
             }
+
+            // Query cursors return captures in syntax-tree order, which can put a
+            // broad scalar capture after a more specific capture over the same
+            // bytes. Keep semantic refinements later so the renderer's stable
+            // equal-range tie-break selects them.
+            colors.extend(refinement_colors);
 
             if depth < MAX_INJECTION_DEPTH {
                 if let Some(injection_query) = &highlighter.injection_query {
@@ -236,6 +267,14 @@ impl Highlighter {
         }
 
         Ok(colors)
+    }
+}
+
+fn capture_refines_equal_range(scope: &str) -> bool {
+    match scope {
+        "property" | "escape" | "string.escape" => true,
+        scope if scope.starts_with("keyword.directive") => true,
+        _ => false,
     }
 }
 
@@ -371,7 +410,10 @@ fn language_definitions() -> Vec<LanguageDefinition> {
             id: "yaml",
             extensions: &["yml", "yaml"],
             language: || tree_sitter_yaml::LANGUAGE.into(),
-            highlight_queries: &[tree_sitter_yaml::HIGHLIGHTS_QUERY],
+            highlight_queries: &[
+                tree_sitter_yaml::HIGHLIGHTS_QUERY,
+                YAML_ADDITIONAL_HIGHLIGHTS_QUERY,
+            ],
             injection_query: None,
         },
         LanguageDefinition {
@@ -753,6 +795,14 @@ mod tests {
         );
     }
 
+    fn effective_style_at(styles: &[StyleInfo], byte: usize) -> Option<&Style> {
+        styles
+            .iter()
+            .filter(|span| span.start <= byte && byte < span.end)
+            .map(|span| &span.style)
+            .next_back()
+    }
+
     #[test]
     fn resolves_language_by_file_extension() {
         let highlighter = highlighter();
@@ -794,6 +844,44 @@ mod tests {
             Some("husk")
         );
         assert_eq!(highlighter.language_id_for_file(Some("LICENSE")), None);
+    }
+
+    #[test]
+    fn yaml_requires_document_prefix_for_highlighting() {
+        let highlighter = highlighter();
+
+        assert!(highlighter.requires_document_prefix(Some("workflow.yml")));
+        assert!(highlighter.requires_document_prefix(Some("config.yaml")));
+        assert!(!highlighter.requires_document_prefix(Some("main.rs")));
+        assert!(!highlighter.requires_document_prefix(Some("README.md")));
+    }
+
+    #[test]
+    fn yaml_distinguishes_properties_values_escapes_and_directives() {
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let property = theme.get_style("property").unwrap();
+        let string = theme.get_style("string").unwrap();
+        let escape = theme.get_style("escape").unwrap();
+        let directive = theme.get_style("keyword.directive").unwrap();
+        assert_ne!(property.fg, string.fg);
+
+        let mut highlighter = Highlighter::new(&theme).unwrap();
+        let code = "%YAML 1.2\n---\nname: example\nescaped: \"line\\n\"\n";
+        let styles = highlighter.highlight("yaml", code).unwrap();
+
+        assert_eq!(
+            effective_style_at(&styles, code.find("name").unwrap()),
+            Some(&property)
+        );
+        assert_eq!(
+            effective_style_at(&styles, code.find("example").unwrap()),
+            Some(&string)
+        );
+        assert_eq!(
+            effective_style_at(&styles, code.find("\\n").unwrap()),
+            Some(&escape)
+        );
+        assert_eq!(effective_style_at(&styles, 0), Some(&directive));
     }
 
     #[test]

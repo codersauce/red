@@ -550,10 +550,34 @@ fn parse_color_value(value: &Value) -> anyhow::Result<Color> {
 }
 
 fn translate_scope(vscode_scope: String) -> String {
+    if vscode_scope
+        .split_whitespace()
+        .any(is_textmate_property_scope)
+    {
+        return "property".to_string();
+    }
+
     SYNTAX_HIGHLIGHTING_MAP
         .get(&vscode_scope.as_str())
         .map(|s| s.to_string())
         .unwrap_or(vscode_scope)
+}
+
+fn is_textmate_property_scope(scope: &str) -> bool {
+    scope == "property"
+        || scope == "entity.name.tag.yaml"
+        || scope == "meta.property-name"
+        || scope_is_or_has_suffix(scope, "support.type.property-name")
+        || scope_is_or_has_suffix(scope, "punctuation.support.type.property-name")
+        || scope_is_or_has_suffix(scope, "variable.other.member")
+        || scope_is_or_has_suffix(scope, "variable.other.property")
+}
+
+fn scope_is_or_has_suffix(scope: &str, base: &str) -> bool {
+    scope == base
+        || scope
+            .strip_prefix(base)
+            .is_some_and(|suffix| suffix.starts_with('.'))
 }
 
 #[derive(Deserialize, Debug)]
@@ -1022,6 +1046,22 @@ mod test {
 
         assert!(theme.get_style("tag").is_some());
         assert!(theme.get_style("attribute").is_some());
+    }
+
+    #[test]
+    fn test_textmate_property_scopes_map_to_tree_sitter_property_capture() {
+        for scope in [
+            "support.type.property-name.yaml",
+            "punctuation.support.type.property-name.json",
+            "source.yaml entity.name.tag.yaml",
+            "source.json meta.structure.dictionary.json support.type.property-name.json",
+            "variable.other.member",
+            "variable.other.property.ts",
+        ] {
+            assert_eq!(translate_scope(scope.to_string()), "property", "{scope}");
+        }
+
+        assert_eq!(translate_scope("entity.name.tag".to_string()), "tag");
     }
 
     #[test]
