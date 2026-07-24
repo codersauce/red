@@ -28,6 +28,7 @@ use crate::{
     plugin::DecorationAnchor,
     splash,
     theme::{SelectionForegroundPriority, Style},
+    undo::TextPosition,
     unicode_utils::{
         char_prefix, display_width, display_width_with_tabs, fit_display_width,
         grapheme_to_column_with_tabs, trim_line_ending, truncate_display_width,
@@ -387,13 +388,29 @@ impl Editor {
         self.sync_to_window();
 
         let new_cursor_position = self.render_cursor_position();
-        let mut rows = Vec::with_capacity(4);
+        let active_window_id = self.window_manager.active_window_id();
+        let matching_bracket_rows = self
+            .window_manager
+            .window_at_index(active_window_id)
+            .cloned()
+            .map(|window| {
+                self.matching_bracket_points(&window)
+                    .into_iter()
+                    .map(|point| point.y)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut rows = Vec::with_capacity(
+            4 + self.last_rendered_bracket_rows.len() + matching_bracket_rows.len(),
+        );
         if let Some((_, y)) = self.last_rendered_cursor_position {
             rows.push(y);
         }
         if let Some((_, y)) = new_cursor_position {
             rows.push(y);
         }
+        rows.extend(self.last_rendered_bracket_rows.iter().copied());
+        rows.extend(matching_bracket_rows.iter().copied());
 
         let status_y = (self.size.1 as usize).saturating_sub(2);
         let command_y = (self.size.1 as usize).saturating_sub(1);
@@ -409,7 +426,6 @@ impl Editor {
         rows.dedup();
 
         let snapshots = buffer.snapshot_rows(&rows);
-        let active_window_id = self.window_manager.active_window_id();
         self.render_window_rows(buffer, active_window_id, &rows)?;
         self.draw_statusline(buffer);
         self.draw_commandline(buffer);
@@ -420,6 +436,7 @@ impl Editor {
         self.render_diff(&changes)?;
         self.commit_render_buffer_changes(&changes);
         self.last_rendered_cursor_position = new_cursor_position;
+        self.last_rendered_bracket_rows = matching_bracket_rows;
         self.render_generation = self.render_generation.wrapping_add(1);
 
         Ok(())
@@ -449,6 +466,7 @@ impl Editor {
         self.render_gutter_rows_in_window(buffer, &window, window_id, &local_rows);
         self.render_main_content_rows_in_window(buffer, &window, &local_rows)?;
         self.render_line_highlight_rows_in_window(buffer, &window, &local_rows);
+        self.render_matching_brackets_in_window(buffer, &window, Some(terminal_rows));
 
         Ok(())
     }
@@ -1166,6 +1184,7 @@ impl Editor {
         }
 
         self.render_search_highlights_in_window(buffer, window)?;
+        self.render_matching_brackets_in_window(buffer, window, None);
 
         // Render selection last so its contrast guarantee is not overwritten by search highlights.
         if self.is_visual() && window.active {
@@ -1183,6 +1202,89 @@ impl Editor {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn matching_bracket_positions(&mut self) -> Option<[TextPosition; 2]> {
+        if !matches!(
+            self.mode,
+            Mode::Normal | Mode::Insert | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+        ) {
+            return None;
+        }
+
+        let cursor = self.cursor_text_position();
+        let buffer = self.buffer_manager.active_buffer()?;
+        let matching = crate::matchit::BracketMatchCache::matching_position(
+            &mut self.bracket_match_cache,
+            buffer,
+            cursor,
+            &self.config.matchit,
+        )?;
+
+        Some([cursor, matching])
+    }
+
+    fn matching_bracket_points(&mut self, window: &crate::window::Window) -> Vec<Point> {
+        if !window.active || self.current_dialog.is_some() {
+            return Vec::new();
+        }
+        let Some(positions) = self.matching_bracket_positions() else {
+            return Vec::new();
+        };
+
+        let mut points = Vec::with_capacity(positions.len());
+        for position in positions {
+            let Some(line) = self
+                .buffer_manager
+                .get(window.buffer_index)
+                .and_then(|buffer| buffer.get(position.line))
+            else {
+                continue;
+            };
+            let line = trim_line_ending(&line);
+            let tab_width = self.tab_width_for_buffer_index(window.buffer_index);
+            let start_col =
+                display_width_with_tabs(char_prefix(line, position.character), tab_width);
+            let end_col = display_width_with_tabs(
+                char_prefix(line, position.character.saturating_add(1)),
+                tab_width,
+            );
+            points.extend(self.display_col_range_points_in_window(
+                window,
+                position.line,
+                start_col,
+                end_col,
+            ));
+        }
+
+        points
+    }
+
+    fn render_matching_brackets_in_window(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        window: &crate::window::Window,
+        terminal_rows: Option<&[usize]>,
+    ) {
+        let mut points = self.matching_bracket_points(window);
+        if terminal_rows.is_none() {
+            self.last_rendered_bracket_rows = points.iter().map(|point| point.y).collect();
+            self.last_rendered_bracket_rows.sort_unstable();
+            self.last_rendered_bracket_rows.dedup();
+        }
+        if let Some(terminal_rows) = terminal_rows {
+            points.retain(|point| terminal_rows.contains(&point.y));
+        }
+        if points.is_empty() {
+            return;
+        }
+
+        buffer.apply_selection_for_points(
+            points,
+            &self.theme.editor_bracket_match_style(),
+            &self.theme,
+            SelectionForegroundPriority::Content,
+        );
     }
 
     fn render_search_highlights_in_window(

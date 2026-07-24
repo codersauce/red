@@ -6,6 +6,8 @@
     "editor.foreground": "#D8D8DE",
     "editor.lineHighlightBackground": "#16161B",
     "editor.selectionBackground": "#2B2B36",
+    "editorBracketMatch.background": "#34313D",
+    "editorBracketMatch.border": "#B4B4C0",
     "editor.findMatchBackground": "#5A3034",
     "editor.findMatchHighlightBackground": "#33262A",
     "editorCursor.foreground": "#E5484D",

@@ -4,12 +4,176 @@
 //! language. Returned positions use editor grapheme coordinates; tree-sitter byte spans
 //! are converted before crossing the module boundary.
 
+use std::collections::HashMap;
+
 use regex::Regex;
 
 use crate::{
+    buffer::{Buffer, BufferId},
     config::{MatchitConfig, MatchitLanguageConfig},
     undo::{TextPosition, TextRange},
 };
+
+/// Lazily indexes configured single-character delimiter pairs for one buffer revision.
+///
+/// The index walks the structurally shared rope directly instead of flattening the
+/// document or running the more expansive `%` motion tokenizer on every cursor move.
+#[derive(Debug)]
+pub(crate) struct BracketMatchCache {
+    buffer_id: BufferId,
+    revision: u64,
+    configured_pairs: Vec<[String; 2]>,
+    matches: HashMap<usize, usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BracketScanState {
+    Code,
+    SingleQuoted,
+    DoubleQuoted,
+    LineComment,
+    BlockComment,
+}
+
+impl BracketMatchCache {
+    /// Returns the partner only when the cursor is directly on a configured delimiter.
+    pub(crate) fn matching_position(
+        cache: &mut Option<Self>,
+        buffer: &Buffer,
+        cursor: TextPosition,
+        config: &MatchitConfig,
+    ) -> Option<TextPosition> {
+        let rope = buffer.contents_snapshot();
+        let cursor_index = buffer.position_to_char_idx(cursor);
+        let character = rope.get_char(cursor_index)?;
+        if !config.pairs.iter().any(|pair| {
+            single_character(&pair[0]) == Some(character)
+                || single_character(&pair[1]) == Some(character)
+        }) {
+            return None;
+        }
+
+        let cache_is_current = cache.as_ref().is_some_and(|entry| {
+            entry.buffer_id == buffer.id()
+                && entry.revision == buffer.revision()
+                && entry.configured_pairs == config.pairs
+        });
+        if !cache_is_current {
+            *cache = Some(Self::build(buffer, &rope, config));
+        }
+
+        cache
+            .as_ref()?
+            .matches
+            .get(&cursor_index)
+            .copied()
+            .map(|index| buffer.char_idx_to_position(index))
+    }
+
+    fn build(buffer: &Buffer, rope: &ropey::Rope, config: &MatchitConfig) -> Self {
+        let pairs = config
+            .pairs
+            .iter()
+            .filter_map(|pair| Some((single_character(&pair[0])?, single_character(&pair[1])?)))
+            .collect::<Vec<_>>();
+        let mut stacks = vec![Vec::<usize>::new(); pairs.len()];
+        let mut matches = HashMap::new();
+        let mut characters = rope.chars().enumerate().peekable();
+        let mut state = BracketScanState::Code;
+        let mut escaped = false;
+        let is_rust = buffer
+            .file
+            .as_deref()
+            .is_some_and(|file| file.ends_with(".rs"));
+
+        while let Some((index, character)) = characters.next() {
+            match state {
+                BracketScanState::LineComment => {
+                    if character == '\n' {
+                        state = BracketScanState::Code;
+                    }
+                }
+                BracketScanState::BlockComment => {
+                    if character == '*' && characters.peek().is_some_and(|(_, next)| *next == '/') {
+                        characters.next();
+                        state = BracketScanState::Code;
+                    }
+                }
+                BracketScanState::SingleQuoted | BracketScanState::DoubleQuoted => {
+                    let quote = if state == BracketScanState::SingleQuoted {
+                        '\''
+                    } else {
+                        '"'
+                    };
+                    if escaped {
+                        escaped = false;
+                    } else if character == '\\' {
+                        escaped = true;
+                    } else if character == quote {
+                        state = BracketScanState::Code;
+                    }
+                }
+                BracketScanState::Code => {
+                    if character == '/' {
+                        match characters.peek().map(|(_, next)| *next) {
+                            Some('/') => {
+                                characters.next();
+                                state = BracketScanState::LineComment;
+                                continue;
+                            }
+                            Some('*') => {
+                                characters.next();
+                                state = BracketScanState::BlockComment;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if character == '\'' {
+                        if is_rust
+                            && rope
+                                .get_char(index.saturating_add(1))
+                                .is_some_and(|next| next == '_' || next.is_alphabetic())
+                            && rope.get_char(index.saturating_add(2)) != Some('\'')
+                        {
+                            continue;
+                        }
+                        state = BracketScanState::SingleQuoted;
+                        continue;
+                    }
+                    if character == '"' {
+                        state = BracketScanState::DoubleQuoted;
+                        continue;
+                    }
+
+                    for (pair_index, (open, close)) in pairs.iter().copied().enumerate() {
+                        if character == open {
+                            stacks[pair_index].push(index);
+                        } else if character == close {
+                            if let Some(open_index) = stacks[pair_index].pop() {
+                                matches.insert(open_index, index);
+                                matches.insert(index, open_index);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Self {
+            buffer_id: buffer.id(),
+            revision: buffer.revision(),
+            configured_pairs: config.pairs.clone(),
+            matches,
+        }
+    }
+}
+
+fn single_character(token: &str) -> Option<char> {
+    let mut characters = token.chars();
+    let character = characters.next()?;
+    characters.next().is_none().then_some(character)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchDirection {
@@ -630,4 +794,163 @@ fn advance_position(position: TextPosition) -> TextPosition {
 
 fn position_le(left: TextPosition, right: TextPosition) -> bool {
     (left.line, left.character) <= (right.line, right.character)
+}
+
+#[cfg(test)]
+mod bracket_match_tests {
+    use super::*;
+
+    fn position(contents: &str, needle: &str, occurrence: usize) -> TextPosition {
+        let byte = contents.match_indices(needle).nth(occurrence).unwrap().0;
+        let line = contents[..byte]
+            .chars()
+            .filter(|character| *character == '\n')
+            .count();
+        let character = contents[..byte]
+            .rsplit('\n')
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .count();
+        TextPosition::new(line, character)
+    }
+
+    #[test]
+    fn configured_brackets_match_nested_pairs_in_both_directions() {
+        let contents = "fn outer() {\n    let value = [({})];\n}";
+        let buffer = Buffer::new(None, contents.to_string());
+        let config = MatchitConfig::default();
+        let mut cache = None;
+
+        for (open, close, open_occurrence, close_occurrence) in [
+            ("{", "}", 0, 1),
+            ("[", "]", 0, 0),
+            ("(", ")", 1, 1),
+            ("{", "}", 1, 0),
+        ] {
+            let opener = position(contents, open, open_occurrence);
+            let closer = position(contents, close, close_occurrence);
+            assert_eq!(
+                BracketMatchCache::matching_position(&mut cache, &buffer, opener, &config),
+                Some(closer)
+            );
+            assert_eq!(
+                BracketMatchCache::matching_position(&mut cache, &buffer, closer, &config),
+                Some(opener)
+            );
+        }
+    }
+
+    #[test]
+    fn bracket_matching_ignores_strings_and_comments() {
+        let contents = "{ \"}\" '\\'' // }\n /* } */ [ ] }";
+        let buffer = Buffer::new(None, contents.to_string());
+        let config = MatchitConfig::default();
+        let mut cache = None;
+        let opener = position(contents, "{", 0);
+        let closer = position(contents, "}", 3);
+
+        assert_eq!(
+            BracketMatchCache::matching_position(&mut cache, &buffer, opener, &config),
+            Some(closer)
+        );
+        for ignored in 0..3 {
+            assert_eq!(
+                BracketMatchCache::matching_position(
+                    &mut cache,
+                    &buffer,
+                    position(contents, "}", ignored),
+                    &config,
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn bracket_matching_requires_a_delimiter_under_the_cursor() {
+        let contents = "value (nested)";
+        let buffer = Buffer::new(None, contents.to_string());
+        let config = MatchitConfig::default();
+        let mut cache = None;
+
+        assert_eq!(
+            BracketMatchCache::matching_position(
+                &mut cache,
+                &buffer,
+                TextPosition::new(0, 0),
+                &config,
+            ),
+            None
+        );
+        assert!(
+            cache.is_none(),
+            "ordinary cursor motion must not index the buffer"
+        );
+    }
+
+    #[test]
+    fn bracket_matching_is_independent_of_advanced_matchit_navigation() {
+        let buffer = Buffer::new(None, "()".to_string());
+        let config = MatchitConfig {
+            enabled: false,
+            ..MatchitConfig::default()
+        };
+        let mut cache = None;
+
+        assert_eq!(
+            BracketMatchCache::matching_position(
+                &mut cache,
+                &buffer,
+                TextPosition::new(0, 0),
+                &config,
+            ),
+            Some(TextPosition::new(0, 1))
+        );
+    }
+
+    #[test]
+    fn bracket_matching_rebuilds_after_the_buffer_changes() {
+        let mut buffer = Buffer::new(None, "()".to_string());
+        let config = MatchitConfig::default();
+        let mut cache = None;
+
+        assert_eq!(
+            BracketMatchCache::matching_position(
+                &mut cache,
+                &buffer,
+                TextPosition::new(0, 0),
+                &config,
+            ),
+            Some(TextPosition::new(0, 1))
+        );
+        buffer.set(0, "(())".to_string());
+        assert_eq!(
+            BracketMatchCache::matching_position(
+                &mut cache,
+                &buffer,
+                TextPosition::new(0, 0),
+                &config,
+            ),
+            Some(TextPosition::new(0, 3))
+        );
+    }
+
+    #[test]
+    fn rust_lifetimes_do_not_hide_later_matching_brackets() {
+        let contents = "fn borrow<'value>(text: &str) { text.len() }";
+        let buffer = Buffer::new(Some("borrow.rs".to_string()), contents.to_string());
+        let config = MatchitConfig::default();
+        let mut cache = None;
+
+        assert_eq!(
+            BracketMatchCache::matching_position(
+                &mut cache,
+                &buffer,
+                position(contents, "{", 0),
+                &config,
+            ),
+            Some(position(contents, "}", 0))
+        );
+    }
 }

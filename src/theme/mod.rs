@@ -39,6 +39,7 @@ pub struct Theme {
     pub ui_style: UiStyle,
     pub token_styles: Vec<TokenStyle>,
     pub line_highlight_style: Option<Style>,
+    pub bracket_match_style: Option<Style>,
     pub find_match_style: Option<Style>,
     pub find_match_highlight_style: Option<Style>,
     pub selection_style: Option<Style>,
@@ -86,6 +87,15 @@ impl Theme {
             }),
             ..Style::default()
         })
+    }
+
+    pub(crate) fn editor_bracket_match_style(&self) -> Style {
+        self.bracket_match_style
+            .clone()
+            .or_else(|| self.find_match_highlight_style.clone())
+            .or_else(|| self.find_match_style.clone())
+            .or_else(|| self.selection_style.clone())
+            .unwrap_or_else(|| self.editor_selection_style())
     }
 
     pub(crate) fn list_selection_style(&self) -> Style {
@@ -352,6 +362,7 @@ impl Default for Theme {
             ui_style: UiStyle::default(),
             token_styles: vec![],
             line_highlight_style: None,
+            bracket_match_style: None,
             find_match_style: None,
             find_match_highlight_style: None,
             selection_style: None,
