@@ -1,0 +1,713 @@
+// One typed unified-diff model feeds signs, workspace detail, hunk navigation,
+// and line/hunk selection. Raw text is retained so metadata and uncommon diff
+// lines round-trip without loss.
+
+pub enum DiffLineKind {
+    Context,
+    Added,
+    Removed,
+    NoNewlineMarker,
+    Metadata,
+}
+
+pub struct DiffLine {
+    raw: String,
+    kind: DiffLineKind,
+    patch_index: i32,
+}
+
+pub struct LineRange {
+    start: i32,
+    count: i32,
+}
+
+pub struct Hunk {
+    header: String,
+    old: LineRange,
+    new: LineRange,
+    patch_index: i32,
+    lines: [DiffLine],
+}
+
+pub struct FilePatch {
+    header: [String],
+    hunks: [Hunk],
+}
+
+pub struct Patch {
+    prefix: [String],
+    files: [FilePatch],
+}
+
+pub struct SignBuffer {
+    path: String,
+    buffer_index: i32,
+}
+
+pub struct SignHunk {
+    buffer_index: i32,
+    old_start: i32,
+    old_count: i32,
+    new_start: i32,
+    new_count: i32,
+}
+
+pub struct WorkspaceLineData {
+    path: String,
+    section: String,
+    patch_index: i32,
+    hunk_id: Option<String>,
+}
+
+pub struct WorkspaceDocumentLine {
+    id: String,
+    text: String,
+    kind: String,
+    old_line: Option<i32>,
+    new_line: Option<i32>,
+    hunk_id: Option<String>,
+    data: WorkspaceLineData,
+}
+
+pub struct WorkspaceDocument {
+    path: String,
+    lines: [WorkspaceDocumentLine],
+}
+
+fn parse_patch(text: String) -> Patch {
+    let mut prefix = [];
+    let mut files = [];
+    let mut header = [];
+    let mut hunks = [];
+    let mut hunk_header = "";
+    let mut hunk_lines = [];
+    let mut old = LineRange { start: 0, count: 0 };
+    let mut new = LineRange { start: 0, count: 0 };
+    let mut hunk_index = 0;
+    let mut in_file = false;
+    let mut index = 0;
+
+    for raw in text.split("\n") {
+        if index >= 12000 {
+            break;
+        }
+        if raw.starts_with("diff --git ") {
+            if hunk_header != "" {
+                hunks.push(Hunk {
+                    header: hunk_header,
+                    old: old,
+                    new: new,
+                    patch_index: hunk_index,
+                    lines: hunk_lines,
+                });
+                hunk_header = "";
+                hunk_lines = [];
+            }
+            if in_file {
+                files.push(FilePatch { header: header, hunks: hunks });
+                header = [];
+                hunks = [];
+            }
+            in_file = true;
+            header.push(raw);
+        } else if raw.starts_with("@@ ") {
+            if hunk_header != "" {
+                hunks.push(Hunk {
+                    header: hunk_header,
+                    old: old,
+                    new: new,
+                    patch_index: hunk_index,
+                    lines: hunk_lines,
+                });
+                hunk_lines = [];
+            }
+            if !in_file {
+                in_file = true;
+                header = prefix;
+                prefix = [];
+            }
+            let ranges = hunk_ranges(raw);
+            old = ranges.0;
+            new = ranges.1;
+            hunk_header = raw;
+            hunk_index = index;
+        } else if hunk_header != "" {
+            hunk_lines.push(DiffLine {
+                raw: raw,
+                kind: line_kind(raw),
+                patch_index: index,
+            });
+        } else if in_file {
+            header.push(raw);
+        } else {
+            prefix.push(raw);
+        }
+        index += 1;
+    }
+
+    if hunk_header != "" {
+        hunks.push(Hunk {
+            header: hunk_header,
+            old: old,
+            new: new,
+            patch_index: hunk_index,
+            lines: hunk_lines,
+        });
+    }
+    if in_file {
+        files.push(FilePatch { header: header, hunks: hunks });
+    }
+    Patch { prefix: prefix, files: files }
+}
+
+fn hunk_ranges(header: String) -> (LineRange, LineRange) {
+    let fields = header.split(" ");
+    if fields.len() < 3 {
+        return (LineRange { start: 0, count: 0 }, LineRange { start: 0, count: 0 });
+    }
+    (parse_range(fields[1]), parse_range(fields[2]))
+}
+
+fn parse_range(field: String) -> LineRange {
+    if field.len() < 2 {
+        return LineRange { start: 0, count: 0 };
+    }
+    let fields = field.slice(1, field.len()).split(",");
+    let start = parse_number(fields[0]);
+    let mut count = 1;
+    if fields.len() > 1 {
+        count = parse_number(fields[1]);
+    }
+    LineRange { start: start, count: count }
+}
+
+fn parse_number(value: String) -> i32 {
+    let mut result = 0;
+    for character in value {
+        if character >= "0" && character <= "9" {
+            let value = digit(character);
+            if result > 214748364 || (result == 214748364 && value > 7) {
+                return 2147483647;
+            }
+            result = result * 10 + value;
+        }
+    }
+    result
+}
+
+fn digit(value: String) -> i32 {
+    if value == "0" { return 0; }
+    if value == "1" { return 1; }
+    if value == "2" { return 2; }
+    if value == "3" { return 3; }
+    if value == "4" { return 4; }
+    if value == "5" { return 5; }
+    if value == "6" { return 6; }
+    if value == "7" { return 7; }
+    if value == "8" { return 8; }
+    9
+}
+
+fn line_kind(raw: String) -> DiffLineKind {
+    if raw.starts_with("+") && !raw.starts_with("+++") {
+        return DiffLineKind::Added;
+    }
+    if raw.starts_with("-") && !raw.starts_with("---") {
+        return DiffLineKind::Removed;
+    }
+    if raw.starts_with(" ") {
+        return DiffLineKind::Context;
+    }
+    if raw.starts_with("\\ No newline at end of file") {
+        return DiffLineKind::NoNewlineMarker;
+    }
+    DiffLineKind::Metadata
+}
+
+pub fn sign_hunks(text: String, buffers: [SignBuffer]) -> [SignHunk] {
+    let patch = parse_patch(text);
+    let mut result = [];
+
+    for file in patch.files {
+        if result.len() >= 1000 {
+            break;
+        }
+        if file.header.len() == 0 {
+            continue;
+        }
+        let buffer_index = buffer_for_header(file.header[0], buffers);
+        if buffer_index < 0 {
+            continue;
+        }
+        for hunk in file.hunks {
+            if result.len() >= 1000 {
+                break;
+            }
+            result.push(SignHunk {
+                buffer_index: buffer_index,
+                old_start: hunk.old.start,
+                old_count: hunk.old.count,
+                new_start: hunk.new.start,
+                new_count: hunk.new.count,
+            });
+        }
+    }
+    result
+}
+
+fn buffer_for_header(header: String, buffers: [SignBuffer]) -> i32 {
+    for buffer in buffers {
+        let path = buffer.path;
+        if header == "diff --git " + path + " " + path ||
+            header == "diff --git \"" + path + "\" \"" + path + "\"" {
+            return buffer.buffer_index;
+        }
+    }
+    for buffer in buffers {
+        let path = buffer.path;
+        if header.ends_with(" " + path) || header.ends_with(" \"" + path + "\"") {
+            return buffer.buffer_index;
+        }
+    }
+    -1
+}
+
+pub fn detail_document(text: String, path: String, section: String) -> WorkspaceDocument {
+    let patch = parse_patch(text);
+    let mut lines = [];
+    let mut hunk_number = 0;
+
+    for raw in patch.prefix {
+        if lines.len() >= 1000 { break; }
+        lines.push(document_meta(raw, path, section, lines.len()));
+    }
+    for file in patch.files {
+        for raw in file.header {
+            if lines.len() >= 1000 { break; }
+            lines.push(document_meta(raw, path, section, lines.len()));
+        }
+        for hunk in file.hunks {
+            if lines.len() >= 1000 { break; }
+            hunk_number += 1;
+            let hunk_id = path + ":" + hunk_number;
+            let header_data = WorkspaceLineData {
+                path: path,
+                section: section,
+                patch_index: hunk.patch_index,
+                hunk_id: Some(hunk_id),
+            };
+            lines.push(WorkspaceDocumentLine {
+                id: hunk_id + ":header",
+                text: hunk.header,
+                kind: "hunk",
+                old_line: None,
+                new_line: None,
+                hunk_id: Some(hunk_id),
+                data: header_data,
+            });
+            let mut old_line = hunk.old.start;
+            let mut new_line = hunk.new.start;
+            for line in hunk.lines {
+                if lines.len() >= 1000 { break; }
+                let mut kind = "meta";
+                let mut text = line.raw;
+                let mut old_value = None;
+                let mut new_value = None;
+                match line.kind {
+                    DiffLineKind::Added => {
+                        kind = "added";
+                        text = line.raw.slice(1, line.raw.len());
+                        new_value = Some(new_line);
+                        new_line += 1;
+                    },
+                    DiffLineKind::Removed => {
+                        kind = "removed";
+                        text = line.raw.slice(1, line.raw.len());
+                        old_value = Some(old_line);
+                        old_line += 1;
+                    },
+                    DiffLineKind::Context => {
+                        kind = "context";
+                        text = line.raw.slice(1, line.raw.len());
+                        old_value = Some(old_line);
+                        new_value = Some(new_line);
+                        old_line += 1;
+                        new_line += 1;
+                    },
+                    DiffLineKind::NoNewlineMarker => {},
+                    DiffLineKind::Metadata => {},
+                };
+                lines.push(WorkspaceDocumentLine {
+                    id: path + ":" + line.patch_index,
+                    text: text,
+                    kind: kind,
+                    old_line: old_value,
+                    new_line: new_value,
+                    hunk_id: Some(hunk_id),
+                    data: WorkspaceLineData {
+                        path: path,
+                        section: section,
+                        patch_index: line.patch_index,
+                        hunk_id: Some(hunk_id),
+                    },
+                });
+            }
+        }
+    }
+    WorkspaceDocument { path: path, lines: lines }
+}
+
+fn document_meta(raw: String, path: String, section: String, index: i32) -> WorkspaceDocumentLine {
+    WorkspaceDocumentLine {
+        id: path + ":meta:" + index,
+        text: raw,
+        kind: "meta",
+        old_line: None,
+        new_line: None,
+        hunk_id: None,
+        data: WorkspaceLineData {
+            path: path,
+            section: section,
+            patch_index: index,
+            hunk_id: None,
+        },
+    }
+}
+
+pub fn dashboard_hunk(text: String, path: String, selected_id: String) -> String {
+    if selected_id == "" {
+        return "";
+    }
+    let patch = parse_patch(text);
+    let mut hunk_number = 0;
+    let mut output = patch.prefix;
+
+    for file in patch.files {
+        for raw in file.header {
+            output.push(raw);
+        }
+        for hunk in file.hunks {
+            hunk_number += 1;
+            if path + ":" + hunk_number == selected_id {
+                output.push(hunk.header);
+                for line in hunk.lines {
+                    output.push(line.raw);
+                }
+                return output.join("\n");
+            }
+        }
+    }
+    ""
+}
+
+pub fn dashboard_range(text: String, start_index: i32, end_index: i32) -> String {
+    let mut first = start_index;
+    let mut last = end_index;
+    if last < first {
+        let swap = first;
+        first = last;
+        last = swap;
+    }
+    let patch = parse_patch(text);
+    let mut output = patch.prefix;
+    let mut found = false;
+
+    for file in patch.files {
+        let mut selected = [];
+        for hunk in file.hunks {
+            let selection = dashboard_selected_hunk(hunk, first, last);
+            if selection != "" {
+                selected.push(selection);
+            }
+        }
+        if selected.len() > 0 {
+            found = true;
+            for raw in file.header {
+                output.push(raw);
+            }
+            for hunk in selected {
+                output.push(hunk);
+            }
+        }
+    }
+    if !found {
+        return "";
+    }
+    output.join("\n")
+}
+
+fn dashboard_selected_hunk(hunk: Hunk, first: i32, last: i32) -> String {
+    let mut output = [];
+    let mut changed = false;
+    for line in hunk.lines {
+        let selected = line.patch_index >= first && line.patch_index <= last;
+        match line.kind {
+            DiffLineKind::Added => {
+                if selected {
+                    output.push(line.raw);
+                    changed = true;
+                }
+            },
+            DiffLineKind::Removed => {
+                if selected {
+                    output.push(line.raw);
+                    changed = true;
+                } else {
+                    output.push(" " + line.raw.slice(1, line.raw.len()));
+                }
+            },
+            DiffLineKind::Context => {
+                output.push(line.raw);
+            },
+            DiffLineKind::NoNewlineMarker => {
+                output.push(line.raw);
+            },
+            DiffLineKind::Metadata => {
+                output.push(line.raw);
+            },
+        };
+    }
+    if !changed {
+        return "";
+    }
+    serialize_selected_hunk(hunk.old.start, hunk.new.start, output)
+}
+
+pub fn hunk_starts(text: String) -> [i32] {
+    let patch = parse_patch(text);
+    let mut starts = [];
+    for file in patch.files {
+        for hunk in file.hunks {
+            starts.push(hunk.new.start - 1);
+        }
+    }
+    starts
+}
+
+pub fn editor_hunk(text: String, cursor_line: i32) -> String {
+    let patch = parse_patch(text);
+    let mut output = patch.prefix;
+    for file in patch.files {
+        for raw in file.header {
+            output.push(raw);
+        }
+        for hunk in file.hunks {
+            let start = hunk.new.start - 1;
+            let end = start + hunk.new.count - 1;
+            if cursor_line >= start && cursor_line <= end {
+                output.push(hunk.header);
+                for line in hunk.lines {
+                    output.push(line.raw);
+                }
+                return output.join("\n");
+            }
+        }
+    }
+    ""
+}
+
+pub fn editor_range(text: String, start_line: i32, end_line: i32) -> String {
+    let patch = parse_patch(text);
+    let mut output = patch.prefix;
+    let mut found = false;
+
+    for file in patch.files {
+        let mut selected = [];
+        for hunk in file.hunks {
+            let result = editor_selected_hunk(hunk, start_line, end_line);
+            if result != "" {
+                selected.push(result);
+            }
+        }
+        if selected.len() > 0 {
+            found = true;
+            for raw in file.header {
+                output.push(raw);
+            }
+            for hunk in selected {
+                output.push(hunk);
+            }
+        }
+    }
+    if !found {
+        return "";
+    }
+    output.join("\n")
+}
+
+fn editor_selected_hunk(hunk: Hunk, start_line: i32, end_line: i32) -> String {
+    let mut output = [];
+    let mut new_line = hunk.new.start - 1;
+    let lines = hunk.lines;
+    let mut index = 0;
+
+    while index < lines.len() {
+        let current = lines[index];
+        let mut is_change = false;
+        match current.kind {
+            DiffLineKind::Added => {
+                is_change = true;
+            },
+            DiffLineKind::Removed => {
+                is_change = true;
+            },
+            DiffLineKind::Context => {},
+            DiffLineKind::NoNewlineMarker => {},
+            DiffLineKind::Metadata => {},
+        };
+        if !is_change {
+            output.push(current.raw);
+            if current.raw.starts_with(" ") {
+                new_line += 1;
+            }
+            index += 1;
+            continue;
+        }
+
+        let mut removed: [String] = [];
+        while index < lines.len() && lines[index].raw.starts_with("-") {
+            removed.push(lines[index].raw);
+            index += 1;
+        }
+        let addition_start = new_line;
+        let mut added: [String] = [];
+        while index < lines.len() && lines[index].raw.starts_with("+") {
+            added.push(lines[index].raw);
+            new_line += 1;
+            index += 1;
+        }
+        let mut addition_end = addition_start;
+        if added.len() > 0 {
+            addition_end = addition_start + added.len() - 1;
+        }
+        let mut selected = addition_start >= start_line && addition_start <= end_line + 1;
+        if added.len() > 0 {
+            selected = addition_start <= end_line && addition_end >= start_line;
+        }
+        if selected {
+            for raw in removed { output.push(raw); }
+            for raw in added { output.push(raw); }
+        } else {
+            for raw in removed {
+                output.push(" " + raw.slice(1, raw.len()));
+            }
+        }
+    }
+    serialize_selected_hunk(hunk.old.start, hunk.new.start, output)
+}
+
+fn serialize_selected_hunk(old_start: i32, new_start: i32, lines: [String]) -> String {
+    let mut old_count = 0;
+    let mut new_count = 0;
+    let mut changed = false;
+    for raw in lines {
+        if raw.starts_with("+") {
+            new_count += 1;
+            changed = true;
+        } else if raw.starts_with("-") {
+            old_count += 1;
+            changed = true;
+        } else if raw.starts_with(" ") {
+            old_count += 1;
+            new_count += 1;
+        }
+    }
+    if !changed {
+        return "";
+    }
+    let mut output = ["@@ -" + old_start + "," + old_count + " +" + new_start + "," + new_count + " @@"];
+    for raw in lines {
+        output.push(raw);
+    }
+    output.join("\n")
+}
+
+pub fn normalize_unsaved(text: String, path: String) -> String {
+    let patch = parse_patch(text);
+    let mut output = patch.prefix;
+    for file in patch.files {
+        for raw in file.header {
+            if raw.starts_with("diff --git ") {
+                output.push("diff --git a/" + path + " b/" + path);
+            } else if raw.starts_with("--- ") {
+                output.push("--- a/" + path);
+            } else if raw.starts_with("+++ ") {
+                output.push("+++ b/" + path);
+            } else {
+                output.push(raw);
+            }
+        }
+        for hunk in file.hunks {
+            output.push(hunk.header);
+            for line in hunk.lines {
+                output.push(line.raw);
+            }
+        }
+    }
+    output.join("\n")
+}
+
+#[test]
+fn parses_multi_file_hunks_and_matches_renamed_destination_buffers() {
+    let text = "diff --git tracked.rs tracked.rs\n--- tracked.rs\n+++ tracked.rs\n@@ -2,2 +2,3 @@\n-old\n+new\n+extra\n context\ndiff --git old name.rs new name.rs\n--- old name.rs\n+++ new name.rs\n@@ -8 +8 @@\n-before\n+after";
+    let hunks = sign_hunks(text, [
+        SignBuffer { path: "tracked.rs", buffer_index: 4 },
+        SignBuffer { path: "new name.rs", buffer_index: 8 },
+    ]);
+
+    assert(hunks.len() == 2);
+    assert(hunks[0].buffer_index == 4);
+    assert(hunks[0].old_start == 2);
+    assert(hunks[0].old_count == 2);
+    assert(hunks[0].new_count == 3);
+    assert(hunks[1].buffer_index == 8);
+}
+
+#[test]
+fn renders_structured_detail_and_selects_one_dashboard_line() {
+    let text = "diff --git a/tracked.rs b/tracked.rs\n--- a/tracked.rs\n+++ b/tracked.rs\n@@ -1,3 +1,3 @@\n-one\n+ONE\n two\n-three\n+THREE\n\\ No newline at end of file";
+    let document = detail_document(text, "tracked.rs", "unstaged");
+
+    assert(document.lines.len() == 10);
+    assert(document.lines[3].kind == "hunk");
+    assert(document.lines[4].kind == "removed");
+    assert(document.lines[5].kind == "added");
+    assert(document.lines[5].data.patch_index == 5);
+    let selected = dashboard_range(text, 4, 5);
+    assert(selected.includes("-one\n+ONE"));
+    assert(!selected.includes("-three"));
+    assert(!selected.includes("+THREE"));
+}
+
+#[test]
+fn selects_editor_hunks_and_preserves_unselected_removed_context() {
+    let text = "diff --git a/tracked.rs b/tracked.rs\n--- a/tracked.rs\n+++ b/tracked.rs\n@@ -1,3 +1,3 @@\n-one\n+ONE\n two\n-three\n+THREE\n@@ -8 +8 @@\n-old\n+new";
+    let starts = hunk_starts(text);
+    assert(starts.len() == 2);
+    assert(starts[0] == 0);
+    assert(starts[1] == 7);
+    assert(editor_hunk(text, 7).includes("-old\n+new"));
+    let selected = editor_range(text, 0, 0);
+    assert(selected.includes("-one\n+ONE"));
+    assert(selected.includes(" three"));
+    assert(!selected.includes("+THREE"));
+}
+
+#[test]
+fn normalizes_unsaved_patch_paths_without_rewriting_content() {
+    let text = "diff --git /private/tmp/file -\n--- /private/tmp/file\n+++ -\n@@ -1 +1 @@\n-before\n+after";
+    let normalized = normalize_unsaved(text, "src/file.rs");
+    assert(normalized.includes("diff --git a/src/file.rs b/src/file.rs"));
+    assert(normalized.includes("--- a/src/file.rs"));
+    assert(normalized.includes("+++ b/src/file.rs"));
+    assert(normalized.includes("-before\n+after"));
+}
+
+#[test]
+fn saturates_pathological_diff_range_values() {
+    let text = "diff --git a.rs a.rs\n@@ -999999999999999999999,1 +999999999999999999999,1 @@\n-old\n+new";
+    let hunks = sign_hunks(text, [SignBuffer { path: "a.rs", buffer_index: 1 }]);
+    assert(hunks.len() == 1);
+    assert(hunks[0].old_start == 2147483647);
+    assert(hunks[0].new_start == 2147483647);
+}

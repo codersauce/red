@@ -138,8 +138,8 @@ Parser/tooling callers can separately use
 
 ## Local packages
 
-A package is filesystem-only. It has no registry, URL dependency, or version
-solver.
+CLI package loading is filesystem-only. It has no registry, URL dependency, or
+version solver.
 
 Example layout:
 
@@ -230,6 +230,30 @@ husk test --locked calculator
 ```
 
 `--locked` rejects a missing or changed lock file.
+
+Embedders can resolve a pure, multi-file package directly from bundled source
+strings without relying on a runtime filesystem layout:
+
+```rust
+use husk::{PackageLimits, ResolvedPackage};
+
+let package = ResolvedPackage::from_sources(
+    "embedded/calculator",
+    include_str!("../calculator/Husk.toml"),
+    &[
+        ("src/main.hk", include_str!("../calculator/src/main.hk")),
+        ("src/math.hk", include_str!("../calculator/src/math.hk")),
+    ],
+    PackageLimits::default(),
+)?;
+# drop(package);
+# Ok::<(), anyhow::Error>(())
+```
+
+The source paths are package-relative, use the same deterministic `mod`
+resolution and size limits as filesystem packages, and reject missing,
+ambiguous, duplicate, or escaping inputs. Embedded packages are pure: extension
+declarations are rejected.
 
 Crate-backed extensions are declarations rather than paths into generated
 state:

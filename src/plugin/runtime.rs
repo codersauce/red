@@ -22,7 +22,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use husk_runtime::{Callback, CompileOptions, CompiledProgram, Host, SemanticProfile, Value};
+use husk_runtime::{
+    Callback, CompileOptions, CompiledProgram, Host, PackageLimits, ResolvedPackage,
+    SemanticProfile, Value,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -56,6 +59,7 @@ lazy_static::lazy_static! {
 
 const PLUGIN_INSTRUCTION_BUDGET: usize = 100_000;
 static NEXT_PLUGIN_VM_GENERATION: AtomicU64 = AtomicU64::new(1);
+static GIT_CORE_PROGRAM: OnceLock<Result<CompiledProgram, String>> = OnceLock::new();
 
 /// User-facing metadata attached to a registered Red plugin command.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,6 +192,7 @@ extern "red" {
         fn char() -> String;
         fn null() -> JsValue;
         fn parse_json() -> JsValue;
+        fn git_core() -> JsValue;
     }
 }
 "#;
@@ -224,6 +229,7 @@ struct RedHost {
     staged_effects: Option<Vec<StagedHostEffect>>,
     staged_replacement_start: Option<usize>,
     staged_teardown_start: Option<usize>,
+    git_core: Option<husk_runtime::Vm>,
 }
 
 #[derive(Debug, Clone)]
@@ -408,6 +414,7 @@ impl RedHost {
             staged_effects: None,
             staged_replacement_start: None,
             staged_teardown_start: None,
+            git_core: None,
         }
     }
 
@@ -1901,8 +1908,145 @@ impl RedHost {
                     .map(Value::Json)
                     .unwrap_or(Value::Unit))
             }
+            "red::git_core" => {
+                let operation = red_required_string(args, 0, path)?;
+                self.call_git_core(operation, &args[1..])
+            }
             _ => anyhow::bail!("unknown Red host function `{path}`"),
         })())
+    }
+
+    fn call_git_core(&mut self, operation: &str, args: &[Value]) -> anyhow::Result<Value> {
+        let function = match operation {
+            "parse_status" => "status::parse_status",
+            "sign_hunks" => "patch::sign_hunks",
+            "detail_document" => "patch::detail_document",
+            "dashboard_hunk" => "patch::dashboard_hunk",
+            "dashboard_range" => "patch::dashboard_range",
+            "hunk_starts" => "patch::hunk_starts",
+            "editor_hunk" => "patch::editor_hunk",
+            "editor_range" => "patch::editor_range",
+            "normalize_unsaved" => "patch::normalize_unsaved",
+            "apply_hunk_args" => "commands::apply_hunk_args",
+            "status_args" => "commands::status_args",
+            "sign_diff_args" => "commands::sign_diff_args",
+            "detail_diff_args" => "commands::detail_diff_args",
+            "hunk_diff_args" => "commands::hunk_diff_args",
+            "commit_args" => "commands::commit_args",
+            _ => anyhow::bail!("unknown Git core operation `{operation}`"),
+        };
+
+        if self.git_core.is_none() {
+            let program = git_core_program()?;
+            let mut vm = new_plugin_vm();
+            let mut host = GitCoreHost;
+            vm.load_compiled_plugin("red-git-core", program, &mut host)?;
+            self.git_core = Some(vm);
+        }
+        let vm = self
+            .git_core
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Git core VM did not initialize"))?;
+        let mut host = GitCoreHost;
+        let result = vm.call_export("red-git-core", function, args.to_vec(), &mut host)?;
+        Ok(normalize_git_core_value(result))
+    }
+}
+
+struct GitCoreHost;
+
+impl Host for GitCoreHost {
+    fn log(&mut self, _message: &str) {}
+}
+
+fn git_core_program() -> anyhow::Result<CompiledProgram> {
+    let compiled = GIT_CORE_PROGRAM.get_or_init(|| {
+        let package = ResolvedPackage::from_sources(
+            "plugins/git_core",
+            include_str!("../../plugins/git_core/Husk.toml"),
+            &[
+                (
+                    "src/main.hk",
+                    include_str!("../../plugins/git_core/src/main.hk"),
+                ),
+                (
+                    "src/status.hk",
+                    include_str!("../../plugins/git_core/src/status.hk"),
+                ),
+                (
+                    "src/patch.hk",
+                    include_str!("../../plugins/git_core/src/patch.hk"),
+                ),
+                (
+                    "src/commands.hk",
+                    include_str!("../../plugins/git_core/src/commands.hk"),
+                ),
+            ],
+            PackageLimits::default(),
+        )
+        .map_err(|error| format!("failed to resolve embedded Git core: {error}"))?;
+        CompiledProgram::compile_package(&package, &CompileOptions::default())
+            .map_err(|error| format!("failed to compile embedded Git core: {error}"))
+    });
+    compiled
+        .as_ref()
+        .cloned()
+        .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+fn normalize_git_core_value(value: Value) -> Value {
+    match value {
+        Value::Variant {
+            type_name,
+            case,
+            fields,
+        } if type_name == "Option" => match (case.as_str(), fields.as_slice()) {
+            ("None", []) => Value::Null,
+            ("Some", [value]) => normalize_git_core_value(value.clone()),
+            _ => Value::Null,
+        },
+        Value::Array(values) => Value::Array(Arc::new(
+            values
+                .iter()
+                .cloned()
+                .map(normalize_git_core_value)
+                .collect(),
+        )),
+        Value::Tuple(values) => Value::Tuple(Arc::new(
+            values
+                .iter()
+                .cloned()
+                .map(normalize_git_core_value)
+                .collect(),
+        )),
+        Value::Object(fields) => Value::Object(Arc::new(
+            fields
+                .iter()
+                .map(|(name, value)| (name.clone(), normalize_git_core_value(value.clone())))
+                .collect(),
+        )),
+        Value::Struct { fields, .. } => Value::Object(Arc::new(
+            fields
+                .iter()
+                .map(|(name, value)| (name.clone(), normalize_git_core_value(value.clone())))
+                .collect(),
+        )),
+        Value::Variant {
+            type_name,
+            case,
+            fields,
+        } => Value::Variant {
+            type_name,
+            case,
+            fields: Arc::new(
+                fields
+                    .iter()
+                    .cloned()
+                    .map(normalize_git_core_value)
+                    .collect(),
+            ),
+        },
+        value => value,
     }
 }
 
@@ -3266,6 +3410,53 @@ mod tests {
             .await
             .unwrap();
         runtime
+    }
+
+    #[test]
+    fn embedded_git_core_compiles_as_a_native_multi_file_package_and_normalizes_options() {
+        let program = git_core_program().unwrap();
+        assert_eq!(program.semantic_profile(), SemanticProfile::Native);
+        assert_eq!(program.source_map().sources().len(), 4);
+        assert_eq!(program.module_semantic_results().len(), 4);
+
+        let mut host = RedHost::new(HashMap::new());
+        let status = host
+            .call_git_core(
+                "parse_status",
+                &[Value::String(
+                    "# branch.head native\0? src/new file.rs\0".to_string(),
+                )],
+            )
+            .unwrap()
+            .to_json();
+        assert_eq!(status["head"], "native");
+        assert_eq!(status["untracked"][0]["path"], "src/new file.rs");
+        assert!(status["untracked"][0]["original_path"].is_null());
+
+        let document = host
+            .call_git_core(
+                "detail_document",
+                &[
+                    Value::String(
+                        "diff --git a/file.rs b/file.rs\n--- a/file.rs\n+++ b/file.rs\n@@ -1 +1 @@\n-old\n+new"
+                            .to_string(),
+                    ),
+                    Value::String("file.rs".to_string()),
+                    Value::String("unstaged".to_string()),
+                ],
+            )
+            .unwrap()
+            .to_json();
+        assert!(document["lines"][3]["old_line"].is_null());
+        assert_eq!(document["lines"][4]["old_line"], 1);
+        assert!(document["lines"][4]["new_line"].is_null());
+        assert_eq!(document["lines"][5]["new_line"], 1);
+
+        let error = host.call_git_core("not_an_operation", &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown Git core operation"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

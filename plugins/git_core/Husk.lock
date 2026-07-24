@@ -1,0 +1,5 @@
+schema_version = 1
+
+[package]
+name = "red-git-core"
+version = "0.1.0"
