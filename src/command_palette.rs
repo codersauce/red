@@ -35,6 +35,9 @@ pub(crate) const BUILTIN_COLON_COMMANDS: &[&str] = &[
     "nohlsearch",
     "wrap",
     "nowrap",
+    "syntax",
+    "syn",
+    "ft",
     "config-diagnostics",
 ];
 
@@ -547,6 +550,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Some(":nowrap"),
             &[],
             Action::SetWrap(false),
+        ),
+        builtin(
+            "view.syntax",
+            "Set syntax",
+            "View",
+            "Choose syntax highlighting for the current buffer",
+            Some(":syntax"),
+            &[":syn", ":ft", "filetype", "language"],
+            Action::OpenSyntaxPicker,
         ),
         builtin(
             "window.split_horizontal",
@@ -1070,6 +1082,22 @@ mod tests {
         assert_eq!(comment.category, "Edit");
         assert_eq!(comment.title, "Toggle line comments");
         assert!(comment.aliases.iter().any(|alias| alias == "gcc"));
+    }
+
+    #[test]
+    fn palette_lists_syntax_selection_with_colon_aliases() {
+        let entries = entries(&default_keys(), &[]);
+        let syntax = entries
+            .iter()
+            .find(|entry| entry.id == "view.syntax")
+            .expect("syntax action should appear in the command palette");
+
+        assert_eq!(syntax.category, "View");
+        assert_eq!(syntax.title, "Set syntax");
+        assert_eq!(syntax.colon.as_deref(), Some(":syntax"));
+        assert!(syntax.aliases.iter().any(|alias| alias == ":syn"));
+        assert!(syntax.aliases.iter().any(|alias| alias == ":ft"));
+        assert_eq!(syntax.action, Action::OpenSyntaxPicker);
     }
 
     #[test]

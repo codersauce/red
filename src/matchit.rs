@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use regex::Regex;
 
 use crate::{
-    buffer::{Buffer, BufferId},
+    buffer::{Buffer, BufferId, SyntaxSelection},
     config::{MatchitConfig, MatchitLanguageConfig},
     undo::{TextPosition, TextRange},
 };
@@ -93,10 +93,13 @@ impl BracketMatchCache {
         let mut characters = rope.chars().enumerate().peekable();
         let mut state = BracketScanState::Code;
         let mut escaped = false;
-        let is_rust = buffer
-            .file
-            .as_deref()
-            .is_some_and(|file| file.ends_with(".rs"));
+        let is_rust = match buffer.syntax_selection() {
+            SyntaxSelection::Language(language) => language == "rust",
+            SyntaxSelection::Auto | SyntaxSelection::Off => buffer
+                .file
+                .as_deref()
+                .is_some_and(|file| file.ends_with(".rs")),
+        };
 
         while let Some((index, character)) = characters.next() {
             match state {
@@ -959,6 +962,25 @@ mod bracket_match_tests {
     fn rust_lifetimes_do_not_hide_later_matching_brackets() {
         let contents = "fn borrow<'value>(text: &str) { text.len() }";
         let buffer = Buffer::new(Some("borrow.rs".to_string()), contents.to_string());
+        let config = MatchitConfig::default();
+        let mut cache = None;
+
+        assert_eq!(
+            BracketMatchCache::matching_position(
+                &mut cache,
+                &buffer,
+                position(contents, "{", 0),
+                &config,
+            ),
+            Some(position(contents, "}", 0))
+        );
+    }
+
+    #[test]
+    fn forced_rust_syntax_keeps_lifetimes_from_hiding_matching_brackets() {
+        let contents = "fn borrow<'value>(text: &str) { text.len() }";
+        let mut buffer = Buffer::new(Some("borrow.txt".to_string()), contents.to_string());
+        buffer.set_syntax_selection(SyntaxSelection::Language("rust".to_string()));
         let config = MatchitConfig::default();
         let mut cache = None;
 
