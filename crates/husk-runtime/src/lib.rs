@@ -1786,6 +1786,7 @@ struct RuntimeHeap {
     slots: Vec<HeapSlot>,
     free: Vec<u32>,
     live_objects: usize,
+    live_closures: usize,
     live_bytes: usize,
     max_objects: usize,
     max_bytes: usize,
@@ -1797,6 +1798,7 @@ impl Default for RuntimeHeap {
             slots: Vec::new(),
             free: Vec::new(),
             live_objects: 0,
+            live_closures: 0,
             live_bytes: 0,
             max_objects: 1_000_000,
             max_bytes: 64 * 1024 * 1024,
@@ -1864,6 +1866,7 @@ impl RuntimeHeap {
         closure: ClosureObject,
     ) -> anyhow::Result<FunctionHandle> {
         let handle = self.allocate(HeapObject::Closure(Box::new(closure)))?;
+        self.live_closures += 1;
         Ok(FunctionHandle {
             instance_generation,
             slot: handle.slot,
@@ -2035,12 +2038,14 @@ impl RuntimeHeap {
                 slot.marked = false;
                 continue;
             }
+            let is_closure = matches!(slot.object, Some(HeapObject::Closure(_)));
             let object_bytes = slot.object.as_ref().map_or(0, heap_object_size);
             slot.object = None;
             slot.generation = slot.generation.wrapping_add(1).max(1);
             self.free
                 .push(u32::try_from(index).expect("allocated heap indices fit in u32"));
             self.live_objects = self.live_objects.saturating_sub(1);
+            self.live_closures = self.live_closures.saturating_sub(usize::from(is_closure));
             self.live_bytes = self.live_bytes.saturating_sub(object_bytes);
         }
     }
@@ -3608,6 +3613,14 @@ impl Vm {
         result: Option<&Value>,
     ) {
         if finished.owned_cells.is_empty() {
+            return;
+        }
+        // Cells can escape a completed frame only through a closure capture.
+        // Avoid walking large, closure-free parent values on every helper call.
+        if self.heap.live_closures == 0 {
+            for handle in &finished.owned_cells {
+                self.heap.free_cell(*handle);
+            }
             return;
         }
         let mut function_roots = self.rooted_functions.iter().copied().collect::<Vec<_>>();
@@ -6833,6 +6846,7 @@ mod tests {
             // immediately. The orphaned closure is swept before the next
             // top-level call.
             assert_eq!(vm.heap.live_objects, 1);
+            assert_eq!(vm.heap.live_closures, 1);
         }
     }
 
@@ -6858,6 +6872,7 @@ mod tests {
         assert!(matches!(closure, Value::Closure(_)));
         vm.call_export("handles", "noop", Vec::new(), &mut host)
             .unwrap();
+        assert_eq!(vm.heap.live_closures, 0);
         let error = vm
             .call_export("handles", "invoke", vec![closure], &mut host)
             .unwrap_err()
