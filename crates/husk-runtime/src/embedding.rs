@@ -929,6 +929,7 @@ impl<T: 'static> Engine<T> {
         vm.set_instance_generation(generation);
         vm.set_call_depth_limit(self.inner.limits.max_call_depth);
         vm.set_host_call_budget(self.inner.limits.native_calls_per_call);
+        vm.set_value_size_limit(self.inner.limits.max_value_bytes);
         vm.set_heap_limits(
             self.inner.limits.max_heap_objects,
             self.inner.limits.max_heap_bytes,

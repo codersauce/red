@@ -10,3 +10,4 @@ description = "Semantic analysis for the Husk programming language"
 husk-ast.workspace = true
 husk-types.workspace = true
 husk-parser.workspace = true
+husk-stdlib.workspace = true

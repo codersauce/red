@@ -23,6 +23,7 @@ for crate in \
     husk-parser \
     husk-runtime \
     husk-semantic \
+    husk-stdlib \
     husk-types \
     husk-value \
     husk-wasm

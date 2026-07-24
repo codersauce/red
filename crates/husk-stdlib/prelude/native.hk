@@ -1,0 +1,49 @@
+// Foundational native Husk declarations. Intrinsic signatures are generated
+// from the typed inventory in `husk-stdlib/src/intrinsic.rs`.
+
+enum Option<T> {
+    None,
+    Some(T),
+}
+
+enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+
+use Option::*;
+use Result::*;
+
+trait From<T> {
+    fn from(value: T) -> Self;
+}
+
+trait Into<T> {
+    fn into(self) -> T;
+}
+
+trait TryFrom<T> {
+    fn try_from(value: T) -> Result<Self, String>;
+}
+
+trait TryInto<T> {
+    fn try_into(self) -> Result<T, String>;
+}
+
+trait PartialEq {}
+trait Eq: PartialEq {}
+
+impl PartialEq for i32 {}
+impl PartialEq for i64 {}
+impl PartialEq for f64 {}
+impl PartialEq for bool {}
+impl PartialEq for String {}
+impl PartialEq for Option {}
+impl PartialEq for Result {}
+impl PartialEq for Range {}
+
+impl Eq for i32 {}
+impl Eq for i64 {}
+impl Eq for bool {}
+impl Eq for String {}
+impl Eq for Range {}

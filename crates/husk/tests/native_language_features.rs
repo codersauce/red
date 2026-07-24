@@ -134,14 +134,24 @@ fn question_mark_propagates_result_and_option_variants() {
         case: "Err".to_string(),
         fields: vec![OwnedValue::String("stop".to_string())],
     };
-    assert_eq!(instance.call("add_one", &[error.clone()]).unwrap(), error);
+    assert_eq!(
+        instance
+            .call("add_one", std::slice::from_ref(&error))
+            .unwrap(),
+        error
+    );
 
     let none = OwnedValue::Variant {
         type_name: "Option".to_string(),
         case: "None".to_string(),
         fields: Vec::new(),
     };
-    assert_eq!(instance.call("present", &[none.clone()]).unwrap(), none);
+    assert_eq!(
+        instance
+            .call("present", std::slice::from_ref(&none))
+            .unwrap(),
+        none
+    );
 }
 
 #[test]
@@ -250,7 +260,9 @@ fn nominal_structs_tuples_enums_and_patterns_keep_their_identity() {
         fields: Vec::new(),
     };
     assert_eq!(
-        instance.call("option_or_zero", &[none.clone()]).unwrap(),
+        instance
+            .call("option_or_zero", std::slice::from_ref(&none))
+            .unwrap(),
         OwnedValue::I64(0)
     );
     assert_eq!(
@@ -328,7 +340,7 @@ fn mutable_array_methods_update_the_receiver_cell() {
                 let mut values = [3, 1, 2];
                 values.push(4);
                 values.sort();
-                let last = values.pop();
+                let last = values.pop().unwrap_or(0);
                 values.reverse();
                 (last, values.join(","))
             }

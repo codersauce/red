@@ -9,6 +9,7 @@ use std::collections::{BTreeSet, HashMap};
 use husk_ast::{self as ast, FormatString, Span, TypeExpr, TypeExprKind};
 
 pub use husk_ast::{AssignOp, BinaryOp, UnaryOp};
+pub use husk_stdlib::StdIntrinsic;
 
 /// Stable identity of one executable node within a function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -64,30 +65,6 @@ impl ModuleFunctionId {
     }
 }
 
-/// Stable identity of one language-provided method implementation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct IntrinsicMethodId(u64);
-
-impl IntrinsicMethodId {
-    #[must_use]
-    pub const fn from_raw(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    #[must_use]
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-}
-
-/// Language-provided free functions that do not dispatch through a host module.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum IntrinsicFunction {
-    Println,
-    Assert,
-    AssertMessage,
-}
-
 /// Resolved target for a function-call expression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CallTarget {
@@ -97,7 +74,7 @@ pub enum CallTarget {
     Indirect,
     Script(FunctionId),
     Module(ModuleFunctionId),
-    Intrinsic(IntrinsicFunction),
+    Intrinsic(StdIntrinsic),
     Constructor,
     /// Explicitly retained only for the legacy compatibility profile.
     LegacyDynamic,
@@ -110,7 +87,7 @@ pub enum MethodTarget {
     Unresolved,
     Script(FunctionId),
     Module(ModuleFunctionId),
-    Intrinsic(IntrinsicMethodId),
+    Intrinsic(StdIntrinsic),
     /// Explicitly retained only for the legacy compatibility profile.
     LegacyDynamic,
 }

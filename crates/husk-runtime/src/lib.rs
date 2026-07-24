@@ -6,6 +6,7 @@
 //! standalone CLI.
 
 mod embedding;
+mod stdlib;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -19,18 +20,20 @@ use husk_ast::{
 };
 use husk_diagnostics::{CallFrame, Diagnostic, Report, SourceFile, SourceMap};
 use husk_hir::{
-    AssignOp, BinaryOp, Block, CallTarget, Expr, ExprKind, Function as HirFunction,
-    IntrinsicFunction, LiteralKind, MethodTarget, PatternKind, Stmt, StmtKind, UnaryOp,
-    lower_function,
+    AssignOp, BinaryOp, Block, CallTarget, Expr, ExprKind, Function as HirFunction, LiteralKind,
+    MethodTarget, PatternKind, Stmt, StmtKind, UnaryOp, lower_function,
 };
 use husk_semantic::{SemanticOptions, SemanticResult};
+use husk_stdlib::{
+    ArrayHigherOrderIntrinsic, ArrayIntrinsic, FunctionIntrinsic, FunctionResolution, StdIntrinsic,
+};
 
 pub use embedding::{
     CallContext, CompiledModule, ConversionError, Engine, EngineBuilder, FromHusk, HuskType,
     Instance, IntoHusk, Limits, NativeError, NativeModule, NativeModuleBuilder, ReplOutcome,
     ReplSession, ScriptResult,
 };
-pub use husk_hir::{FunctionId, IntrinsicMethodId, LocalId, ModuleFunctionId, NodeId};
+pub use husk_hir::{FunctionId, LocalId, ModuleFunctionId, NodeId};
 pub use husk_package::{
     CrateExtensionSource, ExtensionSource, INSTALL_DIRECTORY, LOCK_FILE, LockedCrateExtension,
     LockedExtension, LockedPackage, MANIFEST_FILE, PackageError, PackageLimits, PackageLock,
@@ -455,7 +458,6 @@ pub struct CompiledProgram {
     name: Arc<str>,
     functions: Arc<FunctionTable>,
     module_functions: Arc<HashMap<ModuleFunctionId, ModuleFunctionTarget>>,
-    intrinsic_methods: Arc<HashMap<IntrinsicMethodId, IntrinsicMethodTarget>>,
     source: SourceFile,
     source_map: SourceMap,
     syntax: Arc<File>,
@@ -470,7 +472,6 @@ pub struct CompiledProgram {
 struct LoadedProgram {
     functions: Arc<FunctionTable>,
     module_functions: Arc<HashMap<ModuleFunctionId, ModuleFunctionTarget>>,
-    intrinsic_methods: Arc<HashMap<IntrinsicMethodId, IntrinsicMethodTarget>>,
     source: SourceFile,
     source_map: SourceMap,
     semantic_profile: SemanticProfile,
@@ -488,7 +489,6 @@ impl From<CompiledProgram> for LoadedProgram {
         Self {
             functions: program.functions,
             module_functions: program.module_functions,
-            intrinsic_methods: program.intrinsic_methods,
             source: program.source,
             source_map: program.source_map,
             semantic_profile: program.semantic_profile,
@@ -529,12 +529,6 @@ impl FunctionTable {
 #[derive(Debug, Clone)]
 struct ModuleFunctionTarget {
     path: String,
-}
-
-#[derive(Debug, Clone)]
-struct IntrinsicMethodTarget {
-    receiver_type: String,
-    method: String,
 }
 
 /// Valid standalone `main` argument shape.
@@ -787,7 +781,6 @@ impl CompiledProgram {
         let FinalizedCallTables {
             functions,
             module_functions,
-            intrinsic_methods,
         } = finalize_function_table(functions, &options.modules, options.semantic_profile)?;
         let source_map = SourceMap::single(source_file.clone());
 
@@ -795,7 +788,6 @@ impl CompiledProgram {
             name: name.into(),
             functions: Arc::new(functions),
             module_functions: module_functions.into(),
-            intrinsic_methods: intrinsic_methods.into(),
             source: source_file,
             source_map,
             syntax: Arc::new(file),
@@ -995,7 +987,6 @@ impl CompiledProgram {
         let FinalizedCallTables {
             functions,
             module_functions,
-            intrinsic_methods,
         } = finalize_function_table(functions, &options.modules, options.semantic_profile)?;
         let source = root_source.ok_or_else(|| anyhow::anyhow!("package has no entry module"))?;
         let syntax = root_syntax.ok_or_else(|| anyhow::anyhow!("package has no entry syntax"))?;
@@ -1004,7 +995,6 @@ impl CompiledProgram {
             name: package.manifest.package.name.clone().into(),
             functions: Arc::new(functions),
             module_functions: module_functions.into(),
-            intrinsic_methods: intrinsic_methods.into(),
             source,
             source_map,
             syntax,
@@ -2473,7 +2463,6 @@ fn stable_callable_id(namespace: &str, name: &str) -> u64 {
 struct FinalizedCallTables {
     functions: FunctionTable,
     module_functions: HashMap<ModuleFunctionId, ModuleFunctionTarget>,
-    intrinsic_methods: HashMap<IntrinsicMethodId, IntrinsicMethodTarget>,
 }
 
 fn finalize_function_table(
@@ -2538,8 +2527,6 @@ fn finalize_function_table(
         module_ids.insert(path, id);
     }
 
-    let mut intrinsic_methods = HashMap::new();
-    let mut intrinsic_method_ids = HashMap::new();
     for (_, function) in &mut entries {
         let module_path = function.module_path.clone();
         let imports = function.imports.clone();
@@ -2549,8 +2536,6 @@ fn finalize_function_table(
             &imports,
             &by_name,
             &module_ids,
-            &mut intrinsic_methods,
-            &mut intrinsic_method_ids,
             profile,
         )?;
     }
@@ -2565,12 +2550,11 @@ fn finalize_function_table(
             by_id,
         },
         module_functions,
-        intrinsic_methods,
     })
 }
 
-// Resolution deliberately threads immutable declaration indexes and mutable
-// intrinsic-method indexes through every recursive HIR node.
+// Resolution deliberately threads immutable declaration indexes through every
+// recursive HIR node. Native intrinsics resolve directly to typed operations.
 #[allow(clippy::too_many_arguments)]
 fn resolve_hir_statements(
     statements: &mut [Stmt],
@@ -2578,21 +2562,10 @@ fn resolve_hir_statements(
     imports: &HashMap<String, String>,
     functions: &HashMap<String, FunctionId>,
     modules: &HashMap<String, ModuleFunctionId>,
-    intrinsic_methods: &mut HashMap<IntrinsicMethodId, IntrinsicMethodTarget>,
-    intrinsic_method_ids: &mut HashMap<(String, String), IntrinsicMethodId>,
     profile: SemanticProfile,
 ) -> anyhow::Result<()> {
     for statement in statements {
-        resolve_hir_statement(
-            statement,
-            module_path,
-            imports,
-            functions,
-            modules,
-            intrinsic_methods,
-            intrinsic_method_ids,
-            profile,
-        )?;
+        resolve_hir_statement(statement, module_path, imports, functions, modules, profile)?;
     }
     Ok(())
 }
@@ -2604,22 +2577,10 @@ fn resolve_hir_statement(
     imports: &HashMap<String, String>,
     functions: &HashMap<String, FunctionId>,
     modules: &HashMap<String, ModuleFunctionId>,
-    intrinsic_methods: &mut HashMap<IntrinsicMethodId, IntrinsicMethodTarget>,
-    intrinsic_method_ids: &mut HashMap<(String, String), IntrinsicMethodId>,
     profile: SemanticProfile,
 ) -> anyhow::Result<()> {
-    let mut resolve_expr = |expr: &mut Expr| {
-        resolve_hir_expr(
-            expr,
-            module_path,
-            imports,
-            functions,
-            modules,
-            intrinsic_methods,
-            intrinsic_method_ids,
-            profile,
-        )
-    };
+    let resolve_expr =
+        |expr: &mut Expr| resolve_hir_expr(expr, module_path, imports, functions, modules, profile);
     match &mut statement.kind {
         StmtKind::Let {
             value, else_block, ..
@@ -2634,8 +2595,6 @@ fn resolve_hir_statement(
                     imports,
                     functions,
                     modules,
-                    intrinsic_methods,
-                    intrinsic_method_ids,
                     profile,
                 )?;
             }
@@ -2662,21 +2621,10 @@ fn resolve_hir_statement(
                 imports,
                 functions,
                 modules,
-                intrinsic_methods,
-                intrinsic_method_ids,
                 profile,
             )?;
             if let Some(branch) = else_branch {
-                resolve_hir_statement(
-                    branch,
-                    module_path,
-                    imports,
-                    functions,
-                    modules,
-                    intrinsic_methods,
-                    intrinsic_method_ids,
-                    profile,
-                )?;
+                resolve_hir_statement(branch, module_path, imports, functions, modules, profile)?;
             }
         }
         StmtKind::While { cond, body } => {
@@ -2687,8 +2635,6 @@ fn resolve_hir_statement(
                 imports,
                 functions,
                 modules,
-                intrinsic_methods,
-                intrinsic_method_ids,
                 profile,
             )?;
         }
@@ -2699,8 +2645,6 @@ fn resolve_hir_statement(
                 imports,
                 functions,
                 modules,
-                intrinsic_methods,
-                intrinsic_method_ids,
                 profile,
             )?;
         }
@@ -2712,8 +2656,6 @@ fn resolve_hir_statement(
                 imports,
                 functions,
                 modules,
-                intrinsic_methods,
-                intrinsic_method_ids,
                 profile,
             )?;
         }
@@ -2730,21 +2672,10 @@ fn resolve_hir_statement(
                 imports,
                 functions,
                 modules,
-                intrinsic_methods,
-                intrinsic_method_ids,
                 profile,
             )?;
             if let Some(branch) = else_branch {
-                resolve_hir_statement(
-                    branch,
-                    module_path,
-                    imports,
-                    functions,
-                    modules,
-                    intrinsic_methods,
-                    intrinsic_method_ids,
-                    profile,
-                )?;
+                resolve_hir_statement(branch, module_path, imports, functions, modules, profile)?;
             }
         }
         StmtKind::Break | StmtKind::Continue => {}
@@ -2759,8 +2690,6 @@ fn resolve_hir_expr(
     imports: &HashMap<String, String>,
     functions: &HashMap<String, FunctionId>,
     modules: &HashMap<String, ModuleFunctionId>,
-    intrinsic_methods: &mut HashMap<IntrinsicMethodId, IntrinsicMethodTarget>,
-    intrinsic_method_ids: &mut HashMap<(String, String), IntrinsicMethodId>,
     profile: SemanticProfile,
 ) -> anyhow::Result<()> {
     let is_constructor = expr.constructor.is_some();
@@ -2771,30 +2700,13 @@ fn resolve_hir_expr(
             args,
             ..
         } => {
-            resolve_hir_expr(
-                callee,
-                module_path,
-                imports,
-                functions,
-                modules,
-                intrinsic_methods,
-                intrinsic_method_ids,
-                profile,
-            )?;
-            for argument in args {
-                resolve_hir_expr(
-                    argument,
-                    module_path,
-                    imports,
-                    functions,
-                    modules,
-                    intrinsic_methods,
-                    intrinsic_method_ids,
-                    profile,
-                )?;
+            resolve_hir_expr(callee, module_path, imports, functions, modules, profile)?;
+            for argument in args.iter_mut() {
+                resolve_hir_expr(argument, module_path, imports, functions, modules, profile)?;
             }
             *target = resolve_call_target(
                 callee,
+                args,
                 is_constructor,
                 module_path,
                 imports,
@@ -2810,27 +2722,9 @@ fn resolve_hir_expr(
             args,
             ..
         } => {
-            resolve_hir_expr(
-                receiver,
-                module_path,
-                imports,
-                functions,
-                modules,
-                intrinsic_methods,
-                intrinsic_method_ids,
-                profile,
-            )?;
+            resolve_hir_expr(receiver, module_path, imports, functions, modules, profile)?;
             for argument in args {
-                resolve_hir_expr(
-                    argument,
-                    module_path,
-                    imports,
-                    functions,
-                    modules,
-                    intrinsic_methods,
-                    intrinsic_method_ids,
-                    profile,
-                )?;
+                resolve_hir_expr(argument, module_path, imports, functions, modules, profile)?;
             }
             *target = resolve_method_target(
                 receiver,
@@ -2839,8 +2733,6 @@ fn resolve_hir_expr(
                 imports,
                 functions,
                 modules,
-                intrinsic_methods,
-                intrinsic_method_ids,
                 profile,
             )?;
         }
@@ -2848,16 +2740,9 @@ fn resolve_hir_expr(
         | ExprKind::Unary { expr: base, .. }
         | ExprKind::TupleField { base, .. }
         | ExprKind::Try { expr: base }
-        | ExprKind::Cast { expr: base, .. } => resolve_hir_expr(
-            base,
-            module_path,
-            imports,
-            functions,
-            modules,
-            intrinsic_methods,
-            intrinsic_method_ids,
-            profile,
-        )?,
+        | ExprKind::Cast { expr: base, .. } => {
+            resolve_hir_expr(base, module_path, imports, functions, modules, profile)?
+        }
         ExprKind::Binary { left, right, .. }
         | ExprKind::Index {
             base: left,
@@ -2868,26 +2753,8 @@ fn resolve_hir_expr(
             value: right,
             ..
         } => {
-            resolve_hir_expr(
-                left,
-                module_path,
-                imports,
-                functions,
-                modules,
-                intrinsic_methods,
-                intrinsic_method_ids,
-                profile,
-            )?;
-            resolve_hir_expr(
-                right,
-                module_path,
-                imports,
-                functions,
-                modules,
-                intrinsic_methods,
-                intrinsic_method_ids,
-                profile,
-            )?;
+            resolve_hir_expr(left, module_path, imports, functions, modules, profile)?;
+            resolve_hir_expr(right, module_path, imports, functions, modules, profile)?;
         }
         ExprKind::If {
             cond,
@@ -2895,29 +2762,11 @@ fn resolve_hir_expr(
             else_branch,
         } => {
             for nested in [cond, then_branch, else_branch] {
-                resolve_hir_expr(
-                    nested,
-                    module_path,
-                    imports,
-                    functions,
-                    modules,
-                    intrinsic_methods,
-                    intrinsic_method_ids,
-                    profile,
-                )?;
+                resolve_hir_expr(nested, module_path, imports, functions, modules, profile)?;
             }
         }
         ExprKind::Match { scrutinee, arms } => {
-            resolve_hir_expr(
-                scrutinee,
-                module_path,
-                imports,
-                functions,
-                modules,
-                intrinsic_methods,
-                intrinsic_method_ids,
-                profile,
-            )?;
+            resolve_hir_expr(scrutinee, module_path, imports, functions, modules, profile)?;
             for arm in arms {
                 resolve_hir_expr(
                     &mut arm.expr,
@@ -2925,8 +2774,6 @@ fn resolve_hir_expr(
                     imports,
                     functions,
                     modules,
-                    intrinsic_methods,
-                    intrinsic_method_ids,
                     profile,
                 )?;
             }
@@ -2937,8 +2784,6 @@ fn resolve_hir_expr(
             imports,
             functions,
             modules,
-            intrinsic_methods,
-            intrinsic_method_ids,
             profile,
         )?,
         ExprKind::Struct { fields, .. } => {
@@ -2949,8 +2794,6 @@ fn resolve_hir_expr(
                     imports,
                     functions,
                     modules,
-                    intrinsic_methods,
-                    intrinsic_method_ids,
                     profile,
                 )?;
             }
@@ -2960,52 +2803,18 @@ fn resolve_hir_expr(
         | ExprKind::Array { elements: args }
         | ExprKind::Tuple { elements: args } => {
             for argument in args {
-                resolve_hir_expr(
-                    argument,
-                    module_path,
-                    imports,
-                    functions,
-                    modules,
-                    intrinsic_methods,
-                    intrinsic_method_ids,
-                    profile,
-                )?;
+                resolve_hir_expr(argument, module_path, imports, functions, modules, profile)?;
             }
         }
-        ExprKind::Closure { body, .. } => resolve_hir_expr(
-            body,
-            module_path,
-            imports,
-            functions,
-            modules,
-            intrinsic_methods,
-            intrinsic_method_ids,
-            profile,
-        )?,
+        ExprKind::Closure { body, .. } => {
+            resolve_hir_expr(body, module_path, imports, functions, modules, profile)?
+        }
         ExprKind::Range { start, end, .. } => {
             if let Some(start) = start {
-                resolve_hir_expr(
-                    start,
-                    module_path,
-                    imports,
-                    functions,
-                    modules,
-                    intrinsic_methods,
-                    intrinsic_method_ids,
-                    profile,
-                )?;
+                resolve_hir_expr(start, module_path, imports, functions, modules, profile)?;
             }
             if let Some(end) = end {
-                resolve_hir_expr(
-                    end,
-                    module_path,
-                    imports,
-                    functions,
-                    modules,
-                    intrinsic_methods,
-                    intrinsic_method_ids,
-                    profile,
-                )?;
+                resolve_hir_expr(end, module_path, imports, functions, modules, profile)?;
             }
         }
         ExprKind::Ident {
@@ -3026,8 +2835,10 @@ fn resolve_hir_expr(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_call_target(
     callee: &Expr,
+    args: &[Expr],
     is_constructor: bool,
     module_path: &[String],
     imports: &HashMap<String, String>,
@@ -3060,14 +2871,16 @@ fn resolve_call_target(
     if let Some(module) = modules.get(&resolved).copied() {
         return Ok(CallTarget::Module(module));
     }
-    let intrinsic = match spelling.as_str() {
-        "println" => Some(IntrinsicFunction::Println),
-        "assert" => Some(IntrinsicFunction::Assert),
-        "assert_msg" => Some(IntrinsicFunction::AssertMessage),
-        _ => None,
-    };
-    if let Some(intrinsic) = intrinsic {
-        return Ok(CallTarget::Intrinsic(intrinsic));
+    let argument_types = args
+        .iter()
+        .map(|argument| argument.ty.as_deref())
+        .collect::<Vec<_>>();
+    match StdIntrinsic::resolve_function(&spelling, &argument_types) {
+        FunctionResolution::Unique(intrinsic) => return Ok(CallTarget::Intrinsic(intrinsic)),
+        FunctionResolution::Ambiguous if profile == SemanticProfile::Native => {
+            anyhow::bail!("native Husk call `{spelling}` has ambiguous intrinsic overloads")
+        }
+        FunctionResolution::Missing | FunctionResolution::Ambiguous => {}
     }
     if profile == SemanticProfile::LegacyJavaScript {
         Ok(CallTarget::LegacyDynamic)
@@ -3084,8 +2897,6 @@ fn resolve_method_target(
     imports: &HashMap<String, String>,
     functions: &HashMap<String, FunctionId>,
     modules: &HashMap<String, ModuleFunctionId>,
-    intrinsic_methods: &mut HashMap<IntrinsicMethodId, IntrinsicMethodTarget>,
-    intrinsic_method_ids: &mut HashMap<(String, String), IntrinsicMethodId>,
     profile: SemanticProfile,
 ) -> anyhow::Result<MethodTarget> {
     if let ExprKind::Ident {
@@ -3116,32 +2927,11 @@ fn resolve_method_target(
         return Ok(MethodTarget::LegacyDynamic);
     }
 
-    let receiver_type = receiver_type.unwrap_or_else(|| "<inferred>".to_string());
-    let key = (receiver_type.clone(), method.to_string());
-    let id = if let Some(id) = intrinsic_method_ids.get(&key).copied() {
-        id
-    } else {
-        let id = IntrinsicMethodId::from_raw(stable_callable_id(
-            "intrinsic-method",
-            &format!("{receiver_type}\0{method}"),
-        ));
-        if let Some(previous) = intrinsic_methods.insert(
-            id,
-            IntrinsicMethodTarget {
-                receiver_type,
-                method: method.to_string(),
-            },
-        ) {
-            anyhow::bail!(
-                "stable Husk intrinsic-method ID collision with `{}::{}`",
-                previous.receiver_type,
-                previous.method
-            );
-        }
-        intrinsic_method_ids.insert(key, id);
-        id
-    };
-    Ok(MethodTarget::Intrinsic(id))
+    let receiver_type = receiver_type.as_deref().unwrap_or("<inferred>");
+    let intrinsic = StdIntrinsic::resolve_method(receiver_type, method).ok_or_else(|| {
+        anyhow::anyhow!("native Husk method `{receiver_type}::{method}` has no intrinsic target")
+    })?;
+    Ok(MethodTarget::Intrinsic(intrinsic))
 }
 
 fn resolve_compiled_function_id(
@@ -3195,6 +2985,7 @@ pub struct Vm {
     instruction_budget: usize,
     call_depth_limit: usize,
     host_call_budget: usize,
+    max_value_bytes: usize,
     instance_generation: u64,
     heap: RuntimeHeap,
     rooted_functions: HashSet<FunctionHandle>,
@@ -3209,6 +3000,7 @@ impl Vm {
             instruction_budget: 10_000,
             call_depth_limit: 512,
             host_call_budget: 10_000,
+            max_value_bytes: Limits::default().max_value_bytes,
             max_function_roots: 10_000,
             ..Self::default()
         }
@@ -3227,6 +3019,11 @@ impl Vm {
     /// Set the maximum registered native/Wasm module calls for one call.
     pub fn set_host_call_budget(&mut self, budget: usize) {
         self.host_call_budget = budget;
+    }
+
+    /// Set the maximum value produced by one standard-library operation.
+    pub fn set_value_size_limit(&mut self, limit: usize) {
+        self.max_value_bytes = limit;
     }
 
     /// Set the generation used to reject stale runtime function handles.
@@ -4421,7 +4218,7 @@ impl Vm {
                     }
                     MethodTarget::Intrinsic(intrinsic) => self.call_intrinsic_method(
                         *intrinsic,
-                        receiver,
+                        expr,
                         &receiver_value,
                         &argument_values,
                         frame,
@@ -4949,19 +4746,22 @@ impl Vm {
 
     fn call_intrinsic_function<H: Host>(
         &mut self,
-        function: IntrinsicFunction,
+        intrinsic: StdIntrinsic,
         args: &[Value],
         host: &mut H,
     ) -> anyhow::Result<Value> {
+        let StdIntrinsic::Function(function) = intrinsic else {
+            anyhow::bail!("standard-library function call resolved to a method intrinsic");
+        };
         match function {
-            IntrinsicFunction::Println => {
+            FunctionIntrinsic::Println => {
                 let value = args
                     .first()
                     .ok_or_else(|| anyhow::anyhow!("println expects one argument"))?;
                 host.log(&value_to_log_string(value));
                 Ok(Value::Unit)
             }
-            IntrinsicFunction::Assert => {
+            FunctionIntrinsic::Assert => {
                 let condition = args
                     .first()
                     .and_then(Value::as_bool)
@@ -4972,7 +4772,7 @@ impl Vm {
                     anyhow::bail!("assertion failed")
                 }
             }
-            IntrinsicFunction::AssertMessage => {
+            FunctionIntrinsic::AssertMessage => {
                 let condition = args
                     .first()
                     .and_then(Value::as_bool)
@@ -4987,49 +4787,70 @@ impl Vm {
                     anyhow::bail!("{message}")
                 }
             }
+            FunctionIntrinsic::StringFromI32
+            | FunctionIntrinsic::StringFromI64
+            | FunctionIntrinsic::StringFromF64
+            | FunctionIntrinsic::StringFromBool
+            | FunctionIntrinsic::I64FromI32
+            | FunctionIntrinsic::F64FromI32
+            | FunctionIntrinsic::I32TryFromString
+            | FunctionIntrinsic::I32TryFromI64
+            | FunctionIntrinsic::I64TryFromString
+            | FunctionIntrinsic::F64TryFromString
+            | FunctionIntrinsic::F64TryFromI64 => stdlib::call_function(function, args),
         }
     }
 
     fn call_intrinsic_method<H: Host>(
         &mut self,
-        intrinsic: IntrinsicMethodId,
-        receiver_expr: &Expr,
+        intrinsic: StdIntrinsic,
+        expr: &Expr,
         receiver: &Value,
         args: &[Value],
         frame: &mut Frame,
         host: &mut H,
     ) -> anyhow::Result<Value> {
-        let target = self
-            .programs
-            .get(&frame.plugin)
-            .and_then(|program| program.intrinsic_methods.get(&intrinsic))
-            .cloned()
-            .ok_or_else(|| {
-                anyhow::anyhow!("unknown Husk intrinsic method ID {}", intrinsic.raw())
-            })?;
-        if let Some(value) = self.call_higher_order_builtin_method(
-            receiver_expr,
-            receiver,
-            &target.method,
-            args,
-            frame,
-            host,
-        )? {
-            return Ok(value);
+        let ExprKind::MethodCall {
+            receiver: receiver_expr,
+            type_args,
+            ..
+        } = &expr.kind
+        else {
+            anyhow::bail!("intrinsic method dispatch requires a method-call expression");
+        };
+        match intrinsic {
+            StdIntrinsic::ArrayHigherOrder(operation) => self.call_higher_order_stdlib_method(
+                receiver_expr,
+                receiver,
+                operation,
+                args,
+                frame,
+                host,
+            ),
+            StdIntrinsic::Array(
+                operation @ (ArrayIntrinsic::Push
+                | ArrayIntrinsic::Sort
+                | ArrayIntrinsic::Reverse
+                | ArrayIntrinsic::Pop
+                | ArrayIntrinsic::Shift
+                | ArrayIntrinsic::Unshift),
+            ) => self.call_mutating_stdlib_method(
+                receiver_expr,
+                receiver,
+                operation,
+                args,
+                frame,
+                false,
+            ),
+            intrinsic => stdlib::call_method(
+                intrinsic,
+                receiver,
+                args,
+                type_args,
+                expr.ty.as_deref(),
+                self.max_value_bytes,
+            ),
         }
-        if let Some(value) =
-            self.call_mutating_builtin_method(receiver_expr, receiver, &target.method, args, frame)?
-        {
-            return Ok(value);
-        }
-        if let Some(value) = call_builtin_method(receiver, &target.method, args)? {
-            return Ok(value);
-        }
-        anyhow::bail!(
-            "intrinsic method `{}::{}` has no runtime implementation",
-            target.receiver_type,
-            target.method
-        )
     }
 
     fn call_legacy_method<H: Host>(
@@ -5041,23 +4862,65 @@ impl Vm {
         frame: &mut Frame,
         host: &mut H,
     ) -> anyhow::Result<Value> {
-        if let Some(value) = self.call_higher_order_builtin_method(
-            receiver_expr,
-            &receiver,
-            method,
-            &args,
-            frame,
-            host,
-        )? {
-            return Ok(value);
-        }
-        if let Some(value) =
-            self.call_mutating_builtin_method(receiver_expr, &receiver, method, &args, frame)?
+        let receiver_type = match &receiver {
+            Value::String(_) => Some("String"),
+            Value::Int(_) => Some("i64"),
+            Value::Float(_) => Some("f64"),
+            Value::Bool(_) => Some("bool"),
+            Value::Array(_) => Some("[T]"),
+            Value::Range { .. } => Some("Range<T>"),
+            Value::Variant { type_name, .. } => Some(type_name.as_str()),
+            _ => None,
+        };
+        if let Some(intrinsic) = receiver_type
+            .and_then(|receiver_type| StdIntrinsic::resolve_method(receiver_type, method))
         {
-            return Ok(value);
+            return match intrinsic {
+                StdIntrinsic::ArrayHigherOrder(operation) => self.call_higher_order_stdlib_method(
+                    receiver_expr,
+                    &receiver,
+                    operation,
+                    &args,
+                    frame,
+                    host,
+                ),
+                StdIntrinsic::Array(
+                    operation @ (ArrayIntrinsic::Push
+                    | ArrayIntrinsic::Sort
+                    | ArrayIntrinsic::Reverse
+                    | ArrayIntrinsic::Pop
+                    | ArrayIntrinsic::Shift
+                    | ArrayIntrinsic::Unshift),
+                ) => self.call_mutating_stdlib_method(
+                    receiver_expr,
+                    &receiver,
+                    operation,
+                    &args,
+                    frame,
+                    true,
+                ),
+                intrinsic => stdlib::call_method(
+                    intrinsic,
+                    &receiver,
+                    &args,
+                    &[],
+                    None,
+                    self.max_value_bytes,
+                ),
+            };
         }
-        if let Some(value) = call_builtin_method(&receiver, method, &args)? {
-            return Ok(value);
+        if method == "len" {
+            let length = match &receiver {
+                Value::Tuple(values) => Some(values.len()),
+                Value::Object(values) | Value::Struct { fields: values, .. } => Some(values.len()),
+                Value::Json(serde_json::Value::Array(values)) => Some(values.len()),
+                Value::Json(serde_json::Value::Object(values)) => Some(values.len()),
+                _ => None,
+            };
+            if let Some(length) = length {
+                expect_method_arity("legacy value", method, &args, 0)?;
+                return Ok(Value::Int(saturating_i64(length)));
+            }
         }
         let type_name = match &receiver {
             Value::Struct { type_name, .. } | Value::Variant { type_name, .. } => type_name.clone(),
@@ -5117,101 +4980,107 @@ impl Vm {
         }
     }
 
-    fn call_mutating_builtin_method(
+    fn call_mutating_stdlib_method(
         &mut self,
         receiver_expr: &Expr,
         receiver: &Value,
-        method: &str,
+        operation: ArrayIntrinsic,
         args: &[Value],
         frame: &mut Frame,
-    ) -> anyhow::Result<Option<Value>> {
+        legacy: bool,
+    ) -> anyhow::Result<Value> {
         let Value::Array(values) = receiver else {
-            return Ok(None);
+            anyhow::bail!("mutable array intrinsic expects an array receiver");
         };
-        if !matches!(
-            method,
-            "push" | "sort" | "reverse" | "pop" | "shift" | "unshift"
-        ) {
-            return Ok(None);
-        }
+        let descriptor = StdIntrinsic::Array(operation)
+            .descriptor()
+            .ok_or_else(|| anyhow::anyhow!("mutable array intrinsic has no descriptor"))?;
+        expect_method_arity("array", descriptor.name, args, descriptor.arity())?;
         let receiver_cell = receiver_local_cell(receiver_expr, frame)?;
         let mut values = values.as_ref().clone();
-        let result = match method {
-            "push" => {
-                expect_method_arity("array", method, args, 1)?;
+        let result = match operation {
+            ArrayIntrinsic::Push => {
                 values.push(args[0].clone());
                 Value::Unit
             }
-            "sort" => {
-                expect_method_arity("array", method, args, 0)?;
+            ArrayIntrinsic::Sort => {
                 sort_husk_values(&mut values)?;
-                Value::Array(Arc::new(values.clone()))
-            }
-            "reverse" => {
-                expect_method_arity("array", method, args, 0)?;
-                values.reverse();
-                Value::Array(Arc::new(values.clone()))
-            }
-            "pop" => {
-                expect_method_arity("array", method, args, 0)?;
-                values
-                    .pop()
-                    .ok_or_else(|| anyhow::anyhow!("cannot pop an empty Husk array"))?
-            }
-            "shift" => {
-                expect_method_arity("array", method, args, 0)?;
-                if values.is_empty() {
-                    anyhow::bail!("cannot shift an empty Husk array");
+                if legacy {
+                    Value::Array(Arc::new(values.clone()))
+                } else {
+                    Value::Unit
                 }
-                values.remove(0)
             }
-            "unshift" => {
-                expect_method_arity("array", method, args, 1)?;
+            ArrayIntrinsic::Reverse => {
+                values.reverse();
+                if legacy {
+                    Value::Array(Arc::new(values.clone()))
+                } else {
+                    Value::Unit
+                }
+            }
+            ArrayIntrinsic::Pop => {
+                let value = values.pop();
+                if legacy {
+                    value.ok_or_else(|| anyhow::anyhow!("cannot pop an empty Husk array"))?
+                } else {
+                    stdlib::option_value(value)
+                }
+            }
+            ArrayIntrinsic::Shift => {
+                let value = (!values.is_empty()).then(|| values.remove(0));
+                if legacy {
+                    value.ok_or_else(|| anyhow::anyhow!("cannot shift an empty Husk array"))?
+                } else {
+                    stdlib::option_value(value)
+                }
+            }
+            ArrayIntrinsic::Unshift => {
                 values.insert(0, args[0].clone());
-                Value::Int(saturating_i64(values.len()))
+                if legacy {
+                    Value::Int(saturating_i64(values.len()))
+                } else {
+                    Value::Unit
+                }
             }
-            _ => unreachable!(),
+            ArrayIntrinsic::Len
+            | ArrayIntrinsic::IsEmpty
+            | ArrayIntrinsic::Get
+            | ArrayIntrinsic::First
+            | ArrayIntrinsic::Last
+            | ArrayIntrinsic::Slice
+            | ArrayIntrinsic::Join
+            | ArrayIntrinsic::IndexOf
+            | ArrayIntrinsic::LastIndexOf
+            | ArrayIntrinsic::Contains
+            | ArrayIntrinsic::Iter => {
+                anyhow::bail!("non-mutating array intrinsic reached mutable dispatch")
+            }
         };
         self.heap
             .set_cell(receiver_cell, Value::Array(Arc::new(values)))?;
-        Ok(Some(result))
+        Ok(result)
     }
 
-    fn call_higher_order_builtin_method<H: Host>(
+    fn call_higher_order_stdlib_method<H: Host>(
         &mut self,
         receiver_expr: &Expr,
         receiver: &Value,
-        method: &str,
+        operation: ArrayHigherOrderIntrinsic,
         args: &[Value],
         frame: &mut Frame,
         host: &mut H,
-    ) -> anyhow::Result<Option<Value>> {
+    ) -> anyhow::Result<Value> {
         let Value::Array(values) = receiver else {
-            return Ok(None);
+            anyhow::bail!("higher-order array intrinsic expects an array receiver");
         };
-        if !matches!(
-            method,
-            "map"
-                | "filter"
-                | "some"
-                | "every"
-                | "reduce"
-                | "forEach"
-                | "for_each"
-                | "find"
-                | "findIndex"
-                | "find_index"
-                | "findLastIndex"
-                | "find_last_index"
-                | "sortBy"
-                | "sort_by"
-        ) {
-            return Ok(None);
-        }
-        expect_method_arity("array", method, args, 1)?;
+        let descriptor = StdIntrinsic::ArrayHigherOrder(operation)
+            .descriptor()
+            .ok_or_else(|| anyhow::anyhow!("higher-order array intrinsic has no descriptor"))?;
+        expect_method_arity("array", descriptor.name, args, descriptor.arity())?;
         let callback = args[0].clone();
-        let result = match method {
-            "map" => {
+        let result = match operation {
+            ArrayHigherOrderIntrinsic::Map => {
                 let mut mapped = Vec::with_capacity(values.len());
                 for value in values.iter() {
                     mapped.push(self.call_value(
@@ -5223,24 +5092,24 @@ impl Vm {
                 }
                 Value::Array(Arc::new(mapped))
             }
-            "filter" => {
+            ArrayHigherOrderIntrinsic::Filter => {
                 let mut filtered = Vec::new();
                 for value in values.iter() {
                     if callback_predicate(
                         self.call_value(callback.clone(), vec![value.clone()], frame, host)?,
-                        method,
+                        descriptor.name,
                     )? {
                         filtered.push(value.clone());
                     }
                 }
                 Value::Array(Arc::new(filtered))
             }
-            "some" => {
+            ArrayHigherOrderIntrinsic::Some => {
                 let mut found = false;
                 for value in values.iter() {
                     if callback_predicate(
                         self.call_value(callback.clone(), vec![value.clone()], frame, host)?,
-                        method,
+                        descriptor.name,
                     )? {
                         found = true;
                         break;
@@ -5248,12 +5117,12 @@ impl Vm {
                 }
                 Value::Bool(found)
             }
-            "every" => {
+            ArrayHigherOrderIntrinsic::Every => {
                 let mut all = true;
                 for value in values.iter() {
                     if !callback_predicate(
                         self.call_value(callback.clone(), vec![value.clone()], frame, host)?,
-                        method,
+                        descriptor.name,
                     )? {
                         all = false;
                         break;
@@ -5261,7 +5130,7 @@ impl Vm {
                 }
                 Value::Bool(all)
             }
-            "reduce" => {
+            ArrayHigherOrderIntrinsic::Reduce => {
                 let mut values = values.iter();
                 let mut accumulator = values
                     .next()
@@ -5277,18 +5146,18 @@ impl Vm {
                 }
                 accumulator
             }
-            "forEach" | "for_each" => {
+            ArrayHigherOrderIntrinsic::ForEach => {
                 for value in values.iter() {
                     self.call_value(callback.clone(), vec![value.clone()], frame, host)?;
                 }
                 Value::Unit
             }
-            "find" => {
+            ArrayHigherOrderIntrinsic::Find => {
                 let mut found = None;
                 for value in values.iter() {
                     if callback_predicate(
                         self.call_value(callback.clone(), vec![value.clone()], frame, host)?,
-                        method,
+                        descriptor.name,
                     )? {
                         found = Some(value.clone());
                         break;
@@ -5299,15 +5168,15 @@ impl Vm {
                     |value| enum_variant_value("Option", "Some", vec![value]),
                 )
             }
-            "findIndex" | "find_index" | "findLastIndex" | "find_last_index" => {
-                let reverse = matches!(method, "findLastIndex" | "find_last_index");
-                let indices: Box<dyn Iterator<Item = usize>> = if reverse {
-                    Box::new((0..values.len()).rev())
-                } else {
-                    Box::new(0..values.len())
-                };
+            ArrayHigherOrderIntrinsic::FindIndex | ArrayHigherOrderIntrinsic::FindLastIndex => {
+                let reverse = operation == ArrayHigherOrderIntrinsic::FindLastIndex;
                 let mut found = -1;
-                for index in indices {
+                for position in 0..values.len() {
+                    let index = if reverse {
+                        values.len() - position - 1
+                    } else {
+                        position
+                    };
                     if callback_predicate(
                         self.call_value(
                             callback.clone(),
@@ -5315,7 +5184,7 @@ impl Vm {
                             frame,
                             host,
                         )?,
-                        method,
+                        descriptor.name,
                     )? {
                         found = saturating_i64(index);
                         break;
@@ -5323,7 +5192,7 @@ impl Vm {
                 }
                 Value::Int(found)
             }
-            "sortBy" | "sort_by" => {
+            ArrayHigherOrderIntrinsic::SortBy => {
                 let receiver_cell = receiver_local_cell(receiver_expr, frame)?;
                 let mut sorted = values.as_ref().clone();
                 // Stable insertion sort permits a fallible Husk comparator
@@ -5339,7 +5208,8 @@ impl Vm {
                         )?;
                         let ordering = value_to_i64(&ordering).ok_or_else(|| {
                             anyhow::anyhow!(
-                                "array method `{method}` comparator must return an integer"
+                                "array method `{}` comparator must return an integer",
+                                descriptor.name
                             )
                         })?;
                         if ordering <= 0 {
@@ -5353,9 +5223,8 @@ impl Vm {
                 self.heap.set_cell(receiver_cell, result.clone())?;
                 result
             }
-            _ => unreachable!(),
         };
-        Ok(Some(result))
+        Ok(result)
     }
 
     fn call_closure_in_frame<H: Host>(
@@ -6065,220 +5934,6 @@ fn format_integer(value: &Value) -> anyhow::Result<i64> {
     }
 }
 
-fn call_builtin_method(
-    receiver: &Value,
-    method: &str,
-    args: &[Value],
-) -> anyhow::Result<Option<Value>> {
-    let result = match (receiver, method) {
-        (Value::String(value), "len") => {
-            expect_method_arity("String", method, args, 0)?;
-            Ok(Value::Int(saturating_i64(value.chars().count())))
-        }
-        (Value::String(value), "trim") => {
-            expect_method_arity("String", method, args, 0)?;
-            Ok(Value::String(value.trim().to_string()))
-        }
-        (Value::String(value), "split") => {
-            expect_method_arity("String", method, args, 1)?;
-            let separator = method_string_arg("String", method, args, 0)?;
-            let parts = if separator.is_empty() {
-                value
-                    .chars()
-                    .map(|character| Value::String(character.to_string()))
-                    .collect()
-            } else {
-                value
-                    .split(separator)
-                    .map(|part| Value::String(part.to_string()))
-                    .collect()
-            };
-            Ok(Value::Array(Arc::new(parts)))
-        }
-        (Value::String(value), "char_at") => {
-            expect_method_arity("String", method, args, 1)?;
-            let index = method_integer_arg("String", method, args, 0)?;
-            let character = usize::try_from(index)
-                .ok()
-                .and_then(|index| value.chars().nth(index))
-                .map_or_else(String::new, |character| character.to_string());
-            Ok(Value::String(character))
-        }
-        (Value::String(value), "slice" | "substring") => {
-            expect_method_arity("String", method, args, 2)?;
-            let start = method_integer_arg("String", method, args, 0)?;
-            let end = method_integer_arg("String", method, args, 1)?;
-            Ok(Value::String(slice_string(value, start, end)))
-        }
-        (Value::String(value), "index_of" | "last_index_of") => {
-            expect_method_arity("String", method, args, 1)?;
-            let needle = method_string_arg("String", method, args, 0)?;
-            let byte_index = if method == "index_of" {
-                value.find(needle)
-            } else {
-                value.rfind(needle)
-            };
-            let index = byte_index.map_or(-1, |byte_index| {
-                saturating_i64(value[..byte_index].chars().count())
-            });
-            Ok(Value::Int(index))
-        }
-        (Value::String(value), "starts_with" | "ends_with" | "includes") => {
-            expect_method_arity("String", method, args, 1)?;
-            let needle = method_string_arg("String", method, args, 0)?;
-            let found = match method {
-                "starts_with" => value.starts_with(needle),
-                "ends_with" => value.ends_with(needle),
-                "includes" => value.contains(needle),
-                _ => unreachable!(),
-            };
-            Ok(Value::Bool(found))
-        }
-        (Value::String(value), "to_upper_case") => {
-            expect_method_arity("String", method, args, 0)?;
-            Ok(Value::String(value.to_uppercase()))
-        }
-        (Value::String(value), "to_lower_case") => {
-            expect_method_arity("String", method, args, 0)?;
-            Ok(Value::String(value.to_lowercase()))
-        }
-        (Value::String(value), "split_once") => {
-            expect_method_arity("String", method, args, 1)?;
-            let delimiter = method_string_arg("String", method, args, 0)?;
-            Ok(match value.split_once(delimiter) {
-                Some((before, after)) => enum_variant_value(
-                    "Option",
-                    "Some",
-                    vec![Value::Tuple(Arc::new(vec![
-                        Value::String(before.to_string()),
-                        Value::String(after.to_string()),
-                    ]))],
-                ),
-                None => enum_variant_value("Option", "None", Vec::new()),
-            })
-        }
-        (Value::String(value), "iter" | "into_iter") => {
-            expect_method_arity("String", method, args, 0)?;
-            Ok(Value::Array(Arc::new(
-                value
-                    .chars()
-                    .map(|character| Value::String(character.to_string()))
-                    .collect(),
-            )))
-        }
-        (Value::Int(_) | Value::Float(_) | Value::Bool(_), "to_string") => {
-            expect_method_arity(receiver.kind_name(), method, args, 0)?;
-            Ok(Value::String(value_to_log_string(receiver)))
-        }
-        (Value::Float(value), "floor" | "ceil" | "round" | "abs") => {
-            expect_method_arity("f64", method, args, 0)?;
-            let value = match method {
-                "floor" => value.floor(),
-                "ceil" => value.ceil(),
-                "round" => value.round(),
-                "abs" => value.abs(),
-                _ => unreachable!(),
-            };
-            Ok(Value::Float(value))
-        }
-        (Value::Array(values) | Value::Tuple(values), "len") => {
-            expect_method_arity(receiver.kind_name(), method, args, 0)?;
-            Ok(Value::Int(saturating_i64(values.len())))
-        }
-        (Value::Array(values), "slice") => {
-            expect_method_arity("array", method, args, 2)?;
-            let len = saturating_i64(values.len());
-            let start = normalize_string_index(method_integer_arg("array", method, args, 0)?, len);
-            let end = normalize_string_index(method_integer_arg("array", method, args, 1)?, len);
-            let start = usize::try_from(start).unwrap_or(0);
-            let end = usize::try_from(end.max(i64::try_from(start).unwrap_or(i64::MAX)))
-                .unwrap_or(values.len());
-            Ok(Value::Array(Arc::new(values[start..end].to_vec())))
-        }
-        (Value::Array(values), "join") => {
-            expect_method_arity("array", method, args, 1)?;
-            let separator = method_string_arg("array", method, args, 0)?;
-            Ok(Value::String(
-                values
-                    .iter()
-                    .map(value_to_log_string)
-                    .collect::<Vec<_>>()
-                    .join(separator),
-            ))
-        }
-        (Value::Array(values), "index_of" | "last_index_of") => {
-            expect_method_arity("array", method, args, 1)?;
-            let needle = &args[0];
-            let index = if method == "index_of" {
-                values.iter().position(|value| value == needle)
-            } else {
-                values.iter().rposition(|value| value == needle)
-            };
-            Ok(Value::Int(index.map_or(-1, saturating_i64)))
-        }
-        (Value::Array(values), "includes") => {
-            expect_method_arity("array", method, args, 1)?;
-            Ok(Value::Bool(values.contains(&args[0])))
-        }
-        (Value::Array(values), "iter" | "into_iter") => {
-            expect_method_arity("array", method, args, 0)?;
-            Ok(Value::Array(values.clone()))
-        }
-        (
-            Value::Range {
-                start,
-                end,
-                inclusive,
-            },
-            "contains",
-        ) => {
-            expect_method_arity("range", method, args, 1)?;
-            let needle = method_integer_arg("range", method, args, 0)?;
-            Ok(Value::Bool(if *inclusive {
-                *start <= needle && needle <= *end
-            } else {
-                *start <= needle && needle < *end
-            }))
-        }
-        (
-            Value::Range {
-                start,
-                end,
-                inclusive,
-            },
-            "is_empty",
-        ) => {
-            expect_method_arity("range", method, args, 0)?;
-            Ok(Value::Bool(if *inclusive {
-                start > end
-            } else {
-                start >= end
-            }))
-        }
-        (Value::Range { .. }, "iter" | "into_iter") => {
-            expect_method_arity("range", method, args, 0)?;
-            Ok(receiver.clone())
-        }
-        (Value::Array(_), "push" | "sort" | "reverse" | "pop" | "shift" | "unshift") => Err(
-            anyhow::anyhow!("mutable array method `{method}` requires the instance heap"),
-        ),
-        (Value::Object(values) | Value::Struct { fields: values, .. }, "len") => {
-            expect_method_arity(receiver.kind_name(), method, args, 0)?;
-            Ok(Value::Int(saturating_i64(values.len())))
-        }
-        (Value::Json(serde_json::Value::Array(values)), "len") => {
-            expect_method_arity("array", method, args, 0)?;
-            Ok(Value::Int(saturating_i64(values.len())))
-        }
-        (Value::Json(serde_json::Value::Object(values)), "len") => {
-            expect_method_arity("object", method, args, 0)?;
-            Ok(Value::Int(saturating_i64(values.len())))
-        }
-        _ => return Ok(None),
-    };
-    result.map(Some)
-}
-
 fn receiver_local_cell(receiver: &Expr, frame: &Frame) -> anyhow::Result<CellHandle> {
     let ExprKind::Ident {
         local: Some(local), ..
@@ -6376,28 +6031,6 @@ fn expect_method_arity(
         if expected == 1 { "" } else { "s" },
         args.len()
     )
-}
-
-fn method_string_arg<'a>(
-    receiver: &str,
-    method: &str,
-    args: &'a [Value],
-    index: usize,
-) -> anyhow::Result<&'a str> {
-    args.get(index).and_then(Value::as_str).ok_or_else(|| {
-        anyhow::anyhow!("{receiver} method `{method}` argument {index} must be a string")
-    })
-}
-
-fn method_integer_arg(
-    receiver: &str,
-    method: &str,
-    args: &[Value],
-    index: usize,
-) -> anyhow::Result<i64> {
-    args.get(index).and_then(value_to_i64).ok_or_else(|| {
-        anyhow::anyhow!("{receiver} method `{method}` argument {index} must be an integer")
-    })
 }
 
 fn saturating_i64(value: usize) -> i64 {
@@ -6566,7 +6199,7 @@ mod tests {
                 return [39 / 4, -39 / 4, 39.0 / 4.0];
             }
         "#;
-        let mut host = TestHost::default();
+        let mut host = TestHost;
         let mut vm = Vm::new();
 
         vm.load_plugin("division", source, &mut host).unwrap();
@@ -6588,7 +6221,7 @@ mod tests {
                 return 1 / 0;
             }
         "#;
-        let mut host = TestHost::default();
+        let mut host = TestHost;
         let mut vm = Vm::new();
 
         vm.load_plugin("division", source, &mut host).unwrap();
@@ -6757,7 +6390,7 @@ mod tests {
                 recurse();
             }
         "#;
-        let mut host = TestHost::default();
+        let mut host = TestHost;
         let mut vm = Vm::new();
         vm.set_instruction_budget(32);
 
@@ -6795,7 +6428,7 @@ mod tests {
                 let style = event.theme.uiStyle.popupTitle;
             }
         "#;
-        let mut host = TestHost::default();
+        let mut host = TestHost;
         let mut vm = Vm::new();
         vm.load_plugin("fidget", source, &mut host).unwrap();
 
@@ -6825,7 +6458,7 @@ mod tests {
 
     #[test]
     fn heap_collects_unreachable_recursive_closure_cycles() {
-        let mut host = TestHost::default();
+        let mut host = TestHost;
         let mut vm = Vm::new();
         vm.set_heap_limits(2, 1024 * 1024);
         vm.load_plugin(
@@ -6852,7 +6485,7 @@ mod tests {
 
     #[test]
     fn stale_closure_handle_is_rejected_after_collection_and_slot_reuse() {
-        let mut host = TestHost::default();
+        let mut host = TestHost;
         let mut vm = Vm::new();
         vm.set_instance_generation(7);
         vm.load_plugin(
