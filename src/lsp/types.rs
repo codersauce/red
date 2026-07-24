@@ -427,7 +427,7 @@ pub struct TextDocumentSyncOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub will_save_wait_until: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub save: Option<SaveOptions>,
+    pub save: Option<TextDocumentSyncSaveOptions>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -448,6 +448,13 @@ impl From<TextDocumentSyncKind> for i32 {
     fn from(kind: TextDocumentSyncKind) -> i32 {
         kind as i32
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum TextDocumentSyncSaveOptions {
+    Supported(bool),
+    Options(SaveOptions),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2052,5 +2059,26 @@ mod tests {
         assert_numeric_enum_rejects_unknown!(CompletionItemKind, 1);
         assert_numeric_enum_rejects_unknown!(PrepareSupportDefaultBehavior, 1);
         assert_numeric_enum_rejects_unknown!(InsertTextFormat, 1);
+    }
+
+    #[test]
+    fn text_document_sync_save_accepts_boolean_and_options() {
+        let supported: TextDocumentSyncOptions =
+            serde_json::from_value(serde_json::json!({ "save": true })).unwrap();
+        assert!(matches!(
+            supported.save,
+            Some(TextDocumentSyncSaveOptions::Supported(true))
+        ));
+
+        let options: TextDocumentSyncOptions = serde_json::from_value(serde_json::json!({
+            "save": { "includeText": true }
+        }))
+        .unwrap();
+        assert!(matches!(
+            options.save,
+            Some(TextDocumentSyncSaveOptions::Options(SaveOptions {
+                include_text: Some(true)
+            }))
+        ));
     }
 }

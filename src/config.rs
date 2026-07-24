@@ -671,7 +671,9 @@ pub fn default_language_servers() -> HashMap<String, LanguageServerConfig> {
         (
             "husk".to_string(),
             LanguageServerConfig {
-                command: "red".to_string(),
+                command: std::env::current_exe()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| "red".to_string()),
                 args: vec!["husk".to_string(), "lsp".to_string(), "--stdio".to_string()],
                 language_id: String::new(),
                 file_extensions: Vec::new(),
@@ -2288,7 +2290,13 @@ theme = "theme/nightfox.json"
         assert_eq!(rust.file_extensions, vec!["rs"]);
         assert_eq!(typescript.command, "typescript-language-server");
         let husk = config.lsp.servers.get("husk").unwrap();
-        assert_eq!(husk.command, "red");
+        assert_eq!(
+            husk.command,
+            std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        );
         assert_eq!(husk.args, vec!["husk", "lsp", "--stdio"]);
         assert_eq!(husk.documents(), vec![document("husk", &["hk", "husk"])]);
         assert_eq!(husk.root_markers, vec!["Husk.toml", ".git"]);

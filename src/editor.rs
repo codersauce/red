@@ -6004,6 +6004,8 @@ impl Editor {
             Ok(None) => {}
             Err(err) => {
                 log!("ERROR: Lsp error: {err}");
+                self.last_error = Some(err.to_string());
+                needs_render = true;
             }
         }
 
@@ -9129,8 +9131,7 @@ impl Editor {
                 }
             }
             InboundMessage::ProcessingError(error_msg) => {
-                self.last_error = Some(error_msg.to_string());
-                None
+                Some(Action::Print(error_msg.to_string()))
             }
         }
     }
@@ -24064,6 +24065,21 @@ mod test {
     }
 
     #[test]
+    fn lsp_processing_error_produces_a_visible_print_action() {
+        let mut editor = test_editor(40, 10);
+        let message = InboundMessage::ProcessingError(crate::lsp::LspError::ServerError(
+            "husk lsp exited".to_string(),
+        ));
+
+        let action = editor.handle_lsp_message(&message, None);
+
+        assert!(matches!(
+            action,
+            Some(Action::Print(message)) if message.contains("husk lsp exited")
+        ));
+    }
+
+    #[test]
     fn empty_hover_array_is_ignored() {
         let mut editor = test_editor(40, 10);
         let message = InboundMessage::Message(ResponseMessage {
@@ -25615,7 +25631,7 @@ while True:
         assert!(editor.pending_lsp_format_saves.is_empty());
         assert!(editor.last_error.as_deref().is_some_and(|error| {
             error.contains("format-on-save unavailable; saved unformatted")
-                && error.contains("language server initialization has failed")
+                && error.contains("language server unavailable")
         }));
         let events = std::fs::read_to_string(events).unwrap();
         assert!(!events.contains("textDocument/formatting "));
@@ -25687,7 +25703,7 @@ while True:
             assert!(editor.pending_lsp_format_saves.is_empty());
             assert!(editor.last_error.as_deref().is_some_and(|error| {
                 error.contains("format-on-save unavailable; saved unformatted")
-                    && error.contains("language server initialization has failed")
+                    && error.contains("language server unavailable")
             }));
             let target_uri = crate::lsp::file_uri(&target).unwrap();
             let events = std::fs::read_to_string(events).unwrap();
