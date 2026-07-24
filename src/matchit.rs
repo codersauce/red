@@ -36,6 +36,21 @@ enum BracketScanState {
 }
 
 impl BracketMatchCache {
+    /// Returns whether the position contains a configured single-character delimiter.
+    pub(crate) fn is_configured_delimiter(
+        buffer: &Buffer,
+        position: TextPosition,
+        config: &MatchitConfig,
+    ) -> bool {
+        let rope = buffer.contents_snapshot();
+        let character_index = buffer.position_to_char_idx(position);
+        let Some(character) = rope.get_char(character_index) else {
+            return false;
+        };
+
+        configured_delimiter(character, config)
+    }
+
     /// Returns the partner only when the cursor is directly on a configured delimiter.
     pub(crate) fn matching_position(
         cache: &mut Option<Self>,
@@ -46,10 +61,7 @@ impl BracketMatchCache {
         let rope = buffer.contents_snapshot();
         let cursor_index = buffer.position_to_char_idx(cursor);
         let character = rope.get_char(cursor_index)?;
-        if !config.pairs.iter().any(|pair| {
-            single_character(&pair[0]) == Some(character)
-                || single_character(&pair[1]) == Some(character)
-        }) {
+        if !configured_delimiter(character, config) {
             return None;
         }
 
@@ -167,6 +179,13 @@ impl BracketMatchCache {
             matches,
         }
     }
+}
+
+fn configured_delimiter(character: char, config: &MatchitConfig) -> bool {
+    config.pairs.iter().any(|pair| {
+        single_character(&pair[0]) == Some(character)
+            || single_character(&pair[1]) == Some(character)
+    })
 }
 
 fn single_character(token: &str) -> Option<char> {

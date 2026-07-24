@@ -23006,6 +23006,96 @@ mod test {
         assert_eq!(partner.style.bg, expected.bg);
     }
 
+    #[tokio::test]
+    async fn insert_mode_bracket_matching_tracks_the_delimiter_before_the_cursor() {
+        let mut editor = bracket_test_editor("(", 30, 8);
+        editor.mode = Mode::Insert;
+        editor.cx = 1;
+        let mut render_buffer = RenderBuffer::new(30, 8, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Char(')'), KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), "()");
+        assert_eq!(
+            editor.matching_bracket_positions(),
+            Some([TextPosition::new(0, 1), TextPosition::new(0, 0)])
+        );
+
+        let window = editor.window_manager.active_window().unwrap();
+        for column in 0..=1 {
+            let (x, y) = editor.buffer_to_window_coords(window, column, 0).unwrap();
+            let index = editor.window_to_terminal_y(window, y) * render_buffer.width
+                + editor.window_to_terminal_x(window, x);
+            assert_ne!(
+                render_buffer.cells[index].style.bg, editor.theme.style.bg,
+                "bracket at column {column} should be highlighted"
+            );
+        }
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.matching_bracket_positions(), None);
+        let window = editor.window_manager.active_window().unwrap();
+        for column in 0..=1 {
+            let (x, y) = editor.buffer_to_window_coords(window, column, 0).unwrap();
+            let index = editor.window_to_terminal_y(window, y) * render_buffer.width
+                + editor.window_to_terminal_x(window, x);
+            assert_eq!(
+                render_buffer.cells[index].style.bg, editor.theme.style.bg,
+                "stale highlight at column {column} should be cleared"
+            );
+        }
+    }
+
+    #[test]
+    fn insert_mode_bracket_matching_prefers_the_delimiter_under_the_cursor() {
+        let mut editor = bracket_test_editor("([])", 30, 8);
+        editor.mode = Mode::Insert;
+        editor.cx = 1;
+
+        assert_eq!(
+            editor.matching_bracket_positions(),
+            Some([TextPosition::new(0, 1), TextPosition::new(0, 2)])
+        );
+
+        let mut editor = bracket_test_editor("()[", 30, 8);
+        editor.mode = Mode::Insert;
+        editor.cx = 2;
+
+        assert_eq!(
+            editor.matching_bracket_positions(),
+            None,
+            "an unmatched delimiter under the cursor must not fall back to the previous pair"
+        );
+    }
+
+    #[test]
+    fn insert_mode_bracket_matching_does_not_cross_a_line_boundary() {
+        let mut editor = bracket_test_editor("()\ntext", 30, 8);
+        editor.mode = Mode::Insert;
+        editor.cy = 1;
+        editor.cx = 0;
+
+        assert_eq!(editor.matching_bracket_positions(), None);
+    }
+
     #[test]
     fn bracket_matching_respects_tabs_and_wrapped_lines() {
         let mut editor = bracket_test_editor("\t[abcdefghijklmnopqrstuvwxyz0123456789]", 18, 8);

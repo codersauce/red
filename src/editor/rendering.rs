@@ -1214,14 +1214,31 @@ impl Editor {
 
         let cursor = self.cursor_text_position();
         let buffer = self.buffer_manager.active_buffer()?;
-        let matching = crate::matchit::BracketMatchCache::matching_position(
-            &mut self.bracket_match_cache,
+        let bracket = if crate::matchit::BracketMatchCache::is_configured_delimiter(
             buffer,
             cursor,
             &self.config.matchit,
+        ) {
+            cursor
+        } else if matches!(self.mode, Mode::Insert) {
+            let previous = TextPosition::new(cursor.line, cursor.character.checked_sub(1)?);
+            crate::matchit::BracketMatchCache::is_configured_delimiter(
+                buffer,
+                previous,
+                &self.config.matchit,
+            )
+            .then_some(previous)?
+        } else {
+            return None;
+        };
+        let matching = crate::matchit::BracketMatchCache::matching_position(
+            &mut self.bracket_match_cache,
+            buffer,
+            bracket,
+            &self.config.matchit,
         )?;
 
-        Some([cursor, matching])
+        Some([bracket, matching])
     }
 
     fn matching_bracket_points(&mut self, window: &crate::window::Window) -> Vec<Point> {
