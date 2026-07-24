@@ -17,6 +17,7 @@ clap = { version = "4.5.26", features = ["derive"] }
 flate2 = "1.0"
 husk = { path = "../husk" }
 husk-extension.workspace = true
+husk-lsp.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 semver = "1.0"
 serde = { version = "1.0.196", features = ["derive"] }

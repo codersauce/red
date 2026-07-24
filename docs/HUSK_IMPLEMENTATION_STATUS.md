@@ -74,6 +74,7 @@ This is not yet a release-complete extraction. The main remaining work is:
 | Crate | Current responsibility |
 | --- | --- |
 | `husk` | Small documented facade that re-exports the public embedding API. |
+| `husk-analysis` | Recovered document analysis, UTF-16 positions, workspace symbols, references, and formatting. |
 | `husk-runtime` | Compiler orchestration, resolved HIR interpreter, heap, embedding ownership, limits, and an internal compatibility VM used by Red during migration. |
 | `husk-value` | Detached, backend-neutral host boundary values. |
 | `husk-types` | Validated module/type/function descriptors and stable hashes. |
@@ -81,7 +82,8 @@ This is not yet a release-complete extraction. The main remaining work is:
 | `husk-wasm` | Wasmtime Component inspection, descriptor derivation, dynamic calls, conversion, fuel, and store limits. |
 | `husk-package` | Bounded local `Husk.toml`, deterministic module graph, path and crate-backed extensions, and reproducible `Husk.lock`. |
 | `husk-hir` | Spanned executable HIR with stable per-function node and local IDs. |
-| `husk-cli` | `new`, `add`, `install`, `check`, `run`, `test`, `repl`, and extension bundle commands. |
+| `husk-lsp` | Bounded LSP transport, editor features, and verified locked-crate indexing. |
+| `husk-cli` | `new`, `add`, `install`, `check`, `run`, `test`, `repl`, `lsp`, and extension bundle commands. |
 | `husk-lexer`, `husk-ast`, `husk-parser`, `husk-semantic`, `husk-diagnostics` | Frontend and source-aware diagnostics. |
 
 The intended dependency direction is:
@@ -93,7 +95,9 @@ husk-extension ──> husk-package         └──> husk-wasm (optional featu
        │                  │
        └────────> husk-types <──────── husk-value
 
-husk-cli ──> husk facade
+husk-analysis ──> frontend/package/runtime crates
+husk-lsp ──> husk-analysis + package/extension/runtime crates
+husk-cli ──> husk facade + husk-lsp
 Red ──────> husk-runtime compatibility API (one VM per plugin)
 ```
 
@@ -194,6 +198,7 @@ No Husk crate depends on the Red root package.
 | P10-01 REPL | Mostly complete | Public item/statement/expression fragment parsers distinguish complete, incomplete, and invalid input. `ReplSession` preserves items, locals, heap, native/Wasm state, and rolls back script-owned state on runtime failure. `husk repl` implements only `:help`, `:reset`, and `:quit`. Diagnostics use one accumulated `<repl>` source rather than numbered synthetic source files. |
 | P10-02 test runner | Mostly complete | Package-wide discovery, filtering/listing, cfg, ignore, expected panic, isolated instances, and failure exit status work. Native `std` output is not captured and replayed only on failure. |
 | P10-03 diagnostics/docs | Partial | This status document and `HUSK_LANGUAGE_GUIDE.md` cover public workflows. Source-aware Husk call frames and module boundary context exist in important paths, but the complete diagnostic matrix and secret-redaction audit remain. |
+| P10-04 language server | Complete for the current language | `husk-analysis` and `husk-lsp` provide recovered unsaved analysis, UTF-16 incremental edits, diagnostics, completion, hover, signatures, navigation, references, rename, symbols, semantic tokens, hints, folding, selection, code actions, formatting, and call hierarchy. Locked crate adapters are indexed from verified installed or vendored Components without invoking Cargo or the network, and Red enables the server for `.hk` and `.husk` by default. |
 
 ### Phase 11 — optional native dynamic libraries
 
@@ -317,6 +322,8 @@ husk-package
 husk-wasm
 husk-runtime
 husk
+husk-analysis
+husk-lsp
 husk-cli
 ```
 

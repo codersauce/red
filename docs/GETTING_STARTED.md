@@ -107,9 +107,12 @@ Patterns use Rust regular-expression syntax. `incsearch`, `hlsearch`,
 | `Space .` | Show code actions and quick fixes |
 | `Space r` | Rename the current symbol |
 
-Built-in server defaults cover Rust, TypeScript/JavaScript, Python, Markdown,
-JSON, TOML, YAML, and Lua. Each language server must be installed separately
-and available on `PATH`; servers start only after a matching file is opened.
+Husk's first-party server is included and starts for `.hk` and `.husk` files.
+Built-in defaults also cover Rust, TypeScript/JavaScript, Python, Markdown,
+JSON, TOML, YAML, and Lua; those external servers must be installed separately
+and available on `PATH`. Servers start only after a matching file is opened.
+See the [Husk language-server guide](HUSK_LSP.md) for its complete feature and
+external-crate contract.
 
 Add or override a server in `config.toml`:
 

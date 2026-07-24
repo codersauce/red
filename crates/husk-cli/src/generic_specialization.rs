@@ -225,6 +225,10 @@ pub(crate) fn apply_specializations(
             path: canonical.clone(),
             kind,
             signature: signature.to_string(),
+            documentation: Some(format!(
+                "Portable `{}` specialization for `serde_json::Value`.",
+                specialization.function()
+            )),
             compatibility: "compatible",
             reason: None,
             specialization: Some(canonical),

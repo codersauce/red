@@ -11,12 +11,14 @@ cp -R "$repository_root/tools/husk-standalone/smoke" "$temporary_root/smoke"
 
 for crate in \
     husk \
+    husk-analysis \
     husk-ast \
     husk-cli \
     husk-diagnostics \
     husk-extension \
     husk-hir \
     husk-lexer \
+    husk-lsp \
     husk-package \
     husk-parser \
     husk-runtime \
