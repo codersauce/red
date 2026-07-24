@@ -133,6 +133,14 @@ the Codex/proposal UI (`agent`). The
 [README plugin overview](../README.md#plugins-and-themes) is the concise
 capability inventory; the bundled `.hk` sources are working examples.
 
+The Git plugin keeps its event, picker, and permissioned-process shell in
+`plugins/git.hk`, while its status model, diff and hunk parsing, selection
+logic, and Git argument construction live in the native, multi-file
+`plugins/git_core` Husk package. Red embeds those pure sources and exposes a
+small internal bridge to the compatibility shell, so installed builds do not
+depend on a checkout-relative source path. The bridge is bundled-plugin
+implementation detail, not a public plugin API.
+
 `buffer:changed`, cursor, mode, viewport, file, theme, window, LSP, timer, picker, composer, panel, process, filesystem, workspace, and agent events are emitted by the production runtime. Subscribe only to the events a plugin needs and debounce expensive work.
 
 ## Validation
@@ -141,6 +149,7 @@ Run:
 
 ```shell
 cargo test --workspace
+cargo run -p husk-cli -- test --locked plugins/git_core
 cargo clippy --all-targets --all-features -- -D warnings
 cargo run -- --self-check
 cargo run -- --runtime-files

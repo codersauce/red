@@ -1,4 +1,4 @@
-use std::fs;
+use std::{fs, path::PathBuf};
 
 use husk_package::{
     LOCK_FILE, PackageError, PackageLimits, PackageLock, PackageManifest, ResolvedPackage,
@@ -63,6 +63,144 @@ fn resolves_flat_and_nested_modules_in_stable_order() {
     assert_eq!(
         discover_manifest(directory.path().join("src/util/nested/mod.hk")).unwrap(),
         directory.path().join("Husk.toml").canonicalize().unwrap()
+    );
+}
+
+#[test]
+fn resolves_embedded_modules_in_stable_order() {
+    let manifest = r#"
+        schema_version = 1
+
+        [package]
+        name = "embedded-example"
+        version = "0.1.0"
+        entry = "src/main.hk"
+    "#;
+    let resolved = ResolvedPackage::from_sources(
+        "embedded/example",
+        manifest,
+        &[
+            (
+                "src/main.hk",
+                "mod util;\nfn main() -> i32 { util::answer() }",
+            ),
+            (
+                "src/util.hk",
+                "mod nested;\npub fn answer() -> i32 { nested::value() }",
+            ),
+            ("src/util/nested/mod.hk", "pub fn value() -> i32 { 42 }"),
+        ],
+        PackageLimits::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        resolved
+            .modules
+            .iter()
+            .map(|module| module.module_path.join("::"))
+            .collect::<Vec<_>>(),
+        vec!["", "util", "util::nested"]
+    );
+    assert_eq!(resolved.modules[0].display_path, PathBuf::from("main.hk"));
+    assert_eq!(
+        resolved.modules[2].display_path,
+        PathBuf::from("util/nested/mod.hk")
+    );
+}
+
+#[test]
+fn embedded_modules_reject_ambiguous_missing_duplicate_and_extension_inputs() {
+    let manifest = r#"
+        schema_version = 1
+
+        [package]
+        name = "embedded-example"
+        version = "0.1.0"
+        entry = "src/main.hk"
+    "#;
+    let missing = ResolvedPackage::from_sources(
+        "embedded/example",
+        manifest,
+        &[("src/main.hk", "mod util;")],
+        PackageLimits::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(missing.contains("expected exactly one"), "{missing}");
+
+    let ambiguous = ResolvedPackage::from_sources(
+        "embedded/example",
+        manifest,
+        &[
+            ("src/main.hk", "mod util;"),
+            ("src/util.hk", "pub fn answer() {}"),
+            ("src/util/mod.hk", "pub fn answer() {}"),
+        ],
+        PackageLimits::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(ambiguous.contains("ambiguous"), "{ambiguous}");
+
+    let duplicate = ResolvedPackage::from_sources(
+        "embedded/example",
+        manifest,
+        &[
+            ("src/main.hk", "fn main() {}"),
+            ("src/main.hk", "fn other() {}"),
+        ],
+        PackageLimits::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        duplicate.contains("duplicate embedded source"),
+        "{duplicate}"
+    );
+
+    let duplicate_module = ResolvedPackage::from_sources(
+        "embedded/example",
+        manifest,
+        &[
+            ("src/main.hk", "mod util;\nmod util;"),
+            ("src/util.hk", "pub fn answer() {}"),
+        ],
+        PackageLimits::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        duplicate_module.contains("resolves as both"),
+        "{duplicate_module}"
+    );
+
+    let escaping = ResolvedPackage::from_sources(
+        "embedded/example",
+        manifest,
+        &[("../src/main.hk", "fn main() {}")],
+        PackageLimits::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        escaping.contains("must be a normalized relative path"),
+        "{escaping}"
+    );
+
+    let extension_manifest =
+        format!("{manifest}\n[extensions.regex]\npath = \"vendor/regex.huskext\"\n");
+    let extension = ResolvedPackage::from_sources(
+        "embedded/example",
+        &extension_manifest,
+        &[("src/main.hk", "fn main() {}")],
+        PackageLimits::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        extension.contains("embedded packages cannot declare extensions"),
+        "{extension}"
     );
 }
 

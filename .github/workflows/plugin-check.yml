@@ -46,7 +46,10 @@ jobs:
         run: |
           cargo test --all-features -p red husk
           cargo test --all-features -p red plugin::runtime::tests::lsp_symbols_
-          cargo test --all-features -p husk -p husk-ast -p husk-diagnostics -p husk-lexer -p husk-parser -p husk-semantic -p husk-types
+          cargo test --all-features -p red plugin::runtime::tests::git_
+          cargo test --all-features -p red plugin::runtime::tests::embedded_git_core_
+          cargo test --all-features -p husk -p husk-ast -p husk-diagnostics -p husk-lexer -p husk-package -p husk-parser -p husk-semantic -p husk-types
+          cargo run --all-features -p husk-cli -- test --locked plugins/git_core
 
       - name: Validate example plugin metadata
         run: python3 -m json.tool examples/example-plugin/package.json > /dev/null

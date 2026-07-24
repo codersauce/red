@@ -329,6 +329,77 @@ impl ResolvedPackage {
         })
     }
 
+    /// Resolve a pure package whose sources are embedded in the host binary.
+    ///
+    /// `files` are package-relative paths paired with UTF-8 source. The same
+    /// module layout, ambiguity, size, and module-count rules as filesystem
+    /// packages apply. Embedded packages cannot declare extensions because
+    /// their bundles and lock provenance cannot be verified without a
+    /// filesystem root.
+    pub fn from_sources(
+        display_root: impl Into<PathBuf>,
+        manifest_source: &str,
+        files: &[(&str, &str)],
+        limits: PackageLimits,
+    ) -> Result<Self, PackageError> {
+        let display_root = display_root.into();
+        let manifest_path = display_root.join(MANIFEST_FILE);
+        let manifest_bytes = u64::try_from(manifest_source.len()).unwrap_or(u64::MAX);
+        if manifest_bytes > limits.max_manifest_bytes {
+            return Err(PackageError::TooLarge {
+                path: manifest_path,
+                actual: manifest_bytes,
+                maximum: limits.max_manifest_bytes,
+            });
+        }
+
+        let manifest = PackageManifest::parse(manifest_source)?;
+        if !manifest.extensions.is_empty() {
+            return Err(PackageError::InvalidManifest {
+                message: "embedded packages cannot declare extensions".to_string(),
+            });
+        }
+
+        let mut sources = BTreeMap::new();
+        for (path, source) in files {
+            let path = PathBuf::from(path);
+            validate_local_path(&path, "embedded source")?;
+            if sources
+                .insert(path.clone(), Arc::<str>::from(*source))
+                .is_some()
+            {
+                return Err(PackageError::InvalidManifest {
+                    message: format!("duplicate embedded source `{}`", path.display()),
+                });
+            }
+        }
+
+        let entry = manifest.package.entry.clone();
+        if !sources.contains_key(&entry) {
+            return Err(PackageError::NotFile(display_root.join(entry)));
+        }
+        let source_root = display_root.join(entry.parent().unwrap_or(Path::new("")));
+        let mut resolver =
+            EmbeddedModuleResolver::new(display_root.clone(), source_root.clone(), sources, limits);
+        resolver.resolve(Vec::new(), entry)?;
+        let modules = resolver.finish();
+        let lock = PackageLock::empty(
+            manifest.package.name.clone(),
+            manifest.package.version.clone(),
+        );
+
+        Ok(Self {
+            root: display_root,
+            source_root,
+            manifest_path,
+            manifest,
+            modules,
+            extensions: Vec::new(),
+            lock,
+            limits,
+        })
+    }
+
     pub fn enforce_lock(&self) -> Result<(), PackageError> {
         let path = self.root.join(LOCK_FILE);
         reject_symlink(&path)?;
@@ -595,6 +666,144 @@ struct ModuleResolver {
     modules: BTreeMap<Vec<String>, SourceModule>,
     canonical_owners: HashMap<PathBuf, Vec<String>>,
     stack: Vec<(Vec<String>, PathBuf)>,
+}
+
+struct EmbeddedModuleResolver {
+    display_root: PathBuf,
+    source_root: PathBuf,
+    sources: BTreeMap<PathBuf, Arc<str>>,
+    limits: PackageLimits,
+    modules: BTreeMap<Vec<String>, SourceModule>,
+}
+
+impl EmbeddedModuleResolver {
+    fn new(
+        display_root: PathBuf,
+        source_root: PathBuf,
+        sources: BTreeMap<PathBuf, Arc<str>>,
+        limits: PackageLimits,
+    ) -> Self {
+        Self {
+            display_root,
+            source_root,
+            sources,
+            limits,
+            modules: BTreeMap::new(),
+        }
+    }
+
+    fn resolve(
+        &mut self,
+        module_path: Vec<String>,
+        source_path: PathBuf,
+    ) -> Result<(), PackageError> {
+        if self.modules.len() >= self.limits.max_modules {
+            return Err(PackageError::TooManyModules {
+                maximum: self.limits.max_modules,
+            });
+        }
+        let canonical_path = self.display_root.join(&source_path);
+        if self.modules.contains_key(&module_path) {
+            let module = display_module(&module_path);
+            return Err(PackageError::DuplicateModuleFile {
+                path: canonical_path,
+                first: module.clone(),
+                second: module,
+            });
+        }
+        let source = self
+            .sources
+            .get(&source_path)
+            .cloned()
+            .ok_or_else(|| PackageError::NotFile(canonical_path.clone()))?;
+        let source_bytes = u64::try_from(source.len()).unwrap_or(u64::MAX);
+        if source_bytes > self.limits.max_source_bytes {
+            return Err(PackageError::TooLarge {
+                path: canonical_path,
+                actual: source_bytes,
+                maximum: self.limits.max_source_bytes,
+            });
+        }
+        let parsed = husk_parser::parse_str(&source);
+        if !parsed.errors.is_empty() {
+            return Err(PackageError::Parse {
+                path: canonical_path,
+                errors: parsed
+                    .errors
+                    .into_iter()
+                    .map(|error| {
+                        format!(
+                            "{} at {}..{}",
+                            error.message, error.span.range.start, error.span.range.end
+                        )
+                    })
+                    .collect(),
+            });
+        }
+        let mut syntax = parsed.file.expect("parser returns a file");
+        let display_path = canonical_path
+            .strip_prefix(&self.source_root)
+            .unwrap_or(&canonical_path)
+            .to_path_buf();
+        let ast_path = Arc::<str>::from(display_path.to_string_lossy().as_ref());
+        for item in &mut syntax.items {
+            item.set_file_path(Arc::clone(&ast_path));
+        }
+        let child_names = syntax
+            .items
+            .iter()
+            .filter_map(|item| match &item.kind {
+                ItemKind::Mod { name } => Some(name.name.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        self.modules.insert(
+            module_path.clone(),
+            SourceModule {
+                module_path: module_path.clone(),
+                canonical_path,
+                display_path,
+                source,
+                syntax,
+            },
+        );
+
+        let child_base = module_child_base(&source_path, module_path.is_empty());
+        for child_name in child_names {
+            let flat = child_base.join(format!("{child_name}.hk"));
+            let nested = child_base.join(&child_name).join("mod.hk");
+            let selected = match (
+                self.sources.contains_key(&flat),
+                self.sources.contains_key(&nested),
+            ) {
+                (true, false) => flat,
+                (false, true) => nested,
+                (true, true) => {
+                    return Err(PackageError::AmbiguousModule {
+                        module: child_name,
+                        flat: self.display_root.join(flat),
+                        nested: self.display_root.join(nested),
+                    });
+                }
+                (false, false) => {
+                    return Err(PackageError::MissingModule {
+                        module: child_name,
+                        flat: self.display_root.join(flat),
+                        nested: self.display_root.join(nested),
+                    });
+                }
+            };
+            let mut child_path = module_path.clone();
+            child_path.push(child_name);
+            self.resolve(child_path, selected)?;
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Vec<SourceModule> {
+        self.modules.into_values().collect()
+    }
 }
 
 impl ModuleResolver {

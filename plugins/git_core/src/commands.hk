@@ -1,0 +1,187 @@
+// Typed command construction for operations where an invalid combination can
+// change repository history or the working tree.
+
+enum ApplyTarget {
+    Stage,
+    Unstage,
+    Reset,
+}
+
+enum DiffTarget {
+    Worktree,
+    Index,
+}
+
+enum HunkView {
+    Navigation,
+    Selection,
+}
+
+enum CommitMode {
+    Create,
+    Amend,
+    AmendNoEdit,
+}
+
+pub fn status_args() -> [String] {
+    [
+        "status",
+        "--porcelain=v2",
+        "--branch",
+        "--show-stash",
+        "-z",
+        "--untracked-files=all",
+    ]
+}
+
+pub fn sign_diff_args(staged: bool, paths: [String]) -> [String] {
+    let mut args = ["-c", "core.quotePath=false", "diff"];
+    if staged {
+        args.push("--cached");
+    }
+    args.push("--no-ext-diff");
+    args.push("--no-prefix");
+    args.push("--unified=0");
+    args.push("--");
+    for path in paths {
+        args.push(path);
+    }
+    args
+}
+
+pub fn detail_diff_args(section: String, path: String) -> [String] {
+    let target = diff_target(section);
+    let mut args = ["diff"];
+    match target {
+        DiffTarget::Index => args.push("--cached"),
+        DiffTarget::Worktree => {},
+    };
+    args.push("--no-ext-diff");
+    args.push("--color=never");
+    args.push("--");
+    args.push(path);
+    args
+}
+
+pub fn hunk_diff_args(action: String, path: String) -> [String] {
+    let target = diff_target(action);
+    let view = hunk_view(action);
+    let mut args = ["diff"];
+    match target {
+        DiffTarget::Index => args.push("--cached"),
+        DiffTarget::Worktree => {},
+    };
+    args.push("--no-ext-diff");
+    match view {
+        HunkView::Navigation => args.push("--unified=0"),
+        HunkView::Selection => args.push("--unified=3"),
+    };
+    args.push("--");
+    args.push(path);
+    args
+}
+
+pub fn commit_args(mode: String) -> [String] {
+    let mode = commit_mode(mode);
+    let mut args = ["commit"];
+    let mut no_edit = false;
+    match mode {
+        CommitMode::Create => {},
+        CommitMode::Amend => args.push("--amend"),
+        CommitMode::AmendNoEdit => {
+            args.push("--amend");
+            args.push("--no-edit");
+            no_edit = true;
+        },
+    };
+    if no_edit {
+        return args;
+    }
+    args.push("--cleanup=strip");
+    args.push("-F");
+    args.push("-");
+    args
+}
+
+pub fn apply_hunk_args(action: String) -> [String] {
+    if action != "stage" && action != "unstage" && action != "reset" {
+        return [];
+    }
+    let target = apply_target(action);
+    let mut args = ["apply"];
+
+    match target {
+        ApplyTarget::Stage => args.push("--cached"),
+        ApplyTarget::Unstage => {
+            args.push("--cached");
+            args.push("--reverse");
+        },
+        ApplyTarget::Reset => args.push("--reverse"),
+    };
+    args.push("--unidiff-zero");
+    args.push("-");
+    args
+}
+
+fn apply_target(action: String) -> ApplyTarget {
+    if action == "stage" {
+        return ApplyTarget::Stage;
+    }
+    if action == "unstage" {
+        return ApplyTarget::Unstage;
+    }
+    if action == "reset" {
+        return ApplyTarget::Reset;
+    }
+    ApplyTarget::Reset
+}
+
+fn diff_target(value: String) -> DiffTarget {
+    if value == "staged" || value == "unstage" {
+        return DiffTarget::Index;
+    }
+    DiffTarget::Worktree
+}
+
+fn hunk_view(action: String) -> HunkView {
+    if action == "next" || action == "previous" {
+        return HunkView::Navigation;
+    }
+    HunkView::Selection
+}
+
+fn commit_mode(mode: String) -> CommitMode {
+    if mode == "--amend" {
+        return CommitMode::AmendNoEdit;
+    }
+    if mode == "amend" {
+        return CommitMode::Amend;
+    }
+    CommitMode::Create
+}
+
+#[test]
+fn builds_explicit_apply_modes() {
+    assert(apply_hunk_args("stage").join(" ") == "apply --cached --unidiff-zero -");
+    assert(apply_hunk_args("unstage").join(" ") == "apply --cached --reverse --unidiff-zero -");
+    assert(apply_hunk_args("reset").join(" ") == "apply --reverse --unidiff-zero -");
+    assert(apply_hunk_args("unknown").len() == 0);
+}
+
+#[test]
+fn builds_bounded_noninteractive_status_and_diff_commands() {
+    assert(status_args().join(" ") == "status --porcelain=v2 --branch --show-stash -z --untracked-files=all");
+    assert(sign_diff_args(false, ["src/a.rs"]).join(" ") == "-c core.quotePath=false diff --no-ext-diff --no-prefix --unified=0 -- src/a.rs");
+    assert(sign_diff_args(true, ["src/a.rs", "src/b.rs"]).join(" ") == "-c core.quotePath=false diff --cached --no-ext-diff --no-prefix --unified=0 -- src/a.rs src/b.rs");
+    assert(detail_diff_args("staged", "src/a.rs").join(" ") == "diff --cached --no-ext-diff --color=never -- src/a.rs");
+    assert(detail_diff_args("unstaged", "src/a.rs").join(" ") == "diff --no-ext-diff --color=never -- src/a.rs");
+}
+
+#[test]
+fn builds_navigation_selection_and_commit_modes_explicitly() {
+    assert(hunk_diff_args("next", "src/a.rs").join(" ") == "diff --no-ext-diff --unified=0 -- src/a.rs");
+    assert(hunk_diff_args("unstage", "src/a.rs").join(" ") == "diff --cached --no-ext-diff --unified=3 -- src/a.rs");
+    assert(commit_args("create").join(" ") == "commit --cleanup=strip -F -");
+    assert(commit_args("amend").join(" ") == "commit --amend --cleanup=strip -F -");
+    assert(commit_args("--amend").join(" ") == "commit --amend --no-edit");
+}
