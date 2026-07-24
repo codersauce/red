@@ -214,7 +214,7 @@ fn symbol_batch_timeout(event: Json) {
     red::state_set("lsp_symbol_batch_timer", "");
 
     let symbols = red::state("lsp_symbol_batch_symbols");
-    let items = red::state("lsp_symbol_batch_items");
+    let batch = [];
     let index = red::int(red::state("lsp_symbol_batch_index"), 0);
     let handle = red::state("lsp_symbol_batch_picker");
     if handle == red::null() || handle != red::state("lsp_symbol_picker") {
@@ -232,15 +232,17 @@ fn symbol_batch_timeout(event: Json) {
                 red::string(red::state("lsp_reference_file"), ""),
                 red::state("lsp_reference_position")
             ) {
-                items = red::push(items, reference_item(value));
+                batch = red::push(batch, reference_item(value));
             }
         } else if !workspace_only || is_workspace_symbol_kind(value.kind_name) {
-            items = red::push(items, symbol_item(value));
+            batch = red::push(batch, symbol_item(value));
         }
         index = index + 1;
         processed = processed + 1;
     }
 
+    // Keep the growing result out of helper-call frames and extend it once per batch.
+    let items = red::extend(red::state("lsp_symbol_batch_items"), batch);
     red::state_set("lsp_symbol_batch_items", items);
     red::state_set("lsp_symbol_batch_index", index);
     red::execute("UpdatePickerItems", handle, items);

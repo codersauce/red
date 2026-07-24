@@ -160,6 +160,7 @@ extern "red" {
         fn state_set();
         fn state() -> JsValue;
         fn push() -> JsValue;
+        fn extend() -> JsValue;
         fn unshift() -> JsValue;
         fn contains() -> bool;
         fn remove() -> JsValue;
@@ -1670,6 +1671,12 @@ impl RedHost {
             "red::push" => {
                 let mut values = red_required_value_array(args, 0, path)?;
                 Arc::make_mut(&mut values).push(args.get(1).cloned().unwrap_or(Value::Null));
+                Ok(Value::Array(values))
+            }
+            "red::extend" => {
+                let mut values = red_required_value_array(args, 0, path)?;
+                let additional = red_required_value_array(args, 1, path)?;
+                Arc::make_mut(&mut values).extend(additional.iter().cloned());
                 Ok(Value::Array(values))
             }
             "red::unshift" => {
@@ -3326,6 +3333,37 @@ mod tests {
             }
             _ => panic!("unexpected plugin request"),
         }
+    }
+
+    #[test]
+    fn host_array_extend_appends_json_values_without_mutating_the_source() {
+        let mut host = RedHost::new(HashMap::new());
+        let source = Value::Array(Arc::new(vec![Value::Int(1), Value::Int(2)]));
+
+        let extended = host
+            .call_module(
+                "array-test",
+                "red::extend",
+                &[
+                    source.clone(),
+                    Value::Json(serde_json::json!([{ "value": 3 }, { "value": 4 }])),
+                ],
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(source.to_json(), serde_json::json!([1, 2]));
+        assert_eq!(
+            extended.to_json(),
+            serde_json::json!([1, 2, { "value": 3 }, { "value": 4 }])
+        );
+
+        let error = host
+            .call_module("array-test", "red::extend", &[source, Value::Null])
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("argument 1 must be an array"), "{error}");
     }
 
     #[tokio::test]
