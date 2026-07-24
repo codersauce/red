@@ -76,6 +76,7 @@ use crate::{
     codex::{start_codex, CodexBridge, CodexCommand, CodexEvent, CodexProcessSpec},
     color::Color,
     command, command_palette,
+    comment::CommentSyntax,
     config::{Config, ConfigDiagnostic, ConfigDiagnosticSource, ConfigRecovery, KeyAction},
     dispatcher::Dispatcher,
     highlighter::Highlighter,
@@ -1287,6 +1288,10 @@ pub enum Action {
     JoinLines(u16),
     JoinLinesKeepSpaces(u16),
     ToggleCharCase(u16),
+    StartCommentOperator(u16),
+    ToggleCommentLines(u16),
+    ToggleCommentRange(TextRange),
+    ToggleCommentSelection,
     StartLowercaseOperator(u16),
     StartUppercaseOperator(u16),
     StartToggleCaseOperator(u16),
@@ -2515,6 +2520,7 @@ enum EditOperator {
     Delete,
     Change,
     Yank,
+    Comment,
     Lowercase,
     Uppercase,
     ToggleCase,
@@ -2523,6 +2529,7 @@ enum EditOperator {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingOperatorStep {
     Operator,
+    CommentTextObject,
     FindForward,
     TillForward,
     FindBackward,
@@ -2574,6 +2581,7 @@ impl EditOperator {
             EditOperator::Delete => "d",
             EditOperator::Change => "c",
             EditOperator::Yank => "y",
+            EditOperator::Comment => "gc",
             EditOperator::Lowercase => "gu",
             EditOperator::Uppercase => "gU",
             EditOperator::ToggleCase => "g~",
@@ -11286,6 +11294,9 @@ impl Editor {
                 'c' if pending.operator == EditOperator::Change => Some(KeyAction::Single(
                     Action::ChangeCurrentLines(pending.count()),
                 )),
+                'c' if pending.operator == EditOperator::Comment => Some(KeyAction::Single(
+                    Action::ToggleCommentLines(pending.count()),
+                )),
                 'y' if pending.operator == EditOperator::Yank => {
                     Some(KeyAction::Single(Action::YankCurrentLines(pending.count())))
                 }
@@ -11307,6 +11318,14 @@ impl Editor {
                         Some(self.current_line_range(pending.count(), false)),
                         "no text under cursor",
                     ),
+                'g' => {
+                    self.waiting_command = Some(format!("{}g", pending.operator.as_str()));
+                    self.pending_operator = Some(PendingOperator {
+                        step: PendingOperatorStep::CommentTextObject,
+                        ..pending
+                    });
+                    Some(KeyAction::None)
+                }
                 'w' => self.operator_action_for_range(
                     pending.operator,
                     self.word_motion_range(
@@ -11415,6 +11434,17 @@ impl Editor {
                 }
                 _ => self.pending_operator_invalid(),
             },
+            PendingOperatorStep::CommentTextObject => {
+                if c != 'c' {
+                    return self.pending_operator_invalid();
+                }
+                let range = self.comment_text_object_range();
+                self.operator_action_for_linewise_range(
+                    pending.operator,
+                    range,
+                    "comment block not found",
+                )
+            }
             PendingOperatorStep::FindForward => {
                 self.last_character_motion = Some((ForwardCharacterMotion::Find, c));
                 self.operator_action_for_range(
@@ -11485,6 +11515,7 @@ impl Editor {
             EditOperator::Delete => Action::DeleteTextRange(range),
             EditOperator::Change => Action::ChangeTextRange(range),
             EditOperator::Yank => Action::YankTextRange(range),
+            EditOperator::Comment => Action::ToggleCommentRange(range),
             EditOperator::Lowercase => Action::TransformTextRange {
                 range,
                 transform: CaseTransform::Lower,
@@ -11519,6 +11550,7 @@ impl Editor {
             EditOperator::Delete => Action::DeleteLinewiseRange(range),
             EditOperator::Change => Action::ChangeLinewiseRange(range),
             EditOperator::Yank => Action::YankLinewiseRange(range),
+            EditOperator::Comment => Action::ToggleCommentRange(range),
             EditOperator::Lowercase => Action::TransformTextRange {
                 range,
                 transform: CaseTransform::Lower,
@@ -12740,10 +12772,12 @@ impl Editor {
                 }
                 self.render(buffer)?;
             }
-            Action::StartLowercaseOperator(count)
+            Action::StartCommentOperator(count)
+            | Action::StartLowercaseOperator(count)
             | Action::StartUppercaseOperator(count)
             | Action::StartToggleCaseOperator(count) => {
                 let operator = match action {
+                    Action::StartCommentOperator(_) => EditOperator::Comment,
                     Action::StartLowercaseOperator(_) => EditOperator::Lowercase,
                     Action::StartUppercaseOperator(_) => EditOperator::Uppercase,
                     Action::StartToggleCaseOperator(_) => EditOperator::ToggleCase,
@@ -12751,6 +12785,38 @@ impl Editor {
                 };
                 self.pending_operator = Some(PendingOperator::new(operator, *count));
                 self.waiting_command = Some(operator.as_str().to_string());
+            }
+            Action::ToggleCommentLines(count) => {
+                let start_line = self.buffer_line();
+                let last_line = start_line
+                    .saturating_add(usize::from(count.saturating_sub(1)))
+                    .min(self.last_navigable_line());
+                if self.toggle_comment_lines(start_line, last_line) {
+                    self.notify_change(runtime).await?;
+                }
+                self.render(buffer)?;
+            }
+            Action::ToggleCommentRange(range) => {
+                let start_line = range.start.line.min(self.last_navigable_line());
+                let last_line = if range.end.line > start_line && range.end.character == 0 {
+                    range.end.line.saturating_sub(1)
+                } else {
+                    range.end.line
+                }
+                .min(self.last_navigable_line());
+                if self.toggle_comment_lines(start_line, last_line) {
+                    self.notify_change(runtime).await?;
+                }
+                self.render(buffer)?;
+            }
+            Action::ToggleCommentSelection => {
+                if let Some(selection) = self.selection {
+                    let (_, start_line, _, last_line) = selection.into();
+                    if self.toggle_comment_lines(start_line, last_line) {
+                        self.notify_change(runtime).await?;
+                    }
+                }
+                self.render(buffer)?;
             }
             Action::TransformTextRange { range, transform } => {
                 if self.transform_text_range(*range, *transform, "change case") {
@@ -16732,6 +16798,12 @@ impl Editor {
                     KeyAction::Single(Action::StartLowercaseOperator(_)) => {
                         KeyAction::Single(Action::StartLowercaseOperator(count))
                     }
+                    KeyAction::Single(Action::StartCommentOperator(_)) => {
+                        KeyAction::Single(Action::StartCommentOperator(count))
+                    }
+                    KeyAction::Single(Action::ToggleCommentLines(_)) => {
+                        KeyAction::Single(Action::ToggleCommentLines(count))
+                    }
                     KeyAction::Single(Action::StartUppercaseOperator(_)) => {
                         KeyAction::Single(Action::StartUppercaseOperator(count))
                     }
@@ -17012,6 +17084,101 @@ impl Editor {
             }
         }
         transformed
+    }
+
+    fn comment_syntax(&mut self) -> Option<CommentSyntax> {
+        let Some(language) = self.current_language_id() else {
+            self.last_error = Some("no comment syntax configured for unnamed buffer".to_string());
+            return None;
+        };
+        let extension = self.current_buffer().file_type();
+        let template = extension
+            .as_deref()
+            .and_then(|extension| self.config.commenting.languages.get(extension))
+            .or_else(|| self.config.commenting.languages.get(&language));
+        let Some(template) = template else {
+            self.last_error = Some(format!("no comment syntax configured for {language}"));
+            return None;
+        };
+        let Some(syntax) = CommentSyntax::parse(template) else {
+            self.last_error = Some(format!(
+                "invalid comment syntax configured for {language}: expected exactly one %s placeholder"
+            ));
+            return None;
+        };
+        Some(syntax)
+    }
+
+    fn comment_text_object_range(&mut self) -> Option<TextRange> {
+        let syntax = self.comment_syntax()?;
+        let current_line = self.buffer_line();
+        let is_commented_line = |line| {
+            self.current_buffer()
+                .get(line)
+                .is_some_and(|content| syntax.is_commented(trim_line_ending(&content)))
+        };
+        if !is_commented_line(current_line) {
+            return None;
+        }
+
+        let mut first_line = current_line;
+        while first_line > 0 && is_commented_line(first_line - 1) {
+            first_line -= 1;
+        }
+
+        let mut last_line = current_line;
+        let final_line = self.last_navigable_line();
+        while last_line < final_line && is_commented_line(last_line + 1) {
+            last_line += 1;
+        }
+
+        let end = if last_line < final_line {
+            TextPosition::new(last_line + 1, 0)
+        } else {
+            TextPosition::new(last_line, self.line_character_len(last_line))
+        };
+        Some(TextRange::new(TextPosition::new(first_line, 0), end))
+    }
+
+    fn toggle_comment_lines(&mut self, start_line: usize, last_line: usize) -> bool {
+        let Some(syntax) = self.comment_syntax() else {
+            return false;
+        };
+        let final_line = self.last_navigable_line();
+        let start_line = start_line.min(final_line);
+        let last_line = last_line.min(final_line);
+        if start_line > last_line {
+            return false;
+        }
+
+        let originals = (start_line..=last_line)
+            .filter_map(|line| self.current_buffer().get(line))
+            .map(|line| trim_line_ending(&line).to_string())
+            .collect::<Vec<_>>();
+        let replacements = syntax.toggle_lines(&originals);
+        let edits = originals
+            .iter()
+            .zip(replacements)
+            .enumerate()
+            .filter_map(|(offset, (original, replacement))| {
+                (original != &replacement).then_some((start_line + offset, replacement))
+            })
+            .collect::<Vec<_>>();
+        if edits.is_empty() {
+            return false;
+        }
+
+        self.begin_transaction("toggle comments");
+        for (line, replacement) in edits.into_iter().rev() {
+            let range = TextRange::new(
+                TextPosition::new(line, 0),
+                TextPosition::new(line, self.line_character_len(line)),
+            );
+            self.replace_range(range, &replacement);
+        }
+        self.move_to_text_position(TextPosition::new(start_line, 0));
+        self.commit_transaction(self.cursor_snapshot());
+        true
     }
 
     fn transform_text_range(

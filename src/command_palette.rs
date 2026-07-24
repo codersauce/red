@@ -459,6 +459,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Action::Redo,
         ),
         builtin(
+            "edit.comment",
+            "Toggle line comments",
+            "Edit",
+            "Comment or uncomment the current line",
+            None,
+            &["comment", "uncomment", "toggle comment", "gcc"],
+            Action::ToggleCommentLines(1),
+        ),
+        builtin(
             "edit.repeat",
             "Repeat last change",
             "Edit",
@@ -896,6 +905,10 @@ fn action_label(action: &Action) -> String {
         Action::Quit(_) => "Quit".to_string(),
         Action::Undo => "Undo".to_string(),
         Action::Redo => "Redo".to_string(),
+        Action::StartCommentOperator(_) => "Comment with motion".to_string(),
+        Action::ToggleCommentLines(_) => "Toggle line comments".to_string(),
+        Action::ToggleCommentRange(_) => "Toggle range comments".to_string(),
+        Action::ToggleCommentSelection => "Toggle selected comments".to_string(),
         Action::RepeatLastChange => "Repeat last change".to_string(),
         Action::NextBuffer => "Next buffer".to_string(),
         Action::PreviousBuffer => "Previous buffer".to_string(),
@@ -1044,6 +1057,19 @@ mod tests {
             .unwrap();
         assert_eq!(save.colon.as_deref(), Some(":w"));
         assert!(save.aliases.iter().any(|alias| alias == ":write"));
+    }
+
+    #[test]
+    fn palette_lists_commenting_as_a_discoverable_edit_action() {
+        let entries = entries(&default_keys(), &[]);
+        let comment = entries
+            .iter()
+            .find(|entry| entry.id == "edit.comment")
+            .expect("comment action should appear in the command palette");
+
+        assert_eq!(comment.category, "Edit");
+        assert_eq!(comment.title, "Toggle line comments");
+        assert!(comment.aliases.iter().any(|alias| alias == "gcc"));
     }
 
     #[test]
