@@ -3131,7 +3131,11 @@ impl Editor {
         } else if self.uses_synthetic_block_cursor() {
             self.render_motion_frame(buffer)
         } else {
-            self.draw_cursor_preserving_cursor_goal()
+            self.draw_cursor_preserving_cursor_goal()?;
+            if self.terminal_output_enabled {
+                self.stdout.flush()?;
+            }
+            Ok(())
         }
     }
 
@@ -26460,6 +26464,70 @@ while True:
             editor.render_cursor_position(),
             Some((start.0 + 1, start.1))
         );
+    }
+
+    #[tokio::test]
+    async fn append_key_flushes_terminal_cursor_after_entering_insert_mode() {
+        let cases = [
+            ('a', "hello", 0, 1, 1),
+            ('a', "hello", 4, 5, 5),
+            ('a', "", 0, 0, 0),
+            ('a', "\t👋x", 0, 1, 4),
+            ('a', "\t👋x", 1, 2, 6),
+            ('A', "hello", 0, 5, 5),
+            ('A', "\t👋x", 0, 3, 7),
+        ];
+
+        for (key, contents, initial_x, expected_x, expected_display_col) in cases {
+            let mut config = Config::default();
+            config.keys.normal.insert(
+                "a".to_string(),
+                KeyAction::Multiple(vec![Action::EnterMode(Mode::Insert), Action::MoveRight]),
+            );
+            config.keys.normal.insert(
+                "A".to_string(),
+                KeyAction::Multiple(vec![
+                    Action::MoveToLineEnd,
+                    Action::EnterMode(Mode::Insert),
+                    Action::MoveRight,
+                ]),
+            );
+            let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+            let buffer = Buffer::new(None, contents.to_string());
+            let mut editor =
+                Editor::with_size(lsp, 20, 5, config, Theme::default(), vec![buffer]).unwrap();
+            editor.cx = initial_x;
+            editor.refresh_cursor_goal();
+            editor.sync_to_window();
+            let (initial_screen_x, expected_screen_y) = editor.render_cursor_position().unwrap();
+            let initial_display_col =
+                grapheme_to_column_with_tabs(contents, initial_x, editor.active_tab_width());
+            let content_screen_x = initial_screen_x - initial_display_col;
+            let mut render_buffer = RenderBuffer::new(20, 5, &Style::default());
+            let mut runtime = Runtime::new();
+
+            editor
+                .process_editor_event(
+                    Event::Key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)),
+                    &mut render_buffer,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(editor.mode, Mode::Insert, "key {key} in {contents:?}");
+            assert_eq!(editor.cx, expected_x, "key {key} in {contents:?}");
+            assert_eq!(
+                editor.render_cursor_position(),
+                Some((content_screen_x + expected_display_col, expected_screen_y)),
+                "key {key} in {contents:?}"
+            );
+            assert!(
+                editor.stdout.buffer().is_empty(),
+                "key {key} in {contents:?} left the terminal cursor movement queued"
+            );
+        }
     }
 
     #[test]
