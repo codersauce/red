@@ -2,6 +2,57 @@
 
 All notable changes to Red are documented in this file.
 
+## [0.2.4](https://github.com/codersauce/red/compare/v0.2.3...v0.2.4)
+
+### Features
+
+- **neotree:** Add native-style tree scrolling ([fe39cc0](https://github.com/codersauce/red/commit/fe39cc08822ea4f65511045f29faec0922cc7d37))
+- **neotree:** Add theme-aware tree colors ([612df4a](https://github.com/codersauce/red/commit/612df4a33842c2dd79c50cc1b5acff0808a5d7bb))
+- **editor:** Add buffer-local syntax command ([#151](https://github.com/codersauce/red/issues/151)) ([42ad7fa](https://github.com/codersauce/red/commit/42ad7fa2929bb459943b0bb5d56a1c7b8e6de1f9))
+- **husk:** Add native standard library ([#149](https://github.com/codersauce/red/issues/149)) ([4a79bc4](https://github.com/codersauce/red/commit/4a79bc49c7f91ad2314e3144f9ec779bf4f55cdd))
+- **git:** Extract native husk core ([7d20a52](https://github.com/codersauce/red/commit/7d20a5202cdcaf26f6e56648976c40876b595314))
+- **husk:** Add full language server ([de6a77d](https://github.com/codersauce/red/commit/de6a77de942d87d0bdd051644736a0cb0f90885f))
+- **editor:** Highlight matching brackets in insert mode ([27cb966](https://github.com/codersauce/red/commit/27cb966c39d8e9472f8d354d902cdae7e2f40a4d))
+- **editor:** Highlight matching bracket pairs ([ed72513](https://github.com/codersauce/red/commit/ed725130c981d70c16f9e0e083d1a4de4d7a1f2d))
+- **editor:** Add neovim-style comment operators ([#138](https://github.com/codersauce/red/issues/138)) ([d5a953f](https://github.com/codersauce/red/commit/d5a953f324ab99f4d1d7e9dea0dd797d595c6e72))
+- **husk:** Add generic specialization and grouped imports ([50ac178](https://github.com/codersauce/red/commit/50ac178a7347065c1c8443714efa71ea1a1c3790))
+- **husk:** Add crate adapter workflow ([#136](https://github.com/codersauce/red/issues/136)) ([a5e4e39](https://github.com/codersauce/red/commit/a5e4e3993cabc2553fb2aca4f8907941879d08bb))
+- **neotree:** Add file management actions ([fdfe517](https://github.com/codersauce/red/commit/fdfe51731f84b4bbd42fedb47d6b0b6d468d6913))
+- **git:** Make the dashboard interactive and responsive ([#130](https://github.com/codersauce/red/issues/130)) ([dadde46](https://github.com/codersauce/red/commit/dadde46ea61f605a107d091cf9570ef7e80ae781))
+- **husk:** Extract standalone language runtime ([#118](https://github.com/codersauce/red/issues/118)) ([b208bdd](https://github.com/codersauce/red/commit/b208bddcb185f8aceb9f5432882f3f9569736c4e))
+
+### Bug Fixes
+
+- **tui:** Inset right-aligned panel badges ([c0ef016](https://github.com/codersauce/red/commit/c0ef0166d12df75abc7a7fc7a171d748f5f6f905))
+- **tui:** Match neotree directory status behavior ([9e85e9d](https://github.com/codersauce/red/commit/9e85e9d5d32ed52873376e61c7e320aa17ca3e23))
+- **lsp:** Prevent pathological batching hangs ([7b126be](https://github.com/codersauce/red/commit/7b126be0d96c5cdb75768161a895b0c69a88db22))
+- **editor:** Preserve YAML highlighting context ([c9b3f42](https://github.com/codersauce/red/commit/c9b3f4263f041bb5f7af0e156acd2e38f183807a))
+- **lsp:** Surface initialization failures ([b6ae2ce](https://github.com/codersauce/red/commit/b6ae2ced1415840a5de53f2766ddfbbfe006cfd0))
+- **editor:** Report failed searches ([781649e](https://github.com/codersauce/red/commit/781649e46eca703e9206d951a7ff4a7f7dbf3584))
+- **editor:** Recover from missed terminal resizes ([#143](https://github.com/codersauce/red/issues/143)) ([f4d48a0](https://github.com/codersauce/red/commit/f4d48a076043a60388872eba6d1916ca585e4130))
+- **husk:** Replace deprecated toml document alias ([ddc2fd7](https://github.com/codersauce/red/commit/ddc2fd7ce1e072803bde5616f6cc0acf4cc7e9a4))
+- **editor:** Keep append cursor rendering in sync ([#139](https://github.com/codersauce/red/issues/139)) ([a036b73](https://github.com/codersauce/red/commit/a036b7385f886c2e53c8b141ec1264e99df86478))
+- **lsp:** Avoid waiting after kill failure ([01bfd7a](https://github.com/codersauce/red/commit/01bfd7a584427494a0a22b442dd33cf1313fe06e))
+- **lsp:** Bound editor shutdown latency ([1a5bf5f](https://github.com/codersauce/red/commit/1a5bf5fdef583a7301725b7220102ffd2ab813b9))
+- **logging:** Use a cross-platform default path ([#133](https://github.com/codersauce/red/issues/133)) ([4380f51](https://github.com/codersauce/red/commit/4380f51d61e0161adae2235a3e31b0de71b2f306))
+- **agent:** Honor required codex hooks ([dde7842](https://github.com/codersauce/red/commit/dde784206beb04c8f43147a120113bed9c1b356d))
+- **theme:** Render consistent backgrounds ([#129](https://github.com/codersauce/red/issues/129)) ([b17f85e](https://github.com/codersauce/red/commit/b17f85ef9d6318582c388c31645001c61ca5d71e))
+- **plugins:** Bound pathological callback workloads ([#128](https://github.com/codersauce/red/issues/128)) ([2dbf1b6](https://github.com/codersauce/red/commit/2dbf1b6a9f876d35ffcfa575e7414daf4e636622))
+
+### Documentation
+
+- Screenshots ([70dc651](https://github.com/codersauce/red/commit/70dc6518dd97744342f8f7ec677ac9ed6cca5755))
+
+### Refactoring
+
+- **neotree:** Reuse native husk standard library ([#152](https://github.com/codersauce/red/issues/152)) ([73db294](https://github.com/codersauce/red/commit/73db2945703d0bcd123604066b7b0066e92fb242))
+- **git:** Reuse native husk standard library ([#150](https://github.com/codersauce/red/issues/150)) ([1d9e093](https://github.com/codersauce/red/commit/1d9e09345868d6a5c11eca844161f1271123657a))
+- **editor:** Extract state controllers and tighten hot paths ([#132](https://github.com/codersauce/red/issues/132)) ([6ed3b86](https://github.com/codersauce/red/commit/6ed3b86d9610c6d41a816447dfb67fd5cf804f36))
+
+### Continuous Integration
+
+- **actions:** Accelerate trusted test matrix with warp ([#141](https://github.com/codersauce/red/issues/141)) ([567d660](https://github.com/codersauce/red/commit/567d660d9760b452182616375fe6d2001b16f318))
+
 ## [0.2.3](https://github.com/codersauce/red/compare/v0.2.2...v0.2.3)
 
 ### Bug Fixes
