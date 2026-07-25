@@ -675,6 +675,54 @@ impl PluginPanel {
         }
     }
 
+    fn scroll_view(&mut self, delta: isize, panel_height: usize, scrolloff: usize) {
+        if self.rows.is_empty() {
+            self.selected = 0;
+            self.scroll = 0;
+            return;
+        }
+
+        let visible_rows = self.visible_rows(panel_height);
+        let max_scroll = self.rows.len().saturating_sub(visible_rows);
+        let previous_scroll = self.scroll;
+        self.scroll = self.scroll.saturating_add_signed(delta).min(max_scroll);
+        if self.scroll == previous_scroll {
+            return;
+        }
+
+        let scrolloff = scrolloff.min(visible_rows.saturating_sub(1) / 2);
+        let first = self.scroll.saturating_add(scrolloff);
+        let last = self
+            .scroll
+            .saturating_add(visible_rows.saturating_sub(scrolloff).saturating_sub(1))
+            .min(self.rows.len() - 1);
+        self.selected = self.selected.clamp(first, last);
+    }
+
+    fn page_scroll(&mut self, direction: isize, panel_height: usize, scrolloff: usize) {
+        let page_rows = self.visible_rows(panel_height).saturating_sub(2).max(1);
+        let page_rows = isize::try_from(page_rows).unwrap_or(isize::MAX);
+        self.scroll_view(direction.saturating_mul(page_rows), panel_height, scrolloff);
+    }
+
+    fn scroll_to_top(&mut self) {
+        self.selected = 0;
+        self.scroll = 0;
+    }
+
+    fn scroll_to_bottom(&mut self, panel_height: usize) {
+        if self.rows.is_empty() {
+            self.scroll_to_top();
+            return;
+        }
+
+        self.selected = self.rows.len() - 1;
+        self.scroll = self
+            .rows
+            .len()
+            .saturating_sub(self.visible_rows(panel_height));
+    }
+
     pub fn select_row_by_id(&mut self, row_id: &str, panel_height: usize) -> bool {
         let Some(index) = self.rows.iter().position(|row| row.id == row_id) else {
             return false;
@@ -913,6 +961,7 @@ impl PanelManager {
         action: &str,
         panel_height: usize,
         terminal_width: usize,
+        scrolloff: usize,
     ) -> Option<PanelEvent> {
         let focused = self.focused.clone()?;
         if let Some(panel) = self.text_panels.get_mut(&focused) {
@@ -943,9 +992,45 @@ impl PanelManager {
         match action {
             "up" => panel.move_selection(-1, panel_height),
             "down" => panel.move_selection(1, panel_height),
+            "page_up" => panel.page_scroll(-1, panel_height, scrolloff),
+            "page_down" => panel.page_scroll(1, panel_height, scrolloff),
+            "top" => panel.scroll_to_top(),
+            "bottom" => panel.scroll_to_bottom(panel_height),
             _ => {}
         }
 
+        Some(PanelEvent {
+            panel_id: panel.id.clone(),
+            action: action.to_string(),
+            selected_index: panel.selected,
+            row: panel.selected_row(),
+            text: None,
+        })
+    }
+
+    pub fn handle_mouse_scroll(
+        &mut self,
+        id: &str,
+        delta: isize,
+        panel_height: usize,
+        terminal_width: usize,
+        scrolloff: usize,
+    ) -> Option<PanelEvent> {
+        let action = if delta < 0 { "up" } else { "down" };
+        if let Some(panel) = self.text_panels.get_mut(id) {
+            let width = effective_panel_width(&panel.config, terminal_width);
+            panel.move_scroll(delta, panel_height, width);
+            return Some(PanelEvent {
+                panel_id: panel.id.clone(),
+                action: action.to_string(),
+                selected_index: panel.scroll,
+                row: None,
+                text: None,
+            });
+        }
+
+        let panel = self.panels.get_mut(id)?;
+        panel.scroll_view(delta, panel_height, scrolloff);
         Some(PanelEvent {
             panel_id: panel.id.clone(),
             action: action.to_string(),
@@ -2668,16 +2753,16 @@ mod tests {
         assert!(manager.focus_panel("agent"));
         assert_eq!(manager.reserved_right_width(), 17);
 
-        let top = manager.handle_focused_key("top", 4, 16).unwrap();
+        let top = manager.handle_focused_key("top", 4, 16, 0).unwrap();
         assert_eq!(top.selected_index, 0);
         assert!(top.row.is_none());
         manager.append_text_panel("agent", "answer", "\neight", 4, 16);
         assert_eq!(manager.text_panels["agent"].scroll, 0);
         assert!(!manager.text_panels["agent"].follow_tail);
 
-        let page = manager.handle_focused_key("page_down", 4, 16).unwrap();
+        let page = manager.handle_focused_key("page_down", 4, 16, 0).unwrap();
         assert!(page.selected_index > 0);
-        let bottom = manager.handle_focused_key("bottom", 4, 16).unwrap();
+        let bottom = manager.handle_focused_key("bottom", 4, 16, 0).unwrap();
         assert!(bottom.selected_index >= page.selected_index);
         assert!(manager.text_panels["agent"].follow_tail);
     }
@@ -2761,7 +2846,7 @@ mod tests {
         manager.update_panel("tree", vec![row("a"), row("b")]);
         assert!(manager.focus_panel("tree"));
 
-        let event = manager.handle_focused_key("down", 10, 80).unwrap();
+        let event = manager.handle_focused_key("down", 10, 80, 0).unwrap();
         assert_eq!(event.selected_index, 1);
         assert_eq!(event.row.unwrap().id, "b");
     }
@@ -2773,9 +2858,9 @@ mod tests {
         manager.update_panel("tree", vec![row("a"), row("b"), row("c"), row("d")]);
         assert!(manager.focus_panel("tree"));
 
-        manager.handle_focused_key("down", 3, 80).unwrap();
-        manager.handle_focused_key("down", 3, 80).unwrap();
-        let event = manager.handle_focused_key("down", 3, 80).unwrap();
+        manager.handle_focused_key("down", 3, 80, 0).unwrap();
+        manager.handle_focused_key("down", 3, 80, 0).unwrap();
+        let event = manager.handle_focused_key("down", 3, 80, 0).unwrap();
 
         assert_eq!(event.selected_index, 3);
         assert_eq!(manager.panels["tree"].scroll, 1);
@@ -2788,6 +2873,89 @@ mod tests {
         let mut buffer = RenderBuffer::new(10, 5, &style);
         manager.render(&mut buffer, &theme);
         assert_eq!(row_text(&buffer, 2).trim(), "d");
+    }
+
+    #[test]
+    fn focused_panel_pages_rows_with_two_lines_of_overlap() {
+        let mut manager = PanelManager::default();
+        manager.create_panel(
+            "tree".to_string(),
+            PanelConfig {
+                title: Some("Tree".to_string()),
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_panel(
+            "tree",
+            (0..20).map(|index| row(&index.to_string())).collect(),
+        );
+        assert!(manager.focus_panel("tree"));
+
+        let first = manager.handle_focused_key("page_down", 7, 80, 2).unwrap();
+        assert_eq!(manager.panels["tree"].scroll, 4);
+        assert_eq!(first.selected_index, 6);
+
+        let second = manager.handle_focused_key("page_down", 7, 80, 2).unwrap();
+        assert_eq!(manager.panels["tree"].scroll, 8);
+        assert_eq!(second.selected_index, 10);
+
+        let previous = manager.handle_focused_key("page_up", 7, 80, 2).unwrap();
+        assert_eq!(manager.panels["tree"].scroll, 4);
+        assert_eq!(previous.selected_index, 7);
+
+        let bottom = manager.handle_focused_key("bottom", 7, 80, 2).unwrap();
+        assert_eq!(manager.panels["tree"].scroll, 14);
+        assert_eq!(bottom.selected_index, 19);
+
+        let top = manager.handle_focused_key("top", 7, 80, 2).unwrap();
+        assert_eq!(manager.panels["tree"].scroll, 0);
+        assert_eq!(top.selected_index, 0);
+    }
+
+    #[test]
+    fn mouse_scroll_moves_hovered_panel_without_changing_focus() {
+        let mut manager = PanelManager::default();
+        manager.create_panel("tree".to_string(), PanelConfig::default());
+        manager.create_panel(
+            "other".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_panel(
+            "tree",
+            (0..20).map(|index| row(&index.to_string())).collect(),
+        );
+        manager.update_panel("other", vec![row("other")]);
+        assert!(manager.focus_panel("other"));
+
+        let down = manager.handle_mouse_scroll("tree", 3, 6, 80, 1).unwrap();
+        assert_eq!(manager.focused_panel_id(), Some("other"));
+        assert_eq!(manager.panels["tree"].scroll, 3);
+        assert_eq!(down.selected_index, 4);
+
+        let up = manager.handle_mouse_scroll("tree", -2, 6, 80, 1).unwrap();
+        assert_eq!(manager.panels["tree"].scroll, 1);
+        assert_eq!(up.selected_index, 4);
+    }
+
+    #[test]
+    fn row_panel_scroll_handles_empty_short_and_tiny_viewports() {
+        let mut panel = PluginPanel::new("tree".to_string(), PanelConfig::default());
+
+        panel.scroll_view(3, 4, 3);
+        assert_eq!((panel.selected, panel.scroll), (0, 0));
+
+        panel.update_rows(vec![row("a"), row("b")]);
+        panel.scroll_view(3, 4, 3);
+        assert_eq!((panel.selected, panel.scroll), (0, 0));
+
+        panel.update_rows((0..5).map(|index| row(&index.to_string())).collect());
+        panel.page_scroll(1, 1, usize::MAX);
+        assert_eq!((panel.selected, panel.scroll), (1, 1));
+        panel.page_scroll(-1, 1, usize::MAX);
+        assert_eq!((panel.selected, panel.scroll), (0, 0));
     }
 
     #[test]

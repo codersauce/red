@@ -9300,14 +9300,18 @@ impl Editor {
             if matches!(
                 ev,
                 Event::Mouse(MouseEvent {
-                    kind: MouseEventKind::Down(MouseButton::Left)
-                        | MouseEventKind::ScrollUp
-                        | MouseEventKind::ScrollDown,
+                    kind: MouseEventKind::Down(MouseButton::Left),
                     ..
                 })
             ) {
                 self.panel_manager.focus_editor();
-            } else {
+            } else if !matches!(
+                ev,
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::ScrollUp | MouseEventKind::ScrollDown,
+                    ..
+                })
+            ) {
                 return Ok(None);
             }
         }
@@ -9522,16 +9526,23 @@ impl Editor {
                         }
                         let action = Self::key_string_for_event(ev)?;
                         let panel_height = usize::from(self.size.1.saturating_sub(2));
+                        let scrolloff = self.config.scrolloff.unwrap_or(0);
                         return self
                             .panel_manager
-                            .handle_focused_key(&action, panel_height, usize::from(self.size.0))
+                            .handle_focused_key(
+                                &action,
+                                panel_height,
+                                usize::from(self.size.0),
+                                scrolloff,
+                            )
                             .and_then(Self::panel_event_key_action);
                     }
                 };
 
                 let panel_height = usize::from(self.size.1.saturating_sub(2));
+                let scrolloff = self.config.scrolloff.unwrap_or(0);
                 self.panel_manager
-                    .handle_focused_key(action, panel_height, usize::from(self.size.0))
+                    .handle_focused_key(action, panel_height, usize::from(self.size.0), scrolloff)
                     .and_then(Self::panel_event_key_action)
             }
             Event::Mouse(event) => self.handle_panel_mouse_event(event),
@@ -9557,24 +9568,23 @@ impl Editor {
                     .focus_panel_at_position(x, y, width, height)
                     .and_then(Self::panel_event_key_action)
             }
-            MouseEventKind::ScrollUp => {
-                let id = self
-                    .panel_manager
-                    .panel_at_position(x, y, width, height)?
-                    .id;
-                self.panel_manager.focus_panel(&id);
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let placement = self.panel_manager.panel_at_position(x, y, width, height)?;
+                let scroll_lines = isize::try_from(self.config.mouse_scroll_lines.unwrap_or(3))
+                    .unwrap_or(isize::MAX);
+                let delta = if event.kind == MouseEventKind::ScrollUp {
+                    -scroll_lines
+                } else {
+                    scroll_lines
+                };
                 self.panel_manager
-                    .handle_focused_key("up", height.saturating_sub(2), width)
-                    .and_then(Self::panel_event_key_action)
-            }
-            MouseEventKind::ScrollDown => {
-                let id = self
-                    .panel_manager
-                    .panel_at_position(x, y, width, height)?
-                    .id;
-                self.panel_manager.focus_panel(&id);
-                self.panel_manager
-                    .handle_focused_key("down", height.saturating_sub(2), width)
+                    .handle_mouse_scroll(
+                        &placement.id,
+                        delta,
+                        placement.height,
+                        width,
+                        self.config.scrolloff.unwrap_or(0),
+                    )
                     .and_then(Self::panel_event_key_action)
             }
             _ => None,

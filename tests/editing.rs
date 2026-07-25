@@ -1733,6 +1733,26 @@ fn tree_rows() -> Vec<PanelRow> {
         .collect()
 }
 
+fn numbered_tree_rows(count: usize) -> Vec<PanelRow> {
+    (0..count)
+        .map(|index| {
+            let id = format!("row-{index:02}.rs");
+            PanelRow {
+                id: id.clone(),
+                path: Some(id.clone()),
+                expanded: Some(false),
+                kind: PanelRowKind::File,
+                segments: vec![PanelSegment {
+                    text: id,
+                    style: None,
+                    semantic: None,
+                }],
+                right_segments: vec![],
+            }
+        })
+        .collect()
+}
+
 fn add_tree_panel(harness: &mut EditorHarness) {
     harness.editor.test_create_panel(
         "tree",
@@ -5065,6 +5085,61 @@ fn focused_row_panel_forwards_file_operation_keys_to_its_plugin() {
 }
 
 #[test]
+fn focused_row_panel_pages_with_control_keys_and_page_keys() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config_and_size(buffer, default_key_config(), 80, 10);
+    add_tree_panel(&mut harness);
+    harness
+        .editor
+        .test_update_panel("tree", numbered_tree_rows(30));
+    assert!(harness.editor.test_focus_panel("tree"));
+
+    for (code, modifiers, expected_top, expected_selected) in [
+        (KeyCode::Char('f'), KeyModifiers::CONTROL, "row-06.rs", 9),
+        (KeyCode::PageDown, KeyModifiers::NONE, "row-12.rs", 15),
+        (KeyCode::Char('b'), KeyModifiers::CONTROL, "row-06.rs", 10),
+        (KeyCode::PageUp, KeyModifiers::NONE, "row-00.rs", 4),
+    ] {
+        let action = harness
+            .editor
+            .test_handle_event(Event::Key(KeyEvent::new(code, modifiers)))
+            .unwrap();
+        assert!(matches!(action, Some(KeyAction::Multiple(_))));
+        assert!(harness.render_row(0).unwrap().starts_with(expected_top));
+        assert_eq!(
+            harness.editor.test_focused_panel_selected_index("tree"),
+            Some(expected_selected)
+        );
+    }
+
+    harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('G'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+    assert!(harness.render_row(0).unwrap().starts_with("row-22.rs"));
+    assert_eq!(
+        harness.editor.test_focused_panel_selected_index("tree"),
+        Some(29)
+    );
+
+    harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+    assert!(harness.render_row(0).unwrap().starts_with("row-00.rs"));
+    assert_eq!(
+        harness.editor.test_focused_panel_selected_index("tree"),
+        Some(0)
+    );
+}
+
+#[test]
 fn focused_agent_panel_keeps_leader_available_until_the_composer_is_focused() {
     let buffer = Buffer::new(None, "abcdef".to_string());
     let mut harness = EditorHarness::with_config(buffer, default_key_config());
@@ -5342,6 +5417,104 @@ async fn mouse_click_in_editor_clears_panel_focus() {
 
     assert_eq!(harness.editor.test_focused_panel_id(), None);
     assert!(harness.render_cursor_position().is_some());
+}
+
+#[test]
+fn mouse_wheel_scrolls_hovered_row_panel_without_taking_focus() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config_and_size(buffer, default_key_config(), 80, 10);
+    add_tree_panel(&mut harness);
+    harness
+        .editor
+        .test_update_panel("tree", numbered_tree_rows(30));
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+
+    let down = Event::Mouse(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 1,
+        row: 2,
+        modifiers: KeyModifiers::NONE,
+    });
+    harness.editor.test_handle_event(down.clone()).unwrap();
+    assert!(harness.render_row(0).unwrap().starts_with("row-03.rs"));
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+    assert_eq!(
+        harness.editor.test_focused_panel_selected_index("tree"),
+        Some(6)
+    );
+
+    harness.editor.test_handle_event(down).unwrap();
+    assert!(harness.render_row(0).unwrap().starts_with("row-06.rs"));
+    assert_eq!(
+        harness.editor.test_focused_panel_selected_index("tree"),
+        Some(9)
+    );
+
+    harness
+        .editor
+        .test_handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 1,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .unwrap();
+    assert!(harness.render_row(0).unwrap().starts_with("row-03.rs"));
+    assert_eq!(
+        harness.editor.test_focused_panel_selected_index("tree"),
+        Some(7)
+    );
+}
+
+#[test]
+fn mouse_wheel_over_editor_preserves_focused_row_panel() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    add_tree_panel(&mut harness);
+    assert!(harness.editor.test_focus_panel("tree"));
+
+    let action = harness
+        .editor
+        .test_handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 30,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .unwrap();
+
+    assert_eq!(action, Some(KeyAction::Single(Action::ScrollDown)));
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("tree"));
+}
+
+#[test]
+fn zero_mouse_scroll_lines_does_not_move_hovered_row_panel() {
+    let mut config = default_key_config();
+    config.mouse_scroll_lines = Some(0);
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 80, 10);
+    add_tree_panel(&mut harness);
+    harness
+        .editor
+        .test_update_panel("tree", numbered_tree_rows(30));
+
+    let action = harness
+        .editor
+        .test_handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 1,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .unwrap();
+
+    assert!(matches!(action, Some(KeyAction::Multiple(_))));
+    assert!(harness.render_row(0).unwrap().starts_with("row-00.rs"));
+    assert_eq!(
+        harness.editor.test_focused_panel_selected_index("tree"),
+        Some(0)
+    );
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
 }
 
 #[test]
