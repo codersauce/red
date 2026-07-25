@@ -136,10 +136,13 @@ capability inventory; the bundled `.hk` sources are working examples.
 The Git plugin keeps its event, picker, and permissioned-process shell in
 `plugins/git.hk`, while its status model, diff and hunk parsing, selection
 logic, and Git argument construction live in the native, multi-file
-`plugins/git_core` Husk package. Red embeds those pure sources and exposes a
-small internal bridge to the compatibility shell, so installed builds do not
-depend on a checkout-relative source path. The bridge is bundled-plugin
-implementation detail, not a public plugin API.
+`plugins/git_core` Husk package. Neo-tree follows the same split: filesystem
+actions, confirmations, and panel events stay in `plugins/neotree.hk`, while
+normalized path handling, typed Git-status presentation, and bounded tree-row
+construction live in `plugins/neotree_core`. Red embeds those pure sources and
+exposes small internal bridges to the compatibility shells, so installed
+builds do not depend on checkout-relative source paths. The bridges are
+bundled-plugin implementation detail, not public plugin APIs.
 
 `buffer:changed`, cursor, mode, viewport, file, theme, window, LSP, timer, picker, composer, panel, process, filesystem, workspace, and agent events are emitted by the production runtime. Subscribe only to the events a plugin needs and debounce expensive work.
 
@@ -150,6 +153,7 @@ Run:
 ```shell
 cargo test --workspace
 cargo run -p husk-cli -- test --locked plugins/git_core
+cargo run -p husk-cli -- test --locked plugins/neotree_core
 cargo clippy --all-targets --all-features -- -D warnings
 cargo run -- --self-check
 cargo run -- --runtime-files

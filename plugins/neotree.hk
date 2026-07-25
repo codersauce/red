@@ -23,7 +23,7 @@ pub fn activate() {
         statuses: [],
         error: red::null(),
     });
-    red::state_set("status_index", Json {});
+    red::state_set("status_entries", []);
     red::state_set("cwd", ".");
     red::state_set("current_file", "");
     red::state_set("selected", []);
@@ -504,61 +504,27 @@ fn reset_tree() {
 }
 
 fn path_name(path: String) -> String {
-    let parts = red::split(normalize_path(path), "/");
-    return parts[red::len(parts) - 1];
+    return red::string(red::neotree_core("path_name", path), "");
 }
 
 fn path_parent(path: String) -> String {
-    let normalized = normalize_path(path);
-    let parts = red::split(normalized, "/");
-    if red::len(parts) <= 2 {
-        return ".";
-    }
-    let parent = ".";
-    let index = 1;
-    while index < red::len(parts) - 1 {
-        parent = parent + "/" + parts[index];
-        index = index + 1;
-    }
-    return parent;
+    return red::string(red::neotree_core("path_parent", path), ".");
 }
 
 fn path_join(parent: String, child: String) -> String {
-    let child = normalize_path(child);
-    if red::starts_with(child, "./") || red::starts_with(child, "/") {
-        return child;
-    }
-    if parent == "." {
-        return "./" + child;
-    }
-    return normalize_path(parent) + "/" + child;
+    return red::string(red::neotree_core("path_join", parent, child), "");
 }
 
 fn workspace_path(path: String) -> String {
-    let path = normalize_path(path);
-    if red::starts_with(path, "./") || red::starts_with(path, "/") {
-        return path;
-    }
-    return "./" + path;
+    return red::string(red::neotree_core("workspace_path", path), "");
 }
 
 fn name_extension(name: String) -> String {
-    let parts = red::split(name, ".");
-    if red::len(parts) <= 1 {
-        return "";
-    }
-    if red::starts_with(name, ".") && red::len(parts) == 2 {
-        return "";
-    }
-    return "." + parts[red::len(parts) - 1];
+    return red::string(red::neotree_core("name_extension", name), "");
 }
 
 fn basename(name: String) -> String {
-    let extension = name_extension(name);
-    if extension == "" {
-        return name;
-    }
-    return red::slice(name, 0, red::len(name) - red::len(extension));
+    return red::string(red::neotree_core("basename", name), "");
 }
 
 fn reload_visible_tree() {
@@ -593,7 +559,7 @@ fn directory_loaded(listing: Json) {
 
 fn git_status_loaded(result: Json) {
     red::state_set("status", result);
-    red::state_set("status_index", result.status_index);
+    red::state_set("status_entries", red::neotree_core("status_entries", result.status_index));
     render();
 }
 
@@ -660,27 +626,11 @@ fn try_reveal_current_file() {
 }
 
 fn tree_path_for_file(file: String, cwd: String) -> String {
-    if file == "" {
-        return "";
-    }
-
-    let normalized_file = normalize_path(file);
-    let normalized_cwd = normalize_path(cwd);
-    if red::starts_with(normalized_file, normalized_cwd + "/") {
-        return "./" + red::slice(normalized_file, red::len(normalized_cwd) + 1);
-    }
-    if red::starts_with(normalized_file, "/") {
-        return "";
-    }
-    if red::starts_with(normalized_file, "./") {
-        return normalized_file;
-    }
-    return "./" + normalized_file;
+    return red::string(red::neotree_core("tree_path", file, cwd), "");
 }
 
 fn start_reveal(tree_path: String) {
-    let relative = strip_dot_slash(tree_path);
-    let parts = red::split(relative, "/");
+    let parts = red::neotree_core("reveal_parts", tree_path);
     if red::len(parts) == 0 {
         return;
     }
@@ -783,15 +733,6 @@ fn children_for(path: String) -> Json {
     return [];
 }
 
-fn children_truncated(path: String) -> bool {
-    for child in red::state("children") {
-        if child.path == path {
-            return red::bool(child.truncated, false);
-        }
-    }
-    return false;
-}
-
 fn toggle_directory(path: String) {
     if is_expanded(path) {
         collapse_directory(path);
@@ -849,125 +790,16 @@ fn loading_rows() -> Json {
 }
 
 fn build_rows() -> Json {
-    let rows = [];
-    let root = ".";
-    let root_status = status_for_path(root);
-    rows = red::push(rows, PanelRow {
-        id: root,
-        path: root,
-        expanded: is_expanded(root),
-        kind: "directory",
-        segments: [
-            segment(" ", [], false),
-            segment(" ", ["symbolIcon.folderForeground", "sideBarTitle.foreground", "list.highlightForeground"], false),
-            segment(root_label(), ["sideBarTitle.foreground", "symbolIcon.folderForeground", "list.highlightForeground"], true),
-        ],
-        right_segments: status_segments(root_status),
-    });
-
-    if is_expanded(root) {
-        rows = append_rows(root, [], rows);
-    }
-    if red::len(rows) >= 200 {
-        rows = red::push(rows, truncation_row("tree-limit", "… tree limited to 200 rows"));
-    }
-    return rows;
-}
-
-fn append_rows(path: String, ancestors: Json, rows: Json) -> Json {
-    let entries = [];
-    for entry in children_for(path) {
-        if entry.kind == "directory" || entry.kind == "file" {
-            entries = red::push(entries, entry);
-        }
-    }
-    let index = 0;
-    while index < red::len(entries) && red::len(rows) < 200 {
-        let entry = entries[index];
-        let is_last = index == red::len(entries) - 1;
-        let is_directory = entry.kind == "directory";
-        let expanded = is_directory && is_expanded(entry.path);
-        let status = status_for_path(entry.path);
-        let segments = [
-            segment(selection_marker(entry.path), ["list.highlightForeground"], true),
-        ];
-        for prefix in branch_prefix(ancestors, is_last) {
-            segments = red::push(segments, prefix);
-        }
-        segments = red::push(segments, segment(entry_icon(entry.name, is_directory, expanded) + " ", entry_style_keys(status, is_directory), false));
-        segments = red::push(segments, segment(entry.name, entry_style_keys(status, is_directory), false));
-        rows = red::push(rows, PanelRow {
-            id: entry.path,
-            path: entry.path,
-            expanded: expanded,
-            kind: entry.kind,
-            segments: segments,
-            right_segments: status_segments(status),
-        });
-
-        if expanded {
-            let next_ancestors = red::push(ancestors, Ancestor {
-                last: is_last,
-                visible: red::len(ancestors) > 0,
-            });
-            rows = append_rows(entry.path, next_ancestors, rows);
-        }
-        index = index + 1;
-    }
-    if children_truncated(path) && red::len(rows) < 200 {
-        rows = red::push(rows, truncation_row("directory-limit:" + path, "… directory listing truncated"));
-    }
-    return rows;
-}
-
-fn selection_marker(path: String) -> String {
-    if red::contains(red::state("selected"), path) {
-        return "✓ ";
-    }
-    for entry in red::state("clipboard") {
-        if entry.path == path {
-            if entry.action == "move" {
-                return "✂ ";
-            }
-            return "⧉ ";
-        }
-    }
-    return "  ";
-}
-
-fn truncation_row(id: String, text: String) -> Json {
-    return PanelRow {
-        id: id,
-        path: red::null(),
-        expanded: false,
-        kind: "file",
-        segments: [
-            segment("  ", ["tree.indentGuidesStroke"], false),
-            segment(text, ["gitDecoration.ignoredResourceForeground"], false),
-        ],
-        right_segments: [],
-    };
-}
-
-fn branch_prefix(ancestors: Json, is_last: bool) -> Json {
-    let segments = [];
-    for ancestor in ancestors {
-        if ancestor.visible && !ancestor.last {
-            segments = red::push(segments, segment("│ ", ["tree.indentGuidesStroke"], false));
-        } else {
-            segments = red::push(segments, segment("  ", ["tree.indentGuidesStroke"], false));
-        }
-    }
-    if red::len(ancestors) > 0 {
-        if is_last {
-            segments = red::push(segments, segment("└ ", ["tree.indentGuidesStroke"], false));
-        } else {
-            segments = red::push(segments, segment("├ ", ["tree.indentGuidesStroke"], false));
-        }
-    } else {
-        segments = red::push(segments, segment("  ", ["tree.indentGuidesStroke"], false));
-    }
-    return segments;
+    return red::neotree_core(
+        "build_rows",
+        red::string(red::state("cwd"), "."),
+        red::state("children"),
+        red::state("expanded"),
+        red::state("selected"),
+        red::state("clipboard"),
+        red::string(red::state("status").root, ""),
+        red::state("status_entries")
+    );
 }
 
 fn segment(text: String, foreground: Json, bold: bool) -> Json {
@@ -980,159 +812,6 @@ fn segment(text: String, foreground: Json, bold: bool) -> Json {
     };
 }
 
-fn entry_style_keys(status: String, directory: bool) -> Json {
-    if status == "ignored" {
-        return ["gitDecoration.ignoredResourceForeground"];
-    }
-    if directory {
-        return ["symbolIcon.folderForeground", "sideBarTitle.foreground", "list.highlightForeground"];
-    }
-    return ["sideBar.foreground"];
-}
-
-fn entry_icon(name: String, directory: bool, expanded: bool) -> String {
-    if directory {
-        if expanded {
-            return "";
-        }
-        return "";
-    }
-
-    let parts = red::split(red::lower(name), ".");
-    let extension = parts[red::len(parts) - 1];
-    if extension == "js" || extension == "mjs" || extension == "cjs" {
-        return "";
-    }
-    if extension == "ts" {
-        return "";
-    }
-    if extension == "tsx" || extension == "jsx" {
-        return "";
-    }
-    if extension == "json" {
-        return "";
-    }
-    if extension == "toml" {
-        return "";
-    }
-    if extension == "rs" {
-        return "";
-    }
-    if extension == "lua" {
-        return "";
-    }
-    if extension == "md" || extension == "markdown" {
-        return "";
-    }
-    if extension == "lock" {
-        return "";
-    }
-    if extension == "sh" || extension == "zsh" || extension == "fish" {
-        return "";
-    }
-    return "󰈙";
-}
-
-fn status_segments(status: String) -> Json {
-    if status == "" {
-        return [];
-    }
-    return [segment(status_symbol(status), status_style_keys(status), status == "conflict")];
-}
-
-fn status_symbol(status: String) -> String {
-    if status == "added" {
-        return "✚";
-    }
-    if status == "deleted" {
-        return "✖";
-    }
-    if status == "modified" {
-        return "";
-    }
-    if status == "renamed" {
-        return "";
-    }
-    if status == "untracked" {
-        return "";
-    }
-    if status == "ignored" {
-        return "";
-    }
-    if status == "staged" {
-        return "";
-    }
-    if status == "conflict" {
-        return "";
-    }
-    return "";
-}
-
-fn status_style_keys(status: String) -> Json {
-    if status == "added" {
-        return ["gitDecoration.addedResourceForeground", "gitDecoration.untrackedResourceForeground"];
-    }
-    if status == "deleted" {
-        return ["gitDecoration.deletedResourceForeground", "gitDecoration.stageDeletedResourceForeground"];
-    }
-    if status == "modified" {
-        return ["gitDecoration.modifiedResourceForeground", "gitDecoration.stageModifiedResourceForeground"];
-    }
-    if status == "renamed" {
-        return ["gitDecoration.renamedResourceForeground", "gitDecoration.modifiedResourceForeground"];
-    }
-    if status == "untracked" {
-        return ["gitDecoration.untrackedResourceForeground", "gitDecoration.addedResourceForeground"];
-    }
-    if status == "ignored" {
-        return ["gitDecoration.ignoredResourceForeground"];
-    }
-    if status == "staged" {
-        return ["gitDecoration.stageModifiedResourceForeground", "gitDecoration.addedResourceForeground"];
-    }
-    return ["gitDecoration.conflictingResourceForeground"];
-}
-
-fn status_for_path(path: String) -> String {
-    let result = red::state("status");
-    let root = normalize_path(red::string(result.root, ""));
-    if root == "" {
-        return "";
-    }
-
-    let relative = strip_dot_slash(normalize_path(path));
-    let absolute = root;
-    if relative != "." && relative != "" {
-        if root == "/" {
-            absolute = root + relative;
-        } else {
-            absolute = root + "/" + relative;
-        }
-    }
-
-    return red::string(red::state("status_index")[absolute], "");
-}
-
-fn root_label() -> String {
-    let cwd = normalize_path(red::string(red::state("cwd"), "."));
-    if cwd == "." {
-        return ".";
-    }
-    let parts = red::split(cwd, "/");
-    return parts[red::len(parts) - 1];
-}
-
-fn strip_dot_slash(path: String) -> String {
-    if red::starts_with(path, "./") {
-        return red::slice(path, 2);
-    }
-    return path;
-}
-
 fn normalize_path(path: String) -> String {
-    let normalized = red::replace_all(path, "\\", "/");
-    while red::len(normalized) > 1 && red::ends_with(normalized, "/") {
-        normalized = red::slice(normalized, 0, red::len(normalized) - 1);
-    }
-    return normalized;
+    return red::string(red::neotree_core("normalize_path", path), "");
 }

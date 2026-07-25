@@ -60,6 +60,7 @@ lazy_static::lazy_static! {
 const PLUGIN_INSTRUCTION_BUDGET: usize = 100_000;
 static NEXT_PLUGIN_VM_GENERATION: AtomicU64 = AtomicU64::new(1);
 static GIT_CORE_PROGRAM: OnceLock<Result<CompiledProgram, String>> = OnceLock::new();
+static NEOTREE_CORE_PROGRAM: OnceLock<Result<CompiledProgram, String>> = OnceLock::new();
 
 /// User-facing metadata attached to a registered Red plugin command.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +194,7 @@ extern "red" {
         fn null() -> JsValue;
         fn parse_json() -> JsValue;
         fn git_core() -> JsValue;
+        fn neotree_core() -> JsValue;
     }
 }
 "#;
@@ -230,6 +232,7 @@ struct RedHost {
     staged_replacement_start: Option<usize>,
     staged_teardown_start: Option<usize>,
     git_core: Option<husk_runtime::Vm>,
+    neotree_core: Option<husk_runtime::Vm>,
 }
 
 #[derive(Debug, Clone)]
@@ -415,6 +418,7 @@ impl RedHost {
             staged_replacement_start: None,
             staged_teardown_start: None,
             git_core: None,
+            neotree_core: None,
         }
     }
 
@@ -1912,6 +1916,10 @@ impl RedHost {
                 let operation = red_required_string(args, 0, path)?;
                 self.call_git_core(operation, &args[1..])
             }
+            "red::neotree_core" => {
+                let operation = red_required_string(args, 0, path)?;
+                self.call_neotree_core(operation, &args[1..])
+            }
             _ => anyhow::bail!("unknown Red host function `{path}`"),
         })())
     }
@@ -1939,7 +1947,7 @@ impl RedHost {
         if self.git_core.is_none() {
             let program = git_core_program()?;
             let mut vm = new_plugin_vm();
-            let mut host = GitCoreHost;
+            let mut host = NativeCoreHost;
             vm.load_compiled_plugin("red-git-core", program, &mut host)?;
             self.git_core = Some(vm);
         }
@@ -1947,15 +1955,50 @@ impl RedHost {
             .git_core
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Git core VM did not initialize"))?;
-        let mut host = GitCoreHost;
+        let mut host = NativeCoreHost;
         let result = vm.call_export("red-git-core", function, args.to_vec(), &mut host)?;
-        Ok(normalize_git_core_value(result))
+        Ok(normalize_native_core_value(result))
+    }
+
+    fn call_neotree_core(&mut self, operation: &str, args: &[Value]) -> anyhow::Result<Value> {
+        if operation == "status_entries" {
+            return neotree_status_entries(args.first());
+        }
+
+        let function = match operation {
+            "normalize_path" => "path::normalize",
+            "path_name" => "path::name",
+            "path_parent" => "path::parent",
+            "path_join" => "path::join",
+            "workspace_path" => "path::workspace",
+            "name_extension" => "path::extension",
+            "basename" => "path::basename",
+            "tree_path" => "path::tree_path",
+            "reveal_parts" => "path::reveal_parts",
+            "build_rows" => "tree::build_rows",
+            _ => anyhow::bail!("unknown Neo-tree core operation `{operation}`"),
+        };
+
+        if self.neotree_core.is_none() {
+            let program = neotree_core_program()?;
+            let mut vm = new_plugin_vm();
+            let mut host = NativeCoreHost;
+            vm.load_compiled_plugin("red-neotree-core", program, &mut host)?;
+            self.neotree_core = Some(vm);
+        }
+        let vm = self
+            .neotree_core
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Neo-tree core VM did not initialize"))?;
+        let mut host = NativeCoreHost;
+        let result = vm.call_export("red-neotree-core", function, args.to_vec(), &mut host)?;
+        Ok(normalize_native_core_value(result))
     }
 }
 
-struct GitCoreHost;
+struct NativeCoreHost;
 
-impl Host for GitCoreHost {
+impl Host for NativeCoreHost {
     fn log(&mut self, _message: &str) {}
 }
 
@@ -1994,7 +2037,70 @@ fn git_core_program() -> anyhow::Result<CompiledProgram> {
         .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
-fn normalize_git_core_value(value: Value) -> Value {
+fn neotree_core_program() -> anyhow::Result<CompiledProgram> {
+    let compiled = NEOTREE_CORE_PROGRAM.get_or_init(|| {
+        let package = ResolvedPackage::from_sources(
+            "plugins/neotree_core",
+            include_str!("../../plugins/neotree_core/Husk.toml"),
+            &[
+                (
+                    "src/main.hk",
+                    include_str!("../../plugins/neotree_core/src/main.hk"),
+                ),
+                (
+                    "src/path.hk",
+                    include_str!("../../plugins/neotree_core/src/path.hk"),
+                ),
+                (
+                    "src/status.hk",
+                    include_str!("../../plugins/neotree_core/src/status.hk"),
+                ),
+                (
+                    "src/tree.hk",
+                    include_str!("../../plugins/neotree_core/src/tree.hk"),
+                ),
+            ],
+            PackageLimits::default(),
+        )
+        .map_err(|error| format!("failed to resolve embedded Neo-tree core: {error}"))?;
+        CompiledProgram::compile_package(&package, &CompileOptions::default())
+            .map_err(|error| format!("failed to compile embedded Neo-tree core: {error}"))
+    });
+    compiled
+        .as_ref()
+        .cloned()
+        .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+fn neotree_status_entries(value: Option<&Value>) -> anyhow::Result<Value> {
+    let mut statuses = match value {
+        Some(Value::Object(entries)) => entries
+            .iter()
+            .filter_map(|(path, status)| status.as_str().map(|status| (path.clone(), status)))
+            .collect::<Vec<_>>(),
+        Some(Value::Json(serde_json::Value::Object(entries))) => entries
+            .iter()
+            .filter_map(|(path, status)| status.as_str().map(|status| (path.clone(), status)))
+            .collect::<Vec<_>>(),
+        Some(Value::Unit | Value::Null | Value::Missing(_)) | None => Vec::new(),
+        Some(_) => anyhow::bail!("Neo-tree status index must be an object"),
+    };
+    statuses.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    Ok(Value::Array(Arc::new(
+        statuses
+            .into_iter()
+            .map(|(path, status)| Value::Struct {
+                type_name: "PathStatus".to_string(),
+                fields: Arc::new(BTreeMap::from([
+                    ("path".to_string(), Value::String(path)),
+                    ("status".to_string(), Value::String(status.to_string())),
+                ])),
+            })
+            .collect(),
+    )))
+}
+
+fn normalize_native_core_value(value: Value) -> Value {
     match value {
         Value::Variant {
             type_name,
@@ -2002,33 +2108,33 @@ fn normalize_git_core_value(value: Value) -> Value {
             fields,
         } if type_name == "Option" => match (case.as_str(), fields.as_slice()) {
             ("None", []) => Value::Null,
-            ("Some", [value]) => normalize_git_core_value(value.clone()),
+            ("Some", [value]) => normalize_native_core_value(value.clone()),
             _ => Value::Null,
         },
         Value::Array(values) => Value::Array(Arc::new(
             values
                 .iter()
                 .cloned()
-                .map(normalize_git_core_value)
+                .map(normalize_native_core_value)
                 .collect(),
         )),
         Value::Tuple(values) => Value::Tuple(Arc::new(
             values
                 .iter()
                 .cloned()
-                .map(normalize_git_core_value)
+                .map(normalize_native_core_value)
                 .collect(),
         )),
         Value::Object(fields) => Value::Object(Arc::new(
             fields
                 .iter()
-                .map(|(name, value)| (name.clone(), normalize_git_core_value(value.clone())))
+                .map(|(name, value)| (name.clone(), normalize_native_core_value(value.clone())))
                 .collect(),
         )),
         Value::Struct { fields, .. } => Value::Object(Arc::new(
             fields
                 .iter()
-                .map(|(name, value)| (name.clone(), normalize_git_core_value(value.clone())))
+                .map(|(name, value)| (name.clone(), normalize_native_core_value(value.clone())))
                 .collect(),
         )),
         Value::Variant {
@@ -2042,7 +2148,7 @@ fn normalize_git_core_value(value: Value) -> Value {
                 fields
                     .iter()
                     .cloned()
-                    .map(normalize_git_core_value)
+                    .map(normalize_native_core_value)
                     .collect(),
             ),
         },
@@ -3455,6 +3561,82 @@ mod tests {
         let error = host.call_git_core("not_an_operation", &[]).unwrap_err();
         assert!(
             error.to_string().contains("unknown Git core operation"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn embedded_neotree_core_compiles_as_a_native_multi_file_package_and_renders_typed_rows() {
+        let program = neotree_core_program().unwrap();
+        assert_eq!(program.semantic_profile(), SemanticProfile::Native);
+        assert_eq!(program.source_map().sources().len(), 4);
+        assert_eq!(program.module_semantic_results().len(), 4);
+
+        let mut host = RedHost::new(HashMap::new());
+        let statuses = host
+            .call_neotree_core(
+                "status_entries",
+                &[Value::from_json(serde_json::json!({
+                    "/repo/src": "conflict",
+                    "/repo": "modified",
+                    "/repo/main.rs": "modified",
+                    "/repo/invalid": 42
+                }))],
+            )
+            .unwrap();
+        assert_eq!(
+            statuses.to_json(),
+            serde_json::json!([
+                { "path": "/repo", "status": "modified" },
+                { "path": "/repo/main.rs", "status": "modified" },
+                { "path": "/repo/src", "status": "conflict" }
+            ])
+        );
+
+        let rows = host
+            .call_neotree_core(
+                "build_rows",
+                &[
+                    Value::String("/repo".to_string()),
+                    Value::from_json(serde_json::json!([{
+                        "path": ".",
+                        "entries": [
+                            { "name": "src", "path": "./src", "kind": "directory" },
+                            { "name": "main.rs", "path": "./main.rs", "kind": "file" }
+                        ],
+                        "truncated": true
+                    }])),
+                    Value::from_json(serde_json::json!(["."])),
+                    Value::from_json(serde_json::json!(["./main.rs"])),
+                    Value::from_json(serde_json::json!([{
+                        "path": "./src",
+                        "action": "move"
+                    }])),
+                    Value::String("/repo".to_string()),
+                    statuses,
+                ],
+            )
+            .unwrap()
+            .to_json();
+        assert_eq!(rows[0]["right_segments"][0]["text"], "");
+        assert_eq!(rows[1]["segments"][0]["text"], "✂ ");
+        assert_eq!(rows[1]["right_segments"][0]["text"], "");
+        assert_eq!(rows[2]["segments"][0]["text"], "✓ ");
+        assert_eq!(rows[2]["segments"][2]["text"], " ");
+        assert!(rows[3]["path"].is_null());
+
+        let error = host
+            .call_neotree_core("status_entries", &[Value::String("invalid".to_string())])
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("status index must be an object"),
+            "{error}"
+        );
+        let error = host.call_neotree_core("not_an_operation", &[]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown Neo-tree core operation"),
             "{error}"
         );
     }
