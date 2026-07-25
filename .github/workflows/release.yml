@@ -54,6 +54,8 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build release binary
+        env:
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/red
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Prepare release archive (Unix)
