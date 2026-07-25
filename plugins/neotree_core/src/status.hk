@@ -41,37 +41,39 @@ pub fn symbol(value: String) -> String {
 
 pub fn style_keys(value: String) -> [String] {
     match status(value) {
-        GitStatus::Added => ["gitDecoration.addedResourceForeground", "gitDecoration.untrackedResourceForeground"],
-        GitStatus::Deleted => ["gitDecoration.deletedResourceForeground", "gitDecoration.stageDeletedResourceForeground"],
-        GitStatus::Modified => ["gitDecoration.modifiedResourceForeground", "gitDecoration.stageModifiedResourceForeground"],
-        GitStatus::Renamed => ["gitDecoration.renamedResourceForeground", "gitDecoration.modifiedResourceForeground"],
-        GitStatus::Untracked => ["gitDecoration.untrackedResourceForeground", "gitDecoration.addedResourceForeground"],
-        GitStatus::Ignored => ["gitDecoration.ignoredResourceForeground"],
-        GitStatus::Staged => ["gitDecoration.stageModifiedResourceForeground", "gitDecoration.addedResourceForeground"],
-        GitStatus::Conflict => ["gitDecoration.conflictingResourceForeground"],
+        GitStatus::Added => ["gitDecoration.addedResourceForeground", "gitDecoration.untrackedResourceForeground", "editorGutter.addedBackground", "scope:string"],
+        GitStatus::Deleted => ["gitDecoration.deletedResourceForeground", "gitDecoration.stageDeletedResourceForeground", "editorGutter.deletedBackground", "editorError.foreground", "scope:markup.deleted", "scope:invalid.illegal", "scope:keyword"],
+        GitStatus::Modified => ["gitDecoration.modifiedResourceForeground", "gitDecoration.stageModifiedResourceForeground", "editorGutter.modifiedBackground", "scope:constant.numeric"],
+        GitStatus::Renamed => ["gitDecoration.renamedResourceForeground", "gitDecoration.modifiedResourceForeground", "editorGutter.modifiedBackground", "scope:constant.numeric"],
+        GitStatus::Untracked => ["gitDecoration.untrackedResourceForeground", "gitDecoration.addedResourceForeground", "editorGutter.addedBackground", "scope:string"],
+        GitStatus::Ignored => ["gitDecoration.ignoredResourceForeground", "editorLineNumber.foreground", "scope:comment"],
+        GitStatus::Staged => ["gitDecoration.stageModifiedResourceForeground", "gitDecoration.addedResourceForeground", "gitDecoration.untrackedResourceForeground", "editorGutter.addedBackground", "scope:string"],
+        GitStatus::Conflict => ["gitDecoration.conflictingResourceForeground", "editorError.foreground", "scope:invalid.illegal", "scope:markup.deleted", "scope:keyword"],
         GitStatus::Unknown => [],
     }
 }
 
 pub fn entry_icon_style_keys(value: String, directory: bool) -> [String] {
     if value == "ignored" {
-        return ["gitDecoration.ignoredResourceForeground"];
+        return style_keys(value);
     }
     if directory {
-        return ["symbolIcon.folderForeground", "sideBarTitle.foreground", "list.highlightForeground"];
+        return ["symbolIcon.folderForeground", "sideBarTitle.foreground", "list.highlightForeground", "scope:entity.name.type", "editor.foreground"];
     }
-    ["sideBar.foreground"]
+    ["symbolIcon.fileForeground", "sideBar.foreground", "editor.foreground"]
 }
 
 pub fn entry_name_style_keys(value: String, directory: bool) -> [String] {
-    let git_style = style_keys(value);
-    if !git_style.is_empty() {
-        return git_style;
+    if !value.is_empty() {
+        let git_style = style_keys(value);
+        if !git_style.is_empty() {
+            return git_style;
+        }
     }
     if directory {
-        return ["symbolIcon.folderForeground", "sideBarTitle.foreground", "list.highlightForeground"];
+        return ["symbolIcon.folderForeground", "sideBarTitle.foreground", "list.highlightForeground", "scope:entity.name.type", "editor.foreground"];
     }
-    ["sideBar.foreground"]
+    ["sideBar.foreground", "editor.foreground"]
 }
 
 pub fn is_conflict(value: String) -> bool {
@@ -87,6 +89,10 @@ fn maps_git_statuses_to_semantic_decorations() {
     assert(symbol("conflict") == "");
     assert(symbol("unknown").is_empty());
     assert(style_keys("renamed")[0] == "gitDecoration.renamedResourceForeground");
+    assert(style_keys("modified")[2] == "editorGutter.modifiedBackground");
+    assert(style_keys("ignored")[2] == "scope:comment");
+    assert(style_keys("deleted")[4] == "scope:markup.deleted");
+    assert(style_keys("conflict")[4] == "scope:keyword");
     assert(style_keys("unknown").is_empty());
     assert(entry_icon_style_keys("ignored", true)[0] == "gitDecoration.ignoredResourceForeground");
     assert(entry_icon_style_keys("modified", true)[0] == "symbolIcon.folderForeground");

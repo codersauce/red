@@ -89,8 +89,8 @@ pub fn build_rows(
         kind: "directory",
         segments: [
             segment(" ", [], false),
-            segment(" ", ["symbolIcon.folderForeground", "sideBarTitle.foreground", "list.highlightForeground"], false),
-            segment(path::name(cwd), ["sideBarTitle.foreground", "symbolIcon.folderForeground", "list.highlightForeground"], true),
+            segment(" ", ["symbolIcon.folderForeground", "sideBarTitle.foreground", "list.highlightForeground", "scope:entity.name.type", "editor.foreground"], false),
+            segment(path::name(cwd), ["sideBarTitle.foreground", "symbolIcon.folderForeground", "list.highlightForeground", "scope:entity.name.type", "editor.foreground"], true),
         ],
         right_segments: visible_status_segments(root_status, true, expanded.contains(root)),
     }];
@@ -137,7 +137,7 @@ fn append_rows(
         for prefix in branch_prefix(ancestors, last) {
             segments.push(prefix);
         }
-        let icon_style = status::entry_icon_style_keys(status, directory);
+        let icon_style = entry_icon_style_keys(entry.name, status, directory);
         let name_style = status::entry_name_style_keys(status, directory);
         segments.push(segment(entry_icon(entry.name, directory, open) + " ", icon_style, false));
         segments.push(segment(entry.name, name_style, false));
@@ -234,19 +234,53 @@ fn branch_prefix(ancestors: [Ancestor], last: bool) -> [PanelSegment] {
     let mut segments = [];
     for ancestor in ancestors {
         if ancestor.visible && !ancestor.last {
-            segments.push(segment("│ ", ["tree.indentGuidesStroke"], false));
+            segments.push(segment("│ ", indent_style_keys(), false));
         } else {
-            segments.push(segment("  ", ["tree.indentGuidesStroke"], false));
+            segments.push(segment("  ", indent_style_keys(), false));
         }
     }
     if ancestors.is_empty() {
-        segments.push(segment("  ", ["tree.indentGuidesStroke"], false));
+        segments.push(segment("  ", indent_style_keys(), false));
     } else if last {
-        segments.push(segment("└ ", ["tree.indentGuidesStroke"], false));
+        segments.push(segment("└ ", indent_style_keys(), false));
     } else {
-        segments.push(segment("├ ", ["tree.indentGuidesStroke"], false));
+        segments.push(segment("├ ", indent_style_keys(), false));
     }
     segments
+}
+
+fn indent_style_keys() -> [String] {
+    ["tree.indentGuidesStroke", "editorIndentGuide.background", "editorLineNumber.foreground", "scope:comment"]
+}
+
+fn entry_icon_style_keys(name: String, status: String, directory: bool) -> [String] {
+    if directory || status == "ignored" {
+        return status::entry_icon_style_keys(status, directory);
+    }
+    let name = name.to_lowercase();
+    let extension = name.rsplit_once(".").unwrap_or(("", name)).1;
+    if extension == "rs" || extension == "toml" {
+        return ["terminal.ansiBrightYellow", "terminal.ansiYellow", "scope:constant.numeric", "sideBar.foreground", "editor.foreground"];
+    }
+    if extension == "js" || extension == "mjs" || extension == "cjs" || extension == "json" {
+        return ["terminal.ansiYellow", "terminal.ansiBrightYellow", "scope:constant.numeric", "sideBar.foreground", "editor.foreground"];
+    }
+    if extension == "ts" || extension == "lua" {
+        return ["terminal.ansiBlue", "terminal.ansiCyan", "scope:entity.name.function", "sideBar.foreground", "editor.foreground"];
+    }
+    if extension == "tsx" || extension == "jsx" {
+        return ["terminal.ansiCyan", "terminal.ansiBlue", "scope:entity.name.tag", "scope:entity.name.function", "sideBar.foreground", "editor.foreground"];
+    }
+    if extension == "sh" || extension == "zsh" || extension == "fish" {
+        return ["terminal.ansiGreen", "scope:string", "sideBar.foreground", "editor.foreground"];
+    }
+    if extension == "md" || extension == "markdown" {
+        return ["scope:markup.heading", "terminal.ansiBlue", "scope:entity.name.function", "sideBar.foreground", "editor.foreground"];
+    }
+    if extension == "lock" {
+        return ["descriptionForeground", "editorLineNumber.foreground", "scope:comment", "sideBar.foreground", "editor.foreground"];
+    }
+    ["symbolIcon.fileForeground", "sideBar.foreground", "editor.foreground"]
 }
 
 fn entry_icon(name: String, directory: bool, expanded: bool) -> String {
@@ -293,8 +327,8 @@ fn truncation_row(id: String, text: String) -> PanelRow {
         expanded: false,
         kind: "file",
         segments: [
-            segment("  ", ["tree.indentGuidesStroke"], false),
-            segment(text, ["gitDecoration.ignoredResourceForeground"], false),
+            segment("  ", indent_style_keys(), false),
+            segment(text, status::style_keys("ignored"), false),
         ],
         right_segments: [],
     }
@@ -339,6 +373,12 @@ fn renders_typed_rows_with_status_and_selection_markers() {
     assert(rows[1].segments[3].semantic.foreground[0] == "gitDecoration.conflictingResourceForeground");
     assert(rows[2].segments[0].text == "✓ ");
     assert(rows[2].segments[2].text == " ");
+    assert(rows[2].segments[2].semantic.foreground[0] == "terminal.ansiBrightYellow");
+    assert(entry_icon_style_keys("main.ts", "modified", false)[0] == "terminal.ansiBlue");
+    assert(entry_icon_style_keys("README.md", "modified", false)[0] == "scope:markup.heading");
+    assert(entry_icon_style_keys("Cargo.lock", "modified", false)[0] == "descriptionForeground");
+    assert(entry_icon_style_keys("ignored.rs", "ignored", false)[0] == "gitDecoration.ignoredResourceForeground");
+    assert(indent_style_keys()[1] == "editorIndentGuide.background");
 }
 
 #[test]

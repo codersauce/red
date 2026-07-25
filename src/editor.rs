@@ -27173,6 +27173,8 @@ while True:
                 width: 10,
                 title: None,
                 composer: None,
+                surface: None,
+                border: None,
                 header_actions: Vec::new(),
             },
         );
@@ -27216,6 +27218,8 @@ while True:
                 width: 10,
                 title: None,
                 composer: None,
+                surface: None,
+                border: None,
                 header_actions: Vec::new(),
             },
         );

@@ -50,6 +50,14 @@ fn show() {
     red::execute("CreatePanel", "neotree", PanelConfig {
         side: "left",
         width: 30,
+        surface: ThemeStyleSpec {
+            foreground: ["sideBar.foreground", "editor.foreground"],
+            background: ["sideBar.background", "editor.background"],
+        },
+        border: ThemeStyleSpec {
+            foreground: ["sideBar.border", "panel.border", "editorLineNumber.foreground"],
+            background: ["editor.background"],
+        },
     });
     red::execute("UpdatePanel", "neotree", loading_rows());
     red::execute("FocusPanel", "neotree");

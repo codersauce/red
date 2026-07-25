@@ -48,6 +48,10 @@ pub struct PanelConfig {
     pub composer: Option<TextPanelComposerConfig>,
     #[serde(default)]
     pub header_actions: Vec<TextPanelHeaderAction>,
+    #[serde(default)]
+    pub surface: Option<ThemeStyleSpec>,
+    #[serde(default)]
+    pub border: Option<ThemeStyleSpec>,
 }
 
 impl Default for PanelConfig {
@@ -57,6 +61,8 @@ impl Default for PanelConfig {
             width: 30,
             title: None,
             composer: None,
+            surface: None,
+            border: None,
             header_actions: Vec::new(),
         }
     }
@@ -1405,8 +1411,10 @@ impl PanelManager {
             };
 
             if let Some(separator_x) = separator_x.filter(|x| *x < buffer.width) {
+                let border_style = panel_style(theme, config.border.as_ref());
+                let separator = if config.border.is_some() { "│" } else { " " };
                 for y in 0..buffer.height.saturating_sub(2) {
-                    buffer.set_text(separator_x, y, " ", &theme.style);
+                    buffer.set_text(separator_x, y, separator, &border_style);
                 }
             }
 
@@ -1447,20 +1455,20 @@ fn render_panel(
     }
 
     let height = buffer.height.saturating_sub(2);
-    let editor_style = &theme.style;
+    let surface_style = panel_style(theme, panel.config.surface.as_ref());
     let selection_style = theme.list_selection_style();
     let selected_style = theme.selected_style(
-        editor_style,
+        &surface_style,
         &selection_style,
         SelectionForegroundPriority::Selection,
     );
     let title_style = Style {
         bold: true,
-        ..editor_style.clone()
+        ..surface_style.clone()
     };
 
     for y in 0..height {
-        buffer.set_text(position.x, y, &" ".repeat(width), editor_style);
+        buffer.set_text(position.x, y, &" ".repeat(width), &surface_style);
     }
 
     if let Some(title) = &panel.config.title {
@@ -1488,7 +1496,15 @@ fn render_panel(
             buffer.set_text(position.x, y, &" ".repeat(width), &selected_style);
         }
 
-        render_row_segments(buffer, position.x, y, width, row, theme, selected);
+        render_row_segments(
+            buffer,
+            Point::new(position.x, y),
+            width,
+            row,
+            theme,
+            &surface_style,
+            selected,
+        );
     }
 }
 
@@ -1862,11 +1878,11 @@ fn user_accented(line: RenderedTextLine) -> RenderedTextLine {
 
 fn render_row_segments(
     buffer: &mut RenderBuffer,
-    x: usize,
-    y: usize,
+    position: Point,
     width: usize,
     row: &PanelRow,
     theme: &Theme,
+    surface_style: &Style,
     selected: bool,
 ) {
     let requested_right_width = segments_width(&row.right_segments);
@@ -1878,17 +1894,25 @@ fn render_row_segments(
         .saturating_sub(right_width)
         .saturating_sub(gap);
 
-    render_segments(buffer, x, y, left_width, &row.segments, theme, selected);
+    render_segments(
+        buffer,
+        position,
+        left_width,
+        &row.segments,
+        theme,
+        surface_style,
+        selected,
+    );
 
     if right_width > 0 {
-        let right_x = x + content_width.saturating_sub(right_width);
+        let right_x = position.x + content_width.saturating_sub(right_width);
         render_segments(
             buffer,
-            right_x,
-            y,
+            Point::new(right_x, position.y),
             right_width,
             &row.right_segments,
             theme,
+            surface_style,
             selected,
         );
     }
@@ -1896,11 +1920,11 @@ fn render_row_segments(
 
 fn render_segments(
     buffer: &mut RenderBuffer,
-    x: usize,
-    y: usize,
+    position: Point,
     max_width: usize,
     segments: &[PanelSegment],
     theme: &Theme,
+    surface_style: &Style,
     selected: bool,
 ) {
     let mut used = 0;
@@ -1916,14 +1940,19 @@ fn render_segments(
             continue;
         }
 
-        let style = segment_style(segment, theme, selected);
-        buffer.set_text(x + used, y, &text, &style);
+        let style = segment_style(segment, theme, surface_style, selected);
+        buffer.set_text(position.x + used, position.y, &text, &style);
         used += display_width(&text);
     }
 }
 
-fn segment_style(segment: &PanelSegment, theme: &Theme, selected: bool) -> Style {
-    let mut style = theme.style.clone();
+fn segment_style(
+    segment: &PanelSegment,
+    theme: &Theme,
+    surface_style: &Style,
+    selected: bool,
+) -> Style {
+    let mut style = surface_style.clone();
     if let Some(semantic) = &segment.semantic {
         let resolved = theme.resolve_style(semantic);
         style.fg = resolved.fg.or(style.fg);
@@ -1944,6 +1973,18 @@ fn segment_style(segment: &PanelSegment, theme: &Theme, selected: bool) -> Style
             &selection_style,
             SelectionForegroundPriority::Content,
         );
+    }
+    style
+}
+
+fn panel_style(theme: &Theme, semantic: Option<&ThemeStyleSpec>) -> Style {
+    let mut style = theme.style.clone();
+    if let Some(semantic) = semantic {
+        let resolved = theme.resolve_style(semantic);
+        style.fg = resolved.fg.or(style.fg);
+        style.bg = resolved.bg.or(style.bg);
+        style.bold |= resolved.bold;
+        style.italic |= resolved.italic;
     }
     style
 }
@@ -1994,6 +2035,8 @@ mod tests {
                 width: 24,
                 title: None,
                 composer: None,
+                surface: None,
+                border: None,
                 header_actions: Vec::new(),
             },
         );
@@ -2011,6 +2054,8 @@ mod tests {
                 width: 24,
                 title: None,
                 composer: None,
+                surface: None,
+                border: None,
                 header_actions: Vec::new(),
             },
         );
@@ -2028,6 +2073,8 @@ mod tests {
                 width: 4,
                 title: None,
                 composer: None,
+                surface: None,
+                border: None,
                 header_actions: Vec::new(),
             },
         );
@@ -2038,6 +2085,8 @@ mod tests {
                 width: 4,
                 title: None,
                 composer: None,
+                surface: None,
+                border: None,
                 header_actions: Vec::new(),
             },
         );
@@ -2067,6 +2116,8 @@ mod tests {
                     width: 4,
                     title: None,
                     composer: None,
+                    surface: None,
+                    border: None,
                     header_actions: Vec::new(),
                 },
             );
@@ -2109,6 +2160,8 @@ mod tests {
                     placeholder: "Ask a follow-up…".to_string(),
                     rows: 3,
                 }),
+                surface: None,
+                border: None,
                 header_actions: Vec::new(),
             },
         );
@@ -2160,6 +2213,8 @@ mod tests {
                     placeholder: "Ask".to_string(),
                     rows: 2,
                 }),
+                surface: None,
+                border: None,
                 header_actions: Vec::new(),
             },
         );
@@ -2199,6 +2254,8 @@ mod tests {
                     placeholder: "Ask".to_string(),
                     rows: 2,
                 }),
+                surface: None,
+                border: None,
                 header_actions: vec![
                     TextPanelHeaderAction {
                         id: "clear".to_string(),
@@ -2251,6 +2308,8 @@ mod tests {
                 width: 40,
                 title: Some("Agent".to_string()),
                 composer: None,
+                surface: None,
+                border: None,
                 header_actions: Vec::new(),
             },
         );
@@ -2319,6 +2378,8 @@ mod tests {
                     placeholder: "Ask".to_string(),
                     rows: 3,
                 }),
+                surface: None,
+                border: None,
                 header_actions: Vec::new(),
             },
         );
@@ -2346,6 +2407,8 @@ mod tests {
                     placeholder: "Ask".to_string(),
                     rows: 2,
                 }),
+                surface: None,
+                border: None,
                 header_actions: Vec::new(),
             },
         );
@@ -2400,6 +2463,8 @@ mod tests {
                     placeholder: "Ask".to_string(),
                     rows: 2,
                 }),
+                surface: None,
+                border: None,
                 header_actions: Vec::new(),
             },
         );
@@ -2431,6 +2496,8 @@ mod tests {
                     placeholder: "Ask".to_string(),
                     rows: 2,
                 }),
+                surface: None,
+                border: None,
                 header_actions: Vec::new(),
             },
         );
@@ -2481,6 +2548,8 @@ mod tests {
                 width: 40,
                 title: None,
                 composer: None,
+                surface: None,
+                border: None,
                 header_actions: Vec::new(),
             },
         );
@@ -2580,6 +2649,8 @@ mod tests {
                 width: 16,
                 title: Some("Agent".to_string()),
                 composer: None,
+                surface: None,
+                border: None,
                 header_actions: Vec::new(),
             },
         );
@@ -2621,6 +2692,8 @@ mod tests {
                 width: 52,
                 title: Some("Agent".to_string()),
                 composer: None,
+                surface: None,
+                border: None,
                 header_actions: Vec::new(),
             },
         );
@@ -2654,6 +2727,8 @@ mod tests {
                 width: 8,
                 title: None,
                 composer: None,
+                surface: None,
+                border: None,
                 header_actions: Vec::new(),
             },
         );
@@ -2825,6 +2900,60 @@ mod tests {
             b: 255,
         });
         assert_eq!(buffer.cells[9].style.bg, selected_bg);
+    }
+
+    #[test]
+    fn row_panel_uses_its_theme_aware_surface_and_border_without_affecting_other_panels() {
+        let theme = parse_vscode_theme("themes/kanso.json").unwrap();
+        let sidebar_fg = theme.colors["sideBar.foreground"];
+        let sidebar_bg = theme.colors["sideBar.background"];
+        let sidebar_border = theme.colors["sideBar.border"];
+
+        let mut manager = PanelManager::default();
+        manager.create_panel(
+            "neotree".to_string(),
+            PanelConfig {
+                width: 10,
+                surface: Some(ThemeStyleSpec {
+                    foreground: vec!["sideBar.foreground".to_string()],
+                    background: vec!["sideBar.background".to_string()],
+                    ..ThemeStyleSpec::default()
+                }),
+                border: Some(ThemeStyleSpec {
+                    foreground: vec!["sideBar.border".to_string()],
+                    background: vec!["editor.background".to_string()],
+                    ..ThemeStyleSpec::default()
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_panel("neotree", vec![row("selected"), row("plain")]);
+
+        let mut buffer = RenderBuffer::new(11, 5, &theme.style);
+        manager.render(&mut buffer, &theme);
+
+        assert_eq!(buffer.cells[11].style.fg, Some(sidebar_fg));
+        assert_eq!(buffer.cells[11].style.bg, Some(sidebar_bg));
+        assert_eq!(buffer.cells[10].text, "│");
+        assert_eq!(buffer.cells[10].style.fg, Some(sidebar_border));
+
+        let mut manager = PanelManager::default();
+        manager.create_panel(
+            "other".to_string(),
+            PanelConfig {
+                width: 10,
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_panel("other", vec![row("selected"), row("plain")]);
+
+        let mut buffer = RenderBuffer::new(11, 5, &theme.style);
+        manager.render(&mut buffer, &theme);
+
+        assert_eq!(buffer.cells[11].style.fg, theme.style.fg);
+        assert_eq!(buffer.cells[11].style.bg, theme.style.bg);
+        assert_eq!(buffer.cells[10].text, " ");
+        assert_eq!(buffer.cells[10].style, theme.style);
     }
 
     #[test]

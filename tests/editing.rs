@@ -1741,6 +1741,8 @@ fn add_tree_panel(harness: &mut EditorHarness) {
             width: 20,
             title: None,
             composer: None,
+            surface: None,
+            border: None,
             header_actions: Vec::new(),
         },
     );
@@ -4939,6 +4941,8 @@ fn test_right_panel_reserves_editor_window_width() {
             width: 20,
             title: None,
             composer: None,
+            surface: None,
+            border: None,
             header_actions: Vec::new(),
         },
     );
@@ -5074,6 +5078,8 @@ fn focused_agent_panel_keeps_leader_available_until_the_composer_is_focused() {
                 placeholder: "Ask".to_string(),
                 rows: 2,
             }),
+            surface: None,
+            border: None,
             header_actions: Vec::new(),
         },
     );
@@ -5176,6 +5182,8 @@ async fn window_cycle_uses_left_windows_right_visual_groups() {
             width: 20,
             title: None,
             composer: None,
+            surface: None,
+            border: None,
             header_actions: Vec::new(),
         },
     );
@@ -5232,6 +5240,8 @@ async fn ctrl_w_w_focuses_agent_composer_and_makes_cursor_visible() {
                 placeholder: "Ask".to_string(),
                 rows: 2,
             }),
+            surface: None,
+            border: None,
             header_actions: Vec::new(),
         },
     );
@@ -5348,6 +5358,8 @@ fn passive_mouse_events_over_editor_do_not_clear_focused_agent_composer() {
                 placeholder: "Ask".to_string(),
                 rows: 2,
             }),
+            surface: None,
+            border: None,
             header_actions: Vec::new(),
         },
     );
@@ -5390,6 +5402,8 @@ async fn only_window_hides_auxiliary_panels_and_preserves_agent_draft() {
                 placeholder: "Ask".to_string(),
                 rows: 2,
             }),
+            surface: None,
+            border: None,
             header_actions: Vec::new(),
         },
     );

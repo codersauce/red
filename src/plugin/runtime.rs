@@ -3632,6 +3632,10 @@ mod tests {
         assert_eq!(rows[2]["segments"][0]["text"], "✓ ");
         assert_eq!(rows[2]["segments"][2]["text"], " ");
         assert_eq!(
+            rows[2]["segments"][2]["semantic"]["foreground"][0],
+            "terminal.ansiBrightYellow"
+        );
+        assert_eq!(
             rows[2]["segments"][3]["semantic"]["foreground"][0],
             "gitDecoration.modifiedResourceForeground"
         );
@@ -9275,6 +9279,18 @@ mod tests {
                 assert_eq!(id, "neotree");
                 assert_eq!(config.side, crate::plugin::PanelSide::Left);
                 assert_eq!(config.width, 30);
+                assert_eq!(
+                    config.surface.as_ref().unwrap().background,
+                    ["sideBar.background", "editor.background"]
+                );
+                assert_eq!(
+                    config.border.as_ref().unwrap().foreground,
+                    [
+                        "sideBar.border",
+                        "panel.border",
+                        "editorLineNumber.foreground"
+                    ]
+                );
             }
             _ => panic!("unexpected plugin request"),
         }
