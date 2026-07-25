@@ -3243,10 +3243,13 @@ mod tests {
     #[cfg(not(windows))]
     use std::{fs, process::Command};
 
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
     use super::*;
     use crate::{
         color::Color,
         editor::{PluginRequest, PLUGIN_DISPATCHER_TEST_LOCK},
+        plugin::{PanelManager, PanelSide, TextPanelComposerConfig},
         ui::PickerPresentation,
     };
 
@@ -4731,6 +4734,104 @@ mod tests {
             replacement_dispatched,
             "expected queued prompt on replacement session, got {dispatched_prompts:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_insert_control_enter_dispatches_the_complete_docked_prompt() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+
+        for code in [KeyCode::Enter, KeyCode::Char('\n'), KeyCode::Char('\r')] {
+            for kind in [KeyEventKind::Press, KeyEventKind::Repeat] {
+                drain_requests();
+                let mut runtime = Runtime::new();
+                runtime
+                    .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+                    .await
+                    .unwrap();
+                runtime
+                    .notify(
+                        "agent:session_created",
+                        serde_json::json!({ "session_id": "session-1" }),
+                    )
+                    .await
+                    .unwrap();
+                drain_requests();
+
+                let mut panels = PanelManager::default();
+                panels.create_text_panel(
+                    "agent-conversation".to_string(),
+                    PanelConfig {
+                        side: PanelSide::Right,
+                        width: 40,
+                        title: Some("Agent".to_string()),
+                        composer: Some(TextPanelComposerConfig {
+                            placeholder: "Ask a follow-up".to_string(),
+                            rows: 3,
+                        }),
+                        ..PanelConfig::default()
+                    },
+                );
+                assert!(panels.focus_text_panel_composer("agent-conversation"));
+                panels.handle_focused_text_input(
+                    &Event::Paste("first\r\n漢👨‍👩‍👧\r\nsecond".to_string()),
+                    80,
+                );
+
+                let submitted = panels
+                    .handle_focused_text_input(
+                        &Event::Key(KeyEvent::new_with_kind(code, KeyModifiers::CONTROL, kind)),
+                        80,
+                    )
+                    .unwrap_or_else(|| {
+                        panic!("{code:?} with Ctrl and {kind:?} must submit the Insert draft")
+                    });
+                assert_eq!(submitted.panel_id, "agent-conversation");
+                assert_eq!(submitted.action, "submit");
+                assert_eq!(
+                    submitted.text.as_deref(),
+                    Some("first\n漢👨‍👩‍👧\nsecond")
+                );
+
+                runtime
+                    .notify(
+                        "panel:event:agent-conversation",
+                        serde_json::to_value(&submitted).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+
+                let mut rendered = false;
+                let mut refreshed = false;
+                let mut dispatched = false;
+                while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                    match request {
+                        PluginRequest::UpdateTextPanel { id, blocks } => {
+                            rendered |= id == "agent-conversation"
+                                && blocks
+                                    .iter()
+                                    .any(|block| block.text == "first\n漢👨‍👩‍👧\nsecond");
+                        }
+                        PluginRequest::Action(Action::Refresh) => refreshed = true,
+                        PluginRequest::AgentPrompt { session_id, text } => {
+                            assert!(
+                                rendered && refreshed,
+                                "the submitted conversation must render before dispatch"
+                            );
+                            assert_eq!(session_id, "session-1");
+                            assert_eq!(text, "first\n漢👨‍👩‍👧\nsecond");
+                            dispatched = true;
+                        }
+                        _ => {}
+                    }
+                }
+
+                assert!(
+                    dispatched,
+                    "{code:?} with Ctrl and {kind:?} must reach the bundled agent backend"
+                );
+                assert!(panels.focused_text_input_active());
+            }
+        }
     }
 
     #[tokio::test]

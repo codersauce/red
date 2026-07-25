@@ -3424,6 +3424,68 @@ mod tests {
     }
 
     #[test]
+    fn modified_enter_terminal_variants_submit_insert_drafts_on_every_panel_side() {
+        use crossterm::event::{KeyEvent, KeyEventKind};
+
+        for side in [
+            PanelSide::Left,
+            PanelSide::Right,
+            PanelSide::Top,
+            PanelSide::Bottom,
+        ] {
+            for code in [KeyCode::Enter, KeyCode::Char('\n'), KeyCode::Char('\r')] {
+                for modifiers in [
+                    KeyModifiers::CONTROL,
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                ] {
+                    for kind in [KeyEventKind::Press, KeyEventKind::Repeat] {
+                        let mut manager = focused_agent_conversation(side);
+                        assert!(manager.focus_text_panel_composer("agent"));
+                        manager.handle_focused_text_input(
+                            &Event::Paste("first\r\n漢👨‍👩‍👧\r\nsecond".to_string()),
+                            80,
+                        );
+
+                        let submitted = manager.handle_focused_text_input(
+                            &Event::Key(KeyEvent::new_with_kind(code, modifiers, kind)),
+                            80,
+                        );
+
+                        let event = submitted.unwrap_or_else(|| {
+                            panic!(
+                                "{code:?} with {modifiers:?} and {kind:?} must submit from the {side:?} Insert composer"
+                            )
+                        });
+                        assert_eq!(event.panel_id, "agent");
+                        assert_eq!(event.action, "submit");
+                        assert_eq!(event.text.as_deref(), Some("first\n漢👨‍👩‍👧\nsecond"));
+                        assert_eq!(manager.focused_panel_id(), Some("agent"));
+                        assert!(manager.focused_text_input_active());
+                        assert_eq!(
+                            manager.text_panels["agent"]
+                                .composer
+                                .as_ref()
+                                .unwrap()
+                                .composer
+                                .mode(),
+                            ModalComposerMode::Insert
+                        );
+                        assert_eq!(
+                            manager.text_panels["agent"]
+                                .composer
+                                .as_ref()
+                                .unwrap()
+                                .composer
+                                .contents(),
+                            ""
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn focused_composer_reports_real_vim_cursor_mode_for_every_dock_side() {
         for side in [
             PanelSide::Left,

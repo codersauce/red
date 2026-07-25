@@ -211,7 +211,7 @@ impl ModalComposer {
 
     /// Handles editor-native Vim navigation and mode-aware prompt submission.
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> ModalComposerOutcome {
-        if key.code == KeyCode::Enter
+        if matches!(key.code, KeyCode::Enter | KeyCode::Char('\n' | '\r'))
             && key
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -881,6 +881,10 @@ mod tests {
         KeyEvent::new(KeyCode::Enter, modifiers)
     }
 
+    fn modified_enter_codes() -> [KeyCode; 3] {
+        [KeyCode::Enter, KeyCode::Char('\n'), KeyCode::Char('\r')]
+    }
+
     fn normal(composer: &mut ModalComposer) {
         assert_eq!(
             composer.handle_key(key(KeyCode::Esc)),
@@ -923,6 +927,23 @@ mod tests {
     }
 
     #[test]
+    fn control_enter_submits_immediately_from_insert_without_adding_a_newline() {
+        for code in modified_enter_codes() {
+            let mut composer = ModalComposer::new("first\n漢👨‍👩‍👧", vec![]);
+
+            assert_eq!(composer.mode(), ModalComposerMode::Insert);
+            assert_eq!(
+                composer.handle_key(KeyEvent::new(code, KeyModifiers::CONTROL)),
+                ModalComposerOutcome::Submit,
+                "Ctrl+Enter should immediately submit {code:?} in Insert mode",
+            );
+            assert_eq!(composer.mode(), ModalComposerMode::Insert);
+            assert_eq!(composer.contents(), "first\n漢👨‍👩‍👧");
+            assert_eq!(composer.validation_status(), None);
+        }
+    }
+
+    #[test]
     fn control_and_alt_enter_submit_in_every_vim_mode() {
         let modifiers = [
             KeyModifiers::CONTROL,
@@ -932,49 +953,54 @@ mod tests {
             KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
         ];
 
-        for modifiers in modifiers {
-            for mode in [
-                ModalComposerMode::Insert,
-                ModalComposerMode::Normal,
-                ModalComposerMode::Visual,
-            ] {
-                let mut composer = ModalComposer::new("hello\n漢👨‍👩‍👧", vec![]);
+        for code in modified_enter_codes() {
+            for modifiers in modifiers {
+                for mode in [
+                    ModalComposerMode::Insert,
+                    ModalComposerMode::Normal,
+                    ModalComposerMode::Visual,
+                ] {
+                    let mut composer = ModalComposer::new("hello\n漢👨‍👩‍👧", vec![]);
 
-                if mode != ModalComposerMode::Insert {
-                    normal(&mut composer);
-                    if mode == ModalComposerMode::Visual {
-                        assert_eq!(
-                            composer.handle_key(key(KeyCode::Char('v'))),
-                            ModalComposerOutcome::Changed
-                        );
+                    if mode != ModalComposerMode::Insert {
+                        normal(&mut composer);
+                        if mode == ModalComposerMode::Visual {
+                            assert_eq!(
+                                composer.handle_key(key(KeyCode::Char('v'))),
+                                ModalComposerOutcome::Changed
+                            );
+                        }
                     }
-                }
 
-                assert_eq!(composer.mode(), mode);
-                assert_eq!(
-                    composer.handle_key(modified_enter(modifiers)),
-                    ModalComposerOutcome::Submit,
-                    "modified Enter should submit in {mode:?} with {modifiers:?}",
-                );
-                assert_eq!(composer.contents(), "hello\n漢👨‍👩‍👧");
+                    assert_eq!(composer.mode(), mode);
+                    assert_eq!(
+                        composer.handle_key(KeyEvent::new(code, modifiers)),
+                        ModalComposerOutcome::Submit,
+                        "{code:?} should submit in {mode:?} with {modifiers:?}",
+                    );
+                    assert_eq!(composer.contents(), "hello\n漢👨‍👩‍👧");
+                }
             }
         }
     }
 
     #[test]
     fn modified_enter_takes_precedence_over_a_pending_normal_operator() {
-        let mut composer = ModalComposer::new("keep this draft", vec![]);
-        normal(&mut composer);
+        for code in modified_enter_codes() {
+            let mut composer = ModalComposer::new("keep this draft", vec![]);
+            normal(&mut composer);
 
-        assert_eq!(
-            composer.handle_key(key(KeyCode::Char('d'))),
-            ModalComposerOutcome::Changed
-        );
-        assert_eq!(
-            composer.handle_key(modified_enter(KeyModifiers::CONTROL)),
-            ModalComposerOutcome::Submit
-        );
-        assert_eq!(composer.contents(), "keep this draft");
+            assert_eq!(
+                composer.handle_key(key(KeyCode::Char('d'))),
+                ModalComposerOutcome::Changed
+            );
+            assert_eq!(
+                composer.handle_key(KeyEvent::new(code, KeyModifiers::CONTROL)),
+                ModalComposerOutcome::Submit,
+                "{code:?} should take precedence over a pending operator",
+            );
+            assert_eq!(composer.contents(), "keep this draft");
+        }
     }
 
     #[test]
@@ -1017,20 +1043,22 @@ mod tests {
 
     #[test]
     fn modified_enter_rejects_empty_submissions_without_losing_draft() {
-        for modifiers in [
-            KeyModifiers::CONTROL,
-            KeyModifiers::ALT,
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-        ] {
-            let mut composer = ModalComposer::new(" \n", vec![]);
+        for code in modified_enter_codes() {
+            for modifiers in [
+                KeyModifiers::CONTROL,
+                KeyModifiers::ALT,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ] {
+                let mut composer = ModalComposer::new(" \n", vec![]);
 
-            assert_eq!(
-                composer.handle_key(modified_enter(modifiers)),
-                ModalComposerOutcome::Rejected,
-                "empty drafts must not submit with {modifiers:?}",
-            );
-            assert_eq!(composer.validation_status(), Some("Prompt is empty"));
-            assert_eq!(composer.contents(), " \n");
+                assert_eq!(
+                    composer.handle_key(KeyEvent::new(code, modifiers)),
+                    ModalComposerOutcome::Rejected,
+                    "empty drafts must not submit {code:?} with {modifiers:?}",
+                );
+                assert_eq!(composer.validation_status(), Some("Prompt is empty"));
+                assert_eq!(composer.contents(), " \n");
+            }
         }
     }
 

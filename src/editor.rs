@@ -21889,6 +21889,89 @@ mod test {
     }
 
     #[tokio::test]
+    async fn floating_agent_composer_submits_modified_csi_u_line_endings_in_insert_mode() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+
+        for (code, modifiers, kind) in [
+            (
+                KeyCode::Enter,
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            ),
+            (
+                KeyCode::Char('\n'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            ),
+            (
+                KeyCode::Char('\r'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            ),
+            (
+                KeyCode::Char('\n'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Repeat,
+            ),
+            (
+                KeyCode::Char('\r'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Repeat,
+            ),
+            (KeyCode::Char('\n'), KeyModifiers::ALT, KeyEventKind::Press),
+            (KeyCode::Char('\r'), KeyModifiers::ALT, KeyEventKind::Press),
+        ] {
+            drain_plugin_requests();
+            let mut editor = test_editor(/*width*/ 80, /*height*/ 14);
+            let mut buffer = RenderBuffer::new(/*width*/ 80, /*height*/ 14, &Style::default());
+            let mut runtime = Runtime::new();
+            ACTION_DISPATCHER.send_request(PluginRequest::OpenAgentComposer {
+                owner: "agent".to_string(),
+                title: Some("Agent prompt".to_string()),
+                id: 802,
+                query: String::new(),
+                history: Vec::new(),
+            });
+
+            editor
+                .service_background(&mut buffer, &mut runtime)
+                .await
+                .unwrap();
+            assert_eq!(
+                editor
+                    .current_dialog
+                    .as_ref()
+                    .and_then(|dialog| dialog.cursor_mode()),
+                Some(Mode::Insert),
+            );
+            editor
+                .process_editor_event(
+                    Event::Paste("send directly from Insert mode".to_string()),
+                    &mut buffer,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+
+            editor
+                .process_editor_event(
+                    Event::Key(KeyEvent::new_with_kind(code, modifiers, kind)),
+                    &mut buffer,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+
+            assert!(
+                editor.current_dialog.is_none(),
+                "{code:?} with {modifiers:?} on {kind:?} must submit from Insert mode",
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn opening_a_custom_agent_composer_preserves_unrelated_picker_history() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
@@ -22559,6 +22642,132 @@ mod test {
             detached_input_to_crossterm(crate::headless::InputEvent::Mouse { event: mouse }),
             Event::Mouse(mouse)
         );
+    }
+
+    #[test]
+    fn detached_agent_input_preserves_modified_csi_u_line_endings() {
+        for character in ['\n', '\r'] {
+            for (modifiers, expected_modifiers) in [
+                (
+                    vec![crate::headless::KeyModifier::Control],
+                    KeyModifiers::CONTROL,
+                ),
+                (
+                    vec![crate::headless::KeyModifier::Alt],
+                    KeyModifiers::ALT,
+                ),
+                (
+                    vec![
+                        crate::headless::KeyModifier::Control,
+                        crate::headless::KeyModifier::Shift,
+                    ],
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                ),
+                (
+                    vec![
+                        crate::headless::KeyModifier::Alt,
+                        crate::headless::KeyModifier::Shift,
+                    ],
+                    KeyModifiers::ALT | KeyModifiers::SHIFT,
+                ),
+            ] {
+                assert_eq!(
+                    detached_input_to_crossterm(crate::headless::InputEvent::Key {
+                        code: crate::headless::KeyCode::Character(character),
+                        modifiers,
+                    }),
+                    Event::Key(KeyEvent::new(
+                        KeyCode::Char(character),
+                        expected_modifiers,
+                    )),
+                    "detached input must preserve modified CSI-u character {character:?}",
+                );
+            }
+        }
+
+        assert_eq!(
+            detached_input_to_crossterm(crate::headless::InputEvent::Key {
+                code: crate::headless::KeyCode::Enter,
+                modifiers: Vec::new(),
+            }),
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            "ordinary Enter must remain an unmodified newline in Insert mode",
+        );
+        assert_eq!(
+            detached_input_to_crossterm(crate::headless::InputEvent::Key {
+                code: crate::headless::KeyCode::Character('j'),
+                modifiers: vec![crate::headless::KeyModifier::Control],
+            }),
+            Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            "Ctrl+J must remain distinct from modified Enter",
+        );
+    }
+
+    #[tokio::test]
+    async fn detached_agent_composer_submits_modified_csi_u_line_endings_in_insert_mode() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        let cases: &[(crate::headless::KeyCode, &[crate::headless::KeyModifier])] = &[
+            (
+                crate::headless::KeyCode::Enter,
+                &[crate::headless::KeyModifier::Control],
+            ),
+            (
+                crate::headless::KeyCode::Character('\n'),
+                &[crate::headless::KeyModifier::Control],
+            ),
+            (
+                crate::headless::KeyCode::Character('\r'),
+                &[crate::headless::KeyModifier::Control],
+            ),
+            (
+                crate::headless::KeyCode::Character('\n'),
+                &[crate::headless::KeyModifier::Alt],
+            ),
+            (
+                crate::headless::KeyCode::Character('\r'),
+                &[crate::headless::KeyModifier::Alt],
+            ),
+        ];
+
+        for &(code, modifiers) in cases {
+            drain_plugin_requests();
+            let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
+                .await
+                .unwrap();
+            ACTION_DISPATCHER.send_request(PluginRequest::OpenAgentComposer {
+                owner: "agent".to_string(),
+                title: Some("Agent prompt".to_string()),
+                id: 802,
+                query: String::new(),
+                history: Vec::new(),
+            });
+
+            core.tick().await.unwrap().expect("composer render");
+            assert_eq!(
+                core.editor
+                    .current_dialog
+                    .as_ref()
+                    .and_then(|dialog| dialog.cursor_mode()),
+                Some(Mode::Insert),
+            );
+            core.input(crate::headless::InputEvent::Paste {
+                text: "send directly from detached Insert mode".to_string(),
+            })
+            .await
+            .unwrap();
+
+            core.input(crate::headless::InputEvent::Key {
+                code,
+                modifiers: modifiers.to_vec(),
+            })
+            .await
+            .unwrap();
+
+            assert!(
+                core.editor.current_dialog.is_none(),
+                "detached {code:?} with {modifiers:?} must submit from Insert mode",
+            );
+        }
     }
 
     #[tokio::test]

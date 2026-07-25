@@ -509,6 +509,10 @@ mod tests {
         Event::Key(KeyEvent::new(code, modifiers))
     }
 
+    fn modified_enter_codes() -> [KeyCode; 3] {
+        [KeyCode::Enter, KeyCode::Char('\n'), KeyCode::Char('\r')]
+    }
+
     fn submit(composer: &mut AgentComposer) -> Option<KeyAction> {
         composer.handle_event(&key(KeyCode::Enter, KeyModifiers::CONTROL))
     }
@@ -647,41 +651,43 @@ mod tests {
             KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
         ];
 
-        for modifiers in modifiers {
-            for mode in [
-                ModalComposerMode::Insert,
-                ModalComposerMode::Normal,
-                ModalComposerMode::Visual,
-            ] {
-                let mut composer = new_composer(
-                    &editor,
-                    Some("Agent prompt".to_string()),
-                    802,
-                    "first\n漢👨‍👩‍👧".to_string(),
-                    vec![],
-                );
+        for code in modified_enter_codes() {
+            for modifiers in modifiers {
+                for mode in [
+                    ModalComposerMode::Insert,
+                    ModalComposerMode::Normal,
+                    ModalComposerMode::Visual,
+                ] {
+                    let mut composer = new_composer(
+                        &editor,
+                        Some("Agent prompt".to_string()),
+                        802,
+                        "first\n漢👨‍👩‍👧".to_string(),
+                        vec![],
+                    );
 
-                if mode != ModalComposerMode::Insert {
-                    composer.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE));
-                    if mode == ModalComposerMode::Visual {
-                        composer.handle_event(&key(KeyCode::Char('v'), KeyModifiers::NONE));
+                    if mode != ModalComposerMode::Insert {
+                        composer.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE));
+                        if mode == ModalComposerMode::Visual {
+                            composer.handle_event(&key(KeyCode::Char('v'), KeyModifiers::NONE));
+                        }
                     }
-                }
 
-                assert_eq!(composer.composer.mode(), mode);
-                assert_eq!(
-                    composer.handle_event(&key(KeyCode::Enter, modifiers)),
-                    Some(KeyAction::Multiple(vec![
-                        Action::CloseDialog,
-                        Action::NotifyPlugin(
-                            "agent".to_string(),
-                            "composer:submitted:802".to_string(),
-                            json!("first\n漢👨‍👩‍👧"),
-                        ),
-                    ])),
-                    "modified Enter should submit in {mode:?} with {modifiers:?}",
-                );
-                assert_eq!(composer.composer.contents(), "first\n漢👨‍👩‍👧");
+                    assert_eq!(composer.composer.mode(), mode);
+                    assert_eq!(
+                        composer.handle_event(&key(code, modifiers)),
+                        Some(KeyAction::Multiple(vec![
+                            Action::CloseDialog,
+                            Action::NotifyPlugin(
+                                "agent".to_string(),
+                                "composer:submitted:802".to_string(),
+                                json!("first\n漢👨‍👩‍👧"),
+                            ),
+                        ])),
+                        "{code:?} should submit in {mode:?} with {modifiers:?}",
+                    );
+                    assert_eq!(composer.composer.contents(), "first\n漢👨‍👩‍👧");
+                }
             }
         }
     }
@@ -899,6 +905,31 @@ mod tests {
     }
 
     #[test]
+    fn normalized_modified_enter_rejects_empty_floating_prompts_without_closing() {
+        let editor = editor(60, 18);
+
+        for code in modified_enter_codes() {
+            for modifiers in [
+                KeyModifiers::CONTROL,
+                KeyModifiers::ALT,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ] {
+                let mut composer = new_composer(&editor, None, 802, " \n\t".to_string(), vec![]);
+
+                assert_eq!(composer.composer.mode(), ModalComposerMode::Insert);
+                assert_eq!(
+                    composer.handle_event(&key(code, modifiers)),
+                    Some(KeyAction::Single(Action::ShowDialog)),
+                    "{code:?} with {modifiers:?} must keep an empty floating prompt open",
+                );
+                assert_eq!(composer.composer.mode(), ModalComposerMode::Insert);
+                assert_eq!(composer.composer.contents(), " \n\t");
+                assert_eq!(composer.composer.validation_status(), Some(EMPTY_STATUS));
+            }
+        }
+    }
+
+    #[test]
     fn callback_composer_delivers_terminal_results_before_closing() {
         let editor = editor(60, 18);
         let handle = ComposerHandle::from_raw(42);
@@ -936,6 +967,42 @@ mod tests {
                 Action::CloseDialog,
             ]))
         );
+    }
+
+    #[test]
+    fn normalized_control_enter_immediately_submits_insert_mode_composer_callbacks() {
+        let editor = editor(60, 18);
+        let handle = ComposerHandle::from_raw(42);
+
+        for code in modified_enter_codes() {
+            for modifiers in [
+                KeyModifiers::CONTROL,
+                KeyModifiers::ALT,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ] {
+                let mut composer = AgentComposer::new_callback(
+                    &editor,
+                    Some("Agent prompt".to_string()),
+                    "first\n漢👨‍👩‍👧".to_string(),
+                    vec![],
+                    handle,
+                );
+
+                assert_eq!(composer.composer.mode(), ModalComposerMode::Insert);
+                assert_eq!(
+                    composer.handle_event(&key(code, modifiers)),
+                    Some(KeyAction::Multiple(vec![
+                        Action::NotifyComposer(
+                            handle,
+                            Box::new(ComposerCallback::Submitted("first\n漢👨‍👩‍👧".to_string())),
+                        ),
+                        Action::CloseDialog,
+                    ])),
+                    "{code:?} with {modifiers:?} should immediately submit the callback",
+                );
+                assert_eq!(composer.composer.contents(), "first\n漢👨‍👩‍👧");
+            }
+        }
     }
 
     #[test]

@@ -38,18 +38,30 @@ persistent_threads = true
 ## Lifecycle
 
 Open a workspace, press `Space A` (or run `:Agent`), and type the first request
-in the floating, buffer-backed composer. `Ctrl+Enter` sends from any composer mode;
-`Alt+Enter` also sends when the terminal reports that key combination. In
-Insert mode, `Enter`, `Shift+Enter`, and `Ctrl+J` insert a newline. In Normal
-mode, `Enter` sends. `Esc` enters Normal mode without discarding the draft, so
-`Esc`, then `Enter` is the universal send sequence when a terminal cannot
-distinguish modified Enter. Set `entry = "dock"` to open and focus the
-persistent dock immediately instead. Both composers use the editor's
-configured `[cursor]` shapes for their own Insert, Normal, and Visual modes,
-independently of the background editor.
+in the floating, buffer-backed composer. `Ctrl+Enter` immediately sends from
+Insert, Normal, or Visual mode, including terminals that encode Enter as a
+modified carriage return or line feed. `Alt+Enter` also sends when the terminal
+reports that key combination. In Insert mode, `Enter`, `Shift+Enter`, and
+`Ctrl+J` insert a newline. In Normal mode, `Enter` sends. `Esc` enters Normal
+mode without discarding the draft, so `Esc`, then `Enter` is the universal
+send sequence when a terminal cannot distinguish modified Enter. Set
+`entry = "dock"` to open and focus the persistent dock immediately instead.
+Both composers use the editor's configured `[cursor]` shapes for their own
+Insert, Normal, and Visual modes, independently of the background editor.
 
 `Ctrl+S` keeps its normal editor meaning: save the active file. It is not an
 agent send shortcut.
+
+When running inside tmux, enable CSI-u extended keys so tmux forwards
+`Ctrl+Enter` with its modifier intact:
+
+```sh
+tmux set-option -s extended-keys on
+tmux set-option -s extended-keys-format csi-u
+```
+
+Without extended keys, tmux sends `Ctrl+Enter` as an ordinary `Enter`, which no
+terminal application can distinguish from the insert-newline key.
 
 Red lazily starts `codex app-server --stdio`, initializes the connection,
 checks the account, resumes the saved workspace thread when possible, and

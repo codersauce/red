@@ -115,10 +115,11 @@ modes, multiline editing, wrapping, cursor movement, undo/redo, operators, text
 objects, and history navigation; it does not send a callback for each
 keystroke. Input is limited to 128 KiB so an escaping-heavy prompt remains
 within the Codex app-server frame limit; an oversized paste leaves the current
-draft intact and shows a validation message. `Ctrl+Enter` submits in any
-composer mode. `Alt+Enter` also submits when the terminal reports that key
-combination. In insert mode, `Enter`, `Shift+Enter`, and `Ctrl+J` insert a
-newline; in normal mode, `Enter` submits. `Escape` switches from insert or
+draft intact and shows a validation message. `Ctrl+Enter` submits immediately
+in any composer mode; both modified carriage-return and line-feed terminal
+encodings are supported. `Alt+Enter` also submits when the terminal reports
+that key combination. In insert mode, `Enter`, `Shift+Enter`, and `Ctrl+J`
+insert a newline; in normal mode, `Enter` submits. `Escape` switches from insert or
 visual mode to normal mode, so `Escape`, then `Enter` provides a universal
 send sequence. `Ctrl+C` cancels the floating composer. `Ctrl+P` and `Ctrl+N`
 move through the supplied history while preserving the current draft.

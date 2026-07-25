@@ -871,6 +871,57 @@ mod tests {
     }
 
     #[test]
+    fn detached_key_input_preserves_modified_csi_u_line_endings() {
+        let cases: &[(event::KeyModifiers, &[KeyModifier])] = &[
+            (event::KeyModifiers::CONTROL, &[KeyModifier::Control]),
+            (event::KeyModifiers::ALT, &[KeyModifier::Alt]),
+            (
+                event::KeyModifiers::CONTROL | event::KeyModifiers::SHIFT,
+                &[KeyModifier::Control, KeyModifier::Shift],
+            ),
+            (
+                event::KeyModifiers::ALT | event::KeyModifiers::SHIFT,
+                &[KeyModifier::Alt, KeyModifier::Shift],
+            ),
+            (
+                event::KeyModifiers::CONTROL | event::KeyModifiers::ALT,
+                &[KeyModifier::Control, KeyModifier::Alt],
+            ),
+        ];
+
+        for character in ['\n', '\r'] {
+            for &(modifiers, expected_modifiers) in cases {
+                for kind in [event::KeyEventKind::Press, event::KeyEventKind::Repeat] {
+                    let input = detached_key_input(event::KeyEvent::new_with_kind(
+                        event::KeyCode::Char(character),
+                        modifiers,
+                        kind,
+                    ));
+
+                    assert_eq!(
+                        input,
+                        Some(DetachedInput::Key {
+                            code: DetachedKeyCode::Character(character),
+                            modifiers: expected_modifiers.to_vec(),
+                        }),
+                        "detached input must preserve {character:?} with {modifiers:?} on {kind:?}",
+                    );
+                }
+
+                assert_eq!(
+                    detached_key_input(event::KeyEvent::new_with_kind(
+                        event::KeyCode::Char(character),
+                        modifiers,
+                        event::KeyEventKind::Release,
+                    )),
+                    None,
+                    "released modified {character:?} must not be forwarded",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn detached_resize_drops_rows_below_the_new_terminal_height() {
         let mut rows = (0..5)
             .map(|row| red::headless::LinePatch {
