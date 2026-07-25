@@ -263,9 +263,13 @@ Esc = { EnterMode = "Normal" }
 [keys.normal."Ctrl-w"]
 "a" = { PluginCommand = "AgentOpen" }
 "h" = "MoveWindowLeft"
+"H" = "MoveWindowToLeft"
 "j" = "MoveWindowDown"
+"J" = "MoveWindowToBottom"
 "k" = "MoveWindowUp"
+"K" = "MoveWindowToTop"
 "l" = "MoveWindowRight"
+"L" = "MoveWindowToRight"
 "w" = "NextWindow"
 "W" = "PreviousWindow"
 "p" = "PreviousWindow"

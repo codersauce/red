@@ -1998,6 +1998,28 @@ mod test {
     }
 
     #[test]
+    fn legacy_window_keymap_preserves_focus_and_inherits_edge_movement() {
+        let loaded =
+            Config::load_user_toml(LEGACY_CONFIG, Path::new("/tmp/config.toml"), &[]).unwrap();
+        let Some(KeyAction::Nested(ctrl_w)) = loaded.config.keys.normal.get("Ctrl-w") else {
+            panic!("legacy window bindings should remain a keymap prefix");
+        };
+
+        for (key, action) in [
+            ("h", Action::MoveWindowLeft),
+            ("j", Action::MoveWindowDown),
+            ("k", Action::MoveWindowUp),
+            ("l", Action::MoveWindowRight),
+            ("H", Action::MoveWindowToLeft),
+            ("J", Action::MoveWindowToBottom),
+            ("K", Action::MoveWindowToTop),
+            ("L", Action::MoveWindowToRight),
+        ] {
+            assert_eq!(ctrl_w.get(key), Some(&KeyAction::Single(action)));
+        }
+    }
+
+    #[test]
     fn independent_invalid_values_do_not_hide_valid_siblings() {
         let loaded = Config::load_user_toml(
             r#"
@@ -2720,6 +2742,19 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
         let Some(KeyAction::Nested(ctrl_w)) = config.keys.normal.get("Ctrl-w") else {
             panic!("default config should map Ctrl-w to window management actions");
         };
+
+        for (key, action) in [
+            ("h", Action::MoveWindowLeft),
+            ("j", Action::MoveWindowDown),
+            ("k", Action::MoveWindowUp),
+            ("l", Action::MoveWindowRight),
+            ("H", Action::MoveWindowToLeft),
+            ("J", Action::MoveWindowToBottom),
+            ("K", Action::MoveWindowToTop),
+            ("L", Action::MoveWindowToRight),
+        ] {
+            assert_eq!(ctrl_w.get(key), Some(&KeyAction::Single(action)));
+        }
 
         assert_eq!(
             ctrl_w.get("s"),

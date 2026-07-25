@@ -651,6 +651,42 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Action::MoveWindowRight,
         ),
         builtin(
+            "window.move_to_left",
+            "Move window to left edge",
+            "Window",
+            "Move the current split to the full-height left edge",
+            None,
+            &[],
+            Action::MoveWindowToLeft,
+        ),
+        builtin(
+            "window.move_to_bottom",
+            "Move window to bottom edge",
+            "Window",
+            "Move the current split to the full-width bottom edge",
+            None,
+            &[],
+            Action::MoveWindowToBottom,
+        ),
+        builtin(
+            "window.move_to_top",
+            "Move window to top edge",
+            "Window",
+            "Move the current split to the full-width top edge",
+            None,
+            &[],
+            Action::MoveWindowToTop,
+        ),
+        builtin(
+            "window.move_to_right",
+            "Move window to right edge",
+            "Window",
+            "Move the current split to the full-height right edge",
+            None,
+            &[],
+            Action::MoveWindowToRight,
+        ),
+        builtin(
             "window.balance",
             "Balance windows",
             "Window",
@@ -945,6 +981,10 @@ fn action_label(action: &Action) -> String {
         Action::MoveWindowDown => "Focus window below".to_string(),
         Action::MoveWindowUp => "Focus window above".to_string(),
         Action::MoveWindowRight => "Focus window right".to_string(),
+        Action::MoveWindowToLeft => "Move window to left edge".to_string(),
+        Action::MoveWindowToBottom => "Move window to bottom edge".to_string(),
+        Action::MoveWindowToTop => "Move window to top edge".to_string(),
+        Action::MoveWindowToRight => "Move window to right edge".to_string(),
         Action::ViewLogs => "View logs".to_string(),
         Action::ListPlugins => "List plugins".to_string(),
         Action::DumpBuffer => "Dump buffer".to_string(),
@@ -1069,6 +1109,61 @@ mod tests {
             .unwrap();
         assert_eq!(save.colon.as_deref(), Some(":w"));
         assert!(save.aliases.iter().any(|alias| alias == ":write"));
+    }
+
+    #[test]
+    fn palette_distinguishes_directional_window_focus_from_edge_movement() {
+        let entries = entries(&default_keys(), &[]);
+
+        for (move_id, title, shortcut, action, focus_id, focus_shortcut) in [
+            (
+                "window.move_to_left",
+                "Move window to left edge",
+                "Ctrl-w H",
+                Action::MoveWindowToLeft,
+                "window.left",
+                "Ctrl-w h",
+            ),
+            (
+                "window.move_to_bottom",
+                "Move window to bottom edge",
+                "Ctrl-w J",
+                Action::MoveWindowToBottom,
+                "window.down",
+                "Ctrl-w j",
+            ),
+            (
+                "window.move_to_top",
+                "Move window to top edge",
+                "Ctrl-w K",
+                Action::MoveWindowToTop,
+                "window.up",
+                "Ctrl-w k",
+            ),
+            (
+                "window.move_to_right",
+                "Move window to right edge",
+                "Ctrl-w L",
+                Action::MoveWindowToRight,
+                "window.right",
+                "Ctrl-w l",
+            ),
+        ] {
+            let movement = entries
+                .iter()
+                .find(|entry| entry.id == move_id)
+                .expect("window edge movement should appear in the command palette");
+            assert_eq!(movement.category, "Window");
+            assert_eq!(movement.title, title);
+            assert_eq!(movement.action, action);
+            assert!(movement.shortcuts.iter().any(|value| value == shortcut));
+
+            let focus = entries
+                .iter()
+                .find(|entry| entry.id == focus_id)
+                .expect("directional window focus should remain in the command palette");
+            assert!(focus.shortcuts.iter().any(|value| value == focus_shortcut));
+        }
     }
 
     #[test]
@@ -1262,6 +1357,30 @@ mod tests {
         assert!(hints
             .iter()
             .any(|hint| hint.key == "a" && hint.label == "Select all"));
+    }
+
+    #[test]
+    fn window_keymap_hints_distinguish_focus_from_edge_movement() {
+        let keys = default_keys();
+        let Some(KeyAction::Nested(window_keys)) = keys.normal.get("Ctrl-w") else {
+            panic!("expected the window management keymap");
+        };
+
+        let hints = keymap_hints(&["Ctrl-w".to_string()], window_keys);
+        for (key, label) in [
+            ("h", "Focus window left"),
+            ("H", "Move window to left edge"),
+            ("j", "Focus window below"),
+            ("J", "Move window to bottom edge"),
+            ("k", "Focus window above"),
+            ("K", "Move window to top edge"),
+            ("l", "Focus window right"),
+            ("L", "Move window to right edge"),
+        ] {
+            assert!(hints
+                .iter()
+                .any(|hint| hint.key == key && hint.label == label && !hint.is_group));
+        }
     }
 
     #[test]

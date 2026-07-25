@@ -71,7 +71,7 @@ the corresponding integration tests.
 | Unicode graphemes | **supported** | Cursoring, replacement, selection, paste, undo, and marks are tested with multi-codepoint graphemes. Rust-regex offsets are converted to character coordinates before editing. |
 | Empty buffers | **supported** | The synthetic editable line remains cursor-safe across insert, delete, render, and undo. |
 | Final line / trailing newline | **supported** | Both forms render and edit without exposing a phantom gutter line. |
-| Multi-window | **supported** | Active-buffer cursor, viewport, wrapping, gutter width, and focus-cycle state are window-aware. |
+| Multi-window | **supported** | Active-buffer cursor, viewport, wrapping, gutter width, and focus-cycle state are window-aware; `Ctrl-w H/J/K/L` move the active window to the corresponding outer edge. |
 | Multi-window Vim window command parity | **intentional difference** | Red supports its published `Ctrl-w` subset; arbitrary Vim layouts and every resizing command are not promised. |
 
 ## Release gate

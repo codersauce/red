@@ -22,6 +22,7 @@ use red::{
     preferences::PreferencesStore,
     theme::{Style, Theme},
     undo::EditOrigin,
+    window::SplitSnapshot,
 };
 use std::{
     env, fs,
@@ -5229,6 +5230,183 @@ async fn next_and_previous_window_cycle_through_focused_panels() {
         .await
         .unwrap();
     assert_eq!(harness.editor.test_focused_panel_id(), Some("tree"));
+}
+
+#[tokio::test]
+async fn shifted_window_chords_move_nested_splits_to_each_outer_edge() {
+    for (key, expected_position, expected_size) in [
+        ('H', (0, 0), (39, 22)),
+        ('J', (0, 11), (80, 11)),
+        ('K', (0, 0), (80, 10)),
+        ('L', (40, 0), (40, 22)),
+    ] {
+        let contents = (0..40)
+            .map(|line| format!("line {line:02}\n"))
+            .collect::<String>();
+        let buffer = Buffer::new(None, contents);
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness.execute_action(Action::SplitVertical).await.unwrap();
+        harness
+            .execute_action(Action::SplitHorizontal)
+            .await
+            .unwrap();
+        harness.set_viewport_cursor(2, 3, 3);
+        let cursor = harness.cursor_position();
+
+        harness
+            .execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('w'),
+                KeyModifiers::CONTROL,
+            )))
+            .await
+            .unwrap();
+        assert!(harness.is_waiting_for_key_sequence());
+        harness
+            .execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(key),
+                KeyModifiers::SHIFT,
+            )))
+            .await
+            .unwrap();
+
+        let (position, size) = harness.editor.test_active_window_bounds().unwrap();
+        assert_eq!((position.x, position.y), expected_position);
+        assert_eq!(size, expected_size);
+        assert_eq!(harness.window_count(), 3);
+        assert_eq!(harness.cursor_position(), cursor);
+        assert_eq!(harness.viewport_top(), 2);
+        assert!(!harness.is_waiting_for_key_sequence());
+
+        let snapshot = harness.editor.test_session_snapshot();
+        match (key, snapshot.window_layout.root) {
+            ('H', SplitSnapshot::Vertical { left, .. }) => {
+                assert!(matches!(left.as_ref(), SplitSnapshot::Window { .. }));
+            }
+            ('L', SplitSnapshot::Vertical { right, .. }) => {
+                assert!(matches!(right.as_ref(), SplitSnapshot::Window { .. }));
+            }
+            ('K', SplitSnapshot::Horizontal { top, .. }) => {
+                assert!(matches!(top.as_ref(), SplitSnapshot::Window { .. }));
+            }
+            ('J', SplitSnapshot::Horizontal { bottom, .. }) => {
+                assert!(matches!(bottom.as_ref(), SplitSnapshot::Window { .. }));
+            }
+            _ => panic!("shifted window chord did not create the expected outer split"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn lowercase_window_chords_preserve_split_topology_and_move_focus() {
+    for (key, preparation) in [
+        ('h', Some(Action::MoveWindowRight)),
+        ('j', Some(Action::MoveWindowUp)),
+        ('k', None),
+        ('l', None),
+    ] {
+        let buffer = Buffer::new(None, "first\nsecond\nthird\n".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness.execute_action(Action::SplitVertical).await.unwrap();
+        harness
+            .execute_action(Action::SplitHorizontal)
+            .await
+            .unwrap();
+        harness
+            .execute_action(Action::MoveWindowLeft)
+            .await
+            .unwrap();
+        harness
+            .execute_action(Action::SplitHorizontal)
+            .await
+            .unwrap();
+        if let Some(action) = preparation {
+            harness.execute_action(action).await.unwrap();
+        }
+        let before = harness.editor.test_session_snapshot().window_layout;
+
+        harness
+            .execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('w'),
+                KeyModifiers::CONTROL,
+            )))
+            .await
+            .unwrap();
+        harness
+            .execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(key),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+
+        let after = harness.editor.test_session_snapshot().window_layout;
+        assert_eq!(after.root, before.root);
+        assert_ne!(after.active_window_id, before.active_window_id);
+        assert_eq!(harness.window_count(), 4);
+    }
+}
+
+#[tokio::test]
+async fn moving_a_window_to_an_edge_preserves_both_side_panels() {
+    let buffer = Buffer::new(None, "first\nsecond\nthird\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+    harness
+        .execute_action(Action::SplitHorizontal)
+        .await
+        .unwrap();
+    add_tree_panel(&mut harness);
+    harness.editor.test_create_panel(
+        "right",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 20,
+            title: None,
+            composer: None,
+            surface: None,
+            border: None,
+            header_actions: Vec::new(),
+        },
+    );
+
+    harness
+        .execute_action(Action::MoveWindowToLeft)
+        .await
+        .unwrap();
+    let (left_position, left_size) = harness.editor.test_active_window_bounds().unwrap();
+    assert_eq!(left_position.x, 21);
+    assert_eq!(left_position.y, 0);
+    assert_eq!(left_size.1, 22);
+    assert!(left_position.x + left_size.0 <= 59);
+
+    harness
+        .execute_action(Action::MoveWindowToRight)
+        .await
+        .unwrap();
+    let (right_position, right_size) = harness.editor.test_active_window_bounds().unwrap();
+    assert_eq!(right_position.y, 0);
+    assert_eq!(right_size.1, 22);
+    assert_eq!(right_position.x + right_size.0, 59);
+    assert_eq!(harness.window_count(), 3);
+}
+
+#[tokio::test]
+async fn moving_a_single_window_to_an_edge_is_silent() {
+    for action in [
+        Action::MoveWindowToLeft,
+        Action::MoveWindowToBottom,
+        Action::MoveWindowToTop,
+        Action::MoveWindowToRight,
+    ] {
+        let mut harness = EditorHarness::with_content("abcdef");
+        let before = harness.editor.test_session_snapshot().window_layout;
+
+        harness.execute_action(action).await.unwrap();
+
+        assert_eq!(harness.editor.test_session_snapshot().window_layout, before);
+        assert_eq!(harness.last_error(), None);
+        assert_eq!(harness.window_count(), 1);
+    }
 }
 
 #[tokio::test]
