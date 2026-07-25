@@ -3606,7 +3606,7 @@ mod tests {
                         ],
                         "truncated": true
                     }])),
-                    Value::from_json(serde_json::json!(["."])),
+                    Value::from_json(serde_json::json!([".", "./src"])),
                     Value::from_json(serde_json::json!(["./main.rs"])),
                     Value::from_json(serde_json::json!([{
                         "path": "./src",
@@ -3618,11 +3618,23 @@ mod tests {
             )
             .unwrap()
             .to_json();
-        assert_eq!(rows[0]["right_segments"][0]["text"], "");
+        assert!(rows[0]["right_segments"].as_array().unwrap().is_empty());
         assert_eq!(rows[1]["segments"][0]["text"], "✂ ");
-        assert_eq!(rows[1]["right_segments"][0]["text"], "");
+        assert!(rows[1]["right_segments"].as_array().unwrap().is_empty());
+        assert_eq!(
+            rows[1]["segments"][2]["semantic"]["foreground"][0],
+            "symbolIcon.folderForeground"
+        );
+        assert_eq!(
+            rows[1]["segments"][3]["semantic"]["foreground"][0],
+            "gitDecoration.conflictingResourceForeground"
+        );
         assert_eq!(rows[2]["segments"][0]["text"], "✓ ");
         assert_eq!(rows[2]["segments"][2]["text"], " ");
+        assert_eq!(
+            rows[2]["segments"][3]["semantic"]["foreground"][0],
+            "gitDecoration.modifiedResourceForeground"
+        );
         assert!(rows[3]["path"].is_null());
 
         let error = host
@@ -3638,6 +3650,77 @@ mod tests {
                 .to_string()
                 .contains("unknown Neo-tree core operation"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn neotree_only_decorates_the_exact_ignored_path() {
+        let statuses = [
+            serde_json::json!({
+                "path": "src/.DS_Store",
+                "absolute_path": "/repo/src/.DS_Store",
+                "status": "ignored",
+            }),
+            serde_json::json!({
+                "path": "src/lsp/.DS_Store",
+                "absolute_path": "/repo/src/lsp/.DS_Store",
+                "status": "ignored",
+            }),
+            serde_json::json!({
+                "path": "target/",
+                "absolute_path": "/repo/target/",
+                "status": "ignored",
+            }),
+        ];
+        let status_index = crate::editor::git_status_index(&statuses, "/repo");
+        let mut host = RedHost::new(HashMap::new());
+        let status_entries = host
+            .call_neotree_core("status_entries", &[Value::from_json(status_index)])
+            .unwrap();
+
+        let rows = host
+            .call_neotree_core(
+                "build_rows",
+                &[
+                    Value::String("/repo".to_string()),
+                    Value::from_json(serde_json::json!([
+                        {
+                            "path": ".",
+                            "entries": [
+                                { "name": "src", "path": "./src", "kind": "directory" },
+                                { "name": "target", "path": "./target", "kind": "directory" }
+                            ],
+                            "truncated": false
+                        },
+                        {
+                            "path": "./src",
+                            "entries": [
+                                { "name": "lsp", "path": "./src/lsp", "kind": "directory" }
+                            ],
+                            "truncated": false
+                        }
+                    ])),
+                    Value::from_json(serde_json::json!([".", "./src"])),
+                    Value::from_json(serde_json::json!([])),
+                    Value::from_json(serde_json::json!([])),
+                    Value::String("/repo".to_string()),
+                    status_entries,
+                ],
+            )
+            .unwrap()
+            .to_json();
+
+        assert!(rows[0]["right_segments"].as_array().unwrap().is_empty());
+        assert!(rows[1]["right_segments"].as_array().unwrap().is_empty());
+        assert!(rows[2]["right_segments"].as_array().unwrap().is_empty());
+        assert_eq!(
+            rows[2]["segments"].as_array().unwrap().last().unwrap()["semantic"]["foreground"][0],
+            "symbolIcon.folderForeground"
+        );
+        assert_eq!(rows[3]["right_segments"][0]["text"], "");
+        assert_eq!(
+            rows[3]["segments"].as_array().unwrap().last().unwrap()["semantic"]["foreground"][0],
+            "gitDecoration.ignoredResourceForeground"
         );
     }
 
@@ -9751,7 +9834,7 @@ mod tests {
             _ => panic!("expected neotree panel update"),
         };
         assert_eq!(rows.len(), 122);
-        assert_eq!(rows[0].right_segments[0].text, "");
+        assert!(rows[0].right_segments.is_empty());
         assert!(rows[1..121]
             .iter()
             .all(|row| row.right_segments[0].text == ""));
@@ -9890,7 +9973,7 @@ mod tests {
             _ => panic!("expected neotree panel update"),
         };
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].right_segments[0].text, "");
+        assert!(rows[0].right_segments.is_empty());
         assert_eq!(rows[1].right_segments[0].text, "");
     }
 

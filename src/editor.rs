@@ -20133,6 +20133,11 @@ pub(crate) fn git_status_index(statuses: &[Value], root: &str) -> Value {
             continue;
         };
         let path = normalize_plugin_path(path);
+        let path = if path == "/" {
+            path.as_str()
+        } else {
+            path.trim_end_matches('/')
+        };
         let Some(relative) = path.strip_prefix(&root_prefix) else {
             if path == root {
                 prefer_git_status(&mut index, root, status);
@@ -20140,8 +20145,11 @@ pub(crate) fn git_status_index(statuses: &[Value], root: &str) -> Value {
             continue;
         };
 
-        prefer_git_status(&mut index, &path, status);
-        prefer_git_status(&mut index, root, status);
+        prefer_git_status(&mut index, path, status);
+        // An ignored child does not make an otherwise tracked ancestor ignored.
+        if status == "ignored" {
+            continue;
+        }
         let mut parent = relative;
         while let Some((ancestor, _)) = parent.rsplit_once('/') {
             prefer_git_status(&mut index, &format!("{root_prefix}{ancestor}"), status);
@@ -20165,11 +20173,11 @@ fn prefer_git_status(index: &mut serde_json::Map<String, Value>, path: &str, sta
 fn git_status_rank(status: &str) -> u8 {
     match status {
         "conflict" => 0,
-        "renamed" => 1,
-        "deleted" => 2,
+        "untracked" => 1,
+        "modified" => 2,
         "added" => 3,
-        "modified" => 4,
-        "untracked" => 5,
+        "deleted" => 4,
+        "renamed" => 5,
         "ignored" => 6,
         "staged" => 7,
         _ => 8,
@@ -23950,6 +23958,8 @@ mod test {
             ("src/nested/renamed.rs", "renamed"),
             ("src/nested/conflict.rs", "conflict"),
             ("vendor/cache.rs", "ignored"),
+            ("mixed/modified.rs", "modified"),
+            ("mixed/untracked.rs", "untracked"),
         ]
         .into_iter()
         .map(|(path, status)| {
@@ -23968,13 +23978,43 @@ mod test {
 
         let index = git_status_index(&statuses, "/repo/");
 
-        assert_eq!(index["/repo"], "conflict");
+        assert!(index.get("/repo").is_none());
         assert_eq!(index["/repo/src"], "conflict");
         assert_eq!(index["/repo/src/nested"], "conflict");
         assert_eq!(index["/repo/src/nested/staged.rs"], "staged");
         assert_eq!(index["/repo/src/nested/renamed.rs"], "renamed");
-        assert_eq!(index["/repo/vendor"], "ignored");
+        assert_eq!(index["/repo/vendor/cache.rs"], "ignored");
+        assert!(index.get("/repo/vendor").is_none());
+        assert_eq!(index["/repo/mixed"], "untracked");
         assert!(index.get("/other/outside.rs").is_none());
+    }
+
+    #[test]
+    fn git_status_index_does_not_roll_ignored_files_up_to_tracked_directories() {
+        let statuses = [
+            ("src/.DS_Store", "/repo/src/.DS_Store"),
+            ("src/lsp/.DS_Store", "/repo/src/lsp/.DS_Store"),
+            ("target/", "/repo/target/"),
+        ]
+        .into_iter()
+        .map(|(path, absolute_path)| {
+            json!({
+                "path": path,
+                "absolute_path": absolute_path,
+                "status": "ignored",
+            })
+        })
+        .collect::<Vec<_>>();
+
+        let index = git_status_index(&statuses, "/repo");
+
+        assert_eq!(index["/repo/src/.DS_Store"], "ignored");
+        assert_eq!(index["/repo/src/lsp/.DS_Store"], "ignored");
+        assert_eq!(index["/repo/target"], "ignored");
+        assert!(index.get("/repo").is_none());
+        assert!(index.get("/repo/src").is_none());
+        assert!(index.get("/repo/src/lsp").is_none());
+        assert!(index.get("/repo/target/").is_none());
     }
 
     #[test]
@@ -23987,7 +24027,7 @@ mod test {
 
         let index = git_status_index(&statuses, "/");
 
-        assert_eq!(index["/"], "modified");
+        assert!(index.get("/").is_none());
         assert_eq!(index["/src"], "modified");
         assert_eq!(index["/src/main.rs"], "modified");
         assert!(index.get("").is_none());
@@ -27911,7 +27951,8 @@ while True:
         std::fs::create_dir_all(root.join(".git/objects")).unwrap();
         std::fs::create_dir_all(root.join(".github")).unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join(".gitignore"), "/target\n").unwrap();
+        std::fs::write(root.join(".DS_Store"), "finder metadata").unwrap();
+        std::fs::write(root.join(".gitignore"), "/target\n.DS_Store\n").unwrap();
 
         let listing = directory_listing(&root.to_string_lossy());
         let names = listing["entries"]
@@ -27924,6 +27965,7 @@ while True:
         assert!(names.contains(&"src"));
         assert!(names.contains(&".github"));
         assert!(!names.contains(&"target"));
+        assert!(!names.contains(&".DS_Store"));
         assert!(!names.contains(&".git"));
         assert_eq!(listing["truncated"], false);
 

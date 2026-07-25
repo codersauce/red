@@ -53,9 +53,20 @@ pub fn style_keys(value: String) -> [String] {
     }
 }
 
-pub fn entry_style_keys(value: String, directory: bool) -> [String] {
-    if let GitStatus::Ignored = status(value) {
+pub fn entry_icon_style_keys(value: String, directory: bool) -> [String] {
+    if value == "ignored" {
         return ["gitDecoration.ignoredResourceForeground"];
+    }
+    if directory {
+        return ["symbolIcon.folderForeground", "sideBarTitle.foreground", "list.highlightForeground"];
+    }
+    ["sideBar.foreground"]
+}
+
+pub fn entry_name_style_keys(value: String, directory: bool) -> [String] {
+    let git_style = style_keys(value);
+    if !git_style.is_empty() {
+        return git_style;
     }
     if directory {
         return ["symbolIcon.folderForeground", "sideBarTitle.foreground", "list.highlightForeground"];
@@ -77,7 +88,9 @@ fn maps_git_statuses_to_semantic_decorations() {
     assert(symbol("unknown").is_empty());
     assert(style_keys("renamed")[0] == "gitDecoration.renamedResourceForeground");
     assert(style_keys("unknown").is_empty());
-    assert(entry_style_keys("ignored", true)[0] == "gitDecoration.ignoredResourceForeground");
+    assert(entry_icon_style_keys("ignored", true)[0] == "gitDecoration.ignoredResourceForeground");
+    assert(entry_icon_style_keys("modified", true)[0] == "symbolIcon.folderForeground");
+    assert(entry_name_style_keys("modified", true)[0] == "gitDecoration.modifiedResourceForeground");
     assert(is_conflict("conflict"));
     assert(!is_conflict("modified"));
 }

@@ -92,7 +92,7 @@ pub fn build_rows(
             segment(" ", ["symbolIcon.folderForeground", "sideBarTitle.foreground", "list.highlightForeground"], false),
             segment(path::name(cwd), ["sideBarTitle.foreground", "symbolIcon.folderForeground", "list.highlightForeground"], true),
         ],
-        right_segments: status_segments(root_status),
+        right_segments: visible_status_segments(root_status, true, expanded.contains(root)),
     }];
 
     if expanded.contains(root) {
@@ -137,16 +137,17 @@ fn append_rows(
         for prefix in branch_prefix(ancestors, last) {
             segments.push(prefix);
         }
-        let style = status::entry_style_keys(status, directory);
-        segments.push(segment(entry_icon(entry.name, directory, open) + " ", style, false));
-        segments.push(segment(entry.name, style, false));
+        let icon_style = status::entry_icon_style_keys(status, directory);
+        let name_style = status::entry_name_style_keys(status, directory);
+        segments.push(segment(entry_icon(entry.name, directory, open) + " ", icon_style, false));
+        segments.push(segment(entry.name, name_style, false));
         rows.push(PanelRow {
             id: entry.path,
             path: Some(entry.path),
             expanded: open,
             kind: entry.kind,
             segments: segments,
-            right_segments: status_segments(status),
+            right_segments: visible_status_segments(status, directory, open),
         });
 
         if open {
@@ -278,6 +279,13 @@ fn status_segments(value: String) -> [PanelSegment] {
     [segment(symbol, status::style_keys(value), status::is_conflict(value))]
 }
 
+fn visible_status_segments(value: String, directory: bool, expanded: bool) -> [PanelSegment] {
+    if directory && expanded {
+        return [];
+    }
+    status_segments(value)
+}
+
 fn truncation_row(id: String, text: String) -> PanelRow {
     PanelRow {
         id: id,
@@ -324,9 +332,11 @@ fn renders_typed_rows_with_status_and_selection_markers() {
     );
 
     assert(rows.len() == 3);
-    assert(rows[0].right_segments[0].text == "");
+    assert(rows[0].right_segments.is_empty());
     assert_msg(rows[1].segments[0].text == "✂ ", "unexpected first row marker for " + rows[1].id + ": " + rows[1].segments[0].text);
     assert(rows[1].right_segments[0].text == "");
+    assert(rows[1].segments[2].semantic.foreground[0] == "symbolIcon.folderForeground");
+    assert(rows[1].segments[3].semantic.foreground[0] == "gitDecoration.conflictingResourceForeground");
     assert(rows[2].segments[0].text == "✓ ");
     assert(rows[2].segments[2].text == " ");
 }
