@@ -143,7 +143,9 @@ The command palette includes descriptions, effective keymaps, and accepted
 ## Windows and buffers
 
 - `Ctrl-w s` and `Ctrl-w v` split horizontally and vertically.
-- `Ctrl-w h/j/k/l` move between windows.
+- `Ctrl-w h/j/k/l` move focus between windows.
+- `Ctrl-w H/J/K/L` move the current window to the left, bottom, top, or right
+  outer edge.
 - `Ctrl-w w` selects the next window.
 - `Ctrl-w c` closes a window.
 - `Ctrl-w =`, `Ctrl-w _`, and `Ctrl-w o` balance, maximize, or keep only the

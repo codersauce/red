@@ -30,7 +30,7 @@ impl WindowId {
     }
 }
 
-/// Spatial direction used for window navigation and split resizing.
+/// Spatial direction used for window navigation, movement, and split resizing.
 #[derive(Debug, Clone, Copy)]
 pub enum Direction {
     /// Toward smaller terminal rows.
@@ -317,6 +317,194 @@ mod tests {
         }
         assert!(manager.window_at_index(windows.len()).is_none());
     }
+
+    fn nested_window_manager() -> WindowManager {
+        let mut manager = WindowManager::new(0, (80, 26));
+        manager.split_vertical(1).unwrap();
+        manager.split_horizontal(2).unwrap();
+        manager.set_active(0);
+        manager.split_horizontal(3).unwrap();
+
+        let Split::Vertical { right, .. } = &mut manager.root else {
+            panic!("expected a vertical outer split");
+        };
+        let Split::Horizontal { ratio, .. } = right.as_mut() else {
+            panic!("expected a horizontal right-hand split");
+        };
+        *ratio = 0.3;
+        manager.resize((80, 26));
+        manager
+    }
+
+    fn contains_split_ratio(split: &Split, expected: f32) -> bool {
+        match split {
+            Split::Window(_) => false,
+            Split::Horizontal { top, bottom, ratio } => {
+                (*ratio - expected).abs() < f32::EPSILON
+                    || contains_split_ratio(top, expected)
+                    || contains_split_ratio(bottom, expected)
+            }
+            Split::Vertical { left, right, ratio } => {
+                (*ratio - expected).abs() < f32::EPSILON
+                    || contains_split_ratio(left, expected)
+                    || contains_split_ratio(right, expected)
+            }
+        }
+    }
+
+    #[test]
+    fn move_window_to_each_edge_preserves_identity_state_and_unaffected_ratios() {
+        for direction in [
+            Direction::Left,
+            Direction::Right,
+            Direction::Up,
+            Direction::Down,
+        ] {
+            let mut manager = nested_window_manager();
+            let original_ids = manager
+                .windows()
+                .into_iter()
+                .map(|window| window.id)
+                .collect::<Vec<_>>();
+            let window = manager.active_window_mut().unwrap();
+            window.vtop = 7;
+            window.vleft = 4;
+            window.skipcol = 3;
+            window.wrap = false;
+            window.cx = 9;
+            window.cy = 2;
+            window.cursor_goal = CursorGoal::DisplayCol(11);
+            window.vx = 5;
+            let original_id = window.id;
+
+            assert!(manager.move_window_to_edge(direction).is_some());
+
+            let moved = manager.active_window().unwrap();
+            assert_eq!(moved.id, original_id);
+            assert_eq!(moved.buffer_index, 3);
+            assert_eq!(moved.vtop, 7);
+            assert_eq!(moved.vleft, 4);
+            assert_eq!(moved.skipcol, 3);
+            assert!(!moved.wrap);
+            assert_eq!(moved.cx, 9);
+            assert_eq!(moved.cy, 2);
+            assert_eq!(moved.cursor_goal, CursorGoal::DisplayCol(11));
+            assert_eq!(moved.vx, 5);
+            assert!(moved.active);
+
+            match direction {
+                Direction::Left => {
+                    assert_eq!(moved.position, Point::new(0, 0));
+                    assert_eq!(moved.size, (39, 24));
+                }
+                Direction::Right => {
+                    assert_eq!(moved.position, Point::new(40, 0));
+                    assert_eq!(moved.size, (40, 24));
+                }
+                Direction::Up => {
+                    assert_eq!(moved.position, Point::new(0, 0));
+                    assert_eq!(moved.size, (80, 11));
+                }
+                Direction::Down => {
+                    assert_eq!(moved.position, Point::new(0, 12));
+                    assert_eq!(moved.size, (80, 12));
+                }
+            }
+
+            let mut remaining_ids = manager
+                .windows()
+                .into_iter()
+                .map(|window| window.id)
+                .collect::<Vec<_>>();
+            let mut expected_ids = original_ids;
+            remaining_ids.sort_unstable();
+            expected_ids.sort_unstable();
+            assert_eq!(remaining_ids, expected_ids);
+            assert_eq!(manager.window_count(), 4);
+            assert!(contains_split_ratio(&manager.root, 0.3));
+            assert_eq!(
+                manager.window_index(original_id),
+                Some(manager.active_window_id())
+            );
+        }
+    }
+
+    #[test]
+    fn moving_a_single_window_to_any_edge_is_a_no_op() {
+        for direction in [
+            Direction::Left,
+            Direction::Right,
+            Direction::Up,
+            Direction::Down,
+        ] {
+            let mut manager = WindowManager::new(0, (80, 26));
+            let before = manager.snapshot();
+
+            assert!(manager.move_window_to_edge(direction).is_none());
+            assert_eq!(manager.snapshot(), before);
+        }
+    }
+
+    #[test]
+    fn moving_a_window_already_at_the_full_edge_is_a_no_op() {
+        for direction in [
+            Direction::Left,
+            Direction::Right,
+            Direction::Up,
+            Direction::Down,
+        ] {
+            let mut manager = nested_window_manager();
+            assert!(manager.move_window_to_edge(direction).is_some());
+            let before = manager.snapshot();
+
+            assert!(manager.move_window_to_edge(direction).is_none());
+            assert_eq!(manager.snapshot(), before);
+        }
+    }
+
+    #[test]
+    fn move_window_to_edge_preserves_nonzero_layout_origin() {
+        let mut manager = nested_window_manager();
+        manager.resize_with_origin(Point::new(20, 2), (60, 28));
+
+        assert!(manager.move_window_to_edge(Direction::Left).is_some());
+
+        let moved = manager.active_window().unwrap();
+        assert_eq!(moved.position, Point::new(20, 2));
+        assert_eq!(moved.size, (29, 26));
+        assert!(manager.windows().into_iter().all(|window| {
+            window.position.x >= 20
+                && window.position.x + window.size.0 <= 80
+                && window.position.y >= 2
+                && window.position.y + window.size.1 <= 28
+        }));
+    }
+
+    #[test]
+    fn moved_window_layout_round_trips_through_snapshot() {
+        let mut manager = nested_window_manager();
+        manager.active_window_mut().unwrap().vtop = 12;
+        manager.move_window_to_edge(Direction::Right).unwrap();
+        let snapshot = manager.snapshot();
+        let buffer_map = HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3)]);
+
+        let restored = WindowManager::from_snapshot(&snapshot, (80, 26), &buffer_map).unwrap();
+
+        assert_eq!(restored.snapshot(), snapshot);
+        assert_eq!(restored.active_window().unwrap().buffer_index, 3);
+        assert_eq!(restored.active_window().unwrap().vtop, 12);
+        assert!(contains_split_ratio(&restored.root, 0.3));
+    }
+
+    #[test]
+    fn moving_windows_in_a_tiny_layout_does_not_panic() {
+        let mut manager = WindowManager::new(0, (2, 3));
+        manager.split_vertical(1).unwrap();
+
+        assert!(manager.move_window_to_edge(Direction::Up).is_some());
+        assert_eq!(manager.window_count(), 2);
+        assert!(manager.active_window().unwrap().active);
+    }
 }
 
 /// Represents a split in the window layout
@@ -480,6 +668,73 @@ impl Split {
                     (available_width - split_x, size.1),
                 );
             }
+        }
+    }
+
+    /// Removes a leaf without recreating windows or changing surviving split ratios.
+    fn detach_window(self, target_id: WindowId) -> Result<(Option<Self>, Window), Self> {
+        match self {
+            Self::Window(window) => {
+                if window.id == target_id {
+                    Ok((None, window))
+                } else {
+                    Err(Self::Window(window))
+                }
+            }
+            Self::Horizontal { top, bottom, ratio } => match (*top).detach_window(target_id) {
+                Ok((Some(top), window)) => Ok((
+                    Some(Self::Horizontal {
+                        top: Box::new(top),
+                        bottom,
+                        ratio,
+                    }),
+                    window,
+                )),
+                Ok((None, window)) => Ok((Some(*bottom), window)),
+                Err(top) => match (*bottom).detach_window(target_id) {
+                    Ok((Some(bottom), window)) => Ok((
+                        Some(Self::Horizontal {
+                            top: Box::new(top),
+                            bottom: Box::new(bottom),
+                            ratio,
+                        }),
+                        window,
+                    )),
+                    Ok((None, window)) => Ok((Some(top), window)),
+                    Err(bottom) => Err(Self::Horizontal {
+                        top: Box::new(top),
+                        bottom: Box::new(bottom),
+                        ratio,
+                    }),
+                },
+            },
+            Self::Vertical { left, right, ratio } => match (*left).detach_window(target_id) {
+                Ok((Some(left), window)) => Ok((
+                    Some(Self::Vertical {
+                        left: Box::new(left),
+                        right,
+                        ratio,
+                    }),
+                    window,
+                )),
+                Ok((None, window)) => Ok((Some(*right), window)),
+                Err(left) => match (*right).detach_window(target_id) {
+                    Ok((Some(right), window)) => Ok((
+                        Some(Self::Vertical {
+                            left: Box::new(left),
+                            right: Box::new(right),
+                            ratio,
+                        }),
+                        window,
+                    )),
+                    Ok((None, window)) => Ok((Some(left), window)),
+                    Err(right) => Err(Self::Vertical {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                        ratio,
+                    }),
+                },
+            },
         }
     }
 
@@ -842,6 +1097,92 @@ impl WindowManager {
         self.set_active(self.active_window_id);
         log!("Active window id after split: {}", self.active_window_id);
 
+        Some(())
+    }
+
+    /// Moves the active window to the requested full-height or full-width outer edge.
+    ///
+    /// Returns `None` when there is only one window or the active window already
+    /// occupies the requested edge.
+    pub fn move_window_to_edge(&mut self, direction: Direction) -> Option<()> {
+        let active_window = self.active_window()?;
+        let active_id = active_window.id;
+
+        let already_at_edge = match (&self.root, direction) {
+            (Split::Window(_), _) => true,
+            (Split::Vertical { left, .. }, Direction::Left) => {
+                matches!(left.as_ref(), Split::Window(window) if window.id == active_id)
+            }
+            (Split::Vertical { right, .. }, Direction::Right) => {
+                matches!(right.as_ref(), Split::Window(window) if window.id == active_id)
+            }
+            (Split::Horizontal { top, .. }, Direction::Up) => {
+                matches!(top.as_ref(), Split::Window(window) if window.id == active_id)
+            }
+            (Split::Horizontal { bottom, .. }, Direction::Down) => {
+                matches!(bottom.as_ref(), Split::Window(window) if window.id == active_id)
+            }
+            _ => false,
+        };
+        if already_at_edge {
+            return None;
+        }
+
+        let windows = self.root.windows();
+        let origin_x = windows.iter().map(|window| window.position.x).min()?;
+        let origin_y = windows.iter().map(|window| window.position.y).min()?;
+        let max_x = windows
+            .iter()
+            .map(|window| window.position.x.saturating_add(window.size.0))
+            .max()?;
+        let max_y = windows
+            .iter()
+            .map(|window| window.position.y.saturating_add(window.size.1))
+            .max()?;
+        let origin = Point::new(origin_x, origin_y);
+        let size = (
+            max_x.saturating_sub(origin_x),
+            max_y.saturating_sub(origin_y),
+        );
+
+        let placeholder = Split::Window(active_window.clone());
+        let root = std::mem::replace(&mut self.root, placeholder);
+        let (remaining, window) = match root.detach_window(active_id) {
+            Ok((Some(remaining), window)) => (remaining, window),
+            Ok((None, window)) => {
+                self.root = Split::Window(window);
+                return None;
+            }
+            Err(root) => {
+                self.root = root;
+                return None;
+            }
+        };
+
+        self.root = match direction {
+            Direction::Left => Split::Vertical {
+                left: Box::new(Split::Window(window)),
+                right: Box::new(remaining),
+                ratio: 0.5,
+            },
+            Direction::Right => Split::Vertical {
+                left: Box::new(remaining),
+                right: Box::new(Split::Window(window)),
+                ratio: 0.5,
+            },
+            Direction::Up => Split::Horizontal {
+                top: Box::new(Split::Window(window)),
+                bottom: Box::new(remaining),
+                ratio: 0.5,
+            },
+            Direction::Down => Split::Horizontal {
+                top: Box::new(remaining),
+                bottom: Box::new(Split::Window(window)),
+                ratio: 0.5,
+            },
+        };
+        self.root.layout(origin, size);
+        self.set_active(self.window_index(active_id)?);
         Some(())
     }
 

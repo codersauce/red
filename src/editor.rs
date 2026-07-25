@@ -1455,6 +1455,10 @@ pub enum Action {
     MoveWindowDown,
     MoveWindowLeft,
     MoveWindowRight,
+    MoveWindowToLeft,
+    MoveWindowToBottom,
+    MoveWindowToTop,
+    MoveWindowToRight,
     ResizeWindowUp(usize),
     ResizeWindowDown(usize),
     ResizeWindowLeft(usize),
@@ -2422,6 +2426,13 @@ struct SearchMatchCache {
     matches: Arc<[SearchMatch]>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct WindowLayoutEventSnapshot {
+    id: WindowId,
+    position: Point,
+    size: (usize, usize),
+}
+
 #[derive(Debug, Clone)]
 struct EditorEventSnapshot {
     mode: Mode,
@@ -2435,7 +2446,7 @@ struct EditorEventSnapshot {
     height: usize,
     buffer_index: usize,
     window_id: Option<WindowId>,
-    window_ids: Vec<WindowId>,
+    windows: Vec<WindowLayoutEventSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -4642,11 +4653,15 @@ impl Editor {
             height,
             buffer_index: self.buffer_manager.active_index(),
             window_id: self.window_manager.active_stable_window_id(),
-            window_ids: self
+            windows: self
                 .window_manager
                 .windows()
                 .into_iter()
-                .map(|window| window.id)
+                .map(|window| WindowLayoutEventSnapshot {
+                    id: window.id,
+                    position: window.position,
+                    size: window.size,
+                })
                 .collect(),
         }
     }
@@ -4674,7 +4689,7 @@ impl Editor {
         cause: &str,
     ) -> anyhow::Result<()> {
         let after = self.event_snapshot();
-        perf::gauge_max("plugin_window_count", after.window_ids.len() as u64);
+        perf::gauge_max("plugin_window_count", after.windows.len() as u64);
         let cursor_changed = before.cx != after.cx
             || before.y != after.y
             || before.vtop != after.vtop
@@ -4686,11 +4701,11 @@ impl Editor {
             || before.width != after.width
             || before.height != after.height
             || before.buffer_index != after.buffer_index;
-        let windows_changed = before.window_ids != after.window_ids
+        let layout_changed = before.windows != after.windows
             || before.window_id != after.window_id
-            || before.buffer_index != after.buffer_index
             || before.width != after.width
             || before.height != after.height;
+        let windows_changed = layout_changed || before.buffer_index != after.buffer_index;
         self.refresh_plugin_snapshots(
             runtime,
             cursor_changed || viewport_changed,
@@ -4698,11 +4713,15 @@ impl Editor {
             false,
         )?;
 
-        let current_window_ids = after.window_ids.iter().copied().collect::<HashSet<_>>();
-        for window_id in before
-            .window_ids
+        let current_window_ids = after
+            .windows
             .iter()
-            .copied()
+            .map(|window| window.id)
+            .collect::<HashSet<_>>();
+        for window_id in before
+            .windows
+            .iter()
+            .map(|window| window.id)
             .filter(|window_id| !current_window_ids.contains(window_id))
         {
             self.window_bar_manager.close_window(window_id);
@@ -4732,11 +4751,7 @@ impl Editor {
                 .await?;
         }
 
-        if before.window_ids != after.window_ids
-            || before.window_id != after.window_id
-            || before.width != after.width
-            || before.height != after.height
-        {
+        if layout_changed {
             let mut payload = self.plugin_windows_payload();
             if let Some(object) = payload.as_object_mut() {
                 object.insert("cause".to_string(), json!(cause));
@@ -15199,6 +15214,34 @@ impl Editor {
                 self.move_window_in_direction(crate::window::Direction::Right, buffer)
                     .await?;
             }
+            Action::MoveWindowToLeft => {
+                if self.update_window_layout(|windows| {
+                    windows.move_window_to_edge(crate::window::Direction::Left)
+                }) {
+                    self.render(buffer)?;
+                }
+            }
+            Action::MoveWindowToBottom => {
+                if self.update_window_layout(|windows| {
+                    windows.move_window_to_edge(crate::window::Direction::Down)
+                }) {
+                    self.render(buffer)?;
+                }
+            }
+            Action::MoveWindowToTop => {
+                if self.update_window_layout(|windows| {
+                    windows.move_window_to_edge(crate::window::Direction::Up)
+                }) {
+                    self.render(buffer)?;
+                }
+            }
+            Action::MoveWindowToRight => {
+                if self.update_window_layout(|windows| {
+                    windows.move_window_to_edge(crate::window::Direction::Right)
+                }) {
+                    self.render(buffer)?;
+                }
+            }
             Action::ResizeWindowUp(amount) => {
                 if self.update_window_layout(|windows| {
                     windows.resize_window(crate::window::Direction::Up, *amount)
@@ -22617,6 +22660,44 @@ mod test {
         drain_plugin_requests();
     }
 
+    async fn install_window_event_recorder(editor: &mut Editor, runtime: &mut Runtime) {
+        drain_plugin_requests();
+        let plugin_path = std::env::temp_dir().join(format!(
+            "red-window-event-recorder-{}.hk",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &plugin_path,
+            r#"
+                pub fn activate() {
+                    red::on("window:layout_changed", layout_changed);
+                    red::on("window:closed", window_closed);
+                    red::on("window:focused", window_focused);
+                }
+
+                fn layout_changed(event: Json) {
+                    red::execute("Print", "window:layout_changed");
+                }
+
+                fn window_closed(event: Json) {
+                    red::execute("Print", "window:closed");
+                }
+
+                fn window_focused(event: Json) {
+                    red::execute("Print", "window:focused");
+                }
+            "#,
+        )
+        .unwrap();
+
+        editor.plugin_registry.add(
+            "window_event_recorder",
+            plugin_path.to_string_lossy().as_ref(),
+        );
+        editor.plugin_registry.initialize(runtime).await.unwrap();
+        drain_plugin_requests();
+    }
+
     async fn install_theme_probe(editor: &mut Editor, runtime: &mut Runtime) {
         drain_plugin_requests();
         let plugin_path =
@@ -27490,6 +27571,68 @@ while True:
         let content_row = render_row(&render_buffer, 1);
         assert!(content_row.contains("1 hello"), "{content_row:?}");
         assert_eq!(editor.render_cursor_position().map(|(_, y)| y), Some(1));
+    }
+
+    #[tokio::test]
+    async fn moving_window_to_edge_refreshes_layout_without_closing_or_refocusing_it() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        let mut editor = test_editor(80, 24);
+        editor.window_manager.split_vertical(0).unwrap();
+        editor.window_manager.set_active(0);
+        editor.window_manager.split_vertical(0).unwrap();
+        editor.window_manager.set_active(0);
+
+        let mut layout = editor.window_manager.snapshot();
+        let crate::window::SplitSnapshot::Vertical { left, ratio, .. } = &mut layout.root else {
+            panic!("expected a vertical outer split");
+        };
+        *ratio = 0.75;
+        let crate::window::SplitSnapshot::Vertical { ratio, .. } = left.as_mut() else {
+            panic!("expected a nested vertical split");
+        };
+        *ratio = 0.675;
+        editor.window_manager =
+            WindowManager::from_snapshot(&layout, (80, 24), &HashMap::from([(0, 0)])).unwrap();
+        editor.sync_with_window();
+        install_test_window_bar(&mut editor);
+
+        let mut runtime = Runtime::new();
+        install_window_event_recorder(&mut editor, &mut runtime).await;
+        let before = editor.event_snapshot();
+        let before_ids = before
+            .windows
+            .iter()
+            .map(|window| window.id)
+            .collect::<Vec<_>>();
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+
+        editor
+            .execute(&Action::MoveWindowToLeft, &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        let after = editor.event_snapshot();
+        let after_ids = after
+            .windows
+            .iter()
+            .map(|window| window.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(after.window_id, before.window_id);
+        assert_eq!(after.width, before.width);
+        assert_eq!(after.height, before.height);
+        assert_eq!(after_ids, before_ids);
+        assert_ne!(after.windows, before.windows);
+        assert_eq!(
+            collect_print_requests(),
+            vec!["window:layout_changed".to_string()]
+        );
+        assert_eq!(
+            editor
+                .window_bar_manager
+                .reserved_top_height(after.window_id.unwrap()),
+            1
+        );
     }
 
     #[tokio::test]
