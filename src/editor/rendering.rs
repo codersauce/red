@@ -260,7 +260,12 @@ impl Editor {
         // Startup splash over the pristine scratch window (docs/SPLASH.md)
         self.render_splash(buffer);
 
-        self.panel_manager.render(buffer, &self.theme);
+        self.panel_manager.render_with_highlighter(
+            buffer,
+            &self.theme,
+            &mut self.highlighter,
+            self.config.window_borders_ascii,
+        );
 
         // Render global UI elements
         let chrome_span = super::perf::PerfSpan::start("render:chrome");
@@ -2023,26 +2028,38 @@ impl Editor {
         }
     }
 
+    pub(crate) fn active_cursor_shape(&self) -> CursorShape {
+        if self.is_waiting_for_key_sequence() {
+            return self.config.cursor.waiting;
+        }
+
+        let mode = if let Some(dialog) = self.current_dialog.as_ref() {
+            dialog.cursor_mode().unwrap_or(self.mode)
+        } else {
+            self.panel_manager
+                .focused_text_panel_cursor_mode()
+                .unwrap_or(self.mode)
+        };
+
+        match mode {
+            Mode::Normal => self.config.cursor.normal,
+            Mode::Command => self.config.cursor.command,
+            Mode::Insert => self.config.cursor.insert,
+            Mode::Search => self.config.cursor.search,
+            Mode::Visual => self.config.cursor.visual,
+            Mode::VisualLine => self.config.cursor.visual_line,
+            Mode::VisualBlock => self.config.cursor.visual_block,
+        }
+    }
+
     fn set_cursor_style(&mut self) -> anyhow::Result<()> {
         if !self.terminal_output_enabled {
             return Ok(());
         }
 
         self.queue_theme_cursor_color()?;
-        let shape = if self.is_waiting_for_key_sequence() {
-            self.config.cursor.waiting
-        } else {
-            match self.mode {
-                Mode::Normal => self.config.cursor.normal,
-                Mode::Command => self.config.cursor.command,
-                Mode::Insert => self.config.cursor.insert,
-                Mode::Search => self.config.cursor.search,
-                Mode::Visual => self.config.cursor.visual,
-                Mode::VisualLine => self.config.cursor.visual_line,
-                Mode::VisualBlock => self.config.cursor.visual_block,
-            }
-        };
-        self.stdout.queue(cursor_style_for_shape(shape))?;
+        self.stdout
+            .queue(cursor_style_for_shape(self.active_cursor_shape()))?;
 
         Ok(())
     }
@@ -2072,9 +2089,11 @@ mod tests {
         config::Config,
         editor::display_layout::LineSegment,
         lsp::{LspManager, Position, Range},
-        plugin::{Decoration, DecorationAnchor},
+        plugin::{Decoration, DecorationAnchor, PanelConfig, PanelSide, TextPanelComposerConfig},
         theme::Theme,
+        ui::AgentComposer,
     };
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
     fn diagnostic(message: &str) -> Diagnostic {
         Diagnostic {
@@ -2126,6 +2145,146 @@ mod tests {
             repeat_linebreak: false,
             only_whitespace: false,
         }
+    }
+
+    #[test]
+    fn floating_agent_composer_uses_the_configured_cursor_for_its_own_mode() {
+        let mut config = Config::default();
+        config.cursor.normal = CursorShape::SteadyBlock;
+        config.cursor.insert = CursorShape::BlinkingBar;
+        config.cursor.visual = CursorShape::BlinkingUnderscore;
+        config.cursor.waiting = CursorShape::SteadyUnderscore;
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "background editor".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 40, 12, config, Theme::default(), vec![buffer]).unwrap();
+
+        assert_eq!(editor.mode, Mode::Normal);
+        assert_eq!(editor.active_cursor_shape(), CursorShape::SteadyBlock);
+
+        let composer = AgentComposer::new(
+            &editor,
+            Some("Agent prompt".to_string()),
+            802,
+            "draft".to_string(),
+            Vec::new(),
+            "agent".to_string(),
+        );
+        editor.current_dialog = Some(Box::new(composer));
+
+        assert_eq!(editor.mode, Mode::Normal);
+        assert_eq!(editor.active_cursor_shape(), CursorShape::BlinkingBar);
+        assert!(editor.render_cursor_position().is_some());
+
+        editor
+            .current_dialog
+            .as_mut()
+            .unwrap()
+            .handle_event(&Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert_eq!(editor.active_cursor_shape(), CursorShape::SteadyBlock);
+
+        editor
+            .current_dialog
+            .as_mut()
+            .unwrap()
+            .handle_event(&Event::Key(KeyEvent::new(
+                KeyCode::Char('v'),
+                KeyModifiers::NONE,
+            )));
+        assert_eq!(
+            editor.active_cursor_shape(),
+            CursorShape::BlinkingUnderscore
+        );
+
+        editor
+            .current_dialog
+            .as_mut()
+            .unwrap()
+            .handle_event(&Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        editor
+            .current_dialog
+            .as_mut()
+            .unwrap()
+            .handle_event(&Event::Key(KeyEvent::new(
+                KeyCode::Char('i'),
+                KeyModifiers::NONE,
+            )));
+        assert_eq!(editor.active_cursor_shape(), CursorShape::BlinkingBar);
+
+        editor.waiting_key_action = Some(KeyAction::None);
+        assert_eq!(editor.active_cursor_shape(), CursorShape::SteadyUnderscore);
+        editor.waiting_key_action = None;
+
+        editor.current_dialog = None;
+        assert_eq!(editor.active_cursor_shape(), CursorShape::SteadyBlock);
+    }
+
+    #[test]
+    fn focused_agent_conversation_uses_a_real_mode_aware_terminal_cursor() {
+        let mut config = Config::default();
+        config.cursor.normal = CursorShape::SteadyBlock;
+        config.cursor.insert = CursorShape::SteadyBar;
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "background editor".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 40, 12, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_create_text_panel(
+            "agent",
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 20,
+                title: Some("Agent".to_string()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 2,
+                }),
+                surface: None,
+                border: None,
+                header_actions: Vec::new(),
+            },
+        );
+        let editor_cursor = editor.render_cursor_position();
+
+        assert!(editor.uses_synthetic_block_cursor());
+        assert!(editor.test_focus_panel("agent"));
+        let transcript_cursor = editor.render_cursor_position();
+        assert!(transcript_cursor.is_some());
+        assert_ne!(transcript_cursor, editor_cursor);
+        assert_eq!(editor.active_cursor_shape(), CursorShape::SteadyBlock);
+        assert!(!editor.uses_synthetic_block_cursor());
+
+        assert!(editor.test_focus_text_panel_composer("agent"));
+        let composer_cursor = editor.render_cursor_position();
+        assert!(composer_cursor.is_some());
+        assert_ne!(composer_cursor, transcript_cursor);
+        assert_eq!(editor.active_cursor_shape(), CursorShape::SteadyBar);
+        assert!(!editor.uses_synthetic_block_cursor());
+
+        assert!(editor
+            .panel_manager
+            .handle_focused_text_input(
+                &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                40,
+            )
+            .is_some());
+        assert!(editor.render_cursor_position().is_some());
+        assert_eq!(editor.active_cursor_shape(), CursorShape::SteadyBlock);
+        assert!(!editor.uses_synthetic_block_cursor());
+
+        assert!(editor
+            .panel_manager
+            .handle_focused_text_input(
+                &Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                40,
+            )
+            .is_some());
+        assert!(editor.render_cursor_position().is_some());
+        assert_eq!(editor.active_cursor_shape(), CursorShape::SteadyBlock);
+        assert!(!editor.uses_synthetic_block_cursor());
+
+        editor.panel_manager.focus_editor();
+        assert_eq!(editor.render_cursor_position(), editor_cursor);
+        assert!(editor.uses_synthetic_block_cursor());
     }
 
     #[test]

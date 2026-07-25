@@ -13,7 +13,7 @@ use red::{
     buffer::{Buffer, SyntaxSelection},
     clipboard::MemoryClipboardProvider,
     color::Color,
-    config::{Config, KeyAction, MatchitLanguageConfig},
+    config::{Config, CursorShape, KeyAction, MatchitLanguageConfig},
     editor::{Action, Content, Editor, Mode, SearchDirection},
     lsp::LspClient,
     plugin::{
@@ -5482,7 +5482,9 @@ async fn focused_panel_routes_ctrl_w_w_into_focus_cycle() {
 #[tokio::test]
 async fn ctrl_w_w_focuses_agent_composer_and_makes_cursor_visible() {
     let buffer = Buffer::new(None, "abcdef".to_string());
-    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    let mut config = default_key_config();
+    config.cursor.normal = CursorShape::SteadyBlock;
+    let mut harness = EditorHarness::with_config(buffer, config);
     harness.editor.test_create_text_panel(
         "agent",
         PanelConfig {
@@ -5547,11 +5549,249 @@ async fn ctrl_w_w_focuses_agent_composer_and_makes_cursor_visible() {
             if actions.iter().any(|action| matches!(
                 action,
                 Action::NotifyPlugins(name, payload)
+                    if name == "panel:event:agent" && payload["action"] == "composer_input"
+            ))
+    ));
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("agent"));
+    assert!(harness.render_cursor_position().is_some());
+
+    let action = harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )))
+        .unwrap();
+    assert!(matches!(
+        action,
+        Some(KeyAction::Multiple(actions))
+            if actions.iter().any(|action| matches!(
+                action,
+                Action::NotifyPlugins(name, payload)
                     if name == "panel:event:agent" && payload["action"] == "composer_blur"
             ))
     ));
     assert_eq!(harness.editor.test_focused_panel_id(), Some("agent"));
-    assert_eq!(harness.render_cursor_position(), None);
+    assert!(harness.render_cursor_position().is_some());
+    assert_eq!(
+        harness.editor.test_active_cursor_shape(),
+        CursorShape::SteadyBlock
+    );
+}
+
+#[test]
+fn focused_agent_transcript_i_and_a_request_composer_in_every_dock_position() {
+    for side in [
+        PanelSide::Left,
+        PanelSide::Right,
+        PanelSide::Top,
+        PanelSide::Bottom,
+    ] {
+        for key in ['i', 'a'] {
+            let mut config = default_key_config();
+            config.cursor.normal = CursorShape::SteadyBlock;
+            config.cursor.insert = CursorShape::BlinkingBar;
+            let mut harness = EditorHarness::with_config(
+                Buffer::new(None, "background editor".to_string()),
+                config,
+            );
+            harness.editor.test_create_text_panel(
+                "agent",
+                PanelConfig {
+                    side,
+                    width: match side {
+                        PanelSide::Left | PanelSide::Right => 30,
+                        PanelSide::Top | PanelSide::Bottom => 8,
+                    },
+                    title: Some("Agent".to_string()),
+                    composer: Some(TextPanelComposerConfig {
+                        placeholder: "Ask".to_string(),
+                        rows: 2,
+                    }),
+                    surface: None,
+                    border: None,
+                    header_actions: Vec::new(),
+                },
+            );
+
+            assert!(harness.editor.test_focus_panel("agent"));
+            let (x, y) = harness
+                .render_cursor_position()
+                .expect("focused conversation must expose a cursor");
+            assert!(x < 80 && y < 24, "cursor must stay on screen");
+            assert!(
+                match side {
+                    PanelSide::Left => x < 30,
+                    PanelSide::Right => x >= 50,
+                    PanelSide::Top => y < 8,
+                    PanelSide::Bottom => y >= 14,
+                },
+                "conversation cursor ({x}, {y}) must be inside the {side:?} dock"
+            );
+            assert_eq!(
+                harness.editor.test_active_cursor_shape(),
+                CursorShape::SteadyBlock,
+                "conversation must use the Normal cursor in the {side:?} dock"
+            );
+
+            let action = harness
+                .editor
+                .test_handle_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(key),
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
+
+            assert!(
+                matches!(
+                    action,
+                    Some(KeyAction::Multiple(actions))
+                        if actions.iter().any(|action| matches!(
+                            action,
+                            Action::NotifyPlugins(name, payload)
+                                if name == "panel:event:agent"
+                                    && payload["action"] == "composer_focus"
+                        ))
+                ),
+                "{key} must request composer focus from the {side:?} conversation"
+            );
+            assert_eq!(harness.editor.test_focused_panel_id(), Some("agent"));
+            assert_eq!(harness.buffer_contents(), "background editor");
+        }
+    }
+}
+
+#[test]
+fn agent_composer_uses_its_configured_mode_cursor_in_every_dock_position() {
+    for side in [
+        PanelSide::Left,
+        PanelSide::Right,
+        PanelSide::Top,
+        PanelSide::Bottom,
+    ] {
+        let mut config = default_key_config();
+        config.cursor.normal = CursorShape::SteadyBlock;
+        config.cursor.insert = CursorShape::BlinkingBar;
+        config.cursor.visual = CursorShape::BlinkingUnderscore;
+        let buffer = Buffer::new(None, "background editor".to_string());
+        let mut harness = EditorHarness::with_config(buffer, config);
+        harness.editor.test_create_text_panel(
+            "agent",
+            PanelConfig {
+                side,
+                width: match side {
+                    PanelSide::Left | PanelSide::Right => 30,
+                    PanelSide::Top | PanelSide::Bottom => 8,
+                },
+                title: Some("Agent".to_string()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 2,
+                }),
+                surface: None,
+                border: None,
+                header_actions: Vec::new(),
+            },
+        );
+        let editor_cursor = harness.render_cursor_position();
+
+        assert_eq!(harness.mode(), Mode::Normal, "dock side: {side:?}");
+        assert_eq!(
+            harness.editor.test_active_cursor_shape(),
+            CursorShape::SteadyBlock,
+            "dock side: {side:?}"
+        );
+        assert!(harness.editor.test_focus_panel("agent"));
+        let transcript_cursor = harness.render_cursor_position();
+        assert!(
+            transcript_cursor.is_some(),
+            "focused conversation must expose its Normal cursor for {side:?} dock"
+        );
+        assert_ne!(
+            transcript_cursor, editor_cursor,
+            "focused conversation must move the cursor into the {side:?} dock"
+        );
+        assert!(harness.editor.test_focus_text_panel_composer("agent"));
+        assert_eq!(harness.mode(), Mode::Normal, "dock side: {side:?}");
+        assert!(harness.render_cursor_position().is_some());
+        assert_eq!(
+            harness.editor.test_active_cursor_shape(),
+            CursorShape::BlinkingBar,
+            "insert cursor for {side:?} dock"
+        );
+
+        harness
+            .editor
+            .test_handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(
+            harness.editor.test_active_cursor_shape(),
+            CursorShape::SteadyBlock,
+            "normal cursor for {side:?} dock"
+        );
+
+        harness
+            .editor
+            .test_handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('v'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        assert_eq!(
+            harness.editor.test_active_cursor_shape(),
+            CursorShape::BlinkingUnderscore,
+            "visual cursor for {side:?} dock"
+        );
+
+        harness
+            .editor
+            .test_handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        harness
+            .editor
+            .test_handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('i'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        assert_eq!(
+            harness.editor.test_active_cursor_shape(),
+            CursorShape::BlinkingBar,
+            "restored insert cursor for {side:?} dock"
+        );
+
+        harness
+            .editor
+            .test_handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
+        assert_eq!(
+            harness.editor.test_active_cursor_shape(),
+            CursorShape::SteadyBlock,
+            "conversation cursor for {side:?} dock"
+        );
+        assert!(
+            harness.render_cursor_position().is_some(),
+            "focused conversation must retain a visible cursor for {side:?} dock"
+        );
+
+        harness
+            .editor
+            .test_handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(
+            harness.editor.test_focused_panel_id(),
+            None,
+            "Escape must return focus to the editor from the {side:?} conversation"
+        );
+        assert_eq!(
+            harness.render_cursor_position(),
+            editor_cursor,
+            "Escape must restore the background editor cursor for {side:?} dock"
+        );
+    }
 }
 
 #[tokio::test]

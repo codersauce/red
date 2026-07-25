@@ -850,6 +850,27 @@ mod tests {
     }
 
     #[test]
+    fn detached_key_input_preserves_modified_enter_for_agent_composition() {
+        for (modifiers, expected) in [
+            (event::KeyModifiers::CONTROL, vec![KeyModifier::Control]),
+            (event::KeyModifiers::ALT, vec![KeyModifier::Alt]),
+            (event::KeyModifiers::SHIFT, vec![KeyModifier::Shift]),
+            (
+                event::KeyModifiers::CONTROL | event::KeyModifiers::ALT,
+                vec![KeyModifier::Control, KeyModifier::Alt],
+            ),
+        ] {
+            assert_eq!(
+                detached_key_input(event::KeyEvent::new(event::KeyCode::Enter, modifiers)),
+                Some(DetachedInput::Key {
+                    code: DetachedKeyCode::Enter,
+                    modifiers: expected,
+                })
+            );
+        }
+    }
+
+    #[test]
     fn detached_resize_drops_rows_below_the_new_terminal_height() {
         let mut rows = (0..5)
             .map(|row| red::headless::LinePatch {

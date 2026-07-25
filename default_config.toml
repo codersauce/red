@@ -47,10 +47,21 @@ disabled_plugins = []
 # Remove the bundled agent plugin and reject every Codex process launch.
 disable_ai = false
 
-# Direct, reviewable integration with an installed Codex CLI.
+# Native integration with an installed Codex CLI. Agent mode follows your
+# configured Codex tools, sandbox, and approval policy. Choose "review" for
+# isolated, review-before-apply proposals or "plan" for a planning session.
 # Override `command` only when Codex is installed outside PATH.
 [agent]
 # command = "/path/to/codex"
+mode = "agent"
+# model = "gpt-5.4"
+# reasoning_effort = "high"
+entry = "float"
+position = "right"
+width_percent = 38
+height_percent = 35
+responsive = true
+persistent_threads = true
 
 [search]
 # Preview the next match while typing / or ?.

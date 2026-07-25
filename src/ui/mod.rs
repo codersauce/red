@@ -16,10 +16,11 @@ mod info;
 mod input_prompt;
 mod keymap_hints;
 mod list;
+mod modal_composer;
 mod picker;
 
+pub(crate) use agent_composer::wrap_text;
 pub use agent_composer::AgentComposer;
-pub(crate) use agent_composer::{normalize_newlines, wrap_text};
 pub use completion::CompletionUI;
 pub use confirmation::Confirmation;
 use crossterm::event::{Event, KeyCode, MouseEvent, MouseEventKind};
@@ -30,6 +31,7 @@ pub use info::Info;
 pub use input_prompt::InputPrompt;
 pub(crate) use keymap_hints::draw_keymap_hints;
 use list::List;
+pub(crate) use modal_composer::{ModalComposer, ModalComposerMode, ModalComposerOutcome};
 pub(crate) use picker::{picker_file_icon, picker_file_icon_color};
 pub use picker::{
     LegacyPickerOptions, Picker, PickerIcon, PickerItem, PickerOptions, PickerPresentation,
@@ -38,7 +40,7 @@ pub use picker::{
 
 use crate::{
     config::KeyAction,
-    editor::{Action, RenderBuffer},
+    editor::{Action, Mode, RenderBuffer},
     plugin::{ComposerHandle, PickerHandle},
     theme::Theme,
 };
@@ -95,6 +97,11 @@ pub trait Component: Send {
 
     fn is_sensitive_input(&self) -> bool {
         false
+    }
+
+    /// Returns the editing mode that should determine the terminal cursor.
+    fn cursor_mode(&self) -> Option<Mode> {
+        None
     }
 
     fn cursor_position(&self) -> Option<(usize, usize)> {

@@ -1,4 +1,4 @@
-# Direct Codex workflow and safety contract
+# Direct Codex workflow, modes, and safety contract
 
 Red launches the installed Codex CLI as an app-server and speaks its JSONL
 protocol directly. There is no ACP client, adapter, or companion executable.
@@ -19,22 +19,59 @@ The check is offline. It locates `codex`, reads `codex --version`, and reports
 whether the installed version supports Red's app-server contract.
 Authentication is verified by `account/read` when the first session starts.
 
-To use a Codex executable outside `PATH`:
+Agent defaults and the Codex executable are configurable:
 
 ```toml
 [agent]
-command = "/path/to/codex"
+mode = "agent"              # agent, plan, or review
+entry = "float"             # float or dock
+position = "right"          # left, right, top, or bottom
+width_percent = 38
+height_percent = 35
+responsive = true
+persistent_threads = true
+# model = "gpt-5.4"
+# reasoning_effort = "high"
+# command = "/path/to/codex"
 ```
 
 ## Lifecycle
 
-Open a workspace, press `Space A` (or run `:Agent`), type a request, and press
-Enter. Red lazily starts `codex app-server --stdio`, initializes the connection,
-checks the account, starts an ephemeral thread, and submits turns with
-`turn/start`. Follow-up text and the busy indicator render before dispatch;
-follow-ups submitted during an active turn appear immediately and remain queued
-in FIFO order. Assistant deltas stream into the conversation footer. `Ctrl-c`
-interrupts the active turn with `turn/interrupt`.
+Open a workspace, press `Space A` (or run `:Agent`), and type the first request
+in the floating, buffer-backed composer. `Ctrl+Enter` sends from any composer mode;
+`Alt+Enter` also sends when the terminal reports that key combination. In
+Insert mode, `Enter`, `Shift+Enter`, and `Ctrl+J` insert a newline. In Normal
+mode, `Enter` sends. `Esc` enters Normal mode without discarding the draft, so
+`Esc`, then `Enter` is the universal send sequence when a terminal cannot
+distinguish modified Enter. Set `entry = "dock"` to open and focus the
+persistent dock immediately instead. Both composers use the editor's
+configured `[cursor]` shapes for their own Insert, Normal, and Visual modes,
+independently of the background editor.
+
+`Ctrl+S` keeps its normal editor meaning: save the active file. It is not an
+agent send shortcut.
+
+Red lazily starts `codex app-server --stdio`, initializes the connection,
+checks the account, resumes the saved workspace thread when possible, and
+submits turns with `turn/start`. An expired saved thread falls back once to a
+new thread while retaining the current mode and prompt. After the first
+submission, the conversation opens in the configured dock. Follow-ups use the
+same real modal composer and are held in a bounded FIFO queue; run
+`:AgentSteer` to add instructions directly to an active turn.
+Assistant deltas and real tool progress stream into the conversation. `Ctrl-c`
+interrupts the active turn with `turn/interrupt` without discarding the thread.
+
+The conversation has its own reading cursor and scroll position. In the
+conversation body, use `j`/`k` or the arrow keys to read, `Ctrl+F`/`Ctrl+B`
+to page, and `g`/`G` to reach the beginning or end. `Tab` and `Shift+Tab`
+select links; `Enter` opens the selected link. Press `i` or `a`, or click the footer
+to return to the composer. `Esc` inside the composer enters Normal mode;
+`Ctrl+C` leaves the composer while preserving its draft. In conversation
+reading mode, `Esc` returns focus to the editor.
+
+Use `:AgentLeft`, `:AgentRight`, `:AgentTop`, or `:AgentBottom` to move the
+conversation. Adaptive layout preserves usable editor space on narrow
+terminals.
 
 If Codex cannot start, Red preserves the prompt and offers a retry action.
 Install or update Codex, run `codex login`, then retry without retyping.
@@ -42,21 +79,31 @@ Install or update Codex, run `codex login`, then retry without retyping.
 The app-server process is owned by the detachable editor core, so disconnecting
 and reattaching does not intentionally replace a healthy process.
 
-## Reviewable editing
+## Native Agent, Plan, and isolated Review modes
 
-Every Codex thread is started with:
+The default `mode = "agent"` uses the effective configuration of the installed
+Codex CLI. Native commands, direct workspace edits, configured MCP servers,
+apps, connectors, plugins, skills, and hooks are available only when the
+user's Codex configuration and managed policy allow them. Red does not widen
+the Codex sandbox or auto-accept an approval. Native command, file-change, and
+permission requests are presented to the user with the exact choices supplied
+by Codex; closing an approval without choosing denies it. Completed native file
+changes reload clean open buffers and update their editor and LSP state. Dirty
+buffers are never overwritten: Red retains the unsaved contents and reports the
+file conflict in the conversation.
 
-- `sandbox = "read-only"`
-- `approvalPolicy = "never"`
-- no execution environments
-- configured MCP servers disabled
-- apps, connectors, plugins, orchestrator MCP, and notifications disabled
-- hooks disabled unless the managed Codex policy requires them; when required,
-  Codex may also load trusted user, workspace, or plugin hooks
-- Red's bounded dynamic tools and reviewable-edit instructions
+Set `mode = "plan"` to request Codex's planning collaboration mode. Set
+`mode = "review"` to restore Red's strictly isolated editing contract. Review
+mode starts each Codex thread with:
 
-Native command, file-change, and permission escalation requests are denied.
-Red never asks Codex to edit the workspace directly.
+- `sandbox = "read-only"` and `approvalPolicy = "never"`;
+- no native execution environments;
+- configured MCP servers, apps, connectors, and plugins disabled;
+- hooks disabled unless managed Codex policy requires trusted hooks; and
+- Red's bounded dynamic tools and reviewable-edit instructions.
+
+In Review mode, native command, file-change, and permission requests are
+denied. Red's write tools stage proposals; they do not edit workspace files.
 
 Codex receives nine dynamic tools:
 
@@ -83,9 +130,11 @@ Content search is unavailable on platforms without that safe read boundary;
 Codex must use `read_file` through Red instead.
 
 Run `:AgentReview` to inspect pending files and hunks. Accepting a proposal
-passes through the editor's transaction boundary and receives agent attribution.
-Rejecting it discards only the selected proposal. Unaccepted proposals never
-mutate a visible buffer or disk.
+passes through the editor's transaction boundary and receives agent
+attribution. Rejecting it discards only the selected proposal. Unaccepted
+review-mode proposals never mutate a visible buffer or disk. Native Agent
+mode can separately perform direct edits according to Codex's configured
+sandbox and approval policy.
 
 ## Limits and failure behavior
 
@@ -100,7 +149,7 @@ preserves the submitted prompt for retry.
 
 Dynamic tools are part of Codex app-server's experimental capability surface.
 Red pins a minimum tested CLI version and fails closed when the required
-protocol is unavailable; it does not fall back to `codex exec` or native edits.
+protocol is unavailable; it does not silently fall back to `codex exec`.
 
 ## Commands
 
@@ -108,6 +157,11 @@ protocol is unavailable; it does not fall back to `codex exec` or native edits.
 | --- | --- |
 | `:Agent` / `:AgentPrompt` | Open the prompt composer. |
 | `:AgentOpen` | Show and focus the conversation pane without opening a prompt. |
+| `:AgentLeft` / `:AgentRight` | Dock the conversation beside the editor. |
+| `:AgentTop` / `:AgentBottom` | Dock the conversation above or below the editor. |
+| `:AgentModels` | List models available to the active Codex session. |
+| `:AgentSessions` | List resumable conversations for the workspace. |
+| `:AgentSteer` | Add instructions directly to a running agent turn. |
 | `:AgentCancel` | Interrupt the active Codex turn. |
 | `:AgentClear` | Clear visible conversation while retaining current context. |
 | `:AgentNew` | Close the current thread and start a new one. |

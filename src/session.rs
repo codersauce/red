@@ -106,6 +106,9 @@ pub struct SessionSnapshot {
     /// Human-readable agent transcript retained across recovery.
     #[serde(default)]
     pub agent_transcript: Option<String>,
+    /// Persisted Codex thread that can be resumed in the original workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_thread_id: Option<String>,
     /// Pending agent proposal state, including review dispositions.
     #[serde(default)]
     pub agent_workspace: Option<ProposalWorkspaceSnapshot>,
@@ -2255,6 +2258,7 @@ mod tests {
             global_marks: Vec::new(),
             special_marks: Vec::new(),
             agent_transcript: None,
+            agent_thread_id: None,
             agent_workspace: None,
             agent_session_resumable: false,
         }

@@ -496,6 +496,27 @@ mod tests {
             .expect("agent archive must be present in the host API schema");
         assert_eq!(archive.signature, "(session_id: String)");
         assert_eq!(archive.introduced, "0.2.0");
+
+        for (name, signature) in [
+            ("AgentResumeSession", "(session_id: String, cwd: String)"),
+            ("AgentSteer", "(session_id: String, text: String)"),
+            ("AgentListModels", "(session_id: String)"),
+            ("AgentListSessions", "(session_id: String, cwd: String)"),
+            (
+                "AgentSetModel",
+                "(session_id: String, model: String, reasoning_effort?: String)",
+            ),
+            ("AgentSetReasoningEffort", "(effort: String)"),
+            ("SetAgentPosition", "(position: String)"),
+        ] {
+            let call = HOST_API
+                .calls
+                .iter()
+                .find(|call| call.kind == "execute" && call.name == name)
+                .unwrap_or_else(|| panic!("{name} must be present in the host API schema"));
+            assert_eq!(call.signature, signature);
+            assert_eq!(call.introduced, "0.4.1");
+        }
     }
 
     #[test]

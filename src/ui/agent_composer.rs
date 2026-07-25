@@ -6,21 +6,26 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     config::KeyAction,
-    editor::{Action, ComposerCallback, Editor, RenderBuffer},
+    editor::{Action, ComposerCallback, Editor, Mode, RenderBuffer},
     plugin::ComposerHandle,
     theme::{Style, Theme},
-    unicode_utils::{display_width, grapheme_len, grapheme_to_byte, truncate_display_width},
+    unicode_utils::{display_width, grapheme_len, truncate_display_width},
 };
 
 use super::{
     dialog::{BorderStyle, Dialog},
-    Component,
+    Component, ModalComposer, ModalComposerMode, ModalComposerOutcome,
 };
 
 const TAB_WIDTH: usize = 4;
-const MAX_PROMPT_BYTES: usize = 128 * 1024;
-const STATUS: &str = "Enter  ^J newline  Esc  ^P/N";
+const INSERT_HINTS: &str = " Ctrl+Enter send; Esc normal; Enter line";
+const NORMAL_HINTS: &str = " Ctrl+Enter send; i edit; Enter send";
+const VISUAL_HINTS: &str = " Ctrl+Enter send; Esc normal; hjkl select";
+#[cfg(test)]
+const STATUS: &str = "INSERT Ctrl+Enter send; Esc normal";
+#[cfg(test)]
 const EMPTY_STATUS: &str = "Prompt is empty";
+#[cfg(test)]
 const OVERSIZED_STATUS: &str = "Prompt exceeds 128 KiB";
 
 #[derive(Debug)]
@@ -33,13 +38,9 @@ pub(crate) struct WrappedText {
 pub struct AgentComposer {
     target: ComposerTarget,
     dialog: Dialog,
-    query: String,
-    cursor: usize,
-    history: Vec<String>,
-    history_position: Option<usize>,
-    history_draft: Option<String>,
-    preferred_column: Option<usize>,
-    validation_status: Option<&'static str>,
+    title: Option<String>,
+    composer: ModalComposer,
+    ascii_borders: bool,
     viewport_width: usize,
     viewport_height: usize,
     style: Style,
@@ -54,7 +55,7 @@ enum ComposerTarget {
 }
 
 impl AgentComposer {
-    /// Creates a right-aligned composer with the cursor at the end of `query`.
+    /// Creates a centered, Vim-capable composer with the cursor at the end of `query`.
     pub fn new(
         editor: &Editor,
         title: Option<String>,
@@ -100,22 +101,12 @@ impl AgentComposer {
         let style = theme.ui_style.popup.clone();
         let border_style = theme.ui_style.popup_border.clone();
         let title_style = theme.ui_style.popup_title.clone();
+        let popup_title = title.clone();
+        let ascii_borders = editor.window_borders_ascii();
         let viewport_width = editor.vwidth();
         let viewport_height = editor.vheight();
         let (x, y, width, height) = Self::geometry(viewport_width, viewport_height);
-        let initial_too_large = query.len() > MAX_PROMPT_BYTES;
-        let query = if initial_too_large {
-            String::new()
-        } else {
-            normalize_newlines(&query)
-        };
-        let history_len = history.len();
-        let history = history
-            .into_iter()
-            .filter(|entry| entry.len() <= MAX_PROMPT_BYTES)
-            .collect::<Vec<_>>();
-        let history_too_large = history.len() != history_len;
-        let cursor = grapheme_len(&query);
+        let composer = ModalComposer::new(&query, history);
 
         Self {
             target,
@@ -131,13 +122,9 @@ impl AgentComposer {
             )
             .with_border_draw_style(&border_style)
             .with_title_style(&title_style),
-            query,
-            cursor,
-            history,
-            history_position: None,
-            history_draft: None,
-            preferred_column: None,
-            validation_status: (initial_too_large || history_too_large).then_some(OVERSIZED_STATUS),
+            title: popup_title,
+            composer,
+            ascii_borders,
             viewport_width,
             viewport_height,
             style,
@@ -170,13 +157,13 @@ impl AgentComposer {
                 Action::NotifyPlugin(
                     owner.clone(),
                     format!("composer:submitted:{id}"),
-                    json!(self.query),
+                    json!(self.composer.contents()),
                 ),
             ]),
             ComposerTarget::Callback(handle) => KeyAction::Multiple(vec![
                 Action::NotifyComposer(
                     *handle,
-                    Box::new(ComposerCallback::Submitted(self.query.clone())),
+                    Box::new(ComposerCallback::Submitted(self.composer.contents())),
                 ),
                 Action::CloseDialog,
             ]),
@@ -190,7 +177,7 @@ impl AgentComposer {
         let outer_height = (viewport_height * 65 / 100)
             .clamp(8, 18)
             .min(viewport_height);
-        let x = viewport_width.saturating_sub(outer_width);
+        let x = viewport_width.saturating_sub(outer_width) / 2;
         let y = viewport_height.saturating_sub(outer_height) / 2;
         (
             x,
@@ -209,146 +196,54 @@ impl AgentComposer {
     }
 
     fn wrapped_text(&self) -> WrappedText {
-        wrap_text(&self.query, self.dialog.width)
+        wrap_text(&self.composer.contents(), self.dialog.width)
     }
 
-    fn insert(&mut self, text: &str) {
-        if text.len() > MAX_PROMPT_BYTES.saturating_sub(self.query.len()) {
-            self.validation_status = Some(OVERSIZED_STATUS);
-            return;
-        }
-        let text = normalize_newlines(text);
-        if text.is_empty() {
+    fn draw_border(&self, buffer: &mut RenderBuffer) {
+        if buffer.width == 0 || buffer.height == 0 {
             return;
         }
 
-        let offset = grapheme_to_byte(&self.query, self.cursor);
-        self.query.insert_str(offset, &text);
-        self.cursor = self.query[..offset + text.len()].graphemes(true).count();
-        self.preferred_column = None;
-        self.validation_status = None;
-        self.history_position = None;
-        self.history_draft = None;
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let start = grapheme_to_byte(&self.query, self.cursor - 1);
-        let end = grapheme_to_byte(&self.query, self.cursor);
-        self.query.replace_range(start..end, "");
-        self.cursor -= 1;
-        self.preferred_column = None;
-        self.validation_status = None;
-        self.history_position = None;
-        self.history_draft = None;
-    }
-
-    fn delete(&mut self) {
-        if self.cursor >= grapheme_len(&self.query) {
-            return;
-        }
-        let start = grapheme_to_byte(&self.query, self.cursor);
-        let end = grapheme_to_byte(&self.query, self.cursor + 1);
-        self.query.replace_range(start..end, "");
-        self.preferred_column = None;
-        self.validation_status = None;
-        self.history_position = None;
-        self.history_draft = None;
-    }
-
-    fn delete_previous_word(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let end = grapheme_to_byte(&self.query, self.cursor);
-        let before = &self.query[..end];
-        let mut start = self.cursor;
-        let mut seen_word = false;
-
-        for grapheme in before.graphemes(true).rev() {
-            let whitespace = grapheme.chars().all(char::is_whitespace);
-            if seen_word && whitespace {
-                break;
-            }
-            seen_word |= !whitespace;
-            start -= 1;
-        }
-
-        let start_byte = grapheme_to_byte(&self.query, start);
-        self.query.replace_range(start_byte..end, "");
-        self.cursor = start;
-        self.preferred_column = None;
-        self.validation_status = None;
-        self.history_position = None;
-        self.history_draft = None;
-    }
-
-    fn move_vertically(&mut self, direction: isize) {
-        let wrapped = self.wrapped_text();
-        let Some(&(row, column)) = wrapped.positions.get(self.cursor) else {
-            return;
-        };
-        let target_row = row.saturating_add_signed(direction);
-        if target_row >= wrapped.rows.len() || target_row == row {
-            return;
-        }
-        let goal = *self.preferred_column.get_or_insert(column);
-        let mut target = None;
-        let mut distance = usize::MAX;
-
-        for (index, &(candidate_row, candidate_column)) in wrapped.positions.iter().enumerate() {
-            if candidate_row != target_row {
-                continue;
-            }
-            let candidate_distance = candidate_column.abs_diff(goal);
-            if candidate_distance < distance {
-                target = Some(index);
-                distance = candidate_distance;
-            }
-        }
-
-        if let Some(target) = target {
-            self.cursor = target;
-        }
-    }
-
-    fn history_back(&mut self) {
-        if self.history.is_empty() {
-            return;
-        }
-        let position = match self.history_position {
-            Some(position) => (position + 1).min(self.history.len() - 1),
-            None => {
-                self.history_draft = Some(self.query.clone());
-                0
-            }
-        };
-        self.history_position = Some(position);
-        self.query.clone_from(&self.history[position]);
-        self.query = normalize_newlines(&self.query);
-        self.cursor = grapheme_len(&self.query);
-        self.preferred_column = None;
-        self.validation_status = None;
-    }
-
-    fn history_forward(&mut self) {
-        let Some(position) = self.history_position else {
-            return;
-        };
-        if position > 0 {
-            let next = position - 1;
-            self.history_position = Some(next);
-            self.query.clone_from(&self.history[next]);
-            self.query = normalize_newlines(&self.query);
+        let x = self.dialog.x;
+        let y = self.dialog.y;
+        let width = self.dialog.width.saturating_add(2);
+        let height = self.dialog.height.saturating_add(2);
+        let right = x.saturating_add(width.saturating_sub(1));
+        let bottom = y.saturating_add(height.saturating_sub(1));
+        let (horizontal, vertical, corners) = if self.ascii_borders {
+            ('-', '|', ['+', '+', '+', '+'])
         } else {
-            self.history_position = None;
-            self.query = self.history_draft.take().unwrap_or_default();
+            ('─', '│', ['┌', '┐', '└', '┘'])
+        };
+        let style = &self.dialog.border_draw_style;
+
+        buffer.fill_rect(x, y, width, 1, horizontal, style, &self.theme);
+        buffer.fill_rect(x, bottom, width, 1, horizontal, style, &self.theme);
+        buffer.fill_rect(x, y, 1, height, vertical, style, &self.theme);
+        buffer.fill_rect(right, y, 1, height, vertical, style, &self.theme);
+        buffer.set_char(x, y, corners[0], style, &self.theme);
+        buffer.set_char(right, y, corners[1], style, &self.theme);
+        buffer.set_char(x, bottom, corners[2], style, &self.theme);
+        buffer.set_char(right, bottom, corners[3], style, &self.theme);
+
+        if let Some(title) = &self.title {
+            let available = width.saturating_sub(2);
+            if available > 0 {
+                let title = format!(" {title} ");
+                let title = truncate_display_width(&title, available);
+                let offset = available.saturating_sub(display_width(&title)) / 2;
+                let title_x = x.saturating_add(1).saturating_add(offset);
+                buffer.set_text(title_x, y, &title, &self.dialog.title_style);
+            }
         }
-        self.cursor = grapheme_len(&self.query);
-        self.preferred_column = None;
-        self.validation_status = None;
+    }
+
+    fn composer_action(&self, outcome: ModalComposerOutcome) -> Option<KeyAction> {
+        match outcome {
+            ModalComposerOutcome::Submit => Some(self.submit_action()),
+            ModalComposerOutcome::Changed | ModalComposerOutcome::Rejected => Self::redraw(),
+            ModalComposerOutcome::Unhandled => None,
+        }
     }
 
     fn redraw() -> Option<KeyAction> {
@@ -366,36 +261,7 @@ impl Component for AgentComposer {
 
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.dialog.draw(buffer)?;
-        let right = self.dialog.x + self.dialog.width + 1;
-        let bottom = self.dialog.y + self.dialog.height + 1;
-        buffer.set_char(
-            self.dialog.x,
-            self.dialog.y,
-            '┌',
-            &self.dialog.border_draw_style,
-            &self.theme,
-        );
-        buffer.set_char(
-            right,
-            self.dialog.y,
-            '┐',
-            &self.dialog.border_draw_style,
-            &self.theme,
-        );
-        buffer.set_char(
-            self.dialog.x,
-            bottom,
-            '└',
-            &self.dialog.border_draw_style,
-            &self.theme,
-        );
-        buffer.set_char(
-            right,
-            bottom,
-            '┘',
-            &self.dialog.border_draw_style,
-            &self.theme,
-        );
+        self.draw_border(buffer);
         let body_height = self.body_height();
         let content_x = self.dialog.x + 1;
         let content_y = self.dialog.y + 1;
@@ -403,7 +269,7 @@ impl Component for AgentComposer {
             return Ok(());
         }
 
-        if self.query.is_empty() {
+        if self.composer.contents().is_empty() {
             let placeholder =
                 truncate_display_width("What should the agent do?", self.dialog.width);
             buffer.set_text(content_x, content_y, &placeholder, &self.muted_style);
@@ -411,7 +277,7 @@ impl Component for AgentComposer {
             let wrapped = self.wrapped_text();
             let cursor_row = wrapped
                 .positions
-                .get(self.cursor)
+                .get(self.composer.cursor_grapheme_index())
                 .map_or(0, |position| position.0);
             let scroll = cursor_row.saturating_sub(body_height - 1);
             for (offset, row) in wrapped
@@ -427,7 +293,17 @@ impl Component for AgentComposer {
 
         if self.dialog.height > body_height {
             let status_y = content_y + body_height;
-            let status = self.validation_status.unwrap_or(STATUS);
+            let mode = self.composer.mode();
+            let shortcuts = match mode {
+                ModalComposerMode::Insert => INSERT_HINTS,
+                ModalComposerMode::Normal => NORMAL_HINTS,
+                ModalComposerMode::Visual => VISUAL_HINTS,
+            };
+            let mode_status = format!("{}{shortcuts}", mode.label());
+            let status = self
+                .composer
+                .validation_status()
+                .unwrap_or(mode_status.as_str());
             let status = truncate_display_width(status, self.dialog.width);
             buffer.set_text(content_x, status_y, &status, &self.muted_style);
         }
@@ -437,117 +313,19 @@ impl Component for AgentComposer {
     fn handle_event(&mut self, event: &Event) -> Option<KeyAction> {
         match event {
             Event::Paste(text) => {
-                self.insert(text);
-                Self::redraw()
+                let outcome = self.composer.handle_paste(text);
+                self.composer_action(outcome)
             }
-            Event::Key(key) => match (key.code, key.modifiers) {
-                (KeyCode::Esc, _) => Some(self.cancel_action()),
-                (KeyCode::Char('c' | 'C'), modifiers)
-                    if modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    Some(self.cancel_action())
-                }
-                (KeyCode::Enter, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
-                    self.insert("\n");
-                    Self::redraw()
-                }
-                (KeyCode::Enter, _) => {
-                    if self.query.len() > MAX_PROMPT_BYTES {
-                        self.validation_status = Some(OVERSIZED_STATUS);
-                        return Self::redraw();
-                    }
-                    if self.query.trim().is_empty() {
-                        self.validation_status = Some(EMPTY_STATUS);
-                        return Self::redraw();
-                    }
-                    Some(self.submit_action())
-                }
-                (KeyCode::Char('j' | 'J'), modifiers)
-                    if modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    self.insert("\n");
-                    Self::redraw()
-                }
-                (KeyCode::Char('p' | 'P'), modifiers)
-                    if modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    self.history_back();
-                    Self::redraw()
-                }
-                (KeyCode::Char('n' | 'N'), modifiers)
-                    if modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    self.history_forward();
-                    Self::redraw()
-                }
-                (KeyCode::Char('w' | 'W'), modifiers)
-                    if modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    self.delete_previous_word();
-                    Self::redraw()
-                }
-                (KeyCode::Home, _) => {
-                    self.cursor = 0;
-                    self.preferred_column = None;
-                    Self::redraw()
-                }
-                (KeyCode::Char('a' | 'A'), modifiers)
-                    if modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    self.cursor = 0;
-                    self.preferred_column = None;
-                    Self::redraw()
-                }
-                (KeyCode::End, _) => {
-                    self.cursor = grapheme_len(&self.query);
-                    self.preferred_column = None;
-                    Self::redraw()
-                }
-                (KeyCode::Char('e' | 'E'), modifiers)
-                    if modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    self.cursor = grapheme_len(&self.query);
-                    self.preferred_column = None;
-                    Self::redraw()
-                }
-                (KeyCode::Left, _) => {
-                    self.cursor = self.cursor.saturating_sub(1);
-                    self.preferred_column = None;
-                    Self::redraw()
-                }
-                (KeyCode::Right, _) => {
-                    self.cursor = (self.cursor + 1).min(grapheme_len(&self.query));
-                    self.preferred_column = None;
-                    Self::redraw()
-                }
-                (KeyCode::Up, _) => {
-                    self.move_vertically(-1);
-                    Self::redraw()
-                }
-                (KeyCode::Down, _) => {
-                    self.move_vertically(1);
-                    Self::redraw()
-                }
-                (KeyCode::Backspace, _) => {
-                    self.backspace();
-                    Self::redraw()
-                }
-                (KeyCode::Delete, _) => {
-                    self.delete();
-                    Self::redraw()
-                }
-                (KeyCode::Tab, _) => {
-                    self.insert("\t");
-                    Self::redraw()
-                }
-                (KeyCode::Char(character), modifiers)
-                    if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    self.insert(&character.to_string());
-                    Self::redraw()
-                }
-                _ => None,
-            },
+            Event::Key(key)
+                if matches!(key.code, KeyCode::Char('c' | 'C'))
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Some(self.cancel_action())
+            }
+            Event::Key(key) => {
+                let outcome = self.composer.handle_key(*key);
+                self.composer_action(outcome)
+            }
             _ => None,
         }
     }
@@ -560,7 +338,6 @@ impl Component for AgentComposer {
         self.dialog.height = height;
         self.viewport_width = viewport_width;
         self.viewport_height = viewport_height;
-        self.preferred_column = None;
         true
     }
 
@@ -578,11 +355,22 @@ impl Component for AgentComposer {
         true
     }
 
+    fn cursor_mode(&self) -> Option<Mode> {
+        Some(match self.composer.mode() {
+            ModalComposerMode::Insert => Mode::Insert,
+            ModalComposerMode::Normal => Mode::Normal,
+            ModalComposerMode::Visual => Mode::Visual,
+        })
+    }
+
     fn cursor_position(&self) -> Option<(usize, usize)> {
+        if self.viewport_width == 0 || self.viewport_height == 0 {
+            return None;
+        }
         let wrapped = self.wrapped_text();
         let (row, column) = wrapped
             .positions
-            .get(self.cursor)
+            .get(self.composer.cursor_grapheme_index())
             .copied()
             .unwrap_or_default();
         let body_height = self.body_height();
@@ -601,10 +389,6 @@ impl Component for AgentComposer {
             .min(self.viewport_height.saturating_sub(1));
         Some((x, y))
     }
-}
-
-pub(crate) fn normalize_newlines(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 pub(crate) fn wrap_text(text: &str, width: usize) -> WrappedText {
@@ -691,10 +475,15 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::{buffer::Buffer, config::Config, lsp::LspManager};
+    use crate::{
+        buffer::Buffer, config::Config, lsp::LspManager, ui::modal_composer::MAX_PROMPT_BYTES,
+    };
 
     fn editor(width: usize, height: usize) -> Editor {
-        let config = Config::default();
+        editor_with_config(width, height, Config::default())
+    }
+
+    fn editor_with_config(width: usize, height: usize, config: Config) -> Editor {
         Editor::with_size(
             Box::new(LspManager::new(config.lsp.clone())),
             width,
@@ -711,7 +500,7 @@ mod tests {
     }
 
     fn submit(composer: &mut AgentComposer) -> Option<KeyAction> {
-        composer.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE))
+        composer.handle_event(&key(KeyCode::Enter, KeyModifiers::CONTROL))
     }
 
     fn new_composer(
@@ -729,6 +518,133 @@ mod tests {
             .iter()
             .map(|cell| cell.c)
             .collect()
+    }
+
+    #[test]
+    fn floating_composer_reports_its_vim_cursor_mode_and_wrapped_position() {
+        let editor = editor(16, 12);
+        let mut composer = new_composer(
+            &editor,
+            Some("Agent prompt".to_string()),
+            802,
+            "wide 漢 👨‍👩‍👧\nsecond e\u{301} line".to_string(),
+            vec![],
+        );
+
+        let assert_cursor = |composer: &AgentComposer, expected_mode: Mode| {
+            assert_eq!(Component::cursor_mode(composer), Some(expected_mode));
+
+            let wrapped = composer.wrapped_text();
+            let (row, column) = wrapped.positions[composer.composer.cursor_grapheme_index()];
+            let scroll = row.saturating_sub(composer.body_height().saturating_sub(1));
+
+            assert_eq!(
+                composer.cursor_position(),
+                Some((
+                    composer.dialog.x + 1 + column,
+                    composer.dialog.y + 1 + row.saturating_sub(scroll),
+                )),
+            );
+        };
+
+        assert_cursor(&composer, Mode::Insert);
+
+        composer.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_cursor(&composer, Mode::Normal);
+
+        composer.handle_event(&key(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert_cursor(&composer, Mode::Visual);
+
+        composer.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_cursor(&composer, Mode::Normal);
+
+        composer.handle_event(&key(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert_cursor(&composer, Mode::Insert);
+    }
+
+    #[test]
+    fn modified_enter_submits_the_complete_floating_prompt_in_every_vim_mode() {
+        let editor = editor(60, 18);
+        let modifiers = [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ];
+
+        for modifiers in modifiers {
+            for mode in [
+                ModalComposerMode::Insert,
+                ModalComposerMode::Normal,
+                ModalComposerMode::Visual,
+            ] {
+                let mut composer = new_composer(
+                    &editor,
+                    Some("Agent prompt".to_string()),
+                    802,
+                    "first\n漢👨‍👩‍👧".to_string(),
+                    vec![],
+                );
+
+                if mode != ModalComposerMode::Insert {
+                    composer.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE));
+                    if mode == ModalComposerMode::Visual {
+                        composer.handle_event(&key(KeyCode::Char('v'), KeyModifiers::NONE));
+                    }
+                }
+
+                assert_eq!(composer.composer.mode(), mode);
+                assert_eq!(
+                    composer.handle_event(&key(KeyCode::Enter, modifiers)),
+                    Some(KeyAction::Multiple(vec![
+                        Action::CloseDialog,
+                        Action::NotifyPlugin(
+                            "agent".to_string(),
+                            "composer:submitted:802".to_string(),
+                            json!("first\n漢👨‍👩‍👧"),
+                        ),
+                    ])),
+                    "modified Enter should submit in {mode:?} with {modifiers:?}",
+                );
+                assert_eq!(composer.composer.contents(), "first\n漢👨‍👩‍👧");
+            }
+        }
+    }
+
+    #[test]
+    fn control_s_does_not_submit_or_change_the_floating_prompt() {
+        let editor = editor(60, 18);
+
+        for mode in [
+            ModalComposerMode::Insert,
+            ModalComposerMode::Normal,
+            ModalComposerMode::Visual,
+        ] {
+            let mut composer = new_composer(
+                &editor,
+                Some("Agent prompt".to_string()),
+                802,
+                "preserve this draft".to_string(),
+                vec![],
+            );
+
+            if mode != ModalComposerMode::Insert {
+                composer.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE));
+                if mode == ModalComposerMode::Visual {
+                    composer.handle_event(&key(KeyCode::Char('v'), KeyModifiers::NONE));
+                }
+            }
+
+            assert_eq!(composer.composer.mode(), mode);
+            assert_eq!(
+                composer.handle_event(&key(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+                None,
+                "Ctrl+S must not submit in {mode:?}",
+            );
+            assert_eq!(composer.composer.contents(), "preserve this draft");
+            assert_eq!(composer.composer.mode(), mode);
+        }
     }
 
     #[test]
@@ -771,7 +687,10 @@ mod tests {
             "first\tline\r\n  second\rthird\n".to_string(),
         ));
 
-        assert_eq!(composer.query, "first\tline\n  second\nthird\n");
+        assert_eq!(
+            composer.composer.contents(),
+            "first\tline\n  second\nthird\n"
+        );
         let wrapped = composer.wrapped_text();
         assert_eq!(wrapped.rows[0], "first   line");
         assert_eq!(wrapped.rows[1], "  second");
@@ -800,22 +719,28 @@ mod tests {
         composer.handle_event(&key(KeyCode::Delete, KeyModifiers::NONE));
         composer.handle_event(&key(KeyCode::Char('q'), KeyModifiers::CONTROL));
         composer.handle_event(&key(KeyCode::Char('z'), KeyModifiers::ALT));
-        assert_eq!(composer.query, "one tXo");
+        assert_eq!(composer.composer.contents(), "one tXo");
 
         composer.handle_event(&key(KeyCode::Char('w'), KeyModifiers::CONTROL));
-        assert_eq!(composer.query, "one o");
-        composer.handle_event(&key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(composer.composer.contents(), "one o");
+        composer.handle_event(&key(KeyCode::Home, KeyModifiers::NONE));
         composer.handle_event(&key(KeyCode::Delete, KeyModifiers::NONE));
-        assert_eq!(composer.query, "ne o");
-        composer.handle_event(&key(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(composer.composer.contents(), "ne o");
+        composer.handle_event(&key(KeyCode::End, KeyModifiers::NONE));
         composer.handle_event(&key(KeyCode::Backspace, KeyModifiers::NONE));
-        assert_eq!(composer.query, "ne ");
+        assert_eq!(composer.composer.contents(), "ne ");
     }
 
     #[test]
-    fn newline_shortcuts_and_vertical_motion_work_on_wrapped_lines() {
+    fn newline_shortcuts_and_vertical_motion_work_on_multiline_buffers() {
         let editor = editor(40, 14);
-        let mut composer = new_composer(&editor, None, 1, "a".repeat(40), vec![]);
+        let mut composer = new_composer(
+            &editor,
+            None,
+            1,
+            format!("{}\n{}", "a".repeat(20), "b".repeat(20)),
+            vec![],
+        );
         let (_, original_row) = composer.cursor_position().unwrap();
 
         composer.handle_event(&key(KeyCode::Up, KeyModifiers::NONE));
@@ -827,7 +752,7 @@ mod tests {
         composer.handle_event(&key(KeyCode::Enter, KeyModifiers::SHIFT));
         composer.handle_event(&key(KeyCode::Char('y'), KeyModifiers::NONE));
 
-        assert!(composer.query.ends_with("\nx\ny"));
+        assert!(composer.composer.contents().ends_with("\nx\ny"));
     }
 
     #[test]
@@ -836,12 +761,12 @@ mod tests {
         let mut composer = new_composer(&editor, None, 9, "e\u{301}👨‍👩‍👧漢".to_string(), vec![]);
 
         composer.handle_event(&key(KeyCode::Backspace, KeyModifiers::NONE));
-        assert_eq!(composer.query, "e\u{301}👨‍👩‍👧");
+        assert_eq!(composer.composer.contents(), "e\u{301}👨‍👩‍👧");
         composer.handle_event(&key(KeyCode::Backspace, KeyModifiers::NONE));
-        assert_eq!(composer.query, "e\u{301}");
+        assert_eq!(composer.composer.contents(), "e\u{301}");
         composer.handle_event(&key(KeyCode::Home, KeyModifiers::NONE));
         composer.handle_event(&key(KeyCode::Delete, KeyModifiers::NONE));
-        assert!(composer.query.is_empty());
+        assert!(composer.composer.contents().is_empty());
     }
 
     #[test]
@@ -856,13 +781,13 @@ mod tests {
         );
 
         composer.handle_event(&key(KeyCode::Char('p'), KeyModifiers::CONTROL));
-        assert_eq!(composer.query, "newer\nprompt");
+        assert_eq!(composer.composer.contents(), "newer\nprompt");
         composer.handle_event(&key(KeyCode::Char('p'), KeyModifiers::CONTROL));
-        assert_eq!(composer.query, "older");
+        assert_eq!(composer.composer.contents(), "older");
         composer.handle_event(&key(KeyCode::Char('n'), KeyModifiers::CONTROL));
-        assert_eq!(composer.query, "newer\nprompt");
+        assert_eq!(composer.composer.contents(), "newer\nprompt");
         composer.handle_event(&key(KeyCode::Char('n'), KeyModifiers::CONTROL));
-        assert_eq!(composer.query, "current draft");
+        assert_eq!(composer.composer.contents(), "current draft");
         assert!(composer.is_sensitive_input());
         assert_eq!(composer.picker_id(), None);
     }
@@ -882,15 +807,10 @@ mod tests {
         assert!(rendered_row(&buffer, status_y).contains(EMPTY_STATUS));
         assert_eq!(
             composer.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE)),
-            Some(KeyAction::Multiple(vec![
-                Action::CloseDialog,
-                Action::NotifyPlugin(
-                    "agent".to_string(),
-                    "composer:cancelled:802".to_string(),
-                    json!(null)
-                )
-            ]))
+            Some(KeyAction::Single(Action::ShowDialog))
         );
+        assert_eq!(composer.composer.mode(), ModalComposerMode::Normal);
+        assert_eq!(composer.composer.contents(), " \n\t");
         assert_eq!(
             composer.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Some(KeyAction::Multiple(vec![
@@ -936,7 +856,7 @@ mod tests {
             handle,
         );
         assert_eq!(
-            cancelled.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE)),
+            cancelled.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Some(KeyAction::Multiple(vec![
                 Action::NotifyComposer(handle, Box::new(ComposerCallback::Cancelled)),
                 Action::CloseDialog,
@@ -976,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_status_keeps_every_shortcut_visible_at_minimum_width() {
+    fn compact_status_keeps_control_enter_visible_at_minimum_width() {
         let editor = editor(36, 14);
         let composer = new_composer(
             &editor,
@@ -990,7 +910,50 @@ mod tests {
         composer.draw(&mut buffer).unwrap();
         let status_y = composer.dialog.y + 1 + composer.body_height();
 
-        assert!(rendered_row(&buffer, status_y).contains(STATUS));
+        let status = rendered_row(&buffer, status_y);
+
+        assert!(status.contains(STATUS));
+        assert!(!status.contains("^S"));
+    }
+
+    #[test]
+    fn floating_status_shows_control_enter_in_every_vim_mode() {
+        let editor = editor(60, 18);
+        let mut composer = new_composer(
+            &editor,
+            Some("Agent prompt".to_string()),
+            802,
+            "draft".to_string(),
+            vec![],
+        );
+
+        for mode in [
+            ModalComposerMode::Insert,
+            ModalComposerMode::Normal,
+            ModalComposerMode::Visual,
+        ] {
+            if mode == ModalComposerMode::Normal {
+                composer.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE));
+            } else if mode == ModalComposerMode::Visual {
+                composer.handle_event(&key(KeyCode::Char('v'), KeyModifiers::NONE));
+            }
+
+            assert_eq!(composer.composer.mode(), mode);
+
+            let mut buffer = RenderBuffer::new(60, editor.vheight(), &Style::default());
+            composer.draw(&mut buffer).unwrap();
+            let status_y = composer.dialog.y + 1 + composer.body_height();
+            let status = rendered_row(&buffer, status_y);
+
+            assert!(
+                status.contains("Ctrl+Enter send"),
+                "{mode:?} status should expose Ctrl+Enter: {status}",
+            );
+            assert!(
+                !status.contains("^S"),
+                "{mode:?} status must not advertise Ctrl+S: {status}",
+            );
+        }
     }
 
     #[test]
@@ -1008,17 +971,17 @@ mod tests {
             KeyCode::Char('P'),
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         ));
-        assert_eq!(composer.query, "recent");
+        assert_eq!(composer.composer.contents(), "recent");
         composer.handle_event(&key(
             KeyCode::Char('N'),
             KeyModifiers::CONTROL | KeyModifiers::ALT,
         ));
-        assert_eq!(composer.query, "draft");
+        assert_eq!(composer.composer.contents(), "draft");
         composer.handle_event(&key(
             KeyCode::Char('J'),
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         ));
-        assert_eq!(composer.query, "draft\n");
+        assert_eq!(composer.composer.contents(), "draft\n");
     }
 
     #[test]
@@ -1028,18 +991,25 @@ mod tests {
         let oversized = "x".repeat(MAX_PROMPT_BYTES);
 
         composer.handle_event(&Event::Paste(oversized));
-        assert_eq!(composer.query, "draft");
-        assert_eq!(composer.validation_status, Some(OVERSIZED_STATUS));
+        assert_eq!(composer.composer.contents(), "draft");
+        assert_eq!(
+            composer.composer.validation_status(),
+            Some(OVERSIZED_STATUS)
+        );
         let mut buffer = RenderBuffer::new(60, editor.vheight(), &Style::default());
         composer.draw(&mut buffer).unwrap();
         let status_y = composer.dialog.y + 1 + composer.body_height();
         assert!(rendered_row(&buffer, status_y).contains(OVERSIZED_STATUS));
 
-        composer.query = "x".repeat(MAX_PROMPT_BYTES);
-        composer.cursor = MAX_PROMPT_BYTES;
+        assert!(composer
+            .composer
+            .set_contents(&"x".repeat(MAX_PROMPT_BYTES)));
         composer.handle_event(&key(KeyCode::Char('!'), KeyModifiers::NONE));
-        assert_eq!(composer.query.len(), MAX_PROMPT_BYTES);
-        assert_eq!(composer.validation_status, Some(OVERSIZED_STATUS));
+        assert_eq!(composer.composer.contents().len(), MAX_PROMPT_BYTES);
+        assert_eq!(
+            composer.composer.validation_status(),
+            Some(OVERSIZED_STATUS)
+        );
     }
 
     #[test]
@@ -1050,7 +1020,7 @@ mod tests {
         let encoded = serde_json::to_vec(&accepted).unwrap();
 
         assert!(encoded.len() < 1024 * 1024);
-        assert_eq!(composer.query, accepted);
+        assert_eq!(composer.composer.contents(), accepted);
         assert_eq!(
             submit(&mut composer),
             Some(KeyAction::Multiple(vec![
@@ -1076,14 +1046,210 @@ mod tests {
             vec![oversized, "safe history".to_string()],
         );
 
-        assert!(composer.query.is_empty());
-        assert_eq!(composer.cursor, 0);
-        assert_eq!(composer.history, vec!["safe history".to_string()]);
-        assert_eq!(composer.validation_status, Some(OVERSIZED_STATUS));
+        assert!(composer.composer.contents().is_empty());
+        assert_eq!(composer.composer.cursor(), (0, 0));
+        assert_eq!(
+            composer.composer.validation_status(),
+            Some(OVERSIZED_STATUS)
+        );
         let wrapped = composer.wrapped_text();
         assert_eq!(wrapped.rows, vec![String::new()]);
         composer.handle_event(&key(KeyCode::Char('p'), KeyModifiers::CONTROL));
-        assert_eq!(composer.query, "safe history");
-        assert_eq!(composer.validation_status, None);
+        assert_eq!(composer.composer.contents(), "safe history");
+        assert_eq!(composer.composer.validation_status(), None);
+    }
+
+    #[test]
+    fn first_prompt_is_centered_in_the_available_viewport() {
+        let editor = editor(100, 30);
+        let composer = new_composer(&editor, None, 1, String::new(), vec![]);
+        let outer_width = composer.dialog.width + 2;
+        let outer_height = composer.dialog.height + 2;
+
+        assert_eq!(composer.dialog.x, (100 - outer_width) / 2);
+        assert_eq!(composer.dialog.y, (editor.vheight() - outer_height) / 2);
+    }
+
+    #[test]
+    fn insert_enter_adds_a_line_and_normal_enter_submits_the_complete_prompt() {
+        let editor = editor(60, 18);
+        let mut composer = new_composer(&editor, None, 802, "first".to_string(), vec![]);
+
+        assert_eq!(
+            composer.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(KeyAction::Single(Action::ShowDialog))
+        );
+        composer.handle_event(&key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(composer.composer.contents(), "first\nx");
+
+        assert_eq!(
+            composer.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(KeyAction::Single(Action::ShowDialog))
+        );
+        assert_eq!(composer.composer.mode(), ModalComposerMode::Normal);
+        assert_eq!(
+            composer.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::NotifyPlugin(
+                    "agent".to_string(),
+                    "composer:submitted:802".to_string(),
+                    json!("first\nx")
+                )
+            ]))
+        );
+    }
+
+    #[test]
+    fn floating_normal_mode_uses_real_buffer_operators_and_undo() {
+        let editor = editor(60, 18);
+        let mut composer = new_composer(&editor, None, 802, "one two".to_string(), vec![]);
+
+        composer.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE));
+        composer.handle_event(&key(KeyCode::Char('0'), KeyModifiers::NONE));
+        composer.handle_event(&key(KeyCode::Char('d'), KeyModifiers::NONE));
+        composer.handle_event(&key(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert_eq!(composer.composer.contents(), "two");
+
+        composer.handle_event(&key(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert_eq!(composer.composer.contents(), "one two");
+    }
+
+    #[test]
+    fn narrow_wrapping_uses_ascii_fallback_without_splitting_unicode_graphemes() {
+        let wrapped = wrap_text("漢👨‍👩‍👧e\u{301}", 1);
+
+        assert_eq!(wrapped.rows, vec!["?", "?", "e\u{301}", ""]);
+        assert_eq!(wrapped.positions, vec![(0, 0), (1, 0), (2, 0), (3, 0)]);
+    }
+
+    #[test]
+    fn floating_placeholder_uses_clean_plain_text_without_quote_prefixes() {
+        let editor = editor(60, 18);
+        let composer = new_composer(&editor, None, 802, String::new(), vec![]);
+        let mut buffer = RenderBuffer::new(60, editor.vheight(), &Style::default());
+
+        composer.draw(&mut buffer).unwrap();
+        let body = rendered_row(&buffer, composer.dialog.y + 1);
+
+        assert!(body.contains("What should the agent do?"));
+        assert!(!body.contains("> "));
+    }
+
+    #[test]
+    fn configured_ascii_border_preserves_the_centered_popup_title() {
+        let config = Config {
+            window_borders_ascii: true,
+            ..Config::default()
+        };
+        let editor = editor_with_config(60, 18, config);
+        let composer = new_composer(
+            &editor,
+            Some("Ask the agent".to_string()),
+            802,
+            String::new(),
+            vec![],
+        );
+        let mut buffer = RenderBuffer::new(60, editor.vheight(), &Style::default());
+
+        composer.draw(&mut buffer).unwrap();
+
+        let left = composer.dialog.x;
+        let right = left + composer.dialog.width + 1;
+        let top = composer.dialog.y;
+        let bottom = top + composer.dialog.height + 1;
+        let top_row = rendered_row(&buffer, top);
+
+        assert!(composer.ascii_borders);
+        assert!(top_row.contains(" Ask the agent "));
+        assert_eq!(buffer.cells[top * buffer.width + left].c, '+');
+        assert_eq!(buffer.cells[top * buffer.width + right].c, '+');
+        assert_eq!(buffer.cells[bottom * buffer.width + left].c, '+');
+        assert_eq!(buffer.cells[bottom * buffer.width + right].c, '+');
+        assert_eq!(buffer.cells[(top + 1) * buffer.width + left].c, '|');
+        assert_eq!(buffer.cells[(top + 1) * buffer.width + right].c, '|');
+        assert!(!top_row.contains('─'));
+        assert!(!top_row.contains('┌'));
+    }
+
+    #[test]
+    fn default_border_preserves_unicode_corners_and_clips_long_title_inside_them() {
+        let editor = editor(8, 8);
+        let composer = new_composer(
+            &editor,
+            Some("A very long 👨‍👩‍👧 title".to_string()),
+            802,
+            String::new(),
+            vec![],
+        );
+        let mut buffer = RenderBuffer::new(8, editor.vheight(), &Style::default());
+
+        composer.draw(&mut buffer).unwrap();
+
+        let left = composer.dialog.x;
+        let right = left + composer.dialog.width + 1;
+        let top = composer.dialog.y;
+        let bottom = top + composer.dialog.height + 1;
+
+        assert!(!composer.ascii_borders);
+        assert_eq!(buffer.cells[top * buffer.width + left].c, '┌');
+        assert_eq!(buffer.cells[top * buffer.width + right].c, '┐');
+        assert_eq!(buffer.cells[bottom * buffer.width + left].c, '└');
+        assert_eq!(buffer.cells[bottom * buffer.width + right].c, '┘');
+    }
+
+    #[test]
+    fn resizing_to_a_zero_viewport_hides_the_cursor_and_draws_safely() {
+        let editor = editor(60, 18);
+        let mut composer = new_composer(
+            &editor,
+            Some("Ask the agent".to_string()),
+            802,
+            "👨‍👩‍👧漢".to_string(),
+            vec![],
+        );
+
+        assert!(composer.resize(0, 0));
+        let mut buffer = RenderBuffer::new(0, 0, &Style::default());
+
+        composer.draw(&mut buffer).unwrap();
+        assert_eq!(composer.cursor_position(), None);
+    }
+
+    #[test]
+    fn ascii_border_keeps_all_corners_on_screen_after_tiny_resize() {
+        let config = Config {
+            window_borders_ascii: true,
+            ..Config::default()
+        };
+        let editor = editor_with_config(60, 18, config);
+        let mut composer = new_composer(
+            &editor,
+            Some("A long title".to_string()),
+            802,
+            "👨‍👩‍👧漢".to_string(),
+            vec![],
+        );
+
+        for (width, height) in [(8, 4), (2, 2), (1, 1)] {
+            assert!(composer.resize(width, height));
+            let mut buffer = RenderBuffer::new(width, height, &Style::default());
+
+            composer.draw(&mut buffer).unwrap();
+
+            let (cursor_x, cursor_y) = composer.cursor_position().unwrap();
+            assert!(cursor_x < width);
+            assert!(cursor_y < height);
+            if width >= 2 && height >= 2 {
+                let left = composer.dialog.x;
+                let right = left + composer.dialog.width + 1;
+                let top = composer.dialog.y;
+                let bottom = top + composer.dialog.height + 1;
+                assert_eq!(buffer.cells[top * width + left].c, '+');
+                assert_eq!(buffer.cells[top * width + right].c, '+');
+                assert_eq!(buffer.cells[bottom * width + left].c, '+');
+                assert_eq!(buffer.cells[bottom * width + right].c, '+');
+            }
+        }
     }
 }
