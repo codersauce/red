@@ -34,6 +34,9 @@ jobs:
       - name: Verify README release version
         run: python3 scripts/readme_release.py --check
 
+      - name: Test Discord release announcements
+        run: python3 -m unittest tests.test_discord_release
+
   test:
     name: Test Suite (${{ matrix.platform.standard }}, ${{ matrix.rust }})
     runs-on: >-

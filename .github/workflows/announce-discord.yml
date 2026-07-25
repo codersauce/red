@@ -1,0 +1,85 @@
+name: Announce Discord release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Existing release tag to preview or announce
+        required: true
+        type: string
+      dry_run:
+        description: Generate a preview without posting to Discord
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: discord-release-${{ github.event.release.id || inputs.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  announce:
+    name: Announce ${{ github.event.release.tag_name || inputs.tag_name }}
+    if: github.event_name == 'workflow_dispatch' || !github.event.release.prerelease
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG_NAME: ${{ github.event.release.tag_name || inputs.tag_name }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+
+    steps:
+      - name: Checkout announcement tooling
+        uses: actions/checkout@v4
+
+      - name: Read published release
+        run: |
+          set -euo pipefail
+          gh release view "$TAG_NAME" \
+            --repo "${{ github.repository }}" \
+            --json tagName,url,publishedAt,body \
+            > "$RUNNER_TEMP/release.json"
+
+      - name: Build announcement
+        env:
+          MENTION_EVERYONE: ${{ vars.DISCORD_RELEASE_MENTION_EVERYONE }}
+        run: |
+          set -euo pipefail
+          mention_args=()
+          if [[ "$MENTION_EVERYONE" == "true" ]]; then
+            mention_args+=(--mention-everyone)
+          fi
+          python3 scripts/discord_release.py \
+            --release-json "$RUNNER_TEMP/release.json" \
+            --output "$RUNNER_TEMP/discord-release.json" \
+            --summary "$RUNNER_TEMP/discord-release.md" \
+            "${mention_args[@]}"
+          cat "$RUNNER_TEMP/discord-release.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check webhook configuration
+        if: env.DRY_RUN != 'true'
+        env:
+          DISCORD_RELEASE_WEBHOOK_URL: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
+        run: |
+          if [[ -z "$DISCORD_RELEASE_WEBHOOK_URL" ]]; then
+            echo "DISCORD_RELEASE_WEBHOOK_URL is required to announce releases." >&2
+            exit 1
+          fi
+
+      - name: Post announcement
+        if: env.DRY_RUN != 'true'
+        env:
+          DISCORD_RELEASE_WEBHOOK_URL: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          curl --fail-with-body \
+            --retry 3 \
+            --retry-all-errors \
+            --header "Content-Type: application/json" \
+            --data-binary "@$RUNNER_TEMP/discord-release.json" \
+            "${DISCORD_RELEASE_WEBHOOK_URL}?wait=true" \
+            > "$RUNNER_TEMP/discord-response.json"
