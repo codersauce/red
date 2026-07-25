@@ -911,6 +911,12 @@ struct PanelRenderOptions<'a> {
     use_ascii: bool,
 }
 
+#[derive(Clone, Copy)]
+struct TextPanelRenderStyle<'a> {
+    theme: &'a Theme,
+    surface: &'a Style,
+}
+
 impl PanelManager {
     pub fn create_panel(&mut self, id: String, config: PanelConfig) {
         self.text_panels.remove(&id);
@@ -1939,6 +1945,10 @@ fn render_text_panel(
     }
 
     let surface_style = panel_style(theme, panel.config.surface.as_ref());
+    let render_style = TextPanelRenderStyle {
+        theme,
+        surface: &surface_style,
+    };
     for y in 0..height {
         buffer.set_text(
             position.x,
@@ -1956,7 +1966,7 @@ fn render_text_panel(
     if let Some(title) = &panel.config.title {
         let title_style = Style {
             bold: true,
-            ..theme.style.clone()
+            ..surface_style.clone()
         };
         buffer.set_text(
             position.x,
@@ -1965,16 +1975,13 @@ fn render_text_panel(
             &title_style,
         );
     }
+    let muted_style = theme.ui_style.muted.with_bg(surface_style.bg);
+    let action_style = theme.ui_style.picker_prompt.with_bg(surface_style.bg);
     for (start, _, label) in header_actions {
         let x = position.x + start;
-        buffer.set_text(x, position.y, "[", &theme.ui_style.muted);
-        buffer.set_text(x + 1, position.y, label, &theme.ui_style.picker_prompt);
-        buffer.set_text(
-            x + 1 + display_width(label),
-            position.y,
-            "]",
-            &theme.ui_style.muted,
-        );
+        buffer.set_text(x, position.y, "[", &muted_style);
+        buffer.set_text(x + 1, position.y, label, &action_style);
+        buffer.set_text(x + 1 + display_width(label), position.y, "]", &muted_style);
     }
 
     let composer_height = panel.composer_height();
@@ -1998,7 +2005,7 @@ fn render_text_panel(
             width,
             line,
             panel.selected_link,
-            theme,
+            render_style,
         );
     }
 
@@ -2009,7 +2016,7 @@ fn render_text_panel(
             position,
             width,
             content_height,
-            theme,
+            render_style,
             options.use_ascii,
         );
     }
@@ -2021,7 +2028,7 @@ fn render_text_panel(
             position,
             width,
             content_height + status_height,
-            theme,
+            render_style,
             options.use_ascii,
         );
     }
@@ -2086,19 +2093,22 @@ fn render_text_panel_composer(
     position: Point,
     width: usize,
     top: usize,
-    theme: &Theme,
+    render_style: TextPanelRenderStyle<'_>,
     use_ascii: bool,
 ) {
     if width == 0 {
         return;
     }
+    let theme = render_style.theme;
+    let surface_style = render_style.surface;
     let top = position.y.saturating_add(top);
     let divider = if use_ascii { "-" } else { "─" }.repeat(width);
+    let divider_style = theme.ui_style.muted.with_bg(surface_style.bg);
     buffer.set_text(
         position.x,
         top,
         &fit_display_width(&divider, width),
-        &theme.ui_style.muted,
+        &divider_style,
     );
 
     let rows = composer.config.rows.max(1);
@@ -2123,17 +2133,18 @@ fn render_text_panel_composer(
         } else {
             line
         };
-        let surface_style = if composer.enabled && composer.focused {
-            &theme.ui_style.dialog
+        let input_style = if composer.enabled && composer.focused {
+            theme.ui_style.dialog.with_bg(surface_style.bg)
         } else {
-            &theme.ui_style.muted
+            theme.ui_style.muted.with_bg(surface_style.bg)
         };
+        let placeholder_style = theme.ui_style.muted.with_bg(surface_style.bg);
         let text_style = if placeholder {
-            &theme.ui_style.muted
+            &placeholder_style
         } else {
-            surface_style
+            &input_style
         };
-        buffer.set_text(position.x, y, &" ".repeat(width), surface_style);
+        buffer.set_text(position.x, y, &" ".repeat(width), &input_style);
         buffer.set_text(
             position.x.saturating_add(1),
             y,
@@ -2150,11 +2161,14 @@ fn render_text_panel_composer(
         Some(status) => format!("{status} | {hints}"),
         None => hints,
     };
+    let footer_y = top + rows + 1;
+    let footer_style = &theme.ui_style.muted;
+    buffer.set_text(position.x, footer_y, &" ".repeat(width), footer_style);
     buffer.set_text(
         position.x,
-        top + rows + 1,
+        footer_y,
         &fit_display_width(&status, width),
-        &theme.ui_style.muted,
+        footer_style,
     );
 }
 
@@ -2164,12 +2178,14 @@ fn render_text_panel_status(
     position: Point,
     width: usize,
     y: usize,
-    theme: &Theme,
+    render_style: TextPanelRenderStyle<'_>,
     use_ascii: bool,
 ) {
     if width == 0 {
         return;
     }
+    let theme = render_style.theme;
+    let surface_style = render_style.surface;
     let Some(status) = panel.status.as_ref() else {
         return;
     };
@@ -2184,16 +2200,19 @@ fn render_text_panel_status(
                 status.label,
                 format_elapsed(elapsed_ms / 1000)
             ),
-            &theme.ui_style.picker_prompt,
+            theme.ui_style.picker_prompt.with_bg(surface_style.bg),
         )
     } else {
-        (status.label.clone(), &theme.ui_style.muted)
+        (
+            status.label.clone(),
+            theme.ui_style.muted.with_bg(surface_style.bg),
+        )
     };
     buffer.set_text(
         position.x,
         position.y.saturating_add(y),
         &fit_display_width(&text, width),
-        style,
+        &style,
     );
 }
 
@@ -2257,8 +2276,10 @@ fn render_text_spans(
     width: usize,
     line: &RenderedTextLine,
     selected_link: Option<u64>,
-    theme: &Theme,
+    render_style: TextPanelRenderStyle<'_>,
 ) {
+    let theme = render_style.theme;
+    let surface_style = render_style.surface;
     let mut used = 0;
     for span in &line.spans {
         if used >= width {
@@ -2272,6 +2293,16 @@ fn render_text_spans(
             .syntax_style
             .clone()
             .unwrap_or_else(|| text_panel_span_style(span.style, theme));
+        style.fg = style.fg.or(surface_style.fg);
+        style.bg = if span.syntax_style.is_some()
+            || matches!(
+                span.style,
+                TextPanelSpanStyle::InlineCode | TextPanelSpanStyle::Code
+            ) {
+            style.bg.or(surface_style.bg)
+        } else {
+            surface_style.bg
+        };
         if span
             .link
             .as_ref()
@@ -2999,6 +3030,207 @@ mod tests {
     }
 
     #[test]
+    fn agent_conversation_confines_background_accents_to_its_footer_on_every_dock() {
+        for theme_path in ["themes/kanso.json", "themes/github-light.json"] {
+            let theme = parse_vscode_theme(theme_path).unwrap();
+            let editor_background = theme.style.bg;
+            let footer_background = theme.ui_style.muted.bg;
+
+            assert_ne!(
+                footer_background, editor_background,
+                "{theme_path} should exercise a genuinely contrasting footer",
+            );
+
+            for side in [
+                PanelSide::Left,
+                PanelSide::Right,
+                PanelSide::Top,
+                PanelSide::Bottom,
+            ] {
+                for focus_composer in [false, true] {
+                    let mut manager = PanelManager::default();
+                    manager.create_text_panel(
+                        "agent-conversation".to_string(),
+                        PanelConfig {
+                            side,
+                            width: if matches!(side, PanelSide::Top | PanelSide::Bottom) {
+                                14
+                            } else {
+                                42
+                            },
+                            title: Some("Agent".to_string()),
+                            composer: Some(TextPanelComposerConfig {
+                                placeholder: "Ask a follow-up…".to_string(),
+                                rows: 2,
+                            }),
+                            surface: Some(ThemeStyleSpec {
+                                foreground: vec![
+                                    "sideBar.foreground".to_string(),
+                                    "editor.foreground".to_string(),
+                                ],
+                                background: vec!["editor.background".to_string()],
+                                ..ThemeStyleSpec::default()
+                            }),
+                            border: Some(ThemeStyleSpec {
+                                foreground: vec![
+                                    "sideBar.border".to_string(),
+                                    "panel.border".to_string(),
+                                ],
+                                background: vec!["editor.background".to_string()],
+                                ..ThemeStyleSpec::default()
+                            }),
+                            header_actions: vec![TextPanelHeaderAction {
+                                id: "clear".to_string(),
+                                label: "Clear".to_string(),
+                                compact_label: Some("C".to_string()),
+                            }],
+                        },
+                    );
+                    manager.update_text_panel(
+                        "agent-conversation",
+                        vec![
+                            TextPanelBlock {
+                                id: "user:1".to_string(),
+                                kind: TextPanelBlockKind::User,
+                                format: TextPanelBlockFormat::Plain,
+                                text: "Explain the current file".to_string(),
+                            },
+                            TextPanelBlock {
+                                id: "agent:1".to_string(),
+                                kind: TextPanelBlockKind::Agent,
+                                format: TextPanelBlockFormat::Markdown,
+                                text: "## Answer\n[Read the docs](https://example.com)\n> note"
+                                    .to_string(),
+                            },
+                        ],
+                        30,
+                        100,
+                    );
+                    assert!(manager.set_text_panel_status(
+                        "agent-conversation",
+                        Some(TextPanelStatus {
+                            busy: true,
+                            label: "Reading the current file".to_string(),
+                            stream: false,
+                        }),
+                    ));
+                    if focus_composer {
+                        assert!(manager.focus_text_panel_composer("agent-conversation"));
+                    } else {
+                        assert!(manager.focus_panel("agent-conversation"));
+                    }
+
+                    let mut buffer = RenderBuffer::new(100, 30, &theme.style);
+                    manager.render(&mut buffer, &theme);
+                    let placement = manager
+                        .panel_placements(buffer.width, buffer.height)
+                        .into_iter()
+                        .find(|placement| placement.id == "agent-conversation")
+                        .unwrap();
+                    let footer_y = placement.y + placement.height - 1;
+
+                    for y in placement.y..placement.y + placement.height {
+                        for x in placement.x..placement.x + placement.width {
+                            let expected_background = if y == footer_y {
+                                footer_background
+                            } else {
+                                editor_background
+                            };
+                            assert_eq!(
+                                buffer.cells[y * buffer.width + x].style.bg,
+                                expected_background,
+                                "{theme_path}, {side:?}, composer_focused={focus_composer}, \
+                                 x={x}, y={y}",
+                            );
+                        }
+                    }
+
+                    let title = &buffer.cells[placement.y * buffer.width + placement.x];
+                    assert_eq!(
+                        title.style.fg,
+                        theme.colors.get("sideBar.foreground").copied(),
+                    );
+                    assert!(title.style.bold);
+
+                    let footer = row_text(&buffer, footer_y);
+                    assert!(
+                        footer.contains(if focus_composer { "INSERT" } else { "READ" }),
+                        "the localized footer should retain Vim-mode guidance: {footer}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn custom_text_panel_keeps_its_requested_surface_background() {
+        let theme = parse_vscode_theme("themes/github-light.json").unwrap();
+        let sidebar_background = theme.colors["sideBar.background"];
+        assert_ne!(Some(sidebar_background), theme.style.bg);
+
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "custom-conversation".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 36,
+                title: Some("Custom conversation".to_string()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Custom prompt".to_string(),
+                    rows: 2,
+                }),
+                surface: Some(ThemeStyleSpec {
+                    foreground: vec!["sideBar.foreground".to_string()],
+                    background: vec!["sideBar.background".to_string()],
+                    ..ThemeStyleSpec::default()
+                }),
+                header_actions: vec![TextPanelHeaderAction {
+                    id: "clear".to_string(),
+                    label: "Clear".to_string(),
+                    compact_label: Some("C".to_string()),
+                }],
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_text_panel(
+            "custom-conversation",
+            vec![TextPanelBlock {
+                id: "answer".to_string(),
+                kind: TextPanelBlockKind::Agent,
+                format: TextPanelBlockFormat::Markdown,
+                text: "# Custom heading\n> Custom note".to_string(),
+            }],
+            20,
+            80,
+        );
+        assert!(manager.focus_text_panel_composer("custom-conversation"));
+
+        let mut buffer = RenderBuffer::new(80, 20, &theme.style);
+        manager.render(&mut buffer, &theme);
+        let placement = manager
+            .panel_placements(buffer.width, buffer.height)
+            .into_iter()
+            .find(|placement| placement.id == "custom-conversation")
+            .unwrap();
+        let footer_y = placement.y + placement.height - 1;
+
+        for y in placement.y..placement.y + placement.height {
+            for x in placement.x..placement.x + placement.width {
+                let expected_background = if y == footer_y {
+                    theme.ui_style.muted.bg
+                } else {
+                    Some(sidebar_background)
+                };
+                assert_eq!(
+                    buffer.cells[y * buffer.width + x].style.bg,
+                    expected_background,
+                    "custom text surfaces should remain intact at x={x}, y={y}",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn text_panel_renders_fenced_code_with_the_editors_real_syntax_styles() {
         let theme = parse_vscode_theme("themes/kanso.json").unwrap();
         let mut highlighter = Highlighter::new(&theme).unwrap();
@@ -3044,7 +3276,7 @@ mod tests {
 
         assert_eq!(
             buffer.cells[row * buffer.width + column].style,
-            expected_keyword_style
+            expected_keyword_style.with_bg(expected_keyword_style.bg.or(theme.style.bg))
         );
     }
 
@@ -3805,6 +4037,75 @@ mod tests {
                 path: "src/main.rs".to_string(),
                 location: None,
             })
+        );
+    }
+
+    #[test]
+    fn selected_text_panel_links_keep_their_confined_selection_accent() {
+        let theme = parse_vscode_theme("themes/github-light.json").unwrap();
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent-conversation".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 40,
+                title: Some("Agent".to_string()),
+                surface: Some(ThemeStyleSpec {
+                    foreground: vec!["sideBar.foreground".to_string()],
+                    background: vec!["editor.background".to_string()],
+                    ..ThemeStyleSpec::default()
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_text_panel(
+            "agent-conversation",
+            vec![TextPanelBlock {
+                id: "answer".to_string(),
+                kind: TextPanelBlockKind::Agent,
+                format: TextPanelBlockFormat::Markdown,
+                text: "Read the [docs](https://example.com)".to_string(),
+            }],
+            20,
+            80,
+        );
+        assert!(manager.focus_panel("agent-conversation"));
+        assert!(manager.select_focused_text_link(true, 20, 80));
+
+        let mut buffer = RenderBuffer::new(80, 20, &theme.style);
+        manager.render(&mut buffer, &theme);
+        let (row, column) = (0..buffer.height)
+            .find_map(|row| {
+                let text = row_text(&buffer, row);
+                text.find("docs")
+                    .map(|byte| (row, display_width(&text[..byte])))
+            })
+            .expect("the focused Markdown link should remain visible");
+        let selected = &buffer.cells[row * buffer.width + column];
+        let surface_style = panel_style(
+            &theme,
+            manager.text_panels["agent-conversation"]
+                .config
+                .surface
+                .as_ref(),
+        );
+        let mut link_style = text_panel_span_style(TextPanelSpanStyle::Link, &theme);
+        link_style.fg = link_style.fg.or(surface_style.fg);
+        link_style.bg = surface_style.bg;
+        let selected_style = theme.selected_style(
+            &link_style,
+            &theme.list_selection_style(),
+            SelectionForegroundPriority::Content,
+        );
+
+        assert_ne!(selected.style.bg, theme.style.bg);
+        assert_eq!(selected.style, selected_style);
+        assert_eq!(
+            buffer.cells[row * buffer.width + column.saturating_sub(1)]
+                .style
+                .bg,
+            theme.style.bg,
+            "selection must be confined to the linked text",
         );
     }
 

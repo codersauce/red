@@ -4167,6 +4167,10 @@ mod tests {
                     && config.side == crate::plugin::PanelSide::Right
                     && config.width == 62
                     && config.title.as_deref() == Some("Agent")
+                    && config.surface.as_ref().is_some_and(|surface|
+                        surface.background == ["editor.background"]
+                            && surface.foreground == ["sideBar.foreground", "editor.foreground"]
+                    )
                     && config.header_actions.iter().map(|action| action.id.as_str()).eq(["clear", "new", "close"])
         ));
         assert!(matches!(

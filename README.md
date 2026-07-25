@@ -126,8 +126,9 @@ versioned behavior contract.
    a bounded selection or cursor excerpt, unsaved contents, and relevant
    diagnostics. Set `[agent] entry = "dock"` to compose directly in the dock.
 2. **Continue.** The conversation opens in a responsive dock with the same
-   modal, multiline composer. Use `:AgentLeft`, `:AgentRight`, `:AgentTop`, or
-   `:AgentBottom` to move it without discarding your draft.
+   modal, multiline composer. Focus it and use `Ctrl+W H/J/K/L` to move it,
+   just like an editor window; `:AgentLeft`, `:AgentRight`, `:AgentTop`, and
+   `:AgentBottom` remain available. Moving the dock preserves your draft.
 3. **Choose your workflow.** Native Agent mode honors your installed Codex
    sandbox, tools, and approval policy. Set `[agent] mode = "review"` to stage
    changes in an isolated proposal filesystem; inspect them with `:AgentReview`

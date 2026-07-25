@@ -3326,6 +3326,37 @@ impl Editor {
         Ok(())
     }
 
+    fn move_focused_window_to_edge(
+        &mut self,
+        direction: crate::window::Direction,
+        buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<()> {
+        if self.panel_manager.focused_panel_id() == Some("agent-conversation")
+            && !self.panel_manager.focused_row_panel()
+        {
+            let position = match direction {
+                crate::window::Direction::Up => AgentPosition::Top,
+                crate::window::Direction::Down => AgentPosition::Bottom,
+                crate::window::Direction::Left => AgentPosition::Left,
+                crate::window::Direction::Right => AgentPosition::Right,
+            };
+
+            if self.config.agent.position != position {
+                self.config.agent.position = position;
+                self.apply_panel_layout();
+                self.render(buffer)?;
+            }
+
+            return Ok(());
+        }
+
+        if self.update_window_layout(|windows| windows.move_window_to_edge(direction)) {
+            self.render(buffer)?;
+        }
+
+        Ok(())
+    }
+
     fn update_window_layout(
         &mut self,
         update: impl FnOnce(&mut WindowManager) -> Option<()>,
@@ -15726,32 +15757,16 @@ impl Editor {
                     .await?;
             }
             Action::MoveWindowToLeft => {
-                if self.update_window_layout(|windows| {
-                    windows.move_window_to_edge(crate::window::Direction::Left)
-                }) {
-                    self.render(buffer)?;
-                }
+                self.move_focused_window_to_edge(crate::window::Direction::Left, buffer)?;
             }
             Action::MoveWindowToBottom => {
-                if self.update_window_layout(|windows| {
-                    windows.move_window_to_edge(crate::window::Direction::Down)
-                }) {
-                    self.render(buffer)?;
-                }
+                self.move_focused_window_to_edge(crate::window::Direction::Down, buffer)?;
             }
             Action::MoveWindowToTop => {
-                if self.update_window_layout(|windows| {
-                    windows.move_window_to_edge(crate::window::Direction::Up)
-                }) {
-                    self.render(buffer)?;
-                }
+                self.move_focused_window_to_edge(crate::window::Direction::Up, buffer)?;
             }
             Action::MoveWindowToRight => {
-                if self.update_window_layout(|windows| {
-                    windows.move_window_to_edge(crate::window::Direction::Right)
-                }) {
-                    self.render(buffer)?;
-                }
+                self.move_focused_window_to_edge(crate::window::Direction::Right, buffer)?;
             }
             Action::ResizeWindowUp(amount) => {
                 if self.update_window_layout(|windows| {
@@ -21086,6 +21101,11 @@ impl Editor {
     }
 
     #[doc(hidden)]
+    pub fn test_agent_position(&self) -> crate::config::AgentPosition {
+        self.config.agent.position
+    }
+
+    #[doc(hidden)]
     pub fn test_create_panel(&mut self, id: &str, config: plugin::PanelConfig) {
         self.panel_manager.create_panel(id.to_string(), config);
         self.apply_panel_layout();
@@ -21628,6 +21648,92 @@ mod test {
                 (expected_side, expected_thickness),
             );
         }
+    }
+
+    #[tokio::test]
+    async fn edge_moves_preserve_focused_agent_transcript_composer_and_draft() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 30);
+        editor.test_create_text_panel(
+            "agent-conversation",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Right,
+                composer: Some(plugin::TextPanelComposerConfig {
+                    placeholder: "Ask the agent".to_string(),
+                    rows: 3,
+                }),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        editor.panel_manager.update_text_panel(
+            "agent-conversation",
+            vec![plugin::TextPanelBlock {
+                id: "agent-turn".to_string(),
+                kind: plugin::TextPanelBlockKind::Agent,
+                format: plugin::TextPanelBlockFormat::Plain,
+                text: "Keep the streamed conversation 👋".to_string(),
+            }],
+            /*panel_height*/ 28,
+            /*terminal_width*/ 100,
+        );
+        assert!(editor
+            .panel_manager
+            .focus_text_panel_composer("agent-conversation"));
+        let drafted = editor
+            .panel_manager
+            .handle_focused_text_input(
+                &Event::Paste("Preserve this draft 👨‍👩‍👧".to_string()),
+                /*terminal_width*/ 100,
+            )
+            .expect("focused agent composer must receive the draft");
+        assert_eq!(drafted.action, "composer_input");
+
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 30, &Style::default());
+        let mut runtime = Runtime::new();
+        for (action, position) in [
+            (Action::MoveWindowToLeft, AgentPosition::Left),
+            (Action::MoveWindowToBottom, AgentPosition::Bottom),
+            (Action::MoveWindowToTop, AgentPosition::Top),
+            (Action::MoveWindowToRight, AgentPosition::Right),
+        ] {
+            editor
+                .execute(&action, &mut render_buffer, &mut runtime)
+                .await
+                .unwrap();
+
+            assert_eq!(editor.test_agent_position(), position);
+            assert_eq!(
+                editor.panel_manager.focused_panel_id(),
+                Some("agent-conversation")
+            );
+            assert!(editor.panel_manager.focused_text_input_active());
+            assert_eq!(
+                editor.panel_manager.focused_text_for_copy(/*all*/ false),
+                Some("Keep the streamed conversation 👋".to_string())
+            );
+            let (cursor_x, cursor_y) = editor
+                .render_cursor_position()
+                .expect("the relocated agent composer must retain its real cursor");
+            assert_eq!(
+                editor
+                    .panel_manager
+                    .panel_at_position(cursor_x, cursor_y, /*width*/ 100, /*height*/ 30)
+                    .map(|placement| placement.id),
+                Some("agent-conversation".to_string())
+            );
+        }
+
+        let submitted = editor
+            .panel_manager
+            .handle_focused_text_input(
+                &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+                /*terminal_width*/ 100,
+            )
+            .expect("the preserved draft must remain submittable");
+        assert_eq!(submitted.action, "submit");
+        assert_eq!(submitted.text.as_deref(), Some("Preserve this draft 👨‍👩‍👧"));
     }
 
     #[test]

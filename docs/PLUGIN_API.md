@@ -176,7 +176,10 @@ composer and `header_actions: [Json { id: String, label: String,
 compact_label?: String }]` for clickable, right-aligned header controls. Row
 panels can also set `surface: ThemeStyleSpec` and `border: ThemeStyleSpec` to
 resolve theme-aware panel foreground, background, and separator colors without
-affecting other panels.
+affecting other panels. The bundled agent requests the editor background for
+its text panel and reserves contrasting background color for the bottom
+shortcut strip; message roles, links, status, and separators remain
+theme-colored without applying full-width transcript backgrounds.
 
 Header actions emit `panel:event:<id>` using their configured `id`; compact
 labels are selected automatically on narrow panels, with the rightmost actions
@@ -194,7 +197,10 @@ its independent reading cursor supports `j`/`k`, arrow keys,
 activation with `Enter`. Press `i` or `a`, click the footer, or call
 `FocusTextPanelComposer(id)` to enter the composer. `Escape` inside the
 composer enters normal mode; `Ctrl+C` blurs the composer without discarding
-its draft. `Escape` while reading returns focus to the editor.
+its draft. `Escape` while reading returns focus to the editor. When the
+bundled agent conversation is focused, `Ctrl+W H`, `Ctrl+W J`, `Ctrl+W K`,
+and `Ctrl+W L` move its existing panel to the left, bottom, top, and right
+without recreating its composer or discarding its draft.
 `SetPanelVisible(id, visible)` hides or restores a panel without
 discarding its blocks, scroll position, or draft. Replacing text-panel blocks
 with an empty list resets scrolling and restores tail-following. Responsive

@@ -402,7 +402,7 @@ fn ensure_conversation_panel() {
             title: "Agent",
             surface: ThemeStyleSpec {
                 foreground: ["sideBar.foreground", "editor.foreground"],
-                background: ["sideBar.background", "editor.background"],
+                background: ["editor.background"],
             },
             border: ThemeStyleSpec {
                 foreground: ["sideBar.border", "panel.border", "editorLineNumber.foreground"],
@@ -1242,7 +1242,7 @@ fn render_conversation() {
             id: "empty",
             kind: "activity",
             format: "plain",
-            text: "No messages yet.\n\nAsk about the current file, explain a selection,\nor request a change.\n\nCtrl+Enter sends · Alt+Enter when supported\nEnter, Shift+Enter, or Ctrl+J adds a line\nEsc, then Enter always sends\nj/k reads · i/a edits · Space A opens the prompt\nCtrl+C stops a running turn",
+            text: "No messages yet.\n\nAsk about the current file, explain a selection,\nor request a change.\n\nCtrl+Enter sends · Alt+Enter when supported\nEnter, Shift+Enter, or Ctrl+J adds a line\nEsc, then Enter always sends\nj/k reads · i/a edits · Space A opens the prompt\nCtrl+W H/J/K/L moves the pane\nCtrl+C stops a running turn",
         }];
     }
     red::execute("UpdateTextPanel", "agent-conversation", blocks);

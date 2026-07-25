@@ -69,9 +69,14 @@ to return to the composer. `Esc` inside the composer enters Normal mode;
 `Ctrl+C` leaves the composer while preserving its draft. In conversation
 reading mode, `Esc` returns focus to the editor.
 
-Use `:AgentLeft`, `:AgentRight`, `:AgentTop`, or `:AgentBottom` to move the
-conversation. Adaptive layout preserves usable editor space on narrow
-terminals.
+With the conversation focused, use `Ctrl+W H`, `Ctrl+W J`, `Ctrl+W K`, or
+`Ctrl+W L` to move it to the left, bottom, top, or right, just as with an
+ordinary editor window. `:AgentLeft`, `:AgentBottom`, `:AgentTop`, and
+`:AgentRight` remain available. Moving the conversation preserves its draft,
+history, reading cursor, and focus; adaptive layout preserves usable editor
+space on narrow terminals. The conversation and floating prompt use the
+editor's background, with theme color confined to message text, separators,
+status, and the shortcut strip.
 
 If Codex cannot start, Red preserves the prompt and offers a retry action.
 Install or update Codex, run `codex login`, then retry without retyping.

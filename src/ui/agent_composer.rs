@@ -45,6 +45,7 @@ pub struct AgentComposer {
     viewport_height: usize,
     style: Style,
     muted_style: Style,
+    footer_style: Style,
     theme: Theme,
 }
 
@@ -98,9 +99,9 @@ impl AgentComposer {
         target: ComposerTarget,
     ) -> Self {
         let theme = editor.theme.clone();
-        let style = theme.ui_style.popup.clone();
-        let border_style = theme.ui_style.popup_border.clone();
-        let title_style = theme.ui_style.popup_title.clone();
+        let style = theme.ui_style.popup.with_bg(theme.style.bg);
+        let border_style = theme.ui_style.popup_border.with_bg(theme.style.bg);
+        let title_style = theme.ui_style.popup_title.with_bg(theme.style.bg);
         let popup_title = title.clone();
         let ascii_borders = editor.window_borders_ascii();
         let viewport_width = editor.vwidth();
@@ -128,7 +129,8 @@ impl AgentComposer {
             viewport_width,
             viewport_height,
             style,
-            muted_style: theme.ui_style.muted.clone(),
+            muted_style: theme.ui_style.muted.with_bg(theme.style.bg),
+            footer_style: theme.ui_style.muted.clone(),
             theme,
         }
     }
@@ -305,7 +307,13 @@ impl Component for AgentComposer {
                 .validation_status()
                 .unwrap_or(mode_status.as_str());
             let status = truncate_display_width(status, self.dialog.width);
-            buffer.set_text(content_x, status_y, &status, &self.muted_style);
+            buffer.set_text(
+                content_x,
+                status_y,
+                &" ".repeat(self.dialog.width),
+                &self.footer_style,
+            );
+            buffer.set_text(content_x, status_y, &status, &self.footer_style);
         }
         Ok(())
     }
@@ -342,11 +350,12 @@ impl Component for AgentComposer {
     }
 
     fn set_theme(&mut self, theme: &Theme) {
-        self.style = theme.ui_style.popup.clone();
-        self.muted_style = theme.ui_style.muted.clone();
-        self.dialog.style = theme.ui_style.popup.clone();
-        self.dialog.border_draw_style = theme.ui_style.popup_border.clone();
-        self.dialog.title_style = theme.ui_style.popup_title.clone();
+        self.style = theme.ui_style.popup.with_bg(theme.style.bg);
+        self.muted_style = theme.ui_style.muted.with_bg(theme.style.bg);
+        self.footer_style = theme.ui_style.muted.clone();
+        self.dialog.style = self.style.clone();
+        self.dialog.border_draw_style = theme.ui_style.popup_border.with_bg(theme.style.bg);
+        self.dialog.title_style = theme.ui_style.popup_title.with_bg(theme.style.bg);
         self.dialog.theme = theme.clone();
         self.theme = theme.clone();
     }
@@ -476,7 +485,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        buffer::Buffer, config::Config, lsp::LspManager, ui::modal_composer::MAX_PROMPT_BYTES,
+        buffer::Buffer, config::Config, lsp::LspManager, theme::parse_vscode_theme,
+        ui::modal_composer::MAX_PROMPT_BYTES,
     };
 
     fn editor(width: usize, height: usize) -> Editor {
@@ -518,6 +528,70 @@ mod tests {
             .iter()
             .map(|cell| cell.c)
             .collect()
+    }
+
+    #[test]
+    fn floating_composer_keeps_the_editor_background_and_one_accented_footer() {
+        let editor = editor(80, 24);
+
+        for theme_path in ["themes/kanso.json", "themes/github-light.json"] {
+            let theme = parse_vscode_theme(theme_path).unwrap();
+            assert_ne!(
+                theme.ui_style.muted.bg, theme.style.bg,
+                "{theme_path} should exercise a visibly accented footer",
+            );
+
+            for draft in ["", "Explain the current file"] {
+                let mut composer = new_composer(
+                    &editor,
+                    Some("Agent prompt".to_string()),
+                    802,
+                    draft.to_string(),
+                    vec![],
+                );
+                composer.set_theme(&theme);
+
+                let mut buffer = RenderBuffer::new(80, editor.vheight(), &theme.style);
+                composer.draw(&mut buffer).unwrap();
+
+                let left = composer.dialog.x;
+                let right = left + composer.dialog.width + 1;
+                let top = composer.dialog.y;
+                let bottom = top + composer.dialog.height + 1;
+                let footer_y = top + 1 + composer.body_height();
+
+                for y in top..=bottom {
+                    for x in left..=right {
+                        let footer_content = y == footer_y && x > left && x < right;
+                        let expected_background = if footer_content {
+                            theme.ui_style.muted.bg
+                        } else {
+                            theme.style.bg
+                        };
+                        assert_eq!(
+                            buffer.cells[y * buffer.width + x].style.bg,
+                            expected_background,
+                            "{theme_path}, draft={draft:?}, x={x}, y={y}",
+                        );
+                    }
+                }
+
+                assert_eq!(
+                    buffer.cells[top * buffer.width + left].style.fg,
+                    theme.ui_style.popup_border.fg,
+                    "floating outlines should retain their theme accent",
+                );
+
+                let body = &buffer.cells[(top + 1) * buffer.width + left + 1];
+                let expected_foreground = if draft.is_empty() {
+                    theme.ui_style.muted.fg
+                } else {
+                    theme.ui_style.popup.fg
+                };
+                assert_eq!(body.style.fg, expected_foreground);
+                assert!(rendered_row(&buffer, footer_y).contains("Ctrl+Enter send"));
+            }
+        }
     }
 
     #[test]
