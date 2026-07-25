@@ -1869,14 +1869,19 @@ fn render_row_segments(
     theme: &Theme,
     selected: bool,
 ) {
-    let right_width = segments_width(&row.right_segments).min(width);
-    let gap = usize::from(right_width > 0 && right_width < width);
-    let left_width = width.saturating_sub(right_width).saturating_sub(gap);
+    let requested_right_width = segments_width(&row.right_segments);
+    let right_inset = usize::from(requested_right_width > 0 && requested_right_width < width);
+    let content_width = width.saturating_sub(right_inset);
+    let right_width = requested_right_width.min(content_width);
+    let gap = usize::from(right_width > 0 && right_width < content_width);
+    let left_width = content_width
+        .saturating_sub(right_width)
+        .saturating_sub(gap);
 
     render_segments(buffer, x, y, left_width, &row.segments, theme, selected);
 
     if right_width > 0 {
-        let right_x = x + width.saturating_sub(right_width);
+        let right_x = x + content_width.saturating_sub(right_width);
         render_segments(
             buffer,
             right_x,
@@ -2764,7 +2769,7 @@ mod tests {
         let mut buffer = RenderBuffer::new(10, 5, &style);
         render_panel(&mut buffer, &panel, Point::new(0, 0), 10, &theme);
 
-        assert_eq!(row_text(&buffer, 0), "src      M");
+        assert_eq!(row_text(&buffer, 0), "src     M ");
     }
 
     #[test]
@@ -2823,6 +2828,40 @@ mod tests {
     }
 
     #[test]
+    fn selected_panel_badge_leaves_highlighted_right_inset_for_glyph_overhang() {
+        let mut panel = PluginPanel::new("tree".to_string(), PanelConfig::default());
+        let mut row = row("src");
+        row.right_segments.push(PanelSegment {
+            text: "".to_string(),
+            style: None,
+            semantic: None,
+        });
+        panel.update_rows(vec![row]);
+
+        let style = Style {
+            fg: Some(Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            }),
+            bg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
+            bold: false,
+            italic: false,
+        };
+        let theme = Theme {
+            style: style.clone(),
+            ..Theme::default()
+        };
+        let mut buffer = RenderBuffer::new(10, 5, &style);
+        render_panel(&mut buffer, &panel, Point::new(0, 0), 10, &theme);
+
+        assert_eq!(buffer.cells[8].text, "");
+        assert_eq!(buffer.cells[9].text, " ");
+        assert_eq!(buffer.cells[8].style.bg, buffer.cells[9].style.bg);
+        assert_ne!(buffer.cells[9].style.bg, style.bg);
+    }
+
+    #[test]
     fn selected_panel_segments_meet_contrast_with_kanso_theme() {
         let theme = parse_vscode_theme("themes/kanso.json").unwrap();
         let directory_color = theme.colors["list.highlightForeground"];
@@ -2874,6 +2913,6 @@ mod tests {
         let mut buffer = RenderBuffer::new(6, 5, &style);
         render_panel(&mut buffer, &panel, Point::new(0, 0), 6, &theme);
 
-        assert_eq!(row_text(&buffer, 0), "abcd M");
+        assert_eq!(row_text(&buffer, 0), "abc M ");
     }
 }
