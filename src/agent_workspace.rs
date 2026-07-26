@@ -5,7 +5,7 @@
 //! returned contents through the editor's transaction boundary.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -25,11 +25,15 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    agent_tools::{apply_text_edits, EditorTextEdit, EditorToolRequest, PendingEditorTool},
+    agent_tools::{
+        apply_text_edits, ensure_agent_path_disclosable, EditorTextEdit, EditorToolRequest,
+        PendingEditorTool,
+    },
     codex::CodexToolHost,
 };
 
 const MAX_PROPOSAL_CONTENT_BYTES: usize = 960 * 1024;
+const MAX_AGENT_OVERLAY_FILES: usize = 4096;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct VisibleFile {
@@ -195,6 +199,49 @@ impl ProposalWorkspace {
     /// Returns a monotonic generation for snapshot invalidation.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Lists safe editor-visible and session-proposed contents for agent search.
+    pub(crate) fn agent_overlay_files(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        self.ensure_root_is_current()?;
+        let mut files = BTreeMap::new();
+        for (path, visible) in &self.visible {
+            if visible.contents.len() > MAX_PROPOSAL_CONTENT_BYTES
+                || ensure_agent_path_disclosable(&self.root, path).is_err()
+            {
+                continue;
+            }
+            let Ok(relative) = path.strip_prefix(&self.root) else {
+                continue;
+            };
+            files.insert(
+                relative.to_string_lossy().replace('\\', "/"),
+                visible.contents.clone(),
+            );
+            if files.len() == MAX_AGENT_OVERLAY_FILES {
+                break;
+            }
+        }
+        if let Some(session) = self.sessions.get(session_id) {
+            for (path, proposal) in &session.files {
+                if proposal.proposed_contents.len() > MAX_PROPOSAL_CONTENT_BYTES
+                    || ensure_agent_path_disclosable(&self.root, path).is_err()
+                {
+                    continue;
+                }
+                let Ok(relative) = path.strip_prefix(&self.root) else {
+                    continue;
+                };
+                let relative = relative.to_string_lossy().replace('\\', "/");
+                if files.len() < MAX_AGENT_OVERLAY_FILES || files.contains_key(&relative) {
+                    files.insert(relative, proposal.proposed_contents.clone());
+                }
+            }
+        }
+        Ok(files.into_iter().collect())
     }
 
     #[must_use]
@@ -1038,11 +1085,13 @@ impl CodexToolHost for ProposalToolHost {
         session_id: &str,
         path: &str,
     ) -> anyhow::Result<serde_json::Value> {
-        let contents = self
+        let mut workspace = self
             .workspace
             .lock()
-            .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?
-            .read(session_id, Path::new(path), None, None)?;
+            .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
+        let path = workspace.resolve_tool_path(path)?;
+        ensure_agent_path_disclosable(workspace.root(), &path)?;
+        let contents = workspace.read(session_id, &path, None, None)?;
         Ok(serde_json::json!({"content": contents}))
     }
 
@@ -1052,11 +1101,21 @@ impl CodexToolHost for ProposalToolHost {
         path: &str,
         content: String,
     ) -> anyhow::Result<serde_json::Value> {
+        let mut workspace = self
+            .workspace
+            .lock()
+            .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
+        let path = workspace.resolve_tool_path(path)?;
+        ensure_agent_path_disclosable(workspace.root(), &path)?;
+        workspace.write(session_id, &path, content)?;
+        Ok(serde_json::json!({}))
+    }
+
+    async fn overlay_files(&mut self, session_id: &str) -> anyhow::Result<Vec<(String, String)>> {
         self.workspace
             .lock()
             .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?
-            .write(session_id, Path::new(path), content)?;
-        Ok(serde_json::json!({}))
+            .agent_overlay_files(session_id)
     }
 
     async fn editor_tool(
@@ -1245,6 +1304,84 @@ mod tests {
             .sync_visible_file(&path, 7, "one\nunsaved\nthree\n".to_string())
             .unwrap();
         (temp, workspace, path)
+    }
+
+    #[tokio::test]
+    async fn proposal_host_resolves_relative_paths_against_its_workspace() {
+        let (temp, workspace, path) = workspace();
+        let shared = Arc::new(Mutex::new(workspace));
+        let mut host = ProposalToolHost::new(Arc::clone(&shared));
+
+        let visible = host.read_file("session-1", "src.rs").await.unwrap();
+        assert_eq!(visible["content"], "one\nunsaved\nthree\n");
+
+        host.write_file("session-1", "src.rs", "one\nproposed\nthree\n".to_string())
+            .await
+            .unwrap();
+
+        let proposed = host.read_file("session-1", "src.rs").await.unwrap();
+        assert_eq!(proposed["content"], "one\nproposed\nthree\n");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("src.rs")).unwrap(),
+            "one\ntwo\nthree\n"
+        );
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap()
+                .read("session-1", &path, None, None)
+                .unwrap(),
+            "one\nproposed\nthree\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_host_rejects_unsafe_paths_without_creating_proposals() {
+        let (temp, workspace, _path) = workspace();
+        std::fs::write(temp.path().join(".gitignore"), "ignored.rs\n").unwrap();
+        let shared = Arc::new(Mutex::new(workspace));
+        let initial_generation = shared.lock().unwrap().generation();
+        let mut host = ProposalToolHost::new(Arc::clone(&shared));
+
+        for path in [".env", "ignored.rs", "../outside.rs", "private.key"] {
+            assert!(
+                host.read_file("session-1", path).await.is_err(),
+                "read disclosed {path}"
+            );
+            assert!(
+                host.write_file("session-1", path, "unsafe\n".to_string())
+                    .await
+                    .is_err(),
+                "write staged {path}"
+            );
+        }
+
+        assert_eq!(shared.lock().unwrap().generation(), initial_generation);
+    }
+
+    #[test]
+    fn agent_overlays_prefer_session_proposals_and_filter_unsafe_buffers() {
+        let (temp, mut workspace, path) = workspace();
+        std::fs::write(temp.path().join(".gitignore"), "ignored.rs\n").unwrap();
+        workspace
+            .sync_visible_file(temp.path().join(".env"), 1, "TOKEN=secret\n".to_string())
+            .unwrap();
+        workspace
+            .sync_visible_file(temp.path().join("ignored.rs"), 1, "ignored\n".to_string())
+            .unwrap();
+        workspace
+            .write("session-1", &path, "one\nproposed\nthree\n".to_string())
+            .unwrap();
+        workspace
+            .write("other-session", &path, "one\nother\nthree\n".to_string())
+            .unwrap();
+
+        let overlays = workspace.agent_overlay_files("session-1").unwrap();
+
+        assert_eq!(
+            overlays,
+            vec![("src.rs".to_string(), "one\nproposed\nthree\n".to_string())]
+        );
     }
 
     #[test]

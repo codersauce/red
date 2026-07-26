@@ -32,7 +32,7 @@ pub struct PluginRegistry {
 }
 
 /// Host API version used for plugin compatibility checks.
-pub const RED_HOST_API_VERSION: &str = "0.4.0";
+pub const RED_HOST_API_VERSION: &str = "0.4.1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PluginModification {

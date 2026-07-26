@@ -1,11 +1,92 @@
 //! Strict editor-tool contract shared by Red and Codex dynamic tools.
 
+use std::{ffi::OsStr, path::Path};
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tokio::sync::{mpsc, oneshot};
 
 /// Maximum number of edits accepted in one atomic proposal operation.
 pub const MAX_EDITOR_EDITS: usize = 128;
+
+/// Returns whether a workspace path names credentials or other sensitive data.
+pub(crate) fn agent_path_is_sensitive(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+        return true;
+    };
+    let name = name.to_ascii_lowercase();
+    name == ".env"
+        || name.starts_with(".env.")
+        || name.contains("secret")
+        || name.contains("credential")
+        || matches!(name.as_str(), "id_rsa" | "id_ed25519")
+        || matches!(
+            path.extension()
+                .and_then(OsStr::to_str)
+                .map(|extension| extension.to_ascii_lowercase())
+                .as_deref(),
+            Some("pem" | "key" | "p12" | "pfx")
+        )
+}
+
+/// Evaluates workspace-local ignore files for an agent-visible absolute path.
+pub(crate) fn agent_path_is_ignored(path: &Path, root: &Path) -> bool {
+    let mut ignored = false;
+    let mut directories = path
+        .parent()
+        .into_iter()
+        .flat_map(Path::ancestors)
+        .take_while(|directory| directory.starts_with(root))
+        .collect::<Vec<_>>();
+    directories.reverse();
+    for directory in directories {
+        for name in [".gitignore", ".ignore"] {
+            let (matcher, _) = ignore::gitignore::Gitignore::new(directory.join(name));
+            match matcher.matched_path_or_any_parents(path, /* is_dir */ false) {
+                ignore::Match::Ignore(_) => ignored = true,
+                ignore::Match::Whitelist(_) => ignored = false,
+                ignore::Match::None => {}
+            }
+        }
+    }
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+    builder.add(root.join(".git/info/exclude"));
+    if let Ok(exclude) = builder.build() {
+        match exclude.matched_path_or_any_parents(path, /* is_dir */ false) {
+            ignore::Match::Ignore(_) => ignored = true,
+            ignore::Match::Whitelist(_) => ignored = false,
+            ignore::Match::None => {}
+        }
+    }
+    ignored
+}
+
+/// Applies the same fail-closed path-disclosure policy to every Red agent tool.
+pub(crate) fn ensure_agent_path_disclosable(root: &Path, path: &Path) -> anyhow::Result<()> {
+    let full_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let relative = full_path
+        .strip_prefix(root)
+        .map_err(|_| anyhow::anyhow!("agent path is outside the workspace"))?;
+    anyhow::ensure!(
+        relative
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "agent path contains an unsafe workspace component"
+    );
+    anyhow::ensure!(
+        !agent_path_is_sensitive(&full_path),
+        "agent cannot disclose a sensitive file"
+    );
+    anyhow::ensure!(
+        !agent_path_is_ignored(&full_path, root),
+        "agent cannot disclose an ignored file"
+    );
+    Ok(())
+}
 
 /// A zero-based UTF-16 position, compatible with LSP coordinates.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -375,6 +456,77 @@ mod tests {
 
     fn position(line: usize, character: usize) -> EditorPosition {
         EditorPosition { line, character }
+    }
+
+    #[test]
+    fn sensitive_agent_paths_fail_closed() {
+        let workspace = tempfile::tempdir().unwrap();
+
+        for name in [
+            ".env",
+            ".env.local",
+            "service-secret.json",
+            "credentials.json",
+            "id_rsa",
+            "id_ed25519",
+            "certificate.pem",
+            "private.key",
+            "identity.p12",
+            "identity.pfx",
+        ] {
+            let error = ensure_agent_path_disclosable(workspace.path(), Path::new(name))
+                .expect_err("sensitive agent paths must be rejected");
+            assert!(error.to_string().contains("sensitive"), "{name}: {error}");
+        }
+
+        ensure_agent_path_disclosable(workspace.path(), Path::new("src/main.rs")).unwrap();
+    }
+
+    #[test]
+    fn agent_paths_honor_workspace_and_nested_ignore_rules() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join(".gitignore"), "ignored.rs\n").unwrap();
+        std::fs::write(workspace.path().join(".ignore"), "local.rs\n").unwrap();
+        let nested = workspace.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join(".gitignore"), "blocked.rs\n").unwrap();
+
+        for path in ["ignored.rs", "local.rs", "nested/blocked.rs"] {
+            let error = ensure_agent_path_disclosable(workspace.path(), Path::new(path))
+                .expect_err("ignored agent paths must be rejected");
+            assert!(error.to_string().contains("ignored"), "{path}: {error}");
+        }
+
+        ensure_agent_path_disclosable(workspace.path(), Path::new("nested/included.rs")).unwrap();
+    }
+
+    #[test]
+    fn agent_paths_honor_git_info_exclude() {
+        let workspace = tempfile::tempdir().unwrap();
+        let info = workspace.path().join(".git/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(info.join("exclude"), "machine-local.rs\n").unwrap();
+
+        assert!(
+            ensure_agent_path_disclosable(workspace.path(), Path::new("machine-local.rs")).is_err()
+        );
+        ensure_agent_path_disclosable(workspace.path(), Path::new("shared.rs")).unwrap();
+    }
+
+    #[test]
+    fn agent_paths_reject_workspace_escape_and_non_normal_components() {
+        let workspace = tempfile::tempdir().unwrap();
+
+        for path in [Path::new("../outside.rs"), Path::new("src/../outside.rs")] {
+            assert!(ensure_agent_path_disclosable(workspace.path(), path).is_err());
+        }
+
+        let outside = tempfile::tempdir().unwrap();
+        assert!(ensure_agent_path_disclosable(
+            workspace.path(),
+            &outside.path().join("outside.rs")
+        )
+        .is_err());
     }
 
     #[test]

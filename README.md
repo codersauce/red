@@ -86,9 +86,9 @@ completed `codex login`.
 - **Make it yours.** Embedded Husk plugins power the file tree, project search,
   Git workspace, and theme browser. Defaults work immediately; configuration
   remains optional.
-- **Keep the final say.** Red gives Codex editor context, including unsaved
-  buffers, while staging every suggested write as an isolated proposal for
-  explicit review.
+- **Keep the final say.** Red gives Codex bounded editor context, honors your
+  configured Codex tools and approval policy, and offers an isolated Review
+  mode when changes should be staged for explicit approval.
 - **Work reliably.** Atomic recovery works across platforms, and Unix
   detach/attach sessions preserve buffers, plugins, LSP state, and running
   agents across terminal or SSH disconnects.
@@ -118,23 +118,27 @@ configuration, language servers, Git, CLI, and troubleshooting guidance. The
 [Vim compatibility matrix](docs/VIM_COMPATIBILITY.md) is the precise,
 versioned behavior contract.
 
-## A safer agent workflow
+## An editor-native agent workflow
 
 ![Red preparing a contextual agent prompt over the active source file](docs/images/agent-workflow.jpg)
 
-Every agent edit is a proposal. Nothing touches your files until you accept it.
+1. **Ask.** Press `Space A` to open a floating, Vim-capable prompt. Red includes
+   a bounded selection or cursor excerpt, unsaved contents, and relevant
+   diagnostics. Set `[agent] entry = "dock"` to compose directly in the dock.
+2. **Continue.** The conversation opens in a responsive dock with the same
+   modal, multiline composer. Focus it and use `Ctrl+W H/J/K/L` to move it,
+   just like an editor window; `:AgentLeft`, `:AgentRight`, `:AgentTop`, and
+   `:AgentBottom` remain available. Moving the dock preserves your draft.
+3. **Choose your workflow.** Native Agent mode honors your installed Codex
+   sandbox, tools, and approval policy. Set `[agent] mode = "review"` to stage
+   changes in an isolated proposal filesystem; inspect them with `:AgentReview`
+   and accept or reject each hunk explicitly.
 
-1. **Ask.** Open the agent with `Space A`; Red includes a bounded selection or
-   cursor excerpt, unsaved contents, and relevant diagnostics.
-2. **Review.** Codex reads editor state and stages attributed changes in an
-   isolated proposal filesystem. Open them with `:AgentReview`.
-3. **Decide.** Accept the useful hunks and reject the rest. Codex does not
-   silently write into the workspace.
-
-The integration uses the Codex app-server directly and supports persistent
-conversation, queued follow-ups, live tool progress, and explicit session
-controls. Ignored, out-of-workspace, binary, and common secret files are
-excluded from context. Read the
+The integration uses the Codex app-server directly and supports resumable
+conversations, live steering, queued follow-ups, tool progress, interactive
+Codex approvals, clean-buffer file synchronization, and explicit session
+controls. Red's automatic editor context
+excludes ignored, out-of-workspace, binary, and common secret files. Read the
 [agent workflow and safety contract](docs/AGENT_WORKFLOW.md) for prerequisites,
 limits, commands, and failure behavior.
 

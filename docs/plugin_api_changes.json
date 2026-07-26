@@ -1,6 +1,12 @@
 {
-  "api_version": "0.4.0",
+  "api_version": "0.4.1",
   "changes": [
+    {
+      "version": "0.4.1",
+      "kind": "introduced",
+      "symbols": ["AgentResumeSession", "AgentSteer", "AgentListModels", "AgentListSessions", "AgentSetModel", "AgentSetReasoningEffort", "SetAgentPosition"],
+      "migration_note": "docs/PLUGIN_API.md#native-agent-conversations"
+    },
     {
       "version": "0.4.0",
       "kind": "introduced",

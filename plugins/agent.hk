@@ -30,6 +30,48 @@ pub fn activate() {
         description: "Show and focus the conversation pane without opening a prompt",
         aliases: ["show chat", "open chat"],
     });
+    red::add_command("AgentLeft", dock_left, Json {
+        title: "Move agent to the left",
+        category: "Agent",
+        description: "Dock the current agent conversation on the left",
+        aliases: ["agent left", "chat left"],
+    });
+    red::add_command("AgentRight", dock_right, Json {
+        title: "Move agent to the right",
+        category: "Agent",
+        description: "Dock the current agent conversation on the right",
+        aliases: ["agent right", "chat right"],
+    });
+    red::add_command("AgentTop", dock_top, Json {
+        title: "Move agent to the top",
+        category: "Agent",
+        description: "Dock the current agent conversation above the editor",
+        aliases: ["agent top", "chat top"],
+    });
+    red::add_command("AgentBottom", dock_bottom, Json {
+        title: "Move agent to the bottom",
+        category: "Agent",
+        description: "Dock the current agent conversation below the editor",
+        aliases: ["agent bottom", "chat bottom"],
+    });
+    red::add_command("AgentModels", list_models, Json {
+        title: "List Codex models",
+        category: "Agent",
+        description: "Show the models available to the active Codex conversation",
+        aliases: ["agent models", "codex models"],
+    });
+    red::add_command("AgentSessions", list_sessions, Json {
+        title: "List agent conversations",
+        category: "Agent",
+        description: "Show saved Codex conversations for this workspace",
+        aliases: ["agent sessions", "chat history"],
+    });
+    red::add_command("AgentSteer", steer, Json {
+        title: "Steer the active agent turn",
+        category: "Agent",
+        description: "Add instructions to a running Codex turn without queuing a new turn",
+        aliases: ["steer agent", "guide agent"],
+    });
     red::add_command("AgentCancel", cancel, Json {
         title: "Cancel agent request",
         category: "Agent",
@@ -78,6 +120,8 @@ pub fn activate() {
     red::on("agent:proposal_applied", proposals_changed);
     red::on("agent:proposal_conflict", proposal_conflict);
     red::on("agent:permission_requested", permission_requested);
+    red::on("agent:file_conflict", file_conflict);
+    red::on("agent:open_dock", dock_entry_requested);
     red::on("agent:transcript_restored", transcript_restored);
     red::on("workspace:event:agent-review", review_event);
     red::on("workspace:event:agent-history", history_event);
@@ -86,6 +130,7 @@ pub fn activate() {
     red::on("timeout:callback", stream_timeout);
     red::on("panel:event:agent-conversation", panel_event);
     red::state_set("agent_session_id", "");
+    red::state_set("agent_pending_resume_id", "");
     red::state_set("agent_panel_created", false);
     red::state_set("agent_panel_open", false);
     red::state_set("agent_focus_panel_on_first_prompt", false);
@@ -117,6 +162,7 @@ pub fn activate() {
     red::state_set("agent_activity_rows", []);
     red::state_set("agent_activity_block_id", "");
     red::state_set("agent_thought", "");
+    red::state_set("agent_token_usage", red::null());
 }
 
 fn start() {
@@ -175,12 +221,193 @@ fn open_conversation() {
     red::execute("FocusPanel", "agent-conversation");
 }
 
+fn dock_entry_requested(event: Json) {
+    ensure_conversation_panel();
+    render_conversation();
+    red::execute("FocusTextPanelComposer", "agent-conversation");
+}
+
+fn dock_left() { dock_conversation("left"); }
+fn dock_right() { dock_conversation("right"); }
+fn dock_top() { dock_conversation("top"); }
+fn dock_bottom() { dock_conversation("bottom"); }
+
+fn dock_conversation(position: String) {
+    red::execute("SetAgentPosition", position);
+    open_conversation();
+}
+
+fn list_models() {
+    let session_id = red::string(red::state("agent_session_id"), "");
+    if session_id == "" {
+        red::execute("Print", "Start an agent conversation before listing models");
+        return;
+    }
+    red::execute("AgentListModels", session_id);
+}
+
+fn list_sessions() {
+    if red::string(red::state("agent_session_id"), "") == "" {
+        red::execute("Print", "Start an agent conversation before listing saved sessions");
+        return;
+    }
+    red::request("GetConfig", sessions_cwd_loaded, "cwd");
+}
+
+fn sessions_cwd_loaded(result: Json) {
+    let session_id = red::string(red::state("agent_session_id"), "");
+    if session_id != "" {
+        red::execute("AgentListSessions", session_id, red::string(result.value, "."));
+    }
+}
+
+fn steer() {
+    let session_id = red::string(red::state("agent_session_id"), "");
+    if session_id == "" || !red::state_bool("agent_turn_active") {
+        red::execute("Print", "Start an agent turn before steering it");
+        return;
+    }
+    red::execute(
+        "OpenComposer",
+        "Steer agent",
+        "",
+        red::state("agent_prompt_history"),
+        ComposerHandlers {
+            submitted: steer_submitted,
+            cancelled: prompt_cancelled,
+        }
+    );
+}
+
+fn steer_submitted(text: String) {
+    let session_id = red::string(red::state("agent_session_id"), "");
+    if red::trim(text) == "" {
+        return;
+    }
+    if session_id == "" || !red::state_bool("agent_turn_active") {
+        red::execute("Print", "The agent turn completed before it could be steered");
+        return;
+    }
+    red::execute("AgentSteer", session_id, text);
+}
+
+fn show_models(update: Json) {
+    let items = [];
+    for model in update.models {
+        let id = red::string(model.id, red::string(model.model, ""));
+        if id == "" {
+            continue;
+        }
+        let label = red::string(model.display_name, id);
+        items = red::push(items, PickerItem {
+            id: id,
+            label: label,
+            kind: "Model",
+            annotation: id,
+            detail: red::string(model.description, ""),
+            data: Json {
+                model: id,
+                reasoning_effort: red::string(model.default_reasoning_effort, ""),
+            },
+        });
+    }
+    if red::len(items) == 0 {
+        red::execute("Print", "Codex did not report any available models");
+        return;
+    }
+    red::execute("OpenPicker", "Codex model", items, PickerOptions {
+        placeholder: "Choose a model for the current conversation",
+        status: red::len(items) + " available models",
+        presentation: "compact",
+    }, PickerHandlers {
+        selected: model_selected,
+        cancelled: catalog_cancelled,
+    });
+}
+
+fn model_selected(item: PickerItem) {
+    if red::state_bool("agent_turn_active") {
+        red::execute("Print", "Stop or finish the active turn before changing the Codex model");
+        return;
+    }
+    let session_id = red::string(red::state("agent_session_id"), "");
+    if session_id == "" {
+        red::execute("Print", "Start an agent conversation before changing the Codex model");
+        return;
+    }
+    let model = red::string(item.data.model, item.id);
+    red::execute(
+        "AgentSetModel",
+        session_id,
+        model,
+        red::string(item.data.reasoning_effort, "")
+    );
+}
+
+fn show_sessions(update: Json) {
+    let items = [];
+    for session in update.sessions {
+        let id = red::string(session.id, red::string(session.thread_id, ""));
+        if id == "" {
+            continue;
+        }
+        let preview = red::string(session.preview, red::string(session.name, id));
+        items = red::push(items, PickerItem {
+            id: id,
+            label: preview,
+            kind: "Conversation",
+            annotation: id,
+            data: Json { session_id: id },
+        });
+    }
+    if red::len(items) == 0 {
+        red::execute("Print", "No saved Codex conversations were found for this workspace");
+        return;
+    }
+    red::execute("OpenPicker", "Agent conversations", items, PickerOptions {
+        placeholder: "Resume a saved workspace conversation",
+        status: red::len(items) + " saved conversations",
+        presentation: "compact",
+    }, PickerHandlers {
+        selected: session_selected,
+        cancelled: catalog_cancelled,
+    });
+}
+
+fn session_selected(item: PickerItem) {
+    let session_id = red::string(item.data.session_id, item.id);
+    if session_id == red::string(red::state("agent_session_id"), "") {
+        red::execute("Print", "This agent conversation is already active");
+        return;
+    }
+    red::state_set("agent_pending_resume_id", session_id);
+    red::request("GetConfig", resume_cwd_loaded, "cwd");
+}
+
+fn resume_cwd_loaded(result: Json) {
+    let session_id = red::string(red::state("agent_pending_resume_id"), "");
+    red::state_set("agent_pending_resume_id", "");
+    if session_id != "" {
+        red::execute("AgentResumeSession", session_id, red::string(result.value, "."));
+    }
+}
+
+fn catalog_cancelled(event: PickerCancelled) {}
+
 fn ensure_conversation_panel() {
     if !red::state_bool("agent_panel_created") {
         red::execute("CreateTextPanel", "agent-conversation", PanelConfig {
             side: "right",
             width: 62,
             title: "Agent",
+            surface: ThemeStyleSpec {
+                foreground: ["sideBar.foreground", "editor.foreground"],
+                background: ["editor.background"],
+            },
+            border: ThemeStyleSpec {
+                foreground: ["sideBar.border", "panel.border", "editorLineNumber.foreground"],
+                background: ["editor.background"],
+            },
             composer: Json { placeholder: "Ask a follow-up…", rows: 3 },
             header_actions: [
                 Json { id: "clear", label: "Clear", compact_label: "C" },
@@ -379,7 +606,17 @@ fn activity(event: Json) {
     }
     let update = event.update;
     let kind = red::string(update.session_update, "");
-    if kind == "agent_thought_chunk" {
+    if kind == "models" {
+        show_models(update);
+    } else if kind == "sessions" {
+        show_sessions(update);
+    } else if kind == "token_usage" {
+        red::state_set("agent_token_usage", update.token_usage);
+    } else if kind == "model_selected" {
+        red::execute("Print", "Codex model set to " + red::string(update.model, "the selected model"));
+    } else if kind == "steer" {
+        red::execute("Print", "Follow-up added to the active Codex turn");
+    } else if kind == "agent_thought_chunk" {
         if update.content != red::null() {
             let text = red::string(update.content.text, "");
             if text != "" {
@@ -668,7 +905,8 @@ fn update(event: Json) {
 
     let transcript = red::state("agent_transcript");
     let block_id = red::string(red::state("agent_stream_block_id"), "");
-    if !red::state_bool("agent_streaming") {
+    let first_delta = !red::state_bool("agent_streaming");
+    if first_delta {
         if transcript != "" && !red::ends_with(transcript, "\n") {
             transcript = transcript + "\n";
         }
@@ -714,10 +952,12 @@ fn update(event: Json) {
     red::state_set("agent_stream_delta", red::string(red::state("agent_stream_delta"), "") + delta);
 
     let timer = red::string(red::state("agent_stream_timer"), "");
-    if timer != "" {
-        red::execute("CancelTimeout", timer);
+    if timer == "" {
+        if first_delta {
+            flush_stream(block_id);
+        }
+        red::state_set("agent_stream_timer", red::execute("SetTimeout", 50));
     }
-    red::state_set("agent_stream_timer", red::execute("SetTimeout", 50));
 }
 
 fn completed(event: Json) {
@@ -1002,7 +1242,7 @@ fn render_conversation() {
             id: "empty",
             kind: "activity",
             format: "plain",
-            text: "No messages yet.\n\nEnter sends · ^J adds a line\na edits from the panel · Space A opens the prompt\n^C stops a running turn",
+            text: "No messages yet.\n\nAsk about the current file, explain a selection,\nor request a change.\n\nCtrl+Enter sends · Alt+Enter when supported\nEnter, Shift+Enter, or Ctrl+J adds a line\nEsc, then Enter always sends\nj/k reads · i/a edits · Space A opens the prompt\nCtrl+W H/J/K/L moves the pane\nCtrl+C stops a running turn",
         }];
     }
     red::execute("UpdateTextPanel", "agent-conversation", blocks);
@@ -1416,6 +1656,15 @@ fn permission_requested(event: Json) {
         selected: permission_selected,
         cancelled: permission_cancelled,
     });
+}
+
+fn file_conflict(event: Json) {
+    if !is_current_session_event(event) {
+        return;
+    }
+    let message = red::string(event.message, "Codex changed a file with unsaved editor contents");
+    append_transcript("Error", message);
+    red::execute("Print", message);
 }
 
 fn permission_selected(item: PickerItem) {

@@ -27,7 +27,6 @@ mod session_manager;
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
-    ffi::OsStr,
     fs,
     io::{stdout, Write as _},
     num::NonZeroUsize,
@@ -73,11 +72,16 @@ use crate::{
     },
     buffer::{Buffer, BufferId, SearchMatch, SyntaxSelection},
     clipboard::{ClipboardProvider, DisabledClipboardProvider, NativeClipboardProvider},
-    codex::{start_codex, CodexBridge, CodexCommand, CodexEvent, CodexProcessSpec},
+    codex::{
+        start_codex, CodexBridge, CodexCommand, CodexEvent, CodexExecutionMode, CodexProcessSpec,
+    },
     color::Color,
     command, command_palette,
     comment::CommentSyntax,
-    config::{Config, ConfigDiagnostic, ConfigDiagnosticSource, ConfigRecovery, KeyAction},
+    config::{
+        AgentEntry, AgentMode, AgentPosition, Config, ConfigDiagnostic, ConfigDiagnosticSource,
+        ConfigRecovery, KeyAction,
+    },
     dispatcher::Dispatcher,
     highlighter::Highlighter,
     log,
@@ -133,6 +137,10 @@ const MAX_HIGHLIGHT_SLICE_BYTES: usize = 512 * 1024;
 const MAX_PLUGIN_VIEWPORT_LINE_CHARS: usize = 64 * 1024;
 const MAX_DIRECTORY_LISTING_ENTRIES: usize = 160;
 const AGENT_BRIDGE_CAPACITY: usize = 64;
+const MIN_AGENT_EDITOR_WIDTH: usize = 36;
+const MIN_AGENT_EDITOR_HEIGHT: usize = 6;
+const MIN_AGENT_PANEL_WIDTH: usize = 24;
+const MIN_AGENT_PANEL_HEIGHT: usize = 5;
 const MACRO_MAX_REPLAY_DEPTH: usize = 20;
 const MACRO_MAX_REPLAY_EVENTS: usize = 10_000;
 const SESSION_SNAPSHOT_WARNING: &str =
@@ -502,57 +510,15 @@ fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
 }
 
 fn agent_context_path_is_sensitive(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(OsStr::to_str) else {
-        return true;
-    };
-    let name = name.to_ascii_lowercase();
-    name == ".env"
-        || name.starts_with(".env.")
-        || name.contains("secret")
-        || name.contains("credential")
-        || matches!(name.as_str(), "id_rsa" | "id_ed25519")
-        || matches!(
-            path.extension()
-                .and_then(OsStr::to_str)
-                .map(|extension| extension.to_ascii_lowercase())
-                .as_deref(),
-            Some("pem" | "key" | "p12" | "pfx")
-        )
+    crate::agent_tools::agent_path_is_sensitive(path)
 }
 
 fn agent_context_path_is_ignored(path: &Path, root: &Path) -> bool {
-    let mut ignored = false;
-    let mut directories = path
-        .parent()
-        .into_iter()
-        .flat_map(Path::ancestors)
-        .take_while(|directory| directory.starts_with(root))
-        .collect::<Vec<_>>();
-    directories.reverse();
-    for directory in directories {
-        for name in [".gitignore", ".ignore"] {
-            let (matcher, _) = ignore::gitignore::Gitignore::new(directory.join(name));
-            match matcher.matched_path_or_any_parents(path, /*is_dir*/ false) {
-                ignore::Match::Ignore(_) => ignored = true,
-                ignore::Match::Whitelist(_) => ignored = false,
-                ignore::Match::None => {}
-            }
-        }
-    }
-    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
-    builder.add(root.join(".git/info/exclude"));
-    if let Ok(exclude) = builder.build() {
-        match exclude.matched_path_or_any_parents(path, /*is_dir*/ false) {
-            ignore::Match::Ignore(_) => ignored = true,
-            ignore::Match::Whitelist(_) => ignored = false,
-            ignore::Match::None => {}
-        }
-    }
-    ignored
+    crate::agent_tools::agent_path_is_ignored(path, root)
 }
 
 fn scoped_plugin_storage_key(plugin: &str, key: &str) -> String {
-    if plugin == "agent" && matches!(key, "transcript" | "prompt_history") {
+    if plugin == "agent" && matches!(key, "transcript" | "prompt_history" | "thread_id") {
         format!("{key}:{}", get_workspace_path().display())
     } else {
         key.to_string()
@@ -589,6 +555,10 @@ pub enum PluginRequest {
     AgentNewSession {
         cwd: PathBuf,
     },
+    AgentResumeSession {
+        session_id: String,
+        cwd: PathBuf,
+    },
     AgentPrompt {
         session_id: String,
         text: String,
@@ -598,6 +568,25 @@ pub enum PluginRequest {
         text: String,
         uri: String,
         context: String,
+    },
+    AgentSteer {
+        session_id: String,
+        text: String,
+    },
+    AgentListModels {
+        session_id: String,
+    },
+    AgentListSessions {
+        session_id: String,
+        cwd: PathBuf,
+    },
+    AgentSetModel {
+        session_id: String,
+        model: String,
+        reasoning_effort: Option<String>,
+    },
+    AgentSetReasoningEffort {
+        effort: String,
     },
     AgentCancel {
         session_id: String,
@@ -887,6 +876,9 @@ pub enum PluginRequest {
         id: String,
         visible: bool,
     },
+    SetAgentPosition {
+        position: AgentPosition,
+    },
     ClosePanel {
         id: String,
     },
@@ -943,8 +935,14 @@ impl PluginRequest {
         match self {
             Self::Action(_) => "Action",
             Self::AgentNewSession { .. } => "AgentNewSession",
+            Self::AgentResumeSession { .. } => "AgentResumeSession",
             Self::AgentPrompt { .. } => "AgentPrompt",
             Self::AgentPromptWithContext { .. } => "AgentPromptWithContext",
+            Self::AgentSteer { .. } => "AgentSteer",
+            Self::AgentListModels { .. } => "AgentListModels",
+            Self::AgentListSessions { .. } => "AgentListSessions",
+            Self::AgentSetModel { .. } => "AgentSetModel",
+            Self::AgentSetReasoningEffort { .. } => "AgentSetReasoningEffort",
             Self::AgentCancel { .. } => "AgentCancel",
             Self::AgentCloseSession { .. } => "AgentCloseSession",
             Self::AgentArchiveSession { .. } => "AgentArchiveSession",
@@ -1018,6 +1016,7 @@ impl PluginRequest {
             Self::FocusPanel { .. } => "FocusPanel",
             Self::FocusEditor => "FocusEditor",
             Self::SetPanelVisible { .. } => "SetPanelVisible",
+            Self::SetAgentPosition { .. } => "SetAgentPosition",
             Self::ClosePanel { .. } => "ClosePanel",
             Self::OpenWorkspace { .. } => "OpenWorkspace",
             Self::UpdateWorkspace { .. } => "UpdateWorkspace",
@@ -3194,10 +3193,16 @@ impl Editor {
     fn focus_ring(&self) -> Vec<FocusTarget> {
         let mut targets = self
             .panel_manager
-            .focusable_ids_for_side(plugin::PanelSide::Left)
+            .focusable_ids_for_side(plugin::PanelSide::Top)
             .into_iter()
             .map(FocusTarget::Panel)
             .collect::<Vec<_>>();
+        targets.extend(
+            self.panel_manager
+                .focusable_ids_for_side(plugin::PanelSide::Left)
+                .into_iter()
+                .map(FocusTarget::Panel),
+        );
         targets.extend(
             self.window_manager
                 .windows()
@@ -3207,6 +3212,12 @@ impl Editor {
         targets.extend(
             self.panel_manager
                 .focusable_ids_for_side(plugin::PanelSide::Right)
+                .into_iter()
+                .map(FocusTarget::Panel),
+        );
+        targets.extend(
+            self.panel_manager
+                .focusable_ids_for_side(plugin::PanelSide::Bottom)
                 .into_iter()
                 .map(FocusTarget::Panel),
         );
@@ -3293,6 +3304,24 @@ impl Editor {
             }
         }
 
+        let side = match direction {
+            crate::window::Direction::Up => plugin::PanelSide::Top,
+            crate::window::Direction::Down => plugin::PanelSide::Bottom,
+            crate::window::Direction::Left => plugin::PanelSide::Left,
+            crate::window::Direction::Right => plugin::PanelSide::Right,
+        };
+        if let Some(panel_id) = self
+            .panel_manager
+            .focusable_ids_for_side(side)
+            .into_iter()
+            .next()
+        {
+            if self.focus_target(&FocusTarget::Panel(panel_id)) {
+                self.render(buffer)?;
+                return Ok(());
+            }
+        }
+
         let message = match direction {
             crate::window::Direction::Up => "no window above",
             crate::window::Direction::Down => "no window below",
@@ -3301,6 +3330,37 @@ impl Editor {
         };
         self.last_error = Some(message.to_string());
         self.draw_commandline(buffer);
+        Ok(())
+    }
+
+    fn move_focused_window_to_edge(
+        &mut self,
+        direction: crate::window::Direction,
+        buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<()> {
+        if self.panel_manager.focused_panel_id() == Some("agent-conversation")
+            && !self.panel_manager.focused_row_panel()
+        {
+            let position = match direction {
+                crate::window::Direction::Up => AgentPosition::Top,
+                crate::window::Direction::Down => AgentPosition::Bottom,
+                crate::window::Direction::Left => AgentPosition::Left,
+                crate::window::Direction::Right => AgentPosition::Right,
+            };
+
+            if self.config.agent.position != position {
+                self.config.agent.position = position;
+                self.apply_panel_layout();
+                self.render(buffer)?;
+            }
+
+            return Ok(());
+        }
+
+        if self.update_window_layout(|windows| windows.move_window_to_edge(direction)) {
+            self.render(buffer)?;
+        }
+
         Ok(())
     }
 
@@ -3320,14 +3380,18 @@ impl Editor {
     fn resize_window_layout(&mut self, terminal_size: (usize, usize)) {
         self.sync_to_window();
         let (reserved_left, reserved_right) = self.reserved_panel_widths(terminal_size.0);
+        let (reserved_top, reserved_bottom) = self.reserved_panel_heights(terminal_size.1);
         self.window_manager.resize_with_origin(
-            Point::new(reserved_left, 0),
+            Point::new(reserved_left, reserved_top),
             (
                 terminal_size
                     .0
                     .saturating_sub(reserved_left)
                     .saturating_sub(reserved_right),
-                terminal_size.1,
+                terminal_size
+                    .1
+                    .saturating_sub(reserved_top)
+                    .saturating_sub(reserved_bottom),
             ),
         );
         self.sync_with_window();
@@ -3335,6 +3399,7 @@ impl Editor {
 
     fn resize_terminal_surface(&mut self, width: u16, height: u16, buffer: &mut RenderBuffer) {
         self.size = (width, height);
+        self.refresh_agent_panel_layout();
         let max_y = (height as usize).saturating_sub(2);
         self.cy = self.cy.min(max_y.saturating_sub(1));
         self.resize_window_layout((width as usize, height as usize));
@@ -3353,15 +3418,19 @@ impl Editor {
     }
 
     fn apply_panel_layout(&mut self) {
+        self.refresh_agent_panel_layout();
         self.sync_to_window();
         let (reserved_left, reserved_right) = self.reserved_panel_widths(self.size.0 as usize);
+        let (reserved_top, reserved_bottom) = self.reserved_panel_heights(self.size.1 as usize);
         self.window_manager.resize_with_origin(
-            Point::new(reserved_left, 0),
+            Point::new(reserved_left, reserved_top),
             (
                 (self.size.0 as usize)
                     .saturating_sub(reserved_left)
                     .saturating_sub(reserved_right),
-                self.size.1 as usize,
+                (self.size.1 as usize)
+                    .saturating_sub(reserved_top)
+                    .saturating_sub(reserved_bottom),
             ),
         );
     }
@@ -3374,6 +3443,71 @@ impl Editor {
             .reserved_right_width()
             .min(max_reserved.saturating_sub(reserved_left));
         (reserved_left, reserved_right)
+    }
+
+    fn reserved_panel_heights(&self, terminal_height: usize) -> (usize, usize) {
+        let max_reserved = terminal_height.saturating_sub(MIN_AGENT_EDITOR_HEIGHT);
+        let reserved_top = self.panel_manager.reserved_top_height().min(max_reserved);
+        let reserved_bottom = self
+            .panel_manager
+            .reserved_bottom_height()
+            .min(max_reserved.saturating_sub(reserved_top));
+        (reserved_top, reserved_bottom)
+    }
+
+    fn configured_agent_panel_layout(&self) -> (plugin::PanelSide, usize) {
+        let terminal_width = usize::from(self.size.0);
+        let terminal_height = usize::from(self.size.1.saturating_sub(2));
+        let requested_side = match self.config.agent.position {
+            AgentPosition::Left => plugin::PanelSide::Left,
+            AgentPosition::Right => plugin::PanelSide::Right,
+            AgentPosition::Top => plugin::PanelSide::Top,
+            AgentPosition::Bottom => plugin::PanelSide::Bottom,
+        };
+        let side = if self.config.agent.responsive
+            && matches!(
+                requested_side,
+                plugin::PanelSide::Left | plugin::PanelSide::Right
+            )
+            && terminal_width
+                < MIN_AGENT_EDITOR_WIDTH
+                    .saturating_add(MIN_AGENT_PANEL_WIDTH)
+                    .saturating_add(1)
+        {
+            plugin::PanelSide::Bottom
+        } else {
+            requested_side
+        };
+        let (available, percentage, minimum, editor_minimum) = match side {
+            plugin::PanelSide::Left | plugin::PanelSide::Right => (
+                terminal_width,
+                self.config.agent.width_percent,
+                MIN_AGENT_PANEL_WIDTH,
+                MIN_AGENT_EDITOR_WIDTH,
+            ),
+            plugin::PanelSide::Top | plugin::PanelSide::Bottom => (
+                terminal_height,
+                self.config.agent.height_percent,
+                MIN_AGENT_PANEL_HEIGHT,
+                MIN_AGENT_EDITOR_HEIGHT,
+            ),
+        };
+        let max_thickness = available.saturating_sub(editor_minimum).saturating_sub(1);
+        let thickness = if max_thickness == 0 {
+            0
+        } else {
+            available
+                .saturating_mul(usize::from(percentage.min(100)))
+                .saturating_div(100)
+                .clamp(minimum.min(max_thickness), max_thickness)
+        };
+        (side, thickness)
+    }
+
+    fn refresh_agent_panel_layout(&mut self) -> bool {
+        let (side, width) = self.configured_agent_panel_layout();
+        self.panel_manager
+            .update_panel_layout("agent-conversation", side, width)
     }
 
     fn indentation(&self) -> Indentation {
@@ -3425,6 +3559,11 @@ impl Editor {
             .active_window()
             .map(|window| self.window_content_height(window))
             .unwrap_or_else(|| (self.size.1 as usize).saturating_sub(2))
+    }
+
+    /// Whether popup and dock borders should use terminal-safe ASCII glyphs.
+    pub(crate) fn window_borders_ascii(&self) -> bool {
+        self.config.window_borders_ascii
     }
 
     pub(crate) fn picker_input_position(&self) -> crate::config::PickerInputPosition {
@@ -4956,6 +5095,138 @@ impl Editor {
         Ok(())
     }
 
+    /// Reconciles completed native Codex edits without overwriting unsaved buffers.
+    async fn reconcile_native_agent_file_changes(
+        &mut self,
+        session_id: &str,
+        update: &Value,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<bool> {
+        if matches!(self.config.agent.mode, AgentMode::Review)
+            || update.get("session_update").and_then(Value::as_str) != Some("tool_call_update")
+            || !matches!(
+                update.get("kind").and_then(Value::as_str),
+                Some("fileChange" | "file_change")
+            )
+            || update.get("status").and_then(Value::as_str) != Some("completed")
+        {
+            return Ok(false);
+        }
+
+        let Some(workspace) = self.agent_manager.workspace_cloned() else {
+            return Ok(false);
+        };
+        let root = workspace
+            .lock()
+            .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?
+            .root()
+            .to_path_buf();
+
+        let Some(changes) = update.pointer("/item/changes").and_then(Value::as_array) else {
+            return Ok(false);
+        };
+
+        let mut seen = HashSet::new();
+        let mut reloaded = Vec::new();
+        let mut conflicts = Vec::new();
+        for change in changes.iter().take(crate::agent_tools::MAX_EDITOR_EDITS) {
+            let Some(path) = change.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            let reported = Path::new(path);
+            let path = if reported.is_absolute() {
+                reported.to_path_buf()
+            } else {
+                root.join(reported)
+            };
+            if crate::agent_tools::ensure_agent_path_disclosable(&root, &path).is_err()
+                || !seen.insert(path.clone())
+            {
+                continue;
+            }
+
+            let indices = self
+                .buffer_manager
+                .iter()
+                .enumerate()
+                .filter_map(|(index, buffer)| {
+                    let open_path = Path::new(buffer.file.as_deref()?).absolutize().ok()?;
+                    (open_path.as_ref() == path.as_path()).then_some(index)
+                })
+                .collect::<Vec<_>>();
+
+            for index in indices {
+                let buffer = &mut self.buffer_manager[index];
+                if buffer.is_dirty() {
+                    conflicts.push((path.clone(), "the open buffer has unsaved changes"));
+                    continue;
+                }
+                if buffer.reload_from_file().is_err() {
+                    conflicts.push((path.clone(), "the changed file could not be reloaded"));
+                    continue;
+                }
+                reloaded.push(index);
+            }
+        }
+
+        let changed = !reloaded.is_empty();
+        for index in reloaded {
+            if index == self.buffer_manager.active_index() {
+                self.check_bounds();
+                self.sync_to_window();
+                self.notify_change(runtime).await?;
+                continue;
+            }
+
+            let Some(buffer) = self.buffer_manager.get(index) else {
+                continue;
+            };
+            let file = buffer.file.clone();
+            let contents = buffer.contents();
+            let payload = json!({
+                "buffer_id": index,
+                "buffer_name": buffer.name(),
+                "file_path": file,
+                "revision": buffer.revision(),
+                "line_count": buffer.len(),
+                "source": "codex",
+            });
+            if self.config.lsp.enabled {
+                if let Some(file) = file.as_deref() {
+                    self.ensure_buffer_lsp_opened(index).await?;
+                    self.lsp.did_change(file, contents).await?;
+                }
+            }
+            self.plugin_registry
+                .notify(runtime, "buffer:changed", payload)
+                .await?;
+        }
+
+        if changed {
+            self.sync_agent_visible_buffers(&workspace)?;
+        }
+        for (path, reason) in conflicts {
+            let message = format!(
+                "Codex changed {} but {reason}; unsaved editor contents were preserved",
+                path.display()
+            );
+            self.last_error = Some(message.clone());
+            self.plugin_registry
+                .notify(
+                    runtime,
+                    "agent:file_conflict",
+                    json!({
+                        "session_id": session_id,
+                        "path": path,
+                        "message": message,
+                    }),
+                )
+                .await?;
+        }
+
+        Ok(changed)
+    }
+
     fn agent_context_payload(&self) -> Value {
         const CONTEXT_LINES: usize = 40;
         const MAX_CONTEXT_CHARS: usize = 40_000;
@@ -5925,6 +6196,7 @@ impl Editor {
         self.plugin_registry.poll_hot_reload(runtime).await;
 
         let mut proposal_sessions = Vec::new();
+        let mut native_files_changed = false;
         for _ in 0..AGENT_EVENTS_PER_TICK {
             let Some(event) = self
                 .agent_manager
@@ -5933,6 +6205,18 @@ impl Editor {
             else {
                 break;
             };
+            if let CodexEvent::SessionCreated { session_id } = &event {
+                if self.config.agent.persistent_threads {
+                    let key = scoped_plugin_storage_key("agent", "thread_id");
+                    if let Err(error) = self.preferences.set_plugin_storage(
+                        "agent",
+                        &key,
+                        Value::String(session_id.clone()),
+                    ) {
+                        log!("Unable to persist Codex thread for recovery: {error}");
+                    }
+                }
+            }
             if let CodexEvent::Completed { session_id, .. }
             | CodexEvent::Failed {
                 session_id: Some(session_id),
@@ -5942,8 +6226,17 @@ impl Editor {
                 self.agent_manager.mark_session_inactive(session_id);
             }
             match &event {
-                CodexEvent::Update { session_id, .. } | CodexEvent::Activity { session_id, .. }
+                CodexEvent::Update { session_id, .. }
                     if !self.agent_manager.is_session_active(session_id) =>
+                {
+                    continue;
+                }
+                CodexEvent::Activity { session_id, update }
+                    if !self.agent_manager.is_session_active(session_id)
+                        && !matches!(
+                            update.get("session_update").and_then(Value::as_str),
+                            Some("models" | "sessions" | "model_selected" | "token_usage")
+                        ) =>
                 {
                     continue;
                 }
@@ -5961,6 +6254,11 @@ impl Editor {
                     continue;
                 }
                 _ => {}
+            }
+            if let CodexEvent::Activity { session_id, update } = &event {
+                native_files_changed |= self
+                    .reconcile_native_agent_file_changes(session_id, update, runtime)
+                    .await?;
             }
             if let CodexEvent::Update { session_id, .. }
             | CodexEvent::Activity { session_id, .. }
@@ -6059,7 +6357,7 @@ impl Editor {
 
         // Coalesce background work (LSP messages, plugin requests) into a
         // single render at the end of the tick instead of one per item.
-        let mut needs_render = false;
+        let mut needs_render = native_files_changed;
         let mut needs_motion_render = false;
         let mut agent_proposal_applied = false;
 
@@ -6177,8 +6475,28 @@ impl Editor {
                                             }
                                         };
                                         self.sync_agent_visible_buffers(&workspace)?;
+                                        let execution_mode = match self.config.agent.mode {
+                                            AgentMode::Agent | AgentMode::Plan => {
+                                                CodexExecutionMode::Native
+                                            }
+                                            AgentMode::Review => CodexExecutionMode::ReviewSafe,
+                                        };
                                         let mut spec = CodexProcessSpec::new(command, cwd.clone())
-                                            .args(self.config.agent.args.clone());
+                                            .args(self.config.agent.args.clone())
+                                            .execution_mode(execution_mode)
+                                            .persistent_threads(self.config.agent.persistent_threads)
+                                            .plan_mode(matches!(
+                                                self.config.agent.mode,
+                                                AgentMode::Plan
+                                            ));
+                                        if let Some(model) = self.config.agent.model.as_deref() {
+                                            spec = spec.model(model);
+                                        }
+                                        if let Some(effort) =
+                                            self.config.agent.reasoning_effort.as_deref()
+                                        {
+                                            spec = spec.reasoning_effort(effort);
+                                        }
                                         spec.environment.extend(
                                             self.config
                                                 .agent
@@ -6225,7 +6543,79 @@ impl Editor {
                     let Some(bridge) = self.agent_manager.bridge() else {
                         continue;
                     };
-                    if bridge.send(CodexCommand::NewSession { cwd }).await.is_err() {
+                    let saved_thread = self
+                        .config
+                        .agent
+                        .persistent_threads
+                        .then(|| {
+                            self.preferences
+                                .plugin_storage(
+                                    "agent",
+                                    &scoped_plugin_storage_key("agent", "thread_id"),
+                                )
+                                .and_then(Value::as_str)
+                                .filter(|thread_id| !thread_id.is_empty())
+                                .map(str::to_string)
+                        })
+                        .flatten();
+                    let command = match saved_thread {
+                        Some(session_id) => CodexCommand::RecoverSession { session_id, cwd },
+                        None => CodexCommand::NewSession { cwd },
+                    };
+                    if bridge.send(command).await.is_err() {
+                        self.abort_agent_bridge();
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:session_lost",
+                                json!({ "message": "Codex app-server stopped" }),
+                            )
+                            .await?;
+                    }
+                }
+                PluginRequest::AgentResumeSession { session_id, cwd } => {
+                    if self.config.disable_ai {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:error",
+                                json!({
+                                    "session_id": session_id,
+                                    "message": "agent support is disabled by `disable_ai = true`",
+                                }),
+                            )
+                            .await?;
+                        continue;
+                    }
+                    if !self.agent_manager.has_bridge() {
+                        let key = scoped_plugin_storage_key("agent", "thread_id");
+                        if let Err(error) = self.preferences.set_plugin_storage(
+                            "agent",
+                            &key,
+                            Value::String(session_id),
+                        ) {
+                            self.plugin_registry
+                                .notify(
+                                    runtime,
+                                    "agent:error",
+                                    json!({ "message": format!(
+                                        "unable to prepare Codex conversation recovery: {error}"
+                                    ) }),
+                                )
+                                .await?;
+                            continue;
+                        }
+                        ACTION_DISPATCHER.send_request(PluginRequest::AgentNewSession { cwd });
+                        continue;
+                    }
+                    let Some(bridge) = self.agent_manager.bridge() else {
+                        continue;
+                    };
+                    if bridge
+                        .send(CodexCommand::ResumeSession { session_id, cwd })
+                        .await
+                        .is_err()
+                    {
                         self.abort_agent_bridge();
                         self.plugin_registry
                             .notify(
@@ -6257,6 +6647,117 @@ impl Editor {
                         .dispatch_agent_prompt(runtime, session_id, text, Some((uri, context)))
                         .await?;
                 }
+                PluginRequest::AgentSteer { session_id, text } => {
+                    let Some(bridge) = self.agent_manager.bridge() else {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:error",
+                                json!({
+                                    "session_id": session_id,
+                                    "message": "Codex app-server is not running",
+                                }),
+                            )
+                            .await?;
+                        continue;
+                    };
+                    if bridge
+                        .send(CodexCommand::Steer { session_id, text })
+                        .await
+                        .is_err()
+                    {
+                        self.abort_agent_bridge();
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:session_lost",
+                                json!({ "message": "Codex app-server stopped" }),
+                            )
+                            .await?;
+                    }
+                }
+                PluginRequest::AgentListModels { session_id } => {
+                    if let Some(bridge) = self.agent_manager.bridge() {
+                        if bridge
+                            .send(CodexCommand::ListModels { session_id })
+                            .await
+                            .is_err()
+                        {
+                            self.plugin_registry
+                                .notify(
+                                    runtime,
+                                    "agent:error",
+                                    json!({ "message": "Codex app-server stopped" }),
+                                )
+                                .await?;
+                        }
+                    }
+                }
+                PluginRequest::AgentListSessions { session_id, cwd } => {
+                    if let Some(bridge) = self.agent_manager.bridge() {
+                        if bridge
+                            .send(CodexCommand::ListSessions { session_id, cwd })
+                            .await
+                            .is_err()
+                        {
+                            self.plugin_registry
+                                .notify(
+                                    runtime,
+                                    "agent:error",
+                                    json!({ "message": "Codex app-server stopped" }),
+                                )
+                                .await?;
+                        }
+                    }
+                }
+                PluginRequest::AgentSetModel {
+                    session_id,
+                    model,
+                    reasoning_effort,
+                } => {
+                    let Some(bridge) = self.agent_manager.bridge() else {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:error",
+                                json!({
+                                    "session_id": session_id,
+                                    "message": "Codex app-server is not running",
+                                }),
+                            )
+                            .await?;
+                        continue;
+                    };
+                    if bridge
+                        .send(CodexCommand::SetModel {
+                            session_id,
+                            model: model.clone(),
+                            reasoning_effort: reasoning_effort.clone(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        self.abort_agent_bridge();
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:session_lost",
+                                json!({ "message": "Codex app-server stopped" }),
+                            )
+                            .await?;
+                        continue;
+                    }
+                    self.config.agent.model = Some(model);
+                    self.config.agent.reasoning_effort = reasoning_effort;
+                    needs_render = true;
+                }
+                PluginRequest::AgentSetReasoningEffort { effort } => {
+                    if self.config.agent.reasoning_effort.as_deref() != Some(effort.as_str()) {
+                        self.config.agent.reasoning_effort = Some(effort);
+                        self.abort_agent_bridge();
+                        needs_render = true;
+                    }
+                }
                 PluginRequest::AgentCancel { session_id } => {
                     let Some(bridge) = self.agent_manager.bridge() else {
                         continue;
@@ -6277,6 +6778,20 @@ impl Editor {
                 }
                 PluginRequest::AgentCloseSession { session_id } => {
                     self.agent_manager.mark_session_inactive(&session_id);
+                    let thread_key = scoped_plugin_storage_key("agent", "thread_id");
+                    if self
+                        .preferences
+                        .plugin_storage("agent", &thread_key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|thread_id| thread_id == session_id)
+                    {
+                        if let Err(error) =
+                            self.preferences
+                                .set_plugin_storage("agent", &thread_key, Value::Null)
+                        {
+                            log!("Unable to clear closed Codex recovery thread: {error}");
+                        }
+                    }
                     if let Some(workspace) = self.agent_manager.workspace() {
                         workspace
                             .lock()
@@ -6533,6 +7048,16 @@ impl Editor {
                     }
                     if owner == "agent" {
                         self.remove_legacy_agent_picker_history();
+                        if matches!(self.config.agent.entry, AgentEntry::Dock)
+                            && query.trim().is_empty()
+                        {
+                            runtime.release_composer(handle);
+                            self.plugin_registry
+                                .notify_plugin(runtime, "agent", "agent:open_dock", json!({}))
+                                .await?;
+                            needs_render = true;
+                            continue;
+                        }
                     }
                     self.release_current_dialog_callbacks(runtime);
                     self.current_dialog = Some(Box::new(AgentComposer::new_callback(
@@ -6871,6 +7396,7 @@ impl Editor {
                     let config_value = if let Some(key) = key {
                         // Return specific config value
                         match key.as_str() {
+                            "agent" => json!(self.config.agent),
                             "theme" => json!(self.config.theme),
                             "plugins" => json!(self.config.plugins),
                             "plugin_config" => json!(self.config.plugin_config),
@@ -6891,6 +7417,7 @@ impl Editor {
                     } else {
                         // Return entire config
                         json!({
+                            "agent": self.config.agent,
                             "theme": self.config.theme,
                             "plugins": self.config.plugins,
                             "plugin_config": self.config.plugin_config,
@@ -7311,6 +7838,16 @@ impl Editor {
                     needs_render = true;
                 }
                 PluginRequest::CreateTextPanel { id, config } => {
+                    let config = if id == "agent-conversation" {
+                        let (side, width) = self.configured_agent_panel_layout();
+                        plugin::PanelConfig {
+                            side,
+                            width,
+                            ..config
+                        }
+                    } else {
+                        config
+                    };
                     self.panel_manager.create_text_panel(id, config);
                     self.apply_panel_layout();
                     needs_render = true;
@@ -7387,6 +7924,11 @@ impl Editor {
                         self.apply_panel_layout();
                         needs_render = true;
                     }
+                }
+                PluginRequest::SetAgentPosition { position } => {
+                    self.config.agent.position = position;
+                    self.apply_panel_layout();
+                    needs_render = true;
                 }
                 PluginRequest::ClosePanel { id } => {
                     self.panel_manager.close_panel(&id);
@@ -9538,7 +10080,7 @@ impl Editor {
                     }
                     KeyCode::Char('H') => "history",
                     KeyCode::Char('N') => "new",
-                    KeyCode::Char('a') if !self.panel_manager.focused_row_panel() => {
+                    KeyCode::Char('i' | 'a') if !self.panel_manager.focused_row_panel() => {
                         "composer_focus"
                     }
                     KeyCode::Char('x') if !self.panel_manager.focused_row_panel() => "clear",
@@ -15521,32 +16063,16 @@ impl Editor {
                     .await?;
             }
             Action::MoveWindowToLeft => {
-                if self.update_window_layout(|windows| {
-                    windows.move_window_to_edge(crate::window::Direction::Left)
-                }) {
-                    self.render(buffer)?;
-                }
+                self.move_focused_window_to_edge(crate::window::Direction::Left, buffer)?;
             }
             Action::MoveWindowToBottom => {
-                if self.update_window_layout(|windows| {
-                    windows.move_window_to_edge(crate::window::Direction::Down)
-                }) {
-                    self.render(buffer)?;
-                }
+                self.move_focused_window_to_edge(crate::window::Direction::Down, buffer)?;
             }
             Action::MoveWindowToTop => {
-                if self.update_window_layout(|windows| {
-                    windows.move_window_to_edge(crate::window::Direction::Up)
-                }) {
-                    self.render(buffer)?;
-                }
+                self.move_focused_window_to_edge(crate::window::Direction::Up, buffer)?;
             }
             Action::MoveWindowToRight => {
-                if self.update_window_layout(|windows| {
-                    windows.move_window_to_edge(crate::window::Direction::Right)
-                }) {
-                    self.render(buffer)?;
-                }
+                self.move_focused_window_to_edge(crate::window::Direction::Right, buffer)?;
             }
             Action::ResizeWindowUp(amount) => {
                 if self.update_window_layout(|windows| {
@@ -18315,6 +18841,17 @@ impl Editor {
                 .clone()
                 .map(|workspace| Arc::new(Mutex::new(ProposalWorkspace::from_snapshot(workspace)))),
         );
+        if self.config.agent.persistent_threads && snapshot.agent_session_resumable {
+            if let Some(thread_id) = snapshot.agent_thread_id.as_deref() {
+                if let Err(error) = self.preferences.set_plugin_storage(
+                    "agent",
+                    &scoped_plugin_storage_key("agent", "thread_id"),
+                    Value::String(thread_id.to_string()),
+                ) {
+                    log!("Unable to recover persisted Codex thread: {error}");
+                }
+            }
+        }
         if let Some(transcript) = &snapshot.agent_transcript {
             let transcript_persisted = if let Err(error) = self.preferences.set_plugin_storage(
                 "agent",
@@ -18490,6 +19027,19 @@ impl Editor {
             .plugin_storage("agent", &scoped_plugin_storage_key("agent", "transcript"))
             .and_then(Value::as_str)
             .map(str::to_string);
+        let agent_thread_id = self
+            .config
+            .agent
+            .persistent_threads
+            .then(|| {
+                self.preferences
+                    .plugin_storage("agent", &scoped_plugin_storage_key("agent", "thread_id"))
+                    .and_then(Value::as_str)
+                    .filter(|thread_id| !thread_id.is_empty())
+                    .map(str::to_string)
+            })
+            .flatten();
+        let agent_session_resumable = agent_thread_id.is_some();
 
         (
             SessionSnapshot {
@@ -18515,8 +19065,9 @@ impl Editor {
                 global_marks,
                 special_marks,
                 agent_transcript,
+                agent_thread_id,
                 agent_workspace,
-                agent_session_resumable: false,
+                agent_session_resumable,
             },
             disk_fingerprints,
         )
@@ -20903,6 +21454,11 @@ impl Editor {
     }
 
     #[doc(hidden)]
+    pub fn test_agent_position(&self) -> crate::config::AgentPosition {
+        self.config.agent.position
+    }
+
+    #[doc(hidden)]
     pub fn test_create_panel(&mut self, id: &str, config: plugin::PanelConfig) {
         self.panel_manager.create_panel(id.to_string(), config);
         self.apply_panel_layout();
@@ -20966,6 +21522,11 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_render_cursor_position(&self) -> Option<(usize, usize)> {
         self.render_cursor_position()
+    }
+
+    #[doc(hidden)]
+    pub fn test_active_cursor_shape(&self) -> crate::config::CursorShape {
+        self.active_cursor_shape()
     }
 
     #[doc(hidden)]
@@ -21297,6 +21858,319 @@ mod test {
     }
 
     #[tokio::test]
+    async fn native_agent_file_changes_reload_clean_buffers_and_sync_visible_contents() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("main.rs");
+        std::fs::write(&path, "before\n").unwrap();
+        let workspace = Arc::new(Mutex::new(ProposalWorkspace::new(root.path()).unwrap()));
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.config.lsp.enabled = false;
+        editor.buffer_manager.replace_buffers(vec![Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "before\n".to_string(),
+        )]);
+        editor
+            .agent_manager
+            .set_workspace(Some(Arc::clone(&workspace)));
+        editor.sync_agent_visible_buffers(&workspace).unwrap();
+        std::fs::write(&path, "updated by Codex\n").unwrap();
+        let update = json!({
+            "session_update": "tool_call_update",
+            "kind": "fileChange",
+            "status": "completed",
+            "item": { "changes": [{ "path": "main.rs" }] },
+        });
+
+        let changed = editor
+            .reconcile_native_agent_file_changes("session-1", &update, &mut Runtime::new())
+            .await
+            .unwrap();
+
+        assert!(changed);
+        assert_eq!(editor.current_buffer().contents(), "updated by Codex\n");
+        assert!(!editor.current_buffer().is_dirty());
+        assert_eq!(
+            workspace
+                .lock()
+                .unwrap()
+                .read("session-1", &path, None, None)
+                .unwrap(),
+            "updated by Codex\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_agent_file_changes_preserve_dirty_buffers_and_report_conflicts() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("main.rs");
+        std::fs::write(&path, "before\n").unwrap();
+        let workspace = Arc::new(Mutex::new(ProposalWorkspace::new(root.path()).unwrap()));
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.config.lsp.enabled = false;
+        let mut unsaved = Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "my unsaved changes\n".to_string(),
+        );
+        unsaved.dirty = true;
+        editor.buffer_manager.replace_buffers(vec![unsaved]);
+        editor
+            .agent_manager
+            .set_workspace(Some(Arc::clone(&workspace)));
+        editor.sync_agent_visible_buffers(&workspace).unwrap();
+        std::fs::write(&path, "updated by Codex\n").unwrap();
+        let update = json!({
+            "session_update": "tool_call_update",
+            "kind": "fileChange",
+            "status": "completed",
+            "item": { "changes": [{ "path": "main.rs" }] },
+        });
+
+        let changed = editor
+            .reconcile_native_agent_file_changes("session-1", &update, &mut Runtime::new())
+            .await
+            .unwrap();
+
+        assert!(!changed);
+        assert!(editor.current_buffer().is_dirty());
+        assert_eq!(editor.current_buffer().contents(), "my unsaved changes\n");
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("unsaved editor contents were preserved")));
+        assert_eq!(
+            workspace
+                .lock()
+                .unwrap()
+                .read("session-1", &path, None, None)
+                .unwrap(),
+            "my unsaved changes\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_safe_agent_file_activity_never_reloads_workspace_buffers() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("main.rs");
+        std::fs::write(&path, "before\n").unwrap();
+        let workspace = Arc::new(Mutex::new(ProposalWorkspace::new(root.path()).unwrap()));
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.config.agent.mode = AgentMode::Review;
+        editor.config.lsp.enabled = false;
+        editor.buffer_manager.replace_buffers(vec![Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "before\n".to_string(),
+        )]);
+        editor.agent_manager.set_workspace(Some(workspace));
+        std::fs::write(&path, "external change\n").unwrap();
+        let update = json!({
+            "session_update": "tool_call_update",
+            "kind": "fileChange",
+            "status": "completed",
+            "item": { "changes": [{ "path": "main.rs" }] },
+        });
+
+        assert!(!editor
+            .reconcile_native_agent_file_changes("session-1", &update, &mut Runtime::new())
+            .await
+            .unwrap());
+        assert_eq!(editor.current_buffer().contents(), "before\n");
+    }
+
+    #[test]
+    fn configured_agent_layout_respects_all_four_positions_and_percentages() {
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 30);
+        editor.config.agent.width_percent = 40;
+        editor.config.agent.height_percent = 25;
+
+        for (position, expected_side, expected_thickness) in [
+            (AgentPosition::Left, plugin::PanelSide::Left, 40),
+            (AgentPosition::Right, plugin::PanelSide::Right, 40),
+            (AgentPosition::Top, plugin::PanelSide::Top, 7),
+            (AgentPosition::Bottom, plugin::PanelSide::Bottom, 7),
+        ] {
+            editor.config.agent.position = position;
+
+            assert_eq!(
+                editor.configured_agent_panel_layout(),
+                (expected_side, expected_thickness),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn edge_moves_preserve_focused_agent_transcript_composer_and_draft() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 30);
+        editor.test_create_text_panel(
+            "agent-conversation",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Right,
+                composer: Some(plugin::TextPanelComposerConfig {
+                    placeholder: "Ask the agent".to_string(),
+                    rows: 3,
+                }),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        editor.panel_manager.update_text_panel(
+            "agent-conversation",
+            vec![plugin::TextPanelBlock {
+                id: "agent-turn".to_string(),
+                kind: plugin::TextPanelBlockKind::Agent,
+                format: plugin::TextPanelBlockFormat::Plain,
+                text: "Keep the streamed conversation 👋".to_string(),
+            }],
+            /*panel_height*/ 28,
+            /*terminal_width*/ 100,
+        );
+        assert!(editor
+            .panel_manager
+            .focus_text_panel_composer("agent-conversation"));
+        let drafted = editor
+            .panel_manager
+            .handle_focused_text_input(
+                &Event::Paste("Preserve this draft 👨‍👩‍👧".to_string()),
+                /*terminal_width*/ 100,
+            )
+            .expect("focused agent composer must receive the draft");
+        assert_eq!(drafted.action, "composer_input");
+
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 30, &Style::default());
+        let mut runtime = Runtime::new();
+        for (action, position) in [
+            (Action::MoveWindowToLeft, AgentPosition::Left),
+            (Action::MoveWindowToBottom, AgentPosition::Bottom),
+            (Action::MoveWindowToTop, AgentPosition::Top),
+            (Action::MoveWindowToRight, AgentPosition::Right),
+        ] {
+            editor
+                .execute(&action, &mut render_buffer, &mut runtime)
+                .await
+                .unwrap();
+
+            assert_eq!(editor.test_agent_position(), position);
+            assert_eq!(
+                editor.panel_manager.focused_panel_id(),
+                Some("agent-conversation")
+            );
+            assert!(editor.panel_manager.focused_text_input_active());
+            assert_eq!(
+                editor.panel_manager.focused_text_for_copy(/*all*/ false),
+                Some("Keep the streamed conversation 👋".to_string())
+            );
+            let (cursor_x, cursor_y) = editor
+                .render_cursor_position()
+                .expect("the relocated agent composer must retain its real cursor");
+            assert_eq!(
+                editor
+                    .panel_manager
+                    .panel_at_position(cursor_x, cursor_y, /*width*/ 100, /*height*/ 30)
+                    .map(|placement| placement.id),
+                Some("agent-conversation".to_string())
+            );
+        }
+
+        let submitted = editor
+            .panel_manager
+            .handle_focused_text_input(
+                &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+                /*terminal_width*/ 100,
+            )
+            .expect("the preserved draft must remain submittable");
+        assert_eq!(submitted.action, "submit");
+        assert_eq!(submitted.text.as_deref(), Some("Preserve this draft 👨‍👩‍👧"));
+    }
+
+    #[test]
+    fn narrow_agent_side_dock_falls_back_to_bottom_and_restores_on_resize() {
+        let mut editor = test_editor(/*width*/ 50, /*height*/ 24);
+        editor.config.agent.position = AgentPosition::Right;
+        editor.config.agent.responsive = true;
+
+        assert_eq!(
+            editor.configured_agent_panel_layout().0,
+            plugin::PanelSide::Bottom
+        );
+
+        editor.size = (100, 24);
+        assert_eq!(
+            editor.configured_agent_panel_layout().0,
+            plugin::PanelSide::Right
+        );
+
+        editor.size = (50, 24);
+        editor.config.agent.responsive = false;
+        assert_eq!(
+            editor.configured_agent_panel_layout().0,
+            plugin::PanelSide::Right
+        );
+    }
+
+    #[tokio::test]
+    async fn docked_agent_entry_releases_the_float_and_focuses_the_real_modal_dock() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 30);
+        editor.config.agent.entry = AgentEntry::Dock;
+        editor.config.lsp.enabled = false;
+        let mut render_buffer = RenderBuffer::new(100, 30, &Style::default());
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("Agent").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetPluginStorage {
+                plugin,
+                key,
+                request_id,
+            } => {
+                assert_eq!(plugin, "agent");
+                assert_eq!(key, "prompt_history");
+                request_id
+            }
+            _ => panic!("docked entry must first restore the agent prompt history"),
+        };
+        runtime
+            .resolve_request(request_id, json!({ "value": [] }))
+            .await
+            .unwrap();
+        let callback = ACTION_DISPATCHER.recv_request();
+        let handle = match &callback {
+            PluginRequest::OpenCallbackComposer { owner, handle, .. } => {
+                assert_eq!(owner, "agent");
+                *handle
+            }
+            _ => panic!("agent prompt must retain its scoped composer callback"),
+        };
+        ACTION_DISPATCHER.send_request(callback);
+
+        editor
+            .service_background(&mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert!(editor.current_dialog.is_none());
+        assert_eq!(
+            editor.panel_manager.focused_panel_id(),
+            Some("agent-conversation")
+        );
+        assert!(editor.panel_manager.focused_text_input_active());
+        assert_eq!(runtime.composer_plugin(handle), None);
+        assert!(!editor.agent_manager.has_bridge());
+    }
+
+    #[tokio::test]
     async fn agent_composer_never_uses_picker_history_or_records_prompt_input() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
@@ -21341,7 +22215,7 @@ mod test {
             .unwrap();
         editor
             .process_editor_event(
-                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
                 &mut buffer,
                 &mut runtime,
                 EventRenderMode::Immediate,
@@ -21365,6 +22239,89 @@ mod test {
             )),
             "AgentComposer"
         );
+    }
+
+    #[tokio::test]
+    async fn floating_agent_composer_submits_modified_csi_u_line_endings_in_insert_mode() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+
+        for (code, modifiers, kind) in [
+            (
+                KeyCode::Enter,
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            ),
+            (
+                KeyCode::Char('\n'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            ),
+            (
+                KeyCode::Char('\r'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            ),
+            (
+                KeyCode::Char('\n'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Repeat,
+            ),
+            (
+                KeyCode::Char('\r'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Repeat,
+            ),
+            (KeyCode::Char('\n'), KeyModifiers::ALT, KeyEventKind::Press),
+            (KeyCode::Char('\r'), KeyModifiers::ALT, KeyEventKind::Press),
+        ] {
+            drain_plugin_requests();
+            let mut editor = test_editor(/*width*/ 80, /*height*/ 14);
+            let mut buffer = RenderBuffer::new(/*width*/ 80, /*height*/ 14, &Style::default());
+            let mut runtime = Runtime::new();
+            ACTION_DISPATCHER.send_request(PluginRequest::OpenAgentComposer {
+                owner: "agent".to_string(),
+                title: Some("Agent prompt".to_string()),
+                id: 802,
+                query: String::new(),
+                history: Vec::new(),
+            });
+
+            editor
+                .service_background(&mut buffer, &mut runtime)
+                .await
+                .unwrap();
+            assert_eq!(
+                editor
+                    .current_dialog
+                    .as_ref()
+                    .and_then(|dialog| dialog.cursor_mode()),
+                Some(Mode::Insert),
+            );
+            editor
+                .process_editor_event(
+                    Event::Paste("send directly from Insert mode".to_string()),
+                    &mut buffer,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+
+            editor
+                .process_editor_event(
+                    Event::Key(KeyEvent::new_with_kind(code, modifiers, kind)),
+                    &mut buffer,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+
+            assert!(
+                editor.current_dialog.is_none(),
+                "{code:?} with {modifiers:?} on {kind:?} must submit from Insert mode",
+            );
+        }
     }
 
     #[tokio::test]
@@ -22038,6 +22995,132 @@ mod test {
             detached_input_to_crossterm(crate::headless::InputEvent::Mouse { event: mouse }),
             Event::Mouse(mouse)
         );
+    }
+
+    #[test]
+    fn detached_agent_input_preserves_modified_csi_u_line_endings() {
+        for character in ['\n', '\r'] {
+            for (modifiers, expected_modifiers) in [
+                (
+                    vec![crate::headless::KeyModifier::Control],
+                    KeyModifiers::CONTROL,
+                ),
+                (
+                    vec![crate::headless::KeyModifier::Alt],
+                    KeyModifiers::ALT,
+                ),
+                (
+                    vec![
+                        crate::headless::KeyModifier::Control,
+                        crate::headless::KeyModifier::Shift,
+                    ],
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                ),
+                (
+                    vec![
+                        crate::headless::KeyModifier::Alt,
+                        crate::headless::KeyModifier::Shift,
+                    ],
+                    KeyModifiers::ALT | KeyModifiers::SHIFT,
+                ),
+            ] {
+                assert_eq!(
+                    detached_input_to_crossterm(crate::headless::InputEvent::Key {
+                        code: crate::headless::KeyCode::Character(character),
+                        modifiers,
+                    }),
+                    Event::Key(KeyEvent::new(
+                        KeyCode::Char(character),
+                        expected_modifiers,
+                    )),
+                    "detached input must preserve modified CSI-u character {character:?}",
+                );
+            }
+        }
+
+        assert_eq!(
+            detached_input_to_crossterm(crate::headless::InputEvent::Key {
+                code: crate::headless::KeyCode::Enter,
+                modifiers: Vec::new(),
+            }),
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            "ordinary Enter must remain an unmodified newline in Insert mode",
+        );
+        assert_eq!(
+            detached_input_to_crossterm(crate::headless::InputEvent::Key {
+                code: crate::headless::KeyCode::Character('j'),
+                modifiers: vec![crate::headless::KeyModifier::Control],
+            }),
+            Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            "Ctrl+J must remain distinct from modified Enter",
+        );
+    }
+
+    #[tokio::test]
+    async fn detached_agent_composer_submits_modified_csi_u_line_endings_in_insert_mode() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        let cases: &[(crate::headless::KeyCode, &[crate::headless::KeyModifier])] = &[
+            (
+                crate::headless::KeyCode::Enter,
+                &[crate::headless::KeyModifier::Control],
+            ),
+            (
+                crate::headless::KeyCode::Character('\n'),
+                &[crate::headless::KeyModifier::Control],
+            ),
+            (
+                crate::headless::KeyCode::Character('\r'),
+                &[crate::headless::KeyModifier::Control],
+            ),
+            (
+                crate::headless::KeyCode::Character('\n'),
+                &[crate::headless::KeyModifier::Alt],
+            ),
+            (
+                crate::headless::KeyCode::Character('\r'),
+                &[crate::headless::KeyModifier::Alt],
+            ),
+        ];
+
+        for &(code, modifiers) in cases {
+            drain_plugin_requests();
+            let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
+                .await
+                .unwrap();
+            ACTION_DISPATCHER.send_request(PluginRequest::OpenAgentComposer {
+                owner: "agent".to_string(),
+                title: Some("Agent prompt".to_string()),
+                id: 802,
+                query: String::new(),
+                history: Vec::new(),
+            });
+
+            core.tick().await.unwrap().expect("composer render");
+            assert_eq!(
+                core.editor
+                    .current_dialog
+                    .as_ref()
+                    .and_then(|dialog| dialog.cursor_mode()),
+                Some(Mode::Insert),
+            );
+            core.input(crate::headless::InputEvent::Paste {
+                text: "send directly from detached Insert mode".to_string(),
+            })
+            .await
+            .unwrap();
+
+            core.input(crate::headless::InputEvent::Key {
+                code,
+                modifiers: modifiers.to_vec(),
+            })
+            .await
+            .unwrap();
+
+            assert!(
+                core.editor.current_dialog.is_none(),
+                "detached {code:?} with {modifiers:?} must submit from Insert mode",
+            );
+        }
     }
 
     #[tokio::test]

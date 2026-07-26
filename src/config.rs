@@ -235,8 +235,55 @@ pub struct Config {
     pub startup_file_count: usize,
 }
 
-/// Direct Codex CLI launch configuration.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+/// Native Codex capability profile used for new agent conversations.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMode {
+    /// Use the installed Codex configuration, native tools, and approval policy.
+    #[default]
+    Agent,
+    /// Ask Codex to prepare a plan before making changes.
+    Plan,
+    /// Keep all workspace edits isolated as explicitly reviewable proposals.
+    Review,
+}
+
+/// Edge on which the persistent agent conversation is displayed.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPosition {
+    /// Reserve a vertical region on the left of the editor.
+    Left,
+    /// Reserve a vertical region on the right of the editor.
+    #[default]
+    Right,
+    /// Reserve a horizontal region above the editor.
+    Top,
+    /// Reserve a horizontal region below the editor.
+    Bottom,
+}
+
+/// Surface used to collect the first agent prompt.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEntry {
+    /// Open a floating prompt before revealing the persistent conversation.
+    #[default]
+    Float,
+    /// Focus the persistent conversation composer immediately.
+    Dock,
+}
+
+const fn default_agent_width_percent() -> u8 {
+    38
+}
+
+const fn default_agent_height_percent() -> u8 {
+    35
+}
+
+/// Direct Codex CLI launch, conversation, and user-interface configuration.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     /// Codex executable override. Red uses `codex` from PATH when absent.
@@ -247,6 +294,52 @@ pub struct AgentConfig {
     /// Environment additions supplied only to the Codex child process.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Native agent, planning, or isolated review capability profile.
+    #[serde(default)]
+    pub mode: AgentMode,
+    /// Optional Codex model override; absent uses Codex's configured default.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional reasoning effort advertised by the selected Codex model.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    /// Whether the first prompt opens in a floating or docked composer.
+    #[serde(default)]
+    pub entry: AgentEntry,
+    /// Preferred edge of the persistent agent conversation.
+    #[serde(default)]
+    pub position: AgentPosition,
+    /// Percentage of terminal width requested by left and right docks.
+    #[serde(default = "default_agent_width_percent")]
+    pub width_percent: u8,
+    /// Percentage of terminal height requested by top and bottom docks.
+    #[serde(default = "default_agent_height_percent")]
+    pub height_percent: u8,
+    /// Fall back to a horizontal dock when a side dock would crowd the editor.
+    #[serde(default = "default_true")]
+    pub responsive: bool,
+    /// Create durable Codex threads that can be resumed after editor restart.
+    #[serde(default = "default_true")]
+    pub persistent_threads: bool,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            mode: AgentMode::Agent,
+            model: None,
+            reasoning_effort: None,
+            entry: AgentEntry::Float,
+            position: AgentPosition::Right,
+            width_percent: default_agent_width_percent(),
+            height_percent: default_agent_height_percent(),
+            responsive: true,
+            persistent_threads: true,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -1335,7 +1428,22 @@ fn known_schema_path(path: &[String]) -> bool {
         ["keys", ..] | ["plugin_config", ..] => true,
         ["plugins", _] => true,
         ["plugin_permissions", _] | ["plugin_permissions", _, "process"] => true,
-        ["agent", field] => matches!(*field, "adapter" | "command" | "args" | "env"),
+        ["agent", field] => matches!(
+            *field,
+            "adapter"
+                | "command"
+                | "args"
+                | "env"
+                | "mode"
+                | "model"
+                | "reasoning_effort"
+                | "entry"
+                | "position"
+                | "width_percent"
+                | "height_percent"
+                | "responsive"
+                | "persistent_threads"
+        ),
         ["agent", "env", _] => true,
         ["cursor", field] => matches!(
             *field,
@@ -2483,6 +2591,72 @@ env = { NO_BROWSER = "1" }
             config.agent.env.get("NO_BROWSER").map(String::as_str),
             Some("1")
         );
+        assert_eq!(config.agent.mode, AgentMode::Agent);
+        assert_eq!(config.agent.model, None);
+        assert_eq!(config.agent.reasoning_effort, None);
+        assert_eq!(config.agent.entry, AgentEntry::Float);
+        assert_eq!(config.agent.position, AgentPosition::Right);
+    }
+
+    #[test]
+    fn agent_defaults_use_native_codex_and_an_adaptive_right_dock() {
+        let config = Config::from_user_toml_with_overrides("", &[]).unwrap();
+
+        assert_eq!(config.agent.mode, AgentMode::Agent);
+        assert_eq!(config.agent.entry, AgentEntry::Float);
+        assert_eq!(config.agent.position, AgentPosition::Right);
+        assert_eq!(config.agent.width_percent, 38);
+        assert_eq!(config.agent.height_percent, 35);
+        assert!(config.agent.responsive);
+        assert!(config.agent.persistent_threads);
+    }
+
+    #[test]
+    fn agent_configuration_supports_all_four_conversation_positions() {
+        for (value, expected) in [
+            ("left", AgentPosition::Left),
+            ("right", AgentPosition::Right),
+            ("top", AgentPosition::Top),
+            ("bottom", AgentPosition::Bottom),
+        ] {
+            let config = Config::from_user_toml_with_overrides(
+                &format!("[agent]\nposition = \"{value}\"\n"),
+                &[],
+            )
+            .unwrap();
+
+            assert_eq!(config.agent.position, expected);
+        }
+    }
+
+    #[test]
+    fn agent_configuration_supports_isolated_review_and_docked_entry() {
+        let config = Config::from_user_toml_with_overrides(
+            r#"
+[agent]
+mode = "review"
+model = "gpt-5.4"
+reasoning_effort = "high"
+entry = "dock"
+position = "bottom"
+width_percent = 45
+height_percent = 40
+responsive = false
+persistent_threads = false
+"#,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(config.agent.mode, AgentMode::Review);
+        assert_eq!(config.agent.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(config.agent.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(config.agent.entry, AgentEntry::Dock);
+        assert_eq!(config.agent.position, AgentPosition::Bottom);
+        assert_eq!(config.agent.width_percent, 45);
+        assert_eq!(config.agent.height_percent, 40);
+        assert!(!config.agent.responsive);
+        assert!(!config.agent.persistent_threads);
     }
 
     #[test]

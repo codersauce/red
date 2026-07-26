@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 use crate::{
     assets::RuntimeAssetKind,
-    config::{Config, PluginPermissions},
+    config::{AgentPosition, Config, PluginPermissions},
     editor::{
         Action, ComposerCallback, ComposerCallbackKind, PickerCallback, PickerCallbackKind,
         PluginRequest, ACTION_DISPATCHER,
@@ -632,6 +632,19 @@ impl RedHost {
                     .map_or_else(|| PathBuf::from("."), PathBuf::from);
                 self.send_request(PluginRequest::AgentNewSession { cwd });
             }
+            "AgentResumeSession" => {
+                let session_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .filter(|session_id| !session_id.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("AgentResumeSession requires a session id"))?
+                    .to_string();
+                let cwd = args
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .map_or_else(|| PathBuf::from("."), PathBuf::from);
+                self.send_request(PluginRequest::AgentResumeSession { session_id, cwd });
+            }
             "AgentPrompt" => {
                 let session_id = args
                     .first()
@@ -668,6 +681,86 @@ impl RedHost {
                     uri,
                     context,
                 });
+            }
+            "AgentSteer" => {
+                let session_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .filter(|session_id| !session_id.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("AgentSteer requires a session id"))?
+                    .to_string();
+                let text = args.get(1).map(value_to_string).unwrap_or_default();
+                anyhow::ensure!(!text.trim().is_empty(), "AgentSteer requires nonempty text");
+                self.send_request(PluginRequest::AgentSteer { session_id, text });
+            }
+            "AgentListModels" => {
+                let session_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .filter(|session_id| !session_id.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("AgentListModels requires a session id"))?
+                    .to_string();
+                self.send_request(PluginRequest::AgentListModels { session_id });
+            }
+            "AgentListSessions" => {
+                let session_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .filter(|session_id| !session_id.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("AgentListSessions requires a session id"))?
+                    .to_string();
+                let cwd = args
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .map_or_else(|| PathBuf::from("."), PathBuf::from);
+                self.send_request(PluginRequest::AgentListSessions { session_id, cwd });
+            }
+            "AgentSetModel" => {
+                let session_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|session_id| !session_id.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("AgentSetModel requires a session id"))?
+                    .to_string();
+                let model = args
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("AgentSetModel requires a model"))?
+                    .to_string();
+                anyhow::ensure!(
+                    model.len() <= 256 && !model.chars().any(char::is_control),
+                    "AgentSetModel received an invalid model"
+                );
+                let reasoning_effort = args
+                    .get(2)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|effort| !effort.is_empty())
+                    .map(str::to_string);
+                anyhow::ensure!(
+                    reasoning_effort.as_deref().is_none_or(|effort| {
+                        effort.len() <= 64 && !effort.chars().any(char::is_control)
+                    }),
+                    "AgentSetModel received an invalid reasoning effort"
+                );
+                self.send_request(PluginRequest::AgentSetModel {
+                    session_id,
+                    model,
+                    reasoning_effort,
+                });
+            }
+            "AgentSetReasoningEffort" => {
+                let effort = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|effort| !effort.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("AgentSetReasoningEffort requires an effort"))?
+                    .to_string();
+                self.send_request(PluginRequest::AgentSetReasoningEffort { effort });
             }
             "AgentCancel" => {
                 let session_id = args
@@ -1314,6 +1407,17 @@ impl RedHost {
                     .to_string();
                 let visible = args.get(1).and_then(Value::as_bool).unwrap_or(true);
                 self.send_request(PluginRequest::SetPanelVisible { id, visible });
+            }
+            "SetAgentPosition" => {
+                let position = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("SetAgentPosition requires a position"))?;
+                let position = serde_json::from_value::<AgentPosition>(serde_json::Value::String(
+                    position.to_string(),
+                ))
+                .map_err(|error| anyhow::anyhow!("invalid agent position: {error}"))?;
+                self.send_request(PluginRequest::SetAgentPosition { position });
             }
             "ClosePanel" => {
                 let id = args
@@ -3139,10 +3243,13 @@ mod tests {
     #[cfg(not(windows))]
     use std::{fs, process::Command};
 
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
     use super::*;
     use crate::{
         color::Color,
         editor::{PluginRequest, PLUGIN_DISPATCHER_TEST_LOCK},
+        plugin::{PanelManager, PanelSide, TextPanelComposerConfig},
         ui::PickerPresentation,
     };
 
@@ -4063,6 +4170,10 @@ mod tests {
                     && config.side == crate::plugin::PanelSide::Right
                     && config.width == 62
                     && config.title.as_deref() == Some("Agent")
+                    && config.surface.as_ref().is_some_and(|surface|
+                        surface.background == ["editor.background"]
+                            && surface.foreground == ["sideBar.foreground", "editor.foreground"]
+                    )
                     && config.header_actions.iter().map(|action| action.id.as_str()).eq(["clear", "new", "close"])
         ));
         assert!(matches!(
@@ -4186,6 +4297,13 @@ mod tests {
                     && status.label == "Writing…"
                     && status.stream
         ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AppendTextPanel { id, block_id, delta }
+                if id == "agent-conversation"
+                    && block_id == "agent:2"
+                    && delta == "streamed output"
+        ));
         runtime
             .notify(
                 "agent:update",
@@ -4221,7 +4339,7 @@ mod tests {
             PluginRequest::AppendTextPanel { id, block_id, delta }
                 if id == "agent-conversation"
                     && block_id == "agent:2"
-                    && delta == "streamed output 👋\nnext line"
+                    && delta == " 👋\nnext line"
         ));
 
         runtime
@@ -4619,6 +4737,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_insert_control_enter_dispatches_the_complete_docked_prompt() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+
+        for code in [KeyCode::Enter, KeyCode::Char('\n'), KeyCode::Char('\r')] {
+            for kind in [KeyEventKind::Press, KeyEventKind::Repeat] {
+                drain_requests();
+                let mut runtime = Runtime::new();
+                runtime
+                    .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+                    .await
+                    .unwrap();
+                runtime
+                    .notify(
+                        "agent:session_created",
+                        serde_json::json!({ "session_id": "session-1" }),
+                    )
+                    .await
+                    .unwrap();
+                drain_requests();
+
+                let mut panels = PanelManager::default();
+                panels.create_text_panel(
+                    "agent-conversation".to_string(),
+                    PanelConfig {
+                        side: PanelSide::Right,
+                        width: 40,
+                        title: Some("Agent".to_string()),
+                        composer: Some(TextPanelComposerConfig {
+                            placeholder: "Ask a follow-up".to_string(),
+                            rows: 3,
+                        }),
+                        ..PanelConfig::default()
+                    },
+                );
+                assert!(panels.focus_text_panel_composer("agent-conversation"));
+                panels.handle_focused_text_input(
+                    &Event::Paste("first\r\n漢👨‍👩‍👧\r\nsecond".to_string()),
+                    80,
+                );
+
+                let submitted = panels
+                    .handle_focused_text_input(
+                        &Event::Key(KeyEvent::new_with_kind(code, KeyModifiers::CONTROL, kind)),
+                        80,
+                    )
+                    .unwrap_or_else(|| {
+                        panic!("{code:?} with Ctrl and {kind:?} must submit the Insert draft")
+                    });
+                assert_eq!(submitted.panel_id, "agent-conversation");
+                assert_eq!(submitted.action, "submit");
+                assert_eq!(
+                    submitted.text.as_deref(),
+                    Some("first\n漢👨‍👩‍👧\nsecond")
+                );
+
+                runtime
+                    .notify(
+                        "panel:event:agent-conversation",
+                        serde_json::to_value(&submitted).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+
+                let mut rendered = false;
+                let mut refreshed = false;
+                let mut dispatched = false;
+                while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                    match request {
+                        PluginRequest::UpdateTextPanel { id, blocks } => {
+                            rendered |= id == "agent-conversation"
+                                && blocks
+                                    .iter()
+                                    .any(|block| block.text == "first\n漢👨‍👩‍👧\nsecond");
+                        }
+                        PluginRequest::Action(Action::Refresh) => refreshed = true,
+                        PluginRequest::AgentPrompt { session_id, text } => {
+                            assert!(
+                                rendered && refreshed,
+                                "the submitted conversation must render before dispatch"
+                            );
+                            assert_eq!(session_id, "session-1");
+                            assert_eq!(text, "first\n漢👨‍👩‍👧\nsecond");
+                            dispatched = true;
+                        }
+                        _ => {}
+                    }
+                }
+
+                assert!(
+                    dispatched,
+                    "{code:?} with Ctrl and {kind:?} must reach the bundled agent backend"
+                );
+                assert!(panels.focused_text_input_active());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn bundled_agent_panel_submits_and_drains_followups_in_fifo_order() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -4966,6 +5182,338 @@ mod tests {
             PluginRequest::FocusPanel { id } if id == "agent-conversation"
         ));
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_docking_commands_preserve_and_focus_the_conversation() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        for (command, expected_position) in [
+            ("AgentLeft", crate::config::AgentPosition::Left),
+            ("AgentRight", crate::config::AgentPosition::Right),
+            ("AgentTop", crate::config::AgentPosition::Top),
+            ("AgentBottom", crate::config::AgentPosition::Bottom),
+        ] {
+            runtime.execute_command(command).await.unwrap();
+
+            let mut moved = false;
+            let mut focused = false;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                match request {
+                    PluginRequest::SetAgentPosition { position } => {
+                        assert_eq!(position, expected_position);
+                        moved = true;
+                    }
+                    PluginRequest::FocusPanel { id } => {
+                        focused |= id == "agent-conversation";
+                    }
+                    PluginRequest::CreateTextPanel { id, .. }
+                    | PluginRequest::UpdateTextPanel { id, .. } => {
+                        assert_eq!(id, "agent-conversation");
+                    }
+                    _ => panic!("unexpected host effect while moving {command}"),
+                }
+            }
+
+            assert!(moved, "{command} must update the existing dock position");
+            assert!(focused, "{command} must focus the existing conversation");
+        }
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_catalog_commands_request_the_active_codex_session() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-catalog" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime.execute_command("AgentModels").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentListModels { session_id }
+                if session_id == "session-catalog"
+        ));
+
+        runtime.execute_command("AgentSessions").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(key.as_deref(), Some("cwd"));
+                request_id
+            }
+            _ => panic!("expected a workspace root request for saved conversations"),
+        };
+        runtime
+            .resolve_request(request_id, serde_json::json!({ "value": "/workspace" }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentListSessions { session_id, cwd }
+                if session_id == "session-catalog" && cwd == std::path::Path::new("/workspace")
+        ));
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_docked_entry_opens_and_focuses_the_persistent_composer() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        runtime
+            .notify("agent:open_dock", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::CreateTextPanel { id, config }
+                if id == "agent-conversation"
+                    && config.composer.is_some()
+                    && config.surface.is_some()
+                    && config.border.is_some()
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, .. }
+                if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusTextPanelComposer { id }
+                if id == "agent-conversation"
+        ));
+        assert!(
+            ACTION_DISPATCHER.try_recv_request().is_none(),
+            "docked entry must not open a floating composer or start Codex early"
+        );
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_model_catalog_opens_a_real_model_picker() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-models" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime
+            .notify(
+                "agent:activity",
+                serde_json::json!({
+                    "session_id": "session-models",
+                    "update": {
+                        "session_update": "models",
+                        "models": [{
+                            "id": "gpt-5.4",
+                            "display_name": "GPT-5.4",
+                            "description": "General-purpose coding model",
+                            "default_reasoning_effort": "high",
+                        }],
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+
+        let (picker, items) = recv_agent_picker("Codex model");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "gpt-5.4");
+        assert_eq!(items[0].label, "GPT-5.4");
+
+        runtime
+            .notify_picker(picker, PickerCallback::Selected(items[0].clone()))
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentSetModel {
+                session_id,
+                model,
+                reasoning_effort,
+            } if session_id == "session-models"
+                && model == "gpt-5.4"
+                && reasoning_effort.as_deref() == Some("high")
+        ));
+        assert!(
+            ACTION_DISPATCHER.try_recv_request().is_none(),
+            "model selection must preserve the active Codex thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_reports_confirmed_model_changes_without_resetting_the_session() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-models" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime
+            .notify(
+                "agent:activity",
+                serde_json::json!({
+                    "session_id": "session-models",
+                    "update": {
+                        "session_update": "model_selected",
+                        "model": "gpt-5.4",
+                        "reasoning_effort": "high",
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message))
+                if message == "Codex model set to gpt-5.4"
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_steering_submits_instructions_to_the_current_turn() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-steer" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        runtime
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({ "action": "submit", "text": "inspect the workspace" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime.execute_command("AgentSteer").await.unwrap();
+        let (composer, title, _, _) = recv_agent_composer();
+        assert_eq!(title.as_deref(), Some("Steer agent"));
+        assert!(runtime
+            .notify_composer(
+                composer,
+                ComposerCallback::Submitted("focus on unsaved changes".to_string()),
+            )
+            .unwrap());
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentSteer { session_id, text }
+                if session_id == "session-steer" && text == "focus on unsaved changes"
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_session_catalog_resumes_the_selected_workspace_thread() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-current" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime
+            .notify(
+                "agent:activity",
+                serde_json::json!({
+                    "session_id": "session-current",
+                    "update": {
+                        "session_update": "sessions",
+                        "sessions": [{
+                            "id": "session-saved",
+                            "preview": "Fix the agent composer",
+                        }],
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+
+        let (picker, items) = recv_agent_picker("Agent conversations");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "session-saved");
+
+        runtime
+            .notify_picker(picker, PickerCallback::Selected(items[0].clone()))
+            .unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(key.as_deref(), Some("cwd"));
+                request_id
+            }
+            _ => panic!("resuming a conversation must request the workspace root"),
+        };
+        runtime
+            .resolve_request(request_id, serde_json::json!({ "value": "/workspace" }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentResumeSession { session_id, cwd }
+                if session_id == "session-saved" && cwd == std::path::Path::new("/workspace")
+        ));
     }
 
     #[tokio::test]
