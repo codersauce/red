@@ -226,10 +226,7 @@ async fn run() -> anyhow::Result<()> {
         let buffer = Buffer::new(None, String::new());
         buffers.push(buffer);
     } else {
-        for file in &args.files {
-            let buffer = Buffer::from_file(Some(file.clone())).await?;
-            buffers.push(buffer);
-        }
+        buffers = load_startup_buffers(&args.files).await?;
     }
 
     let diagnostics = std::mem::take(&mut loaded.diagnostics);
@@ -740,9 +737,100 @@ fn resolve_log_path(config_dir: &Path, configured_path: &str) -> anyhow::Result<
     }
 }
 
+async fn load_startup_buffers(files: &[String]) -> anyhow::Result<Vec<Buffer>> {
+    let mut buffers = Vec::with_capacity(files.len());
+    for file in files {
+        buffers.push(Buffer::load_or_create(Some(file.clone())).await?);
+    }
+    Ok(buffers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn startup_opens_missing_file_without_creating_it_until_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("new.rs");
+        let file = path.to_string_lossy().into_owned();
+
+        let mut buffers = load_startup_buffers(std::slice::from_ref(&file))
+            .await
+            .unwrap();
+
+        assert_eq!(buffers.len(), 1);
+        assert_eq!(buffers[0].file.as_deref(), Some(file.as_str()));
+        assert_eq!(buffers[0].contents(), "\n");
+        assert!(!buffers[0].is_dirty());
+        assert!(!path.exists());
+
+        buffers[0].save().unwrap();
+
+        assert_eq!(fs::read_to_string(path).unwrap(), "\n");
+        assert!(!buffers[0].is_dirty());
+    }
+
+    #[tokio::test]
+    async fn startup_opens_existing_and_missing_files_in_argument_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let existing_path = directory.path().join("existing.rs");
+        let missing_path = directory.path().join("new.rs");
+        fs::write(&existing_path, "fn main() {}\n").unwrap();
+        let existing = existing_path.to_string_lossy().into_owned();
+        let missing = missing_path.to_string_lossy().into_owned();
+
+        let buffers = load_startup_buffers(&[existing.clone(), missing.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(buffers.len(), 2);
+        assert_eq!(buffers[0].file.as_deref(), Some(existing.as_str()));
+        assert_eq!(buffers[0].contents(), "fn main() {}\n");
+        assert_eq!(buffers[1].file.as_deref(), Some(missing.as_str()));
+        assert_eq!(buffers[1].contents(), "\n");
+        assert!(!missing_path.exists());
+    }
+
+    #[tokio::test]
+    async fn startup_opens_missing_parent_but_reports_error_on_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("missing");
+        let path = parent.join("new.rs");
+        let file = path.to_string_lossy().into_owned();
+
+        let mut buffers = load_startup_buffers(std::slice::from_ref(&file))
+            .await
+            .unwrap();
+
+        let error = buffers[0].save().unwrap_err();
+
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(|error| error.kind()),
+            Some(std::io::ErrorKind::NotFound)
+        );
+        assert!(!parent.exists());
+        assert!(!path.exists());
+        assert_eq!(buffers[0].file.as_deref(), Some(file.as_str()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_rejects_broken_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("broken.rs");
+        std::os::unix::fs::symlink(directory.path().join("missing.rs"), &path).unwrap();
+        let file = path.to_string_lossy().into_owned();
+
+        let error = load_startup_buffers(std::slice::from_ref(&file))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("not found"));
+        assert!(fs::symlink_metadata(path).unwrap().file_type().is_symlink());
+    }
 
     #[test]
     fn forwards_only_the_husk_subcommand() {
