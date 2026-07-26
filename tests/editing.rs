@@ -3619,6 +3619,66 @@ async fn test_delete_word() {
 }
 
 #[tokio::test]
+async fn delete_word_at_line_end_preserves_the_line_break() {
+    for (contents, keys, expected) in [
+        ("alpha beta\nnext line", "wdw", "alpha \nnext line"),
+        (
+            "alpha beta   \n    next line",
+            "wdw",
+            "alpha \n    next line",
+        ),
+        ("alpha !!!\nnext line", "wdw", "alpha \nnext line"),
+        ("alpha βeta\n    δelta", "wdw", "alpha \n    δelta"),
+        ("alpha beta\r\nnext line", "wdw", "alpha \r\nnext line"),
+        ("alpha beta   \nnext line", "weldw", "alpha beta\nnext line"),
+        ("   \nnext line", "dw", "\nnext line"),
+        ("\n    next line", "dw", "    next line"),
+        ("\n\nnext line", "dw", "\nnext line"),
+    ] {
+        let buffer = Buffer::new(None, contents.to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(expected);
+    }
+}
+
+#[tokio::test]
+async fn counted_delete_word_can_cross_a_line_break() {
+    for keys in ["wd2w", "w2dw"] {
+        let buffer = Buffer::new(None, "alpha beta\n    next line".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents("alpha line");
+    }
+}
+
+#[tokio::test]
+async fn delete_word_action_preserves_line_breaks_and_deletes_through_eof() {
+    for (contents, expected) in [
+        ("alpha beta\nnext line", "alpha \nnext line"),
+        ("alpha beta   \n    next line", "alpha \n    next line"),
+        ("alpha beta\r\nnext line", "alpha \r\nnext line"),
+        ("alpha βeta\n    δelta", "alpha \n    δelta"),
+        ("alpha beta", "alpha "),
+        ("alpha βeta", "alpha "),
+    ] {
+        let mut harness = EditorHarness::with_content(contents);
+        harness
+            .execute_action(Action::MoveToNextWord)
+            .await
+            .unwrap();
+
+        harness.execute_action(Action::DeleteWord).await.unwrap();
+
+        harness.assert_buffer_contents(expected);
+    }
+}
+
+#[tokio::test]
 async fn test_join_lines() {
     for (contents, keys, expected, cursor) in [
         ("alpha\n    beta", "J", "alpha beta", (5, 0)),

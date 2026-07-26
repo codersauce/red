@@ -11815,15 +11815,25 @@ impl Editor {
             let Some(&character) = characters.get(end) else {
                 break;
             };
+            let final_motion = index + 1 == count;
+            if final_motion && matches!(character, '\r' | '\n') {
+                end += 1;
+                if character == '\r' && characters.get(end) == Some(&'\n') {
+                    end += 1;
+                }
+                continue;
+            }
+
             let kind = word_kind(character);
-            while characters
-                .get(end)
-                .is_some_and(|&next| word_kind(next) == kind)
-            {
+            while characters.get(end).is_some_and(|&next| {
+                word_kind(next) == kind && (!final_motion || !matches!(next, '\r' | '\n'))
+            }) {
                 end += 1;
             }
             if !preserve_trailing_whitespace || index + 1 < count {
-                while characters.get(end).is_some_and(|next| next.is_whitespace()) {
+                while characters.get(end).is_some_and(|&next| {
+                    next.is_whitespace() && (!final_motion || !matches!(next, '\r' | '\n'))
+                }) {
                     end += 1;
                 }
             }
@@ -14594,20 +14604,9 @@ impl Editor {
                 }
             }
             Action::DeleteWord => {
-                let cx = self.cx;
-                let line = self.buffer_line();
-                let char_cx = self.grapheme_to_char_on_line(cx, line);
-
-                if let Some((end_x, end_y)) = self.current_buffer().find_next_word((char_cx, line))
-                {
+                if let Some(range) = self.word_motion_range(1, false) {
                     self.begin_transaction("delete word");
-                    self.replace_range(
-                        TextRange::new(
-                            TextPosition::new(line, char_cx),
-                            TextPosition::new(end_y, end_x),
-                        ),
-                        "",
-                    );
+                    self.replace_range(range, "");
                     self.commit_transaction(self.cursor_snapshot());
                 }
 
