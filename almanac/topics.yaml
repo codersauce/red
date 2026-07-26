@@ -1,0 +1,257 @@
+topics:
+  - slug: concepts
+    title: Concepts
+    description: Core vocabulary and mental models for this repository.
+    parents: []
+  - slug: architecture
+    title: Architecture
+    description: Runtime ownership, subsystem boundaries, and cross-file flows.
+    parents: []
+  - slug: guides
+    title: Guides
+    description: Maintainer procedures for common repository work.
+    parents: []
+  - slug: decisions
+    title: Decisions
+    description: Architectural choices and their consequences.
+    parents: []
+  - slug: reference
+    title: Reference
+    description: Exact lookup material for commands, configuration, protocols, and contracts.
+    parents: []
+  - slug: red-editor
+    title: Red Editor
+    description: The product-level editor model and its main reader entry points.
+    parents: [concepts]
+  - slug: editor
+    title: Editor Core
+    description: Modal editing state, buffers, windows, rendering, and input handling.
+    parents: [red-editor, architecture]
+  - slug: startup
+    title: Startup
+    description: Binary entrypoint behavior, lifecycle selection, and startup modes.
+    parents: [architecture, cli]
+  - slug: cli
+    title: CLI
+    description: Public command-line surfaces for Red and Husk.
+    parents: [reference]
+  - slug: commands
+    title: Commands
+    description: Editor commands, command palette discovery, and keymap-derived command lookup.
+    parents: [editor, cli]
+  - slug: configuration
+    title: Configuration
+    description: Config loading, defaults, recovery, and user override behavior.
+    parents: [architecture]
+  - slug: defaults
+    title: Defaults
+    description: Built-in configuration values and default runtime behavior.
+    parents: [configuration]
+  - slug: diagnostics
+    title: Diagnostics
+    description: Validation and diagnostic reporting paths for configuration, tools, and runtime checks.
+    parents: [configuration, validation]
+  - slug: runtime
+    title: Runtime
+    description: Runtime behavior that crosses editor, Husk, and asset boundaries.
+    parents: [architecture]
+  - slug: runtime-assets
+    title: Runtime Assets
+    description: Embedded, development, and user-visible plugins and themes.
+    parents: [runtime, plugins]
+  - slug: themes
+    title: Themes
+    description: VS Code theme import and Red theme handling.
+    parents: [runtime-assets]
+  - slug: preferences
+    title: Preferences
+    description: Persisted user history and plugin preference storage.
+    parents: [persistence]
+  - slug: history
+    title: History
+    description: Command, picker, transaction, and workflow history stored or surfaced by Red.
+    parents: [persistence]
+  - slug: persistence
+    title: Persistence
+    description: Durable local state such as sessions, preferences, locks, and proposals.
+    parents: [architecture]
+  - slug: buffers
+    title: Buffers
+    description: Buffer identity, contents, dirty state, and edit ownership.
+    parents: [editor]
+  - slug: windows
+    title: Windows
+    description: Editor split trees, window identity, and viewport state.
+    parents: [editor]
+  - slug: rendering
+    title: Rendering
+    description: Display layout, render buffers, terminal frames, and screen output.
+    parents: [editor]
+  - slug: unicode
+    title: Unicode
+    description: Coordinate conversions and Unicode-safe editing/rendering behavior.
+    parents: [editor]
+  - slug: undo
+    title: Undo
+    description: Undo tree, redo, dirty revisions, and edit replay contracts.
+    parents: [editor]
+  - slug: vim
+    title: Vim Compatibility
+    description: Vim-inspired motions, modes, commands, and intentional differences.
+    parents: [editor]
+  - slug: syntax
+    title: Syntax
+    description: Syntax selection, highlighting, and matching-token behavior.
+    parents: [editor]
+  - slug: editing
+    title: Editing
+    description: Text mutation, completion edits, and editing-related safety boundaries.
+    parents: [editor]
+  - slug: clipboard
+    title: Clipboard
+    description: Clipboard and register integration.
+    parents: [editor]
+  - slug: ui
+    title: UI
+    description: Modal UI components, dialogs, pickers, composers, and plugin-facing UI handles.
+    parents: [editor, plugins]
+  - slug: plugins
+    title: Plugins
+    description: Husk plugins, host API integration, bundled plugin assets, and plugin-owned resources.
+    parents: [architecture]
+  - slug: host-api
+    title: Host API
+    description: Versioned Red host API calls and plugin-to-editor request contracts.
+    parents: [plugins]
+  - slug: filesystem
+    title: Filesystem
+    description: Workspace-confined file access and fail-closed path handling.
+    parents: [plugins, safety]
+  - slug: husk
+    title: Husk
+    description: The embedded and standalone scripting language workspace.
+    parents: [architecture]
+  - slug: scripting
+    title: Scripting
+    description: Scripting-language behavior and embedded extension points.
+    parents: [husk]
+  - slug: embedding
+    title: Embedding
+    description: Rust embedding API, native modules, and instance ownership.
+    parents: [husk]
+  - slug: packages
+    title: Packages
+    description: Husk package manifests, module resolution, locks, and package execution.
+    parents: [husk]
+  - slug: locks
+    title: Locks
+    description: Lock files and reproducible package or extension state.
+    parents: [packages]
+  - slug: extensions
+    title: Extensions
+    description: Husk static native modules, WebAssembly Components, and extension bundles.
+    parents: [husk]
+  - slug: wasm
+    title: WebAssembly
+    description: WebAssembly Component support for portable Husk extensions.
+    parents: [extensions]
+  - slug: semantics
+    title: Semantics
+    description: Husk semantic profiles and value/evaluation behavior.
+    parents: [husk]
+  - slug: lsp
+    title: LSP
+    description: Language Server Protocol routing, transport, capabilities, diagnostics, and edits.
+    parents: [architecture]
+  - slug: completion
+    title: Completion
+    description: LSP completion requests, completion UI, and completion edit application.
+    parents: [lsp]
+  - slug: workspace-edits
+    title: Workspace Edits
+    description: LSP workspace edit preparation, resource operations, and failure handling.
+    parents: [lsp, editing]
+  - slug: agent
+    title: Agent
+    description: Red's Codex integration, dynamic tools, proposals, and review workflow.
+    parents: [architecture]
+  - slug: codex
+    title: Codex
+    description: Direct Codex app-server lifecycle and prerequisite checks.
+    parents: [agent]
+  - slug: reviewable-edits
+    title: Reviewable Edits
+    description: Proposal-first edit handling for Codex and editor-owned application.
+    parents: [agent, safety]
+  - slug: safety
+    title: Safety
+    description: Fail-closed behavior, review gates, workspace confinement, and protected operations.
+    parents: [architecture]
+  - slug: sessions
+    title: Sessions
+    description: Detachable live sessions and crash-recovery snapshot state.
+    parents: [architecture, persistence]
+  - slug: detach
+    title: Detach
+    description: Unix detachable editor owner/client behavior.
+    parents: [sessions]
+  - slug: recovery
+    title: Recovery
+    description: Crash-safe snapshot recovery and divergence handling.
+    parents: [sessions]
+  - slug: ipc
+    title: IPC
+    description: Versioned local protocol behavior for detachable sessions.
+    parents: [detach]
+  - slug: operations
+    title: Operations
+    description: Task-oriented operational workflows for sessions and maintenance.
+    parents: [guides]
+  - slug: development
+    title: Development
+    description: Local maintainer development and validation workflow.
+    parents: [guides]
+  - slug: validation
+    title: Validation
+    description: Tests, checks, self-checks, CI, and validation gates.
+    parents: [guides, reference]
+  - slug: ci
+    title: CI
+    description: GitHub Actions jobs and continuous verification.
+    parents: [validation]
+  - slug: testing
+    title: Testing
+    description: Test suites and test-backed contracts.
+    parents: [validation]
+  - slug: release
+    title: Release
+    description: Release preparation, artifacts, smoke checks, and announcements.
+    parents: [guides]
+  - slug: installers
+    title: Installers
+    description: macOS, Linux, and Windows installer behavior and verification.
+    parents: [release]
+  - slug: performance
+    title: Performance
+    description: Performance baselines, deterministic checks, and benchmark tooling.
+    parents: [validation]
+  - slug: debugging
+    title: Debugging
+    description: Diagnostic workflows for subsystem failures.
+    parents: [guides]
+  - slug: onboarding
+    title: Onboarding
+    description: First-reader wiki routing and first-run editor orientation.
+    parents: [red-editor]
+  - slug: navigation
+    title: Navigation
+    description: Wiki and editor navigation entry points.
+    parents: [onboarding]
+  - slug: build
+    title: Build
+    description: Wiki build state and build-oriented maintenance pages.
+    parents: [validation]
+  - slug: wiki
+    title: Wiki
+    description: CodeAlmanac wiki structure and build artifacts.
+    parents: []

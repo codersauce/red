@@ -1,0 +1,41 @@
+---
+title: "Detach Versus Recovery"
+summary: "Detach keeps a live Unix editor owner running, while recovery restores persisted snapshots after owner loss or restart."
+topics: [sessions, detach, recovery]
+sources:
+  - id: detach-doc
+    type: file
+    path: docs/DETACH.md
+  - id: recovery-doc
+    type: file
+    path: docs/SESSION_RECOVERY.md
+  - id: headless
+    type: file
+    path: src/headless/mod.rs
+  - id: session
+    type: file
+    path: src/session.rs
+  - id: main
+    type: file
+    path: src/main.rs
+---
+
+Detach and recovery solve different Red session failures. Detach is a live Unix owner model: the editor, unsaved buffers, LSP servers, plugins, and running Codex app-server process can continue after the attached terminal or SSH connection disappears [@detach-doc]. Recovery is a persisted snapshot model: `red --resume` loads the newest valid snapshot with dirty buffers or pending proposals, restores editor state in memory, and does not claim that a Codex process or app-server thread survived a crash [@recovery-doc].
+
+## Live Detach
+
+Detach starts a persistent owner and then attaches the current terminal to it. The documented commands are `red --detach=refactor ...`, `red --attach refactor`, and `red --stop refactor`; `red --detach` without a value uses the `default` session, and only one TUI may attach to a session at a time [@detach-doc]. In the implementation, `start_detached_owner` launches the current executable with the hidden `--core-session` flag, starts it in a new Unix session with `setsid`, waits for the socket, token, and PID files, and then calls the attach path [@main].
+
+The transport is local IPC, not persistence. `src/headless/mod.rs` defines protocol version 3 over Unix sockets with terminal-independent input events, render deltas, reconnect tokens, detach and stop messages, frame and paste limits, heartbeat timing, and one attached interactive client [@headless]. The detach documentation also states that sessions are local to the current OS user and use a private Unix socket and reconnect token rather than a TCP port [@detach-doc]. For operations, read [Detach and reattach](../../guides/sessions/detach-reattach) and [Detachable editor core](../../architecture/sessions/detachable-editor-core).
+
+## Crash Recovery
+
+Recovery is written to disk under the configuration directory's `sessions/<owner>/latest.json` namespace, with separate namespaces for each editor and named detached owner [@recovery-doc]. `SessionSnapshot` is the durable schema: it stores working directory, buffers, window layout, registers, jumps, marks, undo history, agent transcript, proposal workspace, and a flag that explicitly marks agent sessions as not resumable unless negotiated [@session].
+
+The entrypoint loads recovery only for `--resume`. It calls `SessionStore::load_latest_with_store`, changes to the snapshot working directory when present, reconstructs buffers from the snapshot, restores editor session state, reports disk divergence, and continues using the store that supplied the resumed snapshot [@main]. The detailed workflow belongs in [Crash recovery snapshots](../../architecture/sessions/crash-recovery-snapshots) and [Resume after crash](../../guides/sessions/resume-after-crash).
+
+## The Boundary
+
+The important distinction is whether the owner process still exists. A dropped terminal connection leaves the detached owner running, so reattach can reconnect to the same in-memory editor and running agent process [@detach-doc]. If the owner crashes or the machine restarts, only the last crash-safe snapshot remains; the recovery documentation says restored agent transcripts are archived context, and Red does not silently start a replacement Codex process or resume an app-server thread [@recovery-doc].
+
+The storage layer reinforces that boundary. `SessionStore::load_latest_with_store` ranks recoverable dirty or pending-proposal snapshots ahead of newer clean snapshots, falls back from invalid `latest.json` to `previous.json`, rejects future schema versions, and writes by syncing a temporary file before rotating generations [@session]. That makes recovery reliable for editor state, but it is not a substitute for the live IPC guarantees of detach.
