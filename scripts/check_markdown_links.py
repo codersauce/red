@@ -23,6 +23,7 @@ HTML_TAG = re.compile(r"<[^>]+>")
 
 
 def targets(contents: str) -> list[str]:
+    contents = "\n".join(unfenced_lines(contents))
     matches = [*INLINE.findall(contents), *REFERENCE.findall(contents)]
     return [bracketed or plain for bracketed, plain in matches]
 
@@ -119,6 +120,9 @@ Setext heading
     assert targets(
         "[local](guide.md#heading) ![image](<images/a b.png>)\n"
         "[reference]: ../README.md#quick-start\n"
+        "```markdown\n"
+        "[fenced](missing.md)\n"
+        "```\n"
         "[external](https://example.test/page#section)"
     ) == [
         "guide.md#heading",
@@ -133,8 +137,12 @@ Setext heading
         guide.write_text("# Valid heading\n<a id=\"custom-id\"></a>\n", encoding="utf-8")
         source.write_text(
             "[valid](guide.md#valid-heading)\n"
+            "[extensionless](guide#valid-heading)\n"
             "[custom](guide.md#custom-id)\n"
             "[encoded](guide.md#valid%2Dheading)\n"
+            "```markdown\n"
+            "[fenced](missing.md)\n"
+            "```\n"
             "[missing](guide.md#missing-heading)\n"
             "[same-file](#missing-local)\n",
             encoding="utf-8",
@@ -161,6 +169,10 @@ def link_errors(root: Path, files: list[Path]) -> list[str]:
                 if parsed.path
                 else source
             )
+            if not destination.exists() and not destination.suffix:
+                markdown_destination = destination.parent / f"{destination.name}.md"
+                if markdown_destination.exists():
+                    destination = markdown_destination
             if not destination.is_relative_to(root) or not destination.exists():
                 errors.append(f"{source.relative_to(root)}: broken link `{target}`")
                 continue
