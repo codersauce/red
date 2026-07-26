@@ -442,6 +442,28 @@ impl Editor {
         Ok(())
     }
 
+    /// Repaints edited rows through the same document-aware path as full frames.
+    pub(super) fn render_edited_window_rows(
+        &mut self,
+        buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<()> {
+        self.update_gutter_width();
+        self.sync_to_window();
+
+        let window_id = self.window_manager.active_window_id();
+        let Some(window) = self.window_manager.window_at_index(window_id).cloned() else {
+            return Ok(());
+        };
+        let rows = (0..self.window_content_height(&window))
+            .map(|row| self.window_to_terminal_y(&window, row))
+            .collect::<Vec<_>>();
+
+        self.render_window_rows(buffer, window_id, &rows)?;
+        self.draw_line_diagnostics(buffer, self.buffer_line());
+        self.update_and_render_overlays(buffer)?;
+        Ok(())
+    }
+
     fn render_window_rows(
         &mut self,
         buffer: &mut RenderBuffer,

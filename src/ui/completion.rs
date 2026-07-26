@@ -13,10 +13,12 @@ use crate::{
     editor::{Action, RenderBuffer},
     lsp::types::{CompletionItemKind, CompletionResponseItem, Documentation},
     theme::{SelectionForegroundPriority, Style, Theme, UiStyle},
-    unicode_utils::{display_width, fit_display_width, truncate_display_width},
+    unicode_utils::{
+        display_width, fit_display_width, truncate_display_width_with_marker, TruncationSide,
+    },
 };
 
-use super::Component;
+use super::{dialog::BorderStyle, Component, IconCatalog, SelectionViewport};
 
 const MAX_WIDTH: usize = 80;
 const PAGE_SIZE: usize = 10;
@@ -27,8 +29,7 @@ pub struct CompletionUI {
     all_items: Vec<CompletionResponseItem>,
     items: Vec<usize>,
     filter: String,
-    selected: usize,
-    scroll_offset: usize,
+    viewport: SelectionViewport,
     visible: bool,
     x: usize,
     y: usize,
@@ -125,14 +126,14 @@ impl CompletionUI {
         self.items.extend(0..items.len());
         self.all_items = items;
         self.filter.clear();
-        self.selected = selected;
-        self.scroll_offset = 0;
         self.visible = true;
         self.x = x;
         self.y = y;
         self.width = width;
         self.max_rows = max_rows;
         self.max_height = min(min(self.items.len(), PAGE_SIZE), max_rows.saturating_sub(2));
+        self.viewport = SelectionViewport::new(self.items.len(), self.max_height);
+        self.viewport.select(selected);
     }
 
     pub fn hide(&mut self) {
@@ -148,7 +149,7 @@ impl CompletionUI {
 
     pub fn selected_item(&self) -> Option<&CompletionResponseItem> {
         self.items
-            .get(self.selected)
+            .get(self.viewport.selected())
             .and_then(|index| self.all_items.get(*index))
     }
 
@@ -223,12 +224,12 @@ impl CompletionUI {
             self.items.extend(matches.into_iter().map(|(_, idx)| idx));
         }
 
-        self.selected = 0;
-        self.scroll_offset = 0;
         self.max_height = min(
             min(self.items.len(), PAGE_SIZE),
             self.max_rows.saturating_sub(2),
         );
+        self.viewport.reset(self.items.len());
+        self.viewport.set_height(self.max_height);
     }
 
     fn push_filter_char(&mut self, c: char) {
@@ -246,20 +247,7 @@ impl CompletionUI {
             return;
         }
 
-        let new_selected = if delta.is_negative() {
-            self.selected.saturating_sub(delta.unsigned_abs())
-        } else {
-            self.selected.saturating_add(delta as usize)
-        };
-
-        self.selected = min(new_selected, self.items.len() - 1);
-
-        // Adjust scroll if selection is out of view
-        if self.selected < self.scroll_offset {
-            self.scroll_offset = self.selected;
-        } else if self.selected >= self.scroll_offset + self.max_height {
-            self.scroll_offset = self.selected - self.max_height + 1;
-        }
+        self.viewport.move_by(delta);
     }
 
     fn move_page(&mut self, up: bool) {
@@ -272,33 +260,7 @@ impl CompletionUI {
     }
 
     fn kind_to_icon(kind: &CompletionItemKind) -> &'static str {
-        match kind {
-            CompletionItemKind::Text => "abc",
-            CompletionItemKind::Method => "ƒ",
-            CompletionItemKind::Function => "λ",
-            CompletionItemKind::Constructor => "⚡",
-            CompletionItemKind::Field => "◆",
-            CompletionItemKind::Variable => "𝑥",
-            CompletionItemKind::Class => "○",
-            CompletionItemKind::Interface => "◌",
-            CompletionItemKind::Module => "□",
-            CompletionItemKind::Property => "◇",
-            CompletionItemKind::Unit => "∅",
-            CompletionItemKind::Value => "=",
-            CompletionItemKind::Enum => "ℰ",
-            CompletionItemKind::Keyword => "🔑",
-            CompletionItemKind::Snippet => "✂",
-            CompletionItemKind::Color => "🎨",
-            CompletionItemKind::File => "📄",
-            CompletionItemKind::Reference => "→",
-            CompletionItemKind::Folder => "📁",
-            CompletionItemKind::EnumMember => "ℯ",
-            CompletionItemKind::Constant => "π",
-            CompletionItemKind::Struct => "⚪",
-            CompletionItemKind::Event => "⚡",
-            CompletionItemKind::Operator => "±",
-            CompletionItemKind::TypeParameter => "𝑇",
-        }
+        IconCatalog::completion(kind).glyph
     }
 
     fn row_segments(
@@ -347,17 +309,10 @@ impl CompletionUI {
     }
 
     fn ellipsize(content: &str, width: usize) -> String {
-        if display_width(content) <= width {
-            return fit_display_width(content, width);
-        }
-
-        if width <= 3 {
-            return ".".repeat(width);
-        }
-
-        let mut truncated = truncate_display_width(content, width - 3);
-        truncated.push_str("...");
-        fit_display_width(&truncated, width)
+        fit_display_width(
+            &truncate_display_width_with_marker(content, width, "…", TruncationSide::Right),
+            width,
+        )
     }
 
     fn render_completion(&self) -> Vec<(usize, usize, String, Style)> {
@@ -368,12 +323,16 @@ impl CompletionUI {
         let mut output = Vec::new();
         let mut y_offset = 1;
         let last_row_offset = self.max_rows.saturating_sub(1);
+        let [horizontal, _, top_left, top_right, bottom_left, bottom_right] = BorderStyle::Rounded
+            .glyphs()
+            .expect("rounded completion borders have frame glyphs");
+        let horizontal = horizontal.to_string().repeat(self.width.saturating_sub(2));
 
         // Draw top border
         output.push((
             self.x,
             self.y + y_offset,
-            format!("╭{}╮", "─".repeat(self.width - 2)),
+            format!("{top_left}{horizontal}{top_right}"),
             self.styles.popup_border.clone(),
         ));
         y_offset += 1;
@@ -404,15 +363,18 @@ impl CompletionUI {
             .saturating_sub(preview_row_count);
         let visible_count = self.max_height.min(list_capacity);
         let scroll_offset = if visible_count == 0 {
-            self.scroll_offset
+            self.viewport.top()
         } else {
             let max_scroll_offset = self.items.len().saturating_sub(visible_count);
-            let offset = if self.selected < self.scroll_offset {
-                self.selected
-            } else if self.selected >= self.scroll_offset + visible_count {
-                self.selected - visible_count + 1
+            let offset = if self.viewport.selected() < self.viewport.top() {
+                self.viewport.selected()
+            } else if self.viewport.selected() >= self.viewport.top().saturating_add(visible_count)
+            {
+                self.viewport
+                    .selected()
+                    .saturating_sub(visible_count.saturating_sub(1))
             } else {
-                self.scroll_offset
+                self.viewport.top()
             };
             offset.min(max_scroll_offset)
         };
@@ -425,7 +387,7 @@ impl CompletionUI {
 
         // Render completion items.
         for (idx, item) in visible_items.enumerate() {
-            let is_selected = idx + scroll_offset == self.selected;
+            let is_selected = idx + scroll_offset == self.viewport.selected();
             let marker = if is_selected { ">" } else { " " };
             // Format item with icon and handle deprecated items
             let is_deprecated = item.deprecated.unwrap_or(false);
@@ -477,7 +439,7 @@ impl CompletionUI {
         output.push((
             self.x,
             self.y + y_offset,
-            format!("╰{}╯", "─".repeat(self.width - 2)),
+            format!("{bottom_left}{horizontal}{bottom_right}"),
             self.styles.popup_border.clone(),
         ));
 

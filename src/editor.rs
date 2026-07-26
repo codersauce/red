@@ -1962,9 +1962,6 @@ pub struct Editor {
     /// Active dialog/popup component
     current_dialog: Option<Box<dyn Component>>,
 
-    /// UI component for displaying completions
-    completion_ui: CompletionUI,
-
     /// Number prefix for repeating commands
     repeater: Option<u16>,
 
@@ -2928,7 +2925,6 @@ impl Editor {
         for window in window_manager.windows_mut() {
             window.wrap = wrap;
         }
-        let completion_ui = CompletionUI::with_theme(&theme);
         let clipboard = Self::clipboard_provider_for_config(&config);
 
         let lsp_coordinator = lsp_coordinator::LspCoordinator::with_buffers(&buffers);
@@ -3024,7 +3020,6 @@ impl Editor {
             registers: HashMap::new(),
             clipboard,
             diagnostics: HashMap::new(),
-            completion_ui,
             indentation,
             jump_list: Vec::new(),
             jump_index: 0,
@@ -3991,59 +3986,6 @@ impl Editor {
                 style: span.style.clone(),
             })
             .collect())
-    }
-
-    fn fill_line(&mut self, buffer: &mut RenderBuffer, x: usize, y: usize, style: &Style) {
-        let width = self.vwidth().saturating_sub(x);
-        let line_fill = " ".repeat(width);
-        buffer.set_text(x, y, &line_fill, style);
-    }
-
-    fn draw_line(&mut self, buffer: &mut RenderBuffer) {
-        let line = self.viewport_line(self.cy).unwrap_or_default();
-        let language_id =
-            self.highlight_language_id_for_buffer_index(self.buffer_manager.active_index());
-        let style_info = if line.len() > MAX_HIGHLIGHT_SLICE_BYTES {
-            Vec::new()
-        } else {
-            self.highlight_spans_for_language(language_id, &line)
-                .unwrap_or_default()
-        };
-        let default_style = self.theme.style.clone();
-        let mut style_cursor = StyleCursor::new(&style_info);
-
-        let mut x = self.vx;
-        let mut iter = line.char_indices().peekable();
-
-        if line.is_empty() {
-            self.fill_line(buffer, x, self.cy, &default_style);
-            return;
-        }
-
-        while let Some((pos, c)) = iter.next() {
-            if c == '\n' || iter.peek().is_none() {
-                if c != '\n' {
-                    buffer.set_char(x, self.cy, c, &default_style, &self.theme);
-                    x += 1;
-                }
-                self.fill_line(buffer, x, self.cy, &default_style);
-                break;
-            }
-
-            if x < self.vwidth() {
-                if let Some(style) = style_cursor.style_at(pos) {
-                    buffer.set_char(x, self.cy, c, style, &self.theme);
-                } else {
-                    buffer.set_char(x, self.cy, c, &default_style, &self.theme);
-                }
-            }
-            x += 1;
-            if x >= self.vwidth() {
-                break;
-            }
-        }
-
-        self.draw_line_diagnostics(buffer, self.buffer_line());
     }
 
     pub fn draw_line_diagnostics(&mut self, buffer: &mut RenderBuffer, line_num: usize) {
@@ -9031,8 +8973,8 @@ impl Editor {
                                 }
                                 let (completion_x, completion_y) =
                                     self.render_cursor_position().unwrap_or((self.cx, self.cy));
-                                self.completion_ui.set_theme(&self.theme);
-                                self.completion_ui.show_with_bounds(
+                                let mut completion = CompletionUI::with_theme(&self.theme);
+                                completion.show_with_bounds(
                                     items,
                                     completion_x,
                                     completion_y,
@@ -9040,9 +8982,9 @@ impl Editor {
                                     self.size.1 as usize,
                                 );
                                 if let Some(filter) = self.completion_filter_for_response(msg) {
-                                    self.completion_ui.set_filter(&filter);
+                                    completion.set_filter(&filter);
                                 }
-                                self.current_dialog = Some(Box::new(self.completion_ui.clone()));
+                                self.current_dialog = Some(Box::new(completion));
                                 self.completion_snapshot = pending.or_else(|| {
                                     Some(PendingLspEdit {
                                         buffer_id: self.current_buffer().id(),
@@ -13068,7 +13010,7 @@ impl Editor {
                     self.render(buffer)?;
                 } else {
                     let draw_span = perf::PerfSpan::start("edit:draw_line");
-                    self.draw_line(buffer);
+                    self.render_edited_window_rows(buffer)?;
                     drop(draw_span);
                 }
             }
@@ -13080,7 +13022,7 @@ impl Editor {
                 );
                 self.commit_transaction(self.cursor_snapshot());
                 self.notify_change(runtime).await?;
-                self.draw_line(buffer);
+                self.render_edited_window_rows(buffer)?;
             }
             Action::DeleteRange(x0, y0, x1, y1) => {
                 self.begin_transaction("delete range");
@@ -13363,7 +13305,7 @@ impl Editor {
                     if started_transaction {
                         self.commit_transaction(self.cursor_snapshot());
                     }
-                    self.draw_line(buffer);
+                    self.render_edited_window_rows(buffer)?;
                 }
             }
             Action::ReplaceCharsAtCursor { character, count } => {
@@ -13386,7 +13328,7 @@ impl Editor {
                     );
                     self.commit_transaction(self.cursor_snapshot());
                     self.notify_change(runtime).await?;
-                    self.draw_line(buffer);
+                    self.render_edited_window_rows(buffer)?;
                 }
             }
             Action::ReplaceLineAt(y, contents) => {
@@ -13398,7 +13340,7 @@ impl Editor {
                 );
                 self.commit_transaction(self.cursor_snapshot());
                 self.notify_change(runtime).await?;
-                self.draw_line(buffer);
+                self.render_edited_window_rows(buffer)?;
             }
             Action::InsertNewLine => {
                 let started_transaction = !self.transaction_active();
@@ -13866,7 +13808,7 @@ impl Editor {
                             self.cx = prev_grapheme_idx;
 
                             self.notify_change(runtime).await?;
-                            self.draw_line(buffer);
+                            self.render_edited_window_rows(buffer)?;
                         }
                     }
                 } else if self.buffer_line() > 0 {
@@ -14661,7 +14603,7 @@ impl Editor {
                 {
                     self.render(buffer)?;
                 } else {
-                    self.draw_line(buffer);
+                    self.render_edited_window_rows(buffer)?;
                 }
             }
             Action::Save => {
@@ -14918,7 +14860,7 @@ impl Editor {
                 }
 
                 self.notify_change(runtime).await?;
-                self.draw_line(buffer);
+                self.render_edited_window_rows(buffer)?;
             }
             Action::NextBuffer => {
                 let new_index =
@@ -15282,7 +15224,7 @@ impl Editor {
                 if started_transaction {
                     self.commit_transaction(self.cursor_snapshot());
                 }
-                self.draw_line(buffer);
+                self.render_edited_window_rows(buffer)?;
             }
             Action::InsertPastedText(text) => {
                 let line = self.buffer_line();
@@ -16838,7 +16780,6 @@ impl Editor {
         self.highlight_cache.clear();
         self.workspace_manager.update_theme(&self.theme);
         self.force_full_redraw = true;
-        self.completion_ui.set_theme(&self.theme);
         if let Some(dialog) = &mut self.current_dialog {
             dialog.set_theme(&self.theme);
         }
@@ -21341,7 +21282,7 @@ mod test {
             .unwrap();
         editor
             .process_editor_event(
-                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
                 &mut buffer,
                 &mut runtime,
                 EventRenderMode::Immediate,

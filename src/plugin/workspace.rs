@@ -14,7 +14,7 @@ use crate::{
     editor::render_buffer::RenderBuffer,
     highlighter::Highlighter,
     theme::{SelectionForegroundPriority, Style, Theme},
-    ui::{picker_file_icon, picker_file_icon_color},
+    ui::{IconCatalog, ScreenRect},
     unicode_utils::{display_width, fit_display_width, truncate_display_width},
 };
 
@@ -127,32 +127,7 @@ pub enum WorkspaceFocus {
     Detail,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WorkspaceRect {
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
-}
-
-impl WorkspaceRect {
-    fn contains(self, column: usize, row: usize) -> bool {
-        column >= self.x
-            && column < self.x.saturating_add(self.width)
-            && row >= self.y
-            && row < self.y.saturating_add(self.height)
-    }
-
-    fn content_height(self) -> usize {
-        self.height.saturating_sub(1)
-    }
-
-    fn content_offset(self, row: usize) -> Option<usize> {
-        let content_y = self.y.saturating_add(1);
-        (row >= content_y && row < self.y.saturating_add(self.height))
-            .then_some(row.saturating_sub(content_y))
-    }
-}
+type WorkspaceRect = ScreenRect;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspaceSeparator {
@@ -1059,16 +1034,16 @@ fn render_row_pane(
         buffer.set_text(x, y, &fit_display_width("", width), &row_style);
         let mut content_x = x + 1 + row.depth.saturating_mul(2);
         if let Some(path) = row.path.as_deref() {
-            let icon = picker_file_icon(path, icons.style);
-            if !icon.is_empty() {
+            let icon = IconCatalog::file(path, icons.style);
+            if !icon.glyph.is_empty() {
                 let mut icon_style = row_style.clone();
                 if icons.color {
-                    icon_style.fg = picker_file_icon_color(path).or(icon_style.fg);
+                    icon_style.fg = icon.color.or(icon_style.fg);
                 }
                 if selected {
                     icon_style = theme.ensure_text_contrast(&icon_style);
                 }
-                buffer.set_text(content_x, y, &fit_display_width(icon, 2), &icon_style);
+                buffer.set_text(content_x, y, &fit_display_width(icon.glyph, 2), &icon_style);
                 content_x += 3;
             }
         }

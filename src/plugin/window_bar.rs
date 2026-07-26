@@ -7,14 +7,12 @@
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
-use unicode_segmentation::UnicodeSegmentation;
-
 use crate::{
     theme::{Style, Theme, ThemeStyleSpec},
-    unicode_utils::display_width,
+    unicode_utils::{display_width, truncate_display_width, truncate_display_width_from_end},
     window::WindowId,
 };
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -306,7 +304,7 @@ fn clip_segments(
         return segments.to_vec();
     }
 
-    let marker = truncate_right(marker, width);
+    let marker = truncate_display_width(marker, width);
     let marker_width = display_width(&marker);
     let content_width = width.saturating_sub(marker_width);
     match overflow {
@@ -330,7 +328,7 @@ fn take_prefix(segments: &[WindowBarSegment], width: usize) -> Vec<WindowBarSegm
         if remaining == 0 {
             break;
         }
-        let text = truncate_right(&segment.text, remaining);
+        let text = truncate_display_width(&segment.text, remaining);
         remaining = remaining.saturating_sub(display_width(&text));
         if !text.is_empty() {
             result.push(WindowBarSegment {
@@ -349,7 +347,7 @@ fn take_suffix(segments: &[WindowBarSegment], width: usize) -> Vec<WindowBarSegm
         if remaining == 0 {
             break;
         }
-        let text = truncate_left(&segment.text, remaining);
+        let text = truncate_display_width_from_end(&segment.text, remaining);
         remaining = remaining.saturating_sub(display_width(&text));
         if !text.is_empty() {
             result.push(WindowBarSegment {
@@ -360,40 +358,6 @@ fn take_suffix(segments: &[WindowBarSegment], width: usize) -> Vec<WindowBarSegm
     }
     result.reverse();
     result
-}
-
-fn truncate_right(text: &str, width: usize) -> String {
-    let mut used = 0;
-    text.graphemes(true)
-        .take_while(|grapheme| {
-            let next = used + display_width(grapheme);
-            if next <= width {
-                used = next;
-                true
-            } else {
-                false
-            }
-        })
-        .collect()
-}
-
-fn truncate_left(text: &str, width: usize) -> String {
-    let mut used = 0;
-    let mut graphemes = text
-        .graphemes(true)
-        .rev()
-        .take_while(|grapheme| {
-            let next = used + display_width(grapheme);
-            if next <= width {
-                used = next;
-                true
-            } else {
-                false
-            }
-        })
-        .collect::<Vec<_>>();
-    graphemes.reverse();
-    graphemes.concat()
 }
 
 fn push_marker(segments: &mut Vec<WindowBarSegment>, text: String) {

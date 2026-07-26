@@ -6,35 +6,50 @@
 //! editor directly. Sensitive components must report their input status so tracing and
 //! logging do not serialize secrets.
 
+mod action_bar;
 mod agent_composer;
 mod completion;
 mod confirmation;
 mod dialog;
 mod file_picker;
+mod geometry;
 mod hover_info;
+mod icons;
 mod info;
 mod input_prompt;
 mod keymap_hints;
 mod list;
 mod picker;
+mod prompt_buffer;
+mod rich_text;
+mod selection;
 
+pub use action_bar::{
+    ActionBar, ActionBarLayout, ActionBarRole, ActionBarSpan, ActionMode, ActionPriority, UiAction,
+};
+pub(crate) use agent_composer::wrap_text;
 pub use agent_composer::AgentComposer;
-pub(crate) use agent_composer::{normalize_newlines, wrap_text};
 pub use completion::CompletionUI;
 pub use confirmation::Confirmation;
 use crossterm::event::{Event, KeyCode, MouseEvent, MouseEventKind};
 use dialog::Dialog;
 pub use file_picker::FilePicker;
+pub(crate) use geometry::ScreenRect;
 pub use hover_info::{HoverInfo, HoverInfoFormat};
+pub(crate) use icons::IconCatalog;
 pub use info::Info;
 pub use input_prompt::InputPrompt;
 pub(crate) use keymap_hints::draw_keymap_hints;
 use list::List;
-pub(crate) use picker::{picker_file_icon, picker_file_icon_color};
 pub use picker::{
     LegacyPickerOptions, Picker, PickerIcon, PickerItem, PickerOptions, PickerPresentation,
     PickerPreview, PickerUpdate,
 };
+pub(crate) use prompt_buffer::{
+    first_prompt_line, normalize_prompt_newlines, PromptBuffer, PromptInput, PROMPT_MAX_BYTES,
+};
+pub(crate) use rich_text::paint_rich_text;
+pub(crate) use selection::{FollowTailViewport, SelectionViewport};
 
 use crate::{
     config::KeyAction,

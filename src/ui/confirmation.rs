@@ -12,7 +12,7 @@ use crate::{
 };
 
 use super::{
-    dialog::{BorderStyle, Dialog},
+    dialog::{BorderStyle, Dialog, SurfaceRole},
     Component, PickerItem,
 };
 
@@ -40,8 +40,6 @@ impl Confirmation {
         let title = title.into();
         let message = message.into();
         let style = editor.theme.ui_style.dialog.clone();
-        let border_style = editor.theme.ui_style.dialog_border.clone();
-        let title_style = editor.theme.ui_style.dialog_title.clone();
         let width = confirmation_width(editor.vwidth(), &message);
         let x = editor.vwidth().saturating_sub(width + 2) / 2;
         let y = editor.vheight().saturating_sub(4) / 2;
@@ -56,8 +54,7 @@ impl Confirmation {
                 BorderStyle::Single,
                 &editor.theme,
             )
-            .with_border_draw_style(&border_style)
-            .with_title_style(&title_style),
+            .with_surface_theme(&editor.theme, SurfaceRole::Dialog),
             message,
             accept_selected: false,
             callback_handle,
@@ -97,10 +94,7 @@ impl Component for Confirmation {
 
     fn set_theme(&mut self, theme: &Theme) {
         self.style = theme.ui_style.dialog.clone();
-        self.dialog.style = theme.ui_style.dialog.clone();
-        self.dialog.border_draw_style = theme.ui_style.dialog_border.clone();
-        self.dialog.title_style = theme.ui_style.dialog_title.clone();
-        self.dialog.theme = theme.clone();
+        self.dialog.apply_surface_theme(theme, SurfaceRole::Dialog);
         self.theme = theme.clone();
     }
 
@@ -156,11 +150,11 @@ impl Component for Confirmation {
             }
             (KeyCode::Left | KeyCode::BackTab, _) => {
                 self.accept_selected = true;
-                Some(KeyAction::Single(Action::ShowDialog))
+                Some(KeyAction::Single(Action::Refresh))
             }
             (KeyCode::Right | KeyCode::Tab, _) => {
                 self.accept_selected = false;
-                Some(KeyAction::Single(Action::ShowDialog))
+                Some(KeyAction::Single(Action::Refresh))
             }
             (KeyCode::Char('y' | 'Y'), _) => Some(self.terminal_action(true)),
             (KeyCode::Char('n' | 'N'), _) => Some(self.terminal_action(false)),
