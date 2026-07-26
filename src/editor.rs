@@ -1222,6 +1222,9 @@ pub enum Action {
     MoveToLineStart,
     MoveToFirstLineChar,
     MoveToLastLineChar,
+    MoveToViewportTop(u16),
+    MoveToViewportMiddle,
+    MoveToViewportBottom(u16),
     MoveScreenLineUp,
     MoveScreenLineDown,
     MoveToScreenLineEnd,
@@ -2550,7 +2553,7 @@ enum EditOperator {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingOperatorStep {
     Operator,
-    CommentTextObject,
+    GPrefix,
     FindForward,
     TillForward,
     FindBackward,
@@ -2619,6 +2622,8 @@ enum TextObjectScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextObjectKind {
     Word,
+    BigWord,
+    Paragraph,
     Delimited { open: char, close: char },
     Quote(char),
 }
@@ -2637,6 +2642,8 @@ fn is_keyword_char(c: char) -> bool {
 fn text_object_kind_for_key(c: char) -> Option<TextObjectKind> {
     match c {
         'w' => Some(TextObjectKind::Word),
+        'W' => Some(TextObjectKind::BigWord),
+        'p' => Some(TextObjectKind::Paragraph),
         '(' | ')' | 'b' => Some(TextObjectKind::Delimited {
             open: '(',
             close: ')',
@@ -7902,6 +7909,9 @@ impl Editor {
                 | Action::MoveDown
                 | Action::MoveLeft
                 | Action::MoveRight
+                | Action::MoveToViewportTop(_)
+                | Action::MoveToViewportMiddle
+                | Action::MoveToViewportBottom(_)
                 | Action::MoveScreenLineUp
                 | Action::MoveScreenLineDown
                 | Action::MoveToScreenLineEnd
@@ -7944,6 +7954,9 @@ impl Editor {
                 | Action::MoveToLineStart
                 | Action::MoveToFirstLineChar
                 | Action::MoveToLastLineChar
+                | Action::MoveToViewportTop(_)
+                | Action::MoveToViewportMiddle
+                | Action::MoveToViewportBottom(_)
                 | Action::MoveScreenLineUp
                 | Action::MoveScreenLineDown
                 | Action::MoveToScreenLineEnd
@@ -10983,6 +10996,9 @@ impl Editor {
                 return Some(KeyAction::None);
             };
 
+            if kind == TextObjectKind::Paragraph && self.select_linewise_text_range(range) {
+                return Some(KeyAction::Single(Action::Refresh));
+            }
             if self.select_text_range(range) {
                 return Some(KeyAction::Single(Action::Refresh));
             }
@@ -11491,7 +11507,7 @@ impl Editor {
                 'g' => {
                     self.waiting_command = Some(format!("{}g", pending.operator.as_str()));
                     self.pending_operator = Some(PendingOperator {
-                        step: PendingOperatorStep::CommentTextObject,
+                        step: PendingOperatorStep::GPrefix,
                         ..pending
                     });
                     Some(KeyAction::None)
@@ -11501,8 +11517,28 @@ impl Editor {
                     self.word_motion_range(
                         pending.count(),
                         pending.operator == EditOperator::Change,
+                        false,
                     ),
                     "no word under cursor",
+                ),
+                'W' => self.operator_action_for_range(
+                    pending.operator,
+                    self.word_motion_range(
+                        pending.count(),
+                        pending.operator == EditOperator::Change,
+                        true,
+                    ),
+                    "no word under cursor",
+                ),
+                'h' => self.operator_action_for_range(
+                    pending.operator,
+                    self.horizontal_motion_range(pending.count(), true),
+                    "no text before cursor",
+                ),
+                'l' => self.operator_action_for_range(
+                    pending.operator,
+                    self.horizontal_motion_range(pending.count(), false),
+                    "no text under cursor",
                 ),
                 'b' => self.operator_action_for_range(
                     pending.operator,
@@ -11539,6 +11575,19 @@ impl Editor {
                     self.line_start_motion_range(true),
                     "no text under cursor",
                 ),
+                'G' => {
+                    let target = if pending.motion_count.is_some() || pending.operator_count > 1 {
+                        usize::from(pending.count().saturating_sub(1))
+                            .min(self.last_navigable_line())
+                    } else {
+                        self.last_navigable_line()
+                    };
+                    self.operator_action_for_linewise_range(
+                        pending.operator,
+                        Some(self.file_linewise_motion_range(target, pending.operator)),
+                        "no line under cursor",
+                    )
+                }
                 'j' => self.operator_action_for_linewise_range(
                     pending.operator,
                     self.vertical_motion_range(pending.count(), false),
@@ -11604,17 +11653,40 @@ impl Editor {
                 }
                 _ => self.pending_operator_invalid(),
             },
-            PendingOperatorStep::CommentTextObject => {
-                if c != 'c' {
-                    return self.pending_operator_invalid();
+            PendingOperatorStep::GPrefix => match c {
+                'c' => {
+                    let range = self.comment_text_object_range();
+                    self.operator_action_for_linewise_range(
+                        pending.operator,
+                        range,
+                        "comment block not found",
+                    )
                 }
-                let range = self.comment_text_object_range();
-                self.operator_action_for_linewise_range(
+                'g' => {
+                    let target = if pending.motion_count.is_some() || pending.operator_count > 1 {
+                        usize::from(pending.count().saturating_sub(1))
+                            .min(self.last_navigable_line())
+                    } else {
+                        0
+                    };
+                    self.operator_action_for_linewise_range(
+                        pending.operator,
+                        Some(self.file_linewise_motion_range(target, pending.operator)),
+                        "no line under cursor",
+                    )
+                }
+                'e' => self.operator_action_for_range(
                     pending.operator,
-                    range,
-                    "comment block not found",
-                )
-            }
+                    self.previous_end_word_motion_range(pending.count(), false),
+                    "no word under cursor",
+                ),
+                'E' => self.operator_action_for_range(
+                    pending.operator,
+                    self.previous_end_word_motion_range(pending.count(), true),
+                    "no word under cursor",
+                ),
+                _ => self.pending_operator_invalid(),
+            },
             PendingOperatorStep::FindForward => {
                 self.last_character_motion = Some((ForwardCharacterMotion::Find, c));
                 self.operator_action_for_range(
@@ -11793,20 +11865,34 @@ impl Editor {
         characters[start..end].iter().collect()
     }
 
-    fn word_motion_range(&self, count: u16, change_word: bool) -> Option<TextRange> {
+    fn word_motion_range(
+        &self,
+        count: u16,
+        change_word: bool,
+        big_word: bool,
+    ) -> Option<TextRange> {
         let start = self.cursor_text_position();
         let buffer = self.current_buffer();
-        let characters = buffer.contents().chars().collect::<Vec<_>>();
+        let contents = buffer.contents();
+        let characters = contents.chars().collect::<Vec<_>>();
         let mut end = buffer.position_to_char_idx(start);
+        characters.get(end)?;
         let word_kind = |character: char| {
             if character.is_whitespace() {
                 0
-            } else if character.is_alphanumeric() || character == '_' {
+            } else if big_word || character.is_alphanumeric() || character == '_' {
                 1
             } else {
                 2
             }
         };
+        let word_kinds = contents
+            .graphemes(true)
+            .flat_map(|grapheme| {
+                let kind = word_kind(grapheme.chars().next().unwrap_or_default());
+                grapheme.chars().map(move |_| kind)
+            })
+            .collect::<Vec<_>>();
         let preserve_trailing_whitespace = change_word
             && characters
                 .get(end)
@@ -11816,30 +11902,61 @@ impl Editor {
                 break;
             };
             let final_motion = index + 1 == count;
-            if final_motion && matches!(character, '\r' | '\n') {
+            if matches!(character, '\r' | '\n') {
+                if final_motion && (change_word || (!big_word && index > 0)) {
+                    break;
+                }
                 end += 1;
                 if character == '\r' && characters.get(end) == Some(&'\n') {
                     end += 1;
                 }
+                if !final_motion {
+                    while characters
+                        .get(end)
+                        .is_some_and(|next| next.is_whitespace() && !matches!(next, '\r' | '\n'))
+                    {
+                        end += 1;
+                    }
+                }
                 continue;
             }
 
-            let kind = word_kind(character);
-            while characters.get(end).is_some_and(|&next| {
-                word_kind(next) == kind && (!final_motion || !matches!(next, '\r' | '\n'))
-            }) {
+            let kind = word_kinds[end];
+            while word_kinds.get(end) == Some(&kind)
+                && characters
+                    .get(end)
+                    .is_some_and(|next| !matches!(next, '\r' | '\n'))
+            {
                 end += 1;
             }
             if !preserve_trailing_whitespace || index + 1 < count {
-                while characters.get(end).is_some_and(|&next| {
-                    next.is_whitespace() && (!final_motion || !matches!(next, '\r' | '\n'))
-                }) {
+                while characters
+                    .get(end)
+                    .is_some_and(|&next| next.is_whitespace() && !matches!(next, '\r' | '\n'))
+                {
                     end += 1;
+                }
+                if !final_motion {
+                    if change_word {
+                        while characters.get(end).is_some_and(|next| next.is_whitespace()) {
+                            end += 1;
+                        }
+                    } else if let Some(&line_ending @ ('\r' | '\n')) = characters.get(end) {
+                        end += 1;
+                        if line_ending == '\r' && characters.get(end) == Some(&'\n') {
+                            end += 1;
+                        }
+                        while characters.get(end).is_some_and(|next| {
+                            next.is_whitespace() && !matches!(next, '\r' | '\n')
+                        }) {
+                            end += 1;
+                        }
+                    }
                 }
             }
         }
         let end = buffer.char_idx_to_position(end);
-        (start != end).then(|| TextRange::new(start, end))
+        (start != end || change_word).then(|| TextRange::new(start, end))
     }
 
     fn word_motion_target(
@@ -11941,15 +12058,98 @@ impl Editor {
         (start != end).then(|| TextRange::new(start, end))
     }
 
+    fn previous_end_word_motion_range(&self, count: u16, big_word: bool) -> Option<TextRange> {
+        let cursor = self.cursor_text_position();
+        let start = self
+            .word_motion_target(count, true, true, big_word)
+            .or_else(|| {
+                let characters = self.current_buffer().contents().chars().collect::<Vec<_>>();
+                let mut index = self.current_buffer().position_to_char_idx(cursor);
+                let current = *characters.get(index)?;
+                if index == 0 || current.is_whitespace() {
+                    return None;
+                }
+                let kind = |character: char| {
+                    if character.is_whitespace() {
+                        0
+                    } else if big_word || is_keyword_char(character) {
+                        1
+                    } else {
+                        2
+                    }
+                };
+                let current_kind = kind(current);
+                while index > 0 && kind(characters[index - 1]) == current_kind {
+                    index -= 1;
+                }
+                Some(self.current_buffer().char_idx_to_position(index))
+            })?;
+        let end = TextPosition::new(cursor.line, cursor.character.saturating_add(1));
+        Some(TextRange::new(start, end))
+    }
+
     fn end_word_motion_range(&self, count: u16, big_word: bool) -> Option<TextRange> {
         let start = self.cursor_text_position();
-        let target = self.word_motion_target(count, false, true, big_word)?;
+        let target = self
+            .word_motion_target(count, false, true, big_word)
+            .or_else(|| {
+                let index = self.current_buffer().position_to_char_idx(start);
+                self.current_buffer()
+                    .contents()
+                    .chars()
+                    .nth(index)
+                    .filter(|character| !character.is_whitespace())
+                    .map(|_| start)
+            })?;
         let end_index = self
             .current_buffer()
             .position_to_char_idx(target)
             .saturating_add(1);
         let end = self.current_buffer().char_idx_to_position(end_index);
         (start != end).then(|| TextRange::new(start, end))
+    }
+
+    fn horizontal_motion_range(&self, count: u16, backward: bool) -> Option<TextRange> {
+        let line = self.buffer_line();
+        let cursor = self.cx;
+        let target = if backward {
+            cursor.saturating_sub(usize::from(count))
+        } else {
+            cursor
+                .saturating_add(usize::from(count))
+                .min(self.length_for_line(line))
+        };
+        if cursor == target {
+            return None;
+        }
+
+        let start = self.grapheme_to_char_on_line(cursor.min(target), line);
+        let end = self.grapheme_to_char_on_line(cursor.max(target), line);
+        Some(TextRange::new(
+            TextPosition::new(line, start),
+            TextPosition::new(line, end),
+        ))
+    }
+
+    fn file_linewise_motion_range(&self, target: usize, operator: EditOperator) -> TextRange {
+        let current = self.buffer_line();
+        let first_line = current.min(target);
+        let last_line = current.max(target);
+        let end = if last_line < self.current_buffer().len() {
+            TextPosition::new(last_line + 1, 0)
+        } else {
+            TextPosition::new(last_line, self.line_character_len(last_line))
+        };
+        let start = if operator == EditOperator::Delete
+            && first_line > 0
+            && last_line == self.current_buffer().len()
+        {
+            let previous_line = first_line - 1;
+            TextPosition::new(previous_line, self.line_character_len(previous_line))
+        } else {
+            TextPosition::new(first_line, 0)
+        };
+        TextRange::new(start, end)
     }
 
     fn line_character_len(&self, line: usize) -> usize {
@@ -12130,7 +12330,9 @@ impl Editor {
 
     fn text_object_range(&self, scope: TextObjectScope, kind: TextObjectKind) -> Option<TextRange> {
         match kind {
-            TextObjectKind::Word => self.word_text_object_range(scope),
+            TextObjectKind::Word => self.word_text_object_range(scope, false),
+            TextObjectKind::BigWord => self.word_text_object_range(scope, true),
+            TextObjectKind::Paragraph => self.paragraph_text_object_range(scope),
             TextObjectKind::Delimited { open, close } => {
                 self.delimited_text_object_range(scope, open, close)
             }
@@ -12138,38 +12340,45 @@ impl Editor {
         }
     }
 
-    fn word_text_object_range(&self, scope: TextObjectScope) -> Option<TextRange> {
+    fn word_text_object_range(&self, scope: TextObjectScope, big_word: bool) -> Option<TextRange> {
         let line_index = self.buffer_line();
         let line = self.current_buffer().get(line_index)?;
-        let line = line.trim_end_matches('\n');
+        let line = trim_line_ending(&line);
         let chars = line.chars().collect::<Vec<_>>();
         if chars.is_empty() {
             return None;
         }
 
+        let unit_kind = |character: char| {
+            if big_word && !character.is_whitespace() {
+                Some(TextUnitKind::Keyword)
+            } else {
+                text_unit_kind(character)
+            }
+        };
         let cursor = self
             .grapheme_to_char_on_line(self.cx, line_index)
             .min(chars.len().saturating_sub(1));
-        let target = if text_unit_kind(chars[cursor]).is_some() {
+        let target = if unit_kind(chars[cursor]).is_some() {
             cursor
         } else {
             (cursor..chars.len())
-                .find(|idx| text_unit_kind(chars[*idx]).is_some())
+                .find(|idx| unit_kind(chars[*idx]).is_some())
                 .or_else(|| {
                     (0..=cursor)
                         .rev()
-                        .find(|idx| text_unit_kind(chars[*idx]).is_some())
+                        .find(|idx| unit_kind(chars[*idx]).is_some())
                 })?
         };
 
-        let kind = text_unit_kind(chars[target])?;
+        let kind = unit_kind(chars[target])?;
         let mut start = target;
-        while start > 0 && text_unit_kind(chars[start - 1]) == Some(kind) {
+        while start > 0 && unit_kind(chars[start - 1]) == Some(kind) {
             start -= 1;
         }
 
         let mut end = target + 1;
-        while end < chars.len() && text_unit_kind(chars[end]) == Some(kind) {
+        while end < chars.len() && unit_kind(chars[end]) == Some(kind) {
             end += 1;
         }
 
@@ -12189,6 +12398,70 @@ impl Editor {
             TextPosition::new(line_index, start),
             TextPosition::new(line_index, end),
         ))
+    }
+
+    fn paragraph_text_object_range(&self, scope: TextObjectScope) -> Option<TextRange> {
+        let buffer = self.current_buffer();
+        if buffer.is_empty() {
+            return None;
+        }
+
+        let last_line = self.last_navigable_line();
+        let cursor_line = self.buffer_line().min(last_line);
+        let is_blank = |line: usize| {
+            buffer
+                .get(line)
+                .is_some_and(|text| trim_line_ending(&text).trim().is_empty())
+        };
+
+        let mut first_line = cursor_line;
+        let mut last_exclusive = cursor_line + 1;
+        let cursor_is_blank = is_blank(cursor_line);
+
+        while first_line > 0 && is_blank(first_line - 1) == cursor_is_blank {
+            first_line -= 1;
+        }
+        while last_exclusive <= last_line && is_blank(last_exclusive) == cursor_is_blank {
+            last_exclusive += 1;
+        }
+
+        if scope == TextObjectScope::Around {
+            if cursor_is_blank {
+                while last_exclusive <= last_line && !is_blank(last_exclusive) {
+                    last_exclusive += 1;
+                }
+            } else {
+                while last_exclusive <= last_line && is_blank(last_exclusive) {
+                    last_exclusive += 1;
+                }
+            }
+        }
+
+        let ends_at_eof = last_exclusive > last_line;
+        let start = if ends_at_eof && first_line > 0 {
+            if scope == TextObjectScope::Around {
+                while first_line > 0 && is_blank(first_line - 1) {
+                    first_line -= 1;
+                }
+                if first_line > 0 {
+                    let previous_line = first_line - 1;
+                    TextPosition::new(previous_line, self.line_character_len(previous_line))
+                } else {
+                    TextPosition::new(0, 0)
+                }
+            } else {
+                TextPosition::new(first_line - 1, self.line_character_len(first_line - 1))
+            }
+        } else {
+            TextPosition::new(first_line, 0)
+        };
+        let end = if ends_at_eof {
+            TextPosition::new(last_line, self.line_character_len(last_line))
+        } else {
+            TextPosition::new(last_exclusive, 0)
+        };
+
+        (start != end).then(|| TextRange::new(start, end))
     }
 
     fn word_under_cursor(&self) -> Option<String> {
@@ -12576,6 +12849,40 @@ impl Editor {
                         .position(|g| !g.chars().all(char::is_whitespace))
                         .unwrap_or(0);
                     self.cx = grapheme_len(line).saturating_sub(trailing + 1);
+                }
+            }
+            Action::MoveToViewportTop(count) | Action::MoveToViewportBottom(count) => {
+                let Some(window) = self.active_window_with_editor_view() else {
+                    return Ok(false);
+                };
+                let layout = self.layout_for_window(&window);
+                let mut visible_lines = Vec::new();
+                for segment in &layout.rows {
+                    if visible_lines.last().copied() != Some(segment.line) {
+                        visible_lines.push(segment.line);
+                    }
+                }
+                let offset = usize::from(count.saturating_sub(1));
+                let target = if matches!(action, Action::MoveToViewportTop(_)) {
+                    visible_lines.get(offset.min(visible_lines.len().saturating_sub(1)))
+                } else {
+                    visible_lines.get(visible_lines.len().saturating_sub(offset + 1))
+                };
+                if let Some(&line) = target {
+                    self.move_to_text_position(TextPosition::new(line, 0));
+                    self.move_to_first_non_blank_on_current_line();
+                    self.finish_cursor_motion(buffer, false)?;
+                }
+            }
+            Action::MoveToViewportMiddle => {
+                let Some(window) = self.active_window_with_editor_view() else {
+                    return Ok(false);
+                };
+                let layout = self.layout_for_window(&window);
+                if let Some(segment) = layout.rows.get(layout.rows.len().saturating_sub(1) / 2) {
+                    self.move_to_text_position(TextPosition::new(segment.line, 0));
+                    self.move_to_first_non_blank_on_current_line();
+                    self.finish_cursor_motion(buffer, false)?;
                 }
             }
             Action::MoveScreenLineUp => {
@@ -14604,7 +14911,7 @@ impl Editor {
                 }
             }
             Action::DeleteWord => {
-                if let Some(range) = self.word_motion_range(1, false) {
+                if let Some(range) = self.word_motion_range(1, false, false) {
                     self.begin_transaction("delete word");
                     self.replace_range(range, "");
                     self.commit_transaction(self.cursor_snapshot());
@@ -16124,6 +16431,8 @@ impl Editor {
             text.push('\n');
         }
         self.replace_range(TextRange::insertion(TextPosition::new(target_y, 0)), &text);
+        self.move_to_text_position(TextPosition::new(target_y, 0));
+        self.move_to_first_non_blank_on_current_line();
     }
 
     fn insert_blockwise(&mut self, x: usize, y: usize, contents: &Content, before: bool) {
@@ -16164,14 +16473,18 @@ impl Editor {
         let insertion = if before {
             insert_x
         } else {
-            let after_x = self.grapheme_to_char_on_line(x + 1, y);
-            self.cx += 1;
-            after_x
+            self.grapheme_to_char_on_line(x.saturating_add(1), y)
         };
-        self.replace_range(
-            TextRange::insertion(TextPosition::new(y, insertion)),
-            &contents.text,
-        );
+        let start = TextPosition::new(y, insertion);
+        self.replace_range(TextRange::insertion(start), &contents.text);
+        let inserted = self.current_buffer().range_for_text(start, &contents.text);
+        let cursor = if contents.text.contains('\n') {
+            inserted.start
+        } else {
+            self.previous_text_position(inserted.end, inserted.start)
+                .unwrap_or(inserted.start)
+        };
+        self.move_to_text_position(cursor);
     }
 
     fn insert_content_as_transaction(&mut self, x: usize, y: usize, content: &Content) {
@@ -17035,6 +17348,12 @@ impl Editor {
                     KeyAction::Single(Action::RepeatCharSearchOpposite(_)) => {
                         KeyAction::Single(Action::RepeatCharSearchOpposite(count))
                     }
+                    KeyAction::Single(Action::MoveToViewportTop(_)) => {
+                        KeyAction::Single(Action::MoveToViewportTop(count))
+                    }
+                    KeyAction::Single(Action::MoveToViewportBottom(_)) => {
+                        KeyAction::Single(Action::MoveToViewportBottom(count))
+                    }
                     KeyAction::Single(Action::HalfPageDown(_)) => {
                         KeyAction::Single(Action::HalfPageDown(count))
                     }
@@ -17300,6 +17619,13 @@ impl Editor {
 
     fn delete_text_range(&mut self, range: TextRange, label: &str) -> bool {
         let deleted_text = self.current_buffer().text_in_range(range);
+        let deletes_through_eof = range.end.line == self.last_navigable_line()
+            && range.end.character == self.line_character_len(range.end.line);
+        let move_to_first_non_blank = (range.start.character == 0
+            && (deleted_text.ends_with('\n') || deleted_text.ends_with('\r')))
+            || (deletes_through_eof
+                && range.start.character > 0
+                && (deleted_text.starts_with('\n') || deleted_text.starts_with("\r\n")));
         self.set_default_register(Content::charwise(deleted_text.clone()));
         self.move_to_text_position(range.start);
 
@@ -17310,6 +17636,9 @@ impl Editor {
         self.begin_transaction(label);
         self.replace_range(range, "");
         self.move_to_text_position(range.start);
+        if move_to_first_non_blank {
+            self.move_to_first_non_blank_on_current_line();
+        }
         self.commit_transaction(self.cursor_snapshot());
         true
     }
@@ -17610,6 +17939,7 @@ impl Editor {
         self.begin_transaction(label);
         self.replace_range(range, "");
         self.move_to_text_position(range.start);
+        self.move_to_first_non_blank_on_current_line();
         self.commit_transaction(self.cursor_snapshot());
         true
     }
@@ -17730,6 +18060,30 @@ impl Editor {
         self.selection_start = Some(start);
         self.set_selection(start, end);
         self.move_to_text_position(end_position);
+        true
+    }
+
+    fn select_linewise_text_range(&mut self, range: TextRange) -> bool {
+        let first_line = if range.start.character > 0 {
+            range.start.line.saturating_add(1)
+        } else {
+            range.start.line
+        };
+        let last_line = if range.end.character == 0 && range.end.line > first_line {
+            range.end.line - 1
+        } else {
+            range.end.line
+        };
+        if last_line < first_line {
+            return false;
+        }
+
+        let start = Point::new(0, first_line);
+        let end = Point::new(0, last_line);
+        self.mode = Mode::VisualLine;
+        self.selection_start = Some(start);
+        self.set_selection(start, end);
+        self.move_to_text_position(TextPosition::new(last_line, 0));
         true
     }
 

@@ -729,7 +729,8 @@ async fn dot_repeats_linewise_paste_and_visual_block_insert() {
     let buffer = Buffer::new(None, "one\ntwo\nthree\nfour".to_string());
     let mut harness = EditorHarness::with_config(buffer, default_key_config());
     type_normal_keys(&mut harness, "yyjpj.").await;
-    harness.assert_buffer_contents("one\ntwo\none\none\nthree\nfour");
+    harness.assert_buffer_contents("one\ntwo\none\nthree\none\nfour");
+    harness.assert_cursor_at(0, 4);
 
     let buffer = Buffer::new(None, "a\nb\nc\nd".to_string());
     let mut harness = EditorHarness::with_config(buffer, default_key_config());
@@ -2168,6 +2169,25 @@ async fn wrap_commands_toggle_line_wrapping() {
         .await
         .unwrap();
     assert!(harness.wrap());
+}
+
+#[tokio::test]
+async fn vim_parity_gw_toggles_wrapping_without_overriding_big_word_motion() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "foo.bar baz".to_string()),
+        default_key_config(),
+    );
+    let initial_wrap = harness.wrap();
+
+    type_normal_keys(&mut harness, "gW").await;
+
+    assert_eq!(harness.wrap(), !initial_wrap);
+    harness.assert_cursor_at(0, 0);
+
+    type_normal_keys(&mut harness, "gW").await;
+
+    assert_eq!(harness.wrap(), initial_wrap);
+    harness.assert_cursor_at(0, 0);
 }
 
 #[tokio::test]
@@ -6010,6 +6030,299 @@ async fn test_change_to_end_of_line() {
 }
 
 #[tokio::test]
+async fn vim_parity_counted_word_operators_stop_at_blank_line_boundaries() {
+    for (contents, keys, expected, cursor) in [
+        (
+            "alpha beta\n\nnext line",
+            "wd2w",
+            "alpha \nnext line",
+            (5, 0),
+        ),
+        (
+            "alpha beta\n\nnext line",
+            "w2dw",
+            "alpha \nnext line",
+            (5, 0),
+        ),
+        ("alpha beta\n\nnext line", "wd3w", "alpha line", (6, 0)),
+        ("\n    next line", "dw", "    next line", (4, 0)),
+        ("\n    next line", "cwX", "X\n    next line", (0, 0)),
+        (
+            "alpha beta\n\nnext line",
+            "wy2wp",
+            "alpha bbeta\neta\n\nnext line",
+            (7, 0),
+        ),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+        if harness.is_insert() {
+            command_key(&mut harness, KeyCode::Esc).await;
+        }
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_big_word_operators_and_text_objects_match_neovim() {
+    for (contents, keys, expected, cursor) in [
+        ("foo.bar baz", "dW", "baz", (0, 0)),
+        ("foo.bar baz qux", "d2W", "qux", (0, 0)),
+        ("foo.bar baz", "cWX", "X baz", (0, 0)),
+        ("foo.bar baz", "yWp", "ffoo.bar oo.bar baz", (8, 0)),
+        ("foo.bar baz", "diW", " baz", (0, 0)),
+        ("foo.bar baz", "daW", "baz", (0, 0)),
+        ("α.β γδ", "dW", "γδ", (0, 0)),
+        ("foo.bar\n\n baz qux", "d2W", " baz qux", (1, 0)),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+        if harness.is_insert() {
+            command_key(&mut harness, KeyCode::Esc).await;
+        }
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_character_operators_accept_horizontal_motions_and_counts() {
+    for (contents, keys, expected, cursor) in [
+        ("alpha", "dl", "lpha", (0, 0)),
+        ("alpha", "ldh", "lpha", (0, 0)),
+        ("alpha", "d2l", "pha", (0, 0)),
+        ("alpha", "d99l", "", (0, 0)),
+        ("alpha", "3ld99h", "ha", (0, 0)),
+        ("alpha", "clX", "Xlpha", (0, 0)),
+        ("alpha", "ylp", "aalpha", (1, 0)),
+        ("αβγ", "dl", "βγ", (0, 0)),
+        ("αβγ", "ldh", "βγ", (0, 0)),
+        ("αβγ", "d2l", "γ", (0, 0)),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+        if harness.is_insert() {
+            command_key(&mut harness, KeyCode::Esc).await;
+        }
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_end_word_operators_include_the_final_buffer_character() {
+    for (contents, keys, expected, cursor) in [
+        ("alpha beta", "de", " beta", (0, 0)),
+        ("alpha", "$de", "alph", (3, 0)),
+        ("alpha", "$dE", "alph", (3, 0)),
+        ("x", "de", "", (0, 0)),
+        ("alpha", "$ceX", "alphX", (4, 0)),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+        if harness.is_insert() {
+            command_key(&mut harness, KeyCode::Esc).await;
+        }
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_linewise_operators_accept_file_boundary_motions() {
+    for (contents, keys, expected, cursor) in [
+        ("one\ntwo\nthree", "dG", "", (0, 0)),
+        ("one\ntwo\nthree", "jdG", "one", (0, 0)),
+        ("one\ntwo\nthree", "jdgg", "three", (0, 0)),
+        ("one\ntwo\nthree\nfour", "2dG", "three\nfour", (0, 0)),
+        ("one\ntwo\nthree\nfour", "d2G", "three\nfour", (0, 0)),
+        ("one\ntwo\nthree\nfour", "jjd2gg", "one\nfour", (0, 1)),
+        (
+            "one\ntwo\nthree",
+            "yGp",
+            "one\none\ntwo\nthree\ntwo\nthree",
+            (0, 1),
+        ),
+        ("one\ntwo\nthree", "cGX", "X", (0, 0)),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+        if harness.is_insert() {
+            command_key(&mut harness, KeyCode::Esc).await;
+        }
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_operators_accept_previous_word_end_g_motions() {
+    for (contents, keys, expected, cursor) in [
+        ("alpha beta gamma", "wdge", "alpheta gamma", (4, 0)),
+        ("alpha.beta gamma", "wdgE", "beta gamma", (0, 0)),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_charwise_paste_places_the_cursor_on_the_last_inserted_grapheme() {
+    for (contents, keys, expected, cursor) in [
+        ("alpha beta", "ywp", "aalpha lpha beta", (6, 0)),
+        (
+            "alpha beta\nnext line",
+            "wywp",
+            "alpha bbetaeta\nnext line",
+            (10, 0),
+        ),
+        ("alpha", "ylp", "aalpha", (1, 0)),
+        ("αβ γδ", "ywp", "ααβ β γδ", (3, 0)),
+        (
+            "a\u{301}bc next",
+            "ywp",
+            "a\u{301}a\u{301}bc bc next",
+            (4, 0),
+        ),
+        ("alpha beta", "ywP", "alpha alpha beta", (5, 0)),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_paragraph_text_objects_preserve_inner_blank_line_semantics() {
+    for (contents, keys, expected, cursor) in [
+        (
+            "one paragraph\nstill one\n\nnext paragraph",
+            "dip",
+            "\nnext paragraph",
+            (0, 0),
+        ),
+        (
+            "one paragraph\nstill one\n\nnext paragraph",
+            "dap",
+            "next paragraph",
+            (0, 0),
+        ),
+        (
+            "one\n\nsecond line\nsecond end\n\nthird",
+            "jjdip",
+            "one\n\n\nthird",
+            (0, 2),
+        ),
+        (
+            "one\n\nsecond line\nsecond end\n\nthird",
+            "jjdap",
+            "one\n\nthird",
+            (0, 2),
+        ),
+        ("one\n\n\nnext", "jdip", "one\nnext", (0, 1)),
+        ("one\n\n\nnext", "jdap", "one", (0, 0)),
+        ("one\nsecond", "dip", "", (0, 0)),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_visual_big_word_and_paragraph_objects_match_operator_objects() {
+    for (contents, keys, expected) in [
+        ("foo.bar baz", "viWx", " baz"),
+        (
+            "one paragraph\nstill one\n\nnext paragraph",
+            "vipx",
+            "\nnext paragraph",
+        ),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(0, 0);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_default_character_search_repeat_honors_counts() {
+    for (contents, keys, expected_x) in [("foo.bar.baz", "f.;", 7), ("foo.bar.baz.qux", "f.2;", 11)]
+    {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(contents);
+        harness.assert_cursor_at(expected_x, 0);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
 async fn vim_editing_shortcuts_honor_counts_and_register_kinds() {
     let cases = [
         ("one two\nthree four\nfive", "w2D", "one \nfive"),
@@ -6156,29 +6469,18 @@ async fn vim_case_changes_and_visual_replace_are_transactional() {
 }
 
 #[tokio::test]
-async fn vim_word_and_character_repeat_actions_remain_remappable() {
-    let mut config = default_key_config();
-    config.keys.normal.insert(
-        "W".to_string(),
-        KeyAction::Single(Action::MoveToNextBigWord),
+async fn vim_word_and_character_repeat_actions_use_the_default_keymap() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "alpha.beta gamma".to_string()),
+        default_key_config(),
     );
-    config.keys.normal.insert(
-        ";".to_string(),
-        KeyAction::Single(Action::RepeatCharSearch(1)),
-    );
-
-    let mut harness =
-        EditorHarness::with_config(Buffer::new(None, "alpha.beta gamma".to_string()), config);
     type_normal_keys(&mut harness, "W").await;
     harness.assert_cursor_at(11, 0);
 
-    let mut config = default_key_config();
-    config.keys.normal.insert(
-        ";".to_string(),
-        KeyAction::Single(Action::RepeatCharSearch(1)),
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "alpha.beta.gamma".to_string()),
+        default_key_config(),
     );
-    let mut harness =
-        EditorHarness::with_config(Buffer::new(None, "alpha.beta.gamma".to_string()), config);
     type_normal_keys(&mut harness, "f.;").await;
     harness.assert_cursor_at(10, 0);
 }
