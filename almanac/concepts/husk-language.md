@@ -1,7 +1,7 @@
 ---
 title: "Husk Language"
 summary: "Husk is Red's embedded scripting language and standalone Rust workspace for plugins, packages, a CLI, embedding, and portable extensions."
-topics: [husk, plugins, scripting]
+topics: [concepts, husk, plugins, scripting]
 sources:
   - id: guide
     type: file
@@ -21,7 +21,7 @@ Husk is the scripting language Red embeds for plugins and also a standalone Rust
 
 ## Language And CLI
 
-The guide defines the standalone CLI surface: `cargo run -p husk-cli -- check`, `run`, `test`, and `repl`, with installed binaries invoked as `husk ...` or through Red's forwarded `red husk ...` entrypoint [@guide]. One-file scripts use Rust-like `fn main` signatures, and the CLI's built-in `std` module intentionally exposes only `print` and `println`, without ambient filesystem, network, environment, process, clock, or random access [@guide].
+The guide defines the standalone CLI surface: `cargo run -p husk-cli -- check`, `run`, `test`, and `repl`, with installed binaries invoked as `husk ...` or through Red's forwarded `red husk ...` entrypoint [@guide]. One-file scripts use Rust-like `fn main` signatures, and the CLI's built-in `std` module intentionally exposes only `print` and `println`, without ambient filesystem, network, environment, process, clock, or random access [@guide]. The accepted entrypoint and module-resolution boundary is recorded in [Husk Scripts And Modules](../decisions/husk/scripts-and-modules).
 
 Husk packages are local and filesystem-based. The guide describes `Husk.toml`, deterministic module resolution, lock files, `red husk new`, `red husk add`, `red husk install --locked --offline`, and reproducible `--locked` commands [@guide]. That package and CLI behavior belongs in [Husk command](../reference/cli/husk-command).
 
@@ -29,7 +29,7 @@ Husk packages are local and filesystem-based. The guide describes `Husk.toml`, d
 
 The public `husk` crate is a facade over `husk_runtime`. Its library documentation says embedders compile source with an `Engine`, instantiate isolated mutable state, and register statically linked Rust crates through `NativeModule`; the exported API includes `Engine`, `EngineBuilder`, `NativeModule`, `Instance`, package types, REPL types, descriptors, values, limits, and extension sources [@facade]. The guide gives the same model in prose: `Engine` and compiled modules are shareable immutable artifacts, while each `Instance` owns VM heap, script state, callback roots, budgets, host state, and Wasm stores [@guide].
 
-The embedding distinction matters for Red. New standalone applications should use the native semantic profile, while Red's plugin compatibility path can select a legacy JavaScript profile for existing plugin behavior [@guide]. The detailed host-facing API is covered by [Husk public embedding API](../architecture/husk/public-embedding-api).
+The embedding distinction matters for Red. New standalone applications should use the native semantic profile, while Red's plugin compatibility path can select a legacy JavaScript profile for existing plugin behavior [@guide]. The native target is recorded in [Husk Value Semantics](../decisions/husk/value-semantics). The detailed host-facing API is covered by [Husk public embedding API](../architecture/husk/public-embedding-api).
 
 ## Red Plugin Runtime
 

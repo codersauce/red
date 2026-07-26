@@ -1,6 +1,6 @@
 ---
 title: CodeAlmanac Wiki
-topics: [concepts]
+topics: [wiki]
 sources: []
 ---
 
@@ -9,6 +9,9 @@ sources: []
 This is the living wiki for this repository. It records the durable knowledge
 the code cannot say: decisions, flows, invariants, incidents, gotchas, and
 project context that future agents should not rediscover from scratch.
+
+Start with [Getting Started](getting-started) when you need the main reading
+paths through the Red editor, agent, Husk, sessions, and development areas.
 
 ## Notability Bar
 

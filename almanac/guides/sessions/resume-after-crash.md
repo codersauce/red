@@ -1,7 +1,7 @@
 ---
 title: "Resume After Crash"
 summary: "Use `red --resume` to recover the newest useful crash snapshot, inspect divergence warnings, and save recovered buffers deliberately."
-topics: [sessions, recovery, operations]
+topics: [guides, sessions, recovery, operations]
 sources:
   - id: recovery-doc
     type: file

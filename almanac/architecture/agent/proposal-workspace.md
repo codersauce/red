@@ -12,6 +12,9 @@ sources:
   - id: workflow
     type: file
     path: docs/AGENT_WORKFLOW.md
+  - id: agent-plugin
+    type: file
+    path: plugins/agent.hk
 ---
 
 The proposal workspace is Red's review-before-apply filesystem for agent changes. It stores editor-visible file bases, per-session proposed contents, active turn attribution, archived recovered sessions, and a generation counter; its module-level contract says agent writes update proposed contents only and callers must explicitly accept a proposal through the editor transaction boundary before visible buffers or disk can change [@workspace]. This workspace is the data structure behind [Reviewable Agent Edits](../../concepts/reviewable-agent-edits): Codex can read its own staged changes and build on them, while the user still decides what enters the editor through [Review Agent Proposals](../../guides/agent/review-agent-proposals) [@workflow] [@editor].
@@ -48,4 +51,4 @@ This is why proposal acceptance belongs behind the [Text Mutation Boundary](../e
 
 The workspace is serializable for crash recovery. `ProposalWorkspaceSnapshot` captures the root, visible files, and session proposals, and `from_snapshot` restores sessions as recovered sessions without reading or writing workspace files [@workspace]. `archive_session` retains sessions with pending changes after process loss or session close, `review_sessions` returns the active session plus archived sessions with pending files, and `adopt_recovered_sessions` transfers non-overlapping archived proposals into a replacement live session [@workspace].
 
-The workflow relies on that state when app-server failure occurs: a stopped process archives pending proposals and preserves the submitted prompt for retry [@workflow]. The editor also archives proposals for `AgentCloseSession` and `AgentArchiveSession`, and `agent_proposals_payload` adopts recovered sessions before building review data [@editor]. The result is that a lost app-server process does not turn pending proposals into hidden disk edits or discard reviewable work.
+The workflow relies on that state when app-server failure occurs: a stopped process must archive pending proposals, while prompt retry is available only on loss events that carry the submitted prompt [@workflow] [@editor]. The bundled agent UI calls `AgentArchiveSession` for the current session on `agent:session_lost` and saves a retry prompt only when `event.prompt` is present [@agent-plugin]. The editor also archives proposals for `AgentCloseSession` and `AgentArchiveSession`, and `agent_proposals_payload` adopts recovered sessions before building review data [@editor]. The result is that a lost app-server process does not turn pending proposals into hidden disk edits or discard reviewable work.

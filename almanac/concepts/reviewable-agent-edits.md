@@ -1,7 +1,7 @@
 ---
 title: "Reviewable Agent Edits"
 summary: "Reviewable agent edits are Red's model for keeping Codex changes in proposal state until the user explicitly accepts them."
-topics: [agent, reviewable-edits, safety]
+topics: [concepts, agent, reviewable-edits, safety]
 sources:
   - id: agent-workflow
     type: file

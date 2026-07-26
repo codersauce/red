@@ -20,7 +20,7 @@ sources:
     path: tests/detach.rs
 ---
 
-The detachable editor core is Red's live-session architecture for Unix terminals. `red --detach` starts a background owner process that contains the real editor, buffers, LSP client, plugin runtime, Codex task, recovery store, and render model; attached clients only send normalized terminal input and paint render deltas [@main-entry] [@editor-core]. This differs from [crash recovery](crash-recovery-snapshots): detach protects against terminal or SSH loss while the owner still runs, and recovery restores a persisted snapshot after the owner is gone [@detach-doc].
+The detachable editor core is Red's live-session architecture for Unix terminals. `red --detach` starts a background owner process that contains the real editor, buffers, LSP client, plugin runtime, Codex task, recovery store, and render model; attached clients only send normalized terminal input and paint render deltas [@main-entry] [@editor-core]. This differs from [crash recovery](crash-recovery-snapshots): detach protects against terminal or SSH loss while the owner still runs, and recovery restores a persisted snapshot after the owner is gone [@detach-doc]. The accepted owner/client boundary is recorded in [Detachable Core Boundary](../../decisions/sessions/detachable-core-boundary).
 
 ## Owner And Client Split
 

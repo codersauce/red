@@ -15,6 +15,9 @@ sources:
   - id: plugin-api
     type: file
     path: docs/PLUGIN_API.md
+  - id: agent-plugin
+    type: file
+    path: plugins/agent.hk
 ---
 
 Use this guide when Codex has staged changes and a maintainer needs to decide what should enter the editor. A successful review leaves accepted changes as normal editor transactions with agent attribution, leaves rejected changes out of the visible buffer and disk, and preserves pending proposals when Red cannot review them safely [@workflow] [@editor]. The background architecture is [Proposal Workspace](../../architecture/agent/proposal-workspace), and the safety concept is [Reviewable Agent Edits](../../concepts/reviewable-agent-edits).
@@ -51,7 +54,7 @@ After a successful rejection, the editor emits `agent:proposals_changed` for the
 
 ## Recover After Session Loss
 
-If the Codex process stops or a session is closed with pending changes, review should still be possible. The workflow states that a stopped process archives pending proposals and preserves the submitted prompt for retry [@workflow]. The workspace implements this by archiving sessions that still have effective pending files, exposing archived sessions to review, and adopting non-overlapping recovered proposals into a replacement live session [@workspace].
+If the Codex process stops or a session is closed with pending changes, review should still be possible. The workflow states that a stopped process archives pending proposals, and the workspace implements this by retaining sessions that still have effective pending files, exposing archived sessions to review, and adopting non-overlapping recovered proposals into a replacement live session [@workflow] [@workspace]. Prompt retry is narrower: the editor includes a retry prompt only for pre-dispatch loss and send-failure events, and the bundled agent UI saves a pending prompt only when `event.prompt` is present [@editor] [@agent-plugin].
 
 Use `:AgentReview` after reconnecting or starting a new agent session to surface archived proposals. The editor's proposal payload builder calls `adopt_recovered_sessions` before returning files, so non-conflicting recovered work can appear under the active review session while overlapping recovered sessions remain separately reviewable [@workspace] [@editor].
 

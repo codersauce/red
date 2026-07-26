@@ -17,7 +17,7 @@ sources:
     path: plugins/neotree_core/Husk.toml
 ---
 
-Husk package resolution is a deterministic, filesystem-only system. A package is rooted at a `Husk.toml` manifest, its source graph starts at the declared entry file, and its lock file records the exact extension inputs that package commands must reproduce [@package-code]. This architecture keeps package loading local: there is no registry resolver in the package crate, embedded source packages cannot declare extensions, and extension bundles are validated through paths and digests rather than by executing generated state [@package-code]. It is the package layer that connects the public [Husk embedding API](public-embedding-api), [Husk extensions](extensions), and the `husk` command reference.
+Husk package resolution is a deterministic, filesystem-only system. A package is rooted at a `Husk.toml` manifest, its source graph starts at the declared entry file, and its lock file records the exact extension inputs that package commands must reproduce [@package-code]. This architecture keeps package loading local: there is no registry resolver in the package crate, embedded source packages cannot declare extensions, and extension bundles are validated through paths and digests rather than by executing generated state [@package-code]. It is the package layer that connects the public [Husk embedding API](public-embedding-api), [Husk extensions](extensions), the [Husk Scripts And Modules](../../decisions/husk/scripts-and-modules) decision, and the `husk` command reference.
 
 ## Manifest Shape
 

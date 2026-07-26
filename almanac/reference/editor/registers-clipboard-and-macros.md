@@ -1,7 +1,7 @@
 ---
 title: "Registers, Clipboard, And Macros"
 summary: "Registers hold charwise, linewise, or blockwise text, the default register can sync with the system clipboard, and macros replay normalized key notation with deterministic limits."
-topics: [editor, vim, clipboard]
+topics: [reference, editor, vim, clipboard]
 sources:
   - id: clipboard
     type: file

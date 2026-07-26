@@ -1,7 +1,7 @@
 ---
 title: "Callback-Scoped Dialogs"
 summary: "Callback-scoped dialogs bind picker and composer results to host-owned handles instead of global event names."
-topics: [plugins, host-api, ui]
+topics: [concepts, plugins, host-api, ui]
 sources:
   - id: runtime
     type: file

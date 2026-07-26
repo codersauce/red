@@ -20,7 +20,7 @@ sources:
     path: src/config.rs
 ---
 
-The Husk language server is the first-party LSP implementation for `.hk` and `.husk` files. It uses `husk-analysis` for recovered syntax, semantic analysis, overlays, symbols, formatting, and UTF-16 position mapping, and `husk-lsp` for JSON-RPC transport, LSP request routing, dependency indexing, diagnostics, and editor protocol responses [@lsp-doc] [@analysis-code] [@lsp-server]. Red enables this server by default through `red husk lsp --stdio`, while standalone users can launch the same server through `husk lsp --stdio` or `husk-lsp` [@lsp-doc] [@red-config].
+The Husk language server is the first-party LSP implementation for `.hk` and `.husk` files. It uses `husk-analysis` for recovered syntax, semantic analysis, overlays, symbols, formatting, and UTF-16 position mapping, and `husk-lsp` for JSON-RPC transport, LSP request routing, dependency indexing, diagnostics, and editor protocol responses [@lsp-doc] [@analysis-code] [@lsp-server]. Red enables this server by default by launching the current Red executable with `husk lsp --stdio`, while standalone users can launch the same server through `husk lsp --stdio` or `husk-lsp` [@lsp-doc] [@red-config].
 
 ## Workspace Analysis
 

@@ -24,9 +24,9 @@ For startup behavior, read [Runtime lifecycle](architecture/startup/runtime-life
 
 ## Editing, Runtime, And Plugins
 
-Read [Editor event loop](architecture/editor/event-loop) when changing input handling, editing actions, rendering, LSP polling, plugin dispatch, recovery snapshots, or agent event processing. The current user documentation treats editing, selecting, searching, windows, command mode, Git, LSP, configuration, plugins, and troubleshooting as one day-to-day editor surface [@getting-started-doc].
+Read [Editor event loop](architecture/editor/event-loop) when changing input handling, editing actions, rendering, LSP polling, plugin dispatch, recovery snapshots, or agent event processing. For language-server work, start with [LSP architecture](architecture/lsp) before moving into transport, document sync, completion, workspace edits, or configuration. The current user documentation treats editing, selecting, searching, windows, command mode, Git, LSP, configuration, plugins, and troubleshooting as one day-to-day editor surface [@getting-started-doc].
 
-Read [Plugin lifecycle and reload](architecture/plugins/lifecycle-and-reload) when changing bundled plugins or Husk host behavior. Red ships embedded plugins and themes, lets users list visible runtime files with `red --runtime-files`, and can eject bundled assets into the user config directory where they shadow embedded copies [@readme].
+Read [Plugin architecture](architecture/plugins) when changing bundled plugins or Husk host behavior, then use [Plugin lifecycle and reload](architecture/plugins/lifecycle-and-reload) for discovery, activation, quarantine, and reload details. Red ships embedded plugins and themes, lets users list visible runtime files with `red --runtime-files`, and can eject bundled assets into the user config directory where they shadow embedded copies [@readme].
 
 ## Agent Work
 

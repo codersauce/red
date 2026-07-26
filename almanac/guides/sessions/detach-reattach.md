@@ -1,7 +1,7 @@
 ---
 title: "Detach And Reattach"
 summary: "Use `red --detach`, `red --attach`, and `red --stop` to keep a Unix editor owner alive across terminal disconnects."
-topics: [sessions, detach, operations]
+topics: [guides, sessions, detach, operations]
 sources:
   - id: detach-doc
     type: file

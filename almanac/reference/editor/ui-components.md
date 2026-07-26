@@ -1,7 +1,7 @@
 ---
 title: "UI Components"
 summary: "Modal UI components share a Component trait for drawing, event handling, resize/theme updates, plugin handles, cursor placement, and sensitive input reporting."
-topics: [editor, ui, plugins]
+topics: [reference, editor, ui, plugins]
 sources:
   - id: ui-core
     type: file

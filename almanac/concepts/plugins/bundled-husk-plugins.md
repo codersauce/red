@@ -1,7 +1,7 @@
 ---
 title: "Bundled Husk Plugins"
 summary: "Bundled Husk plugins are the editor features shipped as embedded Husk source, with some plugins delegating pure logic to native Husk packages."
-topics: [plugins, husk, runtime-assets]
+topics: [concepts, plugins, husk, runtime-assets]
 sources:
   - id: plugins-dir
     type: file

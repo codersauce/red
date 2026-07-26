@@ -1,7 +1,7 @@
 ---
 title: "Detach Versus Recovery"
 summary: "Detach keeps a live Unix editor owner running, while recovery restores persisted snapshots after owner loss or restart."
-topics: [sessions, detach, recovery]
+topics: [concepts, sessions, detach, recovery]
 sources:
   - id: detach-doc
     type: file
@@ -36,6 +36,6 @@ The entrypoint loads recovery only for `--resume`. It calls `SessionStore::load_
 
 ## The Boundary
 
-The important distinction is whether the owner process still exists. A dropped terminal connection leaves the detached owner running, so reattach can reconnect to the same in-memory editor and running agent process [@detach-doc]. If the owner crashes or the machine restarts, only the last crash-safe snapshot remains; the recovery documentation says restored agent transcripts are archived context, and Red does not silently start a replacement Codex process or resume an app-server thread [@recovery-doc].
+The important distinction is whether the owner process still exists. A dropped terminal connection leaves the detached owner running, so reattach can reconnect to the same in-memory editor and running agent process [@detach-doc]. If the owner crashes or the machine restarts, only the last crash-safe snapshot remains; the recovery documentation says restored agent transcripts are archived context, and Red does not silently start a replacement Codex process or resume an app-server thread [@recovery-doc]. [Detachable Core Boundary](../../decisions/sessions/detachable-core-boundary) records the decision behind that owner/client split.
 
 The storage layer reinforces that boundary. `SessionStore::load_latest_with_store` ranks recoverable dirty or pending-proposal snapshots ahead of newer clean snapshots, falls back from invalid `latest.json` to `previous.json`, rejects future schema versions, and writes by syncing a temporary file before rotating generations [@session]. That makes recovery reliable for editor state, but it is not a substitute for the live IPC guarantees of detach.

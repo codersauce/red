@@ -1,7 +1,7 @@
 ---
 title: "Editor Coordinate Systems"
 summary: "Red keeps separate byte, scalar, grapheme, terminal-column, and UTF-16 coordinate systems at explicit editor boundaries."
-topics: [editor, unicode, lsp]
+topics: [concepts, editor, unicode, lsp]
 sources:
   - id: editor-core
     type: file

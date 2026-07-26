@@ -247,11 +247,7 @@ topics:
     title: Navigation
     description: Wiki and editor navigation entry points.
     parents: [onboarding]
-  - slug: build
-    title: Build
-    description: Wiki build state and build-oriented maintenance pages.
-    parents: [validation]
   - slug: wiki
     title: Wiki
-    description: CodeAlmanac wiki structure and build artifacts.
+    description: CodeAlmanac wiki structure and maintenance conventions.
     parents: []

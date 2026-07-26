@@ -1,7 +1,7 @@
 ---
 title: "Red Editor"
 summary: "Red is a modal terminal editor that combines Vim-style editing, embedded runtime assets, language tooling, Husk plugins, and reviewable agent edits."
-topics: [red-editor, editor, runtime]
+topics: [concepts, red-editor, editor, runtime]
 sources:
   - id: readme
     type: file

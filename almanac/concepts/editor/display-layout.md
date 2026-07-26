@@ -1,7 +1,7 @@
 ---
 title: "Display Layout"
 summary: "Display layout maps logical buffer lines to viewport rows using terminal-column width, wrapping, horizontal scrolling, and break indentation."
-topics: [editor, rendering, unicode]
+topics: [concepts, editor, rendering, unicode]
 sources:
   - id: display-layout
     type: file

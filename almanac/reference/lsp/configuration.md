@@ -62,7 +62,7 @@ The default TOML comments describe the same public set as covering Rust, Markdow
 
 ## Husk Integration
 
-The embedded Husk definition launches Red itself as `red husk lsp --stdio`, routes `.hk` and `.husk` to language id `husk`, and searches for `Husk.toml` before `.git` as workspace roots [@config]. Its initialization options set `looseSemanticProfile` to `legacyJavaScript` and include trusted Red plugin host declarations, so loose plugin files receive Red host types even when no Husk package exists [@config].
+The embedded Husk definition launches the current Red executable with `husk lsp --stdio`, routes `.hk` and `.husk` to language id `husk`, and searches for `Husk.toml` before `.git` as workspace roots [@config]. Its initialization options set `looseSemanticProfile` to `legacyJavaScript` and include trusted Red plugin host declarations, so loose plugin files receive Red host types even when no Husk package exists [@config].
 
 The Husk LSP documentation states that Red enables the first-party server by default and that the same server can also be launched as `husk lsp --stdio`, `red husk lsp --stdio`, or `husk-lsp` [@husk-doc]. It also documents the corresponding custom initialization options: `semanticProfile`, `looseSemanticProfile`, and optional declaration sources [@husk-doc].
 

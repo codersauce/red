@@ -1,7 +1,7 @@
 ---
 title: "Plugin Lifecycle And Reload"
 summary: "The plugin lifecycle is the registry-controlled path from discovery through activation, quarantine, callback delivery, and transactional reload."
-topics: [plugins, husk, runtime]
+topics: [architecture, plugins, husk, runtime]
 sources:
   - id: registry
     type: file

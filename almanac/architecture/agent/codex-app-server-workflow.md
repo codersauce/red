@@ -15,6 +15,9 @@ sources:
   - id: workflow
     type: file
     path: docs/AGENT_WORKFLOW.md
+  - id: agent-plugin
+    type: file
+    path: plugins/agent.hk
 ---
 
 The Codex app-server workflow is Red's direct integration with the installed Codex CLI. Red starts `codex app-server --stdio`, initializes the app-server protocol, verifies the Codex account, starts an ephemeral thread, and then drives turns through JSONL requests and events [@codex]. The workflow matters because Codex is never given Red's normal workspace mutation authority: Red starts threads and turns with read-only sandboxing, denied native approvals, disabled extension surfaces, and Red-owned dynamic tools that stage edits as reviewable proposals [@workflow] [@codex]. The editor side owns the bridge, active-session state, proposal workspace handle, and bounded editor-tool channel through `AgentManager`, so app-server events can be polled from the editor loop without making Codex a direct editor owner [@manager] [@editor].
@@ -46,5 +49,7 @@ The editor polls both directions from `service_background`. It services a bounde
 ## Failure Behavior
 
 Red fails closed when the direct app-server contract is unavailable. The workflow documentation says Red pins a minimum tested Codex CLI version, does not fall back to `codex exec`, and archives pending proposals when a stopped process is detected [@workflow]. In code, missing sessions produce `Failed` events, app-server request errors become user-facing failure events, tool calls against unknown or inactive turns return errors, and a finished worker causes the editor to drop the bridge, clear active sessions and tool requests, and notify `agent:session_lost` [@codex] [@editor].
+
+The retry path depends on the loss event payload. `dispatch_agent_prompt` includes the submitted prompt when no bridge is available or when sending the command to the bridge fails, but the generic finished-worker notification only reports that the app-server stopped [@editor]. The bundled agent UI archives the current session on `agent:session_lost`; it saves and replays a prompt only when the event includes one, otherwise it tells the user to start a new session after preserving reviewable proposals [@agent-plugin].
 
 The readiness gate for this workflow is [Agent Check](../../reference/agent/agent-check). `red --agent-check` is offline, so it verifies executable discovery and minimum version but leaves authentication to the first live `account/read` call [@workflow]. The accepted architectural constraint behind the workflow is recorded in [Direct Codex App-Server](../../decisions/agent/direct-codex-app-server).

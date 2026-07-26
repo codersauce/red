@@ -1,7 +1,7 @@
 ---
 title: "Red Host API"
 summary: "The Red host API is the versioned Husk bridge that statically validates plugin calls and dispatches them into editor-owned requests."
-topics: [plugins, host-api, husk]
+topics: [architecture, plugins, host-api, husk]
 sources:
   - id: schema
     type: file
