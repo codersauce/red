@@ -204,6 +204,7 @@ fn state() -> NeoTreeState {
     category = "File",
     description = "Show or hide the workspace file tree",
     aliases = ["explorer", "neotree"],
+    scope = "global",
 )]
 fn neotree() {
     if state().created {

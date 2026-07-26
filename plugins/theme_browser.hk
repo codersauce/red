@@ -59,6 +59,7 @@ fn state() -> ThemeBrowserState {
     category = "View",
     description = "Preview and select an editor theme",
     aliases = ["colorscheme", "theme"],
+    scope = "global",
 )]
 fn theme_browser() {
     red::state_patch(ThemeBrowserState { original: "" });

@@ -17,7 +17,8 @@ use red::{
     editor::{Action, Content, Editor, Mode, SearchDirection},
     lsp::LspClient,
     plugin::{
-        PanelConfig, PanelRow, PanelRowKind, PanelSegment, PanelSide, TextPanelComposerConfig,
+        PanelConfig, PanelRow, PanelRowKind, PanelSegment, PanelSide, Runtime,
+        TextPanelComposerConfig,
     },
     preferences::PreferencesStore,
     theme::{Style, Theme},
@@ -5245,18 +5246,78 @@ async fn focused_panel_does_not_fall_through_to_editing_keys() {
 }
 
 #[test]
-fn focused_panel_allows_ctrl_e_neotree_toggle() {
+fn focused_panel_allows_global_builtin_hotkeys() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut config = default_key_config();
+    config
+        .keys
+        .normal
+        .insert("x".to_string(), KeyAction::Single(Action::FilePicker));
+    let mut harness = EditorHarness::with_config(buffer, config);
+    add_tree_panel(&mut harness);
+    assert!(harness.editor.test_focus_panel("tree"));
+
+    for (code, modifiers, expected) in [
+        (
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL,
+            Action::FilePicker,
+        ),
+        (KeyCode::Char('z'), KeyModifiers::CONTROL, Action::Suspend),
+        (KeyCode::F(1), KeyModifiers::NONE, Action::CommandPalette),
+    ] {
+        let action = harness
+            .editor
+            .test_handle_event(Event::Key(KeyEvent::new(code, modifiers)))
+            .unwrap();
+        assert_eq!(action, Some(KeyAction::Single(expected)));
+    }
+
+    let local = harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+    assert!(matches!(
+        local,
+        Some(KeyAction::Multiple(actions))
+            if actions.iter().any(|action| matches!(
+                action,
+                Action::NotifyPlugins(name, payload)
+                    if name == "panel:event:tree" && payload["action"] == "x"
+            ))
+    ));
+}
+
+#[tokio::test]
+async fn focused_panel_allows_explicitly_global_plugin_commands() {
     let buffer = Buffer::new(None, "abcdef".to_string());
     let mut harness = EditorHarness::with_config(buffer, default_key_config());
     add_tree_panel(&mut harness);
     assert!(harness.editor.test_focus_panel("tree"));
+    let mut runtime = Runtime::new();
+    runtime
+        .load_plugin(
+            "navigation",
+            r#"
+                pub fn activate() {
+                    red::add_command("NeoTree", noop, Json { scope: "global" });
+                    red::add_command("LspDocumentSymbols", noop);
+                }
+                fn noop() {}
+            "#,
+        )
+        .await
+        .unwrap();
 
     let action = harness
         .editor
-        .test_handle_event(Event::Key(KeyEvent::new(
-            KeyCode::Char('e'),
-            KeyModifiers::CONTROL,
-        )))
+        .test_handle_event_with_runtime(
+            Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+            &runtime,
+        )
         .unwrap();
 
     assert_eq!(
@@ -5265,6 +5326,23 @@ fn focused_panel_allows_ctrl_e_neotree_toggle() {
             "NeoTree".to_string()
         )))
     );
+
+    let contextual = harness
+        .editor
+        .test_handle_event_with_runtime(
+            Event::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
+            &runtime,
+        )
+        .unwrap();
+    assert!(matches!(
+        contextual,
+        Some(KeyAction::Multiple(actions))
+            if actions.iter().any(|action| matches!(
+                action,
+                Action::NotifyPlugins(name, payload)
+                    if name == "panel:event:tree" && payload["action"] == "Ctrl-t"
+            ))
+    ));
 }
 
 #[test]
@@ -5351,8 +5429,8 @@ fn focused_row_panel_pages_with_control_keys_and_page_keys() {
     );
 }
 
-#[test]
-fn focused_agent_panel_keeps_leader_available_until_the_composer_is_focused() {
+#[tokio::test]
+async fn focused_agent_panel_keeps_global_leader_until_the_composer_is_focused() {
     let buffer = Buffer::new(None, "abcdef".to_string());
     let mut harness = EditorHarness::with_config(buffer, default_key_config());
     harness.editor.test_create_text_panel(
@@ -5371,17 +5449,40 @@ fn focused_agent_panel_keeps_leader_available_until_the_composer_is_focused() {
         },
     );
     assert!(harness.editor.test_focus_panel("agent"));
+    let mut runtime = Runtime::new();
+    runtime
+        .load_plugin(
+            "agent",
+            r#"
+                pub fn activate() {
+                    red::add_command("Agent", noop, Json { scope: "global" });
+                }
+                fn noop() {}
+            "#,
+        )
+        .await
+        .unwrap();
 
     let action = harness
         .editor
-        .test_handle_event(Event::Key(KeyEvent::new(
-            KeyCode::Char(' '),
-            KeyModifiers::NONE,
-        )))
+        .test_handle_event_with_runtime(
+            Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+            &runtime,
+        )
         .unwrap();
     let Some(KeyAction::Nested(leader)) = action else {
         panic!("expected Space to start the leader sequence from the conversation, got {action:?}");
     };
+    assert_eq!(leader.len(), 3);
+    assert!(leader.contains_key("A"));
+    assert!(leader.contains_key("?"));
+    assert!(leader.contains_key("d"));
+    for contextual in [" ", "a", "n", "p", "b", "f", ".", "r"] {
+        assert!(
+            !leader.contains_key(contextual),
+            "contextual leader branch {contextual:?} must be filtered"
+        );
+    }
     assert_eq!(
         leader.get("A"),
         Some(&KeyAction::Single(Action::PluginCommand(

@@ -22,6 +22,8 @@ use husk_diagnostics::{Diagnostic, Report, SourceFile};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 
+use super::runtime::CommandScope;
+
 #[derive(Debug, Deserialize)]
 pub struct HostApiSchema {
     pub version: String,
@@ -68,6 +70,7 @@ pub(crate) enum RedFunctionAnnotation {
         description: Option<String>,
         aliases: Vec<String>,
         visible: bool,
+        scope: CommandScope,
     },
     Event {
         name: String,
@@ -145,6 +148,7 @@ pub(crate) fn red_function_annotations(
             let mut description = None;
             let mut aliases = Vec::new();
             let mut visible = true;
+            let mut scope = CommandScope::Editor;
             for argument in arguments {
                 let AttributeArgumentKind::Named { name: key, value } = &argument.kind else {
                     return Err(annotation_value_error(
@@ -213,6 +217,24 @@ pub(crate) fn red_function_annotations(
                         };
                         visible = *visible_value;
                     }
+                    "scope" => {
+                        let Some(scope_value) = value.as_str() else {
+                            return Err(annotation_value_error(
+                                &value.span,
+                                "command metadata `scope` must be a string",
+                            ));
+                        };
+                        scope = match scope_value {
+                            "editor" => CommandScope::Editor,
+                            "global" => CommandScope::Global,
+                            _ => {
+                                return Err(annotation_value_error(
+                                    &value.span,
+                                    "command metadata `scope` must be `editor` or `global`",
+                                ));
+                            }
+                        };
+                    }
                     _ => {
                         return Err(annotation_value_error(
                             &key.span,
@@ -234,6 +256,7 @@ pub(crate) fn red_function_annotations(
                 description,
                 aliases,
                 visible,
+                scope,
             });
         } else if attribute.matches_path(&["red", "on"]) {
             if parameter_count != 1 {
@@ -987,6 +1010,7 @@ mod tests {
                 category = "LSP",
                 description = "Browse symbols",
                 aliases = ["outline", "symbols"],
+                scope = "global",
             )]
             fn open_symbols() {}
 
@@ -1006,6 +1030,7 @@ mod tests {
                 description: Some("Browse symbols".to_string()),
                 aliases: vec!["outline".to_string(), "symbols".to_string()],
                 visible: true,
+                scope: CommandScope::Global,
             }]
         );
         assert_eq!(
@@ -1079,6 +1104,7 @@ mod tests {
                 description: None,
                 aliases: Vec::new(),
                 visible: false,
+                scope: CommandScope::Editor,
             }]
         );
         validate_source("valid", "plugins/valid.hk", source).unwrap();
@@ -1108,6 +1134,10 @@ mod tests {
             (
                 "#[red::command(name = \"Open\", visible = \"no\")] fn open() {}",
                 "`visible` must be a boolean",
+            ),
+            (
+                "#[red::command(name = \"Open\", scope = \"workspace\")] fn open() {}",
+                "`scope` must be `editor` or `global`",
             ),
             ("#[red::on(\"changed\")] fn changed() {}", "exactly one parameter"),
             (

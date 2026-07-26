@@ -138,6 +138,7 @@ fn symbol_icon(kind: String) -> Json {
     category = "LSP",
     description = "Find symbols in the current document",
     aliases = ["outline", "symbols"],
+    scope = "global",
 )]
 fn document_symbols() {
     begin_symbol_flow();
@@ -153,6 +154,7 @@ fn document_symbols() {
     category = "LSP",
     description = "Find symbols across the workspace",
     aliases = ["symbols"],
+    scope = "global",
 )]
 fn workspace_symbols() {
     begin_symbol_flow();

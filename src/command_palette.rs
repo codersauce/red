@@ -1299,6 +1299,7 @@ mod tests {
                 description: Some("Find text across the workspace".to_string()),
                 aliases: vec!["ripgrep".to_string()],
                 visible: true,
+                ..CommandMetadata::default()
             },
         };
 
@@ -1399,6 +1400,7 @@ mod tests {
                     description: Some("Inspect and manage workspace changes".to_string()),
                     aliases: vec!["source control".to_string()],
                     visible: true,
+                    ..CommandMetadata::default()
                 },
             },
             RegisteredPluginCommand {
@@ -1410,6 +1412,7 @@ mod tests {
                     description: Some("Get information together".to_string()),
                     aliases: vec![],
                     visible: true,
+                    ..CommandMetadata::default()
                 },
             },
         ];

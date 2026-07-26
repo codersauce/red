@@ -10267,15 +10267,15 @@ impl Editor {
             if self.panel_manager.focused_text_panel_has_composer()
                 && !self.panel_manager.focused_text_input_active()
             {
-                if let Some(action) = self.panel_global_key_action(ev) {
+                if let Some(action) = self.panel_global_key_action(ev, runtime) {
                     return Ok(Some(action));
                 }
             }
-            if let Some(action) = self.handle_panel_event(ev) {
+            if let Some(action) = self.handle_panel_event(ev, runtime) {
                 return Ok(Some(action));
             }
 
-            if let Some(action) = self.panel_global_key_action(ev) {
+            if let Some(action) = self.panel_global_key_action(ev, runtime) {
                 return Ok(Some(action));
             }
 
@@ -10299,7 +10299,7 @@ impl Editor {
         }
 
         if matches!(ev, Event::Mouse(_)) {
-            if let Some(action) = self.handle_panel_event(ev) {
+            if let Some(action) = self.handle_panel_event(ev, runtime) {
                 return Ok(Some(action));
             }
         }
@@ -10433,7 +10433,11 @@ impl Editor {
         false
     }
 
-    fn handle_panel_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+    fn handle_panel_event(
+        &mut self,
+        ev: &event::Event,
+        runtime: Option<&Runtime>,
+    ) -> Option<KeyAction> {
         if let Some(event) = self
             .panel_manager
             .handle_focused_text_input(ev, usize::from(self.size.0))
@@ -10506,10 +10510,25 @@ impl Editor {
                     KeyCode::Char('q') => "close",
                     KeyCode::Char('R') => "refresh",
                     _ => {
-                        if let Some(action) = self.panel_global_key_action(ev) {
+                        let action = Self::key_string_for_event(ev)?;
+                        if self.panel_manager.focused_row_panel()
+                            && Self::row_panel_prefers_key(event)
+                        {
+                            let panel_height = usize::from(self.size.1.saturating_sub(2));
+                            let scrolloff = self.config.scrolloff.unwrap_or(0);
+                            return self
+                                .panel_manager
+                                .handle_focused_key(
+                                    &action,
+                                    panel_height,
+                                    usize::from(self.size.0),
+                                    scrolloff,
+                                )
+                                .and_then(Self::panel_event_key_action);
+                        }
+                        if let Some(action) = self.panel_global_key_action(ev, runtime) {
                             return Some(action);
                         }
-                        let action = Self::key_string_for_event(ev)?;
                         let panel_height = usize::from(self.size.1.saturating_sub(2));
                         let scrolloff = self.config.scrolloff.unwrap_or(0);
                         return self
@@ -10533,6 +10552,12 @@ impl Editor {
             Event::Mouse(event) => self.handle_panel_mouse_event(event),
             _ => None,
         }
+    }
+
+    fn row_panel_prefers_key(event: &KeyEvent) -> bool {
+        !event.modifiers.intersects(
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::HYPER,
+        ) && matches!(event.code, KeyCode::Char(c) if !matches!(c, ':' | ';'))
     }
 
     fn handle_divider_mouse_event(&mut self, event: &MouseEvent) -> Option<KeyAction> {
@@ -10712,45 +10737,82 @@ impl Editor {
             .map(|buffer| buffer.name().to_string())
     }
 
-    fn panel_global_key_action(&self, ev: &event::Event) -> Option<KeyAction> {
+    fn panel_global_key_action(
+        &self,
+        ev: &event::Event,
+        runtime: Option<&Runtime>,
+    ) -> Option<KeyAction> {
         let key = Self::key_string_for_event(ev)?;
         let action = self
             .config
             .keys
             .normal
             .get(&key)
-            .cloned()
             .or_else(|| match key.as_str() {
-                "Space" => self.config.keys.normal.get(" ").cloned(),
-                "Tab" => self.config.keys.normal.get("Tab").cloned(),
+                "Space" => self.config.keys.normal.get(" "),
+                "Tab" => self.config.keys.normal.get("Tab"),
                 _ => None,
             })?;
 
-        if key == "Ctrl-w" && matches!(action, KeyAction::Nested(_)) {
-            return Some(action);
-        }
-
-        Self::key_action_runs_from_panel(&action).then_some(action)
+        Self::key_action_for_panel(action, runtime)
     }
 
-    fn key_action_runs_from_panel(action: &KeyAction) -> bool {
+    fn key_action_for_panel(action: &KeyAction, runtime: Option<&Runtime>) -> Option<KeyAction> {
         match action {
-            KeyAction::Single(
-                Action::EnterMode(Mode::Command | Mode::Search)
-                | Action::PluginCommand(_)
-                | Action::CommandPalette
-                | Action::NextWindow
-                | Action::PreviousWindow,
-            ) => true,
-            KeyAction::Multiple(actions) => actions.iter().any(|action| {
-                matches!(
-                    action,
-                    Action::EnterMode(Mode::Command | Mode::Search)
-                        | Action::PluginCommand(_)
-                        | Action::CommandPalette
-                )
+            KeyAction::Single(action) => Self::action_runs_from_panel(action, runtime)
+                .then(|| KeyAction::Single(action.clone())),
+            KeyAction::Multiple(actions) => actions
+                .iter()
+                .all(|action| Self::action_runs_from_panel(action, runtime))
+                .then(|| KeyAction::Multiple(actions.clone())),
+            KeyAction::Nested(actions) => {
+                let actions = actions
+                    .iter()
+                    .filter_map(|(key, action)| {
+                        Self::key_action_for_panel(action, runtime)
+                            .map(|action| (key.clone(), action))
+                    })
+                    .collect::<HashMap<_, _>>();
+                (!actions.is_empty()).then_some(KeyAction::Nested(actions))
+            }
+            KeyAction::Repeating(times, action) => Self::key_action_for_panel(action, runtime)
+                .map(|action| KeyAction::Repeating(*times, Box::new(action))),
+            KeyAction::None => None,
+        }
+    }
+
+    fn action_runs_from_panel(action: &Action, runtime: Option<&Runtime>) -> bool {
+        match action {
+            Action::EnterMode(Mode::Command | Mode::Search)
+            | Action::FilePicker
+            | Action::CommandPalette
+            | Action::ConfigDiagnostics
+            | Action::Suspend
+            | Action::ViewLogs
+            | Action::ListPlugins
+            | Action::SplitHorizontal
+            | Action::SplitVertical
+            | Action::CloseWindow
+            | Action::NextWindow
+            | Action::PreviousWindow
+            | Action::MoveWindowUp
+            | Action::MoveWindowDown
+            | Action::MoveWindowLeft
+            | Action::MoveWindowRight
+            | Action::MoveWindowToLeft
+            | Action::MoveWindowToBottom
+            | Action::MoveWindowToTop
+            | Action::MoveWindowToRight
+            | Action::ResizeWindowUp(_)
+            | Action::ResizeWindowDown(_)
+            | Action::ResizeWindowLeft(_)
+            | Action::ResizeWindowRight(_)
+            | Action::BalanceWindows
+            | Action::MaximizeWindow
+            | Action::OnlyWindow => true,
+            Action::PluginCommand(command) => runtime.is_some_and(|runtime| {
+                runtime.command_scope(command) == Some(plugin::CommandScope::Global)
             }),
-            KeyAction::Nested(actions) => actions.values().any(Self::key_action_runs_from_panel),
             _ => false,
         }
     }
@@ -22700,6 +22762,15 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_handle_event(&mut self, event: event::Event) -> anyhow::Result<Option<KeyAction>> {
         self.handle_event(&event)
+    }
+
+    #[doc(hidden)]
+    pub fn test_handle_event_with_runtime(
+        &mut self,
+        event: event::Event,
+        runtime: &Runtime,
+    ) -> anyhow::Result<Option<KeyAction>> {
+        self.handle_event_with_runtime(&event, Some(runtime))
     }
 }
 
