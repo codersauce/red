@@ -2598,13 +2598,39 @@ input_position = "left"
     }
 
     #[test]
-    fn default_config_maps_wrap_toggle_key() {
+    fn default_config_maps_vim_word_character_and_screen_motions() {
         let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
 
         assert_eq!(
             config.keys.normal.get("W"),
-            Some(&KeyAction::Single(Action::ToggleWrap))
+            Some(&KeyAction::Single(Action::MoveToNextBigWord))
         );
+        assert_eq!(
+            config.keys.normal.get(";"),
+            Some(&KeyAction::Single(Action::RepeatCharSearch(1)))
+        );
+        assert_eq!(
+            config.keys.normal.get("H"),
+            Some(&KeyAction::Single(Action::MoveToViewportTop(1)))
+        );
+        assert_eq!(
+            config.keys.normal.get("M"),
+            Some(&KeyAction::Single(Action::MoveToViewportMiddle))
+        );
+        assert_eq!(
+            config.keys.normal.get("L"),
+            Some(&KeyAction::Single(Action::MoveToViewportBottom(1)))
+        );
+    }
+
+    #[test]
+    fn default_config_preserves_wrap_toggle_under_gw() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+        let Some(KeyAction::Nested(g)) = config.keys.normal.get("g") else {
+            panic!("default config should map g to nested actions");
+        };
+
+        assert_eq!(g.get("W"), Some(&KeyAction::Single(Action::ToggleWrap)));
     }
 
     #[test]

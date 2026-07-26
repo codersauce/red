@@ -49,6 +49,68 @@ fn wrapped_long_line_harness(line_count: usize) -> EditorHarness {
 }
 
 #[tokio::test]
+async fn vim_parity_default_big_word_motion_treats_punctuation_as_part_of_a_word() {
+    for (contents, keys, expected_x) in [("foo.bar baz", "W", 8), ("foo.bar baz qux", "2W", 12)] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(contents);
+        harness.assert_cursor_at(expected_x, 0);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_screen_motions_target_the_visible_top_middle_and_bottom() {
+    for (keys, expected_y) in [("jjH", 0), ("M", 2), ("L", 4)] {
+        let contents = "one\ntwo\nthree\nfour\nfive";
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(contents);
+        harness.assert_cursor_at(0, expected_y);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_screen_motions_respect_a_scrolled_viewport_and_counts() {
+    let contents = (0..40)
+        .map(|line| format!("  line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for (keys, expected_line) in [("H", 16), ("2H", 17), ("M", 19), ("L", 23), ("2L", 22)] {
+        let mut harness = EditorHarness::with_config_and_size(
+            Buffer::new(None, contents.clone()),
+            default_key_config(),
+            80,
+            10,
+        );
+        harness
+            .execute_action(Action::SetCursor(0, 20))
+            .await
+            .unwrap();
+        type_normal_keys(&mut harness, "zz").await;
+        assert_eq!(harness.viewport_top(), 16);
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(&contents);
+        harness.assert_cursor_at(2, expected_line);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
 async fn test_basic_cursor_movement() {
     let mut harness = EditorHarness::with_content("Hello, World!\nThis is a test\nThird line");
 

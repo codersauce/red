@@ -1,7 +1,7 @@
 # Red Vim compatibility matrix
 
-**Matrix version:** 1.1
-**Validated against:** Red 0.1.1, July 2026  
+**Matrix version:** 1.2
+**Validated against:** Red 0.2.4, July 2026
 **Status vocabulary:** **supported**, **intentional difference**, **not yet supported**
 
 “Real Vim keys” means the rows marked **supported** below. It does not mean complete
@@ -13,21 +13,21 @@ the corresponding integration tests.
 | Area | Status | Red behavior |
 |---|---|---|
 | Counts | **supported** | Decimal prefixes apply to motions, joins, line-end edits, substitute/delete-character aliases, macro playback, dot-repeat, find/till, and `r`. Nested mappings preserve the prefix until their final key. |
-| Basic motions | **supported** | `h j k l`, arrows, `0`, `^`, `$`, `w`, `b`, `e`, `ge`, `B`, `E`, `gE`, `gg`, `G`, screen-line motions, full/half-page motions, and file percentages use grapheme-safe cursor positions. The typed `MoveToNextBigWord` action can be mapped when `W` semantics are preferred. |
-| Character motions | **supported** | `f{char}`, `t{char}`, `F{char}`, `T{char}`, counted forms, and `,` reverse-repeat; delete, change, and yank accept the same suffixes. Forward-repeat is available as the remappable `RepeatCharSearch` action. |
-| Operators | **supported** | `d`, `c`, and `y` with line, vertical, line-start/end, forward/backward word, find/till, match, and supported text-object targets. `cw` preserves trailing whitespace like Vim. |
-| Text objects | **supported** | Inner/around word, parentheses, brackets, braces, single quotes, double quotes, and backticks. |
+| Basic motions | **supported** | `h j k l`, arrows, `0`, `^`, `$`, `w`, `W`, `b`, `e`, `ge`, `B`, `E`, `gE`, `gg`, `G`, viewport-relative `H`, `M`, and `L`, screen-line motions, full/half-page motions, and file percentages use grapheme-safe cursor positions. Counted `H` and `L` honor the visible viewport. |
+| Character motions | **supported** | `f{char}`, `t{char}`, `F{char}`, `T{char}`, counted forms, `;` forward-repeat, and `,` reverse-repeat; delete, change, and yank accept the same suffixes. |
+| Operators | **supported** | `d`, `c`, and `y` with horizontal, line, vertical, file-boundary, line-start/end, small/big-word, previous-word-end, find/till, match, and supported text-object targets. Counted word operators treat blank lines as Neovim motion boundaries; `cw` and `cW` preserve trailing whitespace like Vim. |
+| Text objects | **supported** | Inner/around small words, big words, paragraphs, parentheses, brackets, braces, single quotes, double quotes, and backticks. |
 | `r{char}` | **supported** | Replaces one or a counted run of graphemes and is one undoable change. A count longer than the remaining line is rejected without editing. |
 | Editing aliases | **supported** | `D`, `C`, and Neovim-style `Y` operate to line end; `S`, `s`, and `X` provide line/character substitute and backward-delete shortcuts. Counts, default-register kind, undo, and Insert transitions are preserved. `U` is an additional redo alias. |
 | Case changes | **supported** | `~`, `gu{motion}`, `gU{motion}`, `g~{motion}`, and the `guu`/`gUU`/`g~~` line forms transform Unicode text as one transaction. |
 | Join | **supported** | `J` joins at least two lines, removes following indentation, and inserts a space unless trailing whitespace or `)` makes it unnecessary; `gJ` preserves whitespace. Normal counts, Visual joins, `:j[oin][!] [count]`, undo, dot-repeat, and macros are covered. |
-| Ex commands and default-key differences | **intentional difference** | Red implements a documented Ex subset and uses `;` as an additional command-line entry key, `W` to toggle wrapping, and `Ctrl-e` for NeoTree; these defaults intentionally differ from Vim and can be remapped. Red does not implement Vimscript. |
+| Ex commands and default-key differences | **intentional difference** | Red implements a documented Ex subset, uses `gW` to toggle wrapping, and uses `Ctrl-e` for NeoTree; these Red-specific defaults can be remapped. `:` enters the command line, while `;` and `W` retain their Vim meanings. Red does not implement Vimscript. |
 
 ## Registers, repeat, and macros
 
 | Area | Status | Red behavior |
 |---|---|---|
-| Default register | **supported** | Yank, delete, change, `p`, and `P`; default-register writes also update the configured system clipboard. |
+| Default register | **supported** | Yank, delete, change, `p`, and `P`; characterwise paste preserves Neovim cursor placement for single-line and multiline text. Default-register writes also update the configured system clipboard. |
 | Named text-register prefix (`"a`) | **not yet supported** | Named storage exists for macros, but interactive text-operation register selection is not implemented. |
 | Dot-repeat (`.`) | **supported** | Replays the last completed content-changing input recipe through normal key resolution. Covered: direct changes, operator+motion, operator+text object, insert sessions, paste, replace, indent, open-line, and visual-block insert. |
 | Count before dot | **supported** | `N.` replays the completed change N times. A failed/no-op change does not replace the previous definition. |
