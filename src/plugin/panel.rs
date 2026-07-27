@@ -18,8 +18,9 @@ use super::markdown::{
     render_markdown_lines, wrap_plain_text, RenderedTextLine, RenderedTextSpan, TextPanelSpanStyle,
 };
 use super::replay_panel::{
-    render_replay_panel, render_replay_panel_title, ReplayPanelLayout, ReplayPanelState,
-    ReplayPanelViewport,
+    render_replay_panel, render_replay_panel_title, replay_content_line_count,
+    replay_outbox_selected_row, replay_visible_rows, ReplayPanelLayout, ReplayPanelState,
+    ReplayPanelView, ReplayPanelViewport,
 };
 use super::text_link::{TextPanelLink, TextPanelLinkTarget};
 use crate::{
@@ -433,7 +434,7 @@ impl TextPanel {
     fn max_scroll(&self, panel_height: usize, panel_width: usize) -> usize {
         let line_count = self.replay.as_ref().map_or_else(
             || self.rendered_lines(panel_width.max(1)).len(),
-            |replay| replay.document.lines.len(),
+            |replay| replay_content_line_count(replay, panel_width.max(1)),
         );
         line_count.saturating_sub(self.visible_rows(panel_height, panel_width))
     }
@@ -446,9 +447,7 @@ impl TextPanel {
             .saturating_sub(self.composer_height())
             .saturating_sub(self.status_height());
         if let Some(replay) = &self.replay {
-            ReplayPanelLayout::calculate(replay, panel_width, body_height)
-                .diff_rows
-                .max(1)
+            replay_visible_rows(replay, panel_width, body_height)
         } else {
             body_height.max(1)
         }
@@ -1461,6 +1460,23 @@ impl PanelManager {
                 panel.config.title.is_some()
                     || !text_panel_header_actions(&panel.config, placement.width).is_empty(),
             );
+            if replay.model.view == ReplayPanelView::Outbox {
+                let body_height = placement.height.saturating_sub(title_rows);
+                let visible_rows = replay_visible_rows(replay, placement.width, body_height);
+                let max_scroll =
+                    replay_content_line_count(replay, placement.width).saturating_sub(visible_rows);
+                let scroll = panel.viewport.visible_offset(max_scroll);
+                let selected = replay_outbox_selected_row(replay, placement.width)
+                    .saturating_sub(scroll)
+                    .min(visible_rows.saturating_sub(1));
+                return Some((
+                    placement.x,
+                    placement
+                        .y
+                        .saturating_add(title_rows)
+                        .saturating_add(selected),
+                ));
+            }
             let layout = ReplayPanelLayout::calculate(
                 replay,
                 placement.width,
@@ -1996,8 +2012,8 @@ fn render_text_panel(
 
     if let Some(replay) = &panel.replay {
         let body_height = height.saturating_sub(title_rows);
-        let layout = ReplayPanelLayout::calculate(replay, width, body_height);
-        let max_scroll = replay.document.lines.len().saturating_sub(layout.diff_rows);
+        let visible_rows = replay_visible_rows(replay, width, body_height);
+        let max_scroll = replay_content_line_count(replay, width).saturating_sub(visible_rows);
         let scroll = panel.viewport.visible_offset(max_scroll);
         render_replay_panel(
             buffer,
@@ -2533,6 +2549,12 @@ mod tests {
             pull_request: plan.pull_request,
             author: plan.author,
             branch: plan.branch,
+            review_role: None,
+            head_commit: String::new(),
+            draft_count: 0,
+            drafts: Vec::new(),
+            outbox_index: 0,
+            view: ReplayPanelView::Guide,
             title: plan.title,
             index: 0,
             mode,
@@ -3170,6 +3192,75 @@ mod tests {
             ),
             None,
         );
+    }
+
+    #[test]
+    fn native_replay_outbox_preserves_focus_divider_status_and_selected_draft_cursor() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "replay-coach".to_string(),
+            PanelConfig {
+                side: PanelSide::Left,
+                width: 46,
+                title: Some("PR REPLAY".to_string()),
+                ..PanelConfig::default()
+            },
+        );
+        let mut block = structured_replay_block(ReplayPanelMode::Challenge);
+        let mut model: ReplayPanelModel = serde_json::from_str(&block.text).unwrap();
+        let target = crate::replay::GitObjectId::parse(&"b".repeat(40)).unwrap();
+        model.review_role = Some(crate::replay::ReplayReviewRole::Author);
+        model.head_commit = target.as_str().to_string();
+        model.view = ReplayPanelView::Outbox;
+        model.drafts = vec![crate::replay::ReplayReviewDraft {
+            id: "local-review-draft".to_string(),
+            target_commit: target.clone(),
+            step_id: Some(model.steps[0].id.clone()),
+            path: Some("src/editor/rendering.rs".into()),
+            kind: crate::replay::ReplayReviewDraftKind::InlineComment,
+            origin: crate::replay::ReplayDraftOrigin::Human,
+            state: crate::replay::ReplayDraftState::Local,
+            anchor: Some(crate::replay::ReplayReviewAnchor {
+                target_commit: target,
+                path: "src/editor/rendering.rs".into(),
+                old_path: Some("src/editor/rendering.rs".into()),
+                side: crate::replay::ReplayDiffSide::Right,
+                start_line: 11,
+                end_line: 12,
+                hunk_digest: "exact-original-hunk".to_string(),
+            }),
+            text: "Keep the original viewport bounded.".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }];
+        model.draft_count = model.drafts.len();
+        block.text = serde_json::to_string(&model).unwrap();
+        manager.update_text_panel(
+            "replay-coach",
+            vec![block],
+            /*panel_height*/ 26,
+            /*terminal_width*/ 100,
+        );
+        assert!(manager.focus_panel("replay-coach"));
+
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let mut buffer = RenderBuffer::new(/*width*/ 100, /*height*/ 28, &theme.style);
+        manager.render(&mut buffer, &theme);
+
+        assert!(row_text(&buffer, 0).starts_with("▌ PR REPLAY"));
+        assert_eq!(buffer.cells[46].text, "┃");
+        assert_eq!(
+            manager.focused_replay_status(),
+            Some((482, "feat/viewport-diagnostics", 0, 5)),
+        );
+        let (x, y) = manager
+            .focused_text_panel_cursor_position(
+                /*terminal_width*/ 100, /*terminal_height*/ 28,
+            )
+            .expect("the terminal cursor follows the selected native outbox draft");
+        assert_eq!(buffer.cells[y * buffer.width + x].text, "▶");
+        assert!((0..28).any(|row| row_text(&buffer, row).contains("LOCAL OUTBOX")));
+        assert!((0..28).any(|row| row_text(&buffer, row).contains("nothing sent to GitHub")));
     }
 
     #[test]

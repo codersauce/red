@@ -24,16 +24,19 @@ pub use plan::{
 };
 pub(crate) use session::anchored_hunk_offset;
 pub use session::{
-    ReplayCompletion, ReplayController, ReplayMode, ReplayNote, ReplayNoteCategory,
-    ReplayRecoverySnapshot, ReplaySession, ReplaySessionState, ReplayStage, ReplayStep,
-    ReplayStepKind, ReplayStepStatus, ReplayValidation, ReplayWorkspace, ReplayWorkspacePreview,
+    ReplayCompletion, ReplayController, ReplayDiffSide, ReplayDraftOrigin, ReplayDraftState,
+    ReplayMode, ReplayNote, ReplayNoteCategory, ReplayRecoverySnapshot, ReplayReviewAnchor,
+    ReplayReviewDraft, ReplayReviewDraftKind, ReplayReviewRole, ReplayReviewState, ReplaySession,
+    ReplaySessionState, ReplayStage, ReplayStep, ReplayStepKind, ReplayStepStatus,
+    ReplayValidation, ReplayWorkspace, ReplayWorkspacePreview,
 };
 pub use source::{
     fetch_pull_request_objects, finalize_pull_request, prepare_workspace,
-    reopen_existing_workspace, resolve_local_branch_source, resolve_local_source,
-    resolve_pull_request, GitObjectId, PullRequestInput, ReplayCommitSummary, ReplayPullRequest,
-    ReplayRepository, ReplayResolvedLocalBranch, ReplayResolvedPullRequest, ReplayReviewContext,
-    ReplaySource, ReplaySourceKind,
+    refresh_pull_request_capabilities, reopen_existing_workspace, resolve_local_branch_source,
+    resolve_local_source, resolve_pull_request, GitObjectId, PullRequestInput, ReplayCommitSummary,
+    ReplayGitHubCapabilities, ReplayPullRequest, ReplayRepository, ReplayRepositoryPermission,
+    ReplayResolvedLocalBranch, ReplayResolvedPullRequest, ReplayReviewContext, ReplaySource,
+    ReplaySourceKind,
 };
 
 /// Upper bounds enforced before a source becomes a replayable plan.
@@ -148,6 +151,9 @@ pub enum ReplayError {
     /// A reviewer note was empty or larger than its configured limit.
     #[error("invalid review observation: {0}")]
     InvalidReviewNote(String),
+    /// A local review draft is empty, unauthorized, or not source anchored.
+    #[error("invalid local review draft: {0}")]
+    InvalidReviewDraft(String),
     /// A safe local filesystem operation could not be completed.
     #[error("replay filesystem operation failed: {0}")]
     Filesystem(String),
@@ -177,6 +183,7 @@ impl ReplayError {
             Self::DependencyBlocked => "dependency_blocked",
             Self::InvalidMetadata(_) => "pull_request_metadata_invalid",
             Self::InvalidReviewNote(_) => "review_note_invalid",
+            Self::InvalidReviewDraft(_) => "review_draft_invalid",
             Self::Filesystem(_) => "replay_filesystem_failed",
         }
     }

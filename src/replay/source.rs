@@ -12,6 +12,7 @@ use url::Url;
 use super::{digest, now_ms, ReplayError, ReplayLimits, ReplayWorkspace, ReplayWorkspacePreview};
 
 const GITHUB_METADATA_FIELDS: &str = "number,url,title,body,author,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,commits,changedFiles";
+const GITHUB_CAPABILITIES_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { viewer { login } repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { number author { login } headRefName headRefOid headRepository { nameWithOwner viewerPermission } } } }";
 const MAX_COMMAND_DIAGNOSTIC_BYTES: usize = 4 * 1024;
 
 /// Validated, immutable SHA-1 or SHA-256 Git object identity.
@@ -220,6 +221,51 @@ pub struct ReplayCommitSummary {
     pub body: String,
 }
 
+/// Authenticated viewer access to the exact original pull-request head.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayRepositoryPermission {
+    /// GitHub did not establish access for the authenticated viewer.
+    #[default]
+    Unknown,
+    /// The authenticated viewer has no access to the head repository.
+    None,
+    /// The authenticated viewer can read the head repository.
+    Read,
+    /// The authenticated viewer has triage access to the head repository.
+    Triage,
+    /// The authenticated viewer can write to the head repository.
+    Write,
+    /// The authenticated viewer can maintain the head repository.
+    Maintain,
+    /// The authenticated viewer can administer the head repository.
+    Admin,
+}
+
+impl ReplayRepositoryPermission {
+    fn from_github(value: Option<&str>) -> Self {
+        match value {
+            Some("NONE") => Self::None,
+            Some("READ") => Self::Read,
+            Some("TRIAGE") => Self::Triage,
+            Some("WRITE") => Self::Write,
+            Some("MAINTAIN") => Self::Maintain,
+            Some("ADMIN") => Self::Admin,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Read-only, identity-verified capabilities for one pinned GitHub PR head.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReplayGitHubCapabilities {
+    /// Authenticated GitHub login verified against the original PR identity.
+    pub viewer: Option<String>,
+    /// Viewer permission on the exact original head repository, not the base.
+    pub head_permission: ReplayRepositoryPermission,
+}
+
 /// Immutable identity of the author's original pull request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayPullRequest {
@@ -249,6 +295,9 @@ pub struct ReplayPullRequest {
     pub head_commit: GitObjectId,
     /// Whether the original head lives in another GitHub repository.
     pub cross_repository: bool,
+    /// Read-only viewer identity and access for the exact original PR head.
+    #[serde(default)]
+    pub capabilities: ReplayGitHubCapabilities,
     /// Unix-millisecond metadata capture time.
     pub captured_at_ms: u64,
 }
@@ -378,6 +427,41 @@ struct GitHubCommit {
     message_body: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct GitHubCapabilityEnvelope {
+    data: Option<GitHubCapabilityData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubCapabilityData {
+    viewer: GitHubActor,
+    repository: Option<GitHubCapabilityRepository>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitHubCapabilityRepository {
+    name_with_owner: String,
+    pull_request: Option<GitHubCapabilityPullRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitHubCapabilityPullRequest {
+    number: u64,
+    author: Option<GitHubActor>,
+    head_ref_name: String,
+    head_ref_oid: String,
+    head_repository: Option<GitHubCapabilityHeadRepository>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitHubCapabilityHeadRepository {
+    name_with_owner: String,
+    viewer_permission: Option<String>,
+}
+
 /// Resolves read-only GitHub metadata without fetching or changing a branch.
 pub fn resolve_pull_request(
     cwd: &Path,
@@ -400,7 +484,115 @@ pub fn resolve_pull_request(
     let metadata = run_command(&mut command, limits.max_metadata_bytes)?;
     let metadata: GitHubMetadata = serde_json::from_slice(&metadata)
         .map_err(|error| ReplayError::InvalidMetadata(error.to_string()))?;
-    parse_pull_request_metadata(repository, input, metadata, limits)
+    let mut resolved = parse_pull_request_metadata(repository, input, metadata, limits)?;
+    match resolve_pull_request_capabilities(&resolved.pull_request, &resolved.repository, limits) {
+        Ok(capabilities) => resolved.pull_request.capabilities = capabilities,
+        Err(ReplayError::CommandFailed { .. }) => {}
+        Err(error) => return Err(error),
+    }
+    Ok(resolved)
+}
+
+fn resolve_pull_request_capabilities(
+    request: &ReplayPullRequest,
+    repository: &ReplayRepository,
+    limits: ReplayLimits,
+) -> Result<ReplayGitHubCapabilities, ReplayError> {
+    let mut command = Command::new("gh");
+    command
+        .current_dir(&repository.root)
+        .args(["api", "graphql", "--hostname", &repository.host])
+        .args(["--raw-field", &format!("query={GITHUB_CAPABILITIES_QUERY}")])
+        .args(["--raw-field", &format!("owner={}", repository.owner)])
+        .args(["--raw-field", &format!("name={}", repository.name)])
+        .args(["--field", &format!("number={}", request.number)])
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1");
+    let output = run_command(&mut command, limits.max_metadata_bytes)?;
+    parse_pull_request_capabilities(request, &output)
+}
+
+/// Refreshes authenticated access without changing a recovered PR identity.
+///
+/// This reads GitHub metadata for the exact pinned original repository, pull
+/// request, head branch, and commit. It never fetches, checks out a branch,
+/// writes a review, or replaces the recovered original source.
+pub fn refresh_pull_request_capabilities(
+    source: &mut ReplaySource,
+    limits: ReplayLimits,
+) -> Result<(), ReplayError> {
+    let Some(request) = source.pull_request.as_mut() else {
+        return Ok(());
+    };
+    request.capabilities = resolve_pull_request_capabilities(request, &source.repository, limits)?;
+    Ok(())
+}
+
+fn parse_pull_request_capabilities(
+    request: &ReplayPullRequest,
+    output: &[u8],
+) -> Result<ReplayGitHubCapabilities, ReplayError> {
+    let envelope: GitHubCapabilityEnvelope = serde_json::from_slice(output)
+        .map_err(|error| ReplayError::InvalidMetadata(error.to_string()))?;
+    let data = envelope.data.ok_or_else(|| {
+        ReplayError::InvalidMetadata("GitHub did not return authenticated PR capabilities".into())
+    })?;
+    if !safe_repository_component(&data.viewer.login) {
+        return Err(ReplayError::InvalidMetadata(
+            "unsafe authenticated GitHub viewer".into(),
+        ));
+    }
+    let repository = data.repository.ok_or(ReplayError::RepositoryMismatch)?;
+    let expected_repository = format!("{}/{}", request.repository_owner, request.repository_name);
+    if !repository
+        .name_with_owner
+        .eq_ignore_ascii_case(&expected_repository)
+    {
+        return Err(ReplayError::RepositoryMismatch);
+    }
+    let pull_request = repository
+        .pull_request
+        .ok_or(ReplayError::RepositoryMismatch)?;
+    if pull_request.number != request.number {
+        return Err(ReplayError::RepositoryMismatch);
+    }
+    if pull_request.head_ref_name != request.head_ref
+        || GitObjectId::parse(&pull_request.head_ref_oid)? != request.head_commit
+    {
+        return Err(ReplayError::SourceRefMoved);
+    }
+    let observed_author = pull_request.author.map(|author| author.login);
+    if !same_optional_github_login(request.author.as_deref(), observed_author.as_deref()) {
+        return Err(ReplayError::InvalidMetadata(
+            "the original pull request author changed during capability resolution".into(),
+        ));
+    }
+
+    let head_permission = if let Some(head) = pull_request.head_repository {
+        let expected_head = format!(
+            "{}/{}",
+            request.head_repository_owner, request.head_repository_name
+        );
+        if !head.name_with_owner.eq_ignore_ascii_case(&expected_head) {
+            return Err(ReplayError::RepositoryMismatch);
+        }
+        ReplayRepositoryPermission::from_github(head.viewer_permission.as_deref())
+    } else {
+        ReplayRepositoryPermission::Unknown
+    };
+
+    Ok(ReplayGitHubCapabilities {
+        viewer: Some(data.viewer.login),
+        head_permission,
+    })
+}
+
+fn same_optional_github_login(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 fn parse_pull_request_metadata(
@@ -487,6 +679,7 @@ fn parse_pull_request_metadata(
         head_ref: metadata.head_ref_name,
         head_commit,
         cross_repository: metadata.is_cross_repository,
+        capabilities: ReplayGitHubCapabilities::default(),
         captured_at_ms: now_ms(),
     };
     let mut missing_objects = Vec::with_capacity(2);
@@ -1091,6 +1284,116 @@ fn run_command(command: &mut Command, limit: usize) -> Result<Vec<u8>, ReplayErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_capability_request() -> ReplayPullRequest {
+        ReplayPullRequest {
+            host: "github.com".to_string(),
+            repository_owner: "example".to_string(),
+            repository_name: "replay-fixture".to_string(),
+            number: 482,
+            url: "https://github.com/example/replay-fixture/pull/482".to_string(),
+            author: Some("original-author".to_string()),
+            base_ref: "master".to_string(),
+            base_ref_tip: GitObjectId::parse(&"a".repeat(40)).unwrap(),
+            head_repository_owner: "example".to_string(),
+            head_repository_name: "replay-fixture".to_string(),
+            head_ref: "feature/replay".to_string(),
+            head_commit: GitObjectId::parse(&"b".repeat(40)).unwrap(),
+            cross_repository: false,
+            capabilities: ReplayGitHubCapabilities::default(),
+            captured_at_ms: 0,
+        }
+    }
+
+    fn sample_capability_response() -> serde_json::Value {
+        serde_json::json!({
+            "data": {
+                "viewer": { "login": "original-author" },
+                "repository": {
+                    "nameWithOwner": "example/replay-fixture",
+                    "pullRequest": {
+                        "number": 482,
+                        "author": { "login": "original-author" },
+                        "headRefName": "feature/replay",
+                        "headRefOid": "b".repeat(40),
+                        "headRepository": {
+                            "nameWithOwner": "example/replay-fixture",
+                            "viewerPermission": "WRITE",
+                        },
+                    },
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn authenticates_capabilities_only_for_the_exact_original_pull_request_head() {
+        let request = sample_capability_request();
+        let response = serde_json::to_vec(&sample_capability_response()).unwrap();
+
+        let capabilities = parse_pull_request_capabilities(&request, &response)
+            .expect("verify the viewer against the immutable original PR head");
+
+        assert_eq!(capabilities.viewer.as_deref(), Some("original-author"));
+        assert_eq!(
+            capabilities.head_permission,
+            ReplayRepositoryPermission::Write
+        );
+    }
+
+    #[test]
+    fn refuses_capabilities_after_the_original_pr_head_moves() {
+        let request = sample_capability_request();
+        let mut response = sample_capability_response();
+        response["data"]["repository"]["pullRequest"]["headRefOid"] =
+            serde_json::Value::String("c".repeat(40));
+
+        assert!(matches!(
+            parse_pull_request_capabilities(&request, &serde_json::to_vec(&response).unwrap()),
+            Err(ReplayError::SourceRefMoved),
+        ));
+    }
+
+    #[test]
+    fn refuses_capabilities_from_a_different_original_head_repository() {
+        let request = sample_capability_request();
+        let mut response = sample_capability_response();
+        response["data"]["repository"]["pullRequest"]["headRepository"]["nameWithOwner"] =
+            serde_json::Value::String("another-owner/replay-fixture".to_string());
+
+        assert!(matches!(
+            parse_pull_request_capabilities(&request, &serde_json::to_vec(&response).unwrap()),
+            Err(ReplayError::RepositoryMismatch),
+        ));
+    }
+
+    #[test]
+    fn refuses_capabilities_when_the_original_pr_author_changes() {
+        let request = sample_capability_request();
+        let mut response = sample_capability_response();
+        response["data"]["repository"]["pullRequest"]["author"]["login"] =
+            serde_json::Value::String("another-author".to_string());
+
+        assert!(matches!(
+            parse_pull_request_capabilities(&request, &serde_json::to_vec(&response).unwrap()),
+            Err(ReplayError::InvalidMetadata(_)),
+        ));
+    }
+
+    #[test]
+    fn existing_pull_request_snapshots_default_to_read_only_capabilities() {
+        let request = sample_capability_request();
+        let mut snapshot = serde_json::to_value(&request).unwrap();
+        snapshot
+            .as_object_mut()
+            .expect("pull request snapshots are structured")
+            .remove("capabilities");
+
+        let recovered: ReplayPullRequest = serde_json::from_value(snapshot)
+            .expect("preserve pull requests captured before role detection");
+
+        assert_eq!(recovered.capabilities, ReplayGitHubCapabilities::default());
+    }
 
     fn fixture_git(root: &Path, arguments: &[&str]) -> String {
         let output = Command::new("git")

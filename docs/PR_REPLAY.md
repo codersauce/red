@@ -139,6 +139,51 @@ worktree, save the scratch files, or reuse an automatic-application token. If
 the pinned source, hunk, worktree, or undo attribution cannot be verified, Red
 recovers the normal editor buffers and refuses only the unsafe Replay session.
 
+## Review role and local outbox
+
+For a GitHub pull request, the guide verifies the authenticated GitHub viewer
+against the original pull-request author, repository, head branch, and exact
+head commit. The header then shows one honest role:
+
+- `AUTHOR`: you are the verified original PR author. You can draft inline
+  comments, PR-level summaries, and proposed fixes to your own PR.
+- `REVIEW`: you are reviewing another user's PR, or ownership could not be
+  verified. You can draft inline comments and PR-level summaries; proposing a
+  code change to someone else's PR is refused.
+
+Write access to a shared repository is not proof that you own a PR. The guide
+also shows the original head branch and seven-character commit prefix. Replay
+uses the complete immutable commit internally; the short prefix is only for
+display. Reopening a review saved before role detection refreshes only the
+authenticated GitHub identity in a bounded background worker; it refuses a
+moved PR head and never creates another scratch worktree.
+
+Press `c` in the focused guide to compose a multiline inline comment about the
+current original change, or `s` to compose a PR-level summary. Authors can also
+press `F` to record a proposed fix. In the composer, `Enter` inserts a new line
+and `Ctrl-Enter` saves the complete draft locally. The selected original diff
+determines each
+inline comment's path, head commit, exact changed-line range, and GitHub `LEFT`
+or `RIGHT` side. Scratch-buffer cursor positions and later edits never replace
+those coordinates. A proposed fix is only text in this first milestone: it does
+not edit either the original PR or its learning scratch source.
+
+Press `r` to open the local review outbox. It shows the verified role, original
+branch and commit, source-linked comments, author fix proposals, PR summaries,
+and a clear `nothing sent to GitHub` status. Use `h` and `l` to select drafts,
+`e` to edit the selected draft, and `d` to discard it after a local confirmation.
+Press `r` again to return to the original guide. Every draft is part of the
+crash-safe editor session and survives `--resume`. The outbox is the same
+structured, dedicated Replay pane as the source guide; it preserves the
+focused `▌ PR REPLAY` title, highlighted divider, `REPLAY` status, real selected
+draft cursor, scrollable content, and pinned review action bar.
+
+The outbox is local-only. Creating, editing, or discarding a draft does not
+create a GitHub `PENDING` review, publish an inline comment, submit a review,
+start an agent, edit the original PR branch, stage files, commit, or push.
+Explicit portable draft save/load, approved PR updates, GitHub submission, and
+agent-proposed outcomes will be introduced in later milestones.
+
 ## Key bindings
 
 All replay bindings use `Space R`; the existing `Space r` rename binding is
@@ -160,6 +205,12 @@ unchanged.
 | `Space R u` | Safely undo the most recent Replay-authored scratch hunk. |
 | `Space R o` | Add a private, recoverable source-linked observation. |
 | `Space R f` | Show local reviewer observations. |
+| `Space R c` | Draft an exact original-source inline review comment. |
+| `Space R F` | Draft a proposed fix for your verified original PR. |
+| `Space R r` | Show the local review outbox or return to the guide. |
+| `Space R s` | Draft a pull-request-level review summary. |
+| `Space R e` | Edit the selected local review draft. |
+| `Space R d` | Discard the selected local review draft after confirmation. |
 | `Space R q` | Hide the coach without touching the scratch source or progress. |
 
 While the dedicated coach is focused, `j` and `k` scroll the current source
@@ -168,8 +219,9 @@ hunk, `h` and `l` select the previous and next reconstruction steps, and `[` and
 their existing editor and Git-hunk motions. The older `p` and `n` step bindings
 remain compatibility aliases. Use `Space R h`
 for a hint so horizontal navigation never unexpectedly changes the exercise
-instead. `i`, `a`, `u`, `m`, `v`, `o`, `f`, `q`, and `?` act directly on
-the Replay pane. The pinned action bar keeps scratch-source focus, manual
+instead. `i`, `a`, `u`, `m`, `v`, `o`, `f`, `c`, `F`, `r`, `s`, `e`, `d`, `q`,
+and `?` act directly on the Replay pane. The pinned action bar keeps
+scratch-source focus, manual
 validation, immediate application, safe undo, `h/l` step navigation, and help
 visible even when the panel is narrow. The title shows the selected step
 separately from the number of genuinely reviewed changes. A `✓` identifies a

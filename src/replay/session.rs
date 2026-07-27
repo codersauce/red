@@ -11,7 +11,7 @@ use crate::undo::{TextPosition, TextRange};
 
 use super::{
     digest, fetch_pull_request_objects, finalize_pull_request, now_ms, parse_patch,
-    prepare_workspace, GitObjectId, ReplayChangeKind, ReplayError, ReplayLimits,
+    prepare_workspace, GitObjectId, ReplayChangeKind, ReplayError, ReplayLimits, ReplayPullRequest,
     ReplayResolvedPullRequest, ReplaySource,
 };
 
@@ -194,6 +194,133 @@ pub struct ReplayNote {
     pub created_at_ms: u64,
 }
 
+/// Authenticated relationship between the current viewer and the original PR.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayReviewRole {
+    /// Treat unknown and nonauthor identities as read-only PR reviewers.
+    #[default]
+    Reviewer,
+    /// The verified GitHub viewer is the original pull-request author.
+    Author,
+}
+
+impl ReplayReviewRole {
+    /// Classifies only an authenticated viewer of the exact pinned PR.
+    #[must_use]
+    pub fn from_pull_request(request: Option<&ReplayPullRequest>) -> Self {
+        request
+            .and_then(|request| {
+                request
+                    .author
+                    .as_deref()
+                    .zip(request.capabilities.viewer.as_deref())
+            })
+            .filter(|(author, viewer)| author.eq_ignore_ascii_case(viewer))
+            .map_or(Self::Reviewer, |_| Self::Author)
+    }
+}
+
+/// Outcome a reviewer is preparing without contacting GitHub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayReviewDraftKind {
+    /// An inline review comment anchored to the original GitHub diff.
+    InlineComment,
+    /// A proposed original-PR fix retained as text until a later approval.
+    CodeFix,
+    /// A pull-request-level review observation or summary.
+    ReviewSummary,
+}
+
+/// Whether a local draft was composed by the reviewer or an approved agent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayDraftOrigin {
+    /// The reviewer composed this draft directly.
+    #[default]
+    Human,
+    /// An agent proposed this draft for later reviewer inspection.
+    Agent,
+}
+
+/// Honest publication state of an editor-owned review draft.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayDraftState {
+    /// The draft exists only in the local, recoverable Replay session.
+    #[default]
+    Local,
+}
+
+/// Original GitHub diff image to which an inline review draft belongs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayDiffSide {
+    /// A deleted original line from the PR merge-base image.
+    Left,
+    /// An added or replacement line from the exact original PR head.
+    Right,
+}
+
+/// Immutable original-source coordinates retained for a future inline comment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayReviewAnchor {
+    /// Exact original PR head; never the mutable learning scratch branch.
+    pub target_commit: GitObjectId,
+    /// Safe repository-relative file for the selected original diff side.
+    pub path: PathBuf,
+    /// Original base-side path when the source exposes one.
+    pub old_path: Option<PathBuf>,
+    /// Original GitHub diff side, not the current scratch-buffer position.
+    pub side: ReplayDiffSide,
+    /// One-based first original changed line on the selected diff side.
+    pub start_line: usize,
+    /// One-based last original changed line on the selected diff side.
+    pub end_line: usize,
+    /// Stable exact original source-hunk identity.
+    pub hunk_digest: String,
+}
+
+/// Reviewer-owned intended outcome, never a remote GitHub pending review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayReviewDraft {
+    /// Opaque, stable local draft identity.
+    pub id: String,
+    /// Exact original PR head to which the intended outcome belongs.
+    pub target_commit: GitObjectId,
+    /// Original replay step for an inline comment or proposed code fix.
+    pub step_id: Option<String>,
+    /// Safe original repository-relative path for a source-anchored draft.
+    pub path: Option<PathBuf>,
+    /// Whether the draft is an inline comment, fix, or PR-level summary.
+    pub kind: ReplayReviewDraftKind,
+    /// Whether the human reviewer or an agent produced the draft.
+    #[serde(default)]
+    pub origin: ReplayDraftOrigin,
+    /// Local-only publication state; never implies a remote GitHub review.
+    #[serde(default)]
+    pub state: ReplayDraftState,
+    /// Verified original diff coordinates for source-anchored outcomes.
+    pub anchor: Option<ReplayReviewAnchor>,
+    /// Bounded reviewer-visible draft text.
+    pub text: String,
+    /// Unix-millisecond original creation time.
+    pub created_at_ms: u64,
+    /// Unix-millisecond time of the latest local edit.
+    pub updated_at_ms: u64,
+}
+
+/// Verified reviewer capabilities and durable, strictly local review outbox.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReplayReviewState {
+    /// Role derived from the authenticated viewer and immutable PR author.
+    pub role: ReplayReviewRole,
+    /// Locally persisted comments, proposed fixes, and PR-level summaries.
+    pub drafts: Vec<ReplayReviewDraft>,
+}
+
 /// Complete reviewer session and original author source context.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplaySession {
@@ -215,6 +342,9 @@ pub struct ReplaySession {
     pub informational_changes: Vec<PathBuf>,
     /// Source-linked local reviewer observations.
     pub notes: Vec<ReplayNote>,
+    /// Authenticated role and local-only, original-source-anchored outbox.
+    #[serde(default)]
+    pub review: ReplayReviewState,
     /// Monotonic state generation used to invalidate stale previews.
     pub generation: u64,
 }
@@ -725,6 +855,128 @@ impl ReplayController {
         Ok(note)
     }
 
+    /// Creates a durable local review outcome from exact original-source data.
+    ///
+    /// This never changes a Git ref, starts an agent, or contacts GitHub.
+    pub fn add_review_draft(
+        &mut self,
+        session_id: &str,
+        step_id: Option<&str>,
+        kind: ReplayReviewDraftKind,
+        text: &str,
+    ) -> Result<ReplayReviewDraft, ReplayError> {
+        let text = text.trim();
+        if text.is_empty() || text.len() > self.limits.max_note_bytes {
+            return Err(ReplayError::InvalidReviewDraft(
+                "draft must be nonempty and within the configured review limit".to_string(),
+            ));
+        }
+        let limits = self.limits;
+        let session = self.session_mut(session_id)?;
+        if session.review.drafts.len() >= limits.max_steps {
+            return Err(ReplayError::LimitExceeded {
+                kind: "local review drafts",
+                limit: limits.max_steps,
+            });
+        }
+        if kind == ReplayReviewDraftKind::CodeFix && session.review.role != ReplayReviewRole::Author
+        {
+            return Err(ReplayError::InvalidReviewDraft(
+                "proposed PR fixes require a verified original pull-request author".to_string(),
+            ));
+        }
+
+        let anchor = match kind {
+            ReplayReviewDraftKind::InlineComment | ReplayReviewDraftKind::CodeFix => {
+                let id = step_id.ok_or_else(|| {
+                    ReplayError::InvalidReviewDraft(
+                        "source-linked drafts require an exact original replay step".to_string(),
+                    )
+                })?;
+                let step = session
+                    .steps
+                    .iter()
+                    .find(|step| step.id == id)
+                    .ok_or_else(|| missing("replay step", id))?;
+                Some(session.original_review_anchor(step, limits)?)
+            }
+            ReplayReviewDraftKind::ReviewSummary => {
+                if step_id.is_some() {
+                    return Err(ReplayError::InvalidReviewDraft(
+                        "a pull-request-level summary cannot claim an inline source anchor"
+                            .to_string(),
+                    ));
+                }
+                None
+            }
+        };
+        let created_at_ms = now_ms();
+        let draft = ReplayReviewDraft {
+            id: uuid::Uuid::new_v4().to_string(),
+            target_commit: session.source.target_commit.clone(),
+            step_id: step_id.map(str::to_string),
+            path: anchor.as_ref().map(|anchor| anchor.path.clone()),
+            kind,
+            origin: ReplayDraftOrigin::Human,
+            state: ReplayDraftState::Local,
+            anchor,
+            text: text.to_string(),
+            created_at_ms,
+            updated_at_ms: created_at_ms,
+        };
+        session.review.drafts.push(draft.clone());
+        session.generation = session.generation.saturating_add(1);
+        self.advance_generation();
+        Ok(draft)
+    }
+
+    /// Updates only the bounded text of an existing local review draft.
+    pub fn update_review_draft(
+        &mut self,
+        session_id: &str,
+        draft_id: &str,
+        text: &str,
+    ) -> Result<ReplayReviewDraft, ReplayError> {
+        let text = text.trim();
+        if text.is_empty() || text.len() > self.limits.max_note_bytes {
+            return Err(ReplayError::InvalidReviewDraft(
+                "draft must be nonempty and within the configured review limit".to_string(),
+            ));
+        }
+        let session = self.session_mut(session_id)?;
+        let draft = session
+            .review
+            .drafts
+            .iter_mut()
+            .find(|draft| draft.id == draft_id)
+            .ok_or_else(|| missing("local replay review draft", draft_id))?;
+        draft.text = text.to_string();
+        draft.updated_at_ms = now_ms().max(draft.created_at_ms);
+        let draft = draft.clone();
+        session.generation = session.generation.saturating_add(1);
+        self.advance_generation();
+        Ok(draft)
+    }
+
+    /// Removes one local outcome without discarding replay or scratch progress.
+    pub fn remove_review_draft(
+        &mut self,
+        session_id: &str,
+        draft_id: &str,
+    ) -> Result<ReplayReviewDraft, ReplayError> {
+        let session = self.session_mut(session_id)?;
+        let index = session
+            .review
+            .drafts
+            .iter()
+            .position(|draft| draft.id == draft_id)
+            .ok_or_else(|| missing("local replay review draft", draft_id))?;
+        let draft = session.review.drafts.remove(index);
+        session.generation = session.generation.saturating_add(1);
+        self.advance_generation();
+        Ok(draft)
+    }
+
     /// Hides a session without discarding its scratch branch or reviewer findings.
     pub fn pause(&mut self, session_id: &str) -> Result<(), ReplayError> {
         let session = self.session_mut(session_id)?;
@@ -887,6 +1139,75 @@ fn validate_recovered_session(
         }
     }
 
+    if session.review.role != expected.review.role {
+        return Err(ReplayError::InvalidReviewDraft(
+            "the recovered review role does not match the authenticated original PR author"
+                .to_string(),
+        ));
+    }
+    if session.review.drafts.len() > limits.max_steps {
+        return Err(ReplayError::LimitExceeded {
+            kind: "local review drafts",
+            limit: limits.max_steps,
+        });
+    }
+    let mut draft_ids = HashSet::with_capacity(session.review.drafts.len());
+    for draft in &session.review.drafts {
+        if !draft_ids.insert(draft.id.as_str())
+            || draft.target_commit != session.source.target_commit
+            || draft.text.trim().is_empty()
+            || draft.text.len() > limits.max_note_bytes
+            || draft.updated_at_ms < draft.created_at_ms
+        {
+            return Err(ReplayError::InvalidReviewDraft(
+                "a recovered local draft does not match the pinned original PR head".to_string(),
+            ));
+        }
+        if draft.kind == ReplayReviewDraftKind::CodeFix
+            && session.review.role != ReplayReviewRole::Author
+        {
+            return Err(ReplayError::InvalidReviewDraft(
+                "a recovered PR fix does not belong to the verified original author".to_string(),
+            ));
+        }
+
+        match draft.kind {
+            ReplayReviewDraftKind::InlineComment | ReplayReviewDraftKind::CodeFix => {
+                let step_id = draft.step_id.as_deref().ok_or_else(|| {
+                    ReplayError::InvalidReviewDraft(
+                        "a recovered source-linked draft has no original replay step".to_string(),
+                    )
+                })?;
+                let step = session
+                    .steps
+                    .iter()
+                    .find(|step| step.id == step_id)
+                    .ok_or_else(|| {
+                        ReplayError::InvalidReviewDraft(
+                            "a recovered draft names an unrelated original source hunk".to_string(),
+                        )
+                    })?;
+                let anchor = session.original_review_anchor(step, limits)?;
+                if draft.anchor.as_ref() != Some(&anchor)
+                    || draft.path.as_deref() != Some(anchor.path.as_path())
+                {
+                    return Err(ReplayError::InvalidReviewDraft(
+                        "a recovered draft no longer matches its exact original diff coordinates"
+                            .to_string(),
+                    ));
+                }
+            }
+            ReplayReviewDraftKind::ReviewSummary => {
+                if draft.step_id.is_some() || draft.path.is_some() || draft.anchor.is_some() {
+                    return Err(ReplayError::InvalidReviewDraft(
+                        "a recovered PR-level summary cannot claim an inline source anchor"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -897,6 +1218,7 @@ impl ReplaySession {
         workspace: ReplayWorkspace,
         limits: ReplayLimits,
     ) -> Result<Self, ReplayError> {
+        let role = ReplayReviewRole::from_pull_request(source.pull_request.as_ref());
         let patch = parse_patch(&source.patch, limits)?;
         let mut steps = Vec::new();
         let mut informational_changes = Vec::new();
@@ -967,8 +1289,83 @@ impl ReplaySession {
             steps,
             informational_changes,
             notes: Vec::new(),
+            review: ReplayReviewState {
+                role,
+                drafts: Vec::new(),
+            },
             generation: 0,
         })
+    }
+
+    fn original_review_anchor(
+        &self,
+        step: &ReplayStep,
+        limits: ReplayLimits,
+    ) -> Result<ReplayReviewAnchor, ReplayError> {
+        let patch = parse_patch(&self.source.patch, limits)?;
+        for file in patch.files {
+            if file.path() != Some(step.path.as_path()) {
+                continue;
+            }
+            let old_path = file.old_path.clone();
+            let new_path = file.new_path.clone();
+            for hunk in file.hunks {
+                let original = format!(
+                    "{}\0{}\0{}\0{}\0{}",
+                    self.source.patch_digest,
+                    step.path.display(),
+                    hunk.header,
+                    hunk.before,
+                    hunk.after,
+                );
+                if digest(original.as_bytes()) != step.hunk_digest {
+                    continue;
+                }
+                let (side, path, range) = if let Some(range) = hunk.added_range {
+                    (
+                        ReplayDiffSide::Right,
+                        new_path.clone().ok_or_else(|| {
+                            ReplayError::InvalidReviewDraft(
+                                "an original added-line comment has no head-side file".to_string(),
+                            )
+                        })?,
+                        range,
+                    )
+                } else if let Some(range) = hunk.removed_range {
+                    (
+                        ReplayDiffSide::Left,
+                        old_path.clone().ok_or_else(|| {
+                            ReplayError::InvalidReviewDraft(
+                                "an original deleted-line comment has no base-side file"
+                                    .to_string(),
+                            )
+                        })?,
+                        range,
+                    )
+                } else {
+                    return Err(ReplayError::InvalidReviewDraft(
+                        "the original hunk has no commentable changed lines".to_string(),
+                    ));
+                };
+                if range.start == 0 || range.count == 0 {
+                    return Err(ReplayError::InvalidReviewDraft(
+                        "the original diff has invalid one-based comment coordinates".to_string(),
+                    ));
+                }
+                return Ok(ReplayReviewAnchor {
+                    target_commit: self.source.target_commit.clone(),
+                    path,
+                    old_path,
+                    side,
+                    start_line: range.start,
+                    end_line: range.start.saturating_add(range.count.saturating_sub(1)),
+                    hunk_digest: step.hunk_digest.clone(),
+                });
+            }
+        }
+        Err(ReplayError::InvalidReviewDraft(
+            "the selected comment does not match an exact pinned original source hunk".to_string(),
+        ))
     }
 
     fn dependencies_complete(&self, index: usize) -> bool {
@@ -1218,6 +1615,47 @@ mod tests {
 
     fn controller_with_session() -> (ReplayController, String, String) {
         let session = sample_session();
+        let session_id = session.id.clone();
+        let step_id = session.steps[0].id.clone();
+        let mut controller = ReplayController::default();
+        controller.sessions.insert(session_id.clone(), session);
+        (controller, session_id, step_id)
+    }
+
+    fn controller_with_pull_request(
+        author: &str,
+        viewer: Option<&str>,
+    ) -> (ReplayController, String, String) {
+        let mut source = sample_source(CHANGE);
+        source.kind = ReplaySourceKind::GitHubPullRequest;
+        source.pull_request = Some(ReplayPullRequest {
+            host: "github.com".to_string(),
+            repository_owner: "owner".to_string(),
+            repository_name: "repository".to_string(),
+            number: 482,
+            url: "https://github.com/owner/repository/pull/482".to_string(),
+            author: Some(author.to_string()),
+            base_ref: "master".to_string(),
+            base_ref_tip: source.base_commit.clone(),
+            head_repository_owner: "owner".to_string(),
+            head_repository_name: "repository".to_string(),
+            head_ref: "feature/replay".to_string(),
+            head_commit: source.target_commit.clone(),
+            cross_repository: false,
+            capabilities: super::super::ReplayGitHubCapabilities {
+                viewer: viewer.map(str::to_string),
+                head_permission: super::super::ReplayRepositoryPermission::Write,
+            },
+            captured_at_ms: 0,
+        });
+        let workspace = ReplayWorkspace {
+            root: PathBuf::from("/workspace/repository.replay"),
+            branch: "replay/test".to_string(),
+            base_commit: source.base_commit.clone(),
+            created_by_replay: true,
+        };
+        let session = ReplaySession::from_source(source, workspace, ReplayLimits::default())
+            .expect("compile the authenticated immutable pull request");
         let session_id = session.id.clone();
         let step_id = session.steps[0].id.clone();
         let mut controller = ReplayController::default();
@@ -1483,6 +1921,263 @@ mod tests {
             note.target_commit,
             GitObjectId::parse(&"b".repeat(40)).unwrap()
         );
+    }
+
+    #[test]
+    fn identifies_the_original_author_only_from_an_authenticated_matching_viewer() {
+        let (author, session_id, _) =
+            controller_with_pull_request("Original-Author", Some("original-author"));
+        assert_eq!(
+            author.session(&session_id).unwrap().review.role,
+            ReplayReviewRole::Author,
+        );
+
+        let (reviewer, session_id, _) =
+            controller_with_pull_request("original-author", Some("another-reviewer"));
+        assert_eq!(
+            reviewer.session(&session_id).unwrap().review.role,
+            ReplayReviewRole::Reviewer,
+        );
+
+        let (unverified, session_id, _) =
+            controller_with_pull_request("original-author", /*viewer*/ None);
+        assert_eq!(
+            unverified.session(&session_id).unwrap().review.role,
+            ReplayReviewRole::Reviewer,
+        );
+    }
+
+    #[test]
+    fn inline_review_drafts_pin_the_original_head_and_actual_changed_line() {
+        let (mut controller, session_id, step_id) = controller_with_session();
+        let draft = controller
+            .add_review_draft(
+                &session_id,
+                Some(&step_id),
+                ReplayReviewDraftKind::InlineComment,
+                "Should the replacement refresh be bounded?",
+            )
+            .expect("anchor a private inline comment to the original Git diff");
+        let anchor = draft
+            .anchor
+            .expect("inline drafts require an exact diff anchor");
+
+        assert_eq!(draft.kind, ReplayReviewDraftKind::InlineComment);
+        assert_eq!(draft.state, ReplayDraftState::Local);
+        assert_eq!(draft.origin, ReplayDraftOrigin::Human);
+        assert_eq!(anchor.target_commit.as_str(), "b".repeat(40));
+        assert_eq!(anchor.path, PathBuf::from("src/token.rs"));
+        assert_eq!(anchor.old_path, Some(PathBuf::from("src/token.rs")));
+        assert_eq!(anchor.side, ReplayDiffSide::Right);
+        assert_eq!(anchor.start_line, 2);
+        assert_eq!(anchor.end_line, 2);
+        assert_eq!(
+            anchor.hunk_digest,
+            controller.session(&session_id).unwrap().steps[0].hunk_digest,
+        );
+    }
+
+    #[test]
+    fn deletion_only_review_drafts_anchor_the_original_base_side() {
+        let patch = concat!(
+            "diff --git a/src/token.rs b/src/token.rs\n",
+            "--- a/src/token.rs\n",
+            "+++ b/src/token.rs\n",
+            "@@ -7,3 +7,2 @@ fn refresh\n",
+            " before\n",
+            "-removed\n",
+            " after\n",
+        );
+        let source = sample_source(patch);
+        let workspace = ReplayWorkspace {
+            root: PathBuf::from("/workspace/repository.replay"),
+            branch: "replay/test".to_string(),
+            base_commit: source.base_commit.clone(),
+            created_by_replay: true,
+        };
+        let session = ReplaySession::from_source(source, workspace, ReplayLimits::default())
+            .expect("compile the exact original deletion");
+        let session_id = session.id.clone();
+        let step_id = session.steps[0].id.clone();
+        let mut controller = ReplayController::default();
+        controller.sessions.insert(session_id.clone(), session);
+
+        let draft = controller
+            .add_review_draft(
+                &session_id,
+                Some(&step_id),
+                ReplayReviewDraftKind::InlineComment,
+                "Why can this original line be safely removed?",
+            )
+            .expect("retain the original base-side deletion coordinates");
+        let anchor = draft.anchor.expect("deleted lines use a left-side anchor");
+
+        assert_eq!(anchor.side, ReplayDiffSide::Left);
+        assert_eq!(anchor.start_line, 8);
+        assert_eq!(anchor.end_line, 8);
+    }
+
+    #[test]
+    fn only_verified_original_authors_can_draft_pr_code_fixes() {
+        let (mut author, author_session, author_step) =
+            controller_with_pull_request("original-author", Some("original-author"));
+        let fix = author
+            .add_review_draft(
+                &author_session,
+                Some(&author_step),
+                ReplayReviewDraftKind::CodeFix,
+                "Replace this with the bounded refresh helper.",
+            )
+            .expect("retain the author's proposed fix locally");
+        assert_eq!(fix.kind, ReplayReviewDraftKind::CodeFix);
+        assert_eq!(fix.state, ReplayDraftState::Local);
+
+        let (mut reviewer, reviewer_session, reviewer_step) =
+            controller_with_pull_request("original-author", Some("another-reviewer"));
+        assert!(matches!(
+            reviewer.add_review_draft(
+                &reviewer_session,
+                Some(&reviewer_step),
+                ReplayReviewDraftKind::CodeFix,
+                "Change someone else's PR.",
+            ),
+            Err(ReplayError::InvalidReviewDraft(_)),
+        ));
+        assert!(reviewer
+            .session(&reviewer_session)
+            .unwrap()
+            .review
+            .drafts
+            .is_empty());
+    }
+
+    #[test]
+    fn review_summaries_never_claim_an_original_inline_anchor() {
+        let (mut controller, session_id, step_id) = controller_with_session();
+        let draft = controller
+            .add_review_draft(
+                &session_id,
+                /*step_id*/ None,
+                ReplayReviewDraftKind::ReviewSummary,
+                "The refresh flow needs a regression test.",
+            )
+            .expect("retain a genuinely pull-request-level local draft");
+
+        assert_eq!(draft.kind, ReplayReviewDraftKind::ReviewSummary);
+        assert!(draft.step_id.is_none());
+        assert!(draft.path.is_none());
+        assert!(draft.anchor.is_none());
+        assert!(matches!(
+            controller.add_review_draft(
+                &session_id,
+                Some(&step_id),
+                ReplayReviewDraftKind::ReviewSummary,
+                "This must not impersonate an inline comment.",
+            ),
+            Err(ReplayError::InvalidReviewDraft(_)),
+        ));
+    }
+
+    #[test]
+    fn local_review_drafts_can_be_edited_and_removed_without_changing_their_anchor() {
+        let (mut controller, session_id, step_id) = controller_with_session();
+        let original = controller
+            .add_review_draft(
+                &session_id,
+                Some(&step_id),
+                ReplayReviewDraftKind::InlineComment,
+                "Initial private review comment.",
+            )
+            .unwrap();
+        let generation = controller.generation();
+
+        let updated = controller
+            .update_review_draft(&session_id, &original.id, "Updated private review comment.")
+            .expect("edit only a local comment");
+        assert_eq!(updated.anchor, original.anchor);
+        assert_eq!(updated.target_commit, original.target_commit);
+        assert_eq!(updated.text, "Updated private review comment.");
+        assert!(controller.generation() > generation);
+
+        let removed = controller
+            .remove_review_draft(&session_id, &original.id)
+            .expect("discard only the selected local comment");
+        assert_eq!(removed.id, original.id);
+        assert!(controller
+            .session(&session_id)
+            .unwrap()
+            .review
+            .drafts
+            .is_empty());
+    }
+
+    #[test]
+    fn recovery_preserves_original_source_anchored_local_review_drafts() {
+        let (mut controller, session_id, step_id) =
+            controller_with_pull_request("original-author", Some("original-author"));
+        let original = controller
+            .add_review_draft(
+                &session_id,
+                Some(&step_id),
+                ReplayReviewDraftKind::CodeFix,
+                "Bound the refresh before updating the original PR.",
+            )
+            .unwrap();
+        let snapshot = controller.recovery_snapshot().unwrap();
+        let mut restored = ReplayController::default();
+
+        restored
+            .restore(&snapshot)
+            .expect("restore only the exact original author and local diff anchor");
+
+        let review = &restored.session(&session_id).unwrap().review;
+        assert_eq!(review.role, ReplayReviewRole::Author);
+        assert_eq!(review.drafts, vec![original]);
+    }
+
+    #[test]
+    fn recovery_rejects_a_local_draft_reassigned_to_a_different_original_line() {
+        let (mut controller, session_id, step_id) = controller_with_session();
+        controller
+            .add_review_draft(
+                &session_id,
+                Some(&step_id),
+                ReplayReviewDraftKind::InlineComment,
+                "Keep this exact original line bounded.",
+            )
+            .unwrap();
+        let mut snapshot = controller.recovery_snapshot().unwrap();
+        snapshot.sessions[0].review.drafts[0]
+            .anchor
+            .as_mut()
+            .unwrap()
+            .start_line = 99;
+        let mut restored = ReplayController::default();
+
+        assert!(matches!(
+            restored.restore(&snapshot),
+            Err(ReplayError::InvalidReviewDraft(_)),
+        ));
+        assert!(restored.sessions().is_empty());
+    }
+
+    #[test]
+    fn existing_replay_snapshots_restore_without_a_local_outbox() {
+        let (controller, session_id, _) = controller_with_session();
+        let mut snapshot = serde_json::to_value(controller.recovery_snapshot().unwrap()).unwrap();
+        snapshot["sessions"][0]
+            .as_object_mut()
+            .expect("recovered sessions are structured")
+            .remove("review");
+        let snapshot: ReplayRecoverySnapshot = serde_json::from_value(snapshot)
+            .expect("recover snapshots created before the review outbox existed");
+        let mut restored = ReplayController::default();
+
+        restored.restore(&snapshot).unwrap();
+
+        let review = &restored.session(&session_id).unwrap().review;
+        assert_eq!(review.role, ReplayReviewRole::Reviewer);
+        assert!(review.drafts.is_empty());
     }
 
     #[test]

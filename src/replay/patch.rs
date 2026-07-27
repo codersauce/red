@@ -67,6 +67,12 @@ pub struct ReplayHunk {
     pub removed_lines: usize,
     /// Number of changed new lines.
     pub added_lines: usize,
+    /// Exact first-to-last removed-line range in the original base image.
+    #[serde(default)]
+    pub removed_range: Option<ReplayHunkRange>,
+    /// Exact first-to-last added-line range in the pinned original head image.
+    #[serde(default)]
+    pub added_range: Option<ReplayHunkRange>,
 }
 
 /// A single source-backed file and all of its complete unified hunks.
@@ -128,6 +134,10 @@ struct HunkBuilder {
     new_seen: usize,
     removed_lines: usize,
     added_lines: usize,
+    first_removed_line: Option<usize>,
+    last_removed_line: Option<usize>,
+    first_added_line: Option<usize>,
+    last_added_line: Option<usize>,
     last_line: Option<HunkLineKind>,
 }
 
@@ -212,12 +222,24 @@ pub fn parse_patch(text: &str, limits: ReplayLimits) -> Result<ReplayPatch, Repl
                     current_hunk.last_line = Some(HunkLineKind::Context);
                 }
                 '-' => {
+                    let original_line = current_hunk
+                        .old_range
+                        .start
+                        .saturating_add(current_hunk.old_seen);
+                    current_hunk.first_removed_line.get_or_insert(original_line);
+                    current_hunk.last_removed_line = Some(original_line);
                     current_hunk.before.push_str(payload);
                     current_hunk.old_seen += 1;
                     current_hunk.removed_lines += 1;
                     current_hunk.last_line = Some(HunkLineKind::Removed);
                 }
                 '+' => {
+                    let original_line = current_hunk
+                        .new_range
+                        .start
+                        .saturating_add(current_hunk.new_seen);
+                    current_hunk.first_added_line.get_or_insert(original_line);
+                    current_hunk.last_added_line = Some(original_line);
                     current_hunk.after.push_str(payload);
                     current_hunk.new_seen += 1;
                     current_hunk.added_lines += 1;
@@ -295,6 +317,10 @@ fn parse_hunk_header(line: &str) -> Result<HunkBuilder, ReplayError> {
         new_seen: 0,
         removed_lines: 0,
         added_lines: 0,
+        first_removed_line: None,
+        last_removed_line: None,
+        first_added_line: None,
+        last_added_line: None,
         last_line: None,
     })
 }
@@ -342,8 +368,17 @@ fn finish_hunk(
         after: hunk.after,
         removed_lines: hunk.removed_lines,
         added_lines: hunk.added_lines,
+        removed_range: changed_hunk_range(hunk.first_removed_line, hunk.last_removed_line),
+        added_range: changed_hunk_range(hunk.first_added_line, hunk.last_added_line),
     });
     Ok(())
+}
+
+fn changed_hunk_range(first: Option<usize>, last: Option<usize>) -> Option<ReplayHunkRange> {
+    first.zip(last).map(|(start, end)| ReplayHunkRange {
+        start,
+        count: end.saturating_sub(start).saturating_add(1),
+    })
 }
 
 fn finish_file(
@@ -428,6 +463,71 @@ mod tests {
         assert_eq!(hunk.heading, "fn refresh");
         assert_eq!(hunk.before, "fn refresh() {\n    old();\n}\n");
         assert_eq!(hunk.after, "fn refresh() {\n    new();\n}\n");
+        assert_eq!(
+            hunk.removed_range,
+            Some(ReplayHunkRange { start: 2, count: 1 }),
+        );
+        assert_eq!(
+            hunk.added_range,
+            Some(ReplayHunkRange { start: 2, count: 1 }),
+        );
+    }
+
+    #[test]
+    fn preserves_exact_changed_line_coordinates_around_original_context() {
+        let text = concat!(
+            "diff --git a/src/token.rs b/src/token.rs\n",
+            "--- a/src/token.rs\n",
+            "+++ b/src/token.rs\n",
+            "@@ -10,5 +20,5 @@ fn refresh\n",
+            " before\n",
+            "-old_first\n",
+            "+new_first\n",
+            " middle\n",
+            "-old_last\n",
+            "+new_last\n",
+            " after\n",
+        );
+        let patch = parse_patch(text, ReplayLimits::default())
+            .expect("parse every original changed and contextual source line");
+        let hunk = &patch.files[0].hunks[0];
+
+        assert_eq!(
+            hunk.removed_range,
+            Some(ReplayHunkRange {
+                start: 11,
+                count: 3,
+            }),
+        );
+        assert_eq!(
+            hunk.added_range,
+            Some(ReplayHunkRange {
+                start: 21,
+                count: 3,
+            }),
+        );
+    }
+
+    #[test]
+    fn deletion_only_hunk_retains_base_side_comment_coordinates() {
+        let text = concat!(
+            "diff --git a/src/token.rs b/src/token.rs\n",
+            "--- a/src/token.rs\n",
+            "+++ b/src/token.rs\n",
+            "@@ -7,3 +7,2 @@ fn refresh\n",
+            " before\n",
+            "-removed\n",
+            " after\n",
+        );
+        let patch = parse_patch(text, ReplayLimits::default())
+            .expect("preserve an original deletion without inventing head-side lines");
+        let hunk = &patch.files[0].hunks[0];
+
+        assert_eq!(
+            hunk.removed_range,
+            Some(ReplayHunkRange { start: 8, count: 1 }),
+        );
+        assert_eq!(hunk.added_range, None);
     }
 
     #[test]
@@ -436,6 +536,11 @@ mod tests {
         let patch = parse_patch(text, ReplayLimits::default()).unwrap();
         assert_eq!(patch.files[0].kind, ReplayChangeKind::AddFile);
         assert_eq!(patch.files[0].hunks[0].before, "");
+        assert_eq!(patch.files[0].hunks[0].removed_range, None);
+        assert_eq!(
+            patch.files[0].hunks[0].added_range,
+            Some(ReplayHunkRange { start: 1, count: 1 }),
+        );
     }
 
     #[test]

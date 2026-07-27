@@ -18,7 +18,10 @@ use super::{
 };
 use crate::{
     editor::{render_buffer::RenderBuffer, Point},
-    replay::{parse_patch, ReplayDemoStep, ReplayLimits},
+    replay::{
+        parse_patch, GitObjectId, ReplayDemoStep, ReplayLimits, ReplayReviewDraft,
+        ReplayReviewDraftKind, ReplayReviewRole,
+    },
     theme::{SelectionForegroundPriority, Style, Theme},
     ui::{ActionBar, ActionPriority, UiAction},
     unicode_utils::{
@@ -47,6 +50,17 @@ impl ReplayPanelMode {
     }
 }
 
+/// Editor-native surface shown within the dedicated Replay pane.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReplayPanelView {
+    /// The original diff, source guidance, and learning-step list.
+    #[default]
+    Guide,
+    /// The recoverable, original-source-anchored local review outbox.
+    Outbox,
+}
+
 /// Completion attributed to one original-author Replay step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,6 +84,18 @@ pub(crate) struct ReplayPanelModel {
     pub(crate) pull_request: u64,
     pub(crate) author: String,
     pub(crate) branch: String,
+    #[serde(default)]
+    pub(crate) review_role: Option<ReplayReviewRole>,
+    #[serde(default)]
+    pub(crate) head_commit: String,
+    #[serde(default)]
+    pub(crate) draft_count: usize,
+    #[serde(default)]
+    pub(crate) drafts: Vec<ReplayReviewDraft>,
+    #[serde(default)]
+    pub(crate) outbox_index: usize,
+    #[serde(default)]
+    pub(crate) view: ReplayPanelView,
     pub(crate) title: String,
     pub(crate) index: usize,
     #[serde(default)]
@@ -141,7 +167,17 @@ impl ReplayPanelState {
             return None;
         }
         let model = serde_json::from_str::<ReplayPanelModel>(text).ok()?;
-        if model.steps.len() > limits.max_steps || model.current_step().is_none() {
+        if model.steps.len() > limits.max_steps
+            || model.draft_count > limits.max_steps
+            || model.drafts.len() > limits.max_steps
+            || model.current_step().is_none()
+            || (!model.head_commit.is_empty() && GitObjectId::parse(&model.head_commit).is_err())
+            || (!model.drafts.is_empty() && model.outbox_index >= model.drafts.len())
+            || model
+                .drafts
+                .iter()
+                .any(|draft| draft.text.len() > limits.max_note_bytes)
+        {
             return None;
         }
         let document = replay_document(&model)?;
@@ -242,11 +278,23 @@ pub(super) fn render_replay_panel_title(
     } else {
         title.to_string()
     };
-    let position_label = format!(
-        "{:02} / {:02}",
-        state.model.index.saturating_add(1),
-        state.model.steps.len(),
-    );
+    let position_label = if state.model.view == ReplayPanelView::Outbox {
+        if state.model.drafts.is_empty() {
+            "OUTBOX".to_string()
+        } else {
+            format!(
+                "{:02} / {:02}",
+                state.model.outbox_index.saturating_add(1),
+                state.model.drafts.len(),
+            )
+        }
+    } else {
+        format!(
+            "{:02} / {:02}",
+            state.model.index.saturating_add(1),
+            state.model.steps.len(),
+        )
+    };
     let line = aligned_line(
         &title,
         TextPanelSpanStyle::Strong,
@@ -307,10 +355,14 @@ pub(super) fn render_replay_panel(
     viewport: ReplayPanelViewport,
     theme: &Theme,
 ) {
-    let layout = ReplayPanelLayout::calculate(state, width, height);
     if width == 0 || height == 0 {
         return;
     }
+    if state.model.view == ReplayPanelView::Outbox {
+        render_replay_outbox(buffer, state, position, width, height, viewport, theme);
+        return;
+    }
+    let layout = ReplayPanelLayout::calculate(state, width, height);
 
     let mut header = replay_header_lines(state, width);
     if layout.header_rows < header.len() && layout.header_rows > 0 {
@@ -513,7 +565,7 @@ fn replay_header_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
     } else {
         format!("#{} · @{}", model.pull_request, model.author)
     };
-    let metadata = if model.notes.is_empty() {
+    let mut metadata = if model.notes.is_empty() {
         identity
     } else {
         let suffix = if model.notes.len() == 1 {
@@ -523,20 +575,77 @@ fn replay_header_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
         };
         format!("{identity} · {} {suffix}", model.notes.len())
     };
-    let mut lines = vec![
-        aligned_line(
-            &metadata,
-            TextPanelSpanStyle::Strong,
-            &progress,
-            TextPanelSpanStyle::Muted,
-            None,
-            width,
-        ),
-        RenderedTextLine::plain(
-            truncate_display_width_with_marker(&model.branch, width, "…", TruncationSide::Right),
-            TextPanelSpanStyle::Muted,
-        ),
-    ];
+    if model.draft_count > 0 {
+        let suffix = if model.draft_count == 1 {
+            "draft"
+        } else {
+            "drafts"
+        };
+        metadata.push_str(&format!(" · {} {suffix}", model.draft_count));
+    }
+    let verified_role = model.review_role.filter(|_| model.pull_request > 0);
+    let mut branch = model.branch.clone();
+    if !model.head_commit.is_empty() {
+        let short = model.head_commit.chars().take(7).collect::<String>();
+        let suffix = format!(" · {short}");
+        let branch_width = if verified_role.is_some() {
+            width
+                .saturating_sub(display_width(&progress))
+                .saturating_sub(1)
+        } else {
+            width
+        };
+        let name_width = branch_width.saturating_sub(display_width(&suffix));
+        branch = format!(
+            "{}{}",
+            truncate_display_width_with_marker(
+                &model.branch,
+                name_width,
+                "…",
+                TruncationSide::Right,
+            ),
+            suffix,
+        );
+    }
+    let mut lines = if let Some(role) = verified_role {
+        let label = match role {
+            ReplayReviewRole::Reviewer => "REVIEW",
+            ReplayReviewRole::Author => "AUTHOR",
+        };
+        vec![
+            aligned_line(
+                &metadata,
+                TextPanelSpanStyle::Strong,
+                label,
+                TextPanelSpanStyle::Heading,
+                None,
+                width,
+            ),
+            aligned_line(
+                &branch,
+                TextPanelSpanStyle::Muted,
+                &progress,
+                TextPanelSpanStyle::Muted,
+                None,
+                width,
+            ),
+        ]
+    } else {
+        vec![
+            aligned_line(
+                &metadata,
+                TextPanelSpanStyle::Strong,
+                &progress,
+                TextPanelSpanStyle::Muted,
+                None,
+                width,
+            ),
+            RenderedTextLine::plain(
+                truncate_display_width_with_marker(&branch, width, "…", TruncationSide::Right),
+                TextPanelSpanStyle::Muted,
+            ),
+        ]
+    };
     let title = model.title.trim();
     if !title.is_empty()
         && title != model.branch
@@ -581,7 +690,7 @@ fn replay_header_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
     if state.model.help_visible {
         lines.extend(
             wrap_plain_text(
-                "j/k scroll · h/l step · [/] file · a apply · u undo · Ctrl-w H/J/K/L dock · Space R h hint",
+                "j/k scroll · h/l step · [/] file · a apply · u undo · c comment · r outbox · Ctrl-w H/J/K/L dock · Space R h hint",
                 width.max(1),
                 TextPanelSpanStyle::Muted,
             )
@@ -622,6 +731,242 @@ fn replay_header_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
         width,
     ));
     lines
+}
+
+/// Returns the complete scrollable row count of the selected Replay surface.
+pub(super) fn replay_content_line_count(state: &ReplayPanelState, width: usize) -> usize {
+    if state.model.view == ReplayPanelView::Outbox {
+        replay_outbox_lines(state, width).len()
+    } else {
+        state.document.lines.len()
+    }
+}
+
+/// Returns native viewport rows while retaining the selected surface's footer.
+pub(super) fn replay_visible_rows(state: &ReplayPanelState, width: usize, height: usize) -> usize {
+    if state.model.view == ReplayPanelView::Outbox {
+        height
+            .saturating_sub(replay_outbox_footer_rows(height))
+            .max(1)
+    } else {
+        ReplayPanelLayout::calculate(state, width, height)
+            .diff_rows
+            .max(1)
+    }
+}
+
+/// Locates the actual native outbox selection marker for terminal cursor focus.
+pub(super) fn replay_outbox_selected_row(state: &ReplayPanelState, width: usize) -> usize {
+    replay_outbox_lines(state, width)
+        .iter()
+        .position(|line| {
+            line.spans
+                .first()
+                .is_some_and(|span| span.text.starts_with('▶'))
+        })
+        .unwrap_or(/*outbox_heading_row*/ 3)
+}
+
+fn replay_outbox_footer_rows(height: usize) -> usize {
+    if height > 2 {
+        2
+    } else {
+        usize::from(height > 0)
+    }
+}
+
+fn replay_outbox_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTextLine> {
+    let model = &state.model;
+    let mut lines = replay_header_lines(state, width)
+        .into_iter()
+        .take(2)
+        .collect::<Vec<_>>();
+    lines.push(RenderedTextLine::plain(
+        String::new(),
+        TextPanelSpanStyle::Text,
+    ));
+    let count = if model.drafts.len() == 1 {
+        "1 draft".to_string()
+    } else {
+        format!("{} drafts", model.drafts.len())
+    };
+    lines.push(aligned_line(
+        "LOCAL OUTBOX",
+        TextPanelSpanStyle::Heading,
+        &count,
+        TextPanelSpanStyle::Muted,
+        None,
+        width,
+    ));
+    lines.extend(wrap_plain_text(
+        "Local only · nothing sent to GitHub",
+        width.max(1),
+        TextPanelSpanStyle::Muted,
+    ));
+    lines.push(RenderedTextLine::plain(
+        String::new(),
+        TextPanelSpanStyle::Text,
+    ));
+
+    if model.drafts.is_empty() {
+        let message = if model.review_role == Some(ReplayReviewRole::Author) {
+            "No review drafts yet. Use c for a comment, s for a summary, or F for a proposed fix."
+        } else {
+            "No review drafts yet. Use c for a comment or s for a review summary."
+        };
+        lines.extend(wrap_plain_text(
+            message,
+            width.max(1),
+            TextPanelSpanStyle::Muted,
+        ));
+        return lines;
+    }
+
+    for (index, draft) in model.drafts.iter().enumerate() {
+        let marker = if index == model.outbox_index {
+            "▶"
+        } else {
+            "○"
+        };
+        let kind = match draft.kind {
+            ReplayReviewDraftKind::InlineComment => "INLINE COMMENT",
+            ReplayReviewDraftKind::CodeFix => "PROPOSED PR FIX",
+            ReplayReviewDraftKind::ReviewSummary => "REVIEW SUMMARY",
+        };
+        let label = format!("{marker} {kind}");
+        lines.push(aligned_line(
+            &label,
+            if index == model.outbox_index {
+                TextPanelSpanStyle::Strong
+            } else {
+                TextPanelSpanStyle::Text
+            },
+            "LOCAL",
+            TextPanelSpanStyle::Muted,
+            None,
+            width,
+        ));
+        if let Some(anchor) = &draft.anchor {
+            let mut line_suffix = format!(":{}", anchor.start_line);
+            if anchor.end_line > anchor.start_line {
+                line_suffix.push_str(&format!("-{}", anchor.end_line));
+            }
+            let side = match anchor.side {
+                crate::replay::ReplayDiffSide::Left => "LEFT",
+                crate::replay::ReplayDiffSide::Right => "RIGHT",
+            };
+            let source_width = width.saturating_sub(display_width(side)).saturating_sub(1);
+            let path_width = source_width.saturating_sub(display_width(&line_suffix));
+            let path = truncate_display_width_with_marker(
+                &anchor.path.to_string_lossy(),
+                path_width,
+                "…",
+                TruncationSide::Left,
+            );
+            let source = format!("{path}{line_suffix}");
+            lines.push(aligned_line(
+                &source,
+                TextPanelSpanStyle::Link,
+                side,
+                TextPanelSpanStyle::Muted,
+                None,
+                width,
+            ));
+        }
+        lines.extend(wrap_plain_text(
+            &draft.text,
+            width.max(1),
+            TextPanelSpanStyle::Text,
+        ));
+        lines.push(RenderedTextLine::plain(
+            String::new(),
+            TextPanelSpanStyle::Text,
+        ));
+    }
+    lines
+}
+
+fn render_replay_outbox(
+    buffer: &mut RenderBuffer,
+    state: &ReplayPanelState,
+    position: Point,
+    width: usize,
+    height: usize,
+    viewport: ReplayPanelViewport,
+    theme: &Theme,
+) {
+    let footer_rows = replay_outbox_footer_rows(height);
+    let visible_rows = height.saturating_sub(footer_rows);
+    for (offset, line) in replay_outbox_lines(state, width)
+        .iter()
+        .skip(viewport.scroll)
+        .take(visible_rows)
+        .enumerate()
+    {
+        render_text_spans_on_surface(
+            buffer,
+            position.x,
+            position.y.saturating_add(offset),
+            width,
+            line,
+            theme,
+            &theme.style,
+        );
+    }
+
+    if footer_rows > 1 {
+        buffer.set_text(
+            position.x,
+            position
+                .y
+                .saturating_add(height.saturating_sub(footer_rows)),
+            &"─".repeat(width),
+            &theme.ui_style.muted.with_bg(theme.style.bg),
+        );
+    }
+    if footer_rows > 0 {
+        let actions = replay_outbox_actions(&state.model);
+        ActionBar::new(&actions).render(
+            buffer,
+            position.x,
+            position.y.saturating_add(height.saturating_sub(1)),
+            width,
+            theme,
+            &theme.style,
+        );
+    }
+}
+
+fn replay_outbox_actions(model: &ReplayPanelModel) -> Vec<UiAction> {
+    let mut actions = vec![
+        UiAction::new("navigate_draft", "[h/l]", "Select")
+            .with_priority(ActionPriority::Essential)
+            .with_compact_label(""),
+        UiAction::new("comment", "[c]", "Comment")
+            .with_priority(ActionPriority::Essential)
+            .with_compact_label(""),
+        UiAction::new("summary", "[s]", "Summary")
+            .with_priority(ActionPriority::Secondary)
+            .with_compact_label(""),
+        UiAction::new("edit_draft", "[e]", "Edit")
+            .with_priority(ActionPriority::Secondary)
+            .with_compact_label(""),
+        UiAction::new("discard_draft", "[d]", "Discard")
+            .with_priority(ActionPriority::Secondary)
+            .with_compact_label(""),
+        UiAction::new("outbox", "[r]", "Return")
+            .with_priority(ActionPriority::Essential)
+            .with_compact_label(""),
+    ];
+    if model.review_role == Some(ReplayReviewRole::Author) {
+        actions.insert(
+            actions.len().saturating_sub(1),
+            UiAction::new("fix", "[F]", "Fix")
+                .with_priority(ActionPriority::Secondary)
+                .with_compact_label(""),
+        );
+    }
+    actions
 }
 
 fn aligned_line(
@@ -919,6 +1264,21 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
             .with_compact_label(""),
     ];
 
+    if model.pull_request > 0 && model.review_role.is_some() {
+        actions.insert(
+            actions.len().saturating_sub(1),
+            UiAction::new("comment", "[c]", "Comment")
+                .with_priority(ActionPriority::Secondary)
+                .with_compact_label(""),
+        );
+        actions.insert(
+            actions.len().saturating_sub(1),
+            UiAction::new("outbox", "[r]", "Outbox")
+                .with_priority(ActionPriority::Secondary)
+                .with_compact_label(""),
+        );
+    }
+
     if model
         .current_file_position()
         .is_some_and(|(_, count)| count > 1)
@@ -949,6 +1309,12 @@ mod tests {
             pull_request: plan.pull_request,
             author: plan.author,
             branch: plan.branch,
+            review_role: None,
+            head_commit: String::new(),
+            draft_count: 0,
+            drafts: Vec::new(),
+            outbox_index: 0,
+            view: ReplayPanelView::Guide,
             title: plan.title,
             index: 0,
             mode: ReplayPanelMode::Challenge,
@@ -958,6 +1324,36 @@ mod tests {
             notes: Vec::new(),
             completions: Vec::new(),
             steps: plan.steps,
+        }
+    }
+
+    fn outbox_draft(kind: ReplayReviewDraftKind, text: &str) -> ReplayReviewDraft {
+        let target_commit = GitObjectId::parse(&"b".repeat(40)).unwrap();
+        let anchor = if kind == ReplayReviewDraftKind::ReviewSummary {
+            None
+        } else {
+            Some(crate::replay::ReplayReviewAnchor {
+                target_commit: target_commit.clone(),
+                path: "src/editor/rendering.rs".into(),
+                old_path: Some("src/editor/rendering.rs".into()),
+                side: crate::replay::ReplayDiffSide::Right,
+                start_line: 11,
+                end_line: 12,
+                hunk_digest: "original-hunk-digest".to_string(),
+            })
+        };
+        ReplayReviewDraft {
+            id: format!("native-outbox-{kind:?}"),
+            target_commit,
+            step_id: anchor.as_ref().map(|_| "fixture-original-step".to_string()),
+            path: anchor.as_ref().map(|anchor| anchor.path.clone()),
+            kind,
+            origin: crate::replay::ReplayDraftOrigin::Human,
+            state: crate::replay::ReplayDraftState::Local,
+            anchor,
+            text: text.to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
         }
     }
 
@@ -1532,6 +1928,242 @@ mod tests {
         assert!(metadata.contains("#482 · @original-author"));
         assert!(metadata.ends_with("1 / 5 reviewed"));
         assert!(!title.contains("reviewed"));
+    }
+
+    #[test]
+    fn original_author_role_and_pinned_head_are_visible_without_hiding_review_progress() {
+        let mut replay = model();
+        replay.review_role = Some(ReplayReviewRole::Author);
+        replay.head_commit = "b".repeat(40);
+        replay.draft_count = 2;
+        let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+        let lines = replay_header_lines(&state, /*width*/ 64)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(lines[0].contains("#482 · @original-author"));
+        assert!(lines[0].contains("2 drafts"));
+        assert!(lines[0].ends_with("AUTHOR"));
+        assert!(lines[1].contains("feat/viewport-diagnostics"));
+        assert!(lines[1].contains("bbbbbbb"));
+        assert!(lines[1].ends_with("0 / 5 reviewed"));
+    }
+
+    #[test]
+    fn narrow_author_header_preserves_original_head_commit_and_review_progress() {
+        let mut replay = model();
+        replay.review_role = Some(ReplayReviewRole::Author);
+        replay.branch = "fcoury/tui-paginated-history".to_string();
+        replay.head_commit = "15c49574d325c0cb783a12cadab7b25fb089ed3e".to_string();
+        let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+        let branch = replay_header_lines(&state, /*width*/ 46)[1]
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+
+        assert!(branch.contains("15c4957"));
+        assert!(branch.ends_with("0 / 5 reviewed"));
+        assert!(branch.contains('…'));
+    }
+
+    #[test]
+    fn native_outbox_retains_original_anchor_selected_marker_and_pinned_actions() {
+        let mut replay = model();
+        replay.review_role = Some(ReplayReviewRole::Author);
+        replay.head_commit = "b".repeat(40);
+        replay.view = ReplayPanelView::Outbox;
+        replay.drafts = vec![outbox_draft(
+            ReplayReviewDraftKind::InlineComment,
+            "Please test the original viewport boundary.",
+        )];
+        replay.draft_count = replay.drafts.len();
+        let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let width = 56;
+        let height = 18;
+        let mut buffer = RenderBuffer::new(width, height, &theme.style);
+
+        render_replay_panel_title(
+            &mut buffer,
+            &state,
+            "PR REPLAY",
+            Point::new(0, 0),
+            width,
+            /*focused*/ true,
+            &theme,
+        );
+        render_replay_panel(
+            &mut buffer,
+            &state,
+            Point::new(0, 1),
+            width,
+            height - 1,
+            ReplayPanelViewport {
+                scroll: 0,
+                focused: true,
+            },
+            &theme,
+        );
+
+        let rows = rendered_rows(&buffer);
+        assert!(rows[0].starts_with("▌ PR REPLAY"));
+        assert!(rows[0].ends_with("01 / 01"));
+        assert!(rows.iter().any(|row| row.contains("AUTHOR")));
+        assert!(rows.iter().any(|row| row.contains("LOCAL OUTBOX")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("nothing sent to GitHub")));
+        assert!(rows.iter().any(|row| row.contains("▶ INLINE COMMENT")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("src/editor/rendering.rs:11-12")));
+        assert!(rows.iter().any(|row| row.contains("RIGHT")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("Please test the original viewport boundary.")));
+        assert!(rows[height - 1].contains("[h/l]"));
+        assert!(rows[height - 1].contains("[c]"));
+        assert!(rows[height - 1].contains("[r]"));
+        assert_eq!(
+            replay_outbox_selected_row(&state, width),
+            replay_outbox_lines(&state, width)
+                .iter()
+                .position(|line| {
+                    line.spans
+                        .first()
+                        .is_some_and(|span| span.text.starts_with('▶'))
+                })
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn native_outbox_keeps_the_return_action_pinned_while_long_drafts_scroll() {
+        let mut replay = model();
+        replay.review_role = Some(ReplayReviewRole::Reviewer);
+        replay.head_commit = "b".repeat(40);
+        replay.view = ReplayPanelView::Outbox;
+        replay.drafts = (0..8)
+            .map(|index| {
+                outbox_draft(
+                    ReplayReviewDraftKind::InlineComment,
+                    &format!("Review draft {index} remains pinned to the original source."),
+                )
+            })
+            .collect();
+        replay.draft_count = replay.drafts.len();
+        let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let width = 46;
+        let height = 12;
+        let mut top = RenderBuffer::new(width, height, &theme.style);
+        let mut scrolled = RenderBuffer::new(width, height, &theme.style);
+        let max_scroll = replay_content_line_count(&state, width)
+            .saturating_sub(replay_visible_rows(&state, width, height));
+
+        render_replay_panel(
+            &mut top,
+            &state,
+            Point::new(0, 0),
+            width,
+            height,
+            ReplayPanelViewport {
+                scroll: 0,
+                focused: true,
+            },
+            &theme,
+        );
+        render_replay_panel(
+            &mut scrolled,
+            &state,
+            Point::new(0, 0),
+            width,
+            height,
+            ReplayPanelViewport {
+                scroll: max_scroll,
+                focused: true,
+            },
+            &theme,
+        );
+
+        let top_rows = rendered_rows(&top);
+        let scrolled_rows = rendered_rows(&scrolled);
+        assert!(max_scroll > 0);
+        assert!(top_rows.iter().any(|row| row.contains("LOCAL OUTBOX")));
+        assert!(scrolled_rows
+            .iter()
+            .any(|row| row.contains("Review draft 7")));
+        assert_eq!(top_rows[height - 1], scrolled_rows[height - 1]);
+        assert!(scrolled_rows[height - 1].contains("[r]"));
+    }
+
+    #[test]
+    fn narrow_native_outbox_preserves_original_filename_line_range_and_diff_side() {
+        let mut replay = model();
+        replay.review_role = Some(ReplayReviewRole::Author);
+        replay.head_commit = "b".repeat(40);
+        replay.view = ReplayPanelView::Outbox;
+        let mut draft = outbox_draft(
+            ReplayReviewDraftKind::InlineComment,
+            "Keep the original replay notification bounded.",
+        );
+        let path = std::path::PathBuf::from(
+            "codex-rs/app-server/src/request_processors/token_usage_replay.rs",
+        );
+        draft.path = Some(path.clone());
+        draft.anchor.as_mut().unwrap().path = path;
+        draft.anchor.as_mut().unwrap().start_line = 84;
+        draft.anchor.as_mut().unwrap().end_line = 86;
+        replay.drafts = vec![draft];
+        replay.draft_count = replay.drafts.len();
+        let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+        let source = replay_outbox_lines(&state, /*width*/ 46)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .find(|line| line.contains("token_usage_replay.rs"))
+            .expect("retain the original changed filename in a narrow pane");
+
+        assert!(source.starts_with('…'));
+        assert!(source.contains("token_usage_replay.rs:84-86"));
+        assert!(source.ends_with("RIGHT"));
+    }
+
+    #[test]
+    fn nonauthor_pull_request_header_is_explicitly_marked_as_review_only() {
+        let mut replay = model();
+        replay.review_role = Some(ReplayReviewRole::Reviewer);
+        replay.head_commit = "b".repeat(40);
+        let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+        let metadata = replay_header_lines(&state, /*width*/ 64)[0]
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+
+        assert!(metadata.contains("#482 · @original-author"));
+        assert!(metadata.ends_with("REVIEW"));
+        assert!(!metadata.contains("AUTHOR"));
+    }
+
+    #[test]
+    fn structured_replay_panel_refuses_unpinned_or_truncated_original_head_identity() {
+        let mut replay = model();
+        replay.review_role = Some(ReplayReviewRole::Author);
+        replay.head_commit = "bbbbbbb".to_string();
+
+        assert!(ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).is_none());
     }
 
     #[test]

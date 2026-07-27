@@ -101,9 +101,15 @@ multi-file step without turning the dedicated guide into an editor buffer.
 
 `ReplayActiveSession(callback)` returns the authoritative recovered source,
 bounded original presentation, selected hunk, learning mode, completed
-exercises, and private observations. The bundled coach requests this snapshot
-on `editor:ready`, so `--resume` restores the dedicated guide without fetching,
-creating another worktree, or exposing reusable application tokens.
+exercises, private observations, authenticated review role, exact original PR
+head, and local review outbox. A GitHub review is classified as `author` only
+when a separate, bounded, read-only GraphQL response verifies that the
+authenticated viewer matches the author of the exact same repository, pull
+request, head branch, and immutable head commit. Otherwise it remains
+`reviewer`; repository write permission alone never grants author authority.
+The bundled coach requests this snapshot on `editor:ready`, so `--resume`
+restores the dedicated guide and local drafts without fetching, creating
+another worktree, or exposing reusable application tokens.
 `ReplayListReviews(callback)` discovers editor-owned and safely identified
 legacy scratch reviews in a bounded background worker, returning provenance,
 completion, note counts, and unsaved or active state without exposing source
@@ -112,9 +118,24 @@ snapshot, immutable source, and exact original scratch worktree before opening
 its guide. Reopening never creates a branch or discards unrelated dirty buffers.
 `ReplayAddNote(callback, workspace_id, step_id, category, text)` validates and
 stores a reviewer observation against the exact original author commit and
-source hunk. `ReplaySetMode(callback, workspace_id, mode)` records the selected
-Challenge or Snippet mode in the same editor-owned session. All five calls
-belong to the unreleased source-backed `0.5.1` contract.
+source hunk.
+
+`ReplayAddDraft(callback, workspace_id, step_id, kind, text)` creates a durable
+local review outcome. An `inline_comment` is anchored to the original changed
+path, full head commit, hunk digest, original GitHub `left` or `right` diff
+side, and exact one-based changed-line range. A `code_fix` receives the same
+source anchor and is accepted only for the verified original author; it records
+a proposal and does not modify the PR branch. A `review_summary` uses an empty
+`step_id` and never claims inline coordinates. `ReplayUpdateDraft(callback,
+workspace_id, draft_id, text)` preserves the original anchor while editing a
+local draft. `ReplayRemoveDraft(callback, workspace_id, draft_id)` removes only
+the specified local draft. All draft mutations advance recoverable editor
+state, enforce bounded reviewer text, and reject foreign or stale original
+hunks.
+
+`ReplaySetMode(callback, workspace_id, mode)` records the selected Challenge or
+Snippet mode in the same editor-owned session. These additive calls belong to
+the unreleased source-backed `0.5.1` contract.
 
 Automatic step application remains a single revision- and pre-image-checked
 editor transaction; `a` requires no additional modal, and Replay undo refuses
@@ -122,7 +143,10 @@ to discard newer reviewer-authored changes. After a successful Replay undo, the
 editor sends `replay:undone` with the original workspace and step identities,
 allowing the coach to distinguish restored source from a new manual edit. No
 Replay host call automatically
-saves, commits, pushes, posts a comment, or submits a GitHub review.
+saves, commits, pushes, posts a comment, creates a GitHub pending review, or
+submits a GitHub review. Explicit cross-computer draft saving, GitHub review
+publication, approved author-branch fixes, and agent-generated proposals are
+separate future operations, not implicit effects of the local outbox.
 
 Plugins requiring these additive source-backed calls should declare
 `"red_api_version": "^0.5.1"`.

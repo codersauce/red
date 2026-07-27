@@ -506,6 +506,9 @@ mod tests {
             ("request", "ReplayListReviews"),
             ("request", "ReplayResumeReview"),
             ("request", "ReplayAddNote"),
+            ("request", "ReplayAddDraft"),
+            ("request", "ReplayUpdateDraft"),
+            ("request", "ReplayRemoveDraft"),
             ("request", "ReplaySetMode"),
             ("execute", "ReplayFocusStepSource"),
         ] {

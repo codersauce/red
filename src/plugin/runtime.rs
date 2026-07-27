@@ -1610,6 +1610,61 @@ impl RedHost {
                     .ok_or_else(|| anyhow::anyhow!("ReplayAddNote requires observation text"))?
                     .to_string(),
             },
+            "ReplayAddDraft" => PluginRequest::ReplayAddDraft {
+                request_id,
+                workspace_id: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayAddDraft requires a workspace id"))?
+                    .to_string(),
+                step_id: args
+                    .get(/*index*/ 1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayAddDraft requires a step id"))?
+                    .to_string(),
+                kind: args
+                    .get(/*index*/ 2)
+                    .map(value_to_json)
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .ok_or_else(|| anyhow::anyhow!("ReplayAddDraft requires a draft kind"))?,
+                text: args
+                    .get(/*index*/ 3)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayAddDraft requires draft text"))?
+                    .to_string(),
+            },
+            "ReplayUpdateDraft" => PluginRequest::ReplayUpdateDraft {
+                request_id,
+                workspace_id: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayUpdateDraft requires a workspace id"))?
+                    .to_string(),
+                draft_id: args
+                    .get(/*index*/ 1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayUpdateDraft requires a draft id"))?
+                    .to_string(),
+                text: args
+                    .get(/*index*/ 2)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayUpdateDraft requires draft text"))?
+                    .to_string(),
+            },
+            "ReplayRemoveDraft" => PluginRequest::ReplayRemoveDraft {
+                request_id,
+                workspace_id: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayRemoveDraft requires a workspace id"))?
+                    .to_string(),
+                draft_id: args
+                    .get(/*index*/ 1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayRemoveDraft requires a draft id"))?
+                    .to_string(),
+            },
             "ReplaySetMode" => PluginRequest::ReplaySetMode {
                 request_id,
                 workspace_id: args
@@ -3333,6 +3388,59 @@ mod tests {
         }
     }
 
+    fn recv_replay_outbox() -> crate::plugin::replay_panel::ReplayPanelModel {
+        let model = recv_replay_guide();
+        assert_eq!(
+            model.view,
+            crate::plugin::replay_panel::ReplayPanelView::Outbox
+        );
+        model
+    }
+
+    fn source_backed_review_draft(
+        plan: &crate::replay::ReplayPresentationPlan,
+        id: &str,
+        kind: &str,
+        text: &str,
+    ) -> serde_json::Value {
+        if kind == "review_summary" {
+            return serde_json::json!({
+                "id": id,
+                "target_commit": "b".repeat(40),
+                "step_id": null,
+                "path": null,
+                "kind": kind,
+                "origin": "human",
+                "state": "local",
+                "anchor": null,
+                "text": text,
+                "created_at_ms": 1,
+                "updated_at_ms": 1,
+            });
+        }
+        serde_json::json!({
+            "id": id,
+            "target_commit": "b".repeat(40),
+            "step_id": plan.steps[0].id,
+            "path": plan.steps[0].path,
+            "kind": kind,
+            "origin": "human",
+            "state": "local",
+            "anchor": {
+                "target_commit": "b".repeat(40),
+                "path": plan.steps[0].path,
+                "old_path": plan.steps[0].path,
+                "side": "right",
+                "start_line": 11,
+                "end_line": 12,
+                "hunk_digest": "original-hunk-digest",
+            },
+            "text": text,
+            "created_at_ms": 1,
+            "updated_at_ms": 1,
+        })
+    }
+
     fn recv_replay_source_focus(expected_workspace: &str, expected_step: &str) {
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::ReplayFocusStepSource {
@@ -3573,6 +3681,13 @@ mod tests {
     async fn open_source_backed_replay(
         runtime: &mut Runtime,
     ) -> crate::replay::ReplayPresentationPlan {
+        open_source_backed_replay_with_role(runtime, "reviewer").await
+    }
+
+    async fn open_source_backed_replay_with_role(
+        runtime: &mut Runtime,
+        review_role: &str,
+    ) -> crate::replay::ReplayPresentationPlan {
         runtime
             .load_plugin("replay", include_str!("../../plugins/replay.hk"))
             .await
@@ -3664,6 +3779,9 @@ mod tests {
                     "source_window_id": 11,
                     "workspace_root": "/workspace/repository.replay-revision-1234567",
                     "workspace_branch": "replay/revision-1234567",
+                    "review_role": review_role,
+                    "head_commit": "b".repeat(40),
+                    "drafts": [],
                     "plan": serde_json::to_value(&plan).unwrap(),
                 }),
             )
@@ -5545,6 +5663,14 @@ mod tests {
                     "source_buffer_index": 1,
                     "index": 1,
                     "mode": "snippet",
+                    "review_role": "reviewer",
+                    "head_commit": "b".repeat(40),
+                    "drafts": [source_backed_review_draft(
+                        &plan,
+                        "recovered-local-draft-1",
+                        "inline_comment",
+                        "Recover the original viewport-bound review comment.",
+                    )],
                     "notes": [{ "index": 1, "text": "Check the original viewport bounds." }],
                     "completions": [{ "index": 0, "completion": "automatically applied" }],
                     "plan": serde_json::to_value(&plan).unwrap(),
@@ -5569,11 +5695,30 @@ mod tests {
         assert!(guide.notes[0].text.contains("viewport bounds"));
         assert_eq!(guide.completions.len(), 1);
         assert_eq!(guide.completions[0].index, 0);
+        assert_eq!(
+            guide.review_role,
+            Some(crate::replay::ReplayReviewRole::Reviewer),
+        );
+        assert_eq!(guide.head_commit, "b".repeat(40));
+        assert_eq!(guide.draft_count, 1);
         assert!(guide.notice.contains("Review restored"));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::FocusPanel { id } if id == "replay-coach"
         ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime.execute_command("ReplayOutbox").await.unwrap();
+        let outbox = recv_replay_outbox();
+        assert_eq!(outbox.draft_count, 1);
+        assert_eq!(
+            outbox.drafts[0].state,
+            crate::replay::ReplayDraftState::Local
+        );
+        assert_eq!(
+            outbox.drafts[0].text,
+            "Recover the original viewport-bound review comment.",
+        );
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
@@ -5660,6 +5805,367 @@ mod tests {
         assert_eq!(guide.notes[0].index, 0);
         assert!(guide.notes[0].text.contains("viewport bounds"));
         assert!(guide.notice.contains("Private observation"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_inline_drafts_use_a_multiline_composer_and_stay_in_the_local_outbox() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_source_backed_replay(&mut runtime).await;
+
+        runtime.execute_command("ReplayComment").await.unwrap();
+        let composer = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer {
+                handle,
+                title,
+                query,
+                ..
+            } => {
+                assert_eq!(title.as_deref(), Some("Local inline review comment"));
+                assert!(query.is_empty());
+                handle
+            }
+            _ => panic!("expected a multiline original-source review composer"),
+        };
+        assert!(runtime
+            .notify_composer(
+                composer,
+                ComposerCallback::Submitted(
+                    "Should the viewport be bounded?\nPlease add a regression test.".to_string(),
+                ),
+            )
+            .unwrap());
+
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayAddDraft {
+                request_id,
+                workspace_id,
+                step_id,
+                kind,
+                text,
+            } => {
+                assert_eq!(workspace_id, "real-workspace-1");
+                assert_eq!(step_id, plan.steps[0].id);
+                assert_eq!(kind, crate::replay::ReplayReviewDraftKind::InlineComment);
+                assert_eq!(
+                    text,
+                    "Should the viewport be bounded?\nPlease add a regression test.",
+                );
+                request_id
+            }
+            _ => panic!("expected only an editor-owned original-source inline draft"),
+        };
+        let draft = source_backed_review_draft(
+            &plan,
+            "local-draft-1",
+            "inline_comment",
+            "Should the viewport be bounded?\nPlease add a regression test.",
+        );
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "real-workspace-1",
+                    "draft": draft,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let outbox = recv_replay_outbox();
+        assert_eq!(outbox.draft_count, 1);
+        assert_eq!(
+            outbox.drafts[0].kind,
+            crate::replay::ReplayReviewDraftKind::InlineComment,
+        );
+        assert_eq!(
+            outbox.drafts[0].state,
+            crate::replay::ReplayDraftState::Local
+        );
+        let anchor = outbox.drafts[0].anchor.as_ref().unwrap();
+        assert_eq!(anchor.path.to_string_lossy(), "src/editor/rendering.rs");
+        assert_eq!(anchor.start_line, 11);
+        assert_eq!(anchor.end_line, 12);
+        assert_eq!(anchor.side, crate::replay::ReplayDiffSide::Right);
+        assert!(outbox.drafts[0]
+            .text
+            .contains("Please add a regression test."));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime.execute_command("ReplayOutbox").await.unwrap();
+        let guide = recv_replay_guide();
+        assert_eq!(guide.draft_count, 1);
+        assert_eq!(
+            guide.review_role,
+            Some(crate::replay::ReplayReviewRole::Reviewer),
+        );
+        assert_eq!(guide.head_commit, "b".repeat(40));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime.execute_command("ReplayOutbox").await.unwrap();
+        assert_eq!(recv_replay_outbox().drafts.len(), 1);
+        runtime.execute_command("ReplayEditDraft").await.unwrap();
+        let composer = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer {
+                handle,
+                title,
+                query,
+                ..
+            } => {
+                assert_eq!(title.as_deref(), Some("Edit local review draft"));
+                assert!(query.contains("Should the viewport be bounded?"));
+                handle
+            }
+            _ => panic!("expected an editable local review draft composer"),
+        };
+        assert!(runtime
+            .notify_composer(
+                composer,
+                ComposerCallback::Submitted("Please cover the exact viewport boundary.".into()),
+            )
+            .unwrap());
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayUpdateDraft {
+                request_id,
+                workspace_id,
+                draft_id,
+                text,
+            } => {
+                assert_eq!(workspace_id, "real-workspace-1");
+                assert_eq!(draft_id, "local-draft-1");
+                assert_eq!(text, "Please cover the exact viewport boundary.");
+                request_id
+            }
+            _ => panic!("expected an update to the exact existing local draft"),
+        };
+        let updated = source_backed_review_draft(
+            &plan,
+            "local-draft-1",
+            "inline_comment",
+            "Please cover the exact viewport boundary.",
+        );
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "real-workspace-1",
+                    "draft": updated,
+                }),
+            )
+            .await
+            .unwrap();
+        let outbox = recv_replay_outbox();
+        assert_eq!(
+            outbox.drafts[0].text,
+            "Please cover the exact viewport boundary.",
+        );
+        let anchor = outbox.drafts[0].anchor.as_ref().unwrap();
+        assert_eq!(anchor.path.to_string_lossy(), "src/editor/rendering.rs");
+        assert_eq!((anchor.start_line, anchor.end_line), (11, 12));
+
+        runtime.execute_command("ReplayDiscardDraft").await.unwrap();
+        let confirmation = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackConfirmation { handle, .. } => handle,
+            _ => panic!("expected confirmation before discarding reviewer-authored local text"),
+        };
+        let accept = serde_json::from_value(serde_json::json!({
+            "id": "accept",
+            "label": "Accept",
+        }))
+        .unwrap();
+        assert!(runtime
+            .notify_picker(confirmation, PickerCallback::Selected(accept))
+            .unwrap());
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayRemoveDraft {
+                request_id,
+                workspace_id,
+                draft_id,
+            } => {
+                assert_eq!(workspace_id, "real-workspace-1");
+                assert_eq!(draft_id, "local-draft-1");
+                request_id
+            }
+            _ => panic!("expected only the chosen local draft to be removed"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "real-workspace-1",
+                    "draft": source_backed_review_draft(
+                        &plan,
+                        "local-draft-1",
+                        "inline_comment",
+                        "Please cover the exact viewport boundary.",
+                    ),
+                }),
+            )
+            .await
+            .unwrap();
+        let outbox = recv_replay_outbox();
+        assert_eq!(outbox.draft_count, 0);
+        assert!(outbox.drafts.is_empty());
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_summaries_stay_at_pull_request_level_without_an_inline_step() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_source_backed_replay(&mut runtime).await;
+
+        runtime.execute_command("ReplaySummary").await.unwrap();
+        let composer = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer { handle, title, .. } => {
+                assert_eq!(title.as_deref(), Some("Local pull request review summary"));
+                handle
+            }
+            _ => panic!("expected a multiline PR-level review summary composer"),
+        };
+        assert!(runtime
+            .notify_composer(
+                composer,
+                ComposerCallback::Submitted("The change needs broader regression tests.".into()),
+            )
+            .unwrap());
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayAddDraft {
+                request_id,
+                workspace_id,
+                step_id,
+                kind,
+                text,
+            } => {
+                assert_eq!(workspace_id, "real-workspace-1");
+                assert!(step_id.is_empty());
+                assert_eq!(kind, crate::replay::ReplayReviewDraftKind::ReviewSummary);
+                assert_eq!(text, "The change needs broader regression tests.");
+                request_id
+            }
+            _ => panic!("expected only a local PR-level review draft"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "real-workspace-1",
+                    "draft": source_backed_review_draft(
+                        &plan,
+                        "local-summary-1",
+                        "review_summary",
+                        "The change needs broader regression tests.",
+                    ),
+                }),
+            )
+            .await
+            .unwrap();
+
+        let outbox = recv_replay_outbox();
+        assert_eq!(
+            outbox.drafts[0].kind,
+            crate::replay::ReplayReviewDraftKind::ReviewSummary,
+        );
+        assert_eq!(
+            outbox.drafts[0].text,
+            "The change needs broader regression tests.",
+        );
+        assert!(outbox.drafts[0].anchor.is_none());
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn nonauthor_replay_refuses_pr_code_fix_without_starting_a_process_or_agent() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        open_source_backed_replay(&mut runtime).await;
+
+        runtime.execute_command("ReplayFix").await.unwrap();
+
+        let guide = recv_replay_guide();
+        assert_eq!(
+            guide.review_role,
+            Some(crate::replay::ReplayReviewRole::Reviewer),
+        );
+        assert!(guide.notice.contains("verified original PR author"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn original_author_can_draft_a_fix_without_modifying_or_pushing_the_pr() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_source_backed_replay_with_role(&mut runtime, "author").await;
+
+        runtime.execute_command("ReplayFix").await.unwrap();
+        let composer = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer { handle, title, .. } => {
+                assert_eq!(title.as_deref(), Some("Local original-PR fix proposal"));
+                handle
+            }
+            _ => panic!("expected only an author's local proposed-fix composer"),
+        };
+        assert!(runtime
+            .notify_composer(
+                composer,
+                ComposerCallback::Submitted("Apply the bounded viewport helper.".into()),
+            )
+            .unwrap());
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayAddDraft {
+                request_id,
+                workspace_id,
+                step_id,
+                kind,
+                text,
+            } => {
+                assert_eq!(workspace_id, "real-workspace-1");
+                assert_eq!(step_id, plan.steps[0].id);
+                assert_eq!(kind, crate::replay::ReplayReviewDraftKind::CodeFix);
+                assert_eq!(text, "Apply the bounded viewport helper.");
+                request_id
+            }
+            _ => panic!("expected a local fix proposal, never a process or PR mutation"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "real-workspace-1",
+                    "draft": source_backed_review_draft(
+                        &plan,
+                        "local-fix-1",
+                        "code_fix",
+                        "Apply the bounded viewport helper.",
+                    ),
+                }),
+            )
+            .await
+            .unwrap();
+
+        let outbox = recv_replay_outbox();
+        assert_eq!(
+            outbox.drafts[0].kind,
+            crate::replay::ReplayReviewDraftKind::CodeFix,
+        );
+        assert_eq!(
+            outbox.drafts[0].state,
+            crate::replay::ReplayDraftState::Local
+        );
+        assert_eq!(
+            outbox.review_role,
+            Some(crate::replay::ReplayReviewRole::Author),
+        );
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 

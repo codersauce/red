@@ -322,6 +322,12 @@ Esc = { EnterMode = "Normal" }
 "u" = "ReplayUndo"
 "o" = { PluginCommand = "ReplayNote" }
 "f" = { PluginCommand = "ReplayFindings" }
+"c" = { PluginCommand = "ReplayComment" }
+"F" = { PluginCommand = "ReplayFix" }
+"r" = { PluginCommand = "ReplayOutbox" }
+"s" = { PluginCommand = "ReplaySummary" }
+"e" = { PluginCommand = "ReplayEditDraft" }
+"d" = { PluginCommand = "ReplayDiscardDraft" }
 "q" = { PluginCommand = "ReplayClose" }
 
 [keys.normal." "."d"]

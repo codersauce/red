@@ -2941,6 +2941,12 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
             ("a", "ReplayApply"),
             ("o", "ReplayNote"),
             ("f", "ReplayFindings"),
+            ("c", "ReplayComment"),
+            ("F", "ReplayFix"),
+            ("r", "ReplayOutbox"),
+            ("s", "ReplaySummary"),
+            ("e", "ReplayEditDraft"),
+            ("d", "ReplayDiscardDraft"),
             ("q", "ReplayClose"),
         ] {
             assert_eq!(

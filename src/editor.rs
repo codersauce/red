@@ -816,6 +816,24 @@ pub enum PluginRequest {
         category: crate::replay::ReplayNoteCategory,
         text: String,
     },
+    ReplayAddDraft {
+        request_id: RequestId,
+        workspace_id: String,
+        step_id: String,
+        kind: crate::replay::ReplayReviewDraftKind,
+        text: String,
+    },
+    ReplayUpdateDraft {
+        request_id: RequestId,
+        workspace_id: String,
+        draft_id: String,
+        text: String,
+    },
+    ReplayRemoveDraft {
+        request_id: RequestId,
+        workspace_id: String,
+        draft_id: String,
+    },
     ReplaySetMode {
         request_id: RequestId,
         workspace_id: String,
@@ -1131,6 +1149,9 @@ impl PluginRequest {
             Self::ReplayListReviews { .. } => "ReplayListReviews",
             Self::ReplayResumeReview { .. } => "ReplayResumeReview",
             Self::ReplayAddNote { .. } => "ReplayAddNote",
+            Self::ReplayAddDraft { .. } => "ReplayAddDraft",
+            Self::ReplayUpdateDraft { .. } => "ReplayUpdateDraft",
+            Self::ReplayRemoveDraft { .. } => "ReplayRemoveDraft",
             Self::ReplaySetMode { .. } => "ReplaySetMode",
             Self::ReplayBackgroundCompleted { .. } => "ReplayBackgroundCompleted",
             Self::ReplayFocusStepSource { .. } => "ReplayFocusStepSource",
@@ -3867,6 +3888,8 @@ impl Editor {
             .buffer_manager
             .iter()
             .position(|buffer| buffer.id() == workspace.source_buffer);
+        let pull_request = session.source.pull_request.as_ref();
+        let drafts = &session.review.drafts;
 
         json!({
             "ok": true,
@@ -3879,6 +3902,27 @@ impl Editor {
             "source_window_id": workspace.source_window.0,
             "index": index,
             "mode": session.mode,
+            "review_role": session.review.role,
+            "viewer": pull_request.and_then(|request| request.capabilities.viewer.as_deref()),
+            "head_ref": pull_request.map(|request| request.head_ref.as_str()),
+            "head_commit": session.source.target_commit.as_str(),
+            "head_permission": pull_request.map(|request| request.capabilities.head_permission),
+            "drafts": drafts,
+            "outbox": {
+                "draft_count": drafts.len(),
+                "inline_count": drafts
+                    .iter()
+                    .filter(|draft| draft.kind == crate::replay::ReplayReviewDraftKind::InlineComment)
+                    .count(),
+                "fix_count": drafts
+                    .iter()
+                    .filter(|draft| draft.kind == crate::replay::ReplayReviewDraftKind::CodeFix)
+                    .count(),
+                "summary_count": drafts
+                    .iter()
+                    .filter(|draft| draft.kind == crate::replay::ReplayReviewDraftKind::ReviewSummary)
+                    .count(),
+            },
             "notes": notes,
             "completions": completions,
             "plan": presentation,
@@ -4069,6 +4113,10 @@ impl Editor {
                 .map(|context| context.title.as_str())
                 .unwrap_or("Local branch replay"),
             "branch": display.head_ref,
+            "review_role": crate::replay::ReplayReviewRole::from_pull_request(pull_request),
+            "viewer": pull_request.and_then(|request| request.capabilities.viewer.as_deref()),
+            "head_commit": source.target_commit.as_str(),
+            "head_permission": pull_request.map(|request| request.capabilities.head_permission),
             "base_ref": display.base_ref,
             "base_commit": source.base_commit.as_str(),
             "target_commit": source.target_commit.as_str(),
@@ -4141,6 +4189,12 @@ impl Editor {
             "author": resolved.pull_request.author,
             "title": resolved.context.title,
             "branch": resolved.pull_request.head_ref,
+            "review_role": crate::replay::ReplayReviewRole::from_pull_request(Some(
+                &resolved.pull_request
+            )),
+            "viewer": resolved.pull_request.capabilities.viewer,
+            "head_commit": resolved.pull_request.head_commit.as_str(),
+            "head_permission": resolved.pull_request.capabilities.head_permission,
             "base_ref": resolved.pull_request.base_ref,
             "missing_object_count": missing_objects.len(),
             "missing_objects": missing_objects,
@@ -4281,6 +4335,8 @@ impl Editor {
             self.focus_replay_step_source(&id, &initial_step),
             "Replay could not focus the initial original source hunk"
         );
+        let recovered = self.replay_controller.session(&id)?;
+        let pull_request = recovered.source.pull_request.as_ref();
         Ok(json!({
             "ok": true,
             "workspace_id": id,
@@ -4288,6 +4344,11 @@ impl Editor {
             "source_window_id": source_window.0,
             "workspace_root": workspace.root,
             "workspace_branch": workspace.branch,
+            "review_role": recovered.review.role,
+            "viewer": pull_request.and_then(|request| request.capabilities.viewer.as_deref()),
+            "head_commit": recovered.source.target_commit.as_str(),
+            "head_permission": pull_request.map(|request| request.capabilities.head_permission),
+            "drafts": recovered.review.drafts,
             "plan": presentation,
         }))
     }
@@ -8379,14 +8440,14 @@ impl Editor {
                                     crate::replay::ReplayError::Filesystem(error.to_string())
                                 })?
                             };
-                            let snapshot = store.load().map_err(|error| {
+                            let mut snapshot = store.load().map_err(|error| {
                                 crate::replay::ReplayError::Filesystem(error.to_string())
                             })?;
                             let session = snapshot
                                 .replay
-                                .as_ref()
+                                .as_mut()
                                 .and_then(|recovery| {
-                                    recovery.controller.sessions.iter().find(|session| {
+                                    recovery.controller.sessions.iter_mut().find(|session| {
                                         Some(session.id.as_str()) == review.session_id.as_deref()
                                     })
                                 })
@@ -8402,6 +8463,31 @@ impl Editor {
                                 return Err(crate::replay::ReplayError::WorkspaceExists(
                                     review.workspace_root.display().to_string(),
                                 ));
+                            }
+                            if session
+                                .source
+                                .pull_request
+                                .as_ref()
+                                .is_some_and(|request| request.capabilities.viewer.is_none())
+                            {
+                                match crate::replay::refresh_pull_request_capabilities(
+                                    &mut session.source,
+                                    limits,
+                                ) {
+                                    Ok(()) => {
+                                        session.review.role =
+                                            crate::replay::ReplayReviewRole::from_pull_request(
+                                                session.source.pull_request.as_ref(),
+                                            );
+                                        session.generation = session.generation.saturating_add(1);
+                                        if let Some(recovery) = snapshot.replay.as_mut() {
+                                            recovery.controller.generation =
+                                                recovery.controller.generation.saturating_add(1);
+                                        }
+                                    }
+                                    Err(crate::replay::ReplayError::CommandFailed { .. }) => {}
+                                    Err(error) => return Err(error),
+                                }
                             }
                             Ok(ReplayBackgroundResult::ReviewSnapshot {
                                 review_id: review.id,
@@ -8446,6 +8532,81 @@ impl Editor {
                                     "index": index,
                                     "text": note.text,
                                 },
+                            })
+                        }
+                        Err(error) => error.payload(),
+                    };
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
+                }
+                PluginRequest::ReplayAddDraft {
+                    request_id,
+                    workspace_id,
+                    step_id,
+                    kind,
+                    text,
+                } => {
+                    let result = self.replay_controller.add_review_draft(
+                        &workspace_id,
+                        (!step_id.is_empty()).then_some(step_id.as_str()),
+                        kind,
+                        &text,
+                    );
+                    let payload = match result {
+                        Ok(draft) => {
+                            needs_render = true;
+                            json!({
+                                "ok": true,
+                                "workspace_id": workspace_id,
+                                "draft": draft,
+                            })
+                        }
+                        Err(error) => error.payload(),
+                    };
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
+                }
+                PluginRequest::ReplayUpdateDraft {
+                    request_id,
+                    workspace_id,
+                    draft_id,
+                    text,
+                } => {
+                    let result =
+                        self.replay_controller
+                            .update_review_draft(&workspace_id, &draft_id, &text);
+                    let payload = match result {
+                        Ok(draft) => {
+                            needs_render = true;
+                            json!({
+                                "ok": true,
+                                "workspace_id": workspace_id,
+                                "draft": draft,
+                            })
+                        }
+                        Err(error) => error.payload(),
+                    };
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
+                }
+                PluginRequest::ReplayRemoveDraft {
+                    request_id,
+                    workspace_id,
+                    draft_id,
+                } => {
+                    let result = self
+                        .replay_controller
+                        .remove_review_draft(&workspace_id, &draft_id);
+                    let payload = match result {
+                        Ok(draft) => {
+                            needs_render = true;
+                            json!({
+                                "ok": true,
+                                "workspace_id": workspace_id,
+                                "draft": draft,
                             })
                         }
                         Err(error) => error.payload(),
@@ -23582,6 +23743,15 @@ mod test {
             .expect("retain a private finding on the actual original hunk");
         editor
             .replay_controller
+            .add_review_draft(
+                &workspace_id,
+                Some(&second_id),
+                crate::replay::ReplayReviewDraftKind::InlineComment,
+                "Should the original second-source change include a bounds test?",
+            )
+            .expect("retain a recoverable comment on the exact original source line");
+        editor
+            .replay_controller
             .set_mode(&workspace_id, crate::replay::ReplayMode::Snippet)
             .expect("retain the selected review mode");
         assert!(editor.focus_replay_step_source(&workspace_id, &second_id));
@@ -23593,6 +23763,7 @@ mod test {
             .expect("real review state belongs to the core recovery snapshot");
         assert_eq!(replay.controller.sessions.len(), 1);
         assert_eq!(replay.controller.sessions[0].notes.len(), 1);
+        assert_eq!(replay.controller.sessions[0].review.drafts.len(), 1);
         assert_eq!(replay.applied_steps.len(), 1);
         assert_eq!(replay.applied_steps[0].step_id, first_id);
         assert_eq!(
@@ -23628,6 +23799,16 @@ mod test {
         assert_eq!(restored["index"], 1);
         assert_eq!(restored["mode"], "snippet");
         assert_eq!(restored["plan"]["branch"], "feature/replay");
+        assert_eq!(restored["review_role"], "reviewer");
+        assert_eq!(restored["head_commit"], "b".repeat(40));
+        assert_eq!(restored["outbox"]["draft_count"], 1);
+        assert_eq!(restored["outbox"]["inline_count"], 1);
+        assert_eq!(restored["drafts"][0]["kind"], "inline_comment");
+        assert_eq!(restored["drafts"][0]["anchor"]["side"], "right");
+        assert_eq!(
+            restored["drafts"][0]["text"],
+            "Should the original second-source change include a bounds test?",
+        );
         assert_eq!(restored["notes"][0]["index"], 1);
         assert_eq!(
             restored["notes"][0]["text"],
