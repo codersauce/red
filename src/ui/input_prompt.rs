@@ -314,6 +314,23 @@ mod tests {
     }
 
     #[test]
+    fn combining_mark_paste_keeps_input_prompt_cursor_after_merged_grapheme() {
+        let editor = editor();
+        let mut prompt = InputPrompt::new(&editor, "Rename symbol", "aX", Action::Print);
+
+        prompt.handle_event(&key(KeyCode::Left));
+        prompt.handle_event(&Event::Paste("\u{301}".to_string()));
+
+        assert_eq!(prompt.prompt.text(), "a\u{301}X");
+        assert_eq!(prompt.prompt.cursor(), 1);
+
+        prompt.handle_event(&key(KeyCode::Char('Z')));
+
+        assert_eq!(prompt.prompt.text(), "a\u{301}ZX");
+        assert_eq!(prompt.prompt.cursor(), 2);
+    }
+
+    #[test]
     fn paste_is_single_line_and_backspace_removes_one_grapheme() {
         let editor = editor();
         let mut prompt = InputPrompt::new(&editor, "Rename symbol", "old", Action::Print);

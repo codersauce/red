@@ -585,6 +585,23 @@ mod tests {
     }
 
     #[test]
+    fn combining_mark_insertion_keeps_agent_composer_cursor_after_merged_grapheme() {
+        let editor = editor(60, 18);
+        let mut composer = new_composer(&editor, None, 7, "aX".to_string(), vec![]);
+
+        composer.handle_event(&key(KeyCode::Left, KeyModifiers::NONE));
+        composer.handle_event(&key(KeyCode::Char('\u{301}'), KeyModifiers::NONE));
+
+        assert_eq!(composer.prompt.text(), "a\u{301}X");
+        assert_eq!(composer.prompt.cursor(), 1);
+
+        composer.handle_event(&key(KeyCode::Char('Z'), KeyModifiers::NONE));
+
+        assert_eq!(composer.prompt.text(), "a\u{301}ZX");
+        assert_eq!(composer.prompt.cursor(), 2);
+    }
+
+    #[test]
     fn newline_shortcuts_and_vertical_motion_work_on_wrapped_lines() {
         let editor = editor(40, 14);
         let mut composer = new_composer(&editor, None, 1, "a".repeat(40), vec![]);

@@ -141,12 +141,16 @@ impl PromptBuffer {
             return false;
         }
         let cursor = self.cursor;
-        let inserted = grapheme_len(&text);
+        let mut resulting_prefix = self.text();
+        let insertion_byte = grapheme_to_byte(&resulting_prefix, cursor);
+        resulting_prefix.truncate(insertion_byte);
+        resulting_prefix.push_str(&text);
+        let resulting_cursor = grapheme_len(&resulting_prefix);
         self.replace_user_graphemes(
             cursor,
             cursor,
             &text,
-            cursor.saturating_add(inserted),
+            resulting_cursor,
             "insert into prompt",
         )
     }
@@ -689,6 +693,93 @@ mod tests {
         assert!(prompt.redo());
         assert_eq!(prompt.text(), "hello world");
         assert_eq!(prompt.cursor(), 11);
+    }
+
+    #[test]
+    fn insertion_keeps_cursor_after_merged_graphemes() {
+        let cases = [
+            (
+                "combining mark",
+                "aX",
+                1,
+                "\u{301}",
+                "a\u{301}X",
+                1,
+                "a\u{301}ZX",
+            ),
+            (
+                "stacked combining marks",
+                "a\u{301}X",
+                1,
+                "\u{327}",
+                "a\u{301}\u{327}X",
+                1,
+                "a\u{301}\u{327}ZX",
+            ),
+            ("emoji modifier", "👍X", 1, "🏽", "👍🏽X", 1, "👍🏽ZX"),
+            (
+                "joined emoji",
+                "👩X",
+                1,
+                "\u{200d}💻",
+                "👩\u{200d}💻X",
+                1,
+                "👩\u{200d}💻ZX",
+            ),
+            (
+                "multiline combining mark",
+                "one\naX\ntail",
+                5,
+                "\u{301}",
+                "one\na\u{301}X\ntail",
+                5,
+                "one\na\u{301}ZX\ntail",
+            ),
+            (
+                "multiple inserted graphemes",
+                "aX",
+                1,
+                "\u{301}b",
+                "a\u{301}bX",
+                2,
+                "a\u{301}bZX",
+            ),
+        ];
+
+        for (name, initial, cursor, inserted, merged, merged_cursor, subsequent) in cases {
+            let mut prompt = PromptBuffer::new(initial);
+            prompt.set_cursor(cursor);
+
+            assert!(prompt.insert(inserted), "{name}: insert grapheme extension");
+            assert_eq!(prompt.text(), merged, "{name}: preserve merged grapheme");
+            assert_eq!(
+                prompt.cursor(),
+                merged_cursor,
+                "{name}: position cursor after resulting prefix"
+            );
+
+            assert!(prompt.insert("Z"), "{name}: insert following character");
+            assert_eq!(prompt.text(), subsequent, "{name}: preserve following text");
+            assert_eq!(prompt.cursor(), merged_cursor + 1, "{name}: advance cursor");
+
+            assert!(prompt.undo(), "{name}: undo following character");
+            assert_eq!(prompt.text(), merged, "{name}: restore merged grapheme");
+            assert_eq!(
+                prompt.cursor(),
+                merged_cursor,
+                "{name}: restore merged cursor"
+            );
+            assert!(prompt.undo(), "{name}: undo grapheme extension");
+            assert_eq!(prompt.text(), initial, "{name}: restore original text");
+            assert_eq!(prompt.cursor(), cursor, "{name}: restore original cursor");
+
+            assert!(prompt.redo(), "{name}: redo grapheme extension");
+            assert_eq!(prompt.text(), merged, "{name}: redo merged grapheme");
+            assert_eq!(prompt.cursor(), merged_cursor, "{name}: redo merged cursor");
+            assert!(prompt.redo(), "{name}: redo following character");
+            assert_eq!(prompt.text(), subsequent, "{name}: redo following text");
+            assert_eq!(prompt.cursor(), merged_cursor + 1, "{name}: redo cursor");
+        }
     }
 
     #[test]
