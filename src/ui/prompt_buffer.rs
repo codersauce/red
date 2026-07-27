@@ -428,7 +428,10 @@ impl PromptBuffer {
             'k' => self.move_vertical(-1, wrap_width),
             'l' => self.set_cursor(self.cursor.saturating_add(1)),
             '0' => self.set_cursor(self.current_line_start()),
-            '$' => self.set_cursor(self.current_line_end()),
+            '$' => {
+                let line_end = self.current_line_end();
+                self.set_cursor(line_end.saturating_sub(1).max(self.current_line_start()));
+            }
             'w' => self.set_cursor(self.next_word_boundary()),
             'o' => {
                 self.set_cursor(self.current_line_end());
@@ -780,6 +783,78 @@ mod tests {
             PromptInput::Changed
         );
         assert_eq!(prompt.text(), "second");
+    }
+
+    #[test]
+    fn normal_mode_line_end_selects_the_current_lines_final_grapheme() {
+        let cases = [
+            ("single line", "abc", 0, 2, Some("ab"), "abZc"),
+            ("first line", "abc\ndef", 0, 2, Some("ab\ndef"), "abZc\ndef"),
+            (
+                "middle line",
+                "one\ntwo\nthree",
+                5,
+                6,
+                Some("one\ntw\nthree"),
+                "one\ntwZo\nthree",
+            ),
+            ("last line", "one\ntwo", 5, 6, Some("one\ntw"), "one\ntwZo"),
+            (
+                "Unicode graphemes",
+                "e\u{301}👨‍👩‍👧\nlast",
+                0,
+                1,
+                Some("e\u{301}\nlast"),
+                "e\u{301}Z👨‍👩‍👧\nlast",
+            ),
+            ("empty line", "first\n\nlast", 6, 6, None, "first\nZ\nlast"),
+            ("empty draft", "", 0, 0, None, "Z"),
+        ];
+
+        for (name, text, cursor, line_end, expected_delete, expected_insert) in cases {
+            let at_line_end = || {
+                let mut prompt = PromptBuffer::new(text);
+                prompt.set_cursor(cursor);
+                prompt.set_mode(Mode::Normal);
+
+                assert_eq!(
+                    prompt.handle_event(&key(KeyCode::Char('$'), KeyModifiers::NONE), 40),
+                    PromptInput::Changed,
+                    "{name}: move to current line end"
+                );
+                assert_eq!(prompt.mode(), Mode::Normal, "{name}: remain in normal mode");
+                assert_eq!(prompt.cursor(), line_end, "{name}: select final grapheme");
+                prompt
+            };
+
+            if let Some(expected) = expected_delete {
+                let mut prompt = at_line_end();
+                assert_eq!(
+                    prompt.handle_event(&key(KeyCode::Char('x'), KeyModifiers::NONE), 40),
+                    PromptInput::Changed,
+                    "{name}: delete final grapheme"
+                );
+                assert_eq!(prompt.text(), expected, "{name}: preserve other lines");
+            }
+
+            let mut prompt = at_line_end();
+            assert_eq!(
+                prompt.handle_event(&key(KeyCode::Char('i'), KeyModifiers::NONE), 40),
+                PromptInput::Changed,
+                "{name}: enter insert mode"
+            );
+            assert_eq!(prompt.mode(), Mode::Insert, "{name}: enter insert mode");
+            assert_eq!(
+                prompt.handle_event(&key(KeyCode::Char('Z'), KeyModifiers::NONE), 40),
+                PromptInput::Changed,
+                "{name}: insert before final grapheme"
+            );
+            assert_eq!(
+                prompt.text(),
+                expected_insert,
+                "{name}: insert on current line"
+            );
+        }
     }
 
     #[test]
