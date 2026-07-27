@@ -446,7 +446,11 @@ impl ReplayController {
         if step.path != path {
             return Ok(ReplayValidation::Conflict);
         }
-        Ok(validate_text(step, text))
+        Ok(validate_text(
+            step,
+            text,
+            effective_old_start(session, step),
+        ))
     }
 
     /// Issues one immutable, session-owned preview without changing an editor buffer.
@@ -470,7 +474,7 @@ impl ReplayController {
         if step.path != path {
             return Err(ReplayError::AnchorConflict);
         }
-        let range = anchored_range(step, text)?;
+        let range = anchored_range(step, text, effective_old_start(session, step))?;
         let stage = ReplayStage {
             token: uuid::Uuid::new_v4().to_string(),
             session_id: session_id.to_string(),
@@ -509,7 +513,7 @@ impl ReplayController {
             .iter()
             .find(|step| step.id == stage.step_id)
             .ok_or(ReplayError::StalePreview)?;
-        if anchored_range(step, text)? != stage.range {
+        if anchored_range(step, text, effective_old_start(session, step))? != stage.range {
             return Err(ReplayError::StalePreview);
         }
         Ok(stage)
@@ -783,7 +787,7 @@ impl ReplaySession {
     }
 }
 
-fn validate_text(step: &ReplayStep, text: &str) -> ReplayValidation {
+fn validate_text(step: &ReplayStep, text: &str, old_start: usize) -> ReplayValidation {
     if step.before.is_empty() {
         if text == step.after || (text.ends_with('\n') && text.trim_end_matches('\n') == step.after)
         {
@@ -794,41 +798,162 @@ fn validate_text(step: &ReplayStep, text: &str) -> ReplayValidation {
         }
         return ReplayValidation::Conflict;
     }
-    let after_count = count_matches(text, &step.after);
-    if after_count == 1 {
-        return ReplayValidation::Exact;
+    if !step.after.is_empty() {
+        match anchored_hunk_offset(text, &step.after, old_start) {
+            Ok(_) => return ReplayValidation::Exact,
+            Err(ReplayError::AnchorConflict)
+                if has_equidistant_hunk_candidates(text, &step.after, old_start) =>
+            {
+                return ReplayValidation::Ambiguous;
+            }
+            Err(_) => {}
+        }
     }
-    if after_count > 1 {
-        return ReplayValidation::Ambiguous;
-    }
-    match count_matches(text, &step.before) {
-        1 => ReplayValidation::Incomplete,
-        0 => ReplayValidation::Conflict,
-        _ => ReplayValidation::Ambiguous,
+
+    match anchored_hunk_offset(text, &step.before, old_start) {
+        Ok(_) => ReplayValidation::Incomplete,
+        Err(ReplayError::AnchorConflict)
+            if has_equidistant_hunk_candidates(text, &step.before, old_start) =>
+        {
+            ReplayValidation::Ambiguous
+        }
+        Err(_) => ReplayValidation::Conflict,
     }
 }
 
-fn count_matches(text: &str, pattern: &str) -> usize {
+fn effective_old_start(session: &ReplaySession, step: &ReplayStep) -> usize {
+    let line_delta = session
+        .steps
+        .iter()
+        .take_while(|candidate| candidate.id != step.id)
+        .filter(|candidate| {
+            candidate.path == step.path && candidate.status == ReplayStepStatus::Done
+        })
+        .fold(0_isize, |delta, candidate| {
+            delta.saturating_add(replay_line_delta(&candidate.before, &candidate.after))
+        });
+    step.old_start.saturating_add_signed(line_delta).max(1)
+}
+
+pub(super) fn replay_line_delta(before: &str, after: &str) -> isize {
+    let before_lines = before.bytes().filter(|byte| *byte == b'\n').count();
+    let after_lines = after.bytes().filter(|byte| *byte == b'\n').count();
+    let before_lines = isize::try_from(before_lines).unwrap_or(isize::MAX);
+    let after_lines = isize::try_from(after_lines).unwrap_or(isize::MAX);
+    after_lines.saturating_sub(before_lines)
+}
+
+fn has_equidistant_hunk_candidates(text: &str, pattern: &str, old_start: usize) -> bool {
     if pattern.is_empty() {
-        return 0;
+        return false;
     }
-    text.match_indices(pattern).count()
+
+    let expected_line = old_start.max(1);
+    let mut previous_offset = 0;
+    let mut current_line = 1_usize;
+    let mut minimum_distance = usize::MAX;
+    let mut closest_count = 0_usize;
+
+    for (offset, _) in text.match_indices(pattern) {
+        current_line = current_line.saturating_add(
+            text[previous_offset..offset]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count(),
+        );
+        previous_offset = offset;
+        if offset != 0 && text.as_bytes()[offset - 1] != b'\n' {
+            continue;
+        }
+
+        let end = offset + pattern.len();
+        if !pattern.ends_with('\n') && end != text.len() && text.as_bytes().get(end) != Some(&b'\n')
+        {
+            continue;
+        }
+
+        let distance = current_line.abs_diff(expected_line);
+        match distance.cmp(&minimum_distance) {
+            std::cmp::Ordering::Less => {
+                minimum_distance = distance;
+                closest_count = 1;
+            }
+            std::cmp::Ordering::Equal => closest_count = closest_count.saturating_add(1),
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+
+    closest_count > 1
 }
 
-fn anchored_range(step: &ReplayStep, text: &str) -> Result<TextRange, ReplayError> {
+pub(super) fn anchored_hunk_offset(
+    text: &str,
+    pattern: &str,
+    old_start: usize,
+) -> Result<usize, ReplayError> {
+    if pattern.is_empty() {
+        return Err(ReplayError::AnchorConflict);
+    }
+
+    let expected_line = old_start.max(1);
+    let mut previous_offset = 0;
+    let mut current_line = 1_usize;
+    let mut closest: Option<(usize, usize)> = None;
+    let mut tied = false;
+
+    for (offset, _) in text.match_indices(pattern) {
+        current_line = current_line.saturating_add(
+            text[previous_offset..offset]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count(),
+        );
+        previous_offset = offset;
+        if offset != 0 && text.as_bytes()[offset - 1] != b'\n' {
+            continue;
+        }
+
+        let end = offset + pattern.len();
+        if !pattern.ends_with('\n') && end != text.len() && text.as_bytes().get(end) != Some(&b'\n')
+        {
+            continue;
+        }
+
+        let distance = current_line.abs_diff(expected_line);
+        match closest {
+            None => {
+                closest = Some((distance, offset));
+                tied = false;
+            }
+            Some((best_distance, _)) if distance < best_distance => {
+                closest = Some((distance, offset));
+                tied = false;
+            }
+            Some((best_distance, _)) if distance == best_distance => tied = true,
+            Some(_) => {}
+        }
+    }
+
+    if tied {
+        return Err(ReplayError::AnchorConflict);
+    }
+    closest
+        .map(|(_, offset)| offset)
+        .ok_or(ReplayError::AnchorConflict)
+}
+
+fn anchored_range(
+    step: &ReplayStep,
+    text: &str,
+    old_start: usize,
+) -> Result<TextRange, ReplayError> {
     if step.before.is_empty() {
         if text.is_empty() || text == "\n" {
             return Ok(TextRange::insertion(TextPosition::new(0, 0)));
         }
         return Err(ReplayError::AnchorConflict);
     }
-    let mut matches = text.match_indices(&step.before);
-    let Some((start, _)) = matches.next() else {
-        return Err(ReplayError::AnchorConflict);
-    };
-    if matches.next().is_some() {
-        return Err(ReplayError::AnchorConflict);
-    }
+    let start = anchored_hunk_offset(text, &step.before, old_start)?;
     Ok(TextRange::new(
         text_position_at_byte(text, start),
         text_position_at_byte(text, start + step.before.len()),
@@ -940,14 +1065,61 @@ mod tests {
     }
 
     #[test]
-    fn refuses_ambiguous_original_context() {
+    fn repeated_original_context_uses_the_pinned_hunk_line() {
         let (mut controller, session, step) = controller_with_session();
         let old = "fn refresh() {\n    old();\n}\n";
         let duplicate = format!("{old}{old}");
+        let stage = controller
+            .stage_step(
+                &session,
+                &step,
+                Path::new("src/token.rs"),
+                &duplicate,
+                /*buffer_revision*/ 0,
+            )
+            .expect("the original hunk line selects the first repeated context");
+
+        assert_eq!(
+            stage.range.start,
+            TextPosition::new(/*line*/ 0, /*character*/ 0)
+        );
+        assert_eq!(stage.before, old);
+        assert_eq!(
+            controller
+                .validate_step(&session, &step, Path::new("src/token.rs"), &duplicate)
+                .unwrap(),
+            ReplayValidation::Incomplete,
+        );
+    }
+
+    #[test]
+    fn genuinely_equidistant_repeated_original_context_remains_ambiguous() {
+        let (mut controller, session, step) = controller_with_session();
+        controller
+            .sessions
+            .get_mut(&session)
+            .expect("registered isolated replay session")
+            .steps[0]
+            .old_start = 3;
+        let old = "fn refresh() {\n    old();\n}\n";
+        let duplicate = format!("{old}\n{old}");
+
         assert!(matches!(
-            controller.stage_step(&session, &step, Path::new("src/token.rs"), &duplicate, 0),
-            Err(ReplayError::AnchorConflict)
+            controller.stage_step(
+                &session,
+                &step,
+                Path::new("src/token.rs"),
+                &duplicate,
+                /*buffer_revision*/ 0,
+            ),
+            Err(ReplayError::AnchorConflict),
         ));
+        assert_eq!(
+            controller
+                .validate_step(&session, &step, Path::new("src/token.rs"), &duplicate)
+                .unwrap(),
+            ReplayValidation::Ambiguous,
+        );
     }
 
     #[test]

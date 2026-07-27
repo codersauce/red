@@ -1,14 +1,15 @@
 //! Exact, multi-file presentation snapshots compiled from pinned Replay sources.
 //!
-//! The coach receives one complete original Git hunk per learning step together
-//! with the full before- and after-images of its scratch-worktree source file.
-//! Git transport headers are preserved for validation even though the native
-//! panel presents only the syntax-highlighted source.
+//! The editor retains complete scratch-source images and gives the coach only
+//! one bounded, original Git hunk per learning step. Git transport headers are
+//! preserved for validation even though the native panel presents only the
+//! syntax-highlighted source.
 
 use std::{collections::HashMap, path::Path};
 
 use serde::{Deserialize, Serialize};
 
+use super::session::{anchored_hunk_offset, replay_line_delta};
 use super::{
     parse_patch, ReplayChangeKind, ReplayDemoPlan, ReplayDemoStep, ReplayError, ReplayLimits,
     ReplaySession, ReplayStep, ReplayStepKind,
@@ -168,6 +169,7 @@ pub fn replay_plan_from_session(
     let workspace_root = std::fs::canonicalize(&session.workspace.root)
         .map_err(|error| ReplayError::Filesystem(error.to_string()))?;
     let mut file_images: HashMap<String, String> = HashMap::new();
+    let mut file_line_deltas: HashMap<String, isize> = HashMap::new();
     let mut steps = Vec::with_capacity(session.steps.len());
     let mut initial_source = None;
 
@@ -217,7 +219,17 @@ pub fn replay_plan_from_session(
                 .get(&display_path)
                 .cloned()
                 .ok_or_else(|| ReplayError::UnsafePath(display_path.clone()))?;
-            let after = apply_unique_original_hunk(&before, source_step)?;
+            let old_start = source_step
+                .old_start
+                .saturating_add_signed(*file_line_deltas.get(&display_path).unwrap_or(&0));
+            let after = apply_unique_original_hunk(&before, source_step, old_start)?;
+            file_line_deltas
+                .entry(display_path.clone())
+                .and_modify(|delta| {
+                    *delta = delta
+                        .saturating_add(replay_line_delta(&source_step.before, &source_step.after));
+                })
+                .or_insert_with(|| replay_line_delta(&source_step.before, &source_step.after));
             file_images.insert(display_path.clone(), after.clone());
             steps.push(ReplayDemoStep {
                 id: source_step.id.clone(),
@@ -329,17 +341,29 @@ fn scratch_file_image(
     std::fs::read_to_string(canonical).map_err(|error| ReplayError::Filesystem(error.to_string()))
 }
 
-fn apply_unique_original_hunk(before: &str, step: &ReplayStep) -> Result<String, ReplayError> {
+fn apply_unique_original_hunk(
+    before: &str,
+    step: &ReplayStep,
+    old_start: usize,
+) -> Result<String, ReplayError> {
     if step.before.is_empty() {
         if !before.is_empty() {
             return Err(ReplayError::AnchorConflict);
         }
         return Ok(step.after.clone());
     }
-    if before.matches(&step.before).count() != 1 {
-        return Err(ReplayError::AnchorConflict);
-    }
-    Ok(before.replacen(&step.before, &step.after, /*count*/ 1))
+    let start = anchored_hunk_offset(before, &step.before, old_start)?;
+    let end = start + step.before.len();
+    let mut after = String::with_capacity(
+        before
+            .len()
+            .saturating_sub(step.before.len())
+            .saturating_add(step.after.len()),
+    );
+    after.push_str(&before[..start]);
+    after.push_str(&step.after);
+    after.push_str(&before[end..]);
+    Ok(after)
 }
 
 const fn replay_kind(kind: ReplayStepKind) -> &'static str {
@@ -487,6 +511,54 @@ mod tests {
         assert!(plan.steps[1].after.contains("new_second()"));
         assert_eq!(plan.steps[2].before, "assert_eq!(token(), 1);\n");
         assert_eq!(plan.steps[2].after, "assert_eq!(token(), 2);\n");
+    }
+
+    #[test]
+    fn repeated_hunk_context_follows_original_lines_and_prior_line_changes() {
+        const PATCH: &str = concat!(
+            "diff --git a/src/token.rs b/src/token.rs\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/src/token.rs\n",
+            "+++ b/src/token.rs\n",
+            "@@ -1,3 +1,4 @@ prepare first occurrence\n",
+            "+// prepare the original first occurrence\n",
+            " fn repeated() {\n",
+            "     old();\n",
+            " }\n",
+            "@@ -5,3 +6,3 @@ update second occurrence\n",
+            " fn repeated() {\n",
+            "-    old();\n",
+            "+    new();\n",
+            " }\n",
+        );
+
+        let (directory, session) = source_session(PATCH);
+        let original = "fn repeated() {\n    old();\n}\n\nfn repeated() {\n    old();\n}\n";
+        std::fs::write(directory.path().join("src/token.rs"), original)
+            .expect("identical original source contexts");
+
+        let plan = replay_plan_from_session(&session, "feature/replay", ReplayLimits::default())
+            .expect("the exact original hunk lines disambiguate repeated source");
+
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[0].before, original);
+        assert_eq!(
+            plan.steps[0].after,
+            concat!(
+                "// prepare the original first occurrence\n",
+                "fn repeated() {\n    old();\n}\n\n",
+                "fn repeated() {\n    old();\n}\n",
+            ),
+        );
+        assert_eq!(plan.steps[1].before, plan.steps[0].after);
+        assert_eq!(
+            plan.steps[1].after,
+            concat!(
+                "// prepare the original first occurrence\n",
+                "fn repeated() {\n    old();\n}\n\n",
+                "fn repeated() {\n    new();\n}\n",
+            ),
+        );
     }
 
     #[test]
