@@ -815,7 +815,8 @@ pub fn prepare_workspace(
         return Ok((preview, None));
     }
     if root.exists() || std::fs::symlink_metadata(&root).is_ok() {
-        return Err(ReplayError::WorkspaceExists(root.display().to_string()));
+        let workspace = existing_workspace(source, &root, &branch)?;
+        return Ok((preview, Some(workspace)));
     }
     let branch_exists = Command::new("git")
         .current_dir(&source.repository.root)
@@ -845,6 +846,74 @@ pub fn prepare_workspace(
             created_by_replay: true,
         }),
     ))
+}
+
+fn existing_workspace(
+    source: &ReplaySource,
+    root: &Path,
+    branch: &str,
+) -> Result<ReplayWorkspace, ReplayError> {
+    let conflict = || ReplayError::WorkspaceExists(root.display().to_string());
+    let metadata = std::fs::symlink_metadata(root).map_err(|_| conflict())?;
+    if !metadata.file_type().is_dir() {
+        return Err(conflict());
+    }
+
+    let canonical_root = std::fs::canonicalize(root).map_err(|_| conflict())?;
+    if canonical_root != root {
+        return Err(conflict());
+    }
+
+    let actual_root =
+        git_text(root, &["rev-parse", "--show-toplevel"], 16 * 1024).map_err(|_| conflict())?;
+    let actual_root = std::fs::canonicalize(actual_root.trim()).map_err(|_| conflict())?;
+    if actual_root != canonical_root {
+        return Err(conflict());
+    }
+
+    let actual_branch = git_text(root, &["symbolic-ref", "--quiet", "--short", "HEAD"], 1024)
+        .map_err(|_| conflict())?;
+    if actual_branch.trim() != branch {
+        return Err(conflict());
+    }
+
+    let actual_head = git_text(root, &["rev-parse", "HEAD"], 1024).map_err(|_| conflict())?;
+    if GitObjectId::parse(actual_head.trim()).map_err(|_| conflict())? != source.base_commit {
+        return Err(conflict());
+    }
+
+    let common =
+        git_text(root, &["rev-parse", "--git-common-dir"], 16 * 1024).map_err(|_| conflict())?;
+    let common = PathBuf::from(common.trim());
+    let common = if common.is_absolute() {
+        common
+    } else {
+        root.join(common)
+    };
+    let common = std::fs::canonicalize(common).map_err(|_| conflict())?;
+    if common != source.repository.common_directory {
+        return Err(conflict());
+    }
+
+    let status = git_text(
+        root,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+        16 * 1024,
+    )
+    .map_err(|_| conflict())?;
+    if !status.trim().is_empty() {
+        return Err(ReplayError::WorkspaceExists(format!(
+            "{} contains saved or untracked review changes",
+            root.display(),
+        )));
+    }
+
+    Ok(ReplayWorkspace {
+        root: canonical_root,
+        branch: branch.to_string(),
+        base_commit: source.base_commit.clone(),
+        created_by_replay: false,
+    })
 }
 
 pub(super) fn validate_relative_path(path: &Path) -> Result<(), ReplayError> {
@@ -1050,6 +1119,130 @@ mod tests {
         fixture_git(root, &["commit", "--quiet", "-m", "advance default branch"]);
 
         (directory, merge_base, feature_head)
+    }
+
+    fn reusable_workspace_source() -> (tempfile::TempDir, ReplaySource) {
+        let directory = tempfile::tempdir().expect("isolated Replay worktree fixture");
+        let root = directory.path().join("replay-fixture");
+        std::fs::create_dir(&root).expect("isolated repository directory");
+        fixture_git(&root, &["init", "--initial-branch=master"]);
+        fixture_git(&root, &["config", "user.name", "Replay Fixture"]);
+        fixture_git(&root, &["config", "user.email", "replay@example.test"]);
+        fixture_git(
+            &root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/replay-fixture.git",
+            ],
+        );
+        std::fs::create_dir(root.join("src")).expect("fixture source directory");
+        std::fs::write(root.join("src/token.rs"), "pub fn token() -> usize { 1 }\n")
+            .expect("fixture merge-base source");
+        fixture_git(&root, &["add", "src/token.rs"]);
+        fixture_git(&root, &["commit", "--quiet", "-m", "create replay base"]);
+        fixture_git(&root, &["checkout", "--quiet", "-b", "feature/replay"]);
+        std::fs::write(root.join("src/token.rs"), "pub fn token() -> usize { 2 }\n")
+            .expect("fixture original feature change");
+        fixture_git(&root, &["add", "src/token.rs"]);
+        fixture_git(&root, &["commit", "--quiet", "-m", "change replay token"]);
+        fixture_git(&root, &["checkout", "--quiet", "master"]);
+
+        let source = resolve_local_branch_source(
+            &root,
+            "feature/replay",
+            Some("master"),
+            ReplayLimits::default(),
+        )
+        .expect("resolve the isolated original feature");
+        (directory, source.source)
+    }
+
+    #[test]
+    fn resumes_only_the_exact_clean_original_replay_worktree() {
+        let (_directory, source) = reusable_workspace_source();
+        let (preview, created) = prepare_workspace(&source, /*confirmed*/ true)
+            .expect("create the explicitly confirmed original scratch worktree");
+        let created = created.expect("confirmed Replay creates its scratch worktree");
+        assert!(created.created_by_replay);
+
+        let (second_preview, resumed) = prepare_workspace(&source, /*confirmed*/ true)
+            .expect("resume the exact pinned original scratch worktree");
+        let resumed = resumed.expect("confirmed Replay reopens its verified worktree");
+
+        assert_eq!(second_preview, preview);
+        assert_eq!(resumed.root, created.root);
+        assert_eq!(resumed.branch, created.branch);
+        assert_eq!(resumed.base_commit, source.base_commit);
+        assert!(!resumed.created_by_replay);
+        assert_eq!(
+            fixture_git(&resumed.root, &["branch", "--show-current"]),
+            resumed.branch,
+        );
+    }
+
+    #[test]
+    fn never_resumes_over_saved_or_untracked_reviewer_changes() {
+        let (_directory, source) = reusable_workspace_source();
+        let (_, workspace) = prepare_workspace(&source, /*confirmed*/ true)
+            .expect("create the explicitly confirmed original scratch worktree");
+        let workspace = workspace.unwrap();
+        let reviewer_source = "pub fn token() -> usize { 42 }\n";
+        std::fs::write(workspace.root.join("src/token.rs"), reviewer_source)
+            .expect("retain the reviewer's saved reconstruction");
+
+        let error = prepare_workspace(&source, /*confirmed*/ true)
+            .expect_err("saved reviewer changes must never be reset or overwritten");
+
+        assert!(matches!(error, ReplayError::WorkspaceExists(_)));
+        assert_eq!(
+            std::fs::read_to_string(workspace.root.join("src/token.rs")).unwrap(),
+            reviewer_source,
+        );
+        assert_eq!(
+            fixture_git(&workspace.root, &["branch", "--show-current"]),
+            workspace.branch,
+        );
+    }
+
+    #[test]
+    fn refuses_an_unrelated_repository_at_the_expected_replay_path() {
+        let (_directory, source) = reusable_workspace_source();
+        let (preview, _) = prepare_workspace(&source, /*confirmed*/ false)
+            .expect("preview without creating a scratch worktree");
+        std::fs::create_dir(&preview.root).expect("unrelated existing directory");
+        fixture_git(&preview.root, &["init", "--initial-branch=master"]);
+
+        assert!(matches!(
+            prepare_workspace(&source, /*confirmed*/ true),
+            Err(ReplayError::WorkspaceExists(_)),
+        ));
+        assert_eq!(
+            fixture_git(&preview.root, &["branch", "--show-current"]),
+            "master",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_symbolic_link_at_the_expected_replay_path() {
+        let (directory, source) = reusable_workspace_source();
+        let (preview, _) = prepare_workspace(&source, /*confirmed*/ false)
+            .expect("preview without creating a scratch worktree");
+        let unrelated = directory.path().join("unrelated-review");
+        std::fs::create_dir(&unrelated).expect("preserved symbolic-link destination");
+        std::os::unix::fs::symlink(&unrelated, &preview.root)
+            .expect("symbolic-link collision fixture");
+
+        assert!(matches!(
+            prepare_workspace(&source, /*confirmed*/ true),
+            Err(ReplayError::WorkspaceExists(_)),
+        ));
+        assert!(std::fs::symlink_metadata(&preview.root)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]
