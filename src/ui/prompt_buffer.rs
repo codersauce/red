@@ -420,7 +420,7 @@ impl PromptBuffer {
                 self.set_mode(Mode::Insert);
             }
             'A' => {
-                self.set_cursor(grapheme_len(&self.text()));
+                self.set_cursor(self.current_line_end());
                 self.set_mode(Mode::Insert);
             }
             'h' => self.set_cursor(self.cursor.saturating_sub(1)),
@@ -780,6 +780,45 @@ mod tests {
             PromptInput::Changed
         );
         assert_eq!(prompt.text(), "second");
+    }
+
+    #[test]
+    fn normal_mode_append_stays_on_the_current_prompt_line() {
+        let cases = [
+            ("first line", "first\nsecond", 2, 5, "first!\nsecond"),
+            ("middle line", "one\ntwo\nthree", 5, 7, "one\ntwo!\nthree"),
+            ("last line", "first\nlast", 8, 10, "first\nlast!"),
+            ("empty line", "first\n\nlast", 6, 6, "first\n!\nlast"),
+            (
+                "Unicode graphemes",
+                "e\u{301}👨‍👩‍👧\nlast",
+                0,
+                2,
+                "e\u{301}👨‍👩‍👧!\nlast",
+            ),
+        ];
+
+        for (name, text, cursor, line_end, expected) in cases {
+            let mut prompt = PromptBuffer::new(text);
+            prompt.set_cursor(cursor);
+            prompt.set_mode(Mode::Normal);
+
+            assert_eq!(
+                prompt.handle_event(&key(KeyCode::Char('A'), KeyModifiers::NONE), 40),
+                PromptInput::Changed,
+                "{name}: enter append mode"
+            );
+            assert_eq!(prompt.mode(), Mode::Insert, "{name}: enter insert mode");
+            assert_eq!(prompt.cursor(), line_end, "{name}: stay on current line");
+
+            assert_eq!(
+                prompt.handle_event(&key(KeyCode::Char('!'), KeyModifiers::NONE), 40),
+                PromptInput::Changed,
+                "{name}: append to current line"
+            );
+            assert_eq!(prompt.text(), expected, "{name}: preserve remaining lines");
+            assert_eq!(prompt.cursor(), line_end + 1, "{name}: advance cursor");
+        }
     }
 
     #[test]
