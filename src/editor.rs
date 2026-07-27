@@ -3676,8 +3676,17 @@ impl Editor {
             return false;
         };
         let source_buffer = self.buffer_manager[source_index].id();
-        let source_vtop = self.buffer_manager[source_index].vtop;
-        let (source_cx, source_cy) = self.buffer_manager[source_index].pos;
+        let source_line = self.replay_step_source_line(workspace_id, step_id, source_index);
+        let (source_vtop, source_cx, source_cy) = source_line.map_or_else(
+            || {
+                let source = &self.buffer_manager[source_index];
+                (source.vtop, source.pos.0, source.pos.1)
+            },
+            |line| {
+                let top = line.saturating_sub(/*context_lines*/ 3);
+                (top, /*column*/ 0, line.saturating_sub(top))
+            },
+        );
 
         self.panel_manager.focus_editor();
         self.set_active_window(window_index);
@@ -3697,6 +3706,55 @@ impl Editor {
             workspace.source_buffer = source_buffer;
         }
         true
+    }
+
+    fn replay_step_source_line(
+        &self,
+        workspace_id: &str,
+        step_id: &str,
+        source_index: usize,
+    ) -> Option<usize> {
+        let workspace = self.replay_demo_workspace.as_ref()?;
+        if workspace.id != workspace_id {
+            return None;
+        }
+        let step = workspace
+            .plan
+            .steps
+            .iter()
+            .find(|step| step.id == step_id)?;
+        let patch = crate::replay::parse_patch(&step.diff, self.replay_controller.limits()).ok()?;
+        if patch.files.len() != 1 || patch.files[0].hunks.len() != 1 {
+            return None;
+        }
+        let hunk = &patch.files[0].hunks[0];
+        let source = &self.buffer_manager[source_index];
+        let contents = source.contents();
+        let offset = (!hunk.after.is_empty())
+            .then(|| {
+                crate::replay::anchored_hunk_offset(&contents, &hunk.after, hunk.new_range.start)
+                    .ok()
+            })
+            .flatten()
+            .or_else(|| {
+                (!hunk.before.is_empty())
+                    .then(|| {
+                        crate::replay::anchored_hunk_offset(
+                            &contents,
+                            &hunk.before,
+                            hunk.old_range.start,
+                        )
+                        .ok()
+                    })
+                    .flatten()
+            });
+        offset
+            .map(|offset| {
+                source
+                    .char_idx_to_position(contents[..offset].chars().count())
+                    .line
+            })
+            .or_else(|| Some(hunk.old_range.start.saturating_sub(1)))
     }
 
     fn replay_source_preview(
@@ -3864,6 +3922,11 @@ impl Editor {
         )?;
         let presentation =
             crate::replay::replay_presentation_plan(&plan, self.replay_controller.limits())?;
+        let initial_step = plan
+            .steps
+            .first()
+            .map(|step| step.id.clone())
+            .ok_or_else(|| anyhow::anyhow!("Replay has no initial original source hunk"))?;
 
         let mut source_buffers = HashMap::new();
         for step in &plan.steps {
@@ -3904,6 +3967,10 @@ impl Editor {
             source_window,
             applied_steps: Vec::new(),
         });
+        anyhow::ensure!(
+            self.focus_replay_step_source(&id, &initial_step),
+            "Replay could not focus the initial original source hunk"
+        );
         Ok(json!({
             "ok": true,
             "workspace_id": id,
@@ -22512,6 +22579,63 @@ mod test {
             step.completion,
             Some(crate::replay::ReplayCompletion::Automatic),
         );
+    }
+
+    #[tokio::test]
+    async fn real_replay_opens_and_navigates_at_each_distant_original_hunk() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let (directory, session, workspace) = real_replay_session_fixture();
+        let first = directory.path().join("src/first.rs");
+        let original = std::fs::read_to_string(&first).unwrap();
+        let prefix = (0..120)
+            .map(|line| format!("// preserved original context {line}\n"))
+            .collect::<String>();
+        std::fs::write(&first, format!("{prefix}{original}"))
+            .expect("preserve a real distant original source hunk");
+
+        let mut source = session.source.clone();
+        source.patch = source.patch.replace(
+            "@@ -1,3 +1,3 @@ fn first\n",
+            "@@ -121,3 +121,3 @@ fn first\n",
+        );
+        source.patch_digest = crate::replay::digest(source.patch.as_bytes());
+        let session = crate::replay::ReplaySession::from_source(
+            source,
+            workspace.clone(),
+            crate::replay::ReplayLimits::default(),
+        )
+        .expect("compile the pinned distant original source hunk");
+
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        let response = editor
+            .install_replay_source_session(session, "feature/replay", workspace, &mut render_buffer)
+            .await
+            .expect("open the scratch source at the actual original hunk");
+        let workspace_id = response["workspace_id"].as_str().unwrap().to_string();
+        let first = response["plan"]["steps"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let second = response["plan"]["steps"][1]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        assert!(editor.current_buffer().name().ends_with("/src/first.rs"));
+        assert_eq!(editor.vtop + editor.cy, 120);
+        assert_eq!(editor.vtop, 117);
+
+        assert!(editor.focus_replay_step_source(&workspace_id, &second));
+        assert!(editor.current_buffer().name().ends_with("/src/second.rs"));
+        assert_eq!(editor.vtop + editor.cy, 0);
+
+        assert!(editor.focus_replay_step_source(&workspace_id, &first));
+        assert!(editor.current_buffer().name().ends_with("/src/first.rs"));
+        assert_eq!(editor.vtop + editor.cy, 120);
+        assert_eq!(editor.vtop, 117);
     }
 
     #[tokio::test]
