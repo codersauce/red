@@ -585,6 +585,57 @@ mod tests {
     }
 
     #[test]
+    fn normal_mode_arrow_motions_keep_agent_composer_lines_intact() {
+        let editor = editor(60, 18);
+        let cases = [
+            (
+                "Left at second line start",
+                "one\ntwo",
+                4,
+                KeyCode::Left,
+                4,
+                "one\nwo",
+            ),
+            (
+                "Right at first line end",
+                "one\ntwo",
+                2,
+                KeyCode::Right,
+                2,
+                "on\ntwo",
+            ),
+        ];
+
+        for (name, text, cursor, arrow, expected_cursor, expected_text) in cases {
+            let mut composer = new_composer(&editor, None, 7, text.to_string(), vec![]);
+            composer.prompt.set_cursor(cursor);
+            composer.prompt.set_mode(Mode::Normal);
+
+            assert_eq!(
+                composer.handle_event(&key(arrow, KeyModifiers::NONE)),
+                Some(KeyAction::Single(Action::Refresh)),
+                "{name}: move with arrow key"
+            );
+            assert_eq!(
+                composer.prompt.cursor(),
+                expected_cursor,
+                "{name}: stay on line"
+            );
+
+            assert_eq!(
+                composer.handle_event(&key(KeyCode::Char('x'), KeyModifiers::NONE)),
+                Some(KeyAction::Single(Action::Refresh)),
+                "{name}: delete selected grapheme"
+            );
+            assert_eq!(
+                composer.prompt.text(),
+                expected_text,
+                "{name}: preserve lines"
+            );
+        }
+    }
+
+    #[test]
     fn combining_mark_insertion_keeps_agent_composer_cursor_after_merged_grapheme() {
         let editor = editor(60, 18);
         let mut composer = new_composer(&editor, None, 7, "aX".to_string(), vec![]);

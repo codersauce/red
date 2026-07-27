@@ -345,11 +345,11 @@ impl PromptBuffer {
                         PromptInput::Changed
                     }
                     KeyCode::Left => {
-                        self.set_cursor(self.cursor.saturating_sub(1));
+                        self.move_horizontal(-1);
                         PromptInput::Changed
                     }
                     KeyCode::Right => {
-                        self.set_cursor(self.cursor.saturating_add(1));
+                        self.move_horizontal(1);
                         PromptInput::Changed
                     }
                     KeyCode::Up => {
@@ -429,18 +429,10 @@ impl PromptBuffer {
                 self.set_cursor(self.current_line_end());
                 self.set_mode(Mode::Insert);
             }
-            'h' => {
-                self.set_cursor(self.cursor.saturating_sub(1).max(self.current_line_start()));
-            }
+            'h' => self.move_horizontal(-1),
             'j' => self.move_vertical(1, wrap_width),
             'k' => self.move_vertical(-1, wrap_width),
-            'l' => {
-                self.set_cursor(
-                    self.cursor
-                        .saturating_add(1)
-                        .min(self.current_line_last_grapheme()),
-                );
-            }
+            'l' => self.move_horizontal(1),
             '0' => self.set_cursor(self.current_line_start()),
             '$' => self.set_cursor(self.current_line_last_grapheme()),
             'w' => self.set_cursor(self.next_word_boundary()),
@@ -522,6 +514,16 @@ impl PromptBuffer {
         self.buffer.undo_history.commit_transaction(after);
         self.buffer.refresh_dirty_from_history();
         true
+    }
+
+    fn move_horizontal(&mut self, direction: isize) {
+        let cursor = self.cursor.saturating_add_signed(direction);
+        let cursor = if self.mode == Mode::Normal {
+            cursor.clamp(self.current_line_start(), self.current_line_last_grapheme())
+        } else {
+            cursor
+        };
+        self.set_cursor(cursor);
     }
 
     fn move_vertical(&mut self, direction: isize, width: usize) {
@@ -967,6 +969,162 @@ mod tests {
                 );
                 assert_eq!(prompt.text(), expected, "{name}: preserve adjacent line");
             }
+        }
+    }
+
+    #[test]
+    fn normal_mode_line_boundary_arrow_motions_stay_on_current_line() {
+        let cases = [
+            (
+                "Left at second line start",
+                "one\ntwo",
+                4,
+                KeyCode::Left,
+                4,
+                Some("one\nwo"),
+            ),
+            (
+                "Right at first line end",
+                "one\ntwo",
+                2,
+                KeyCode::Right,
+                2,
+                Some("on\ntwo"),
+            ),
+            (
+                "Left within second line",
+                "one\ntwo",
+                5,
+                KeyCode::Left,
+                4,
+                Some("one\nwo"),
+            ),
+            (
+                "Right within second line",
+                "one\ntwo",
+                4,
+                KeyCode::Right,
+                5,
+                Some("one\nto"),
+            ),
+            (
+                "Left on empty line",
+                "one\n\ntwo",
+                4,
+                KeyCode::Left,
+                4,
+                None,
+            ),
+            (
+                "Right on empty line",
+                "one\n\ntwo",
+                4,
+                KeyCode::Right,
+                4,
+                None,
+            ),
+            (
+                "Right after Unicode grapheme",
+                "e\u{301}👨‍👩‍👧\nlast",
+                1,
+                KeyCode::Right,
+                1,
+                Some("e\u{301}\nlast"),
+            ),
+        ];
+
+        for (name, text, cursor, arrow, expected_cursor, expected_delete) in cases {
+            let mut prompt = PromptBuffer::new(text);
+            prompt.set_cursor(cursor);
+            prompt.set_mode(Mode::Normal);
+
+            assert_eq!(
+                prompt.handle_event(&key(arrow, KeyModifiers::NONE), 40),
+                PromptInput::Changed,
+                "{name}: move with arrow key"
+            );
+            assert_eq!(prompt.mode(), Mode::Normal, "{name}: remain in normal mode");
+            assert_eq!(
+                prompt.cursor(),
+                expected_cursor,
+                "{name}: stay on current line"
+            );
+            assert_eq!(prompt.text(), text, "{name}: preserve line breaks");
+
+            if let Some(expected) = expected_delete {
+                assert_eq!(
+                    prompt.handle_event(&key(KeyCode::Char('x'), KeyModifiers::NONE), 40),
+                    PromptInput::Changed,
+                    "{name}: delete selected grapheme"
+                );
+                assert_eq!(prompt.text(), expected, "{name}: preserve adjacent line");
+            }
+        }
+    }
+
+    #[test]
+    fn insert_mode_arrow_motions_cross_prompt_line_boundaries() {
+        let cases = [
+            (
+                "Left from second line",
+                "one\ntwo",
+                4,
+                KeyCode::Left,
+                3,
+                "oneZ\ntwo",
+            ),
+            (
+                "Right across newline",
+                "one\ntwo",
+                3,
+                KeyCode::Right,
+                4,
+                "one\nZtwo",
+            ),
+            (
+                "Right across empty line",
+                "one\n\ntwo",
+                4,
+                KeyCode::Right,
+                5,
+                "one\n\nZtwo",
+            ),
+            (
+                "Left after Unicode graphemes",
+                "e\u{301}👨‍👩‍👧\nlast",
+                3,
+                KeyCode::Left,
+                2,
+                "e\u{301}👨‍👩‍👧Z\nlast",
+            ),
+        ];
+
+        for (name, text, cursor, arrow, expected_cursor, expected_text) in cases {
+            let mut prompt = PromptBuffer::new(text);
+            prompt.set_cursor(cursor);
+
+            assert_eq!(
+                prompt.handle_event(&key(arrow, KeyModifiers::NONE), 40),
+                PromptInput::Changed,
+                "{name}: move with arrow key"
+            );
+            assert_eq!(prompt.mode(), Mode::Insert, "{name}: remain in insert mode");
+            assert_eq!(
+                prompt.cursor(),
+                expected_cursor,
+                "{name}: cross line boundary"
+            );
+
+            assert_eq!(
+                prompt.handle_event(&key(KeyCode::Char('Z'), KeyModifiers::NONE), 40),
+                PromptInput::Changed,
+                "{name}: insert at destination"
+            );
+            assert_eq!(
+                prompt.text(),
+                expected_text,
+                "{name}: preserve cursor semantics"
+            );
         }
     }
 
