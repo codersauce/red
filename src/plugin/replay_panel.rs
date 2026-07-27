@@ -159,6 +159,13 @@ pub(super) struct ReplayPanelLayout {
     pub(super) footer_rows: usize,
 }
 
+/// Scroll and keyboard-focus state for one rendered Replay source viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReplayPanelViewport {
+    pub(super) scroll: usize,
+    pub(super) focused: bool,
+}
+
 impl ReplayPanelLayout {
     pub(super) fn calculate(
         state: &ReplayPanelState,
@@ -227,15 +234,21 @@ pub(super) fn render_replay_panel_title(
     title: &str,
     position: Point,
     width: usize,
+    focused: bool,
     theme: &Theme,
 ) {
+    let title = if focused {
+        format!("▌ {title}")
+    } else {
+        title.to_string()
+    };
     let position_label = format!(
         "{:02} / {:02}",
         state.model.index.saturating_add(1),
         state.model.steps.len(),
     );
     let line = aligned_line(
-        title,
+        &title,
         TextPanelSpanStyle::Strong,
         &position_label,
         TextPanelSpanStyle::Muted,
@@ -251,6 +264,37 @@ pub(super) fn render_replay_panel_title(
         theme,
         &theme.style,
     );
+
+    let right_width = display_width(&position_label);
+    let title_width = if right_width.saturating_add(2) < width {
+        width.saturating_sub(right_width).saturating_sub(1)
+    } else {
+        width
+    };
+    let title = truncate_display_width_with_marker(&title, title_width, "…", TruncationSide::Right);
+    let foreground = if focused {
+        theme
+            .colors
+            .get("panelTitle.activeForeground")
+            .copied()
+            .or_else(|| theme.colors.get("editorCursor.foreground").copied())
+            .or_else(|| theme.colors.get("focusBorder").copied())
+            .or(theme.ui_style.picker_prompt.fg)
+    } else {
+        theme
+            .colors
+            .get("panelTitle.inactiveForeground")
+            .copied()
+            .or_else(|| theme.colors.get("sideBarTitle.foreground").copied())
+            .or(theme.ui_style.muted.fg)
+    };
+    let title_style = Style {
+        fg: foreground.or(theme.style.fg),
+        bg: theme.style.bg,
+        bold: true,
+        italic: false,
+    };
+    buffer.set_text(position.x, position.y, &title, &title_style);
 }
 
 /// Render all structured Replay chrome inside an already-painted panel body.
@@ -260,7 +304,7 @@ pub(super) fn render_replay_panel(
     position: Point,
     width: usize,
     height: usize,
-    scroll: usize,
+    viewport: ReplayPanelViewport,
     theme: &Theme,
 ) {
     let layout = ReplayPanelLayout::calculate(state, width, height);
@@ -295,7 +339,7 @@ pub(super) fn render_replay_panel(
         .lines
         .iter()
         .zip(highlights.iter())
-        .skip(scroll)
+        .skip(viewport.scroll)
         .take(layout.diff_rows)
         .enumerate()
     {
@@ -337,6 +381,7 @@ pub(super) fn render_replay_panel(
                 position.x,
                 changes_top.saturating_add(row + 1),
                 width,
+                viewport.focused,
                 theme,
             );
         }
@@ -719,6 +764,7 @@ fn render_change_row(
     x: usize,
     y: usize,
     width: usize,
+    focused: bool,
     theme: &Theme,
 ) {
     if width == 0 || y >= buffer.height {
@@ -726,7 +772,21 @@ fn render_change_row(
     }
     let active = index == state.model.index;
     let completion = state.model.completion(index);
-    let selection = theme.list_selection_style();
+    let mut selection = theme.list_selection_style();
+    if !focused {
+        selection.bg = theme
+            .colors
+            .get("list.inactiveSelectionBackground")
+            .copied()
+            .or_else(|| theme.colors.get("editor.selectionBackground").copied())
+            .or(selection.bg);
+        selection.fg = theme
+            .colors
+            .get("list.inactiveSelectionForeground")
+            .copied()
+            .or(theme.ui_style.muted.fg)
+            .or(selection.fg);
+    }
     let row_style = if active {
         theme.selected_style(
             &theme.style,
@@ -758,6 +818,9 @@ fn render_change_row(
     let number = format!(" {:02} ", index.saturating_add(1));
 
     let mut column = x;
+    let caret = if focused && active { "▶ " } else { "  " };
+    let caret_style = theme.ui_style.picker_prompt.clone().with_bg(row_style.bg);
+    column = render_change_segment(buffer, column, y, x + width, caret, &caret_style);
     column = render_change_segment(buffer, column, y, x + width, marker, &marker_style);
     column = render_change_segment(
         buffer,
@@ -1174,7 +1237,10 @@ mod tests {
             Point::new(0, 0),
             width,
             height,
-            /*scroll*/ 0,
+            ReplayPanelViewport {
+                scroll: 0,
+                focused: true,
+            },
             &theme,
         );
 
@@ -1212,7 +1278,10 @@ mod tests {
             Point::new(0, 0),
             width,
             height,
-            /*scroll*/ 0,
+            ReplayPanelViewport {
+                scroll: 0,
+                focused: true,
+            },
             &theme,
         );
 
@@ -1252,14 +1321,17 @@ mod tests {
             Point::new(0, 0),
             /*width*/ 46,
             /*height*/ 35,
-            /*scroll*/ 0,
+            ReplayPanelViewport {
+                scroll: 0,
+                focused: true,
+            },
             &theme,
         );
 
         let rows = rendered_rows(&buffer);
-        assert!(rows.iter().any(|row| row.starts_with("✓ 01 ")));
-        assert!(rows.iter().any(|row| row.starts_with("⊕ 02 ")));
-        assert!(rows.iter().any(|row| row.starts_with("● 03 ")));
+        assert!(rows.iter().any(|row| row.trim_start().starts_with("✓ 01 ")));
+        assert!(rows.iter().any(|row| row.trim_start().starts_with("⊕ 02 ")));
+        assert!(rows.iter().any(|row| row.starts_with("▶ ● 03 ")));
         assert!(!rows.iter().any(|row| row.contains(" ADD ")));
     }
 
@@ -1278,7 +1350,10 @@ mod tests {
             Point::new(0, 0),
             width,
             height,
-            /*scroll*/ 0,
+            ReplayPanelViewport {
+                scroll: 0,
+                focused: true,
+            },
             &theme,
         );
 
@@ -1339,6 +1414,7 @@ mod tests {
             "PR REPLAY",
             Point::new(0, 0),
             /*width*/ 46,
+            /*focused*/ false,
             &theme,
         );
 
@@ -1353,6 +1429,98 @@ mod tests {
         assert!(metadata.contains("#482 · @original-author"));
         assert!(metadata.ends_with("1 / 5 reviewed"));
         assert!(!title.contains("reviewed"));
+    }
+
+    #[test]
+    fn focused_replay_title_uses_a_structural_marker_and_theme_foreground() {
+        let state = state();
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let mut focused = RenderBuffer::new(/*width*/ 46, /*height*/ 1, &theme.style);
+        let mut unfocused = RenderBuffer::new(/*width*/ 46, /*height*/ 1, &theme.style);
+
+        render_replay_panel_title(
+            &mut focused,
+            &state,
+            "PR REPLAY",
+            Point::new(0, 0),
+            /*width*/ 46,
+            /*focused*/ true,
+            &theme,
+        );
+        render_replay_panel_title(
+            &mut unfocused,
+            &state,
+            "PR REPLAY",
+            Point::new(0, 0),
+            /*width*/ 46,
+            /*focused*/ false,
+            &theme,
+        );
+
+        assert!(rendered_rows(&focused)[0].starts_with("▌ PR REPLAY"));
+        assert!(rendered_rows(&focused)[0].ends_with("01 / 05"));
+        assert!(rendered_rows(&unfocused)[0].starts_with("PR REPLAY"));
+        assert_eq!(
+            focused.cells[0].style.fg,
+            theme.colors.get("editorCursor.foreground").copied(),
+        );
+        assert_eq!(
+            unfocused.cells[0].style.fg,
+            theme.colors.get("sideBarTitle.foreground").copied(),
+        );
+    }
+
+    #[test]
+    fn step_focus_caret_is_independent_of_semantic_completion() {
+        let mut replay = model();
+        replay.completions = vec![ReplayPanelCompletion {
+            index: 0,
+            completion: "manually reconstructed".to_string(),
+        }];
+        let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let width = 46;
+        let height = 35;
+        let mut focused = RenderBuffer::new(width, height, &theme.style);
+        let mut unfocused = RenderBuffer::new(width, height, &theme.style);
+
+        render_replay_panel(
+            &mut focused,
+            &state,
+            Point::new(0, 0),
+            width,
+            height,
+            ReplayPanelViewport {
+                scroll: 0,
+                focused: true,
+            },
+            &theme,
+        );
+        render_replay_panel(
+            &mut unfocused,
+            &state,
+            Point::new(0, 0),
+            width,
+            height,
+            ReplayPanelViewport {
+                scroll: 0,
+                focused: false,
+            },
+            &theme,
+        );
+
+        let focused_rows = rendered_rows(&focused);
+        let unfocused_rows = rendered_rows(&unfocused);
+        assert!(focused_rows.iter().any(|row| row.starts_with("▶ ✓ 01 ")));
+        assert!(unfocused_rows.iter().any(|row| row.starts_with("  ✓ 01 ")));
+        assert!(!unfocused_rows.iter().any(|row| row.starts_with('▶')));
+
+        let layout = ReplayPanelLayout::calculate(&state, width, height);
+        let row = layout.header_rows + layout.diff_rows + layout.change_gap_rows + 1;
+        assert_ne!(
+            focused.cells[row * width].style.bg,
+            unfocused.cells[row * width].style.bg,
+        );
     }
 
     #[test]
@@ -1418,7 +1586,10 @@ mod tests {
                 Point::new(0, 0),
                 width,
                 height,
-                /*scroll*/ 0,
+                ReplayPanelViewport {
+                    scroll: 0,
+                    focused: true,
+                },
                 &theme,
             );
 

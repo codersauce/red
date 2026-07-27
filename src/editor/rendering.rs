@@ -1771,12 +1771,28 @@ impl Editor {
             return;
         }
 
-        let mode = format_mode_name(&self.mode);
+        let replay_status = self.panel_manager.focused_replay_status().map(
+            |(pull_request, branch, index, total)| {
+                let file = if pull_request == 0 {
+                    format!(" {branch}")
+                } else {
+                    format!(" PR #{pull_request}")
+                };
+                (file, format!(" {:02}/{:02} ", index + 1, total))
+            },
+        );
+        let mode = if replay_status.is_some() {
+            "REPLAY".to_string()
+        } else {
+            format_mode_name(&self.mode)
+        };
         let mode = format!(" {mode} ");
 
         // Get information from the active window
         let active_window = self.window_manager.active_window();
-        let (file, pos, window_indicator) = if let Some(window) = active_window {
+        let (file, pos, window_indicator) = if let Some((file, pos)) = replay_status {
+            (file, pos, String::new())
+        } else if let Some(window) = active_window {
             let window_buffer = &self.buffer_manager[window.buffer_index];
             let dirty = if window_buffer.is_dirty() {
                 " [+] "

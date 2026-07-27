@@ -21752,6 +21752,65 @@ mod test {
     }
 
     #[tokio::test]
+    async fn focused_replay_guide_owns_the_status_line_and_terminal_cursor() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        editor
+            .open_replay_demo_workspace(&mut render_buffer)
+            .await
+            .unwrap();
+        let plan = editor.replay_demo_workspace.as_ref().unwrap().plan.clone();
+        editor.test_create_text_panel(
+            "replay-coach",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Left,
+                width: 46,
+                title: Some("PR REPLAY".to_string()),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        editor.panel_manager.update_text_panel(
+            "replay-coach",
+            vec![plugin::TextPanelBlock {
+                id: "replay-current-change".to_string(),
+                kind: plugin::TextPanelBlockKind::Text,
+                format: plugin::TextPanelBlockFormat::Replay,
+                text: json!({
+                    "pull_request": plan.pull_request,
+                    "author": plan.author,
+                    "branch": plan.branch,
+                    "title": plan.title,
+                    "index": 0,
+                    "steps": plan.steps,
+                })
+                .to_string(),
+            }],
+            /*panel_height*/ 26,
+            /*terminal_width*/ 100,
+        );
+
+        assert!(editor.test_focus_panel("replay-coach"));
+        let status = editor.test_statusline_row();
+        assert!(status.contains("REPLAY"));
+        assert!(status.contains("PR #482"));
+        assert!(status.contains("01/05"));
+        editor.render(&mut render_buffer).unwrap();
+        let (x, y) = editor
+            .test_render_cursor_position()
+            .expect("focused Replay exposes its step caret as the terminal cursor");
+        assert_eq!(render_buffer.cells[y * render_buffer.width + x].text, "▶");
+
+        editor.panel_manager.focus_editor();
+        let status = editor.test_statusline_row();
+        assert!(status.contains("NORMAL"));
+        assert!(!status.contains("PR #482"));
+        assert!(editor.test_render_cursor_position().is_some());
+    }
+
+    #[tokio::test]
     async fn replay_demo_hunk_application_is_real_attributed_and_undoable() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();

@@ -19,6 +19,7 @@ use super::markdown::{
 };
 use super::replay_panel::{
     render_replay_panel, render_replay_panel_title, ReplayPanelLayout, ReplayPanelState,
+    ReplayPanelViewport,
 };
 use super::text_link::{TextPanelLink, TextPanelLinkTarget};
 use crate::{
@@ -1002,6 +1003,18 @@ impl PanelManager {
         self.focused.as_deref()
     }
 
+    /// Return source and step information only while a structured Replay owns focus.
+    pub(crate) fn focused_replay_status(&self) -> Option<(u64, &str, usize, usize)> {
+        let id = self.focused.as_deref()?;
+        let replay = self.text_panels.get(id)?.replay.as_ref()?;
+        Some((
+            replay.model.pull_request,
+            replay.model.branch.as_str(),
+            replay.model.index,
+            replay.model.steps.len(),
+        ))
+    }
+
     pub fn focused_text_input_active(&self) -> bool {
         self.focused
             .as_deref()
@@ -1439,6 +1452,45 @@ impl PanelManager {
     ) -> Option<(usize, usize)> {
         let id = self.focused.as_deref()?;
         let panel = self.text_panels.get(id)?;
+        if let Some(replay) = panel.replay.as_ref() {
+            let placement = self
+                .panel_placements(terminal_width, terminal_height)
+                .into_iter()
+                .find(|placement| placement.id == id)?;
+            let title_rows = usize::from(
+                panel.config.title.is_some()
+                    || !text_panel_header_actions(&panel.config, placement.width).is_empty(),
+            );
+            let layout = ReplayPanelLayout::calculate(
+                replay,
+                placement.width,
+                placement.height.saturating_sub(title_rows),
+            );
+            if layout.change_rows == 0 {
+                return Some((placement.x, placement.y));
+            }
+            let first = replay
+                .model
+                .index
+                .saturating_sub(layout.change_rows / 2)
+                .min(replay.model.steps.len().saturating_sub(layout.change_rows));
+            let selected_row = replay
+                .model
+                .index
+                .saturating_sub(first)
+                .min(layout.change_rows.saturating_sub(1));
+            return Some((
+                placement.x,
+                placement
+                    .y
+                    .saturating_add(title_rows)
+                    .saturating_add(layout.header_rows)
+                    .saturating_add(layout.diff_rows)
+                    .saturating_add(layout.change_gap_rows)
+                    .saturating_add(1)
+                    .saturating_add(selected_row),
+            ));
+        }
         let composer = panel.composer.as_ref()?;
         if !composer.focused || !composer.enabled {
             return None;
@@ -1707,29 +1759,38 @@ impl PanelManager {
             };
             let position = Point::new(placement.x, placement.y);
             let is_active = active_divider == Some(placement.id.as_str());
-            let border_style = panel_style(theme, config.border.as_ref());
-            let border_style = if is_active {
-                theme.active_divider_style(
+            let focused_replay = self.focused.as_deref() == Some(placement.id.as_str())
+                && self
+                    .text_panels
+                    .get(&placement.id)
+                    .is_some_and(|panel| panel.replay.is_some());
+            let mut border_style = panel_style(theme, config.border.as_ref());
+            if is_active {
+                border_style = theme.active_divider_style(
                     &border_style,
                     &panel_style(theme, config.surface.as_ref()),
-                )
-            } else {
-                border_style
-            };
+                );
+            } else if focused_replay {
+                border_style.fg = theme
+                    .colors
+                    .get("panelTitle.activeBorder")
+                    .copied()
+                    .or_else(|| theme.colors.get("editorCursor.foreground").copied())
+                    .or_else(|| theme.colors.get("focusBorder").copied())
+                    .or(theme.ui_style.picker_prompt.fg)
+                    .or(border_style.fg);
+            }
             let separator = if is_active
                 || config.border.is_some()
                 || self.text_panels.contains_key(&placement.id)
             {
-                if matches!(config.side, PanelSide::Left | PanelSide::Right) {
-                    if use_ascii {
-                        "|"
-                    } else {
-                        "│"
-                    }
-                } else if use_ascii {
-                    "-"
-                } else {
-                    "─"
+                match (config.side, use_ascii, focused_replay && !is_active) {
+                    (PanelSide::Left | PanelSide::Right, true, _) => "|",
+                    (PanelSide::Top | PanelSide::Bottom, true, _) => "-",
+                    (PanelSide::Left | PanelSide::Right, false, true) => "┃",
+                    (PanelSide::Top | PanelSide::Bottom, false, true) => "━",
+                    (PanelSide::Left | PanelSide::Right, false, false) => "│",
+                    (PanelSide::Top | PanelSide::Bottom, false, false) => "─",
                 }
             } else {
                 " "
@@ -1760,6 +1821,7 @@ impl PanelManager {
                     position,
                     placement.width,
                     placement.height,
+                    focused_replay,
                     theme,
                 );
             }
@@ -1883,6 +1945,7 @@ fn render_text_panel(
     position: Point,
     width: usize,
     height: usize,
+    focused: bool,
     theme: &Theme,
 ) {
     if width == 0 || height == 0 {
@@ -1905,7 +1968,7 @@ fn render_text_panel(
         .map_or(width, |(start, _, _)| start.saturating_sub(1));
     if let Some(title) = &panel.config.title {
         if let Some(replay) = panel.replay.as_ref().filter(|_| header_actions.is_empty()) {
-            render_replay_panel_title(buffer, replay, title, position, width, theme);
+            render_replay_panel_title(buffer, replay, title, position, width, focused, theme);
         } else {
             let title_style = Style {
                 bold: true,
@@ -1942,7 +2005,7 @@ fn render_text_panel(
             Point::new(position.x, position.y.saturating_add(title_rows)),
             width,
             body_height,
-            scroll,
+            ReplayPanelViewport { scroll, focused },
             theme,
         );
         return;
@@ -3052,6 +3115,64 @@ mod tests {
     }
 
     #[test]
+    fn focused_replay_exposes_its_caret_status_and_theme_derived_separator() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "replay-coach".to_string(),
+            PanelConfig {
+                side: PanelSide::Left,
+                width: 46,
+                title: Some("PR REPLAY".to_string()),
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_text_panel(
+            "replay-coach",
+            vec![structured_replay_block(ReplayPanelMode::Challenge)],
+            /*panel_height*/ 26,
+            /*terminal_width*/ 100,
+        );
+
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let mut buffer = RenderBuffer::new(/*width*/ 100, /*height*/ 28, &theme.style);
+        manager.render(&mut buffer, &theme);
+        assert!(row_text(&buffer, 0).starts_with("PR REPLAY"));
+        assert_eq!(buffer.cells[46].text, "│");
+        assert_eq!(manager.focused_replay_status(), None);
+
+        assert!(manager.focus_panel("replay-coach"));
+        manager.render(&mut buffer, &theme);
+        assert!(row_text(&buffer, 0).starts_with("▌ PR REPLAY"));
+        assert_eq!(buffer.cells[46].text, "┃");
+        assert_eq!(
+            buffer.cells[46].style.fg,
+            theme.colors.get("editorCursor.foreground").copied(),
+        );
+        assert_eq!(
+            manager.focused_replay_status(),
+            Some((482, "feat/viewport-diagnostics", 0, 5)),
+        );
+        let (x, y) = manager
+            .focused_text_panel_cursor_position(
+                /*terminal_width*/ 100, /*terminal_height*/ 28,
+            )
+            .expect("a visible replay step caret");
+        assert_eq!(buffer.cells[y * buffer.width + x].text, "▶");
+
+        manager.focus_editor();
+        manager.render(&mut buffer, &theme);
+        assert!(row_text(&buffer, 0).starts_with("PR REPLAY"));
+        assert_eq!(buffer.cells[46].text, "│");
+        assert_eq!(manager.focused_replay_status(), None);
+        assert_eq!(
+            manager.focused_text_panel_cursor_position(
+                /*terminal_width*/ 100, /*terminal_height*/ 28,
+            ),
+            None,
+        );
+    }
+
+    #[test]
     fn structured_replay_panel_keeps_typed_diff_and_focus_at_all_four_vim_edges() {
         let mut manager = PanelManager::default();
         manager.create_text_panel(
@@ -3095,7 +3216,25 @@ mod tests {
                 .into_iter()
                 .find(|placement| placement.id == "replay-coach")
                 .expect("Replay pane remains visible at its selected Vim edge");
-            assert!(row_text(&buffer, placement.y).contains("PR REPLAY"));
+            assert!(row_text(&buffer, placement.y).contains("▌ PR REPLAY"));
+            let (separator_x, separator_y, separator) = match side {
+                PanelSide::Left => (placement.x + placement.width, placement.y, "┃"),
+                PanelSide::Right => (placement.x - 1, placement.y, "┃"),
+                PanelSide::Top => (placement.x, placement.y + placement.height, "━"),
+                PanelSide::Bottom => (placement.x, placement.y - 1, "━"),
+            };
+            assert_eq!(
+                buffer.cells[separator_y * buffer.width + separator_x].text,
+                separator,
+                "focused Replay separator follows its {side:?} docking edge",
+            );
+            let (cursor_x, cursor_y) = manager
+                .focused_text_panel_cursor_position(
+                    /*terminal_width*/ 100, /*terminal_height*/ 28,
+                )
+                .expect("focused Replay retains an actual terminal cursor");
+            assert!(cursor_x >= placement.x && cursor_x < placement.x + placement.width);
+            assert!(cursor_y >= placement.y && cursor_y < placement.y + placement.height);
             assert!(
                 row_text(&buffer, placement.y + placement.height - 1).contains("[i]"),
                 "essential shortcuts remain visible after docking {side:?}",
