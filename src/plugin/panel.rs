@@ -1806,10 +1806,17 @@ fn render_text_spans(
     theme: &Theme,
 ) {
     paint_rich_text(buffer, x, y, width, line, |span| {
-        let mut style = span
-            .syntax_style
-            .clone()
-            .unwrap_or_else(|| text_panel_span_style(span.style, theme));
+        let base_style = text_panel_span_style(span.style, theme);
+        let mut style = if let Some(syntax_style) = &span.syntax_style {
+            Style {
+                fg: syntax_style.fg.or(base_style.fg),
+                bg: syntax_style.bg.or(base_style.bg).or(theme.style.bg),
+                bold: syntax_style.bold || base_style.bold,
+                italic: syntax_style.italic || base_style.italic,
+            }
+        } else {
+            base_style
+        };
         if span
             .link
             .as_ref()
@@ -2176,6 +2183,97 @@ mod tests {
         assert_eq!(block.kind, TextPanelBlockKind::Agent);
         assert_eq!(block.format, TextPanelBlockFormat::Markdown);
         assert_eq!(block.text, "# Heading");
+    }
+
+    #[test]
+    fn syntax_highlighted_text_panel_spans_preserve_panel_background() {
+        let panel_foreground = Color::Rgb {
+            r: 10,
+            g: 20,
+            b: 30,
+        };
+        let panel_background = Color::Rgb {
+            r: 40,
+            g: 50,
+            b: 60,
+        };
+        let code_foreground = Color::Rgb {
+            r: 70,
+            g: 80,
+            b: 90,
+        };
+        let syntax_foreground = Color::Rgb {
+            r: 100,
+            g: 110,
+            b: 120,
+        };
+        let syntax_background = Color::Rgb {
+            r: 130,
+            g: 140,
+            b: 150,
+        };
+        let theme = Theme {
+            style: Style {
+                fg: Some(panel_foreground),
+                bg: Some(panel_background),
+                ..Style::default()
+            },
+            token_styles: vec![crate::theme::TokenStyle {
+                name: None,
+                scope: vec!["markup.raw.block.markdown".to_string()],
+                style: Style {
+                    fg: Some(code_foreground),
+                    bold: true,
+                    ..Style::default()
+                },
+            }],
+            ..Theme::default()
+        };
+        let line = RenderedTextLine {
+            spans: vec![
+                RenderedTextSpan {
+                    text: "a".to_string(),
+                    style: TextPanelSpanStyle::Code,
+                    syntax_style: Some(Style {
+                        fg: Some(syntax_foreground),
+                        italic: true,
+                        ..Style::default()
+                    }),
+                    link: None,
+                },
+                RenderedTextSpan {
+                    text: "b".to_string(),
+                    style: TextPanelSpanStyle::Code,
+                    syntax_style: Some(Style {
+                        bg: Some(syntax_background),
+                        ..Style::default()
+                    }),
+                    link: None,
+                },
+            ],
+        };
+        let mut buffer = RenderBuffer::new(2, 1, &theme.style);
+
+        render_text_spans(&mut buffer, 0, 0, 2, &line, None, &theme);
+
+        assert_eq!(
+            buffer.cells[0].style,
+            Style {
+                fg: Some(syntax_foreground),
+                bg: Some(panel_background),
+                bold: true,
+                italic: true,
+            }
+        );
+        assert_eq!(
+            buffer.cells[1].style,
+            Style {
+                fg: Some(code_foreground),
+                bg: Some(syntax_background),
+                bold: true,
+                italic: false,
+            }
+        );
     }
 
     #[test]
