@@ -1039,11 +1039,7 @@ fn replay_outbox_actions(model: &ReplayPanelModel) -> Vec<UiAction> {
     if has_drafts || !model.notes.is_empty() {
         actions.push(
             UiAction::new("save_review", "[S]", "Save")
-                .with_priority(if has_drafts {
-                    ActionPriority::Essential
-                } else {
-                    ActionPriority::Secondary
-                })
+                .with_priority(ActionPriority::Essential)
                 .with_compact_label("Sv"),
         );
     }
@@ -1885,7 +1881,7 @@ mod tests {
             text: "Preserve this private original-source observation.".to_string(),
         });
         let actions = replay_outbox_actions(&replay);
-        let layout = ActionBar::new(&actions).layout(/*width*/ 80);
+        let layout = ActionBar::new(&actions).layout(/*width*/ 46);
         let visible = layout.text();
 
         assert!(visible.contains("[S]"));
