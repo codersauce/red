@@ -10437,7 +10437,8 @@ impl Editor {
             if !self.panel_manager.focused_text_input_active() && self.handle_repeater(ev) {
                 return Ok(None);
             }
-            if !self.panel_manager.focused_row_panel()
+            if (self.panel_manager.focused_text_panel_has_composer()
+                || self.panel_manager.focused_replay_status().is_some())
                 && !self.panel_manager.focused_text_input_active()
             {
                 if let Some(action) = self.panel_global_key_action(ev) {
@@ -22904,6 +22905,43 @@ mod test {
         assert!(status.contains("NORMAL"));
         assert!(!status.contains("PR #482"));
         assert!(editor.test_render_cursor_position().is_some());
+    }
+
+    #[test]
+    fn replay_shortcuts_do_not_capture_unrelated_read_only_text_panels() {
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        editor.config.keys.normal.insert(
+            "a".to_string(),
+            KeyAction::Single(Action::PluginCommand("ReplayApply".to_string())),
+        );
+        editor.test_create_text_panel(
+            "unrelated-read-only-panel",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Left,
+                width: 40,
+                title: Some("OTHER PANEL".to_string()),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        assert!(editor.test_focus_panel("unrelated-read-only-panel"));
+
+        let action = editor
+            .test_handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+            )))
+            .expect("dispatch the focused read-only panel's own shortcut");
+
+        assert!(matches!(
+            action,
+            Some(KeyAction::Multiple(actions)) if actions.iter().any(|action| {
+                matches!(
+                    action,
+                    Action::NotifyPlugins(event, _)
+                        if event == "panel:event:unrelated-read-only-panel"
+                )
+            })
+        ));
     }
 
     #[tokio::test]
