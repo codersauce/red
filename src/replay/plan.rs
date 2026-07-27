@@ -242,7 +242,7 @@ pub fn replay_plan_from_session(
                 title: replay_title(source_step, &display_path),
                 why: replay_rationale(session, source_step, &display_path),
                 task: replay_task(source_step, &display_path),
-                hint: String::new(),
+                hint: replay_hint(source_step, &display_path),
                 before,
                 after,
                 diff,
@@ -471,6 +471,62 @@ fn replay_task(step: &ReplayStep, path: &str) -> String {
     }
 
     format!("Reconstruct the exact original change in {path}.")
+}
+
+fn replay_hint(step: &ReplayStep, path: &str) -> String {
+    let location = format!("{path}:{}", step.old_start.max(1));
+    let action = replay_action(step.kind).to_ascii_lowercase();
+
+    if let Some((field, container)) = changed_field(step) {
+        return format!(
+            "At {location}, {action} the `{field}` field {} `{container}`; use the neighboring original fields as your anchor.",
+            replay_container_preposition(step.kind),
+        );
+    }
+
+    if let Some((kind, container)) = source_symbol(&step.heading) {
+        if matches!(kind, "fn" | "impl") {
+            if let Some(function) = changed_function(step) {
+                if function != container {
+                    return format!(
+                        "At {location}, {action} `{function}` {} `{container}`; preserve the surrounding original implementation.",
+                        replay_container_preposition(step.kind),
+                    );
+                }
+            }
+            if let Some(binding) = changed_binding(step) {
+                return format!(
+                    "At {location}, {action} the `{binding}` binding {} `{container}`; use its unchanged neighboring statements as your anchor.",
+                    replay_container_preposition(step.kind),
+                );
+            }
+        }
+        return format!(
+            "At {location}, inspect `{container}` and reconstruct only the original {kind} change.",
+        );
+    }
+
+    if let Some(subject) = changed_markdown_subject(step) {
+        if let Some(endpoint) = markdown_endpoint(step) {
+            return format!(
+                "At {location}, update the `{endpoint}` documentation for `{subject}`; keep the surrounding original explanation intact.",
+            );
+        }
+        return format!(
+            "At {location}, update the original documentation for `{subject}` without changing unrelated examples.",
+        );
+    }
+
+    if let Some(module) = changed_module(step) {
+        return format!(
+            "At {location}, {action} the `{module}` module; use its neighboring original declarations as your anchor.",
+        );
+    }
+
+    format!(
+        "At {location}, use the unchanged lines around the original {} hunk as your reconstruction anchor.",
+        replay_kind(step.kind),
+    )
 }
 
 const fn replay_action(kind: ReplayStepKind) -> &'static str {
@@ -1009,6 +1065,10 @@ mod tests {
             step.task,
             "Add the restore_token_usage field to ThreadResumeParams.",
         );
+        assert_eq!(
+            step.hint,
+            "At src/token.rs:1, add the `restore_token_usage` field to `ThreadResumeParams`; use the neighboring original fields as your anchor.",
+        );
         assert!(!step.why.starts_with('#'));
     }
 
@@ -1084,6 +1144,10 @@ mod tests {
             replay_title(&resume, "codex-rs/app-server/README.md"),
             "Document thread/resume restoreTokenUsage",
         );
+        assert_eq!(
+            replay_hint(&resume, "codex-rs/app-server/README.md"),
+            "At codex-rs/app-server/README.md:1, update the `thread/resume` documentation for `restoreTokenUsage`; keep the surrounding original explanation intact.",
+        );
 
         let mut fork = resume.clone();
         fork.heading = "To branch from a stored session, call `thread/fork`.".to_string();
@@ -1102,6 +1166,10 @@ mod tests {
         assert_eq!(
             replay_title(&fork, "codex-rs/app-server/README.md"),
             "Document thread/fork restoreTokenUsage",
+        );
+        assert_eq!(
+            replay_hint(&fork, "codex-rs/app-server/README.md"),
+            "At codex-rs/app-server/README.md:1, update the `thread/fork` documentation for `restoreTokenUsage`; keep the surrounding original explanation intact.",
         );
     }
 
@@ -1126,6 +1194,10 @@ mod tests {
             replay_task(&removal, "src/thread_lifecycle.rs"),
             "Remove the token_usage_turn_id binding from handle_pending_thread_resume_request.",
         );
+        assert_eq!(
+            replay_hint(&removal, "src/thread_lifecycle.rs"),
+            "At src/thread_lifecycle.rs:1, remove the `token_usage_turn_id` binding from `handle_pending_thread_resume_request`; use its unchanged neighboring statements as your anchor.",
+        );
 
         let mut addition = removal.clone();
         addition.kind = ReplayStepKind::Add;
@@ -1140,6 +1212,10 @@ mod tests {
             replay_title(&addition, "src/thread_lifecycle.rs"),
             "Add token_usage_turn_id to handle_pending_thread_resume_request",
         );
+        let hint = replay_hint(&addition, "src/thread_lifecycle.rs");
+        assert!(hint.contains("`token_usage_turn_id`"));
+        assert!(hint.contains("`handle_pending_thread_resume_request`"));
+        assert!(!hint.contains("pending.restore_token_usage"));
     }
 
     #[test]
@@ -1166,6 +1242,10 @@ mod tests {
         assert_eq!(
             replay_task(&step, "src/pager_overlay.rs"),
             "Add the should_load_older function to TranscriptOverlay.",
+        );
+        assert_eq!(
+            replay_hint(&step, "src/pager_overlay.rs"),
+            "At src/pager_overlay.rs:1, add `should_load_older` to `TranscriptOverlay`; preserve the surrounding original implementation.",
         );
     }
 
@@ -1206,6 +1286,8 @@ mod tests {
             assert_eq!(parsed.files.len(), 1);
             assert_eq!(parsed.files[0].hunks.len(), 1);
             assert_eq!(parsed.files[0].path(), Some(Path::new(&step.path)));
+            assert!(step.hint.starts_with(&format!("At {}:", step.path)));
+            assert!(!step.hint.contains("diff --git"));
         }
     }
 

@@ -75,8 +75,11 @@ presented as explanations. This guidance is derived from the pinned original
 source and review context; it does not invent or attribute undocumented intent
 to the author.
 
-For a multi-file review, `h` and `l` select the previous and next original hunk
-and switch the existing editor window to that hunk's actual scratch file.
+For a multi-file review, `h` and `l` select the previous and next original hunk,
+while `[` and `]` jump directly to the first hunk in the previous or next
+changed file. Both motions switch the existing editor window to the actual
+scratch file. The changes heading keeps the current file and total file count
+visible without introducing a second tree or another pane.
 The source cursor and viewport jump directly to the original hunk, even when
 the change occurs thousands of lines into a large file.
 Changes from different files stay in their own buffers; no unrelated file tree,
@@ -134,6 +137,8 @@ unchanged.
 | --- | --- |
 | `Space R ?` | Show or hide the compact Replay keyboard help. |
 | `Space R g` | Open or return to the guide. |
+| `Space R [` | Jump to the first change in the previous file. |
+| `Space R ]` | Jump to the first change in the next file. |
 | `Space R n` | Next reconstruction step. |
 | `Space R p` | Previous reconstruction step. |
 | `Space R h` | Reveal or hide the current hint. |
@@ -147,8 +152,10 @@ unchanged.
 | `Space R q` | Hide the coach without touching the scratch source or progress. |
 
 While the dedicated coach is focused, `j` and `k` scroll the current source
-hunk, and `h` and `l` select the previous and next reconstruction steps. The
-older `p` and `n` step bindings remain compatibility aliases. Use `Space R h`
+hunk, `h` and `l` select the previous and next reconstruction steps, and `[` and
+`]` jump between changed files. Outside the focused coach, `[` and `]` retain
+their existing editor and Git-hunk motions. The older `p` and `n` step bindings
+remain compatibility aliases. Use `Space R h`
 for a hint so horizontal navigation never unexpectedly changes the exercise
 instead. `i`, `a`, `u`, `m`, `v`, `o`, `f`, `q`, and `?` act directly on
 the Replay pane. The pinned action bar keeps scratch-source focus, manual

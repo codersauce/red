@@ -358,7 +358,7 @@ pub(super) fn render_replay_panel(
         .saturating_add(layout.diff_rows)
         .saturating_add(layout.change_gap_rows);
     if layout.change_rows > 0 {
-        render_change_heading(buffer, position.x, changes_top, width, theme);
+        render_change_heading(buffer, state, position.x, changes_top, width, theme);
         let first = state
             .model
             .index
@@ -398,7 +398,7 @@ pub(super) fn render_replay_panel(
             &theme.ui_style.muted.with_bg(theme.style.bg),
         );
     }
-    let actions = replay_actions();
+    let actions = replay_actions(&state.model, width);
     ActionBar::new(&actions).render(
         buffer,
         position.x,
@@ -581,7 +581,7 @@ fn replay_header_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
     if state.model.help_visible {
         lines.extend(
             wrap_plain_text(
-                "j/k scroll · h/l step · a apply · u undo · Ctrl-w H/J/K/L dock · Space R h hint",
+                "j/k scroll · h/l step · [/] file · a apply · u undo · Ctrl-w H/J/K/L dock · Space R h hint",
                 width.max(1),
                 TextPanelSpanStyle::Muted,
             )
@@ -758,12 +758,27 @@ fn render_replay_diff_line(
 
 fn render_change_heading(
     buffer: &mut RenderBuffer,
+    state: &ReplayPanelState,
     x: usize,
     y: usize,
     width: usize,
     theme: &Theme,
 ) {
-    let line = RenderedTextLine::plain("CHANGES".to_string(), TextPanelSpanStyle::Heading);
+    let file_progress = state
+        .model
+        .current_file_position()
+        .filter(|(_, count)| *count > 1)
+        .map_or_else(String::new, |(index, count)| {
+            format!("{index}/{count} files")
+        });
+    let line = aligned_line(
+        "CHANGES",
+        TextPanelSpanStyle::Heading,
+        &file_progress,
+        TextPanelSpanStyle::Muted,
+        None,
+        width,
+    );
     render_text_spans_on_surface(buffer, x, y, width, &line, theme, &theme.style);
 }
 
@@ -882,8 +897,8 @@ fn change_kind_style(kind: &str, theme: &Theme) -> Style {
     }
 }
 
-fn replay_actions() -> Vec<UiAction> {
-    vec![
+fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
+    let mut actions = vec![
         UiAction::new("edit", "[i]", "Source")
             .with_priority(ActionPriority::Essential)
             .with_compact_label(""),
@@ -902,7 +917,24 @@ fn replay_actions() -> Vec<UiAction> {
         UiAction::new("help", "[?]", "Help")
             .with_priority(ActionPriority::Essential)
             .with_compact_label(""),
-    ]
+    ];
+
+    if model
+        .current_file_position()
+        .is_some_and(|(_, count)| count > 1)
+    {
+        actions.insert(
+            5,
+            UiAction::new("navigate_file", "[/]", "File")
+                .with_priority(ActionPriority::Essential)
+                .with_compact_label(""),
+        );
+        if ActionBar::new(&actions).layout(width).hidden_count() > 0 {
+            actions.remove(5);
+        }
+    }
+
+    actions
 }
 
 #[cfg(test)]
@@ -1225,7 +1257,7 @@ mod tests {
 
     #[test]
     fn replay_action_bar_keeps_complete_shortcuts_at_narrow_widths() {
-        let actions = replay_actions();
+        let actions = replay_actions(&model(), /*width*/ 30);
         let layout = ActionBar::new(&actions).layout(/*width*/ 30);
         let visible = layout.text();
         assert!(visible.contains("[i]"));
@@ -1236,6 +1268,31 @@ mod tests {
         assert!(visible.contains("[?]"));
         assert!(display_width(&visible) <= 30);
         assert_eq!(layout.hidden_count(), 0);
+    }
+
+    #[test]
+    fn multi_file_action_bar_shows_file_motion_without_hiding_essential_shortcuts() {
+        let replay = multi_file_model();
+        let actions = replay_actions(&replay, /*width*/ 46);
+        let layout = ActionBar::new(&actions).layout(/*width*/ 46);
+        let visible = layout.text();
+
+        for key in ["[i]", "[v]", "[a]", "[u]", "[h/l]", "[/]", "[?]"] {
+            assert!(visible.contains(key), "missing visible replay action {key}");
+        }
+        assert_eq!(layout.hidden_count(), 0);
+
+        let compact_actions = replay_actions(&replay, /*width*/ 30);
+        let compact_layout = ActionBar::new(&compact_actions).layout(/*width*/ 30);
+        let compact_visible = compact_layout.text();
+        for key in ["[i]", "[v]", "[a]", "[u]", "[h/l]", "[?]"] {
+            assert!(
+                compact_visible.contains(key),
+                "missing essential narrow replay action {key}"
+            );
+        }
+        assert!(!compact_visible.contains("[/]"));
+        assert_eq!(compact_layout.hidden_count(), 0);
     }
 
     #[test]
@@ -1409,6 +1466,36 @@ mod tests {
             .lines
             .iter()
             .any(|line| line.text.contains("render_visible()")));
+    }
+
+    #[test]
+    fn multi_file_change_heading_keeps_current_file_progress_on_the_original_surface() {
+        let replay = multi_file_model();
+        let text = serde_json::to_string(&replay).unwrap();
+        let state = ReplayPanelState::parse(&text).unwrap();
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let width = 46;
+        let height = 35;
+        let layout = ReplayPanelLayout::calculate(&state, width, height);
+        let mut buffer = RenderBuffer::new(width, height, &theme.style);
+
+        render_replay_panel(
+            &mut buffer,
+            &state,
+            Point::new(0, 0),
+            width,
+            height,
+            ReplayPanelViewport {
+                scroll: 0,
+                focused: true,
+            },
+            &theme,
+        );
+
+        let heading =
+            &rendered_rows(&buffer)[layout.header_rows + layout.diff_rows + layout.change_gap_rows];
+        assert!(heading.starts_with("CHANGES"));
+        assert!(heading.contains("2/3 files"));
     }
 
     #[test]

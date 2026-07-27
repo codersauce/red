@@ -11021,6 +11021,12 @@ impl Editor {
                     KeyCode::Char('u') if self.panel_manager.focused_replay_status().is_some() => {
                         return Some(KeyAction::Single(Action::ReplayUndo));
                     }
+                    KeyCode::Char('[') if self.panel_manager.focused_replay_status().is_some() => {
+                        "previous_file"
+                    }
+                    KeyCode::Char(']') if self.panel_manager.focused_replay_status().is_some() => {
+                        "next_file"
+                    }
                     KeyCode::Char('a') if !self.panel_manager.focused_row_panel() => {
                         "composer_focus"
                     }
@@ -23691,6 +23697,26 @@ mod test {
         assert!(status.contains("REPLAY"));
         assert!(status.contains("PR #482"));
         assert!(status.contains("01/05"));
+        for (key, expected_action) in [('[', "previous_file"), (']', "next_file")] {
+            let action = editor
+                .test_handle_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(key),
+                    KeyModifiers::NONE,
+                )))
+                .expect("dispatch focused Replay changed-file motion");
+
+            assert!(matches!(
+                action,
+                Some(KeyAction::Multiple(actions)) if actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        Action::NotifyPlugins(event, payload)
+                            if event == "panel:event:replay-coach"
+                                && payload["action"] == expected_action
+                    )
+                })
+            ));
+        }
         assert_eq!(
             editor
                 .test_handle_event(Event::Key(KeyEvent::new(

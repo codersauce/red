@@ -3324,6 +3324,23 @@ mod tests {
         }
     }
 
+    fn recv_replay_source_focus(expected_workspace: &str, expected_step: &str) {
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayFocusStepSource {
+                workspace_id,
+                step_id,
+            } => {
+                assert_eq!(workspace_id, expected_workspace);
+                assert_eq!(step_id, expected_step);
+            }
+            _ => panic!("expected the exact original changed-file scratch source"),
+        }
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusPanel { id } if id == "replay-coach"
+        ));
+    }
+
     fn recv_replay_workspace_preparation(expected_pull_request: u64) {
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::CreateTextPanel { id, config } => {
@@ -4858,6 +4875,81 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::FocusPanel { id } if id == "replay-coach"
         ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn source_backed_replay_jumps_between_original_changed_files() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_source_backed_replay(&mut runtime).await;
+
+        runtime.execute_command("ReplayHint").await.unwrap();
+        assert!(recv_replay_guide().hint_visible);
+
+        runtime.execute_command("ReplayNextFile").await.unwrap();
+        let next_file = recv_replay_guide();
+        assert_eq!(next_file.index, 1);
+        assert_eq!(next_file.current_step().unwrap().path, "tests/rendering.rs");
+        assert!(!next_file.hint_visible);
+        recv_replay_source_focus("real-workspace-1", &plan.steps[1].id);
+
+        runtime.execute_command("ReplayNextFile").await.unwrap();
+        let original_file = recv_replay_guide();
+        assert_eq!(original_file.index, 2);
+        assert_eq!(
+            original_file.current_step().unwrap().path,
+            "src/editor/rendering.rs"
+        );
+        recv_replay_source_focus("real-workspace-1", &plan.steps[2].id);
+
+        runtime.execute_command("ReplayNextFile").await.unwrap();
+        let last_file = recv_replay_guide();
+        assert_eq!(last_file.index, 2);
+        assert!(last_file.notice.contains("last changed file"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime.execute_command("ReplayPreviousFile").await.unwrap();
+        let previous_file = recv_replay_guide();
+        assert_eq!(previous_file.index, 1);
+        assert!(previous_file.notice.is_empty());
+        recv_replay_source_focus("real-workspace-1", &plan.steps[1].id);
+
+        runtime
+            .notify(
+                "panel:event:replay-coach",
+                serde_json::json!({ "action": "previous_file" }),
+            )
+            .await
+            .unwrap();
+        let first_file = recv_replay_guide();
+        assert_eq!(first_file.index, 0);
+        recv_replay_source_focus("real-workspace-1", &plan.steps[0].id);
+
+        runtime
+            .notify(
+                "panel:event:replay-coach",
+                serde_json::json!({ "action": "previous_file" }),
+            )
+            .await
+            .unwrap();
+        let first_file = recv_replay_guide();
+        assert_eq!(first_file.index, 0);
+        assert!(first_file.notice.contains("first changed file"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime
+            .notify(
+                "panel:event:replay-coach",
+                serde_json::json!({ "action": "next_file" }),
+            )
+            .await
+            .unwrap();
+        let next_file = recv_replay_guide();
+        assert_eq!(next_file.index, 1);
+        assert!(next_file.notice.is_empty());
+        recv_replay_source_focus("real-workspace-1", &plan.steps[1].id);
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 

@@ -41,6 +41,16 @@ pub fn activate() {
         category: "PR Replay",
         description: "Show the previous pull request reconstruction exercise",
     });
+    red::add_command("ReplayNextFile", next_file, Json {
+        title: "Next replay file",
+        category: "PR Replay",
+        description: "Jump to the first original reconstruction exercise in the next changed file",
+    });
+    red::add_command("ReplayPreviousFile", previous_file, Json {
+        title: "Previous replay file",
+        category: "PR Replay",
+        description: "Jump to the first original reconstruction exercise in the previous changed file",
+    });
     red::add_command("ReplayHint", toggle_hint, Json {
         title: "Toggle replay hint",
         category: "PR Replay",
@@ -442,6 +452,10 @@ fn panel_event(event: Json) {
         next();
     } else if action == "previous" || action == "p" || action == "collapse" {
         previous();
+    } else if action == "next_file" || action == "]" {
+        next_file();
+    } else if action == "previous_file" || action == "[" {
+        previous_file();
     } else if action == "composer_focus" {
         apply();
     } else if action == "i" {
@@ -492,6 +506,65 @@ fn previous() {
         red::state_set("replay_hint_visible", false);
         red::state_set("replay_notice", "");
     }
+    red::state_set("replay_view", "guide");
+    render();
+    sync_selected_source();
+}
+
+fn next_file() {
+    if !ensure_workspace() {
+        return;
+    }
+    let steps = red::state("replay_steps");
+    let index = red::int(red::state("replay_index"), 0);
+    if index < 0 || index >= red::len(steps) {
+        return;
+    }
+    let current_path = red::string(steps[index].path, "");
+    let candidate = index + 1;
+    while candidate < red::len(steps) {
+        if red::string(steps[candidate].path, "") != current_path {
+            select_file_step(candidate);
+            return;
+        }
+        candidate = candidate + 1;
+    }
+    red::state_set("replay_notice", "Already at the last changed file.");
+    red::state_set("replay_view", "guide");
+    render();
+}
+
+fn previous_file() {
+    if !ensure_workspace() {
+        return;
+    }
+    let steps = red::state("replay_steps");
+    let index = red::int(red::state("replay_index"), 0);
+    if index < 0 || index >= red::len(steps) {
+        return;
+    }
+    let current_path = red::string(steps[index].path, "");
+    let candidate = index - 1;
+    while candidate >= 0 {
+        let candidate_path = red::string(steps[candidate].path, "");
+        if candidate_path != current_path {
+            while candidate > 0 && red::string(steps[candidate - 1].path, "") == candidate_path {
+                candidate = candidate - 1;
+            }
+            select_file_step(candidate);
+            return;
+        }
+        candidate = candidate - 1;
+    }
+    red::state_set("replay_notice", "Already at the first changed file.");
+    red::state_set("replay_view", "guide");
+    render();
+}
+
+fn select_file_step(index: int) {
+    red::state_set("replay_index", index);
+    red::state_set("replay_hint_visible", false);
+    red::state_set("replay_notice", "");
     red::state_set("replay_view", "guide");
     render();
     sync_selected_source();

@@ -2930,6 +2930,8 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
         for (key, command) in [
             ("?", "ReplayHelp"),
             ("g", "Replay"),
+            ("[", "ReplayPreviousFile"),
+            ("]", "ReplayNextFile"),
             ("n", "ReplayNext"),
             ("p", "ReplayPrevious"),
             ("h", "ReplayHint"),
