@@ -301,6 +301,8 @@ impl PromptBuffer {
                         PromptInput::Cancel
                     }
                     KeyCode::Esc if self.mode == Mode::Insert => {
+                        let cursor = self.cursor.saturating_sub(1).max(self.current_line_start());
+                        self.set_cursor(cursor);
                         self.set_mode(Mode::Normal);
                         PromptInput::Changed
                     }
@@ -420,22 +422,27 @@ impl PromptBuffer {
         match character {
             'i' => self.set_mode(Mode::Insert),
             'a' => {
-                self.set_cursor(self.cursor.saturating_add(1));
+                self.set_cursor(self.cursor.saturating_add(1).min(self.current_line_end()));
                 self.set_mode(Mode::Insert);
             }
             'A' => {
                 self.set_cursor(self.current_line_end());
                 self.set_mode(Mode::Insert);
             }
-            'h' => self.set_cursor(self.cursor.saturating_sub(1)),
+            'h' => {
+                self.set_cursor(self.cursor.saturating_sub(1).max(self.current_line_start()));
+            }
             'j' => self.move_vertical(1, wrap_width),
             'k' => self.move_vertical(-1, wrap_width),
-            'l' => self.set_cursor(self.cursor.saturating_add(1)),
-            '0' => self.set_cursor(self.current_line_start()),
-            '$' => {
-                let line_end = self.current_line_end();
-                self.set_cursor(line_end.saturating_sub(1).max(self.current_line_start()));
+            'l' => {
+                self.set_cursor(
+                    self.cursor
+                        .saturating_add(1)
+                        .min(self.current_line_last_grapheme()),
+                );
             }
+            '0' => self.set_cursor(self.current_line_start()),
+            '$' => self.set_cursor(self.current_line_last_grapheme()),
             'w' => self.set_cursor(self.next_word_boundary()),
             'o' => {
                 self.set_cursor(self.current_line_end());
@@ -443,7 +450,9 @@ impl PromptBuffer {
                 self.set_mode(Mode::Insert);
             }
             'x' => {
-                self.delete();
+                if self.cursor < self.current_line_end() {
+                    self.delete();
+                }
             }
             'u' => {
                 self.undo();
@@ -552,6 +561,12 @@ impl PromptBuffer {
             || grapheme_len(&text),
             |index| grapheme_len(&text[..byte + index]),
         )
+    }
+
+    fn current_line_last_grapheme(&self) -> usize {
+        self.current_line_end()
+            .saturating_sub(1)
+            .max(self.current_line_start())
     }
 
     fn next_word_boundary(&self) -> usize {
@@ -847,6 +862,171 @@ mod tests {
             PromptInput::Submit
         );
         assert_eq!(prompt.text(), "draft");
+    }
+
+    #[test]
+    fn normal_mode_line_boundary_escape_selects_a_current_line_grapheme() {
+        let cases = [
+            ("single line", "abc", 3, 2),
+            ("first line end", "abc\ndef", 3, 2),
+            ("second line start", "abc\ndef", 4, 4),
+            ("second line interior", "abc\ndef", 6, 5),
+            ("empty middle line", "abc\n\ndef", 4, 4),
+            ("empty draft", "", 0, 0),
+            ("Unicode graphemes", "e\u{301}👨‍👩‍👧", 2, 1),
+        ];
+
+        for (name, text, insertion_cursor, normal_cursor) in cases {
+            let mut prompt = PromptBuffer::new(text);
+            prompt.set_cursor(insertion_cursor);
+
+            assert_eq!(
+                prompt.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE), 40),
+                PromptInput::Changed,
+                "{name}: enter normal mode"
+            );
+            assert_eq!(prompt.mode(), Mode::Normal, "{name}: set normal mode");
+            assert_eq!(
+                prompt.cursor(),
+                normal_cursor,
+                "{name}: remain on the current line"
+            );
+            assert_eq!(prompt.text(), text, "{name}: preserve draft");
+        }
+    }
+
+    #[test]
+    fn normal_mode_line_boundary_horizontal_motions_stay_on_current_line() {
+        let cases = [
+            (
+                "h at second line start",
+                "one\ntwo",
+                4,
+                'h',
+                4,
+                Some("one\nwo"),
+            ),
+            (
+                "l at first line end",
+                "one\ntwo",
+                2,
+                'l',
+                2,
+                Some("on\ntwo"),
+            ),
+            (
+                "h within second line",
+                "one\ntwo",
+                5,
+                'h',
+                4,
+                Some("one\nwo"),
+            ),
+            (
+                "l within second line",
+                "one\ntwo",
+                4,
+                'l',
+                5,
+                Some("one\nto"),
+            ),
+            ("h on empty line", "one\n\ntwo", 4, 'h', 4, None),
+            ("l on empty line", "one\n\ntwo", 4, 'l', 4, None),
+            (
+                "l after Unicode grapheme",
+                "e\u{301}👨‍👩‍👧\nlast",
+                1,
+                'l',
+                1,
+                Some("e\u{301}\nlast"),
+            ),
+        ];
+
+        for (name, text, cursor, motion, expected_cursor, expected_delete) in cases {
+            let mut prompt = PromptBuffer::new(text);
+            prompt.set_cursor(cursor);
+            prompt.set_mode(Mode::Normal);
+
+            assert_eq!(
+                prompt.handle_event(&key(KeyCode::Char(motion), KeyModifiers::NONE), 40),
+                PromptInput::Changed,
+                "{name}: apply horizontal motion"
+            );
+            assert_eq!(
+                prompt.cursor(),
+                expected_cursor,
+                "{name}: stay on current line"
+            );
+            assert_eq!(prompt.text(), text, "{name}: preserve line breaks");
+
+            if let Some(expected) = expected_delete {
+                assert_eq!(
+                    prompt.handle_event(&key(KeyCode::Char('x'), KeyModifiers::NONE), 40),
+                    PromptInput::Changed,
+                    "{name}: delete selected grapheme"
+                );
+                assert_eq!(prompt.text(), expected, "{name}: preserve adjacent line");
+            }
+        }
+    }
+
+    #[test]
+    fn normal_mode_line_boundary_delete_preserves_empty_line_separators() {
+        let cases = [
+            ("empty first line", "\ntwo", 0),
+            ("empty middle line", "one\n\ntwo", 4),
+            ("empty final line", "one\n", 4),
+            ("only a newline", "\n", 0),
+            ("empty draft", "", 0),
+        ];
+
+        for (name, text, cursor) in cases {
+            let mut prompt = PromptBuffer::new(text);
+            prompt.set_cursor(cursor);
+            prompt.set_mode(Mode::Normal);
+            let original_history = prompt.buffer().undo_history.node_count();
+
+            assert_eq!(
+                prompt.handle_event(&key(KeyCode::Char('$'), KeyModifiers::NONE), 40),
+                PromptInput::Changed,
+                "{name}: select empty line"
+            );
+            assert_eq!(prompt.cursor(), cursor, "{name}: remain on empty line");
+
+            assert_eq!(
+                prompt.handle_event(&key(KeyCode::Char('x'), KeyModifiers::NONE), 40),
+                PromptInput::Changed,
+                "{name}: ignore deletion on empty line"
+            );
+            assert_eq!(prompt.text(), text, "{name}: preserve newline separator");
+            assert_eq!(prompt.cursor(), cursor, "{name}: preserve cursor");
+            assert_eq!(
+                prompt.buffer().undo_history.node_count(),
+                original_history,
+                "{name}: avoid creating an undo transaction"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_mode_line_boundary_append_stays_on_empty_line() {
+        let mut prompt = PromptBuffer::new("one\n\ntwo");
+        prompt.set_cursor(4);
+        prompt.set_mode(Mode::Normal);
+
+        assert_eq!(
+            prompt.handle_event(&key(KeyCode::Char('a'), KeyModifiers::NONE), 40),
+            PromptInput::Changed
+        );
+        assert_eq!(prompt.mode(), Mode::Insert);
+        assert_eq!(prompt.cursor(), 4);
+
+        assert_eq!(
+            prompt.handle_event(&key(KeyCode::Char('Z'), KeyModifiers::NONE), 40),
+            PromptInput::Changed
+        );
+        assert_eq!(prompt.text(), "one\nZ\ntwo");
+        assert_eq!(prompt.cursor(), 5);
     }
 
     #[test]
