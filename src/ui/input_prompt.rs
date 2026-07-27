@@ -17,8 +17,8 @@ use crate::{
 };
 
 use super::{
-    dialog::{BorderStyle, Dialog},
-    Component,
+    dialog::{BorderStyle, Dialog, SurfaceRole},
+    first_prompt_line, Component, PromptBuffer,
 };
 
 type SubmitAction = Box<dyn Fn(String) -> Action + Send>;
@@ -27,8 +27,7 @@ type SubmitAction = Box<dyn Fn(String) -> Action + Send>;
 /// replacement is one keystroke, while cursor motion and paste remain Unicode-safe.
 pub struct InputPrompt {
     dialog: Dialog,
-    value: String,
-    cursor: usize,
+    prompt: PromptBuffer,
     selected: bool,
     masked: bool,
     submit: SubmitAction,
@@ -46,12 +45,12 @@ impl InputPrompt {
     ) -> Self {
         let title = title.into();
         let value = initial.into();
+        let selected = !value.is_empty();
+        let prompt = PromptBuffer::new(&value);
         let width = editor.vwidth().saturating_sub(2).clamp(1, 60);
         let x = editor.vwidth().saturating_sub(width + 2) / 2;
         let y = editor.vheight().saturating_sub(3) / 2;
         let style = editor.theme.ui_style.dialog.clone();
-        let border_style = editor.theme.ui_style.dialog_border.clone();
-        let title_style = editor.theme.ui_style.dialog_title.clone();
         Self {
             dialog: Dialog::new(
                 Some(title),
@@ -63,11 +62,9 @@ impl InputPrompt {
                 BorderStyle::Single,
                 &editor.theme,
             )
-            .with_border_draw_style(&border_style)
-            .with_title_style(&title_style),
-            cursor: grapheme_len(&value),
-            selected: !value.is_empty(),
-            value,
+            .with_surface_theme(&editor.theme, SurfaceRole::Dialog),
+            prompt,
+            selected,
             masked: false,
             submit: Box::new(submit),
             callback_handle: None,
@@ -104,15 +101,12 @@ impl InputPrompt {
     }
 
     fn insert(&mut self, text: &str) {
-        let text = text.split(['\r', '\n']).next().unwrap_or_default();
+        let text = first_prompt_line(text);
         if self.selected {
-            self.value.clear();
-            self.cursor = 0;
+            self.prompt.clear();
             self.selected = false;
         }
-        let offset = grapheme_to_byte(&self.value, self.cursor);
-        self.value.insert_str(offset, text);
-        self.cursor += grapheme_len(text);
+        self.prompt.insert(&text);
     }
 }
 
@@ -123,10 +117,7 @@ impl Component for InputPrompt {
 
     fn set_theme(&mut self, theme: &Theme) {
         self.style = theme.ui_style.dialog.clone();
-        self.dialog.style = theme.ui_style.dialog.clone();
-        self.dialog.border_draw_style = theme.ui_style.dialog_border.clone();
-        self.dialog.title_style = theme.ui_style.dialog_title.clone();
-        self.dialog.theme = theme.clone();
+        self.dialog.apply_surface_theme(theme, SurfaceRole::Dialog);
         self.theme = theme.clone();
     }
 
@@ -139,10 +130,11 @@ impl Component for InputPrompt {
 
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.dialog.draw(buffer)?;
+        let text = self.prompt.text();
         let visible = if self.masked {
-            "*".repeat(grapheme_len(&self.value).min(self.dialog.width))
+            "*".repeat(grapheme_len(&text).min(self.dialog.width))
         } else {
-            truncate_display_width(&self.value, self.dialog.width)
+            truncate_display_width(&text, self.dialog.width)
         };
         let style = if self.selected {
             self.theme.selected_style(
@@ -161,14 +153,14 @@ impl Component for InputPrompt {
         match ev {
             Event::Paste(text) => {
                 self.insert(text);
-                Some(KeyAction::Single(Action::ShowDialog))
+                Some(KeyAction::Single(Action::Refresh))
             }
             Event::Key(key) => match (key.code, key.modifiers) {
                 (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                     Some(self.cancel_action())
                 }
                 (KeyCode::Enter, _) => {
-                    let value = self.value.trim().to_string();
+                    let value = self.prompt.text().trim().to_string();
                     if value.is_empty() {
                         return Some(self.cancel_action());
                     }
@@ -180,54 +172,49 @@ impl Component for InputPrompt {
                 }
                 (KeyCode::Left, _) => {
                     self.selected = false;
-                    self.cursor = self.cursor.saturating_sub(1);
-                    Some(KeyAction::Single(Action::ShowDialog))
+                    self.prompt
+                        .set_cursor(self.prompt.cursor().saturating_sub(1));
+                    Some(KeyAction::Single(Action::Refresh))
                 }
                 (KeyCode::Right, _) => {
                     self.selected = false;
-                    self.cursor = (self.cursor + 1).min(grapheme_len(&self.value));
-                    Some(KeyAction::Single(Action::ShowDialog))
+                    self.prompt
+                        .set_cursor(self.prompt.cursor().saturating_add(1));
+                    Some(KeyAction::Single(Action::Refresh))
                 }
                 (KeyCode::Home, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
                     self.selected = false;
-                    self.cursor = 0;
-                    Some(KeyAction::Single(Action::ShowDialog))
+                    self.prompt.set_cursor(0);
+                    Some(KeyAction::Single(Action::Refresh))
                 }
                 (KeyCode::End, _) | (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
                     self.selected = false;
-                    self.cursor = grapheme_len(&self.value);
-                    Some(KeyAction::Single(Action::ShowDialog))
+                    self.prompt.set_cursor(grapheme_len(&self.prompt.text()));
+                    Some(KeyAction::Single(Action::Refresh))
                 }
                 (KeyCode::Backspace, _) => {
                     if self.selected {
-                        self.value.clear();
-                        self.cursor = 0;
+                        self.prompt.clear();
                         self.selected = false;
-                    } else if self.cursor > 0 {
-                        let start = grapheme_to_byte(&self.value, self.cursor - 1);
-                        let end = grapheme_to_byte(&self.value, self.cursor);
-                        self.value.replace_range(start..end, "");
-                        self.cursor -= 1;
+                    } else {
+                        self.prompt.backspace();
                     }
-                    Some(KeyAction::Single(Action::ShowDialog))
+                    Some(KeyAction::Single(Action::Refresh))
                 }
                 (KeyCode::Delete, _) => {
                     if self.selected {
-                        self.value.clear();
-                        self.cursor = 0;
+                        self.prompt.clear();
                         self.selected = false;
-                    } else if self.cursor < grapheme_len(&self.value) {
-                        let start = grapheme_to_byte(&self.value, self.cursor);
-                        let end = grapheme_to_byte(&self.value, self.cursor + 1);
-                        self.value.replace_range(start..end, "");
+                    } else {
+                        self.prompt.delete();
                     }
-                    Some(KeyAction::Single(Action::ShowDialog))
+                    Some(KeyAction::Single(Action::Refresh))
                 }
                 (KeyCode::Char(character), modifiers)
                     if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     self.insert(&character.to_string());
-                    Some(KeyAction::Single(Action::ShowDialog))
+                    Some(KeyAction::Single(Action::Refresh))
                 }
                 _ => None,
             },
@@ -237,9 +224,12 @@ impl Component for InputPrompt {
 
     fn cursor_position(&self) -> Option<(usize, usize)> {
         let offset = if self.masked {
-            self.cursor.min(self.dialog.width.saturating_sub(1))
+            self.prompt
+                .cursor()
+                .min(self.dialog.width.saturating_sub(1))
         } else {
-            let prefix = &self.value[..grapheme_to_byte(&self.value, self.cursor)];
+            let value = self.prompt.text();
+            let prefix = &value[..grapheme_to_byte(&value, self.prompt.cursor())];
             display_width(prefix).min(self.dialog.width.saturating_sub(1))
         };
         let x = self.dialog.x + 1 + offset;
@@ -300,6 +290,44 @@ mod tests {
                 Action::Print("ne".to_string())
             ]))
         );
+    }
+
+    #[test]
+    fn single_line_input_edits_the_shared_unnamed_prompt_buffer() {
+        let editor = editor();
+        let mut prompt = InputPrompt::new(&editor, "Rename symbol", "old", Action::Print);
+
+        prompt.handle_event(&Event::Paste("👨‍👩‍👧name\r\nignored".to_string()));
+        prompt.handle_event(&key(KeyCode::Left));
+        prompt.handle_event(&key(KeyCode::Backspace));
+
+        assert_eq!(prompt.prompt.text(), "👨‍👩‍👧nae");
+        assert!(prompt.prompt.buffer().file.is_none());
+        assert!(prompt.prompt.buffer().undo_history.node_count() > 0);
+        assert_eq!(
+            prompt.handle_event(&key(KeyCode::Enter)),
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::Print("👨‍👩‍👧nae".to_string())
+            ]))
+        );
+    }
+
+    #[test]
+    fn combining_mark_paste_keeps_input_prompt_cursor_after_merged_grapheme() {
+        let editor = editor();
+        let mut prompt = InputPrompt::new(&editor, "Rename symbol", "aX", Action::Print);
+
+        prompt.handle_event(&key(KeyCode::Left));
+        prompt.handle_event(&Event::Paste("\u{301}".to_string()));
+
+        assert_eq!(prompt.prompt.text(), "a\u{301}X");
+        assert_eq!(prompt.prompt.cursor(), 1);
+
+        prompt.handle_event(&key(KeyCode::Char('Z')));
+
+        assert_eq!(prompt.prompt.text(), "a\u{301}ZX");
+        assert_eq!(prompt.prompt.cursor(), 2);
     }
 
     #[test]

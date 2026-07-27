@@ -37,7 +37,9 @@ use crate::{
     },
 };
 
-use super::{dialog::BorderStyle, Component, Dialog, List};
+use super::{
+    dialog::BorderStyle, first_prompt_line, Component, Dialog, IconCatalog, List, ScreenRect,
+};
 
 type SelectAction = Box<dyn Fn(String) -> Action + Send>;
 type FilterAction = Box<dyn Fn(&PickerItem, &str) -> Option<i64> + Send>;
@@ -307,13 +309,7 @@ struct PickerHistoryNavigation {
     position: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PickerRect {
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
-}
+type PickerRect = ScreenRect;
 
 #[derive(Debug, Clone, Copy)]
 enum PickerDivider {
@@ -1036,7 +1032,8 @@ impl Picker {
         }
         if item.icon.is_none() {
             if let Some(path) = item_file_path(item) {
-                let semantic = picker_file_icon_color(path)
+                let semantic = IconCatalog::file(path, self.icons.style)
+                    .color
                     .map(|fg| Style {
                         fg: Some(fg),
                         ..Style::default()
@@ -1059,13 +1056,13 @@ impl Picker {
         }
         if item.icon.is_none() {
             if let Some(path) = item_file_path(item) {
-                return picker_file_icon(path, self.icons.style);
+                return IconCatalog::file(path, self.icons.style).glyph;
             }
         }
         item.icon.as_ref().map(PickerIcon::text).unwrap_or_else(|| {
             item.kind
                 .as_deref()
-                .map(|kind| picker_kind_icon(kind, self.icons.style))
+                .map(|kind| IconCatalog::symbol(kind, self.icons.style).glyph)
                 .unwrap_or_default()
         })
     }
@@ -2047,7 +2044,7 @@ fn symbol_kind_scope(kind: &str) -> Option<&'static str> {
     }
 }
 
-fn picker_kind_icon(kind: &str, style: PickerIconStyle) -> &'static str {
+pub(crate) fn picker_kind_icon(kind: &str, style: PickerIconStyle) -> &'static str {
     match style {
         PickerIconStyle::Unicode => unicode_picker_kind_icon(kind),
         PickerIconStyle::NerdFont => nerd_font_picker_kind_icon(kind),
@@ -2690,13 +2687,7 @@ impl Component for Picker {
             Event::Paste(text) => {
                 self.reset_history_navigation();
                 let previous = self.selected_item();
-                let pasted = text
-                    .replace("\r\n", "\n")
-                    .replace('\r', "\n")
-                    .split('\n')
-                    .next()
-                    .unwrap_or_default()
-                    .to_string();
+                let pasted = first_prompt_line(text);
                 self.set_search(format!("{}{}", self.search, pasted));
                 self.changed_actions(previous)
             }

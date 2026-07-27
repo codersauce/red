@@ -6,6 +6,7 @@
 
 use crate::color::Color;
 use crate::theme::{Style, Theme};
+use crate::unicode_utils::display_width;
 
 /// Content cells required for the full splash block.
 pub const FULL_MIN_WIDTH: usize = 60;
@@ -56,7 +57,7 @@ impl Line {
     pub fn width(&self) -> usize {
         self.spans
             .iter()
-            .map(|span| span.text.chars().count())
+            .map(|span| display_width(&span.text))
             .sum()
     }
 }
@@ -93,7 +94,7 @@ const HINT_VERB_WIDTH: usize = 7;
 const HINT_KEY_WIDTH: usize = 22;
 
 fn centered(text: &str, role: Role, width: usize) -> Line {
-    let pad = width.saturating_sub(text.chars().count()) / 2;
+    let pad = width.saturating_sub(display_width(text)) / 2;
     Line::new(vec![span(format!("{}{text}", " ".repeat(pad)), role)])
 }
 
@@ -290,6 +291,25 @@ mod tests {
         assert!(text.contains("red v0.1.1"));
         assert!(text.contains(":AgentReview<Enter>"));
         assert!(text.contains("every agent edit is a proposal"));
+    }
+
+    #[test]
+    fn splash_lines_measure_wide_graphemes_in_terminal_columns() {
+        let line = Line::new(vec![
+            span("👋", Role::Mark),
+            span("世", Role::Text),
+            span("e\u{301}", Role::Muted),
+        ]);
+
+        assert_eq!(line.width(), 5);
+    }
+
+    #[test]
+    fn centered_splash_text_reserves_the_display_width_of_wide_graphemes() {
+        let line = centered("👋世", Role::Text, 10);
+
+        assert_eq!(line.spans[0].text, "   👋世");
+        assert_eq!(line.width(), 7);
     }
 
     #[test]

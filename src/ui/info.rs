@@ -10,7 +10,7 @@ use crate::{
 };
 
 use super::{
-    dialog::{BorderStyle, Dialog},
+    dialog::{BorderStyle, Dialog, SurfaceRole},
     Component,
 };
 
@@ -53,8 +53,6 @@ fn fit_info_geometry(
 impl Info {
     pub fn new(editor: &Editor, text: String) -> Self {
         let style = editor.theme.ui_style.dialog.clone();
-        let border_style = editor.theme.ui_style.dialog_border.clone();
-        let title_style = editor.theme.ui_style.dialog_title.clone();
 
         let width = text.lines().map(display_width).max().unwrap_or(0);
         let height = text.lines().count();
@@ -83,8 +81,7 @@ impl Info {
                 BorderStyle::Single,
                 &editor.theme,
             )
-            .with_border_draw_style(&border_style)
-            .with_title_style(&title_style),
+            .with_surface_theme(&editor.theme, SurfaceRole::Dialog),
             theme: editor.theme.clone(),
         }
     }
@@ -93,10 +90,7 @@ impl Info {
 impl Component for Info {
     fn set_theme(&mut self, theme: &Theme) {
         self.style = theme.ui_style.dialog.clone();
-        self.dialog.style = theme.ui_style.dialog.clone();
-        self.dialog.border_draw_style = theme.ui_style.dialog_border.clone();
-        self.dialog.title_style = theme.ui_style.dialog_title.clone();
-        self.dialog.theme = theme.clone();
+        self.dialog.apply_surface_theme(theme, SurfaceRole::Dialog);
         self.theme = theme.clone();
     }
 

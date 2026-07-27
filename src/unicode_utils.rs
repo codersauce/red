@@ -15,6 +15,15 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;
 
+/// The side on which hidden terminal text is replaced by an overflow marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TruncationSide {
+    /// Preserve the end of the text and place the marker on the left.
+    Left,
+    /// Preserve the beginning of the text and place the marker on the right.
+    Right,
+}
+
 /// Calculate the display width of a string in terminal columns
 pub fn display_width(s: &str) -> usize {
     s.width()
@@ -187,6 +196,59 @@ pub fn truncate_display_width(s: &str, max_width: usize) -> String {
     s.to_owned()
 }
 
+/// Return the longest complete-grapheme suffix that fits `max_width` cells.
+pub fn truncate_display_width_from_end(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+
+    let mut start = text.len();
+    let mut used = 0;
+    for (index, grapheme) in text.grapheme_indices(true).rev() {
+        let next = used + display_width(grapheme);
+        if next > max_width {
+            break;
+        }
+        used = next;
+        start = index;
+    }
+
+    text[start..].to_owned()
+}
+
+/// Clip at a complete grapheme and display a bounded, caller-selected marker.
+///
+/// Text that already fits is returned unchanged. The marker is itself clipped
+/// to the available terminal cells so zero-width and narrow surfaces are safe.
+pub fn truncate_display_width_with_marker(
+    text: &str,
+    max_width: usize,
+    marker: &str,
+    side: TruncationSide,
+) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if display_width(text) <= max_width {
+        return text.to_owned();
+    }
+
+    let marker = truncate_display_width(marker, max_width);
+    let content_width = max_width.saturating_sub(display_width(&marker));
+    match side {
+        TruncationSide::Left => {
+            let mut result = marker;
+            result.push_str(&truncate_display_width_from_end(text, content_width));
+            result
+        }
+        TruncationSide::Right => {
+            let mut result = truncate_display_width(text, content_width);
+            result.push_str(&marker);
+            result
+        }
+    }
+}
+
 /// Pad or truncate a string so it occupies exactly `width` display columns.
 pub fn fit_display_width(s: &str, width: usize) -> String {
     let mut result = truncate_display_width(s, width);
@@ -357,6 +419,37 @@ mod tests {
         assert_eq!(fit_display_width("a👋b", 3), "a👋");
         assert_eq!(fit_display_width("a👋b", 5), "a👋b ");
         assert_eq!(fit_display_width("👨‍👩‍👧‍👦x", 2), "👨‍👩‍👧‍👦");
+    }
+
+    #[test]
+    fn suffix_truncation_preserves_complete_graphemes() {
+        assert_eq!(truncate_display_width_from_end("a👨‍👩‍👧‍👦世z", 4), "世z");
+        assert_eq!(truncate_display_width_from_end("e\u{301}👋x", 3), "👋x");
+        assert_eq!(truncate_display_width_from_end("visible", 0), "");
+    }
+
+    #[test]
+    fn marker_truncation_preserves_configured_direction_and_width() {
+        assert_eq!(
+            truncate_display_width_with_marker("src/👨‍👩‍👧‍👦/function", 10, "…", TruncationSide::Left,),
+            "…/function"
+        );
+        assert_eq!(
+            truncate_display_width_with_marker("ab👋cd", 5, "…", TruncationSide::Right,),
+            "ab👋…"
+        );
+        assert_eq!(
+            truncate_display_width_with_marker("visible", 2, "...", TruncationSide::Right,),
+            ".."
+        );
+        assert_eq!(
+            truncate_display_width_with_marker("fit", 5, "…", TruncationSide::Right),
+            "fit"
+        );
+        assert_eq!(
+            truncate_display_width_with_marker("hidden", 0, "…", TruncationSide::Left),
+            ""
+        );
     }
 
     #[test]

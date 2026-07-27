@@ -700,6 +700,14 @@ mod tests {
             missing.is_empty(),
             "runtime calls missing from schema: {missing:?}"
         );
+        let unreachable = documented
+            .difference(&dispatched)
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(
+            unreachable.is_empty(),
+            "schema calls missing from runtime dispatch: {unreachable:?}"
+        );
     }
 
     #[test]

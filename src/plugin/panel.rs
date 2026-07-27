@@ -21,10 +21,8 @@ use super::text_link::{TextPanelLink, TextPanelLinkTarget};
 use crate::{
     editor::{render_buffer::RenderBuffer, Point},
     theme::{SelectionForegroundPriority, Style, Theme, ThemeStyleSpec},
-    ui::{normalize_newlines, wrap_text},
-    unicode_utils::{
-        display_width, fit_display_width, grapheme_len, grapheme_to_byte, truncate_display_width,
-    },
+    ui::{paint_rich_text, wrap_text, FollowTailViewport, PromptBuffer, PROMPT_MAX_BYTES},
+    unicode_utils::{display_width, fit_display_width, grapheme_len, truncate_display_width},
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,6 +199,7 @@ pub struct TextPanel {
     pub blocks: Vec<TextPanelBlock>,
     pub scroll: usize,
     pub follow_tail: bool,
+    viewport: FollowTailViewport,
     composer: Option<TextPanelComposer>,
     status: Option<TextPanelStatus>,
     busy_since: Option<Instant>,
@@ -223,132 +222,74 @@ fn format_elapsed(seconds: u64) -> String {
     }
 }
 
-const MAX_COMPOSER_BYTES: usize = 128 * 1024;
+const MAX_COMPOSER_BYTES: usize = PROMPT_MAX_BYTES;
 
 struct TextPanelComposer {
     config: TextPanelComposerConfig,
-    draft: String,
-    cursor: usize,
+    prompt: PromptBuffer,
     focused: bool,
     enabled: bool,
     status: Option<String>,
     validation: Option<&'static str>,
-    history: Vec<String>,
-    history_index: Option<usize>,
-    saved_draft: Option<String>,
 }
 
 impl TextPanelComposer {
     fn new(config: TextPanelComposerConfig) -> Self {
         Self {
             config,
-            draft: String::new(),
-            cursor: 0,
+            prompt: PromptBuffer::new(""),
             focused: false,
             enabled: true,
             status: None,
             validation: None,
-            history: Vec::new(),
-            history_index: None,
-            saved_draft: None,
         }
     }
 
     fn insert(&mut self, text: &str) {
-        let text = normalize_newlines(text);
-        if text.len() > MAX_COMPOSER_BYTES.saturating_sub(self.draft.len()) {
+        if self.prompt.insert(text) {
+            self.validation = None;
+        } else if text.len() > MAX_COMPOSER_BYTES.saturating_sub(self.prompt.text().len()) {
             self.validation = Some("Prompt exceeds 128 KiB");
-            return;
         }
-        let offset = grapheme_to_byte(&self.draft, self.cursor);
-        self.draft.insert_str(offset, &text);
-        self.cursor = grapheme_len(&self.draft[..offset + text.len()]);
-        self.validation = None;
     }
 
     fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
+        if self.prompt.backspace() {
+            self.validation = None;
         }
-        let start = grapheme_to_byte(&self.draft, self.cursor - 1);
-        let end = grapheme_to_byte(&self.draft, self.cursor);
-        self.draft.replace_range(start..end, "");
-        self.cursor -= 1;
-        self.validation = None;
     }
 
     fn delete(&mut self) {
-        if self.cursor >= grapheme_len(&self.draft) {
-            return;
+        if self.prompt.delete() {
+            self.validation = None;
         }
-        let start = grapheme_to_byte(&self.draft, self.cursor);
-        let end = grapheme_to_byte(&self.draft, self.cursor + 1);
-        self.draft.replace_range(start..end, "");
-        self.validation = None;
     }
 
     fn take_submission(&mut self) -> Option<String> {
-        if self.draft.trim().is_empty() {
+        let Some(text) = self.prompt.take_submission() else {
             self.validation = Some("Prompt is empty");
             return None;
-        }
-        self.cursor = 0;
+        };
         self.validation = None;
-        let text = std::mem::take(&mut self.draft);
-        self.history.retain(|entry| entry != &text);
-        self.history.insert(0, text.clone());
-        self.history.truncate(50);
-        self.history_index = None;
-        self.saved_draft = None;
         Some(text)
     }
 
     fn history_previous(&mut self) {
-        if self.history.is_empty() {
-            return;
-        }
-        let index = self.history_index.map_or(0, |index| {
-            index.saturating_add(1).min(self.history.len() - 1)
-        });
-        if self.history_index.is_none() {
-            self.saved_draft = Some(self.draft.clone());
-        }
-        self.history_index = Some(index);
-        self.draft = self.history[index].clone();
-        self.cursor = grapheme_len(&self.draft);
+        self.prompt.history_previous();
     }
 
     fn history_next(&mut self) {
-        let Some(index) = self.history_index else {
-            return;
-        };
-        if index == 0 {
-            self.history_index = None;
-            self.draft = self.saved_draft.take().unwrap_or_default();
-        } else {
-            self.history_index = Some(index - 1);
-            self.draft = self.history[index - 1].clone();
-        }
-        self.cursor = grapheme_len(&self.draft);
+        self.prompt.history_next();
     }
 
     fn move_vertical(&mut self, delta: isize, width: usize) {
-        let wrapped = wrap_text(&self.draft, width.max(1));
-        let (row, column) = wrapped
-            .positions
-            .get(self.cursor)
-            .copied()
-            .unwrap_or_default();
-        let target = row.saturating_add_signed(delta);
-        if let Some((index, _)) = wrapped
-            .positions
-            .iter()
-            .enumerate()
-            .filter(|(_, position)| position.0 == target)
-            .min_by_key(|(_, position)| position.1.abs_diff(column))
-        {
-            self.cursor = index;
-        }
+        let code = if delta.is_negative() {
+            KeyCode::Up
+        } else {
+            KeyCode::Down
+        };
+        let event = Event::Key(crossterm::event::KeyEvent::new(code, KeyModifiers::NONE));
+        self.prompt.handle_event(&event, width);
     }
 }
 
@@ -361,6 +302,7 @@ impl TextPanel {
             blocks: Vec::new(),
             scroll: 0,
             follow_tail: true,
+            viewport: FollowTailViewport::default(),
             composer,
             status: None,
             busy_since: None,
@@ -388,8 +330,9 @@ impl TextPanel {
         panel_width: usize,
     ) {
         if blocks.is_empty() {
-            self.scroll = 0;
-            self.follow_tail = true;
+            self.viewport.reset();
+            self.scroll = self.viewport.offset();
+            self.follow_tail = self.viewport.is_following();
         }
         self.blocks = blocks;
         if self.follow_tail {
@@ -426,8 +369,10 @@ impl TextPanel {
 
     fn move_scroll(&mut self, delta: isize, panel_height: usize, panel_width: usize) {
         let max_scroll = self.max_scroll(panel_height, panel_width);
-        self.scroll = self.scroll.saturating_add_signed(delta).min(max_scroll);
-        self.follow_tail = self.scroll == max_scroll;
+        self.viewport.restore(self.scroll, self.follow_tail);
+        self.viewport.move_by(delta, max_scroll);
+        self.scroll = self.viewport.offset();
+        self.follow_tail = self.viewport.is_following();
     }
 
     fn page_scroll(&mut self, delta: isize, panel_height: usize, panel_width: usize) {
@@ -436,17 +381,24 @@ impl TextPanel {
     }
 
     fn scroll_to_top(&mut self) {
-        self.scroll = 0;
-        self.follow_tail = false;
+        self.viewport.scroll_to_top();
+        self.scroll = self.viewport.offset();
+        self.follow_tail = self.viewport.is_following();
     }
 
     fn scroll_to_bottom(&mut self, panel_height: usize, panel_width: usize) {
-        self.scroll = self.max_scroll(panel_height, panel_width);
-        self.follow_tail = true;
+        self.viewport
+            .follow(self.max_scroll(panel_height, panel_width));
+        self.scroll = self.viewport.offset();
+        self.follow_tail = self.viewport.is_following();
     }
 
     fn clamp_scroll(&mut self, panel_height: usize, panel_width: usize) {
-        self.scroll = self.scroll.min(self.max_scroll(panel_height, panel_width));
+        self.viewport.restore(self.scroll, self.follow_tail);
+        self.viewport
+            .clamp(self.max_scroll(panel_height, panel_width));
+        self.scroll = self.viewport.offset();
+        self.follow_tail = self.viewport.is_following();
     }
 
     fn max_scroll(&self, panel_height: usize, panel_width: usize) -> usize {
@@ -524,13 +476,10 @@ impl TextPanel {
         };
         let (link, line) = &links[index];
         self.selected_link = Some(link.id);
-        self.follow_tail = false;
-        let visible_rows = self.visible_rows(panel_height);
-        if *line < self.scroll {
-            self.scroll = *line;
-        } else if *line >= self.scroll.saturating_add(visible_rows) {
-            self.scroll = line.saturating_sub(visible_rows.saturating_sub(1));
-        }
+        self.viewport.restore(self.scroll, self.follow_tail);
+        self.viewport.reveal(*line, self.visible_rows(panel_height));
+        self.scroll = self.viewport.offset();
+        self.follow_tail = self.viewport.is_following();
         true
     }
 
@@ -1207,8 +1156,7 @@ impl PanelManager {
         else {
             return false;
         };
-        composer.draft.clear();
-        composer.cursor = 0;
+        composer.prompt.clear();
         composer.validation = None;
         true
     }
@@ -1259,9 +1207,17 @@ impl PanelManager {
                 }
                 (KeyCode::Backspace, _) => composer.backspace(),
                 (KeyCode::Delete, _) => composer.delete(),
-                (KeyCode::Left, _) => composer.cursor = composer.cursor.saturating_sub(1),
+                (KeyCode::Left, _) => composer
+                    .prompt
+                    .set_cursor(composer.prompt.cursor().saturating_sub(1)),
                 (KeyCode::Right, _) => {
-                    composer.cursor = (composer.cursor + 1).min(grapheme_len(&composer.draft));
+                    composer.prompt.set_cursor(
+                        composer
+                            .prompt
+                            .cursor()
+                            .saturating_add(1)
+                            .min(grapheme_len(&composer.prompt.text())),
+                    );
                 }
                 (KeyCode::Up, _) => {
                     composer.move_vertical(-1, panel_width.saturating_sub(2));
@@ -1269,8 +1225,10 @@ impl PanelManager {
                 (KeyCode::Down, _) => {
                     composer.move_vertical(1, panel_width.saturating_sub(2));
                 }
-                (KeyCode::Home, _) => composer.cursor = 0,
-                (KeyCode::End, _) => composer.cursor = grapheme_len(&composer.draft),
+                (KeyCode::Home, _) => composer.prompt.set_cursor(0),
+                (KeyCode::End, _) => composer
+                    .prompt
+                    .set_cursor(grapheme_len(&composer.prompt.text())),
                 (KeyCode::Tab, _) => composer.insert("\t"),
                 (KeyCode::Char(character), modifiers)
                     if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
@@ -1307,10 +1265,10 @@ impl PanelManager {
             .into_iter()
             .find(|placement| placement.id == id)?;
         let content_width = placement.width.saturating_sub(2).max(1);
-        let wrapped = wrap_text(&composer.draft, content_width);
+        let wrapped = wrap_text(&composer.prompt.text(), content_width);
         let (row, column) = wrapped
             .positions
-            .get(composer.cursor)
+            .get(composer.prompt.cursor())
             .copied()
             .unwrap_or_default();
         let rows = composer.config.rows.max(1);
@@ -1361,10 +1319,10 @@ impl PanelManager {
                 if let Some(composer) = panel.composer.as_mut() {
                     composer.focused = true;
                     let content_width = placement.width.saturating_sub(2).max(1);
-                    let wrapped = wrap_text(&composer.draft, content_width);
+                    let wrapped = wrap_text(&composer.prompt.text(), content_width);
                     let cursor_row = wrapped
                         .positions
-                        .get(composer.cursor)
+                        .get(composer.prompt.cursor())
                         .map_or(0, |position| position.0);
                     let rows = composer.config.rows.max(1);
                     let first = cursor_row.saturating_sub(rows.saturating_sub(1));
@@ -1377,7 +1335,7 @@ impl PanelManager {
                         .filter(|(_, position)| position.0 == row)
                         .min_by_key(|(_, position)| position.1.abs_diff(column))
                     {
-                        composer.cursor = index;
+                        composer.prompt.set_cursor(index);
                     }
                 }
                 "composer_focus"
@@ -1641,11 +1599,7 @@ fn render_text_panel(
     let visible_rows = content_height.saturating_sub(title_rows);
     let lines = panel.rendered_lines(width);
     let max_scroll = lines.len().saturating_sub(visible_rows);
-    let scroll = if panel.follow_tail {
-        max_scroll
-    } else {
-        panel.scroll.min(max_scroll)
-    };
+    let scroll = panel.viewport.visible_offset(max_scroll);
     for (offset, line) in lines.iter().skip(scroll).take(visible_rows).enumerate() {
         render_text_spans(
             buffer,
@@ -1712,10 +1666,10 @@ fn render_text_panel_composer(
 
     let rows = composer.config.rows.max(1);
     let content_width = width.saturating_sub(2).max(1);
-    let wrapped = wrap_text(&composer.draft, content_width);
+    let wrapped = wrap_text(&composer.prompt.text(), content_width);
     let cursor_row = wrapped
         .positions
-        .get(composer.cursor)
+        .get(composer.prompt.cursor())
         .map_or(0, |position| position.0);
     let first = cursor_row.saturating_sub(rows.saturating_sub(1));
     for row in 0..rows {
@@ -1725,7 +1679,7 @@ fn render_text_panel_composer(
             .get(first + row)
             .map(String::as_str)
             .unwrap_or("");
-        let text = if line.is_empty() && composer.draft.is_empty() && row == 0 {
+        let text = if line.is_empty() && composer.prompt.text().is_empty() && row == 0 {
             composer.config.placeholder.as_str()
         } else {
             line
@@ -1851,16 +1805,18 @@ fn render_text_spans(
     selected_link: Option<u64>,
     theme: &Theme,
 ) {
-    let mut used = 0;
-    for span in &line.spans {
-        if used >= width {
-            break;
-        }
-        let text = truncate_display_width(&span.text, width - used);
-        if text.is_empty() {
-            continue;
-        }
-        let mut style = text_panel_span_style(span.style, theme);
+    paint_rich_text(buffer, x, y, width, line, |span| {
+        let base_style = text_panel_span_style(span.style, theme);
+        let mut style = if let Some(syntax_style) = &span.syntax_style {
+            Style {
+                fg: syntax_style.fg.or(base_style.fg),
+                bg: syntax_style.bg.or(base_style.bg).or(theme.style.bg),
+                bold: syntax_style.bold || base_style.bold,
+                italic: syntax_style.italic || base_style.italic,
+            }
+        } else {
+            base_style
+        };
         if span
             .link
             .as_ref()
@@ -1869,9 +1825,8 @@ fn render_text_spans(
             let selection = theme.list_selection_style();
             style = theme.selected_style(&style, &selection, SelectionForegroundPriority::Content);
         }
-        buffer.set_text(x + used, y, &text, &style);
-        used += display_width(&text);
-    }
+        style
+    });
 }
 
 fn text_panel_span_style(style: TextPanelSpanStyle, theme: &Theme) -> Style {
@@ -2231,6 +2186,97 @@ mod tests {
     }
 
     #[test]
+    fn syntax_highlighted_text_panel_spans_preserve_panel_background() {
+        let panel_foreground = Color::Rgb {
+            r: 10,
+            g: 20,
+            b: 30,
+        };
+        let panel_background = Color::Rgb {
+            r: 40,
+            g: 50,
+            b: 60,
+        };
+        let code_foreground = Color::Rgb {
+            r: 70,
+            g: 80,
+            b: 90,
+        };
+        let syntax_foreground = Color::Rgb {
+            r: 100,
+            g: 110,
+            b: 120,
+        };
+        let syntax_background = Color::Rgb {
+            r: 130,
+            g: 140,
+            b: 150,
+        };
+        let theme = Theme {
+            style: Style {
+                fg: Some(panel_foreground),
+                bg: Some(panel_background),
+                ..Style::default()
+            },
+            token_styles: vec![crate::theme::TokenStyle {
+                name: None,
+                scope: vec!["markup.raw.block.markdown".to_string()],
+                style: Style {
+                    fg: Some(code_foreground),
+                    bold: true,
+                    ..Style::default()
+                },
+            }],
+            ..Theme::default()
+        };
+        let line = RenderedTextLine {
+            spans: vec![
+                RenderedTextSpan {
+                    text: "a".to_string(),
+                    style: TextPanelSpanStyle::Code,
+                    syntax_style: Some(Style {
+                        fg: Some(syntax_foreground),
+                        italic: true,
+                        ..Style::default()
+                    }),
+                    link: None,
+                },
+                RenderedTextSpan {
+                    text: "b".to_string(),
+                    style: TextPanelSpanStyle::Code,
+                    syntax_style: Some(Style {
+                        bg: Some(syntax_background),
+                        ..Style::default()
+                    }),
+                    link: None,
+                },
+            ],
+        };
+        let mut buffer = RenderBuffer::new(2, 1, &theme.style);
+
+        render_text_spans(&mut buffer, 0, 0, 2, &line, None, &theme);
+
+        assert_eq!(
+            buffer.cells[0].style,
+            Style {
+                fg: Some(syntax_foreground),
+                bg: Some(panel_background),
+                bold: true,
+                italic: true,
+            }
+        );
+        assert_eq!(
+            buffer.cells[1].style,
+            Style {
+                fg: Some(code_foreground),
+                bg: Some(syntax_background),
+                bold: true,
+                italic: false,
+            }
+        );
+    }
+
+    #[test]
     fn text_panel_composer_edits_unicode_submits_and_recalls_history() {
         use crossterm::event::KeyEvent;
 
@@ -2275,13 +2321,13 @@ mod tests {
             80,
         );
         let recalled = manager.text_panels["agent"].composer.as_ref().unwrap();
-        assert_eq!(recalled.draft, "one 👨‍👩‍👧\ntwo\n世");
+        assert_eq!(recalled.prompt.text(), "one 👨‍👩‍👧\ntwo\n世");
         manager.handle_focused_text_input(
             &Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
             80,
         );
         let restored = manager.text_panels["agent"].composer.as_ref().unwrap();
-        assert_eq!(restored.draft, "draft");
+        assert_eq!(restored.prompt.text(), "draft");
         assert!(manager.focused_text_panel_cursor_position(80, 20).is_some());
     }
 
@@ -2476,7 +2522,7 @@ mod tests {
         manager.handle_focused_text_input(&Event::Paste("X".to_string()), 80);
 
         let composer = manager.text_panels["agent"].composer.as_ref().unwrap();
-        assert_eq!(composer.draft, "first line\nsecXond line");
+        assert_eq!(composer.prompt.text(), "first line\nsecXond line");
     }
 
     #[test]
@@ -2509,7 +2555,7 @@ mod tests {
         assert_eq!(manager.reserved_right_width(), 25);
         assert!(manager.focus_text_panel_composer("agent"));
         let composer = manager.text_panels["agent"].composer.as_ref().unwrap();
-        assert_eq!(composer.draft, "keep this draft");
+        assert_eq!(composer.prompt.text(), "keep this draft");
     }
 
     #[test]

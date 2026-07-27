@@ -10,12 +10,12 @@ use crate::{
         RenderedTextSpan, TextPanelSpanStyle,
     },
     theme::{SelectionForegroundPriority, Style, Theme},
-    unicode_utils::{display_width, truncate_display_width},
+    unicode_utils::display_width,
 };
 
 use super::{
-    dialog::{BorderStyle, Dialog},
-    Component,
+    dialog::{BorderStyle, Dialog, SurfaceRole},
+    paint_rich_text, ActionPriority, Component, UiAction,
 };
 
 const MAX_PROSE_HOVER_WIDTH: usize = 80;
@@ -74,8 +74,13 @@ impl HoverInfo {
             &theme,
             &actions,
         );
-        let (x, y, height) =
-            hover_geometry(anchor, viewport_width, viewport_height, width, lines.len());
+        let (x, y, height) = hover_geometry(
+            anchor,
+            viewport_width,
+            viewport_height,
+            width,
+            lines.len().saturating_add(1),
+        );
         let style = theme.ui_style.dialog.clone();
         let mut info = Self {
             source,
@@ -103,8 +108,7 @@ impl HoverInfo {
                 BorderStyle::Single,
                 &theme,
             )
-            .with_border_draw_style(&theme.ui_style.dialog_border)
-            .with_title_style(&theme.ui_style.dialog_title)
+            .with_surface_theme(&theme, SurfaceRole::Dialog)
             .with_footer_style(&theme.ui_style.muted),
             theme,
         };
@@ -112,8 +116,12 @@ impl HoverInfo {
         info
     }
 
+    fn content_height(&self) -> usize {
+        self.height.saturating_sub(1)
+    }
+
     fn max_scroll(&self) -> usize {
-        self.lines.len().saturating_sub(self.height)
+        self.lines.len().saturating_sub(self.content_height())
     }
 
     fn scroll_by(&mut self, delta: isize) {
@@ -135,13 +143,18 @@ impl HoverInfo {
             )
         };
         self.dialog.set_title(Some(title));
-        let footer = match (!self.actions.is_empty(), self.max_scroll() > 0) {
-            (true, true) => "Tab actions · Enter open · ↑↓ scroll",
-            (true, false) => "Tab actions · Enter open",
-            (false, true) => "↑↓ scroll",
-            (false, false) => "Esc close",
-        };
-        self.dialog.set_footer(Some(footer.to_string()));
+        let mut actions =
+            vec![UiAction::new("close", "Esc", "Close").with_priority(ActionPriority::Essential)];
+        if !self.actions.is_empty() {
+            actions.push(
+                UiAction::new("open", "Enter", "Open").with_priority(ActionPriority::Essential),
+            );
+            actions.push(UiAction::new("actions", "Tab", "Actions"));
+        }
+        if self.max_scroll() > 0 {
+            actions.push(UiAction::new("scroll", "↑↓", "Scroll"));
+        }
+        self.dialog.set_actions(actions);
     }
 
     fn reflow(&mut self, viewport_width: usize, viewport_height: usize) {
@@ -158,7 +171,7 @@ impl HoverInfo {
             viewport_width,
             viewport_height,
             width,
-            lines.len(),
+            lines.len().saturating_add(1),
         );
         self.viewport_width = viewport_width;
         self.viewport_height = viewport_height;
@@ -199,10 +212,11 @@ impl HoverInfo {
         else {
             return;
         };
+        let content_height = self.content_height().max(1);
         if line < self.scroll {
             self.scroll = line;
-        } else if line >= self.scroll.saturating_add(self.height) {
-            self.scroll = line.saturating_sub(self.height.saturating_sub(1));
+        } else if line >= self.scroll.saturating_add(content_height) {
+            self.scroll = line.saturating_sub(content_height.saturating_sub(1));
         }
         self.scroll = self.scroll.min(self.max_scroll());
     }
@@ -224,7 +238,7 @@ impl Component for HoverInfo {
             .lines
             .iter()
             .skip(self.scroll)
-            .take(self.height)
+            .take(self.content_height())
             .enumerate()
         {
             let line_index = self.scroll + row;
@@ -248,7 +262,7 @@ impl Component for HoverInfo {
     }
 
     fn handle_event(&mut self, event: &Event) -> Option<KeyAction> {
-        let redraw = || Some(KeyAction::Single(Action::ShowDialog));
+        let redraw = || Some(KeyAction::Single(Action::Refresh));
         match event {
             Event::Key(key) => match (key.code, key.modifiers) {
                 (KeyCode::Esc | KeyCode::Char('q'), _) => {
@@ -263,11 +277,11 @@ impl Component for HoverInfo {
                     redraw()
                 }
                 (KeyCode::PageUp, _) | (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                    self.scroll_by(-(self.height.max(1) as isize));
+                    self.scroll_by(-(self.content_height().max(1) as isize));
                     redraw()
                 }
                 (KeyCode::PageDown, _) | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                    self.scroll_by(self.height.max(1) as isize);
+                    self.scroll_by(self.content_height().max(1) as isize);
                     redraw()
                 }
                 (KeyCode::Home | KeyCode::Char('g'), _) => {
@@ -310,7 +324,7 @@ impl Component for HoverInfo {
                     let content_y = self.y.saturating_add(1);
                     if (content_x..content_x.saturating_add(self.width))
                         .contains(&(mouse.column as usize))
-                        && (content_y..content_y.saturating_add(self.height))
+                        && (content_y..content_y.saturating_add(self.content_height()))
                             .contains(&(mouse.row as usize))
                     {
                         let line = self.scroll.saturating_add(mouse.row as usize - content_y);
@@ -336,11 +350,7 @@ impl Component for HoverInfo {
 
     fn set_theme(&mut self, theme: &Theme) {
         self.theme = theme.clone();
-        self.dialog.style = theme.ui_style.dialog.clone();
-        self.dialog.border_draw_style = theme.ui_style.dialog_border.clone();
-        self.dialog.title_style = theme.ui_style.dialog_title.clone();
-        self.dialog.footer_style = theme.ui_style.muted.clone();
-        self.dialog.theme = theme.clone();
+        self.dialog.apply_surface_theme(theme, SurfaceRole::Dialog);
         self.reflow(self.viewport_width, self.viewport_height);
     }
 }
@@ -517,23 +527,14 @@ fn render_line(
         );
         buffer.set_text(x, y, &" ".repeat(width), &selected_style);
     }
-    let mut used = 0;
-    for span in &line.spans {
-        if used >= width {
-            break;
-        }
-        let text = truncate_display_width(&span.text, width - used);
-        if text.is_empty() {
-            continue;
-        }
+    paint_rich_text(buffer, x, y, width, line, |span| {
         let mut style = hover_span_style(span, theme);
         if selected {
             let selection = theme.list_selection_style();
             style = theme.selected_style(&style, &selection, SelectionForegroundPriority::Content);
         }
-        buffer.set_text(x + used, y, &text, &style);
-        used += display_width(&text);
-    }
+        style
+    });
 }
 
 fn hover_span_style(span: &RenderedTextSpan, theme: &Theme) -> Style {
@@ -690,6 +691,46 @@ mod tests {
                     Action::ExecuteLspCommand(command)
                 ] if command.command == "rust-analyzer.gotoLocation")
         ));
+    }
+
+    #[test]
+    fn hover_footer_reserves_an_interior_row_without_overwriting_content_or_border() {
+        let editor = test_editor(Theme::default(), 80, 24);
+        let info = HoverInfo::new(
+            &editor,
+            "The first documentation line\nThe final documentation line".to_string(),
+            HoverInfoFormat::Plaintext,
+            Vec::new(),
+        );
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+
+        info.draw(&mut buffer).unwrap();
+
+        let first_start = (info.y + 1) * buffer.width + info.x + 1;
+        let last_start = (info.y + 2) * buffer.width + info.x + 1;
+        let footer_y = info.y + info.height;
+        let footer_start = footer_y * buffer.width + info.x + 1;
+        let first = buffer.cells[first_start..first_start + info.width]
+            .iter()
+            .map(|cell| cell.c)
+            .collect::<String>();
+        let last = buffer.cells[last_start..last_start + info.width]
+            .iter()
+            .map(|cell| cell.c)
+            .collect::<String>();
+        let footer = buffer.cells[footer_start..footer_start + info.width]
+            .iter()
+            .map(|cell| cell.c)
+            .collect::<String>();
+
+        assert!(first.contains("The first documentation line"), "{first:?}");
+        assert!(last.contains("The final documentation line"), "{last:?}");
+        assert!(footer.contains("Esc Close"), "{footer:?}");
+        assert_eq!(buffer.cells[(footer_y + 1) * buffer.width + info.x].c, '└');
+        assert_eq!(
+            buffer.cells[(footer_y + 1) * buffer.width + info.x + info.width + 1].c,
+            '┘'
+        );
     }
 
     #[test]

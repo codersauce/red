@@ -150,14 +150,18 @@ impl PluginOverlay {
 
     pub fn render(&self, buffer: &mut RenderBuffer) {
         if let Some(pos) = self.position {
+            let content_height = buffer.height.saturating_sub(2);
             for (i, (text, style)) in self.content.lines.iter().enumerate() {
-                let y = pos.y + i;
-                if y < buffer.height - 2 {
-                    // Don't render over status line
-                    let text_width = display_width(text);
-                    let text_x = pos.x + self.width.saturating_sub(text_width);
-                    buffer.set_text(text_x, y, text, style);
+                let Some(y) = pos.y.checked_add(i) else {
+                    break;
+                };
+                if y >= content_height {
+                    break;
                 }
+
+                let text_width = display_width(text);
+                let text_x = pos.x.saturating_add(self.width.saturating_sub(text_width));
+                buffer.set_text(text_x, y, text, style);
             }
         }
     }
@@ -218,10 +222,8 @@ impl OverlayManager {
     pub fn render_all(&mut self, buffer: &mut RenderBuffer) {
         for id in &self.z_order {
             if let Some(overlay) = self.overlays.get_mut(id) {
-                if overlay.is_dirty() {
-                    overlay.render(buffer);
-                    overlay.mark_clean();
-                }
+                overlay.render(buffer);
+                overlay.mark_clean();
             }
         }
     }
@@ -255,7 +257,14 @@ mod tests {
         theme::Style,
     };
 
-    use super::PluginOverlay;
+    use super::{OverlayManager, PluginOverlay};
+
+    fn render_row(buffer: &RenderBuffer, y: usize) -> String {
+        buffer.cells[y * buffer.width..(y + 1) * buffer.width]
+            .iter()
+            .map(|cell| cell.c)
+            .collect()
+    }
 
     #[test]
     fn avoid_cursor_overlay_marks_dirty_when_position_changes() {
@@ -333,5 +342,80 @@ mod tests {
 
         assert_eq!(row(0), "...long.");
         assert_eq!(row(1), ".....👋 .");
+    }
+
+    #[test]
+    fn clean_overlay_is_composited_into_every_new_frame() {
+        let mut overlays = OverlayManager::new();
+        let overlay = overlays.create_overlay(
+            "persistent".to_string(),
+            OverlayConfig {
+                align: OverlayAlignment::Top,
+                x_padding: 0,
+                ..OverlayConfig::default()
+            },
+        );
+        overlay.update_content(vec![("visible".to_string(), Style::default())]);
+        overlays.update_positions(12, 6, None);
+
+        let mut first = RenderBuffer::new(12, 6, &Style::default());
+        overlays.render_all(&mut first);
+        assert!(render_row(&first, 0).contains("visible"));
+        assert!(!overlays.has_dirty_overlays());
+
+        let mut next = RenderBuffer::new(12, 6, &Style::default());
+        overlays.render_all(&mut next);
+        assert!(render_row(&next, 0).contains("visible"));
+        assert!(!overlays.has_dirty_overlays());
+    }
+
+    #[test]
+    fn overlay_rendering_saturates_tiny_terminal_heights() {
+        for height in 0..=2 {
+            let mut overlays = OverlayManager::new();
+            let overlay = overlays.create_overlay(
+                "tiny".to_string(),
+                OverlayConfig {
+                    align: OverlayAlignment::Top,
+                    ..OverlayConfig::default()
+                },
+            );
+            overlay.update_content(vec![("hidden".to_string(), Style::default())]);
+            overlays.update_positions(8, height, None);
+
+            let mut buffer = RenderBuffer::new(8, height, &Style::default());
+            overlays.render_all(&mut buffer);
+
+            assert_eq!(buffer.cells.len(), 8 * height);
+            assert!(buffer.cells.iter().all(|cell| cell.c == ' '));
+        }
+    }
+
+    #[test]
+    fn overlays_preserve_z_order_across_recomposed_frames() {
+        let mut overlays = OverlayManager::new();
+        for (id, text) in [("lower", "first"), ("upper", "above")] {
+            let overlay = overlays.create_overlay(
+                id.to_string(),
+                OverlayConfig {
+                    align: OverlayAlignment::Top,
+                    x_padding: 0,
+                    ..OverlayConfig::default()
+                },
+            );
+            overlay.update_content(vec![(text.to_string(), Style::default())]);
+        }
+        overlays.update_positions(10, 6, None);
+
+        for _ in 0..2 {
+            let mut buffer = RenderBuffer::new(10, 6, &Style::default());
+            overlays.render_all(&mut buffer);
+            assert!(render_row(&buffer, 0).ends_with("above"));
+        }
+
+        overlays.remove_overlay("upper");
+        let mut buffer = RenderBuffer::new(10, 6, &Style::default());
+        overlays.render_all(&mut buffer);
+        assert!(render_row(&buffer, 0).ends_with("first"));
     }
 }
