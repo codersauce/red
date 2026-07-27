@@ -1014,6 +1014,15 @@ impl PanelManager {
         ))
     }
 
+    /// Whether the focused Replay surface owns source-reconstruction actions.
+    pub(crate) fn focused_replay_is_guide(&self) -> bool {
+        self.focused
+            .as_deref()
+            .and_then(|id| self.text_panels.get(id))
+            .and_then(|panel| panel.replay.as_ref())
+            .is_some_and(|replay| replay.model.view == ReplayPanelView::Guide)
+    }
+
     pub fn focused_text_input_active(&self) -> bool {
         self.focused
             .as_deref()
@@ -3161,6 +3170,7 @@ mod tests {
         assert!(row_text(&buffer, 0).starts_with("PR REPLAY"));
         assert_eq!(buffer.cells[46].text, "│");
         assert_eq!(manager.focused_replay_status(), None);
+        assert!(!manager.focused_replay_is_guide());
 
         assert!(manager.focus_panel("replay-coach"));
         manager.render(&mut buffer, &theme);
@@ -3174,6 +3184,7 @@ mod tests {
             manager.focused_replay_status(),
             Some((482, "feat/viewport-diagnostics", 0, 5)),
         );
+        assert!(manager.focused_replay_is_guide());
         let (x, y) = manager
             .focused_text_panel_cursor_position(
                 /*terminal_width*/ 100, /*terminal_height*/ 28,
@@ -3186,6 +3197,7 @@ mod tests {
         assert!(row_text(&buffer, 0).starts_with("PR REPLAY"));
         assert_eq!(buffer.cells[46].text, "│");
         assert_eq!(manager.focused_replay_status(), None);
+        assert!(!manager.focused_replay_is_guide());
         assert_eq!(
             manager.focused_text_panel_cursor_position(
                 /*terminal_width*/ 100, /*terminal_height*/ 28,
@@ -3253,6 +3265,7 @@ mod tests {
             manager.focused_replay_status(),
             Some((482, "feat/viewport-diagnostics", 0, 5)),
         );
+        assert!(!manager.focused_replay_is_guide());
         let (x, y) = manager
             .focused_text_panel_cursor_position(
                 /*terminal_width*/ 100, /*terminal_height*/ 28,

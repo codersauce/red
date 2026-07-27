@@ -6015,6 +6015,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_outbox_never_dispatches_source_reconstruction_actions() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        open_source_backed_replay(&mut runtime).await;
+
+        runtime.execute_command("ReplayOutbox").await.unwrap();
+        let outbox = recv_replay_outbox();
+        assert_eq!(
+            outbox.view,
+            crate::plugin::replay_panel::ReplayPanelView::Outbox,
+        );
+
+        for action in [
+            "composer_focus",
+            "a",
+            "apply",
+            "i",
+            "v",
+            "m",
+            "o",
+            "f",
+            "next_file",
+            "]",
+            "previous_file",
+            "[",
+        ] {
+            runtime
+                .notify(
+                    "panel:event:replay-coach",
+                    serde_json::json!({ "action": action }),
+                )
+                .await
+                .expect("route the focused local outbox action");
+            assert!(
+                ACTION_DISPATCHER.try_recv_request().is_none(),
+                "local outbox action {action} must never mutate or change scratch source",
+            );
+        }
+
+        runtime.execute_command("ReplayOutbox").await.unwrap();
+        let guide = recv_replay_guide();
+        assert_eq!(
+            guide.view,
+            crate::plugin::replay_panel::ReplayPanelView::Guide,
+        );
+        assert_eq!(guide.index, 0);
+    }
+
+    #[tokio::test]
     async fn replay_summaries_stay_at_pull_request_level_without_an_inline_step() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();

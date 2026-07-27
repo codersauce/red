@@ -598,16 +598,33 @@ fn ensure_panel() {
 
 fn panel_event(event: Json) {
     let action = red::string(event.action, "");
+    let in_outbox = red::string(red::state("replay_view"), "guide") == "outbox";
+    if in_outbox && (
+        action == "composer_focus"
+        || action == "a"
+        || action == "apply"
+        || action == "i"
+        || action == "v"
+        || action == "m"
+        || action == "o"
+        || action == "f"
+        || action == "next_file"
+        || action == "]"
+        || action == "previous_file"
+        || action == "["
+    ) {
+        return;
+    }
     if action == "close" {
         close();
     } else if action == "next" || action == "n" || action == "expand" {
-        if red::string(red::state("replay_view"), "guide") == "outbox" {
+        if in_outbox {
             next_draft();
         } else {
             next();
         }
     } else if action == "previous" || action == "p" || action == "collapse" {
-        if red::string(red::state("replay_view"), "guide") == "outbox" {
+        if in_outbox {
             previous_draft();
         } else {
             previous();

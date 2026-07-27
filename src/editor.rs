@@ -4149,10 +4149,14 @@ impl Editor {
         let result = std::thread::Builder::new()
             .name(format!("red-replay-{operation}"))
             .spawn(move || {
-                ACTION_DISPATCHER.send_request(PluginRequest::ReplayBackgroundCompleted {
-                    request_id,
-                    result: work(),
-                });
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                    .unwrap_or_else(|_| {
+                        Err(crate::replay::ReplayError::Filesystem(format!(
+                            "the Replay {operation} worker stopped unexpectedly",
+                        )))
+                    });
+                ACTION_DISPATCHER
+                    .send_request(PluginRequest::ReplayBackgroundCompleted { request_id, result });
             });
         if let Err(error) = result {
             self.pending_replay_requests.remove(&request_id);
@@ -11494,13 +11498,13 @@ impl Editor {
                     }
                     KeyCode::Char('H') => "history",
                     KeyCode::Char('N') => "new",
-                    KeyCode::Char('u') if self.panel_manager.focused_replay_status().is_some() => {
+                    KeyCode::Char('u') if self.panel_manager.focused_replay_is_guide() => {
                         return Some(KeyAction::Single(Action::ReplayUndo));
                     }
-                    KeyCode::Char('[') if self.panel_manager.focused_replay_status().is_some() => {
+                    KeyCode::Char('[') if self.panel_manager.focused_replay_is_guide() => {
                         "previous_file"
                     }
-                    KeyCode::Char(']') if self.panel_manager.focused_replay_status().is_some() => {
+                    KeyCode::Char(']') if self.panel_manager.focused_replay_is_guide() => {
                         "next_file"
                     }
                     KeyCode::Char('a') if !self.panel_manager.focused_row_panel() => {
@@ -24097,6 +24101,84 @@ mod test {
     }
 
     #[tokio::test]
+    async fn panicking_replay_worker_returns_an_error_and_releases_its_slot() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        let mut runtime = Runtime::new();
+        let request_id = RequestId::from_raw(/*value*/ 27146);
+
+        editor
+            .spawn_replay_background(request_id, "panic-test", || {
+                panic!("simulate a failed Replay background worker")
+            })
+            .expect("start the bounded Replay worker");
+
+        let completed = tokio::time::timeout(Duration::from_secs(/*secs*/ 2), async {
+            loop {
+                if let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                    break request;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a panicking Replay worker returns a bounded error");
+
+        match &completed {
+            PluginRequest::ReplayBackgroundCompleted {
+                request_id: completed_id,
+                result: Err(crate::replay::ReplayError::Filesystem(message)),
+            } => {
+                assert_eq!(*completed_id, request_id);
+                assert!(message.contains("panic-test"));
+                assert!(message.contains("stopped unexpectedly"));
+            }
+            _ => panic!("expected a sanitized Replay background-worker error"),
+        }
+
+        ACTION_DISPATCHER.send_request(completed);
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .expect("resolve the failed Replay request in the editor owner");
+        assert!(!editor.pending_replay_requests.contains(&request_id));
+
+        let next_request_id = RequestId::from_raw(/*value*/ 27147);
+        editor
+            .spawn_replay_background(next_request_id, "after-panic", || {
+                Err(crate::replay::ReplayError::MissingObjects)
+            })
+            .expect("a recovered Replay worker slot accepts another request");
+
+        let next = tokio::time::timeout(Duration::from_secs(/*secs*/ 2), async {
+            loop {
+                if let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                    break request;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a recovered Replay worker returns its next completion");
+        assert!(matches!(
+            &next,
+            PluginRequest::ReplayBackgroundCompleted {
+                request_id,
+                result: Err(crate::replay::ReplayError::MissingObjects),
+            } if *request_id == next_request_id
+        ));
+        ACTION_DISPATCHER.send_request(next);
+        editor
+            .service_background(&mut buffer, &mut runtime)
+            .await
+            .expect("resolve the recovered Replay request");
+        assert!(editor.pending_replay_requests.is_empty());
+    }
+
+    #[tokio::test]
     async fn real_replay_opens_each_original_file_without_modifying_the_scratch_worktree() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
@@ -24569,6 +24651,81 @@ mod test {
         assert!(status.contains("NORMAL"));
         assert!(!status.contains("PR #482"));
         assert!(editor.test_render_cursor_position().is_some());
+    }
+
+    #[tokio::test]
+    async fn focused_replay_outbox_never_dispatches_guide_undo_or_file_motion() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        editor
+            .open_replay_demo_workspace(&mut render_buffer)
+            .await
+            .expect("open the safe in-memory replay source");
+        let plan = editor.replay_demo_workspace.as_ref().unwrap().plan.clone();
+        editor.test_create_text_panel(
+            "replay-coach",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Left,
+                width: 46,
+                title: Some("PR REPLAY".to_string()),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        editor.panel_manager.update_text_panel(
+            "replay-coach",
+            vec![plugin::TextPanelBlock {
+                id: "replay-current-change".to_string(),
+                kind: plugin::TextPanelBlockKind::Text,
+                format: plugin::TextPanelBlockFormat::Replay,
+                text: json!({
+                    "pull_request": plan.pull_request,
+                    "author": plan.author,
+                    "branch": plan.branch,
+                    "title": plan.title,
+                    "index": 0,
+                    "view": "outbox",
+                    "steps": plan.steps,
+                })
+                .to_string(),
+            }],
+            /*panel_height*/ 26,
+            /*terminal_width*/ 100,
+        );
+        assert!(editor.test_focus_panel("replay-coach"));
+        assert!(!editor.panel_manager.focused_replay_is_guide());
+
+        for key in ['u', '[', ']'] {
+            let action = editor
+                .test_handle_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(key),
+                    KeyModifiers::NONE,
+                )))
+                .expect("route a focused outbox key without modifying the guide");
+
+            assert!(
+                !matches!(action, Some(KeyAction::Single(Action::ReplayUndo))),
+                "outbox key {key} must never undo a source reconstruction",
+            );
+            if let Some(KeyAction::Multiple(actions)) = action {
+                assert!(
+                    !actions.iter().any(|action| {
+                        matches!(
+                            action,
+                            Action::NotifyPlugins(event, payload)
+                                if event == "panel:event:replay-coach"
+                                    && matches!(
+                                        payload["action"].as_str(),
+                                        Some("previous_file" | "next_file")
+                                    )
+                        )
+                    }),
+                    "outbox key {key} must never switch the scratch source file",
+                );
+            }
+        }
     }
 
     #[test]

@@ -807,6 +807,18 @@ fn replay_outbox_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
         TextPanelSpanStyle::Text,
     ));
 
+    if !model.notice.is_empty() {
+        lines.extend(
+            wrap_plain_text(&model.notice, width.max(1), TextPanelSpanStyle::Quote)
+                .into_iter()
+                .take(2),
+        );
+        lines.push(RenderedTextLine::plain(
+            String::new(),
+            TextPanelSpanStyle::Text,
+        ));
+    }
+
     if model.drafts.is_empty() {
         let message = if model.review_role == Some(ReplayReviewRole::Author) {
             "No review drafts yet. Use c for a comment, s for a summary, or F for a proposed fix."
@@ -1978,6 +1990,7 @@ mod tests {
         replay.review_role = Some(ReplayReviewRole::Author);
         replay.head_commit = "b".repeat(40);
         replay.view = ReplayPanelView::Outbox;
+        replay.notice = "Local review draft saved without sending to GitHub.".to_string();
         replay.drafts = vec![outbox_draft(
             ReplayReviewDraftKind::InlineComment,
             "Please test the original viewport boundary.",
@@ -2019,6 +2032,9 @@ mod tests {
         assert!(rows
             .iter()
             .any(|row| row.contains("nothing sent to GitHub")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("Local review draft saved without sending")));
         assert!(rows.iter().any(|row| row.contains("▶ INLINE COMMENT")));
         assert!(rows
             .iter()
