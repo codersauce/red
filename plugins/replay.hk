@@ -98,6 +98,7 @@ pub fn activate() {
     red::state_set("replay_panel_created", false);
     red::state_set("replay_panel_open", false);
     red::state_set("replay_workspace_id", "");
+    red::state_set("replay_workspace_root", "");
     red::state_set("replay_source_buffer_index", -1);
     red::state_set("replay_source_kind", "demo");
     red::state_set("replay_pending_source_id", "");
@@ -329,6 +330,7 @@ fn demo_workspace_opened(event: Json) {
 
 fn workspace_opened(event: Json) {
     red::state_set("replay_workspace_id", red::string(event.workspace_id, ""));
+    red::state_set("replay_workspace_root", red::string(event.workspace_root, ""));
     red::state_set("replay_source_buffer_index", red::int(event.source_buffer_index, -1));
     ensure_panel();
     render();
@@ -489,10 +491,13 @@ fn source_changed(event: Json) {
     let source_matches = red::int(event.buffer_id, -1)
         == red::int(red::state("replay_source_buffer_index"), -1);
     if red::string(red::state("replay_source_kind"), "demo") != "demo" {
-        source_matches = red::ends_with(
-            red::string(event.buffer_name, ""),
-            "/" + red::string(steps[index].path, "")
+        let expected_path = red::string(red::state("replay_workspace_root"), "")
+            + "/" + red::string(steps[index].path, "");
+        let changed_path = red::string(
+            event.file_path,
+            red::string(event.buffer_name, "")
         );
+        source_matches = changed_path == expected_path;
     }
     if !source_matches {
         return;
@@ -517,18 +522,24 @@ fn replay_undone(event: Json) {
         != red::string(red::state("replay_workspace_id"), "") {
         return;
     }
-    let index = red::int(red::state("replay_index"), 0);
     let steps = red::state("replay_steps");
-    if index < 0 || index >= red::len(steps) {
-        return;
+    let index = -1;
+    let candidate_index = 0;
+    for step in steps {
+        if red::string(event.step_id, "") == red::string(step.id, "") {
+            index = candidate_index;
+        }
+        candidate_index = candidate_index + 1;
     }
-    if red::string(event.step_id, "") != red::string(steps[index].id, "") {
+    if index < 0 {
         return;
     }
 
+    red::state_set("replay_index", index);
     remove_completed(index);
     red::state_set("replay_notice", "Undid the original hunk; scratch source restored.");
     render();
+    sync_selected_source();
 }
 
 fn validation_completed(result: Json) {

@@ -3357,6 +3357,117 @@ mod tests {
         (plan, guide)
     }
 
+    async fn open_source_backed_replay(
+        runtime: &mut Runtime,
+    ) -> crate::replay::ReplayPresentationPlan {
+        runtime
+            .load_plugin("replay", include_str!("../../plugins/replay.hk"))
+            .await
+            .expect("load the original-source Replay coach");
+        runtime
+            .execute_command("ReplayBranch")
+            .await
+            .expect("request a source-backed local review");
+        let branch = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackInput { handle, .. } => handle,
+            _ => panic!("expected original feature-branch input"),
+        };
+        assert!(runtime
+            .notify_composer(
+                branch,
+                ComposerCallback::Submitted("feature/replay".to_string()),
+            )
+            .unwrap());
+        let base = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackInput { handle, .. } => handle,
+            _ => panic!("expected original merge-base input"),
+        };
+        assert!(runtime
+            .notify_composer(base, ComposerCallback::Submitted("master".to_string()))
+            .unwrap());
+        let resolve = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayResolveLocalBranch { request_id, .. } => request_id,
+            _ => panic!("expected trusted original-source resolution"),
+        };
+        runtime
+            .resolve_request(
+                resolve,
+                serde_json::json!({
+                    "ok": true,
+                    "source_id": "source-backed-replay",
+                    "source_kind": "local_range",
+                    "branch": "feature/replay",
+                    "base_ref": "master",
+                    "missing_object_count": 0,
+                    "workspace_root": "/workspace/repository.replay-revision-1234567",
+                    "workspace_branch": "replay/revision-1234567",
+                }),
+            )
+            .await
+            .unwrap();
+        let confirmation = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackConfirmation { handle, .. } => handle,
+            _ => panic!("expected explicit source-worktree confirmation"),
+        };
+        let accept = serde_json::from_value(serde_json::json!({
+            "id": "accept",
+            "label": "Accept",
+        }))
+        .unwrap();
+        assert!(runtime
+            .notify_picker(confirmation, PickerCallback::Selected(accept))
+            .unwrap());
+        let workspace = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayCreateWorkspace {
+                request_id,
+                confirmed,
+                ..
+            } => {
+                assert!(confirmed);
+                request_id
+            }
+            _ => panic!("expected explicitly confirmed scratch-worktree creation"),
+        };
+
+        let mut demo = crate::replay::replay_demo_plan().unwrap();
+        demo.pull_request = 0;
+        demo.author = "local".to_string();
+        demo.branch = "feature/replay".to_string();
+        demo.steps[1].path = "tests/rendering.rs".to_string();
+        demo.steps[1].diff = demo.steps[1]
+            .diff
+            .replace("src/editor/rendering.rs", "tests/rendering.rs");
+        let plan =
+            crate::replay::replay_presentation_plan(&demo, crate::replay::ReplayLimits::default())
+                .expect("bounded independently parseable original source hunks");
+        runtime
+            .resolve_request(
+                workspace,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "real-workspace-1",
+                    "source_buffer_index": 1,
+                    "source_window_id": 11,
+                    "workspace_root": "/workspace/repository.replay-revision-1234567",
+                    "workspace_branch": "replay/revision-1234567",
+                    "plan": serde_json::to_value(&plan).unwrap(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::CreateTextPanel { id, .. } if id == "replay-coach"
+        ));
+        let guide = recv_replay_guide();
+        assert_eq!(guide.index, 0);
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusPanel { id } if id == "replay-coach"
+        ));
+        plan
+    }
+
     fn recv_agent_composer() -> (ComposerHandle, Option<String>, String, Vec<String>) {
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::OpenCallbackComposer {
@@ -4379,6 +4490,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_replay_ignores_matching_files_outside_its_exact_scratch_worktree() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_source_backed_replay(&mut runtime).await;
+
+        runtime.execute_command("ReplayValidate").await.unwrap();
+        let request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayDemoValidateStep {
+                request_id,
+                workspace_id,
+                step_id,
+            } => {
+                assert_eq!(workspace_id, "real-workspace-1");
+                assert_eq!(step_id, plan.steps[0].id);
+                request_id
+            }
+            _ => panic!("expected original scratch-source hunk validation"),
+        };
+        runtime
+            .resolve_request(
+                request,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "real-workspace-1",
+                    "step_id": plan.steps[0].id,
+                    "state": "exact",
+                    "revision": 1,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recv_replay_guide().completions.len(), 1);
+
+        runtime
+            .notify(
+                "buffer:changed",
+                serde_json::json!({
+                    "buffer_id": 1,
+                    "buffer_name": "/workspace/repository/src/editor/rendering.rs",
+                    "file_path": "/workspace/repository/src/editor/rendering.rs",
+                    "revision": 2,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            ACTION_DISPATCHER.try_recv_request().is_none(),
+            "the same relative file in the original repository cannot invalidate Replay",
+        );
+
+        runtime
+            .notify(
+                "buffer:changed",
+                serde_json::json!({
+                    "buffer_id": 1,
+                    "buffer_name":
+                        "/workspace/repository.replay-revision-1234567/src/editor/rendering.rs",
+                    "file_path":
+                        "/workspace/repository.replay-revision-1234567/src/editor/rendering.rs",
+                    "revision": 3,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let guide = recv_replay_guide();
+        assert!(guide.completions.is_empty());
+        assert!(guide.notice.contains("check this step again"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn real_replay_undo_returns_the_guide_to_the_actual_original_file() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_source_backed_replay(&mut runtime).await;
+
+        runtime.execute_command("ReplayValidate").await.unwrap();
+        let request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayDemoValidateStep { request_id, .. } => request_id,
+            _ => panic!("expected validation of the first source-backed original hunk"),
+        };
+        runtime
+            .resolve_request(
+                request,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "real-workspace-1",
+                    "step_id": plan.steps[0].id,
+                    "state": "exact",
+                    "revision": 1,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recv_replay_guide().completions.len(), 1);
+
+        runtime.execute_command("ReplayNext").await.unwrap();
+        let second = recv_replay_guide();
+        assert_eq!(second.index, 1);
+        assert_eq!(second.current_step().unwrap().path, "tests/rendering.rs");
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ReplayFocusStepSource { workspace_id, step_id }
+                if workspace_id == "real-workspace-1" && step_id == plan.steps[1].id
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusPanel { id } if id == "replay-coach"
+        ));
+
+        runtime
+            .notify(
+                "replay:undone",
+                serde_json::json!({
+                    "workspace_id": "real-workspace-1",
+                    "step_id": plan.steps[0].id,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let restored = recv_replay_guide();
+        assert_eq!(restored.index, 0);
+        assert_eq!(restored.current_step().unwrap().id, plan.steps[0].id);
+        assert!(restored.completions.is_empty());
+        assert!(restored.notice.contains("scratch source restored"));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ReplayFocusStepSource { workspace_id, step_id }
+                if workspace_id == "real-workspace-1" && step_id == plan.steps[0].id
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusPanel { id } if id == "replay-coach"
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
     async fn bundled_replay_demo_opens_a_dedicated_panel_with_real_per_step_diffs() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -4679,7 +4932,7 @@ mod tests {
                 "replay:undone",
                 serde_json::json!({
                     "workspace_id": "replay-workspace-1",
-                    "step_id": plan.steps[1].id,
+                    "step_id": "unknown-original-hunk",
                 }),
             )
             .await
