@@ -18,7 +18,10 @@ pub use demo::{replay_demo_plan, ReplayDemoPlan, ReplayDemoStep};
 pub use patch::{
     parse_patch, ReplayChangeKind, ReplayFilePatch, ReplayHunk, ReplayHunkRange, ReplayPatch,
 };
-pub use plan::replay_plan_from_session;
+pub use plan::{
+    replay_plan_from_session, replay_presentation_plan, ReplayPresentationPlan,
+    ReplayPresentationStep,
+};
 pub use session::{
     ReplayCompletion, ReplayController, ReplayMode, ReplayNote, ReplayNoteCategory,
     ReplayRecoverySnapshot, ReplaySession, ReplaySessionState, ReplayStage, ReplayStep,

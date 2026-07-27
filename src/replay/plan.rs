@@ -7,10 +7,138 @@
 
 use std::{collections::HashMap, path::Path};
 
+use serde::{Deserialize, Serialize};
+
 use super::{
     parse_patch, ReplayChangeKind, ReplayDemoPlan, ReplayDemoStep, ReplayError, ReplayLimits,
     ReplaySession, ReplayStep, ReplayStepKind,
 };
+
+/// Bounded reviewer-visible source context for one original-author hunk.
+///
+/// The editor retains the complete scratch-file images for validation and
+/// application. The presentation boundary carries only this step's exact
+/// independent unified diff and the original hunk-local source images.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayPresentationStep {
+    /// Stable original source-hunk identity.
+    pub id: String,
+    /// One-based reconstruction order.
+    pub ordinal: usize,
+    /// Safe repository-relative scratch-source path.
+    pub path: String,
+    /// User-facing patch operation.
+    pub kind: String,
+    /// Concise description of the original change.
+    pub title: String,
+    /// Original-author rationale for this exercise.
+    pub why: String,
+    /// Concrete manual-reconstruction instruction.
+    pub task: String,
+    /// Optional graduated reconstruction hint.
+    pub hint: String,
+    /// Exact old hunk and its original surrounding context.
+    pub before: String,
+    /// Exact new hunk and its original surrounding context.
+    pub after: String,
+    /// Complete, independently parseable original Git unified hunk.
+    pub diff: String,
+}
+
+/// Bounded metadata and original hunk snapshots sent to the Replay coach.
+///
+/// Complete file buffers never cross the plugin boundary or get repeated for
+/// every change. They remain owned and validated by the editor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayPresentationPlan {
+    /// Original GitHub pull request number, or zero for a local branch.
+    pub pull_request: u64,
+    /// Original pull request or local-review title.
+    pub title: String,
+    /// Original pull request author or local source label.
+    pub author: String,
+    /// Original reviewed feature branch.
+    pub branch: String,
+    /// Repository-relative initial scratch-source path.
+    pub source_path: String,
+    /// Ordered, independently parseable, hunk-local presentation steps.
+    pub steps: Vec<ReplayPresentationStep>,
+}
+
+/// Projects an editor-owned replay into exact, bounded reviewer-visible hunks.
+///
+/// Full source-file images remain exclusively in the editor-owned plan, so a
+/// small change in a megabyte-sized source file does not exhaust the panel's
+/// bounded model or repeatedly serialize the complete source.
+///
+/// # Errors
+///
+/// Returns an error when a step does not contain exactly one original hunk,
+/// its source path is inconsistent, or the complete serialized presentation
+/// exceeds the configured review limit.
+pub fn replay_presentation_plan(
+    plan: &ReplayDemoPlan,
+    limits: ReplayLimits,
+) -> Result<ReplayPresentationPlan, ReplayError> {
+    if plan.steps.len() > limits.max_steps {
+        return Err(ReplayError::LimitExceeded {
+            kind: "replay presentation steps",
+            limit: limits.max_steps,
+        });
+    }
+
+    let steps = plan
+        .steps
+        .iter()
+        .map(|step| {
+            let patch = parse_patch(&step.diff, limits)?;
+            if patch.files.len() != 1 {
+                return Err(ReplayError::InvalidPatch(
+                    "presentation step is not one original source file".to_string(),
+                ));
+            }
+            let file = &patch.files[0];
+            if file.path() != Some(Path::new(&step.path)) || file.hunks.len() != 1 {
+                return Err(ReplayError::InvalidPatch(
+                    "presentation step is not one original source hunk".to_string(),
+                ));
+            }
+            let hunk = &file.hunks[0];
+            Ok(ReplayPresentationStep {
+                id: step.id.clone(),
+                ordinal: step.ordinal,
+                path: step.path.clone(),
+                kind: step.kind.clone(),
+                title: step.title.clone(),
+                why: step.why.clone(),
+                task: step.task.clone(),
+                hint: step.hint.clone(),
+                before: hunk.before.clone(),
+                after: hunk.after.clone(),
+                diff: step.diff.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, ReplayError>>()?;
+
+    let presentation = ReplayPresentationPlan {
+        pull_request: plan.pull_request,
+        title: plan.title.clone(),
+        author: plan.author.clone(),
+        branch: plan.branch.clone(),
+        source_path: plan.source_path.clone(),
+        steps,
+    };
+    let bytes = serde_json::to_vec(&presentation)
+        .map_err(|error| ReplayError::InvalidPatch(error.to_string()))?;
+    if bytes.len() > limits.max_patch_bytes {
+        return Err(ReplayError::LimitExceeded {
+            kind: "replay presentation bytes",
+            limit: limits.max_patch_bytes,
+        });
+    }
+
+    Ok(presentation)
+}
 
 /// Compiles exact, source-backed presentation steps for a confirmed worktree.
 ///
@@ -251,7 +379,8 @@ fn replay_rationale(session: &ReplaySession, step: &ReplayStep, path: &str) -> S
 mod tests {
     use super::*;
     use crate::replay::{
-        digest, GitObjectId, ReplayRepository, ReplaySource, ReplaySourceKind, ReplayWorkspace,
+        digest, replay_demo_plan, GitObjectId, ReplayRepository, ReplaySource, ReplaySourceKind,
+        ReplayWorkspace,
     };
 
     const MULTI_FILE_PATCH: &str = concat!(
@@ -358,6 +487,72 @@ mod tests {
         assert!(plan.steps[1].after.contains("new_second()"));
         assert_eq!(plan.steps[2].before, "assert_eq!(token(), 1);\n");
         assert_eq!(plan.steps[2].after, "assert_eq!(token(), 2);\n");
+    }
+
+    #[test]
+    fn real_presentation_preserves_each_exact_original_independent_hunk() {
+        let (_directory, session) = source_session(MULTI_FILE_PATCH);
+        let limits = ReplayLimits::default();
+        let plan = replay_plan_from_session(&session, "feature/replay", limits)
+            .expect("compile the full editor-owned source plan");
+
+        let presentation = replay_presentation_plan(&plan, limits)
+            .expect("compile bounded reviewer-visible original hunks");
+
+        assert_eq!(presentation.source_path, "src/token.rs");
+        assert_eq!(presentation.steps.len(), plan.steps.len());
+        for (presented, original) in presentation.steps.iter().zip(&plan.steps) {
+            assert_eq!(presented.id, original.id);
+            assert_eq!(presented.path, original.path);
+            assert_eq!(presented.diff, original.diff);
+
+            let patch = parse_patch(&presented.diff, limits)
+                .expect("presentation retains the complete independent original hunk");
+            let hunk = &patch.files[0].hunks[0];
+            assert_eq!(presented.before, hunk.before);
+            assert_eq!(presented.after, hunk.after);
+        }
+        assert!(presentation.steps[0].before.contains("old_first()"));
+        assert!(!presentation.steps[0].before.contains("old_second()"));
+        assert!(presentation.steps[1].after.contains("new_second()"));
+        assert!(!presentation.steps[1].after.contains("new_first()"));
+    }
+
+    #[test]
+    fn large_source_images_never_exhaust_the_bounded_replay_presentation() {
+        let mut plan = replay_demo_plan().expect("original source-backed demo hunks");
+        let unchanged_source = "// unrelated original source stays in the editor\n".repeat(30_000);
+        plan.initial_source = format!("{unchanged_source}{}", plan.initial_source);
+        for step in &mut plan.steps {
+            step.before = format!("{unchanged_source}{}", step.before);
+            step.after = format!("{unchanged_source}{}", step.after);
+        }
+        let limits = ReplayLimits::default();
+        let complete_plan = serde_json::to_vec(&plan).expect("serialize full editor-owned images");
+        assert!(complete_plan.len() > limits.max_patch_bytes);
+
+        let presentation = replay_presentation_plan(&plan, limits)
+            .expect("large source files must still produce a bounded real reviewer guide");
+        let bytes = serde_json::to_vec(&presentation).expect("serialize bounded original hunks");
+
+        assert!(bytes.len() < 64 * 1024);
+        assert_eq!(presentation.steps.len(), plan.steps.len());
+        for (presented, original) in presentation.steps.iter().zip(&plan.steps) {
+            assert_eq!(presented.diff, original.diff);
+            assert!(!presented.before.contains("unrelated original source"));
+            assert!(!presented.after.contains("unrelated original source"));
+        }
+    }
+
+    #[test]
+    fn real_presentation_refuses_a_hunk_for_an_unrelated_source_file() {
+        let mut plan = replay_demo_plan().expect("original source-backed demo hunks");
+        plan.steps[0].path = "src/unrelated.rs".to_string();
+
+        assert!(matches!(
+            replay_presentation_plan(&plan, ReplayLimits::default()),
+            Err(ReplayError::InvalidPatch(_)),
+        ));
     }
 
     #[test]

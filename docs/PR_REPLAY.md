@@ -113,7 +113,8 @@ application.
 Every step always displays its exact, independently parseable unified diff.
 Challenge mode emphasizes manually reconstructing the hunk in the real source
 buffer. Snippet mode additionally reveals the complete resulting original-author
-source.
+source for that hunk. Full scratch-file images remain editor-owned instead of
+being copied into every guide step.
 
 To apply a step automatically, press `a` while the guide is focused, or use
 `Space R a` from either surface. Rust checks the original step, scratch-buffer

@@ -84,8 +84,10 @@ branch are excluded. Neither source-resolution call creates a worktree.
 Both resolution calls provide a durable sibling-worktree preview.
 `ReplayCreateWorkspace(callback, source_id, confirmed)` creates the displayed
 local scratch branch only after the reviewer explicitly confirms. Its response
-contains the real source-backed plan, complete original per-step unified
-hunks, and editable scratch-file identities. `ReplayFocusStepSource(workspace_id,
+contains a bounded presentation plan, complete original per-step unified
+hunks, hunk-local original source images, and editable scratch-file identities.
+Full scratch-file images remain in editor-owned buffers; a large file is never
+copied into every plugin-visible step. `ReplayFocusStepSource(workspace_id,
 step_id)` switches the existing source window to the exact scratch file for a
 multi-file step without turning the dedicated guide into an editor buffer.
 

@@ -3855,6 +3855,8 @@ impl Editor {
             branch,
             self.replay_controller.limits(),
         )?;
+        let presentation =
+            crate::replay::replay_presentation_plan(&plan, self.replay_controller.limits())?;
 
         let mut source_buffers = HashMap::new();
         for step in &plan.steps {
@@ -3886,7 +3888,7 @@ impl Editor {
         let id = session.id;
         self.replay_demo_workspace = Some(ReplayDemoWorkspaceState {
             id: id.clone(),
-            plan: plan.clone(),
+            plan,
             source_buffer,
             source_buffers,
             source_window,
@@ -3898,7 +3900,7 @@ impl Editor {
             "source_window_id": source_window.0,
             "workspace_root": workspace.root,
             "workspace_branch": workspace.branch,
-            "plan": plan,
+            "plan": presentation,
         }))
     }
 
@@ -22252,6 +22254,15 @@ mod test {
         assert_eq!(response["ok"], true);
         assert_eq!(response["plan"]["branch"], "feature/replay");
         assert_eq!(response["plan"]["steps"].as_array().unwrap().len(), 2);
+        assert!(response["plan"].get("initial_source").is_none());
+        assert_eq!(
+            response["plan"]["steps"][0]["before"],
+            "fn first() {\n    before_first();\n}\n",
+        );
+        assert_eq!(
+            response["plan"]["steps"][0]["after"],
+            "fn first() {\n    after_first();\n}\n",
+        );
         assert_eq!(editor.buffer_manager.len(), 3);
         assert!(editor.current_buffer().name().ends_with("/src/first.rs"));
         assert!(editor
