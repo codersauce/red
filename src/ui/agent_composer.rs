@@ -245,20 +245,21 @@ impl Component for AgentComposer {
 
         if self.dialog.height > body_height {
             let status_y = content_y + body_height;
-            let escape_label = if self.prompt.mode() == Mode::Insert {
-                "Normal"
+            let normal_mode = self.prompt.mode() == Mode::Normal;
+            let (send_key, compact_send_key, escape_label) = if normal_mode {
+                ("Enter", "↵", "Cancel")
             } else {
-                "Cancel"
+                ("Ctrl+Enter", "^↵", "Normal")
             };
             let actions = [
-                UiAction::new("send", "Ctrl+Enter", "Send")
-                    .with_compact_key("^↵")
+                UiAction::new("send", send_key, "Send")
+                    .with_compact_key(compact_send_key)
                     .with_compact_label("")
                     .with_priority(ActionPriority::Essential),
                 UiAction::new("cancel", "Esc", escape_label)
                     .with_compact_label("")
                     .with_priority(ActionPriority::Essential),
-                UiAction::new("newline", "Enter", "New line"),
+                UiAction::new("newline", "Enter", "New line").with_modes([ActionMode::Insert]),
                 UiAction::new("history", "Ctrl+P/N", "History")
                     .with_compact_key("^P/N")
                     .with_priority(ActionPriority::Secondary),
@@ -269,7 +270,7 @@ impl Component for AgentComposer {
                 &actions[..]
             };
             ActionBar::new(visible_actions)
-                .with_mode(if self.prompt.mode() == Mode::Normal {
+                .with_mode(if normal_mode {
                     ActionMode::Normal
                 } else {
                     ActionMode::Insert
@@ -740,6 +741,51 @@ mod tests {
     }
 
     #[test]
+    fn composer_action_hints_follow_prompt_mode() {
+        let editor = editor(160, 24);
+        let mut composer = new_composer(&editor, None, 802, "send this".to_string(), vec![]);
+        let mut buffer = RenderBuffer::new(160, editor.vheight(), &Style::default());
+        let status_y = composer.dialog.y + 1 + composer.body_height();
+
+        composer.draw(&mut buffer).unwrap();
+        let insert_status = rendered_row(&buffer, status_y);
+        assert!(insert_status.contains("INSERT"), "{insert_status:?}");
+        assert!(
+            insert_status.contains("Ctrl+Enter Send"),
+            "{insert_status:?}"
+        );
+        assert!(
+            insert_status.contains("Enter New line"),
+            "{insert_status:?}"
+        );
+        assert!(insert_status.contains("Esc Normal"), "{insert_status:?}");
+
+        assert_eq!(
+            composer.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(KeyAction::Single(Action::Refresh))
+        );
+        composer.draw(&mut buffer).unwrap();
+        let normal_status = rendered_row(&buffer, status_y);
+        assert!(normal_status.contains("NORMAL"), "{normal_status:?}");
+        assert!(normal_status.contains("Enter Send"), "{normal_status:?}");
+        assert!(normal_status.contains("Esc Cancel"), "{normal_status:?}");
+        assert!(!normal_status.contains("Ctrl+Enter"), "{normal_status:?}");
+        assert!(!normal_status.contains("New line"), "{normal_status:?}");
+
+        assert_eq!(
+            composer.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::NotifyPlugin(
+                    "agent".to_string(),
+                    "composer:submitted:802".to_string(),
+                    json!("send this"),
+                ),
+            ]))
+        );
+    }
+
+    #[test]
     fn modified_enter_and_modified_linefeed_submit_scoped_callbacks() {
         let editor = editor(60, 18);
         let handle = ComposerHandle::from_raw(42);
@@ -856,6 +902,32 @@ mod tests {
         let status = rendered_row(&buffer, status_y);
         assert!(status.contains("Send"), "{status:?}");
         assert!(status.contains("Esc"), "{status:?}");
+    }
+
+    #[test]
+    fn compact_normal_mode_status_preserves_submission_and_cancel_actions() {
+        let editor = editor(36, 14);
+        let mut composer = new_composer(
+            &editor,
+            Some("Agent prompt".to_string()),
+            802,
+            "send this".to_string(),
+            vec![],
+        );
+        let mut buffer = RenderBuffer::new(36, editor.vheight(), &Style::default());
+
+        assert_eq!(
+            composer.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(KeyAction::Single(Action::Refresh))
+        );
+        composer.draw(&mut buffer).unwrap();
+        let status_y = composer.dialog.y + 1 + composer.body_height();
+        let status = rendered_row(&buffer, status_y);
+
+        assert!(status.contains("Send"), "{status:?}");
+        assert!(status.contains("Esc"), "{status:?}");
+        assert!(!status.contains("New line"), "{status:?}");
+        assert!(!status.contains("^↵"), "{status:?}");
     }
 
     #[test]
