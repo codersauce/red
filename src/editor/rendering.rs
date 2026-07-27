@@ -442,27 +442,12 @@ impl Editor {
         Ok(())
     }
 
-    /// Repaints edited rows through the same document-aware path as full frames.
+    /// Flushes one complete, document-aware frame after an edit.
     pub(super) fn render_edited_window_rows(
         &mut self,
         buffer: &mut RenderBuffer,
     ) -> anyhow::Result<()> {
-        self.update_gutter_width();
-        self.sync_to_window();
-
-        let window_id = self.window_manager.active_window_id();
-        let Some(window) = self.window_manager.window_at_index(window_id).cloned() else {
-            return Ok(());
-        };
-        let rows = (0..self.window_content_height(&window))
-            .map(|row| self.window_to_terminal_y(&window, row))
-            .collect::<Vec<_>>();
-
-        self.render_window_rows(buffer, window_id, &rows)?;
-        self.render_overlays_in_window(buffer, &window)?;
-        self.render_dialog(buffer)?;
-        self.update_and_render_overlays(buffer)?;
-        Ok(())
+        self.render(buffer)
     }
 
     fn render_window_rows(
@@ -2204,6 +2189,34 @@ mod tests {
         assert_eq!(by_line[&4].len(), 2);
         assert_eq!(by_line[&4][0].message, "first visible");
         assert_eq!(by_line[&4][1].message, "second visible");
+    }
+
+    #[test]
+    fn edited_window_rows_commit_a_single_complete_frame() {
+        let source = Buffer::new(None, "hello\nworld\n".to_string());
+        let mut editor = rendering_test_editor(source);
+        let mut buffer = RenderBuffer::new(60, 12, &Style::default());
+
+        editor.render(&mut buffer).unwrap();
+        let previous_generation = editor.render_generation;
+
+        editor.render_edited_window_rows(&mut buffer).unwrap();
+
+        assert_eq!(
+            editor.render_generation,
+            previous_generation.wrapping_add(1),
+            "edited rows must commit a final frame instead of forcing a second viewport render"
+        );
+        assert_eq!(
+            editor.previous_render_buffer.as_ref().unwrap().cells,
+            buffer.cells,
+            "the committed frame must match the visible render buffer"
+        );
+        assert_eq!(
+            editor.last_rendered_cursor_position,
+            editor.render_cursor_position(),
+            "the committed frame must update the rendered cursor"
+        );
     }
 
     #[test]
