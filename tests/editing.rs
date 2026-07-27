@@ -285,6 +285,41 @@ async fn type_normal_keys(harness: &mut EditorHarness, keys: &str) {
     }
 }
 
+async fn execute_window_chord(harness: &mut EditorHarness, key: char) {
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('w'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(key),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+}
+
+async fn drag_window_divider(harness: &mut EditorHarness, start: (u16, u16), end: (u16, u16)) {
+    for (kind, (column, row)) in [
+        (MouseEventKind::Down(MouseButton::Left), start),
+        (MouseEventKind::Drag(MouseButton::Left), end),
+        (MouseEventKind::Up(MouseButton::Left), end),
+    ] {
+        harness
+            .execute_event(Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .await
+            .unwrap();
+    }
+}
+
 fn default_key_config() -> Config {
     toml::from_str(include_str!("../default_config.toml")).unwrap()
 }
@@ -5313,6 +5348,483 @@ async fn next_and_previous_window_cycle_through_focused_panels() {
 }
 
 #[tokio::test]
+async fn focused_vertical_panels_resize_with_vim_width_chords() {
+    for side in [PanelSide::Left, PanelSide::Right] {
+        let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness.editor.test_create_panel(
+            "inspector",
+            PanelConfig {
+                side,
+                width: 20,
+                ..PanelConfig::default()
+            },
+        );
+        assert!(harness.editor.test_focus_panel("inspector"));
+
+        execute_window_chord(&mut harness, '>').await;
+        assert_eq!(
+            harness.editor.test_panel_layout("inspector"),
+            Some((side, 21)),
+        );
+        assert_eq!(harness.editor.test_focused_panel_id(), Some("inspector"));
+
+        execute_window_chord(&mut harness, '<').await;
+        assert_eq!(
+            harness.editor.test_panel_layout("inspector"),
+            Some((side, 20)),
+        );
+
+        execute_window_chord(&mut harness, '+').await;
+        assert_eq!(
+            harness.editor.test_panel_layout("inspector"),
+            Some((side, 20)),
+            "height commands must not resize a vertical pane or the hidden editor window",
+        );
+    }
+}
+
+#[tokio::test]
+async fn focused_horizontal_panels_resize_with_vim_height_chords() {
+    for side in [PanelSide::Top, PanelSide::Bottom] {
+        let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness.editor.test_create_panel(
+            "inspector",
+            PanelConfig {
+                side,
+                width: 6,
+                ..PanelConfig::default()
+            },
+        );
+        assert!(harness.editor.test_focus_panel("inspector"));
+
+        execute_window_chord(&mut harness, '+').await;
+        assert_eq!(
+            harness.editor.test_panel_layout("inspector"),
+            Some((side, 7)),
+        );
+
+        execute_window_chord(&mut harness, '-').await;
+        assert_eq!(
+            harness.editor.test_panel_layout("inspector"),
+            Some((side, 6)),
+        );
+
+        execute_window_chord(&mut harness, '>').await;
+        assert_eq!(
+            harness.editor.test_panel_layout("inspector"),
+            Some((side, 6)),
+            "width commands must not resize a horizontal pane or the hidden editor window",
+        );
+    }
+}
+
+#[tokio::test]
+async fn vim_resize_chords_grow_and_shrink_either_editor_split_by_one_cell() {
+    for (split_action, grow, shrink, first_window_action, vertical) in [
+        (
+            Action::SplitVertical,
+            '>',
+            '<',
+            Action::MoveWindowLeft,
+            true,
+        ),
+        (
+            Action::SplitHorizontal,
+            '+',
+            '-',
+            Action::MoveWindowUp,
+            false,
+        ),
+    ] {
+        for first_window in [false, true] {
+            let buffer = Buffer::new(None, "first\nsecond\nthird\n".to_string());
+            let mut harness = EditorHarness::with_config(buffer, default_key_config());
+            harness.execute_action(split_action.clone()).await.unwrap();
+            if first_window {
+                harness
+                    .execute_action(first_window_action.clone())
+                    .await
+                    .unwrap();
+            }
+            let (_, initial_size) = harness.editor.test_active_window_bounds().unwrap();
+            let initial_dimension = if vertical {
+                initial_size.0
+            } else {
+                initial_size.1
+            };
+
+            execute_window_chord(&mut harness, grow).await;
+            let (_, grown_size) = harness.editor.test_active_window_bounds().unwrap();
+            let grown_dimension = if vertical { grown_size.0 } else { grown_size.1 };
+            assert_eq!(grown_dimension, initial_dimension + 1);
+
+            execute_window_chord(&mut harness, shrink).await;
+            let (_, restored_size) = harness.editor.test_active_window_bounds().unwrap();
+            assert_eq!(restored_size, initial_size);
+        }
+    }
+}
+
+#[tokio::test]
+async fn counted_vim_resize_moves_editor_split_by_the_requested_cells() {
+    let buffer = Buffer::new(None, "first\nsecond\nthird\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+    let (_, initial_size) = harness.editor.test_active_window_bounds().unwrap();
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('5'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+    execute_window_chord(&mut harness, '>').await;
+
+    let (_, resized) = harness.editor.test_active_window_bounds().unwrap();
+    assert_eq!(resized.0, initial_size.0 + 5);
+    assert_eq!(resized.1, initial_size.1);
+}
+
+#[tokio::test]
+async fn focused_panel_window_resize_chords_honor_vim_counts() {
+    let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.test_create_panel(
+        "inspector",
+        PanelConfig {
+            side: PanelSide::Left,
+            width: 20,
+            ..PanelConfig::default()
+        },
+    );
+    assert!(harness.editor.test_focus_panel("inspector"));
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('5'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+    execute_window_chord(&mut harness, '>').await;
+
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Left, 25)),
+    );
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("inspector"));
+}
+
+#[tokio::test]
+async fn ctrl_w_equals_resets_a_focused_panel_without_balancing_editor_splits() {
+    let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+    harness
+        .execute_action(Action::ResizeWindowLeft(/*amount*/ 3))
+        .await
+        .unwrap();
+    harness.editor.test_create_panel(
+        "inspector",
+        PanelConfig {
+            side: PanelSide::Left,
+            width: 20,
+            ..PanelConfig::default()
+        },
+    );
+    let split_topology = harness.editor.test_session_snapshot().window_layout.root;
+    assert!(harness.editor.test_focus_panel("inspector"));
+
+    harness
+        .execute_action(Action::ResizeWindowRight(/*amount*/ 5))
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Left, 25)),
+    );
+
+    execute_window_chord(&mut harness, '=').await;
+
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Left, 20)),
+    );
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("inspector"));
+    assert_eq!(
+        harness.editor.test_session_snapshot().window_layout.root,
+        split_topology,
+        "resetting a pane must not rebalance unrelated editor splits",
+    );
+}
+
+#[tokio::test]
+async fn shifted_window_chords_move_every_panel_kind_to_all_four_edges() {
+    for source_backed in [false, true] {
+        let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        let config = PanelConfig {
+            side: PanelSide::Left,
+            width: 24,
+            title: Some("Inspector".to_string()),
+            ..PanelConfig::default()
+        };
+        if source_backed {
+            harness.editor.test_create_text_panel("inspector", config);
+        } else {
+            harness.editor.test_create_panel("inspector", config);
+        }
+        assert!(harness.editor.test_focus_panel("inspector"));
+
+        for (key, side, expected_size) in [
+            ('K', PanelSide::Top, 7),
+            ('J', PanelSide::Bottom, 7),
+            ('L', PanelSide::Right, 24),
+            ('H', PanelSide::Left, 24),
+        ] {
+            execute_window_chord(&mut harness, key).await;
+
+            assert_eq!(
+                harness.editor.test_panel_layout("inspector"),
+                Some((side, expected_size)),
+                "both row and source-backed panes should move with Ctrl-w {key}",
+            );
+            assert_eq!(harness.editor.test_focused_panel_id(), Some("inspector"));
+            let (_, editor_size) = harness.editor.test_active_window_bounds().unwrap();
+            assert!(editor_size.0 >= 10);
+            assert!(editor_size.1 >= 5);
+        }
+    }
+}
+
+#[tokio::test]
+async fn moved_panels_restore_their_independent_width_and_height() {
+    let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.test_create_text_panel(
+        "inspector",
+        PanelConfig {
+            side: PanelSide::Left,
+            width: 24,
+            ..PanelConfig::default()
+        },
+    );
+    assert!(harness.editor.test_focus_panel("inspector"));
+
+    execute_window_chord(&mut harness, 'K').await;
+    execute_window_chord(&mut harness, '+').await;
+    execute_window_chord(&mut harness, '+').await;
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Top, 9)),
+    );
+
+    execute_window_chord(&mut harness, 'L').await;
+    execute_window_chord(&mut harness, '>').await;
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Right, 25)),
+    );
+
+    execute_window_chord(&mut harness, 'J').await;
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Bottom, 9)),
+    );
+
+    execute_window_chord(&mut harness, 'H').await;
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Left, 25)),
+    );
+}
+
+#[tokio::test]
+async fn docked_pane_resizing_preserves_minimum_editor_dimensions() {
+    let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+    let mut vertical = EditorHarness::with_config_and_size(
+        buffer,
+        default_key_config(),
+        /*width*/ 40,
+        /*height*/ 14,
+    );
+    vertical.editor.test_create_panel(
+        "inspector",
+        PanelConfig {
+            side: PanelSide::Left,
+            width: 15,
+            ..PanelConfig::default()
+        },
+    );
+    assert!(vertical.editor.test_focus_panel("inspector"));
+
+    vertical
+        .execute_action(Action::ResizeWindowRight(/*amount*/ usize::MAX))
+        .await
+        .unwrap();
+    assert_eq!(
+        vertical.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Left, 29)),
+    );
+    let (_, vertical_editor_size) = vertical.editor.test_active_window_bounds().unwrap();
+    assert_eq!(vertical_editor_size.0, 10);
+
+    vertical
+        .execute_action(Action::ResizeWindowLeft(/*amount*/ usize::MAX))
+        .await
+        .unwrap();
+    assert_eq!(
+        vertical.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Left, 12)),
+    );
+
+    let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+    let mut horizontal = EditorHarness::with_config_and_size(
+        buffer,
+        default_key_config(),
+        /*width*/ 40,
+        /*height*/ 14,
+    );
+    horizontal.editor.test_create_panel(
+        "inspector",
+        PanelConfig {
+            side: PanelSide::Bottom,
+            width: 4,
+            ..PanelConfig::default()
+        },
+    );
+    assert!(horizontal.editor.test_focus_panel("inspector"));
+
+    horizontal
+        .execute_action(Action::ResizeWindowDown(/*amount*/ usize::MAX))
+        .await
+        .unwrap();
+    assert_eq!(
+        horizontal.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Bottom, 6)),
+    );
+    let (_, horizontal_editor_size) = horizontal.editor.test_active_window_bounds().unwrap();
+    assert_eq!(horizontal_editor_size.1, 5);
+
+    horizontal
+        .execute_action(Action::ResizeWindowUp(/*amount*/ usize::MAX))
+        .await
+        .unwrap();
+    assert_eq!(
+        horizontal.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Bottom, 4)),
+    );
+}
+
+#[tokio::test]
+async fn terminal_resize_preserves_independent_docked_pane_preferences() {
+    let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.test_create_text_panel(
+        "inspector",
+        PanelConfig {
+            side: PanelSide::Left,
+            width: 24,
+            ..PanelConfig::default()
+        },
+    );
+    assert!(harness.editor.test_focus_panel("inspector"));
+    execute_window_chord(&mut harness, 'J').await;
+    execute_window_chord(&mut harness, '+').await;
+    execute_window_chord(&mut harness, '+').await;
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Bottom, 9)),
+    );
+
+    harness
+        .execute_event(Event::Resize(/*columns*/ 60, /*rows*/ 20))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Bottom, 9)),
+    );
+    let (_, editor_size) = harness.editor.test_active_window_bounds().unwrap();
+    assert_eq!(editor_size, (60, 8));
+
+    execute_window_chord(&mut harness, 'L').await;
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Right, 24)),
+    );
+
+    execute_window_chord(&mut harness, 'K').await;
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Top, 9)),
+    );
+}
+
+#[tokio::test]
+async fn directional_window_chords_focus_and_leave_all_four_pane_edges() {
+    for (side, enter, leave, initial_size) in [
+        (PanelSide::Left, 'h', 'l', 20),
+        (PanelSide::Right, 'l', 'h', 20),
+        (PanelSide::Top, 'k', 'j', 6),
+        (PanelSide::Bottom, 'j', 'k', 6),
+    ] {
+        let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness.editor.test_create_panel(
+            "inspector",
+            PanelConfig {
+                side,
+                width: initial_size,
+                ..PanelConfig::default()
+            },
+        );
+
+        execute_window_chord(&mut harness, enter).await;
+        assert_eq!(harness.editor.test_focused_panel_id(), Some("inspector"));
+
+        execute_window_chord(&mut harness, leave).await;
+        assert_eq!(harness.editor.test_focused_panel_id(), None);
+    }
+}
+
+#[tokio::test]
+async fn window_cycle_includes_top_left_editor_right_and_bottom_panes() {
+    let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    for (id, side, width) in [
+        ("top", PanelSide::Top, 4),
+        ("left", PanelSide::Left, 12),
+        ("right", PanelSide::Right, 12),
+        ("bottom", PanelSide::Bottom, 4),
+    ] {
+        harness.editor.test_create_panel(
+            id,
+            PanelConfig {
+                side,
+                width,
+                ..PanelConfig::default()
+            },
+        );
+    }
+
+    for expected in [
+        Some("right"),
+        Some("bottom"),
+        Some("top"),
+        Some("left"),
+        None,
+    ] {
+        execute_window_chord(&mut harness, 'w').await;
+        assert_eq!(harness.editor.test_focused_panel_id(), expected);
+    }
+}
+
+#[tokio::test]
 async fn shifted_window_chords_move_nested_splits_to_each_outer_edge() {
     for (key, expected_position, expected_size) in [
         ('H', (0, 0), (39, 22)),
@@ -5675,6 +6187,191 @@ async fn mouse_click_in_editor_clears_panel_focus() {
 
     assert_eq!(harness.editor.test_focused_panel_id(), None);
     assert!(harness.render_cursor_position().is_some());
+}
+
+#[tokio::test]
+async fn mouse_drag_resizes_all_four_docked_pane_edges_without_stealing_focus() {
+    for (side, initial_size, start, end, expected_size) in [
+        (PanelSide::Left, 20, (20, 4), (25, 4), 25),
+        (PanelSide::Right, 20, (59, 4), (54, 4), 25),
+        (PanelSide::Top, 6, (12, 6), (12, 9), 9),
+        (PanelSide::Bottom, 6, (12, 15), (12, 12), 9),
+    ] {
+        let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness.editor.test_create_panel(
+            "inspector",
+            PanelConfig {
+                side,
+                width: initial_size,
+                ..PanelConfig::default()
+            },
+        );
+        assert!(harness.editor.test_focus_panel("inspector"));
+
+        drag_window_divider(&mut harness, start, end).await;
+
+        assert_eq!(
+            harness.editor.test_panel_layout("inspector"),
+            Some((side, expected_size)),
+            "dragging the actual {side:?} divider should resize the focused pane",
+        );
+        assert_eq!(harness.editor.test_focused_panel_id(), Some("inspector"));
+    }
+}
+
+#[tokio::test]
+async fn pane_divider_drag_stays_captured_after_the_pointer_enters_the_editor() {
+    let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.test_create_panel(
+        "inspector",
+        PanelConfig {
+            side: PanelSide::Left,
+            width: 20,
+            ..PanelConfig::default()
+        },
+    );
+    assert!(harness.editor.test_focus_panel("inspector"));
+
+    for (kind, column) in [
+        (MouseEventKind::Down(MouseButton::Left), 20),
+        (MouseEventKind::Drag(MouseButton::Left), 34),
+    ] {
+        harness
+            .execute_event(Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row: 3,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Left, 34)),
+    );
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("inspector"));
+
+    harness
+        .execute_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 34,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .await
+        .unwrap();
+
+    let passive_drag = harness
+        .editor
+        .test_handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 45,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .unwrap();
+
+    assert_eq!(passive_drag, None);
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Left, 34)),
+    );
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("inspector"));
+}
+
+#[tokio::test]
+async fn mouse_drag_resizes_a_vertical_editor_split_without_moving_the_cursor() {
+    let buffer = Buffer::new(None, "first\nsecond\nthird\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+    let active_window_id = harness.active_window_id();
+    let cursor = harness.cursor_position();
+
+    drag_window_divider(&mut harness, (39, 4), (53, 4)).await;
+
+    let (position, size) = harness.editor.test_active_window_bounds().unwrap();
+    assert_eq!((position.x, position.y), (54, 0));
+    assert_eq!(size, (26, 22));
+    assert_eq!(harness.active_window_id(), active_window_id);
+    assert_eq!(harness.cursor_position(), cursor);
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+}
+
+#[tokio::test]
+async fn mouse_drag_resizes_a_horizontal_editor_split_without_moving_the_cursor() {
+    let buffer = Buffer::new(None, "first\nsecond\nthird\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .execute_action(Action::SplitHorizontal)
+        .await
+        .unwrap();
+    let active_window_id = harness.active_window_id();
+    let cursor = harness.cursor_position();
+
+    drag_window_divider(&mut harness, (8, 10), (8, 14)).await;
+
+    let (position, size) = harness.editor.test_active_window_bounds().unwrap();
+    assert_eq!((position.x, position.y), (0, 15));
+    assert_eq!(size, (80, 7));
+    assert_eq!(harness.active_window_id(), active_window_id);
+    assert_eq!(harness.cursor_position(), cursor);
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+}
+
+#[tokio::test]
+async fn mouse_drag_preserves_a_focused_text_composer_and_its_draft() {
+    let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 24,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+            ..PanelConfig::default()
+        },
+    );
+    assert!(harness.editor.test_focus_text_panel_composer("agent"));
+    harness
+        .editor
+        .test_handle_event(Event::Paste("keep this follow-up".to_string()))
+        .unwrap();
+
+    drag_window_divider(&mut harness, (55, 4), (50, 4)).await;
+
+    assert_eq!(
+        harness.editor.test_panel_layout("agent"),
+        Some((PanelSide::Right, 29)),
+    );
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("agent"));
+    assert!(harness.render_cursor_position().is_some());
+
+    let submitted = harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+    assert!(matches!(
+        submitted,
+        Some(KeyAction::Multiple(actions))
+            if actions.iter().any(|action| matches!(
+                action,
+                Action::NotifyPlugins(name, payload)
+                    if name == "panel:event:agent"
+                        && payload["action"] == "submit"
+                        && payload["text"] == "keep this follow-up"
+            ))
+    ));
 }
 
 #[test]

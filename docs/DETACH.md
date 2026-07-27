@@ -28,9 +28,10 @@ session name. Only one TUI may attach to a session at a time. Sessions are local
 current OS user: Red uses a private Unix socket and reconnect token, and does not
 expose a TCP port.
 
-The attach protocol is version 3. It preserves native mouse click/scroll behavior,
-chunks large bracketed pastes into one editor transaction, and sends only changed frame
-rows during ordinary input. Frames are capped at 2 MiB, pending paste is capped at
+The attach protocol is version 3. It preserves native mouse clicks, scrolling,
+and pane or editor-divider dragging, chunks large bracketed pastes into one
+editor transaction, and sends only changed frame rows during ordinary input.
+Frames are capped at 2 MiB, pending paste is capped at
 16 MiB and cleared on disconnect, terminal dimensions are capped at 12,288 cells
 before allocation, and stalled handshakes/reads/writes time out. Stop an older
 owner before attaching a version-3 client; protocol versions are intentionally not

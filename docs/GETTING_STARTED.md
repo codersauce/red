@@ -143,13 +143,17 @@ The command palette includes descriptions, effective keymaps, and accepted
 ## Windows and buffers
 
 - `Ctrl-w s` and `Ctrl-w v` split horizontally and vertically.
-- `Ctrl-w h/j/k/l` move focus between windows.
-- `Ctrl-w H/J/K/L` move the current window to the left, bottom, top, or right
-  outer edge.
+- `Ctrl-w h/j/k/l` move focus between editor windows and docked panes.
+- `Ctrl-w H/J/K/L` move the focused editor window or pane to the left, bottom,
+  top, or right outer edge.
+- `Ctrl-w >` and `Ctrl-w <` grow or shrink a vertical pane or editor split.
+- `Ctrl-w +` and `Ctrl-w -` grow or shrink a horizontal pane or editor split.
+- Prefix a resize with a count, such as `5 Ctrl-w >`, to move five cells.
+- Drag a pane or editor-split divider with the mouse to resize it directly.
 - `Ctrl-w w` selects the next window.
 - `Ctrl-w c` closes a window.
-- `Ctrl-w =`, `Ctrl-w _`, and `Ctrl-w o` balance, maximize, or keep only the
-  current window.
+- `Ctrl-w =` balances editor splits or restores a focused pane's original size.
+- `Ctrl-w _` and `Ctrl-w o` maximize or keep only the current window.
 - `Space Space`, `Space n`, and `Space p` move through buffers.
 
 ## Command mode

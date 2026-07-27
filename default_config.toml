@@ -276,12 +276,12 @@ Esc = { EnterMode = "Normal" }
 "p" = "PreviousWindow"
 "s" = "SplitHorizontal"
 "v" = "SplitVertical"
-"-" = "SplitHorizontal"
 "|" = "SplitVertical"
 "c" = "CloseWindow"
 "q" = "CloseWindow"
 "Ctrl-w" = "NextWindow"
 "+" = { ResizeWindowDown = 1 }
+"-" = { ResizeWindowUp = 1 }
 "<" = { ResizeWindowLeft = 1 }
 ">" = { ResizeWindowRight = 1 }
 "=" = "BalanceWindows"

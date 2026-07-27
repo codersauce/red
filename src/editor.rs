@@ -108,7 +108,7 @@ use crate::{
     },
     undo::{AppliedTextEdit, CursorSnapshot, EditOrigin, RevertEdit, TextPosition, TextRange},
     utils::{expand_user_path, get_workspace_path},
-    window::{WindowId, WindowManager, WindowManagerSnapshot},
+    window::{WindowDivider, WindowId, WindowManager, WindowManagerSnapshot},
 };
 
 use self::display_layout::{
@@ -135,6 +135,10 @@ const MAX_DIRECTORY_LISTING_ENTRIES: usize = 160;
 const AGENT_BRIDGE_CAPACITY: usize = 64;
 const MACRO_MAX_REPLAY_DEPTH: usize = 20;
 const MACRO_MAX_REPLAY_EVENTS: usize = 10_000;
+const MIN_EDITOR_WINDOW_WIDTH: usize = 10;
+const MIN_EDITOR_WINDOW_HEIGHT: usize = 7;
+const MIN_DOCKED_PANEL_WIDTH: usize = 12;
+const MIN_DOCKED_PANEL_HEIGHT: usize = 4;
 const SESSION_SNAPSHOT_WARNING: &str =
     "Crash recovery is not being saved; check free space and permissions or reduce open-buffer size";
 
@@ -332,6 +336,19 @@ enum EventRenderMode {
 enum FocusTarget {
     Panel(String),
     Window(WindowId),
+}
+
+#[derive(Debug, Clone)]
+enum DividerDrag {
+    Panel {
+        id: String,
+        side: plugin::PanelSide,
+        origin: Point,
+        initial_size: usize,
+    },
+    Window {
+        divider: WindowDivider,
+    },
 }
 
 fn expanded_path_string(path: &str) -> anyhow::Result<String> {
@@ -2003,6 +2020,9 @@ pub struct Editor {
 
     panel_manager: plugin::PanelManager,
 
+    /// Mouse-captured pane or split divider; passive mouse motion never starts a drag.
+    divider_drag: Option<DividerDrag>,
+
     workspace_manager: plugin::WorkspaceManager,
 
     window_bar_manager: plugin::WindowBarManager,
@@ -3028,6 +3048,7 @@ impl Editor {
             decoration_manager: plugin::DecorationManager::default(),
             gutter_sign_manager: plugin::GutterSignManager::default(),
             panel_manager: plugin::PanelManager::default(),
+            divider_drag: None,
             workspace_manager: plugin::WorkspaceManager::default(),
             window_bar_manager: plugin::WindowBarManager::default(),
             directory_watchers: HashMap::new(),
@@ -3189,10 +3210,16 @@ impl Editor {
     fn focus_ring(&self) -> Vec<FocusTarget> {
         let mut targets = self
             .panel_manager
-            .focusable_ids_for_side(plugin::PanelSide::Left)
+            .focusable_ids_for_side(plugin::PanelSide::Top)
             .into_iter()
             .map(FocusTarget::Panel)
             .collect::<Vec<_>>();
+        targets.extend(
+            self.panel_manager
+                .focusable_ids_for_side(plugin::PanelSide::Left)
+                .into_iter()
+                .map(FocusTarget::Panel),
+        );
         targets.extend(
             self.window_manager
                 .windows()
@@ -3202,6 +3229,12 @@ impl Editor {
         targets.extend(
             self.panel_manager
                 .focusable_ids_for_side(plugin::PanelSide::Right)
+                .into_iter()
+                .map(FocusTarget::Panel),
+        );
+        targets.extend(
+            self.panel_manager
+                .focusable_ids_for_side(plugin::PanelSide::Bottom)
                 .into_iter()
                 .map(FocusTarget::Panel),
         );
@@ -3280,9 +3313,43 @@ impl Editor {
         direction: crate::window::Direction,
         buffer: &mut RenderBuffer,
     ) -> anyhow::Result<()> {
+        if let Some(panel_id) = self.panel_manager.focused_panel_id() {
+            if let Some((side, _)) = self.panel_manager.panel_layout(panel_id) {
+                let points_into_editor = matches!(
+                    (side, direction),
+                    (plugin::PanelSide::Left, crate::window::Direction::Right)
+                        | (plugin::PanelSide::Right, crate::window::Direction::Left)
+                        | (plugin::PanelSide::Top, crate::window::Direction::Down)
+                        | (plugin::PanelSide::Bottom, crate::window::Direction::Up)
+                );
+                if points_into_editor {
+                    if let Some(window_id) = self.window_manager.active_stable_window_id() {
+                        if self.focus_target(&FocusTarget::Window(window_id)) {
+                            self.render(buffer)?;
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
         if let Some(target_id) = self.window_manager.find_window_in_direction(direction) {
             if self.set_active_window(target_id) {
+                self.panel_manager.focus_editor();
                 self.request_diagnostics().await?;
+                self.render(buffer)?;
+                return Ok(());
+            }
+        }
+
+        let side = Self::panel_side_for_direction(direction);
+        if let Some(panel_id) = self
+            .panel_manager
+            .focusable_ids_for_side(side)
+            .into_iter()
+            .next()
+        {
+            if self.focus_target(&FocusTarget::Panel(panel_id)) {
                 self.render(buffer)?;
                 return Ok(());
             }
@@ -3297,6 +3364,163 @@ impl Editor {
         self.last_error = Some(message.to_string());
         self.draw_commandline(buffer);
         Ok(())
+    }
+
+    fn panel_side_for_direction(direction: crate::window::Direction) -> plugin::PanelSide {
+        match direction {
+            crate::window::Direction::Up => plugin::PanelSide::Top,
+            crate::window::Direction::Down => plugin::PanelSide::Bottom,
+            crate::window::Direction::Left => plugin::PanelSide::Left,
+            crate::window::Direction::Right => plugin::PanelSide::Right,
+        }
+    }
+
+    fn move_focused_window_to_edge(
+        &mut self,
+        direction: crate::window::Direction,
+        buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<()> {
+        if let Some(panel_id) = self.panel_manager.focused_panel_id().map(str::to_string) {
+            if let Some((current_side, current_size)) = self.panel_manager.panel_layout(&panel_id) {
+                let side = Self::panel_side_for_direction(direction);
+                let current_is_vertical = matches!(
+                    current_side,
+                    plugin::PanelSide::Left | plugin::PanelSide::Right
+                );
+                let target_is_vertical =
+                    matches!(side, plugin::PanelSide::Left | plugin::PanelSide::Right);
+                let default_size = if target_is_vertical {
+                    usize::from(self.size.0)
+                        .saturating_mul(2)
+                        .saturating_div(5)
+                        .max(MIN_DOCKED_PANEL_WIDTH)
+                } else {
+                    usize::from(self.size.1)
+                        .saturating_sub(2)
+                        .saturating_div(3)
+                        .max(MIN_DOCKED_PANEL_HEIGHT)
+                };
+                let size = if current_is_vertical == target_is_vertical {
+                    current_size
+                } else {
+                    self.panel_manager
+                        .panel_preferred_size(&panel_id, side)
+                        .unwrap_or(default_size)
+                };
+
+                if self.set_panel_size(&panel_id, side, size) {
+                    self.render(buffer)?;
+                }
+                return Ok(());
+            }
+        }
+
+        if self.update_window_layout(|windows| windows.move_window_to_edge(direction)) {
+            self.render(buffer)?;
+        }
+        Ok(())
+    }
+
+    fn set_panel_size(&mut self, id: &str, side: plugin::PanelSide, requested_size: usize) -> bool {
+        let Some((current_side, current_size)) = self.panel_manager.panel_layout(id) else {
+            return false;
+        };
+        let target_is_vertical = matches!(side, plugin::PanelSide::Left | plugin::PanelSide::Right);
+        let current_is_vertical = matches!(
+            current_side,
+            plugin::PanelSide::Left | plugin::PanelSide::Right
+        );
+        let reserved_on_axis = if target_is_vertical {
+            self.panel_manager
+                .reserved_left_width()
+                .saturating_add(self.panel_manager.reserved_right_width())
+        } else {
+            self.panel_manager
+                .reserved_top_height()
+                .saturating_add(self.panel_manager.reserved_bottom_height())
+        };
+        let reserved_other = if current_is_vertical == target_is_vertical {
+            reserved_on_axis.saturating_sub(current_size.saturating_add(1))
+        } else {
+            reserved_on_axis
+        };
+        let (terminal_extent, minimum_editor, minimum_panel) = if target_is_vertical {
+            (
+                usize::from(self.size.0),
+                MIN_EDITOR_WINDOW_WIDTH,
+                MIN_DOCKED_PANEL_WIDTH,
+            )
+        } else {
+            (
+                usize::from(self.size.1),
+                MIN_EDITOR_WINDOW_HEIGHT,
+                MIN_DOCKED_PANEL_HEIGHT,
+            )
+        };
+        let maximum = terminal_extent
+            .saturating_sub(minimum_editor)
+            .saturating_sub(reserved_other)
+            .saturating_sub(1);
+        if maximum == 0 {
+            return false;
+        }
+        let size = requested_size.clamp(minimum_panel.min(maximum), maximum);
+
+        if !self.panel_manager.update_panel_layout(id, side, size) {
+            return false;
+        }
+        self.apply_panel_layout();
+        self.sync_with_window();
+        true
+    }
+
+    fn resize_window_or_panel(
+        &mut self,
+        direction: crate::window::Direction,
+        amount: usize,
+    ) -> bool {
+        let Some(panel_id) = self.panel_manager.focused_panel_id().map(str::to_string) else {
+            return self.update_window_layout(|windows| {
+                windows
+                    .resize_window_by_cells(direction, amount)
+                    .then_some(())
+            });
+        };
+        let Some((side, current_size)) = self.panel_manager.panel_layout(&panel_id) else {
+            return false;
+        };
+        let requested_size = match (side, direction) {
+            (
+                plugin::PanelSide::Left | plugin::PanelSide::Right,
+                crate::window::Direction::Right,
+            )
+            | (
+                plugin::PanelSide::Top | plugin::PanelSide::Bottom,
+                crate::window::Direction::Down,
+            ) => current_size.saturating_add(amount),
+            (
+                plugin::PanelSide::Left | plugin::PanelSide::Right,
+                crate::window::Direction::Left,
+            )
+            | (plugin::PanelSide::Top | plugin::PanelSide::Bottom, crate::window::Direction::Up) => {
+                current_size.saturating_sub(amount)
+            }
+            _ => return false,
+        };
+        self.set_panel_size(&panel_id, side, requested_size)
+    }
+
+    fn balance_focused_window_or_panel(&mut self) -> bool {
+        let Some(panel_id) = self.panel_manager.focused_panel_id().map(str::to_string) else {
+            return self.update_window_layout(WindowManager::balance_windows);
+        };
+        let Some((side, _)) = self.panel_manager.panel_layout(&panel_id) else {
+            return false;
+        };
+        let Some(default_size) = self.panel_manager.panel_default_size(&panel_id, side) else {
+            return false;
+        };
+        self.set_panel_size(&panel_id, side, default_size)
     }
 
     fn update_window_layout(
@@ -3315,14 +3539,18 @@ impl Editor {
     fn resize_window_layout(&mut self, terminal_size: (usize, usize)) {
         self.sync_to_window();
         let (reserved_left, reserved_right) = self.reserved_panel_widths(terminal_size.0);
+        let (reserved_top, reserved_bottom) = self.reserved_panel_heights(terminal_size.1);
         self.window_manager.resize_with_origin(
-            Point::new(reserved_left, 0),
+            Point::new(reserved_left, reserved_top),
             (
                 terminal_size
                     .0
                     .saturating_sub(reserved_left)
                     .saturating_sub(reserved_right),
-                terminal_size.1,
+                terminal_size
+                    .1
+                    .saturating_sub(reserved_top)
+                    .saturating_sub(reserved_bottom),
             ),
         );
         self.sync_with_window();
@@ -3330,6 +3558,7 @@ impl Editor {
 
     fn resize_terminal_surface(&mut self, width: u16, height: u16, buffer: &mut RenderBuffer) {
         self.size = (width, height);
+        self.divider_drag = None;
         let max_y = (height as usize).saturating_sub(2);
         self.cy = self.cy.min(max_y.saturating_sub(1));
         self.resize_window_layout((width as usize, height as usize));
@@ -3350,25 +3579,38 @@ impl Editor {
     fn apply_panel_layout(&mut self) {
         self.sync_to_window();
         let (reserved_left, reserved_right) = self.reserved_panel_widths(self.size.0 as usize);
+        let (reserved_top, reserved_bottom) = self.reserved_panel_heights(self.size.1 as usize);
         self.window_manager.resize_with_origin(
-            Point::new(reserved_left, 0),
+            Point::new(reserved_left, reserved_top),
             (
                 (self.size.0 as usize)
                     .saturating_sub(reserved_left)
                     .saturating_sub(reserved_right),
-                self.size.1 as usize,
+                (self.size.1 as usize)
+                    .saturating_sub(reserved_top)
+                    .saturating_sub(reserved_bottom),
             ),
         );
     }
 
     fn reserved_panel_widths(&self, terminal_width: usize) -> (usize, usize) {
-        let max_reserved = terminal_width.saturating_sub(10);
+        let max_reserved = terminal_width.saturating_sub(MIN_EDITOR_WINDOW_WIDTH);
         let reserved_left = self.panel_manager.reserved_left_width().min(max_reserved);
         let reserved_right = self
             .panel_manager
             .reserved_right_width()
             .min(max_reserved.saturating_sub(reserved_left));
         (reserved_left, reserved_right)
+    }
+
+    fn reserved_panel_heights(&self, terminal_height: usize) -> (usize, usize) {
+        let max_reserved = terminal_height.saturating_sub(MIN_EDITOR_WINDOW_HEIGHT);
+        let reserved_top = self.panel_manager.reserved_top_height().min(max_reserved);
+        let reserved_bottom = self
+            .panel_manager
+            .reserved_bottom_height()
+            .min(max_reserved.saturating_sub(reserved_top));
+        (reserved_top, reserved_bottom)
     }
 
     fn indentation(&self) -> Indentation {
@@ -9251,7 +9493,16 @@ impl Editor {
             return Ok(self.handle_search_event(ev));
         }
 
+        if let Event::Mouse(mouse) = ev {
+            if let Some(action) = self.handle_divider_mouse_event(mouse) {
+                return Ok(Some(action));
+            }
+        }
+
         if self.panel_manager.focused_panel_id().is_some() {
+            if !self.panel_manager.focused_text_input_active() && self.handle_repeater(ev) {
+                return Ok(None);
+            }
             if self.panel_manager.focused_text_panel_has_composer()
                 && !self.panel_manager.focused_text_input_active()
             {
@@ -9516,6 +9767,91 @@ impl Editor {
                     .and_then(Self::panel_event_key_action)
             }
             Event::Mouse(event) => self.handle_panel_mouse_event(event),
+            _ => None,
+        }
+    }
+
+    fn handle_divider_mouse_event(&mut self, event: &MouseEvent) -> Option<KeyAction> {
+        let x = usize::from(event.column);
+        let y = usize::from(event.row);
+
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.divider_drag = None;
+                if let Some(divider) = self.panel_manager.panel_divider_at_position(
+                    x,
+                    y,
+                    usize::from(self.size.0),
+                    usize::from(self.size.1),
+                ) {
+                    let (_, initial_size) = self.panel_manager.panel_layout(&divider.id)?;
+                    self.divider_drag = Some(DividerDrag::Panel {
+                        id: divider.id,
+                        side: divider.side,
+                        origin: Point::new(x, y),
+                        initial_size,
+                    });
+                    return Some(KeyAction::None);
+                }
+
+                if let Some(divider) = self.window_manager.divider_at_position(x, y) {
+                    self.divider_drag = Some(DividerDrag::Window { divider });
+                    return Some(KeyAction::None);
+                }
+
+                None
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let drag = self.divider_drag.clone()?;
+                let resized = match drag {
+                    DividerDrag::Panel {
+                        id,
+                        side,
+                        origin,
+                        initial_size,
+                    } => {
+                        let delta = match side {
+                            plugin::PanelSide::Left | plugin::PanelSide::Right => {
+                                isize::try_from(x)
+                                    .unwrap_or(isize::MAX)
+                                    .saturating_sub(isize::try_from(origin.x).unwrap_or(isize::MAX))
+                            }
+                            plugin::PanelSide::Top | plugin::PanelSide::Bottom => {
+                                isize::try_from(y)
+                                    .unwrap_or(isize::MAX)
+                                    .saturating_sub(isize::try_from(origin.y).unwrap_or(isize::MAX))
+                            }
+                        };
+                        let delta =
+                            if matches!(side, plugin::PanelSide::Right | plugin::PanelSide::Bottom)
+                            {
+                                delta.saturating_neg()
+                            } else {
+                                delta
+                            };
+                        let requested_size = initial_size.saturating_add_signed(delta);
+                        self.set_panel_size(&id, side, requested_size)
+                    }
+                    DividerDrag::Window { divider } => {
+                        self.sync_to_window();
+                        let resized = self.window_manager.resize_divider(&divider, x, y);
+                        if resized {
+                            self.sync_with_window();
+                        }
+                        resized
+                    }
+                };
+
+                Some(if resized {
+                    KeyAction::Single(Action::Refresh)
+                } else {
+                    KeyAction::None
+                })
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.divider_drag.is_some() => {
+                self.divider_drag = None;
+                Some(KeyAction::None)
+            }
             _ => None,
         }
     }
@@ -15463,63 +15799,39 @@ impl Editor {
                     .await?;
             }
             Action::MoveWindowToLeft => {
-                if self.update_window_layout(|windows| {
-                    windows.move_window_to_edge(crate::window::Direction::Left)
-                }) {
-                    self.render(buffer)?;
-                }
+                self.move_focused_window_to_edge(crate::window::Direction::Left, buffer)?;
             }
             Action::MoveWindowToBottom => {
-                if self.update_window_layout(|windows| {
-                    windows.move_window_to_edge(crate::window::Direction::Down)
-                }) {
-                    self.render(buffer)?;
-                }
+                self.move_focused_window_to_edge(crate::window::Direction::Down, buffer)?;
             }
             Action::MoveWindowToTop => {
-                if self.update_window_layout(|windows| {
-                    windows.move_window_to_edge(crate::window::Direction::Up)
-                }) {
-                    self.render(buffer)?;
-                }
+                self.move_focused_window_to_edge(crate::window::Direction::Up, buffer)?;
             }
             Action::MoveWindowToRight => {
-                if self.update_window_layout(|windows| {
-                    windows.move_window_to_edge(crate::window::Direction::Right)
-                }) {
-                    self.render(buffer)?;
-                }
+                self.move_focused_window_to_edge(crate::window::Direction::Right, buffer)?;
             }
             Action::ResizeWindowUp(amount) => {
-                if self.update_window_layout(|windows| {
-                    windows.resize_window(crate::window::Direction::Up, *amount)
-                }) {
+                if self.resize_window_or_panel(crate::window::Direction::Up, *amount) {
                     self.render(buffer)?;
                 }
             }
             Action::ResizeWindowDown(amount) => {
-                if self.update_window_layout(|windows| {
-                    windows.resize_window(crate::window::Direction::Down, *amount)
-                }) {
+                if self.resize_window_or_panel(crate::window::Direction::Down, *amount) {
                     self.render(buffer)?;
                 }
             }
             Action::ResizeWindowLeft(amount) => {
-                if self.update_window_layout(|windows| {
-                    windows.resize_window(crate::window::Direction::Left, *amount)
-                }) {
+                if self.resize_window_or_panel(crate::window::Direction::Left, *amount) {
                     self.render(buffer)?;
                 }
             }
             Action::ResizeWindowRight(amount) => {
-                if self.update_window_layout(|windows| {
-                    windows.resize_window(crate::window::Direction::Right, *amount)
-                }) {
+                if self.resize_window_or_panel(crate::window::Direction::Right, *amount) {
                     self.render(buffer)?;
                 }
             }
             Action::BalanceWindows => {
-                if self.update_window_layout(WindowManager::balance_windows) {
+                if self.balance_focused_window_or_panel() {
                     self.render(buffer)?;
                 }
             }
@@ -20883,6 +21195,11 @@ impl Editor {
     }
 
     #[doc(hidden)]
+    pub fn test_panel_layout(&self, id: &str) -> Option<(plugin::PanelSide, usize)> {
+        self.panel_manager.panel_layout(id)
+    }
+
+    #[doc(hidden)]
     pub fn test_focused_panel_selected_index(&self, id: &str) -> Option<usize> {
         self.panel_manager.selected_index(id)
     }
@@ -21979,6 +22296,109 @@ mod test {
             detached_input_to_crossterm(crate::headless::InputEvent::Mouse { event: mouse }),
             Event::Mouse(mouse)
         );
+    }
+
+    #[tokio::test]
+    async fn detached_mouse_drag_resizes_each_docked_pane_without_stealing_focus() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+
+        for (side, initial_size, start, end, expected_size) in [
+            (plugin::PanelSide::Left, 20, (20, 4), (25, 4), 25),
+            (plugin::PanelSide::Right, 20, (59, 4), (54, 4), 25),
+            (plugin::PanelSide::Top, 6, (12, 6), (12, 9), 9),
+            (plugin::PanelSide::Bottom, 6, (12, 15), (12, 12), 9),
+        ] {
+            let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+            editor.test_create_panel(
+                "inspector",
+                plugin::PanelConfig {
+                    side,
+                    width: initial_size,
+                    title: Some("Inspector".to_string()),
+                    ..plugin::PanelConfig::default()
+                },
+            );
+            assert!(editor.test_focus_panel("inspector"));
+            let mut core = DetachedEditorCore::new(editor).await.unwrap();
+            let original_revision = core.snapshot(None).revision;
+
+            for (kind, (column, row)) in [
+                (MouseEventKind::Down(MouseButton::Left), start),
+                (MouseEventKind::Drag(MouseButton::Left), end),
+                (MouseEventKind::Up(MouseButton::Left), end),
+            ] {
+                core.input(crate::headless::InputEvent::Mouse {
+                    event: MouseEvent {
+                        kind,
+                        column,
+                        row,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                })
+                .await
+                .unwrap();
+            }
+
+            assert_eq!(
+                core.editor.panel_manager.panel_layout("inspector"),
+                Some((side, expected_size)),
+            );
+            assert_eq!(
+                core.editor.panel_manager.focused_panel_id(),
+                Some("inspector")
+            );
+            assert!(core.snapshot(None).revision > original_revision);
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_mouse_drag_resizes_vertical_and_horizontal_editor_splits() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+
+        for (vertical, start, end, expected_position, expected_size) in [
+            (true, (39, 4), (53, 4), (54, 0), (26, 22)),
+            (false, (8, 10), (8, 14), (0, 15), (80, 7)),
+        ] {
+            let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+            let split = if vertical {
+                editor
+                    .update_window_layout(|windows| windows.split_vertical(/*buffer_index*/ 0))
+            } else {
+                editor.update_window_layout(|windows| {
+                    windows.split_horizontal(/*buffer_index*/ 0)
+                })
+            };
+            assert!(split);
+            let original_window = editor.window_manager.active_stable_window_id();
+            let mut core = DetachedEditorCore::new(editor).await.unwrap();
+
+            for (kind, (column, row)) in [
+                (MouseEventKind::Down(MouseButton::Left), start),
+                (MouseEventKind::Drag(MouseButton::Left), end),
+                (MouseEventKind::Up(MouseButton::Left), end),
+            ] {
+                core.input(crate::headless::InputEvent::Mouse {
+                    event: MouseEvent {
+                        kind,
+                        column,
+                        row,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                })
+                .await
+                .unwrap();
+            }
+
+            let active = core.editor.window_manager.active_window().unwrap();
+            assert_eq!((active.position.x, active.position.y), expected_position);
+            assert_eq!(active.size, expected_size);
+            assert_eq!(
+                core.editor.window_manager.active_stable_window_id(),
+                original_window,
+            );
+        }
     }
 
     #[tokio::test]
