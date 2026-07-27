@@ -1,6 +1,6 @@
 # Husk plugin compatibility
 
-Red host API version `0.4.0` is defined by
+Red host API version `0.5.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -22,6 +22,42 @@ literal host call absent from the canonical schema. Literal host calls also chec
 required/optional arity (`HUSK-A0002`) and obvious literal argument types
 (`HUSK-A0003`) against the machine-readable signature. `--no-typecheck` is an unsupported
 development escape hatch; compatibility guarantees do not apply while it is enabled.
+
+## Pull request replay preview
+
+Host API `0.5.0` introduces an editor-owned, in-memory PR Replay preview.
+`ReplayDemoPlan(callback)` returns the original mock PR metadata and complete,
+source-linked unified hunks. `ReplayDemoOpenWorkspace(callback)` opens only the
+Rust-owned, editable, fileless scratch source. The bundled replay plugin uses the
+existing `CreateTextPanel`, `UpdateTextPanel`, `FocusPanel`, and
+`SetPanelVisible` host calls to render a separate read-only Replay coach. The
+coach is a real plugin panel, never a Markdown file or an editable editor
+buffer. `Ctrl-w H`, `Ctrl-w J`, `Ctrl-w K`, and `Ctrl-w L` move a focused text
+panel to the left, bottom, top, or right dock while preserving its content,
+scroll state, and stable identity.
+
+The coach uses the structured `replay` text-panel block format. Its JSON model
+retains the complete original unified patch, PR metadata, step progress,
+learning mode, local observations, and completion state. The editor validates
+the model and its source path before rendering the hunk. Removed and added source
+are independently Tree-sitter highlighted against the old and new file
+projections, then combined with theme-derived Git colors and source line
+numbers. PR context, reconstruction steps, and responsive actions remain pinned;
+only the actual source hunk scrolls.
+
+`ReplayDemoFocusSource(workspace_id)` restores the original scratch-source
+window. Hiding the coach preserves both the panel and replay session.
+
+`ReplayDemoValidateStep(callback, workspace_id, step_id)` checks the actual
+in-memory scratch source against the Rust-owned original hunk.
+`ReplayDemoApplyStep(callback, workspace_id, step_id, revision)` rejects a stale
+workspace, changed source, nested user transaction, or nonmatching pre-image.
+Successful application becomes exactly one attributed, undoable editor
+transaction. These preview calls never create files or branches, fetch GitHub,
+stage changes, save buffers, or submit reviews.
+
+Plugins declaring a host API requirement for these calls should use
+`"red_api_version": "^0.5.0"`.
 
 ## Workspace file operations
 
@@ -96,7 +132,7 @@ payloads use the declared `PickerItem`, `PickerCancelled`, and `PickerActionEven
 the `PickerItem.data` field remains `Json` so a plugin can attach its own payload.
 
 `OpenPicker` was added in host API `0.3.0`. Plugins targeting this Red release should
-declare `"red_api_version": "^0.4.0"`. The numeric-ID `OpenDynamicPicker` API remains
+declare `"red_api_version": "^0.5.0"`. The numeric-ID `OpenDynamicPicker` API remains
 available for compatibility, but new plugins should not use it.
 
 ## Agent composer

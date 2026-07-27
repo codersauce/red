@@ -21,6 +21,7 @@ pub mod overlay;
 pub mod panel;
 pub mod process;
 mod registry;
+mod replay_panel;
 mod runtime;
 mod text_link;
 pub mod timer_stats;

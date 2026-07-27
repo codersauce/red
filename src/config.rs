@@ -2909,6 +2909,49 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
     }
 
     #[test]
+    fn default_config_groups_replay_under_uppercase_leader_and_preserves_rename() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+        assert_eq!(
+            config.plugins.get("replay").map(String::as_str),
+            Some("replay.hk")
+        );
+
+        let Some(KeyAction::Nested(leader)) = config.keys.normal.get(" ") else {
+            panic!("expected a Space leader mapping");
+        };
+        assert_eq!(
+            leader.get("r"),
+            Some(&KeyAction::Single(Action::StartRename))
+        );
+
+        let Some(KeyAction::Nested(replay)) = leader.get("R") else {
+            panic!("expected a Space R replay leader mapping");
+        };
+        for (key, command) in [
+            ("?", "ReplayHelp"),
+            ("g", "Replay"),
+            ("n", "ReplayNext"),
+            ("p", "ReplayPrevious"),
+            ("h", "ReplayHint"),
+            ("m", "ReplayToggleMode"),
+            ("i", "ReplayEdit"),
+            ("v", "ReplayValidate"),
+            ("a", "ReplayApply"),
+            ("o", "ReplayNote"),
+            ("f", "ReplayFindings"),
+            ("q", "ReplayClose"),
+        ] {
+            assert_eq!(
+                replay.get(key),
+                Some(&KeyAction::Single(Action::PluginCommand(
+                    command.to_string()
+                ))),
+                "missing replay leader action {key}"
+            );
+        }
+    }
+
+    #[test]
     fn user_config_can_disable_or_delay_key_hints() {
         let config = Config::from_user_toml_with_overrides(
             "[key_hints]\nenabled = false\ndelay_ms = 750\n",

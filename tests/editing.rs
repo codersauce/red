@@ -5889,6 +5889,99 @@ async fn shifted_window_chords_move_nested_splits_to_each_outer_edge() {
 }
 
 #[tokio::test]
+async fn shifted_window_chords_move_a_dedicated_replay_panel_without_creating_a_buffer() {
+    for (key, expected_side, expected_position, expected_size) in [
+        ('H', PanelSide::Left, (47, 0), (33, 22)),
+        ('J', PanelSide::Bottom, (0, 0), (80, 14)),
+        ('K', PanelSide::Top, (0, 8), (80, 14)),
+        ('L', PanelSide::Right, (0, 0), (33, 22)),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, "editable source\n".to_string()),
+            default_key_config(),
+        );
+        harness.editor.test_create_text_panel(
+            "replay-coach",
+            PanelConfig {
+                side: PanelSide::Left,
+                width: 46,
+                title: Some("PR REPLAY".to_string()),
+                ..PanelConfig::default()
+            },
+        );
+        assert!(harness.editor.test_focus_panel("replay-coach"));
+        let original_layout = harness.editor.test_session_snapshot().window_layout;
+
+        harness
+            .execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('w'),
+                KeyModifiers::CONTROL,
+            )))
+            .await
+            .unwrap();
+        assert!(harness.is_waiting_for_key_sequence());
+        harness
+            .execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(key),
+                KeyModifiers::SHIFT,
+            )))
+            .await
+            .unwrap();
+
+        assert!(!harness.is_waiting_for_key_sequence());
+        assert_eq!(harness.editor.test_focused_panel_id(), Some("replay-coach"),);
+        assert_eq!(
+            harness
+                .editor
+                .test_panel_layout("replay-coach")
+                .map(|(side, _)| side),
+            Some(expected_side),
+        );
+        let (position, size) = harness.editor.test_active_window_bounds().unwrap();
+        assert_eq!((position.x, position.y), expected_position);
+        assert_eq!(size, expected_size);
+        assert_eq!(harness.window_count(), 1);
+        assert_eq!(harness.buffer_contents(), "editable source\n");
+        let updated_layout = harness.editor.test_session_snapshot().window_layout;
+        assert_eq!(
+            updated_layout.active_window_id,
+            original_layout.active_window_id
+        );
+        assert!(matches!(updated_layout.root, SplitSnapshot::Window { .. }));
+    }
+}
+
+#[test]
+fn focused_read_only_replay_panel_keeps_global_leader_available() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "editable source\n".to_string()),
+        default_key_config(),
+    );
+    harness.editor.test_create_text_panel(
+        "replay-coach",
+        PanelConfig {
+            side: PanelSide::Left,
+            width: 46,
+            title: Some("PR REPLAY".to_string()),
+            ..PanelConfig::default()
+        },
+    );
+    assert!(harness.editor.test_focus_panel("replay-coach"));
+
+    let action = harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+
+    assert!(matches!(action, Some(KeyAction::Nested(_))));
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("replay-coach"));
+    assert_eq!(harness.buffer_contents(), "editable source\n");
+}
+
+#[tokio::test]
 async fn lowercase_window_chords_preserve_split_topology_and_move_focus() {
     for (key, preparation) in [
         ('h', Some(Action::MoveWindowRight)),

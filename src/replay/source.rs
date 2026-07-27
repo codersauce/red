@@ -1,0 +1,974 @@
+//! Bounded, editor-owned GitHub metadata and immutable Git source resolution.
+
+use std::{
+    ffi::OsStr,
+    path::{Component, Path, PathBuf},
+    process::{Command, Stdio},
+};
+
+use serde::{Deserialize, Serialize};
+use url::Url;
+
+use super::{digest, now_ms, ReplayError, ReplayLimits, ReplayWorkspace, ReplayWorkspacePreview};
+
+const GITHUB_METADATA_FIELDS: &str = "number,url,title,body,author,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,commits,changedFiles";
+const MAX_COMMAND_DIAGNOSTIC_BYTES: usize = 4 * 1024;
+
+/// Validated, immutable SHA-1 or SHA-256 Git object identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct GitObjectId(String);
+
+impl GitObjectId {
+    /// Parses an unambiguous complete Git object ID.
+    pub fn parse(value: &str) -> Result<Self, ReplayError> {
+        if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ReplayError::InvalidObject(value.to_string()));
+        }
+        Ok(Self(value.to_ascii_lowercase()))
+    }
+
+    /// Borrows the complete pinned object identity.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Returns the short object prefix used only in a display-safe branch name.
+    #[must_use]
+    pub fn short(&self) -> &str {
+        &self.0[..7]
+    }
+}
+
+impl std::fmt::Display for GitObjectId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Validated Git repository used to confine every replay Git operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayRepository {
+    /// Canonical current worktree root.
+    pub root: PathBuf,
+    /// Canonical shared Git directory identity.
+    pub common_directory: PathBuf,
+    /// Configured origin host.
+    pub host: String,
+    /// Validated origin repository owner.
+    pub owner: String,
+    /// Validated origin repository name.
+    pub name: String,
+}
+
+impl ReplayRepository {
+    /// Resolves the current repository without checking out or fetching a ref.
+    pub fn discover(cwd: &Path) -> Result<Self, ReplayError> {
+        let root = git_text(cwd, &["rev-parse", "--show-toplevel"], 16 * 1024)
+            .map_err(|error| ReplayError::RepositoryMissing(error.to_string()))?;
+        let root = std::fs::canonicalize(root.trim())
+            .map_err(|error| ReplayError::RepositoryMissing(error.to_string()))?;
+        let common = git_text(&root, &["rev-parse", "--git-common-dir"], 16 * 1024)?;
+        let common_path = PathBuf::from(common.trim());
+        let common_directory = if common_path.is_absolute() {
+            common_path
+        } else {
+            root.join(common_path)
+        };
+        let common_directory = std::fs::canonicalize(&common_directory)
+            .map_err(|error| ReplayError::RepositoryMissing(error.to_string()))?;
+        let origin = git_text(&root, &["remote", "get-url", "origin"], 16 * 1024)
+            .map_err(|error| ReplayError::RepositoryMissing(error.to_string()))?;
+        let (host, owner, name) = parse_remote(origin.trim())?;
+        Ok(Self {
+            root,
+            common_directory,
+            host,
+            owner,
+            name,
+        })
+    }
+
+    /// Returns the validated host-qualified GitHub repository selector.
+    #[must_use]
+    pub fn host_repository(&self) -> String {
+        format!("{}/{}/{}", self.host, self.owner, self.name)
+    }
+
+    /// Returns a stable digest of the canonical shared repository identity.
+    #[must_use]
+    pub fn identity(&self) -> String {
+        digest(self.common_directory.to_string_lossy().as_bytes())
+    }
+}
+
+/// Supported first-release GitHub PR input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PullRequestInput {
+    /// PR number scoped to the verified current origin repository.
+    Number(u64),
+    /// Validated canonical PR URL.
+    Url {
+        /// Validated URL host.
+        host: String,
+        /// Validated base-repository owner.
+        owner: String,
+        /// Validated base-repository name.
+        repository: String,
+        /// Positive pull request number.
+        number: u64,
+        /// Canonical HTTPS pull request URL.
+        url: String,
+    },
+}
+
+impl PullRequestInput {
+    /// Parses a positive current-repository PR number or canonical HTTPS PR URL.
+    pub fn parse(input: &str) -> Result<Self, ReplayError> {
+        let input = input.trim();
+        if !input.is_empty() && input.bytes().all(|byte| byte.is_ascii_digit()) {
+            let number = input
+                .parse::<u64>()
+                .map_err(|_| ReplayError::InvalidPullRequest(input.to_string()))?;
+            if number == 0 {
+                return Err(ReplayError::InvalidPullRequest(input.to_string()));
+            }
+            return Ok(Self::Number(number));
+        }
+
+        let url =
+            Url::parse(input).map_err(|_| ReplayError::InvalidPullRequest(input.to_string()))?;
+        if url.scheme() != "https"
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(ReplayError::InvalidPullRequest(input.to_string()));
+        }
+        let host = url
+            .host_str()
+            .ok_or_else(|| ReplayError::InvalidPullRequest(input.to_string()))?;
+        let segments = url
+            .path_segments()
+            .map(Iterator::collect::<Vec<_>>)
+            .ok_or_else(|| ReplayError::InvalidPullRequest(input.to_string()))?;
+        let [owner, repository, pull, raw_number] = segments.as_slice() else {
+            return Err(ReplayError::InvalidPullRequest(input.to_string()));
+        };
+        if *pull != "pull"
+            || !safe_repository_component(owner)
+            || !safe_repository_component(repository)
+        {
+            return Err(ReplayError::InvalidPullRequest(input.to_string()));
+        }
+        let number = raw_number
+            .parse::<u64>()
+            .ok()
+            .filter(|number| *number > 0)
+            .ok_or_else(|| ReplayError::InvalidPullRequest(input.to_string()))?;
+        Ok(Self::Url {
+            host: host.to_ascii_lowercase(),
+            owner: (*owner).to_string(),
+            repository: (*repository).to_string(),
+            number,
+            url: format!("https://{host}/{owner}/{repository}/pull/{number}"),
+        })
+    }
+
+    fn validate_repository(&self, repository: &ReplayRepository) -> Result<(), ReplayError> {
+        match self {
+            Self::Number(_) => Ok(()),
+            Self::Url {
+                host,
+                owner,
+                repository: name,
+                ..
+            } if host.eq_ignore_ascii_case(&repository.host)
+                && owner.eq_ignore_ascii_case(&repository.owner)
+                && name.eq_ignore_ascii_case(&repository.name) =>
+            {
+                Ok(())
+            }
+            Self::Url { .. } => Err(ReplayError::RepositoryMismatch),
+        }
+    }
+
+    fn argument(&self) -> String {
+        match self {
+            Self::Number(number) => number.to_string(),
+            Self::Url { url, .. } => url.clone(),
+        }
+    }
+
+    fn expected_number(&self) -> u64 {
+        match self {
+            Self::Number(number) | Self::Url { number, .. } => *number,
+        }
+    }
+}
+
+/// Bounded original-author commit information shown in the replay guide.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayCommitSummary {
+    /// Pinned source commit when the provider supplies one.
+    pub oid: Option<GitObjectId>,
+    /// Untrusted, bounded author-written commit subject.
+    pub headline: String,
+    /// Untrusted, bounded original commit explanation.
+    pub body: String,
+}
+
+/// Immutable identity of the author's original pull request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayPullRequest {
+    /// Configured, validated GitHub host.
+    pub host: String,
+    /// Base repository owner.
+    pub repository_owner: String,
+    /// Base repository name.
+    pub repository_name: String,
+    /// Positive original pull request number.
+    pub number: u64,
+    /// Validated canonical original pull request URL.
+    pub url: String,
+    /// Original author's GitHub login, when visible.
+    pub author: Option<String>,
+    /// Validated original base reference name.
+    pub base_ref: String,
+    /// Pinned tip of the original base reference.
+    pub base_ref_tip: GitObjectId,
+    /// Original head repository owner, including fork identity.
+    pub head_repository_owner: String,
+    /// Original head repository name.
+    pub head_repository_name: String,
+    /// Validated original head reference.
+    pub head_ref: String,
+    /// Exact pinned original author head.
+    pub head_commit: GitObjectId,
+    /// Whether the original head lives in another GitHub repository.
+    pub cross_repository: bool,
+    /// Unix-millisecond metadata capture time.
+    pub captured_at_ms: u64,
+}
+
+/// Original author context retained for understanding, never as instructions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayReviewContext {
+    /// Bounded original pull request title.
+    pub title: String,
+    /// Bounded, untrusted original pull request description.
+    pub body: String,
+    /// Original author identity when visible.
+    pub author: Option<String>,
+    /// Bounded original-author commit messages.
+    pub commits: Vec<ReplayCommitSummary>,
+    /// Provider-reported changed-file count.
+    pub changed_files: usize,
+}
+
+/// Resolved metadata before the user authorizes any missing-object fetch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayResolvedPullRequest {
+    /// Stable editor-owned source handle.
+    pub source_id: String,
+    /// Validated originating repository.
+    pub repository: ReplayRepository,
+    /// Pinned original author and pull request identity.
+    pub pull_request: ReplayPullRequest,
+    /// Bounded read-only review context.
+    pub context: ReplayReviewContext,
+    /// Exact endpoint objects not yet present in the local object store.
+    pub missing_objects: Vec<GitObjectId>,
+}
+
+/// First-release local or GitHub replay source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplaySourceKind {
+    /// Original GitHub pull request resolved through the trusted editor.
+    GitHubPullRequest,
+    /// Immutable locally selected commit or reference.
+    LocalRevision,
+    /// Explicitly pinned local commit endpoints.
+    LocalRange,
+}
+
+/// Complete, immutable source from which learning exercises are compiled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplaySource {
+    /// Stable editor-owned source handle.
+    pub id: String,
+    /// Verified originating repository and shared Git identity.
+    pub repository: ReplayRepository,
+    /// Whether the source came from GitHub or pinned local objects.
+    pub kind: ReplaySourceKind,
+    /// Exact replay base; GitHub sources use the computed merge base.
+    pub base_commit: GitObjectId,
+    /// Exact original target tree.
+    pub target_commit: GitObjectId,
+    /// Complete bounded source diff.
+    pub patch: String,
+    /// SHA-256 digest of the complete canonical diff.
+    pub patch_digest: String,
+    /// Original pull request identity when the source is GitHub.
+    pub pull_request: Option<ReplayPullRequest>,
+    /// Original author and commit context.
+    pub review_context: Option<ReplayReviewContext>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitHubMetadata {
+    number: u64,
+    url: String,
+    title: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    author: Option<GitHubActor>,
+    base_ref_name: String,
+    base_ref_oid: String,
+    head_ref_name: String,
+    head_ref_oid: String,
+    #[serde(default)]
+    head_repository: Option<GitHubRepository>,
+    #[serde(default)]
+    head_repository_owner: Option<GitHubActor>,
+    #[serde(default)]
+    is_cross_repository: bool,
+    #[serde(default)]
+    commits: Vec<GitHubCommit>,
+    #[serde(default)]
+    changed_files: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubActor {
+    #[serde(default)]
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubRepository {
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitHubCommit {
+    #[serde(default)]
+    oid: String,
+    #[serde(default)]
+    message_headline: String,
+    #[serde(default)]
+    message_body: String,
+}
+
+/// Resolves read-only GitHub metadata without fetching or changing a branch.
+pub fn resolve_pull_request(
+    cwd: &Path,
+    input: &str,
+    limits: ReplayLimits,
+) -> Result<ReplayResolvedPullRequest, ReplayError> {
+    let repository = ReplayRepository::discover(cwd)?;
+    let input = PullRequestInput::parse(input)?;
+    input.validate_repository(&repository)?;
+
+    let mut command = Command::new("gh");
+    command
+        .current_dir(&repository.root)
+        .args(["pr", "view"])
+        .arg(input.argument())
+        .args(["--repo", &repository.host_repository()])
+        .args(["--json", GITHUB_METADATA_FIELDS])
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1");
+    let metadata = run_command(&mut command, limits.max_metadata_bytes)?;
+    let metadata: GitHubMetadata = serde_json::from_slice(&metadata)
+        .map_err(|error| ReplayError::InvalidMetadata(error.to_string()))?;
+    parse_pull_request_metadata(repository, input, metadata, limits)
+}
+
+fn parse_pull_request_metadata(
+    repository: ReplayRepository,
+    input: PullRequestInput,
+    metadata: GitHubMetadata,
+    limits: ReplayLimits,
+) -> Result<ReplayResolvedPullRequest, ReplayError> {
+    if metadata.number != input.expected_number() {
+        return Err(ReplayError::RepositoryMismatch);
+    }
+    let canonical = PullRequestInput::parse(&metadata.url)?;
+    canonical.validate_repository(&repository)?;
+    if canonical.expected_number() != metadata.number {
+        return Err(ReplayError::RepositoryMismatch);
+    }
+    if metadata.body.len() > limits.max_description_bytes {
+        return Err(ReplayError::LimitExceeded {
+            kind: "pull request description",
+            limit: limits.max_description_bytes,
+        });
+    }
+    if metadata.commits.len() > limits.max_commit_summaries {
+        return Err(ReplayError::LimitExceeded {
+            kind: "pull request commit summaries",
+            limit: limits.max_commit_summaries,
+        });
+    }
+    if metadata.changed_files > limits.max_changed_files {
+        return Err(ReplayError::LimitExceeded {
+            kind: "changed files",
+            limit: limits.max_changed_files,
+        });
+    }
+    validate_git_reference(&metadata.base_ref_name)?;
+    validate_git_reference(&metadata.head_ref_name)?;
+    let base_ref_tip = GitObjectId::parse(&metadata.base_ref_oid)?;
+    let head_commit = GitObjectId::parse(&metadata.head_ref_oid)?;
+    let author = metadata.author.map(|author| author.login);
+    let head_repository_owner = metadata
+        .head_repository_owner
+        .map(|owner| owner.login)
+        .filter(|owner| !owner.is_empty())
+        .unwrap_or_else(|| repository.owner.clone());
+    let head_repository_name = metadata
+        .head_repository
+        .map(|head| head.name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| repository.name.clone());
+    if !safe_repository_component(&head_repository_owner)
+        || !safe_repository_component(&head_repository_name)
+    {
+        return Err(ReplayError::InvalidMetadata(
+            "unsafe pull request head repository".to_string(),
+        ));
+    }
+    let commits = metadata
+        .commits
+        .into_iter()
+        .map(|commit| {
+            let oid = if commit.oid.is_empty() {
+                None
+            } else {
+                Some(GitObjectId::parse(&commit.oid)?)
+            };
+            Ok(ReplayCommitSummary {
+                oid,
+                headline: commit.message_headline,
+                body: commit.message_body,
+            })
+        })
+        .collect::<Result<Vec<_>, ReplayError>>()?;
+    let pull_request = ReplayPullRequest {
+        host: repository.host.clone(),
+        repository_owner: repository.owner.clone(),
+        repository_name: repository.name.clone(),
+        number: metadata.number,
+        url: metadata.url,
+        author: author.clone(),
+        base_ref: metadata.base_ref_name,
+        base_ref_tip,
+        head_repository_owner,
+        head_repository_name,
+        head_ref: metadata.head_ref_name,
+        head_commit,
+        cross_repository: metadata.is_cross_repository,
+        captured_at_ms: now_ms(),
+    };
+    let mut missing_objects = Vec::with_capacity(2);
+    for object in [&pull_request.base_ref_tip, &pull_request.head_commit] {
+        if !has_git_commit(&repository.root, object)? {
+            missing_objects.push(object.clone());
+        }
+    }
+    Ok(ReplayResolvedPullRequest {
+        source_id: uuid::Uuid::new_v4().to_string(),
+        repository,
+        pull_request,
+        context: ReplayReviewContext {
+            title: metadata.title,
+            body: metadata.body,
+            author,
+            commits,
+            changed_files: metadata.changed_files,
+        },
+        missing_objects,
+    })
+}
+
+/// Fetches only exact verified PR refs after the editor has obtained confirmation.
+pub fn fetch_pull_request_objects(
+    resolved: &mut ReplayResolvedPullRequest,
+    confirmed: bool,
+) -> Result<(), ReplayError> {
+    if resolved.missing_objects.is_empty() {
+        return Ok(());
+    }
+    if !confirmed {
+        return Err(ReplayError::WorkspaceConfirmationRequired);
+    }
+    let request = &resolved.pull_request;
+    validate_git_reference(&request.base_ref)?;
+    let namespace = format!(
+        "refs/replay/pr-{}-{}",
+        request.number,
+        request.head_commit.short()
+    );
+    let base = format!("refs/heads/{}:{namespace}/base", request.base_ref);
+    let head = format!("refs/pull/{}/head:{namespace}/head", request.number);
+    let mut command = Command::new("git");
+    command
+        .current_dir(&resolved.repository.root)
+        .args(["-c", "core.hooksPath=/dev/null", "fetch"])
+        .args([
+            "--no-tags",
+            "--no-recurse-submodules",
+            "--no-write-fetch-head",
+        ])
+        .arg("origin")
+        .arg(base)
+        .arg(head);
+    run_command(&mut command, MAX_COMMAND_DIAGNOSTIC_BYTES)?;
+    for object in [&request.base_ref_tip, &request.head_commit] {
+        if !has_git_commit(&resolved.repository.root, object)? {
+            return Err(ReplayError::SourceRefMoved);
+        }
+    }
+    let fetched_base = git_object(&resolved.repository.root, &format!("{namespace}/base"))?;
+    let fetched_head = git_object(&resolved.repository.root, &format!("{namespace}/head"))?;
+    if fetched_base != request.base_ref_tip || fetched_head != request.head_commit {
+        return Err(ReplayError::SourceRefMoved);
+    }
+    resolved.missing_objects.clear();
+    Ok(())
+}
+
+/// Captures the complete original PR diff from immutable, locally verified objects.
+pub fn finalize_pull_request(
+    resolved: &ReplayResolvedPullRequest,
+    limits: ReplayLimits,
+) -> Result<ReplaySource, ReplayError> {
+    if !resolved.missing_objects.is_empty() {
+        return Err(ReplayError::MissingObjects);
+    }
+    let request = &resolved.pull_request;
+    let merge_base = git_text(
+        &resolved.repository.root,
+        &[
+            "merge-base",
+            request.base_ref_tip.as_str(),
+            request.head_commit.as_str(),
+        ],
+        1024,
+    )?;
+    let base_commit = GitObjectId::parse(merge_base.trim())?;
+    build_source(
+        ReplaySourceSeed {
+            id: resolved.source_id.clone(),
+            repository: resolved.repository.clone(),
+            kind: ReplaySourceKind::GitHubPullRequest,
+            base_commit,
+            target_commit: request.head_commit.clone(),
+            pull_request: Some(request.clone()),
+            review_context: Some(resolved.context.clone()),
+        },
+        limits,
+    )
+}
+
+/// Resolves a locally present commit or explicit commit range without network access.
+pub fn resolve_local_source(
+    cwd: &Path,
+    input: &str,
+    limits: ReplayLimits,
+) -> Result<ReplaySource, ReplayError> {
+    let repository = ReplayRepository::discover(cwd)?;
+    let input = input.trim();
+    if input.is_empty() || input.starts_with('-') {
+        return Err(ReplayError::InvalidObject(input.to_string()));
+    }
+    let (kind, base, target) = if let Some((base, target)) = input.split_once("..") {
+        if base.is_empty() || target.is_empty() || target.contains("..") {
+            return Err(ReplayError::InvalidObject(input.to_string()));
+        }
+        (
+            ReplaySourceKind::LocalRange,
+            git_object(&repository.root, base)?,
+            git_object(&repository.root, target)?,
+        )
+    } else {
+        let target = git_object(&repository.root, input)?;
+        let parent = git_text(
+            &repository.root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                &format!("{target}^"),
+            ],
+            1024,
+        )?;
+        (
+            ReplaySourceKind::LocalRevision,
+            GitObjectId::parse(parent.trim())?,
+            target,
+        )
+    };
+    build_source(
+        ReplaySourceSeed {
+            id: uuid::Uuid::new_v4().to_string(),
+            repository,
+            kind,
+            base_commit: base,
+            target_commit: target,
+            pull_request: None,
+            review_context: None,
+        },
+        limits,
+    )
+}
+
+struct ReplaySourceSeed {
+    id: String,
+    repository: ReplayRepository,
+    kind: ReplaySourceKind,
+    base_commit: GitObjectId,
+    target_commit: GitObjectId,
+    pull_request: Option<ReplayPullRequest>,
+    review_context: Option<ReplayReviewContext>,
+}
+
+fn build_source(seed: ReplaySourceSeed, limits: ReplayLimits) -> Result<ReplaySource, ReplayError> {
+    let ReplaySourceSeed {
+        id,
+        repository,
+        kind,
+        base_commit,
+        target_commit,
+        pull_request,
+        review_context,
+    } = seed;
+    let mut command = Command::new("git");
+    command
+        .current_dir(&repository.root)
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--find-renames",
+            "--full-index",
+            "--no-color",
+        ])
+        .arg(base_commit.as_str())
+        .arg(target_commit.as_str())
+        .arg("--");
+    let output = run_command(&mut command, limits.max_patch_bytes)?;
+    let line_count = output.iter().filter(|byte| **byte == b'\n').count();
+    if line_count > limits.max_patch_lines {
+        return Err(ReplayError::LimitExceeded {
+            kind: "canonical patch lines",
+            limit: limits.max_patch_lines,
+        });
+    }
+    let patch_digest = digest(&output);
+    let patch = String::from_utf8(output)
+        .map_err(|_| ReplayError::InvalidPatch("canonical patch is not UTF-8".to_string()))?;
+    Ok(ReplaySource {
+        id,
+        repository,
+        kind,
+        base_commit,
+        target_commit,
+        patch,
+        patch_digest,
+        pull_request,
+        review_context,
+    })
+}
+
+/// Produces the preview or creates the explicitly confirmed scratch worktree.
+pub fn prepare_workspace(
+    source: &ReplaySource,
+    confirmed: bool,
+) -> Result<(ReplayWorkspacePreview, Option<ReplayWorkspace>), ReplayError> {
+    let repository_name = &source.repository.name;
+    let (branch, slug) = if let Some(request) = &source.pull_request {
+        let slug = format!("pr-{}-{}", request.number, request.head_commit.short());
+        (format!("replay/{slug}"), slug)
+    } else {
+        let slug = format!("revision-{}", source.target_commit.short());
+        (format!("replay/{slug}"), slug)
+    };
+    let parent =
+        source.repository.root.parent().ok_or_else(|| {
+            ReplayError::UnsafePath("repository has no durable parent".to_string())
+        })?;
+    let root = parent.join(format!("{repository_name}.replay-{slug}"));
+    let preview = ReplayWorkspacePreview {
+        repository_root: source.repository.root.clone(),
+        root: root.clone(),
+        branch: branch.clone(),
+        base_commit: source.base_commit.clone(),
+    };
+    if !confirmed {
+        return Ok((preview, None));
+    }
+    if root.exists() || std::fs::symlink_metadata(&root).is_ok() {
+        return Err(ReplayError::WorkspaceExists(root.display().to_string()));
+    }
+    let branch_exists = Command::new("git")
+        .current_dir(&source.repository.root)
+        .args(["show-ref", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .stdin(Stdio::null())
+        .status()
+        .map_err(|error| ReplayError::Filesystem(error.to_string()))?
+        .success();
+    if branch_exists {
+        return Err(ReplayError::WorkspaceExists(branch));
+    }
+    let mut command = Command::new("git");
+    command
+        .current_dir(&source.repository.root)
+        .args(["-c", "core.hooksPath=/dev/null", "worktree", "add", "-b"])
+        .arg(&branch)
+        .arg(&root)
+        .arg(source.base_commit.as_str());
+    run_command(&mut command, MAX_COMMAND_DIAGNOSTIC_BYTES)?;
+    Ok((
+        preview,
+        Some(ReplayWorkspace {
+            root,
+            branch,
+            base_commit: source.base_commit.clone(),
+            created_by_replay: true,
+        }),
+    ))
+}
+
+pub(super) fn validate_relative_path(path: &Path) -> Result<(), ReplayError> {
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        || path.components().any(
+            |component| matches!(component, Component::Normal(name) if name == OsStr::new(".git")),
+        )
+    {
+        return Err(ReplayError::UnsafePath(path.display().to_string()));
+    }
+    Ok(())
+}
+
+fn parse_remote(remote: &str) -> Result<(String, String, String), ReplayError> {
+    let (host, path) = if let Ok(url) = Url::parse(remote) {
+        let host = url
+            .host_str()
+            .ok_or_else(|| ReplayError::RepositoryMissing("origin has no host".to_string()))?;
+        (
+            host.to_ascii_lowercase(),
+            url.path().trim_start_matches('/').to_string(),
+        )
+    } else if let Some((authority, path)) = remote.split_once(':') {
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        (host.to_ascii_lowercase(), path.to_string())
+    } else {
+        return Err(ReplayError::RepositoryMissing(
+            "origin is not a supported GitHub remote".to_string(),
+        ));
+    };
+    let path = path.strip_suffix(".git").unwrap_or(&path);
+    let mut segments = path.split('/');
+    let owner = segments.next().unwrap_or_default();
+    let name = segments.next().unwrap_or_default();
+    if segments.next().is_some()
+        || !safe_repository_component(owner)
+        || !safe_repository_component(name)
+    {
+        return Err(ReplayError::RepositoryMissing(
+            "origin does not identify one GitHub repository".to_string(),
+        ));
+    }
+    Ok((host, owner.to_string(), name.to_string()))
+}
+
+fn safe_repository_component(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn validate_git_reference(reference: &str) -> Result<(), ReplayError> {
+    if reference.is_empty()
+        || reference.starts_with('-')
+        || reference.starts_with('/')
+        || reference.ends_with('/')
+        || reference.ends_with(".lock")
+        || reference.contains("..")
+        || reference.contains("@{")
+        || reference.contains("//")
+        || !reference
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.'))
+    {
+        return Err(ReplayError::InvalidMetadata(
+            "unsafe Git reference".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn git_object(root: &Path, reference: &str) -> Result<GitObjectId, ReplayError> {
+    if reference.is_empty() || reference.starts_with('-') {
+        return Err(ReplayError::InvalidObject(reference.to_string()));
+    }
+    let object = git_text(
+        root,
+        &["rev-parse", "--verify", "--end-of-options", reference],
+        1024,
+    )?;
+    GitObjectId::parse(object.trim())
+}
+
+fn has_git_commit(root: &Path, object: &GitObjectId) -> Result<bool, ReplayError> {
+    Command::new("git")
+        .current_dir(root)
+        .args(["cat-file", "-e"])
+        .arg(format!("{}^{{commit}}", object.as_str()))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .map_err(|error| ReplayError::CommandFailed {
+            program: "git".to_string(),
+            message: error.to_string(),
+        })
+}
+
+fn git_text(root: &Path, args: &[&str], limit: usize) -> Result<String, ReplayError> {
+    let mut command = Command::new("git");
+    command.current_dir(root).args(args);
+    let output = run_command(&mut command, limit)?;
+    String::from_utf8(output).map_err(|_| ReplayError::CommandFailed {
+        program: "git".to_string(),
+        message: "command output was not UTF-8".to_string(),
+    })
+}
+
+fn run_command(command: &mut Command, limit: usize) -> Result<Vec<u8>, ReplayError> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    let output = command
+        .stdin(Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|error| ReplayError::CommandFailed {
+            program: program.clone(),
+            message: error.to_string(),
+        })?;
+    if output.stdout.len() > limit {
+        return Err(ReplayError::LimitExceeded {
+            kind: "source command output",
+            limit,
+        });
+    }
+    if !output.status.success() {
+        let diagnostic_length = output.stderr.len().min(MAX_COMMAND_DIAGNOSTIC_BYTES);
+        let diagnostic = String::from_utf8_lossy(&output.stderr[..diagnostic_length]);
+        return Err(ReplayError::CommandFailed {
+            program,
+            message: diagnostic.trim().to_string(),
+        });
+    }
+    Ok(output.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pull_request_input_accepts_positive_numbers() {
+        assert_eq!(
+            PullRequestInput::parse("482").unwrap(),
+            PullRequestInput::Number(482)
+        );
+        assert!(PullRequestInput::parse("0").is_err());
+    }
+
+    #[test]
+    fn pull_request_input_accepts_canonical_github_urls() {
+        let parsed = PullRequestInput::parse("https://github.com/codersauce/red/pull/482").unwrap();
+        assert!(matches!(parsed, PullRequestInput::Url { number: 482, .. }));
+    }
+
+    #[test]
+    fn pull_request_input_rejects_credentials_query_and_fragments() {
+        for input in [
+            "https://token@github.com/owner/repo/pull/1",
+            "https://github.com/owner/repo/pull/1?token=secret",
+            "https://github.com/owner/repo/pull/1#review",
+            "http://github.com/owner/repo/pull/1",
+            "https://github.com/owner/repo/issues/1",
+        ] {
+            assert!(PullRequestInput::parse(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn parses_https_and_ssh_github_origins() {
+        assert_eq!(
+            parse_remote("https://github.com/codersauce/red.git").unwrap(),
+            (
+                "github.com".to_string(),
+                "codersauce".to_string(),
+                "red".to_string()
+            )
+        );
+        assert_eq!(
+            parse_remote("git@github.com:codersauce/red.git").unwrap(),
+            (
+                "github.com".to_string(),
+                "codersauce".to_string(),
+                "red".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_repository_and_git_reference_components() {
+        for reference in ["", "../main", "-main", "main.lock", "a//b", "a@{b"] {
+            assert!(validate_git_reference(reference).is_err(), "{reference}");
+        }
+        assert!(validate_git_reference("feature/pr-replay").is_ok());
+    }
+
+    #[test]
+    fn rejects_absolute_parent_and_git_administrative_paths() {
+        for path in [
+            Path::new("/tmp/escape"),
+            Path::new("../escape"),
+            Path::new(".git/config"),
+            Path::new("src/../escape"),
+        ] {
+            assert!(validate_relative_path(path).is_err(), "{}", path.display());
+        }
+        assert!(validate_relative_path(Path::new("src/replay/mod.rs")).is_ok());
+    }
+
+    #[test]
+    fn git_object_ids_require_complete_immutable_hex() {
+        assert!(GitObjectId::parse("1234567").is_err());
+        assert!(GitObjectId::parse(&"g".repeat(40)).is_err());
+        let object = GitObjectId::parse(&"a".repeat(40)).unwrap();
+        assert_eq!(object.short(), "aaaaaaa");
+    }
+}

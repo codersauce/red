@@ -32,7 +32,7 @@ pub struct PluginRegistry {
 }
 
 /// Host API version used for plugin compatibility checks.
-pub const RED_HOST_API_VERSION: &str = "0.4.0";
+pub const RED_HOST_API_VERSION: &str = "0.5.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PluginModification {
@@ -1186,7 +1186,7 @@ mod tests {
     #[test]
     fn pre_one_minor_host_api_requirements_do_not_cross_minor_versions() {
         let mut metadata = PluginMetadata::minimal("composer-plugin".to_string());
-        metadata.red_api_version = Some("^0.4.0".to_string());
+        metadata.red_api_version = Some("^0.5.0".to_string());
         check_api_compatibility(&metadata).unwrap();
 
         metadata.red_api_version = Some("^0.3.0".to_string());
@@ -1404,7 +1404,7 @@ mod tests {
         ));
         assert_eq!(runtime.command_plugin("FutureCommand"), None);
 
-        fs::write(&metadata, r#"{"name":"future","red_api_version":"^0.4.0"}"#).unwrap();
+        fs::write(&metadata, r#"{"name":"future","red_api_version":"^0.5.0"}"#).unwrap();
         registry.reload(&mut runtime).await.unwrap();
 
         assert_eq!(
@@ -1657,7 +1657,7 @@ mod tests {
         .unwrap();
         fs::write(
             &metadata,
-            r#"{"name":"metadata","red_api_version":"^0.4.0"}"#,
+            r#"{"name":"metadata","red_api_version":"^0.5.0"}"#,
         )
         .unwrap();
         let mut registry = PluginRegistry::new();

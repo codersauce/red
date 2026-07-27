@@ -680,6 +680,10 @@ mod tests {
     #[test]
     fn bundled_assets_include_default_theme_and_plugins() {
         assert!(bundled_theme("red.json").is_some());
+        assert!(bundled_plugin_specifier("replay.hk")
+            .as_deref()
+            .is_some_and(|specifier| specifier == "red-bundled:///plugins/replay.hk"));
+        assert!(bundled_plugin_contents("red-bundled:///plugins/replay.hk").is_some());
         assert!(bundled_plugin_specifier("theme_browser.hk")
             .as_deref()
             .is_some_and(|specifier| specifier == "red-bundled:///plugins/theme_browser.hk"));

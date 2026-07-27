@@ -1,0 +1,531 @@
+// Safe, bundled preview of the pull-request reconstruction coach.
+//
+// Rust owns the complete demo patch, editable scratch source, source validation,
+// preview revisions, and undoable application. The coach is a dedicated,
+// source-backed, read-only plugin panel, not an editable editor buffer.
+// This plugin owns presentation, learning mode, local observations, and
+// confirmation flow.
+// No demo action fetches GitHub, creates a branch, writes a file, or posts a review.
+
+pub fn activate() {
+    red::add_command("Replay", open, Json {
+        title: "Open PR Replay Coach",
+        category: "PR Replay",
+        description: "Try the safe, mock-backed pull request reconstruction coach",
+        aliases: ["pr replay", "replay coach"],
+    });
+    red::add_command("ReplayDemo", open, Json {
+        title: "Open PR Replay demo",
+        category: "PR Replay",
+        description: "Open the bundled coach without GitHub or file changes",
+        aliases: ["replay demo"],
+    });
+    red::add_command("ReplayNext", next, Json {
+        title: "Next replay step",
+        category: "PR Replay",
+        description: "Show the next pull request reconstruction exercise",
+    });
+    red::add_command("ReplayPrevious", previous, Json {
+        title: "Previous replay step",
+        category: "PR Replay",
+        description: "Show the previous pull request reconstruction exercise",
+    });
+    red::add_command("ReplayHint", toggle_hint, Json {
+        title: "Toggle replay hint",
+        category: "PR Replay",
+        description: "Reveal or hide the current exercise hint",
+    });
+    red::add_command("ReplayHelp", toggle_help, Json {
+        title: "Toggle replay keyboard help",
+        category: "PR Replay",
+        description: "Reveal or hide the dedicated Replay pane shortcuts",
+    });
+    red::add_command("ReplayToggleMode", toggle_mode, Json {
+        title: "Toggle replay learning mode",
+        category: "PR Replay",
+        description: "Switch between Challenge and original-author Snippet modes",
+    });
+    red::add_command("ReplayValidate", validate, Json {
+        title: "Validate demo replay step",
+        category: "PR Replay",
+        description: "Preview the manual reconstruction completion flow",
+    });
+    red::add_command("ReplayApply", confirm_apply, Json {
+        title: "Apply the current original replay hunk",
+        category: "PR Replay",
+        description: "Confirm one undoable change to the in-memory replay scratch source",
+    });
+    red::add_command("ReplayEdit", edit_manually, Json {
+        title: "Edit replay source manually",
+        category: "PR Replay",
+        description: "Focus the original-author scratch source and reconstruct the visible hunk",
+    });
+    red::add_command("ReplayNote", open_note, Json {
+        title: "Add a local replay observation",
+        category: "PR Replay",
+        description: "Record a demo-only reviewer observation in memory",
+    });
+    red::add_command("ReplayFindings", findings, Json {
+        title: "Show local replay findings",
+        category: "PR Replay",
+        description: "Show observations without submitting a GitHub review",
+    });
+    red::add_command("ReplayFocusGuide", focus, Json {
+        title: "Focus the PR Replay guide",
+        category: "PR Replay",
+        description: "Focus the dedicated, movable Replay Coach panel",
+    });
+    red::add_command("ReplayClose", close, Json {
+        title: "Hide PR Replay Coach",
+        category: "PR Replay",
+        description: "Hide the dedicated coach while preserving this demo session",
+    });
+
+    red::on("panel:event:replay-coach", panel_event);
+    red::on("buffer:changed", source_changed);
+    red::state_set("replay_panel_created", false);
+    red::state_set("replay_panel_open", false);
+    red::state_set("replay_workspace_id", "");
+    red::state_set("replay_source_buffer_index", -1);
+    red::state_set("replay_pull_request", 0);
+    red::state_set("replay_author", "");
+    red::state_set("replay_branch", "");
+    red::state_set("replay_title", "");
+    red::state_set("replay_index", 0);
+    red::state_set("replay_mode", "challenge");
+    red::state_set("replay_hint_visible", false);
+    red::state_set("replay_help_visible", false);
+    red::state_set("replay_view", "guide");
+    red::state_set("replay_notes", []);
+    red::state_set("replay_completions", []);
+    red::state_set("replay_pending_apply", "");
+    red::state_set("replay_pending_revision", -1);
+    red::state_set("replay_notice", "");
+    red::state_set("replay_steps", []);
+}
+
+fn open() {
+    let workspace = red::string(red::state("replay_workspace_id"), "");
+    if workspace != "" {
+        ensure_panel();
+        red::state_set("replay_view", "guide");
+        render();
+        red::execute("FocusPanel", "replay-coach");
+        return;
+    }
+    red::request("ReplayDemoPlan", demo_plan_loaded);
+}
+
+fn demo_plan_loaded(plan: Json) {
+    if red::len(plan.steps) == 0 {
+        red::execute("Print", "Replay demo could not load its original unified hunks");
+        return;
+    }
+    red::state_set("replay_pull_request", red::int(plan.pull_request, 0));
+    red::state_set("replay_author", red::string(plan.author, ""));
+    red::state_set("replay_branch", red::string(plan.branch, ""));
+    red::state_set("replay_title", red::string(plan.title, ""));
+    red::state_set("replay_steps", plan.steps);
+    red::state_set("replay_view", "guide");
+    red::request("ReplayDemoOpenWorkspace", demo_workspace_opened);
+}
+
+fn demo_workspace_opened(event: Json) {
+    if !red::bool(event.ok, false) {
+        red::execute("Print", "Replay could not open its scratch source: " + red::string(event.error, "unknown error"));
+        return;
+    }
+    red::state_set("replay_workspace_id", red::string(event.workspace_id, ""));
+    red::state_set("replay_source_buffer_index", red::int(event.source_buffer_index, -1));
+    ensure_panel();
+    render();
+    red::execute("FocusPanel", "replay-coach");
+}
+
+fn ensure_panel() {
+    if !red::state_bool("replay_panel_created") {
+        red::execute("CreateTextPanel", "replay-coach", PanelConfig {
+            side: "left",
+            width: 46,
+            title: "PR REPLAY",
+        });
+        red::state_set("replay_panel_created", true);
+        red::state_set("replay_panel_open", true);
+        return;
+    }
+    if !red::state_bool("replay_panel_open") {
+        red::execute("SetPanelVisible", "replay-coach", true);
+        red::state_set("replay_panel_open", true);
+    }
+}
+
+fn panel_event(event: Json) {
+    let action = red::string(event.action, "");
+    if action == "close" {
+        close();
+    } else if action == "next" || action == "n" || action == "expand" {
+        next();
+    } else if action == "previous" || action == "p" || action == "collapse" {
+        previous();
+    } else if action == "composer_focus" {
+        confirm_apply();
+    } else if action == "i" {
+        edit_manually();
+    } else if action == "v" {
+        validate();
+    } else if action == "?" {
+        toggle_help();
+    } else if action == "m" {
+        toggle_mode();
+    } else if action == "o" {
+        open_note();
+    } else if action == "f" {
+        findings();
+    }
+}
+
+fn ensure_workspace() -> bool {
+    if red::string(red::state("replay_workspace_id"), "") == "" {
+        open();
+        return false;
+    }
+    return true;
+}
+
+fn next() {
+    if !ensure_workspace() {
+        return;
+    }
+    let index = red::int(red::state("replay_index"), 0);
+    if index + 1 < red::len(red::state("replay_steps")) {
+        red::state_set("replay_index", index + 1);
+        red::state_set("replay_hint_visible", false);
+        red::state_set("replay_notice", "");
+    }
+    red::state_set("replay_view", "guide");
+    render();
+}
+
+fn previous() {
+    if !ensure_workspace() {
+        return;
+    }
+    let index = red::int(red::state("replay_index"), 0);
+    if index > 0 {
+        red::state_set("replay_index", index - 1);
+        red::state_set("replay_hint_visible", false);
+        red::state_set("replay_notice", "");
+    }
+    red::state_set("replay_view", "guide");
+    render();
+}
+
+fn toggle_hint() {
+    if !ensure_workspace() {
+        return;
+    }
+    red::state_set("replay_hint_visible", !red::state_bool("replay_hint_visible"));
+    red::state_set("replay_view", "guide");
+    render();
+}
+
+fn toggle_help() {
+    if !ensure_workspace() {
+        return;
+    }
+    red::state_set("replay_help_visible", !red::state_bool("replay_help_visible"));
+    red::state_set("replay_view", "guide");
+    render();
+}
+
+fn toggle_mode() {
+    if !ensure_workspace() {
+        return;
+    }
+    if red::string(red::state("replay_mode"), "challenge") == "challenge" {
+        red::state_set("replay_mode", "snippet");
+    } else {
+        red::state_set("replay_mode", "challenge");
+    }
+    red::state_set("replay_view", "guide");
+    render();
+}
+
+fn validate() {
+    if !ensure_workspace() {
+        return;
+    }
+    let index = red::int(red::state("replay_index"), 0);
+    let step = red::state("replay_steps")[index];
+    red::request(
+        "ReplayDemoValidateStep",
+        validation_completed,
+        red::string(red::state("replay_workspace_id"), ""),
+        red::string(step.id, "")
+    );
+}
+
+fn source_changed(event: Json) {
+    if red::string(red::state("replay_workspace_id"), "") == "" {
+        return;
+    }
+    if red::int(event.buffer_id, -1) != red::int(red::state("replay_source_buffer_index"), -1) {
+        return;
+    }
+
+    let index = red::int(red::state("replay_index"), 0);
+    let current_completed = false;
+    for completion in red::state("replay_completions") {
+        if red::int(completion.index, -1) == index {
+            current_completed = true;
+        }
+    }
+    if !current_completed {
+        return;
+    }
+
+    remove_completed(index);
+    red::state_set("replay_notice", "Scratch source changed; check this step again.");
+    render();
+}
+
+fn validation_completed(result: Json) {
+    if !red::bool(result.ok, false) {
+        red::state_set("replay_notice", red::string(result.error, "Could not validate the scratch source"));
+        render();
+        return;
+    }
+    if red::string(result.state, "") == "exact" {
+        mark_completed(red::int(red::state("replay_index"), 0), "manually reconstructed");
+        red::state_set("replay_notice", "Original hunk reconstructed in the scratch buffer.");
+    } else if red::string(result.state, "") == "incomplete" {
+        red::state_set("replay_notice", "The source still matches the original pre-image; implement the shown diff first.");
+    } else {
+        red::state_set("replay_notice", "The source does not match this step. Finish its prerequisite or adjust your reconstruction.");
+    }
+    render();
+}
+
+fn confirm_apply() {
+    if !ensure_workspace() {
+        return;
+    }
+    let step = red::state("replay_steps")[red::int(red::state("replay_index"), 0)];
+    red::request(
+        "ReplayDemoValidateStep",
+        apply_prepared,
+        red::string(red::state("replay_workspace_id"), ""),
+        red::string(step.id, "")
+    );
+}
+
+fn apply_prepared(result: Json) {
+    if !red::bool(result.ok, false) {
+        red::state_set("replay_notice", red::string(result.error, "Could not prepare the hunk"));
+        render();
+        return;
+    }
+    if red::string(result.state, "") == "exact" {
+        mark_completed(red::int(red::state("replay_index"), 0), "manually reconstructed");
+        red::state_set("replay_notice", "This original hunk is already present in the scratch buffer.");
+        render();
+        return;
+    }
+    if red::string(result.state, "") != "incomplete" {
+        red::state_set("replay_notice", "The scratch source does not match this hunk's pre-image.");
+        render();
+        return;
+    }
+    red::state_set("replay_pending_apply", red::string(result.step_id, ""));
+    red::state_set("replay_pending_revision", red::int(result.revision, -1));
+    red::execute(
+        "OpenConfirm",
+        "Apply original replay hunk?",
+        "Apply this exact original diff to the in-memory scratch source? The change is undoable. No file, branch, or GitHub review will be written.",
+        PickerHandlers {
+            selected: apply_confirmed,
+            cancelled: apply_cancelled,
+        }
+    );
+}
+
+fn apply_confirmed(item: PickerItem) {
+    let pending = red::string(red::state("replay_pending_apply"), "");
+    let revision = red::int(red::state("replay_pending_revision"), -1);
+    red::state_set("replay_pending_apply", "");
+    red::state_set("replay_pending_revision", -1);
+    let step = red::state("replay_steps")[red::int(red::state("replay_index"), 0)];
+    if item.id == "accept" && pending == red::string(step.id, "") && revision >= 0 {
+        red::request(
+            "ReplayDemoApplyStep",
+            apply_completed,
+            red::string(red::state("replay_workspace_id"), ""),
+            pending,
+            revision
+        );
+        return;
+    }
+    render();
+}
+
+fn apply_completed(result: Json) {
+    if red::bool(result.ok, false) && red::string(result.state, "") == "exact" {
+        mark_completed(red::int(red::state("replay_index"), 0), "automatically applied");
+        red::state_set("replay_notice", "Applied one original hunk. Press u in the source to undo it.");
+    } else {
+        red::state_set("replay_notice", red::string(result.error, "The original hunk could not be safely applied."));
+    }
+    render();
+}
+
+fn apply_cancelled(event: PickerCancelled) {
+    red::state_set("replay_pending_apply", "");
+    red::state_set("replay_pending_revision", -1);
+    red::state_set("replay_notice", "Automatic application cancelled; the scratch source is unchanged.");
+    render();
+}
+
+fn mark_completed(index: i32, completion: String) {
+    let completions = [];
+    for existing in red::state("replay_completions") {
+        if red::int(existing.index, -1) != index {
+            completions = red::push(completions, existing);
+        }
+    }
+    completions = red::push(completions, Json {
+        index: index,
+        completion: completion,
+    });
+    red::state_set("replay_completions", completions);
+}
+
+fn remove_completed(index: i32) {
+    let completions = [];
+    for existing in red::state("replay_completions") {
+        if red::int(existing.index, -1) != index {
+            completions = red::push(completions, existing);
+        }
+    }
+    red::state_set("replay_completions", completions);
+}
+
+fn open_note() {
+    if !ensure_workspace() {
+        return;
+    }
+    red::execute("OpenInput", "Local replay observation", "", ComposerHandlers {
+        submitted: note_submitted,
+        cancelled: note_cancelled,
+    });
+}
+
+fn note_submitted(value: String) {
+    let observation = red::trim(value);
+    if observation == "" {
+        render();
+        return;
+    }
+    red::state_set("replay_notes", red::push(red::state("replay_notes"), Json {
+        index: red::int(red::state("replay_index"), 0),
+        text: observation,
+    }));
+    render();
+}
+
+fn note_cancelled(event: ComposerCancelled) {
+    render();
+}
+
+fn findings() {
+    if !ensure_workspace() {
+        return;
+    }
+    red::state_set("replay_view", "findings");
+    render();
+}
+
+fn focus() {
+    if !ensure_workspace() {
+        return;
+    }
+    ensure_panel();
+    render();
+    red::execute("FocusPanel", "replay-coach");
+}
+
+fn edit_manually() {
+    if !ensure_workspace() {
+        return;
+    }
+    red::execute("ReplayDemoFocusSource", red::string(red::state("replay_workspace_id"), ""));
+}
+
+fn close() {
+    if red::state_bool("replay_panel_open") {
+        red::execute("SetPanelVisible", "replay-coach", false);
+        red::state_set("replay_panel_open", false);
+    }
+}
+
+fn render() {
+    let workspace = red::string(red::state("replay_workspace_id"), "");
+    if workspace == "" {
+        return;
+    }
+    if red::string(red::state("replay_view"), "guide") == "findings" {
+        red::execute("UpdateTextPanel", "replay-coach", [TextPanelBlock {
+            id: "replay-current-change",
+            kind: "text",
+            format: "markdown",
+            text: findings_content(),
+        }]);
+        return;
+    }
+    red::execute("UpdateTextPanel", "replay-coach", [TextPanelBlock {
+        id: "replay-current-change",
+        kind: "text",
+        format: "replay",
+        text: guide_content(),
+    }]);
+}
+
+fn guide_content() -> String {
+    return red::join([Json {
+        pull_request: red::int(red::state("replay_pull_request"), 0),
+        author: red::string(red::state("replay_author"), "original-author"),
+        branch: red::string(red::state("replay_branch"), ""),
+        title: red::string(red::state("replay_title"), ""),
+        index: red::int(red::state("replay_index"), 0),
+        mode: red::string(red::state("replay_mode"), "challenge"),
+        hint_visible: red::state_bool("replay_hint_visible"),
+        help_visible: red::state_bool("replay_help_visible"),
+        notice: red::string(red::state("replay_notice"), ""),
+        notes: red::state("replay_notes"),
+        completions: red::state("replay_completions"),
+        steps: red::state("replay_steps"),
+    }], "");
+}
+
+fn findings_content() -> String {
+    let notes = red::state("replay_notes");
+    let steps = red::state("replay_steps");
+    let content = "# Local reviewer findings\n\n";
+    content = content + "**Mock PR #" + red::int(red::state("replay_pull_request"), 0);
+    content = content + " · @" + red::string(red::state("replay_author"), "original-author") + "**\n\n";
+    content = content + "These observations exist only in the demo session. Nothing is sent to GitHub.\n\n";
+
+    if red::len(notes) == 0 {
+        content = content + "No observations yet. Use `Space R o` to add one.\n\n";
+    }
+    for note in notes {
+        let index = red::int(note.index, 0);
+        let step = steps[index];
+        content = content + "### Step " + (index + 1) + " · " + step.title + "\n";
+        content = content + "`" + step.path + "`\n\n";
+        content = content + red::string(note.text, "") + "\n\n";
+    }
+
+    content = content + "`Space R g` return · `Space R o` add note · `Space R q` close\n\n";
+    content = content + "**Safe preview:** no network, branch, file writes, or submitted review.";
+    return content;
+}

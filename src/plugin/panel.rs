@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 use super::markdown::{
     render_markdown_lines, wrap_plain_text, RenderedTextLine, RenderedTextSpan, TextPanelSpanStyle,
 };
+use super::replay_panel::{
+    render_replay_panel, render_replay_panel_title, ReplayPanelLayout, ReplayPanelState,
+};
 use super::text_link::{TextPanelLink, TextPanelLinkTarget};
 use crate::{
     editor::{render_buffer::RenderBuffer, Point},
@@ -177,6 +180,8 @@ pub enum TextPanelBlockFormat {
     #[default]
     Plain,
     Markdown,
+    /// A validated, structured pull-request replay model and source hunk.
+    Replay,
 }
 
 /// One logical block in a text panel.
@@ -214,6 +219,7 @@ pub struct TextPanel {
     pub scroll: usize,
     pub follow_tail: bool,
     viewport: FollowTailViewport,
+    replay: Option<ReplayPanelState>,
     composer: Option<TextPanelComposer>,
     status: Option<TextPanelStatus>,
     busy_since: Option<Instant>,
@@ -317,6 +323,7 @@ impl TextPanel {
             scroll: 0,
             follow_tail: true,
             viewport: FollowTailViewport::default(),
+            replay: None,
             composer,
             status: None,
             busy_since: None,
@@ -348,6 +355,10 @@ impl TextPanel {
             self.scroll = self.viewport.offset();
             self.follow_tail = self.viewport.is_following();
         }
+        self.replay = blocks
+            .iter()
+            .find(|block| block.format == TextPanelBlockFormat::Replay)
+            .and_then(|block| ReplayPanelState::parse(&block.text));
         self.blocks = blocks;
         if self.follow_tail {
             self.scroll_to_bottom(panel_height, panel_width);
@@ -365,6 +376,9 @@ impl TextPanel {
     ) {
         if let Some(block) = self.blocks.iter_mut().find(|block| block.id == block_id) {
             block.text.push_str(delta);
+            if block.format == TextPanelBlockFormat::Replay {
+                self.replay = ReplayPanelState::parse(&block.text);
+            }
         } else {
             self.blocks.push(TextPanelBlock {
                 id: block_id.to_string(),
@@ -390,7 +404,7 @@ impl TextPanel {
     }
 
     fn page_scroll(&mut self, delta: isize, panel_height: usize, panel_width: usize) {
-        let page = self.visible_rows(panel_height).max(1) as isize;
+        let page = self.visible_rows(panel_height, panel_width).max(1) as isize;
         self.move_scroll(delta.saturating_mul(page), panel_height, panel_width);
     }
 
@@ -416,19 +430,27 @@ impl TextPanel {
     }
 
     fn max_scroll(&self, panel_height: usize, panel_width: usize) -> usize {
-        self.rendered_lines(panel_width.max(1))
-            .len()
-            .saturating_sub(self.visible_rows(panel_height))
+        let line_count = self.replay.as_ref().map_or_else(
+            || self.rendered_lines(panel_width.max(1)).len(),
+            |replay| replay.document.lines.len(),
+        );
+        line_count.saturating_sub(self.visible_rows(panel_height, panel_width))
     }
 
-    fn visible_rows(&self, panel_height: usize) -> usize {
-        panel_height
+    fn visible_rows(&self, panel_height: usize, panel_width: usize) -> usize {
+        let body_height = panel_height
             .saturating_sub(usize::from(
                 self.config.title.is_some() || !self.config.header_actions.is_empty(),
             ))
             .saturating_sub(self.composer_height())
-            .saturating_sub(self.status_height())
-            .max(1)
+            .saturating_sub(self.status_height());
+        if let Some(replay) = &self.replay {
+            ReplayPanelLayout::calculate(replay, panel_width, body_height)
+                .diff_rows
+                .max(1)
+        } else {
+            body_height.max(1)
+        }
     }
 
     fn composer_height(&self) -> usize {
@@ -491,7 +513,8 @@ impl TextPanel {
         let (link, line) = &links[index];
         self.selected_link = Some(link.id);
         self.viewport.restore(self.scroll, self.follow_tail);
-        self.viewport.reveal(*line, self.visible_rows(panel_height));
+        self.viewport
+            .reveal(*line, self.visible_rows(panel_height, width));
         self.scroll = self.viewport.offset();
         self.follow_tail = self.viewport.is_following();
         true
@@ -506,6 +529,19 @@ impl TextPanel {
     }
 
     fn rendered_lines(&self, width: usize) -> Vec<RenderedTextLine> {
+        if let Some(replay) = &self.replay {
+            return replay
+                .document
+                .lines
+                .iter()
+                .map(|line| {
+                    RenderedTextLine::plain(
+                        truncate_display_width(&line.text, width),
+                        TextPanelSpanStyle::Code,
+                    )
+                })
+                .collect();
+        }
         let mut lines: Vec<RenderedTextLine> = Vec::new();
         for (block_index, block) in self.blocks.iter().enumerate() {
             if block.kind == TextPanelBlockKind::User {
@@ -531,6 +567,11 @@ impl TextPanel {
                     TextPanelBlockFormat::Markdown => {
                         render_markdown_lines(&block.text, content_width)
                     }
+                    TextPanelBlockFormat::Replay => wrap_plain_text(
+                        "The replay view could not load its original source.",
+                        content_width,
+                        TextPanelSpanStyle::Error,
+                    ),
                 };
                 if block_lines.is_empty() {
                     block_lines.push(RenderedTextLine::plain(
@@ -549,6 +590,11 @@ impl TextPanel {
                 let mut block_lines = match block.format {
                     TextPanelBlockFormat::Plain => wrap_plain_text(&block.text, width, style),
                     TextPanelBlockFormat::Markdown => render_markdown_lines(&block.text, width),
+                    TextPanelBlockFormat::Replay => wrap_plain_text(
+                        "The replay view could not load its original source.",
+                        width,
+                        TextPanelSpanStyle::Error,
+                    ),
                 };
                 if block_lines.is_empty() {
                     block_lines.push(RenderedTextLine::plain(String::new(), style));
@@ -878,6 +924,15 @@ impl PanelManager {
             .entry(id.to_string())
             .or_default()
             .remember(side, size);
+    }
+
+    /// Keeps a source-backed guide anchored to its first rendered line.
+    pub fn scroll_text_panel_to_top(&mut self, id: &str) -> bool {
+        let Some(panel) = self.text_panels.get_mut(id) else {
+            return false;
+        };
+        panel.scroll_to_top();
+        true
     }
 
     pub fn close_panel(&mut self, id: &str) {
@@ -1849,16 +1904,20 @@ fn render_text_panel(
         .first()
         .map_or(width, |(start, _, _)| start.saturating_sub(1));
     if let Some(title) = &panel.config.title {
-        let title_style = Style {
-            bold: true,
-            ..theme.style.clone()
-        };
-        buffer.set_text(
-            position.x,
-            position.y,
-            &fit_display_width(title, title_width),
-            &title_style,
-        );
+        if let Some(replay) = panel.replay.as_ref().filter(|_| header_actions.is_empty()) {
+            render_replay_panel_title(buffer, replay, title, position, width, theme);
+        } else {
+            let title_style = Style {
+                bold: true,
+                ..theme.style.clone()
+            };
+            buffer.set_text(
+                position.x,
+                position.y,
+                &fit_display_width(title, title_width),
+                &title_style,
+            );
+        }
     }
     for (start, _, label) in header_actions {
         let x = position.x + start;
@@ -1870,6 +1929,23 @@ fn render_text_panel(
             "]",
             &theme.ui_style.muted,
         );
+    }
+
+    if let Some(replay) = &panel.replay {
+        let body_height = height.saturating_sub(title_rows);
+        let layout = ReplayPanelLayout::calculate(replay, width, body_height);
+        let max_scroll = replay.document.lines.len().saturating_sub(layout.diff_rows);
+        let scroll = panel.viewport.visible_offset(max_scroll);
+        render_replay_panel(
+            buffer,
+            replay,
+            Point::new(position.x, position.y.saturating_add(title_rows)),
+            width,
+            body_height,
+            scroll,
+            theme,
+        );
+        return;
     }
 
     let composer_height = panel.composer_height();
@@ -2074,7 +2150,7 @@ fn text_panel_header_action_at(config: &PanelConfig, width: usize, x: usize) -> 
         .map(|(_, action, _)| action)
 }
 
-fn render_text_spans(
+pub(super) fn render_text_spans(
     buffer: &mut RenderBuffer,
     x: usize,
     y: usize,
@@ -2084,27 +2160,53 @@ fn render_text_spans(
     theme: &Theme,
 ) {
     paint_rich_text(buffer, x, y, width, line, |span| {
-        let base_style = text_panel_span_style(span.style, theme);
-        let mut style = if let Some(syntax_style) = &span.syntax_style {
-            Style {
-                fg: syntax_style.fg.or(base_style.fg),
-                bg: syntax_style.bg.or(base_style.bg).or(theme.style.bg),
-                bold: syntax_style.bold || base_style.bold,
-                italic: syntax_style.italic || base_style.italic,
-            }
-        } else {
-            base_style
-        };
-        if span
-            .link
-            .as_ref()
-            .is_some_and(|link| Some(link.id) == selected_link)
-        {
-            let selection = theme.list_selection_style();
-            style = theme.selected_style(&style, &selection, SelectionForegroundPriority::Content);
-        }
-        style
+        text_panel_rendered_span_style(span, theme, selected_link, None)
     });
+}
+
+pub(super) fn render_text_spans_on_surface(
+    buffer: &mut RenderBuffer,
+    x: usize,
+    y: usize,
+    width: usize,
+    line: &RenderedTextLine,
+    theme: &Theme,
+    surface: &Style,
+) {
+    paint_rich_text(buffer, x, y, width, line, |span| {
+        text_panel_rendered_span_style(span, theme, None, Some(surface))
+    });
+}
+
+fn text_panel_rendered_span_style(
+    span: &RenderedTextSpan,
+    theme: &Theme,
+    selected_link: Option<u64>,
+    surface: Option<&Style>,
+) -> Style {
+    let base_style = text_panel_span_style(span.style, theme);
+    let mut style = if let Some(syntax_style) = &span.syntax_style {
+        Style {
+            fg: syntax_style.fg.or(base_style.fg),
+            bg: syntax_style.bg.or(base_style.bg).or(theme.style.bg),
+            bold: syntax_style.bold || base_style.bold,
+            italic: syntax_style.italic || base_style.italic,
+        }
+    } else {
+        base_style
+    };
+    if let Some(surface) = surface {
+        style = style.with_bg(surface.bg);
+    }
+    if span
+        .link
+        .as_ref()
+        .is_some_and(|link| Some(link.id) == selected_link)
+    {
+        let selection = theme.list_selection_style();
+        style = theme.selected_style(&style, &selection, SelectionForegroundPriority::Content);
+    }
+    style
 }
 
 fn text_panel_span_style(style: TextPanelSpanStyle, theme: &Theme) -> Style {
@@ -2336,6 +2438,8 @@ mod tests {
     use super::*;
     use crate::{
         color::{contrast_ratio, Color},
+        plugin::replay_panel::{ReplayPanelMode, ReplayPanelModel},
+        replay::replay_demo_plan,
         theme::parse_vscode_theme,
     };
 
@@ -2358,6 +2462,30 @@ mod tests {
         (0..buffer.width)
             .map(|x| buffer.cells[y * buffer.width + x].text.as_str())
             .collect()
+    }
+
+    fn structured_replay_block(mode: ReplayPanelMode) -> TextPanelBlock {
+        let plan = replay_demo_plan().expect("source-backed replay demonstration");
+        let model = ReplayPanelModel {
+            pull_request: plan.pull_request,
+            author: plan.author,
+            branch: plan.branch,
+            title: plan.title,
+            index: 0,
+            mode,
+            hint_visible: false,
+            help_visible: false,
+            notice: String::new(),
+            notes: Vec::new(),
+            completions: Vec::new(),
+            steps: plan.steps,
+        };
+        TextPanelBlock {
+            id: "replay-current-change".to_string(),
+            kind: TextPanelBlockKind::Text,
+            format: TextPanelBlockFormat::Replay,
+            text: serde_json::to_string(&model).expect("serializable replay model"),
+        }
     }
 
     #[test]
@@ -2806,6 +2934,210 @@ mod tests {
                     assert!(placement.y.saturating_add(placement.height) <= height);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn moving_a_read_only_replay_panel_preserves_content_focus_and_top_anchor() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "replay-coach".to_string(),
+            PanelConfig {
+                side: PanelSide::Left,
+                width: 24,
+                title: Some("PR REPLAY".to_string()),
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_text_panel(
+            "replay-coach",
+            vec![TextPanelBlock {
+                id: "change".to_string(),
+                kind: TextPanelBlockKind::Text,
+                format: TextPanelBlockFormat::Markdown,
+                text: "# Current change\n\n```diff\n+visible_start: usize\n```".to_string(),
+            }],
+            /*panel_height*/ 16,
+            /*terminal_width*/ 48,
+        );
+        assert!(manager.scroll_text_panel_to_top("replay-coach"));
+        assert!(manager.focus_panel("replay-coach"));
+
+        for (side, width) in [
+            (PanelSide::Top, 6),
+            (PanelSide::Bottom, 6),
+            (PanelSide::Right, 24),
+            (PanelSide::Left, 24),
+        ] {
+            assert!(manager.update_panel_layout("replay-coach", side, width));
+            assert_eq!(manager.focused_panel_id(), Some("replay-coach"));
+            assert_eq!(manager.panel_layout("replay-coach"), Some((side, width)));
+            let panel = &manager.text_panels["replay-coach"];
+            assert!(panel.composer.is_none());
+            assert_eq!(panel.scroll, 0);
+            assert!(panel.blocks[0].text.contains("+visible_start: usize"));
+        }
+    }
+
+    #[test]
+    fn structured_replay_keeps_step_rows_and_actions_pinned_while_the_diff_scrolls() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "replay-coach".to_string(),
+            PanelConfig {
+                side: PanelSide::Left,
+                width: 46,
+                title: Some("PR REPLAY".to_string()),
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_text_panel(
+            "replay-coach",
+            vec![structured_replay_block(ReplayPanelMode::Snippet)],
+            /*panel_height*/ 24,
+            /*terminal_width*/ 96,
+        );
+        assert!(manager.scroll_text_panel_to_top("replay-coach"));
+        assert!(manager.focus_panel("replay-coach"));
+
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let mut buffer = RenderBuffer::new(/*width*/ 96, /*height*/ 26, &theme.style);
+        manager.render(&mut buffer, &theme);
+
+        let placement = manager
+            .panel_placements(/*terminal_width*/ 96, /*terminal_height*/ 26)
+            .into_iter()
+            .find(|placement| placement.id == "replay-coach")
+            .expect("visible dedicated Replay pane");
+        let rows = (placement.y..placement.y + placement.height)
+            .map(|y| row_text(&buffer, y))
+            .collect::<Vec<_>>();
+        let change_row = rows
+            .iter()
+            .position(|line| line.contains("CHANGES"))
+            .expect("pinned change list");
+        let footer_row = placement.y + placement.height - 1;
+        assert!(rows[0].contains("PR REPLAY"));
+        assert!(rows[0].contains("01 / 05"));
+        assert!(rows.iter().any(|line| line.contains("CURRENT CHANGE")));
+        assert!(rows.iter().any(|line| line.contains("visible_start")));
+        assert!(rows.iter().all(|line| !line.contains("diff --git")));
+        assert!(rows[change_row + 1].contains("Capture the visible viewport"));
+        assert!(rows[change_row + 2].contains("Filter diagnostics"));
+        let active_row = placement.y + change_row + 1;
+        let marker = &buffer.cells[active_row * buffer.width + placement.x];
+        let badge = &buffer.cells[active_row * buffer.width + placement.x + 5];
+        assert_eq!(marker.style.bg, badge.style.bg);
+        assert!(row_text(&buffer, footer_row).contains("[i]"));
+        assert!(row_text(&buffer, footer_row).contains("[v]"));
+        assert!(row_text(&buffer, footer_row).contains("[a]"));
+        assert!(row_text(&buffer, footer_row).contains("[?]"));
+
+        let visible_hunk = rows[..change_row].join("\n");
+        manager
+            .handle_focused_key(
+                "bottom", /*panel_height*/ 24, /*terminal_width*/ 96,
+                /*scrolloff*/ 0,
+            )
+            .expect("scroll the dedicated source hunk");
+        manager.render(&mut buffer, &theme);
+        let scrolled_rows = (placement.y..placement.y + placement.height)
+            .map(|y| row_text(&buffer, y))
+            .collect::<Vec<_>>();
+        assert_eq!(scrolled_rows[0], rows[0]);
+        assert_eq!(scrolled_rows[change_row], rows[change_row]);
+        assert_eq!(scrolled_rows[change_row + 1], rows[change_row + 1]);
+        assert_eq!(row_text(&buffer, footer_row), rows[rows.len() - 1]);
+        assert_ne!(scrolled_rows[..change_row].join("\n"), visible_hunk);
+    }
+
+    #[test]
+    fn structured_replay_panel_keeps_typed_diff_and_focus_at_all_four_vim_edges() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "replay-coach".to_string(),
+            PanelConfig {
+                side: PanelSide::Left,
+                width: 46,
+                title: Some("PR REPLAY".to_string()),
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_text_panel(
+            "replay-coach",
+            vec![structured_replay_block(ReplayPanelMode::Challenge)],
+            /*panel_height*/ 26,
+            /*terminal_width*/ 100,
+        );
+        assert!(manager.scroll_text_panel_to_top("replay-coach"));
+        assert!(manager.focus_panel("replay-coach"));
+
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        for (side, requested_width) in [
+            (PanelSide::Top, 12),
+            (PanelSide::Bottom, 12),
+            (PanelSide::Right, 46),
+            (PanelSide::Left, 46),
+        ] {
+            assert!(manager.update_panel_layout("replay-coach", side, requested_width));
+            assert_eq!(manager.focused_panel_id(), Some("replay-coach"));
+            let panel = &manager.text_panels["replay-coach"];
+            let replay = panel.replay.as_ref().expect("typed Replay pane state");
+            assert_eq!(replay.model.index, 0);
+            assert_eq!(replay.document.path, "src/editor/rendering.rs");
+            assert!(panel.composer.is_none());
+
+            let mut buffer =
+                RenderBuffer::new(/*width*/ 100, /*height*/ 28, &theme.style);
+            manager.render(&mut buffer, &theme);
+            let placement = manager
+                .panel_placements(/*terminal_width*/ 100, /*terminal_height*/ 28)
+                .into_iter()
+                .find(|placement| placement.id == "replay-coach")
+                .expect("Replay pane remains visible at its selected Vim edge");
+            assert!(row_text(&buffer, placement.y).contains("PR REPLAY"));
+            assert!(
+                row_text(&buffer, placement.y + placement.height - 1).contains("[i]"),
+                "essential shortcuts remain visible after docking {side:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_four_sided_panels_are_clipped_on_tiny_terminals() {
+        let mut manager = PanelManager::default();
+        for (id, side) in [
+            ("left", PanelSide::Left),
+            ("top", PanelSide::Top),
+            ("bottom", PanelSide::Bottom),
+            ("right", PanelSide::Right),
+        ] {
+            manager.create_panel(
+                id.to_string(),
+                PanelConfig {
+                    side,
+                    width: 99,
+                    ..PanelConfig::default()
+                },
+            );
+        }
+
+        let theme = Theme::default();
+        for (width, height) in [(0, 0), (1, 1), (1, 2), (2, 3), (8, 5), (20, 8)] {
+            let placements = manager.panel_placements(width, height);
+            for (index, placement) in placements.iter().enumerate() {
+                assert!(placement.x + placement.width <= width);
+                assert!(placement.y + placement.height <= height.saturating_sub(2));
+                for other in placements.iter().skip(index + 1) {
+                    let separated = placement.x + placement.width <= other.x
+                        || other.x + other.width <= placement.x
+                        || placement.y + placement.height <= other.y
+                        || other.y + other.height <= placement.y;
+                    assert!(separated, "overlapping panes at {width}x{height}");
+                }
+            }
+            let mut buffer = RenderBuffer::new(width, height, &theme.style);
+            manager.render(&mut buffer, &theme);
         }
     }
 

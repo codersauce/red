@@ -1306,6 +1306,16 @@ impl RedHost {
             "FocusEditor" => {
                 self.send_request(PluginRequest::FocusEditor);
             }
+            "ReplayDemoFocusSource" => {
+                let workspace_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ReplayDemoFocusSource requires a workspace id")
+                    })?
+                    .to_string();
+                self.send_request(PluginRequest::ReplayDemoFocusSource { workspace_id });
+            }
             "SetPanelVisible" => {
                 let id = args
                     .first()
@@ -1458,6 +1468,40 @@ impl RedHost {
                 request_id,
                 name: args.first().map(value_to_string).unwrap_or_default(),
                 text: args.get(1).map(value_to_string).unwrap_or_default(),
+            },
+            "ReplayDemoPlan" => PluginRequest::ReplayDemoPlan { request_id },
+            "ReplayDemoOpenWorkspace" => PluginRequest::ReplayDemoOpenWorkspace { request_id },
+            "ReplayDemoValidateStep" => PluginRequest::ReplayDemoValidateStep {
+                request_id,
+                workspace_id: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ReplayDemoValidateStep requires a workspace id")
+                    })?
+                    .to_string(),
+                step_id: args
+                    .get(/*index*/ 1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayDemoValidateStep requires a step id"))?
+                    .to_string(),
+            },
+            "ReplayDemoApplyStep" => PluginRequest::ReplayDemoApplyStep {
+                request_id,
+                workspace_id: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayDemoApplyStep requires a workspace id"))?
+                    .to_string(),
+                step_id: args
+                    .get(/*index*/ 1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayDemoApplyStep requires a step id"))?
+                    .to_string(),
+                revision: args
+                    .get(/*index*/ 2)
+                    .and_then(value_to_u64)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayDemoApplyStep requires a revision"))?,
             },
             "GetConfig" => PluginRequest::GetConfig {
                 request_id,
@@ -3150,6 +3194,96 @@ mod tests {
         while ACTION_DISPATCHER.try_recv_request().is_some() {}
     }
 
+    fn recv_replay_guide() -> crate::plugin::replay_panel::ReplayPanelModel {
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdateTextPanel { id, blocks } => {
+                assert_eq!(id, "replay-coach");
+                assert_eq!(blocks.len(), 1);
+                let block = blocks.into_iter().next().unwrap();
+                assert_eq!(block.id, "replay-current-change");
+                assert_eq!(block.kind, crate::plugin::TextPanelBlockKind::Text);
+                assert_eq!(block.format, crate::plugin::TextPanelBlockFormat::Replay);
+                assert!(
+                    crate::plugin::replay_panel::ReplayPanelState::parse(&block.text).is_some()
+                );
+                serde_json::from_str(&block.text).expect("valid structured replay panel model")
+            }
+            _ => panic!("expected a dedicated replay text-panel update"),
+        }
+    }
+
+    fn recv_replay_findings() -> String {
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdateTextPanel { id, blocks } => {
+                assert_eq!(id, "replay-coach");
+                assert_eq!(blocks.len(), 1);
+                let block = blocks.into_iter().next().unwrap();
+                assert_eq!(block.id, "replay-current-change");
+                assert_eq!(block.kind, crate::plugin::TextPanelBlockKind::Text);
+                assert_eq!(block.format, crate::plugin::TextPanelBlockFormat::Markdown);
+                block.text
+            }
+            _ => panic!("expected a dedicated replay findings update"),
+        }
+    }
+
+    async fn open_replay_demo(
+        runtime: &mut Runtime,
+    ) -> (
+        crate::replay::ReplayDemoPlan,
+        crate::plugin::replay_panel::ReplayPanelModel,
+    ) {
+        runtime
+            .load_plugin("replay", include_str!("../../plugins/replay.hk"))
+            .await
+            .unwrap();
+        runtime.execute_command("Replay").await.unwrap();
+
+        let plan_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayDemoPlan { request_id } => request_id,
+            _ => panic!("expected editor-owned replay demo plan request"),
+        };
+        let plan = crate::replay::replay_demo_plan().unwrap();
+        runtime
+            .resolve_request(plan_request, serde_json::to_value(&plan).unwrap())
+            .await
+            .unwrap();
+
+        let workspace_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayDemoOpenWorkspace { request_id } => request_id,
+            _ => panic!("expected a fileless replay scratch-source request"),
+        };
+        runtime
+            .resolve_request(
+                workspace_request,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "replay-workspace-1",
+                    "source_buffer_index": 1,
+                    "source_window_id": 11,
+                }),
+            )
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::CreateTextPanel { id, config } => {
+                assert_eq!(id, "replay-coach");
+                assert_eq!(config.side, crate::plugin::PanelSide::Left);
+                assert_eq!(config.width, 46);
+                assert!(config.composer.is_none());
+            }
+            _ => panic!("expected a dedicated, read-only replay panel"),
+        }
+        let guide = recv_replay_guide();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusPanel { id } if id == "replay-coach"
+        ));
+
+        (plan, guide)
+    }
+
     fn recv_agent_composer() -> (ComposerHandle, Option<String>, String, Vec<String>) {
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::OpenCallbackComposer {
@@ -3766,6 +3900,426 @@ mod tests {
             .iter()
             .any(|timeout| timeout.id == pending));
         cancel_timeout(&pending);
+    }
+
+    #[tokio::test]
+    async fn bundled_replay_demo_opens_a_dedicated_panel_with_real_per_step_diffs() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let (plan, guide) = open_replay_demo(&mut runtime).await;
+        assert_eq!(guide.pull_request, 482);
+        assert_eq!(guide.index, 0);
+        assert_eq!(guide.steps.len(), 5);
+        assert_eq!(
+            guide.mode,
+            crate::plugin::replay_panel::ReplayPanelMode::Challenge,
+        );
+        let current = guide.current_step().unwrap();
+        assert_eq!(current.title, "Capture the visible viewport");
+        assert!(current
+            .diff
+            .starts_with("diff --git a/src/editor/rendering.rs"));
+        assert!(current.diff.contains("+    visible_start: usize,"));
+
+        runtime.execute_command("ReplayNext").await.unwrap();
+        let guide = recv_replay_guide();
+        assert_eq!(guide.index, 1);
+        assert_eq!(
+            guide.current_step().unwrap().title,
+            "Filter diagnostics to the visible viewport",
+        );
+        assert!(guide
+            .current_step()
+            .unwrap()
+            .diff
+            .contains("+        .filter(|diagnostic| {"));
+
+        runtime.execute_command("ReplayHint").await.unwrap();
+        let guide = recv_replay_guide();
+        assert!(guide.hint_visible);
+        assert!(guide
+            .current_step()
+            .unwrap()
+            .hint
+            .contains("An inclusive Rust range"));
+
+        runtime.execute_command("ReplayToggleMode").await.unwrap();
+        let guide = recv_replay_guide();
+        assert_eq!(
+            guide.mode,
+            crate::plugin::replay_panel::ReplayPanelMode::Snippet,
+        );
+        assert!(guide
+            .current_step()
+            .unwrap()
+            .after
+            .contains("diagnostics_by_visible_line"));
+
+        runtime.execute_command("ReplayHelp").await.unwrap();
+        let guide = recv_replay_guide();
+        assert!(guide.help_visible);
+
+        runtime.execute_command("ReplayValidate").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayDemoValidateStep {
+                request_id,
+                workspace_id,
+                step_id,
+            } => {
+                assert_eq!(workspace_id, "replay-workspace-1");
+                assert_eq!(step_id, plan.steps[1].id);
+                request_id
+            }
+            _ => panic!("expected editor-owned scratch validation"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "replay-workspace-1",
+                    "step_id": plan.steps[1].id,
+                    "state": "exact",
+                    "revision": 2,
+                }),
+            )
+            .await
+            .unwrap();
+        let guide = recv_replay_guide();
+        assert_eq!(guide.completions.len(), 1);
+        assert_eq!(guide.completions[0].index, 1);
+        assert_eq!(guide.completions[0].completion, "manually reconstructed");
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn bundled_replay_vim_horizontal_keys_navigate_without_stealing_scroll_or_hints() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        open_replay_demo(&mut runtime).await;
+
+        for (action, expected_index) in [("expand", 1), ("collapse", 0), ("n", 1), ("p", 0)] {
+            runtime
+                .notify(
+                    "panel:event:replay-coach",
+                    serde_json::json!({ "action": action }),
+                )
+                .await
+                .unwrap();
+            let guide = recv_replay_guide();
+            assert_eq!(guide.index, expected_index, "unexpected {action} motion");
+            assert!(!guide.hint_visible);
+        }
+
+        for action in ["up", "down"] {
+            runtime
+                .notify(
+                    "panel:event:replay-coach",
+                    serde_json::json!({ "action": action }),
+                )
+                .await
+                .unwrap();
+            assert!(
+                ACTION_DISPATCHER.try_recv_request().is_none(),
+                "{action} should scroll the pane without navigating the replay",
+            );
+        }
+
+        runtime.execute_command("ReplayHint").await.unwrap();
+        let guide = recv_replay_guide();
+        assert!(guide.hint_visible);
+        assert_eq!(guide.index, 0);
+    }
+
+    #[tokio::test]
+    async fn bundled_replay_source_edits_invalidate_only_the_active_reviewed_step() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let (plan, _) = open_replay_demo(&mut runtime).await;
+
+        runtime.execute_command("ReplayValidate").await.unwrap();
+        let first_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayDemoValidateStep {
+                request_id,
+                workspace_id,
+                step_id,
+            } => {
+                assert_eq!(workspace_id, "replay-workspace-1");
+                assert_eq!(step_id, plan.steps[0].id);
+                request_id
+            }
+            _ => panic!("expected source validation for the first original replay hunk"),
+        };
+        runtime
+            .resolve_request(
+                first_request,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "replay-workspace-1",
+                    "step_id": plan.steps[0].id,
+                    "state": "exact",
+                    "revision": 1,
+                }),
+            )
+            .await
+            .unwrap();
+        let guide = recv_replay_guide();
+        assert_eq!(guide.completions.len(), 1);
+        assert_eq!(guide.completions[0].index, 0);
+        assert!(guide.notice.contains("reconstructed"));
+
+        runtime.execute_command("ReplayNext").await.unwrap();
+        let guide = recv_replay_guide();
+        assert_eq!(guide.index, 1);
+        assert_eq!(guide.completions.len(), 1);
+        assert!(guide.notice.is_empty());
+
+        runtime
+            .notify(
+                "buffer:changed",
+                serde_json::json!({ "buffer_id": 1, "revision": 2 }),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime.execute_command("ReplayValidate").await.unwrap();
+        let second_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayDemoValidateStep {
+                request_id,
+                workspace_id,
+                step_id,
+            } => {
+                assert_eq!(workspace_id, "replay-workspace-1");
+                assert_eq!(step_id, plan.steps[1].id);
+                request_id
+            }
+            _ => panic!("expected source validation for the second original replay hunk"),
+        };
+        runtime
+            .resolve_request(
+                second_request,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "replay-workspace-1",
+                    "step_id": plan.steps[1].id,
+                    "state": "exact",
+                    "revision": 3,
+                }),
+            )
+            .await
+            .unwrap();
+        let guide = recv_replay_guide();
+        assert_eq!(guide.completions.len(), 2);
+        assert_eq!(guide.completions[0].index, 0);
+        assert_eq!(guide.completions[1].index, 1);
+
+        runtime
+            .notify(
+                "buffer:changed",
+                serde_json::json!({ "buffer_id": 0, "revision": 4 }),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime
+            .notify(
+                "buffer:changed",
+                serde_json::json!({ "buffer_id": 1, "revision": 5 }),
+            )
+            .await
+            .unwrap();
+        let guide = recv_replay_guide();
+        assert_eq!(guide.completions.len(), 1);
+        assert_eq!(guide.completions[0].index, 0);
+        assert!(guide.notice.contains("check this step again"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn bundled_replay_notes_remain_local_and_source_linked() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        open_replay_demo(&mut runtime).await;
+
+        runtime.execute_command("ReplayNote").await.unwrap();
+        let handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackInput {
+                owner,
+                handle,
+                title,
+                initial,
+            } => {
+                assert_eq!(owner, "replay");
+                assert_eq!(title, "Local replay observation");
+                assert!(initial.is_empty());
+                handle
+            }
+            _ => panic!("expected local replay note input"),
+        };
+        assert!(runtime
+            .notify_composer(
+                handle,
+                ComposerCallback::Submitted("Should we bound the PR description?".to_string()),
+            )
+            .unwrap());
+        let guide = recv_replay_guide();
+        assert_eq!(guide.notes.len(), 1);
+        assert_eq!(guide.notes[0].index, 0);
+        assert!(guide.notes[0].text.contains("bound the PR description"));
+
+        runtime.execute_command("ReplayFindings").await.unwrap();
+        let findings = recv_replay_findings();
+        assert!(findings.contains("Local reviewer findings"));
+        assert!(findings.contains("Should we bound the PR description?"));
+        assert!(findings.contains("src/editor/rendering.rs"));
+        assert!(findings.contains("Nothing is sent to GitHub"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn bundled_replay_demo_applies_only_a_confirmed_revision_checked_hunk() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let (plan, _) = open_replay_demo(&mut runtime).await;
+
+        runtime.execute_command("ReplayApply").await.unwrap();
+        let validation_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayDemoValidateStep {
+                request_id,
+                workspace_id,
+                step_id,
+            } => {
+                assert_eq!(workspace_id, "replay-workspace-1");
+                assert_eq!(step_id, plan.steps[0].id);
+                request_id
+            }
+            _ => panic!("expected source pre-image validation before confirmation"),
+        };
+        runtime
+            .resolve_request(
+                validation_request,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "replay-workspace-1",
+                    "step_id": plan.steps[0].id,
+                    "state": "incomplete",
+                    "revision": 7,
+                }),
+            )
+            .await
+            .unwrap();
+        let handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackConfirmation {
+                owner,
+                handle,
+                title,
+                message,
+            } => {
+                assert_eq!(owner, "replay");
+                assert_eq!(title, "Apply original replay hunk?");
+                assert!(message.contains("undoable"));
+                assert!(message.contains("No file, branch, or GitHub review"));
+                handle
+            }
+            _ => panic!("expected safe replay confirmation"),
+        };
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        let accept = serde_json::from_value(serde_json::json!({
+            "id": "accept",
+            "label": "Accept",
+        }))
+        .unwrap();
+        assert!(runtime
+            .notify_picker(handle, PickerCallback::Selected(accept))
+            .unwrap());
+        let apply_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayDemoApplyStep {
+                request_id,
+                workspace_id,
+                step_id,
+                revision,
+            } => {
+                assert_eq!(workspace_id, "replay-workspace-1");
+                assert_eq!(step_id, plan.steps[0].id);
+                assert_eq!(revision, 7);
+                request_id
+            }
+            _ => panic!("expected the explicitly confirmed Rust replay transaction"),
+        };
+        runtime
+            .resolve_request(
+                apply_request,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "replay-workspace-1",
+                    "step_id": plan.steps[0].id,
+                    "state": "exact",
+                    "revision": 8,
+                }),
+            )
+            .await
+            .unwrap();
+        let guide = recv_replay_guide();
+        assert_eq!(guide.completions.len(), 1);
+        assert_eq!(guide.completions[0].index, 0);
+        assert_eq!(guide.completions[0].completion, "automatically applied");
+        assert!(guide.notice.contains("Press u in the source to undo"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn bundled_replay_focuses_a_dedicated_panel_and_fileless_source() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        open_replay_demo(&mut runtime).await;
+
+        runtime.execute_command("ReplayEdit").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ReplayDemoFocusSource { workspace_id }
+                if workspace_id == "replay-workspace-1"
+        ));
+
+        runtime.execute_command("ReplayFocusGuide").await.unwrap();
+        let guide = recv_replay_guide();
+        assert!(guide.current_step().unwrap().diff.contains("\n@@ "));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusPanel { id } if id == "replay-coach"
+        ));
+
+        runtime.execute_command("ReplayClose").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPanelVisible { id, visible: false }
+                if id == "replay-coach"
+        ));
+
+        runtime.execute_command("Replay").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPanelVisible { id, visible: true }
+                if id == "replay-coach"
+        ));
+        assert!(recv_replay_guide()
+            .current_step()
+            .unwrap()
+            .diff
+            .contains("\n@@ "));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusPanel { id } if id == "replay-coach"
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
     #[tokio::test]

@@ -757,6 +757,26 @@ pub enum PluginRequest {
         name: String,
         text: String,
     },
+    ReplayDemoPlan {
+        request_id: RequestId,
+    },
+    ReplayDemoOpenWorkspace {
+        request_id: RequestId,
+    },
+    ReplayDemoFocusSource {
+        workspace_id: String,
+    },
+    ReplayDemoValidateStep {
+        request_id: RequestId,
+        workspace_id: String,
+        step_id: String,
+    },
+    ReplayDemoApplyStep {
+        request_id: RequestId,
+        workspace_id: String,
+        step_id: String,
+        revision: u64,
+    },
     CloseScratchBuffer {
         buffer_index: usize,
     },
@@ -996,6 +1016,11 @@ impl PluginRequest {
             Self::GetSelection { .. } => "GetSelection",
             Self::GetAgentContext { .. } => "GetAgentContext",
             Self::OpenScratchBuffer { .. } => "OpenScratchBuffer",
+            Self::ReplayDemoPlan { .. } => "ReplayDemoPlan",
+            Self::ReplayDemoOpenWorkspace { .. } => "ReplayDemoOpenWorkspace",
+            Self::ReplayDemoFocusSource { .. } => "ReplayDemoFocusSource",
+            Self::ReplayDemoValidateStep { .. } => "ReplayDemoValidateStep",
+            Self::ReplayDemoApplyStep { .. } => "ReplayDemoApplyStep",
             Self::CloseScratchBuffer { .. } => "CloseScratchBuffer",
             Self::GetViewportLayout { .. } => "GetViewportLayout",
             Self::GetWindows { .. } => "GetWindows",
@@ -1737,6 +1762,14 @@ impl ActionOnSelection {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ReplayDemoWorkspaceState {
+    id: String,
+    plan: crate::replay::ReplayDemoPlan,
+    source_buffer: BufferId,
+    source_window: WindowId,
+}
+
 /// Single-task owner of Red's interactive application state.
 ///
 /// The editor coordinates buffers, windows, rendering, LSP, plugins,
@@ -1754,6 +1787,9 @@ pub struct Editor {
 
     /// Domain sub-controller managing background AI agent state and tool channels
     agent_manager: agent_manager::AgentManager,
+
+    /// Editor-owned original hunks and a stable, fileless scratch-source identity.
+    replay_demo_workspace: Option<ReplayDemoWorkspaceState>,
 
     /// LSP client for code intelligence features
     lsp: Box<dyn LspClient>,
@@ -2957,6 +2993,7 @@ impl Editor {
             session_manager,
             lsp_coordinator,
             agent_manager,
+            replay_demo_workspace: None,
             lsp,
             config,
             config_diagnostics: Vec::new(),
@@ -3534,6 +3571,177 @@ impl Editor {
         } else {
             false
         }
+    }
+
+    fn replay_demo_source_index(&self, workspace_id: &str) -> Option<usize> {
+        let workspace = self.replay_demo_workspace.as_ref()?;
+        if workspace.id != workspace_id {
+            return None;
+        }
+        self.buffer_manager
+            .iter()
+            .position(|buffer| buffer.id() == workspace.source_buffer)
+    }
+
+    fn focus_replay_demo_source(&mut self, workspace_id: &str) -> bool {
+        let Some(workspace) = self.replay_demo_workspace.as_ref() else {
+            return false;
+        };
+        if workspace.id != workspace_id {
+            return false;
+        }
+        let Some(window_index) = self.window_manager.window_index(workspace.source_window) else {
+            return false;
+        };
+        self.panel_manager.focus_editor();
+        self.set_active_window(window_index);
+        true
+    }
+
+    async fn open_replay_demo_workspace(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<Value> {
+        if let Some(existing) = self.replay_demo_workspace.clone() {
+            if self.window_manager.window(existing.source_window).is_some() {
+                self.focus_replay_demo_source(&existing.id);
+                let source_index = self
+                    .replay_demo_source_index(&existing.id)
+                    .ok_or_else(|| anyhow::anyhow!("replay scratch buffer no longer exists"))?;
+                return Ok(json!({
+                    "ok": true,
+                    "workspace_id": existing.id,
+                    "source_buffer_index": source_index,
+                    "source_window_id": existing.source_window.0,
+                }));
+            }
+        }
+
+        let plan = crate::replay::replay_demo_plan()?;
+        let mut source = Buffer::named_scratch(
+            format!("[PR Replay] {}", plan.source_path),
+            plan.initial_source.clone(),
+        );
+        source.set_syntax_selection(SyntaxSelection::Language("rust".to_string()));
+        let source_buffer = source.id();
+        self.buffer_manager.push_buffer(source);
+        let source_index = self.buffer_manager.len() - 1;
+        self.set_current_buffer(render_buffer, source_index).await?;
+        let source_window = self
+            .window_manager
+            .active_stable_window_id()
+            .ok_or_else(|| anyhow::anyhow!("replay source has no active editor window"))?;
+
+        let id = uuid::Uuid::new_v4().to_string();
+        self.replay_demo_workspace = Some(ReplayDemoWorkspaceState {
+            id: id.clone(),
+            plan,
+            source_buffer,
+            source_window,
+        });
+        Ok(json!({
+            "ok": true,
+            "workspace_id": id,
+            "source_buffer_index": source_index,
+            "source_window_id": source_window.0,
+        }))
+    }
+
+    fn replay_demo_step_validation(&self, workspace_id: &str, step_id: &str) -> Value {
+        let Some(workspace) = self.replay_demo_workspace.as_ref() else {
+            return json!({ "ok": false, "error": "replay workspace is not active" });
+        };
+        if workspace.id != workspace_id {
+            return json!({ "ok": false, "error": "replay workspace is stale" });
+        }
+        let Some(step) = workspace.plan.steps.iter().find(|step| step.id == step_id) else {
+            return json!({ "ok": false, "error": "replay step is not part of the original source" });
+        };
+        let Some(index) = self.replay_demo_source_index(workspace_id) else {
+            return json!({ "ok": false, "error": "replay scratch source is no longer open" });
+        };
+        let source = &self.buffer_manager[index];
+        let contents = source.contents();
+        let state = if contents == step.after {
+            "exact"
+        } else if contents == step.before {
+            "incomplete"
+        } else {
+            "conflict"
+        };
+        json!({
+            "ok": true,
+            "workspace_id": workspace_id,
+            "step_id": step_id,
+            "state": state,
+            "revision": source.revision(),
+        })
+    }
+
+    async fn apply_replay_demo_step(
+        &mut self,
+        workspace_id: &str,
+        step_id: &str,
+        revision: u64,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<Value> {
+        let workspace = self
+            .replay_demo_workspace
+            .as_ref()
+            .filter(|workspace| workspace.id == workspace_id)
+            .ok_or_else(|| anyhow::anyhow!("replay workspace is stale"))?;
+        let step = workspace
+            .plan
+            .steps
+            .iter()
+            .find(|step| step.id == step_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("replay step does not belong to the original source"))?;
+        let source_index = self
+            .replay_demo_source_index(workspace_id)
+            .ok_or_else(|| anyhow::anyhow!("replay scratch source is no longer open"))?;
+        let source = &self.buffer_manager[source_index];
+        anyhow::ensure!(
+            !source.undo_history.is_transaction_active(),
+            "finish the active source transaction before applying a replay hunk"
+        );
+        anyhow::ensure!(source.revision() == revision, "replay preview is stale");
+        anyhow::ensure!(
+            source.contents() == step.before,
+            "replay source no longer matches the original hunk pre-image"
+        );
+        anyhow::ensure!(
+            self.focus_replay_demo_source(workspace_id),
+            "replay source window is no longer open"
+        );
+        anyhow::ensure!(
+            self.current_buffer().id() == self.buffer_manager[source_index].id(),
+            "replay source focus changed before application"
+        );
+
+        let end = self.current_buffer().char_idx_to_position(usize::MAX);
+        self.begin_transaction_with_origin(
+            "apply PR replay hunk",
+            EditOrigin::Replay {
+                session_id: workspace_id.to_string(),
+                step_id: step_id.to_string(),
+            },
+        );
+        self.replace_range(
+            TextRange::new(TextPosition::new(/*line*/ 0, /*character*/ 0), end),
+            &step.after,
+        );
+        self.commit_transaction(self.cursor_snapshot());
+        if let Err(error) = self.notify_change(runtime).await {
+            log!("Replay hunk was applied but change notification failed: {error}");
+        }
+        Ok(json!({
+            "ok": true,
+            "workspace_id": workspace_id,
+            "step_id": step_id,
+            "state": "exact",
+            "revision": self.current_buffer().revision(),
+        }))
     }
 
     fn resize_window_layout(&mut self, terminal_size: (usize, usize)) {
@@ -6980,6 +7188,62 @@ impl Editor {
                         .await?;
                     needs_render = true;
                 }
+                PluginRequest::ReplayDemoPlan { request_id } => {
+                    let payload = match crate::replay::replay_demo_plan() {
+                        Ok(plan) => serde_json::to_value(plan)?,
+                        Err(error) => json!({ "ok": false, "error": error.to_string() }),
+                    };
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
+                }
+                PluginRequest::ReplayDemoOpenWorkspace { request_id } => {
+                    let payload = match self.open_replay_demo_workspace(buffer).await {
+                        Ok(payload) => {
+                            needs_render = true;
+                            payload
+                        }
+                        Err(error) => json!({ "ok": false, "error": error.to_string() }),
+                    };
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
+                }
+                PluginRequest::ReplayDemoFocusSource { workspace_id } => {
+                    if self.focus_replay_demo_source(&workspace_id) {
+                        needs_render = true;
+                    }
+                }
+                PluginRequest::ReplayDemoValidateStep {
+                    request_id,
+                    workspace_id,
+                    step_id,
+                } => {
+                    let payload = self.replay_demo_step_validation(&workspace_id, &step_id);
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
+                }
+                PluginRequest::ReplayDemoApplyStep {
+                    request_id,
+                    workspace_id,
+                    step_id,
+                    revision,
+                } => {
+                    let payload = match self
+                        .apply_replay_demo_step(&workspace_id, &step_id, revision, runtime)
+                        .await
+                    {
+                        Ok(payload) => {
+                            needs_render = true;
+                            payload
+                        }
+                        Err(error) => json!({ "ok": false, "error": error.to_string() }),
+                    };
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
+                }
                 PluginRequest::CloseScratchBuffer { buffer_index } => {
                     if buffer_index == self.buffer_manager.active_index() {
                         self.delete_current_buffer(buffer, true).await?;
@@ -7506,6 +7770,9 @@ impl Editor {
                         usize::from(self.size.1.saturating_sub(2)),
                         usize::from(self.size.0),
                     );
+                    if id == "replay-coach" {
+                        self.panel_manager.scroll_text_panel_to_top(&id);
+                    }
                     needs_render = true;
                 }
                 PluginRequest::AppendTextPanel {
@@ -9516,7 +9783,7 @@ impl Editor {
             if !self.panel_manager.focused_text_input_active() && self.handle_repeater(ev) {
                 return Ok(None);
             }
-            if self.panel_manager.focused_text_panel_has_composer()
+            if !self.panel_manager.focused_row_panel()
                 && !self.panel_manager.focused_text_input_active()
             {
                 if let Some(action) = self.panel_global_key_action(ev) {
@@ -21424,6 +21691,216 @@ mod test {
             }
         }
         prints
+    }
+
+    #[tokio::test]
+    async fn replay_demo_opens_a_dedicated_panel_and_one_editable_fileless_source() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        let plan = crate::replay::replay_demo_plan().unwrap();
+
+        let response = editor
+            .open_replay_demo_workspace(&mut render_buffer)
+            .await
+            .unwrap();
+
+        editor.test_create_text_panel(
+            "replay-coach",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Left,
+                width: 46,
+                title: Some("PR REPLAY".to_string()),
+                ..plugin::PanelConfig::default()
+            },
+        );
+
+        let workspace = editor.replay_demo_workspace.as_ref().unwrap();
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["workspace_id"], workspace.id);
+        assert_eq!(editor.window_manager.window_count(), 1);
+        assert_eq!(editor.buffer_manager.len(), 2);
+        let source = editor
+            .buffer_manager
+            .iter()
+            .find(|buffer| buffer.id() == workspace.source_buffer)
+            .unwrap();
+        assert_eq!(source.name(), "[PR Replay] src/editor/rendering.rs");
+        assert_eq!(source.contents(), plan.initial_source);
+        assert!(source.file.is_none());
+        assert!(source.uri().unwrap().is_none());
+        assert!(editor
+            .buffer_manager
+            .iter()
+            .all(|buffer| !buffer.name().contains("Coach")));
+        assert_eq!(
+            editor.panel_manager.panel_layout("replay-coach"),
+            Some((plugin::PanelSide::Left, 46)),
+        );
+        assert_eq!(
+            editor.window_manager.active_stable_window_id(),
+            Some(workspace.source_window)
+        );
+        let source_window = editor
+            .window_manager
+            .window(workspace.source_window)
+            .unwrap();
+        assert_eq!(source_window.position.x, 47);
+        assert_eq!(editor.buffer_manager[0].contents(), "hello");
+    }
+
+    #[tokio::test]
+    async fn replay_demo_hunk_application_is_real_attributed_and_undoable() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        let mut runtime = Runtime::new();
+        let response = editor
+            .open_replay_demo_workspace(&mut render_buffer)
+            .await
+            .unwrap();
+        let workspace_id = response["workspace_id"].as_str().unwrap().to_string();
+        let step = editor.replay_demo_workspace.as_ref().unwrap().plan.steps[0].clone();
+        let validation = editor.replay_demo_step_validation(&workspace_id, &step.id);
+        assert_eq!(validation["state"], "incomplete");
+        let revision = validation["revision"].as_u64().unwrap();
+
+        let applied = editor
+            .apply_replay_demo_step(&workspace_id, &step.id, revision, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(applied["ok"], true);
+        assert_eq!(applied["state"], "exact");
+        assert_eq!(editor.current_buffer().contents(), step.after);
+        assert!(editor.current_buffer().file.is_none());
+        assert_eq!(
+            editor
+                .current_buffer()
+                .undo_history
+                .latest_transaction()
+                .map(|transaction| &transaction.origin),
+            Some(&EditOrigin::Replay {
+                session_id: workspace_id.clone(),
+                step_id: step.id.clone(),
+            })
+        );
+
+        editor
+            .undo_transaction(&mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), step.before);
+        assert_eq!(
+            editor.replay_demo_step_validation(&workspace_id, &step.id)["state"],
+            "incomplete"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_demo_rejects_stale_revisions_without_changing_the_scratch_source() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        let mut runtime = Runtime::new();
+        let response = editor
+            .open_replay_demo_workspace(&mut render_buffer)
+            .await
+            .unwrap();
+        let workspace_id = response["workspace_id"].as_str().unwrap();
+        let step = editor.replay_demo_workspace.as_ref().unwrap().plan.steps[0].clone();
+        let original = editor.current_buffer().contents();
+
+        let error = editor
+            .apply_replay_demo_step(workspace_id, &step.id, /*revision*/ 7, &mut runtime)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("stale"));
+        assert_eq!(editor.current_buffer().contents(), original);
+        assert!(editor
+            .current_buffer()
+            .undo_history
+            .latest_transaction()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn dedicated_replay_panel_moves_to_all_four_vim_edges_without_becoming_a_buffer() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+
+        for action in [
+            Action::MoveWindowToLeft,
+            Action::MoveWindowToBottom,
+            Action::MoveWindowToTop,
+            Action::MoveWindowToRight,
+        ] {
+            let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+            let mut render_buffer =
+                RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+            let mut runtime = Runtime::new();
+            let response = editor
+                .open_replay_demo_workspace(&mut render_buffer)
+                .await
+                .unwrap();
+            assert_eq!(response["ok"], true);
+            let source_window = editor.replay_demo_workspace.as_ref().unwrap().source_window;
+            let source_before = editor.current_buffer().contents();
+            editor.test_create_text_panel(
+                "replay-coach",
+                plugin::PanelConfig {
+                    side: plugin::PanelSide::Left,
+                    width: 46,
+                    title: Some("PR REPLAY".to_string()),
+                    ..plugin::PanelConfig::default()
+                },
+            );
+            assert!(editor.panel_manager.focus_panel("replay-coach"));
+
+            editor
+                .execute(&action, &mut render_buffer, &mut runtime)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                editor.panel_manager.focused_panel_id(),
+                Some("replay-coach")
+            );
+            assert_eq!(
+                editor.window_manager.active_stable_window_id(),
+                Some(source_window)
+            );
+            assert_eq!(editor.window_manager.window_count(), 1);
+            assert_eq!(editor.buffer_manager.len(), 2);
+            assert_eq!(editor.current_buffer().contents(), source_before);
+            let (side, _) = editor.panel_manager.panel_layout("replay-coach").unwrap();
+            let (expected_side, x, y) = match action {
+                Action::MoveWindowToLeft => (plugin::PanelSide::Left, 0, 0),
+                Action::MoveWindowToRight => (plugin::PanelSide::Right, 99, 0),
+                Action::MoveWindowToTop => (plugin::PanelSide::Top, 0, 0),
+                Action::MoveWindowToBottom => (plugin::PanelSide::Bottom, 0, 25),
+                _ => unreachable!("only replay window edge actions are tested"),
+            };
+            assert_eq!(side, expected_side);
+            assert_eq!(
+                editor
+                    .panel_manager
+                    .panel_at_position(x, y, /*width*/ 100, /*height*/ 28)
+                    .map(|placement| placement.id),
+                Some("replay-coach".to_string()),
+            );
+            assert!(editor
+                .buffer_manager
+                .iter()
+                .all(|buffer| !buffer.name().contains("Coach")));
+        }
     }
 
     #[test]

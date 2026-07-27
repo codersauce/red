@@ -307,6 +307,20 @@ Esc = { EnterMode = "Normal" }
 "h" = { "s" = { PluginCommand = "GitHunkStage" }, "u" = { PluginCommand = "GitHunkUnstage" }, "r" = { PluginCommand = "GitHunkReset" } }
 "c" = { "c" = { PluginCommand = "GitSubmitMessage" }, "q" = { PluginCommand = "GitCancelMessage" } }
 
+[keys.normal." "."R"]
+"?" = { PluginCommand = "ReplayHelp" }
+"g" = { PluginCommand = "Replay" }
+"n" = { PluginCommand = "ReplayNext" }
+"p" = { PluginCommand = "ReplayPrevious" }
+"h" = { PluginCommand = "ReplayHint" }
+"m" = { PluginCommand = "ReplayToggleMode" }
+"i" = { PluginCommand = "ReplayEdit" }
+"v" = { PluginCommand = "ReplayValidate" }
+"a" = { PluginCommand = "ReplayApply" }
+"o" = { PluginCommand = "ReplayNote" }
+"f" = { PluginCommand = "ReplayFindings" }
+"q" = { PluginCommand = "ReplayClose" }
+
 [keys.normal." "."d"]
 "b" = "DumpBuffer"
 "i" = "DumpDiagnostics"
@@ -363,6 +377,7 @@ inlay_hints = "inlay_hints.hk"
 lsp_symbols = "lsp_symbols.hk"
 neotree = "neotree.hk"
 project_search = "project_search.hk"
+replay = "replay.hk"
 theme_browser = "theme_browser.hk"
 
 # Breadcrumb text uses theme colors; file icons use nvim-web-devicons' light/dark palette.

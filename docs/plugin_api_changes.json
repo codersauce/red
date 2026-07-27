@@ -1,6 +1,12 @@
 {
-  "api_version": "0.4.0",
+  "api_version": "0.5.0",
   "changes": [
+    {
+      "version": "0.5.0",
+      "kind": "introduced",
+      "symbols": ["ReplayDemoPlan", "ReplayDemoOpenWorkspace", "ReplayDemoFocusSource", "ReplayDemoValidateStep", "ReplayDemoApplyStep"],
+      "migration_note": "docs/PLUGIN_API.md#pull-request-replay-preview"
+    },
     {
       "version": "0.4.0",
       "kind": "introduced",
