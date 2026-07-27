@@ -2949,6 +2949,11 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
                 "missing replay leader action {key}"
             );
         }
+        assert_eq!(
+            replay.get("u"),
+            Some(&KeyAction::Single(Action::ReplayUndo)),
+            "missing origin-checked Replay undo leader action",
+        );
     }
 
     #[test]

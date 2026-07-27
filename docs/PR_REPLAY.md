@@ -46,7 +46,12 @@ panel itself:
 - `Ctrl-w L`: Dock the focused panel on the right.
 
 Lowercase `Ctrl-w h/j/k/l` continues to move focus without changing split
-topology. `Ctrl-w w` cycles between the coach and source.
+topology. `Ctrl-w w` cycles between the coach and source. A focused guide shows
+`▌ PR REPLAY`, a theme-accented `┃` or `━` at its docking edge, and a `▶`
+beside the current step. The real terminal cursor rests on that marker and the
+status line reads `REPLAY`. Focusing the source restores the normal editor
+status line; the guide, its original diff, and syntax highlighting remain
+visible.
 
 ## Key bindings
 
@@ -63,7 +68,8 @@ unchanged.
 | `Space R m` | Switch between Challenge and Snippet mode. |
 | `Space R i` | Focus the editable scratch source for manual reconstruction. |
 | `Space R v` | Validate the real scratch source against the original hunk. |
-| `Space R a` | Preview, confirm, and apply one real hunk to the scratch source. |
+| `Space R a` | Immediately apply one exact, undoable original hunk. |
+| `Space R u` | Safely undo the most recent Replay-authored scratch hunk. |
 | `Space R o` | Add a local, in-memory reviewer observation. |
 | `Space R f` | Show local reviewer observations. |
 | `Space R q` | Hide the coach without touching the scratch source or progress. |
@@ -72,12 +78,12 @@ While the dedicated coach is focused, `j` and `k` scroll the current source
 hunk, and `h` and `l` select the previous and next reconstruction steps. The
 older `p` and `n` step bindings remain compatibility aliases. Use `Space R h`
 for a hint so horizontal navigation never unexpectedly changes the exercise
-instead. `i`, `a`, `m`, `v`, `o`, `f`, `q`, and `?` continue to act directly on
+instead. `i`, `a`, `u`, `m`, `v`, `o`, `f`, `q`, and `?` act directly on
 the Replay pane. The pinned action bar keeps scratch-source focus, manual
-validation, confirmed-application preview, `h/l` step navigation, and help
+validation, immediate application, safe undo, `h/l` step navigation, and help
 visible even when the panel is narrow. The title shows the selected step
 separately from the number of genuinely reviewed changes. A `✓` identifies a
-manually reconstructed step; `⊕` identifies an explicitly confirmed automatic
+manually reconstructed step; `⊕` identifies an automatic
 application.
 
 Every step always displays its exact, independently parseable unified diff.
@@ -85,14 +91,18 @@ Challenge mode emphasizes manually reconstructing the hunk in the real source
 buffer. Snippet mode additionally reveals the complete resulting original-author
 source.
 
-To apply a step automatically, use `Space R a` and accept the confirmation.
-The confirmation defaults to Cancel; press `y` to explicitly accept, or `Esc`
-to leave the scratch source unchanged.
-Rust checks the original step, scratch-buffer revision, complete pre-image, and
-transaction boundary before applying it. The result is one real undoable
-in-memory editor transaction; press `u` in the scratch source to undo it. Undoing
-or subsequently editing a completed current step automatically removes its
-completion mark without disturbing earlier reconstructed steps.
+To apply a step automatically, press `a` while the guide is focused, or use
+`Space R a` from either surface. Rust checks the original step, scratch-buffer
+revision, complete pre-image, and transaction boundary before immediately
+applying the exact original hunk as one editor transaction. Focus stays where
+the action started; no confirmation interrupts the reconstruction.
+
+Press `u` in the focused guide or `Space R u` to undo the latest transaction
+only when it belongs to the current Replay session. If newer manual edits are
+present, Replay refuses to skip over them; return to the source and use normal
+Vim `u` first. Undoing or subsequently editing a completed current step
+automatically removes its completion mark without disturbing earlier
+reconstructed steps.
 
 To apply it manually, use `Space R i`, edit the visible Rust buffer to match the
 original diff, return to normal mode, and press `Space R v`. A step is marked

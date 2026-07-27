@@ -32,7 +32,7 @@ pub enum EditOrigin {
         /// Registered plugin name.
         name: String,
     },
-    /// An explicitly confirmed original-author hunk reconstructed in a replay session.
+    /// A user-requested original-author hunk reconstructed in a replay session.
     Replay {
         /// Stable editor-owned replay workspace identity.
         session_id: String,

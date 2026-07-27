@@ -3,8 +3,7 @@
 // Rust owns the complete demo patch, editable scratch source, source validation,
 // preview revisions, and undoable application. The coach is a dedicated,
 // source-backed, read-only plugin panel, not an editable editor buffer.
-// This plugin owns presentation, learning mode, local observations, and
-// confirmation flow.
+// This plugin owns presentation, learning mode, and local observations.
 // No demo action fetches GitHub, creates a branch, writes a file, or posts a review.
 
 pub fn activate() {
@@ -50,10 +49,10 @@ pub fn activate() {
         category: "PR Replay",
         description: "Preview the manual reconstruction completion flow",
     });
-    red::add_command("ReplayApply", confirm_apply, Json {
+    red::add_command("ReplayApply", apply, Json {
         title: "Apply the current original replay hunk",
         category: "PR Replay",
-        description: "Confirm one undoable change to the in-memory replay scratch source",
+        description: "Apply one exact, undoable change to the replay scratch source",
     });
     red::add_command("ReplayEdit", edit_manually, Json {
         title: "Edit replay source manually",
@@ -98,8 +97,6 @@ pub fn activate() {
     red::state_set("replay_view", "guide");
     red::state_set("replay_notes", []);
     red::state_set("replay_completions", []);
-    red::state_set("replay_pending_apply", "");
-    red::state_set("replay_pending_revision", -1);
     red::state_set("replay_notice", "");
     red::state_set("replay_steps", []);
 }
@@ -168,7 +165,7 @@ fn panel_event(event: Json) {
     } else if action == "previous" || action == "p" || action == "collapse" {
         previous();
     } else if action == "composer_focus" {
-        confirm_apply();
+        apply();
     } else if action == "i" {
         edit_manually();
     } else if action == "v" {
@@ -306,7 +303,7 @@ fn validation_completed(result: Json) {
     render();
 }
 
-fn confirm_apply() {
+fn apply() {
     if !ensure_workspace() {
         return;
     }
@@ -336,52 +333,22 @@ fn apply_prepared(result: Json) {
         render();
         return;
     }
-    red::state_set("replay_pending_apply", red::string(result.step_id, ""));
-    red::state_set("replay_pending_revision", red::int(result.revision, -1));
-    red::execute(
-        "OpenConfirm",
-        "Apply original replay hunk?",
-        "Apply this exact original diff to the in-memory scratch source? The change is undoable. No file, branch, or GitHub review will be written.",
-        PickerHandlers {
-            selected: apply_confirmed,
-            cancelled: apply_cancelled,
-        }
+    red::request(
+        "ReplayDemoApplyStep",
+        apply_completed,
+        red::string(red::state("replay_workspace_id"), ""),
+        red::string(result.step_id, ""),
+        red::int(result.revision, -1)
     );
-}
-
-fn apply_confirmed(item: PickerItem) {
-    let pending = red::string(red::state("replay_pending_apply"), "");
-    let revision = red::int(red::state("replay_pending_revision"), -1);
-    red::state_set("replay_pending_apply", "");
-    red::state_set("replay_pending_revision", -1);
-    let step = red::state("replay_steps")[red::int(red::state("replay_index"), 0)];
-    if item.id == "accept" && pending == red::string(step.id, "") && revision >= 0 {
-        red::request(
-            "ReplayDemoApplyStep",
-            apply_completed,
-            red::string(red::state("replay_workspace_id"), ""),
-            pending,
-            revision
-        );
-        return;
-    }
-    render();
 }
 
 fn apply_completed(result: Json) {
     if red::bool(result.ok, false) && red::string(result.state, "") == "exact" {
         mark_completed(red::int(red::state("replay_index"), 0), "automatically applied");
-        red::state_set("replay_notice", "Applied one original hunk. Press u in the source to undo it.");
+        red::state_set("replay_notice", "Applied the original hunk · u to undo.");
     } else {
         red::state_set("replay_notice", red::string(result.error, "The original hunk could not be safely applied."));
     }
-    render();
-}
-
-fn apply_cancelled(event: PickerCancelled) {
-    red::state_set("replay_pending_apply", "");
-    red::state_set("replay_pending_revision", -1);
-    red::state_set("replay_notice", "Automatic application cancelled; the scratch source is unchanged.");
     render();
 }
 

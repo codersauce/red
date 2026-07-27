@@ -1208,6 +1208,7 @@ pub enum Action {
     EnterSearch(SearchDirection),
 
     Undo,
+    ReplayUndo,
     Redo,
     SelectPreviousUndoBranch,
     SelectNextUndoBranch,
@@ -3710,6 +3711,7 @@ impl Editor {
             source.contents() == step.before,
             "replay source no longer matches the original hunk pre-image"
         );
+        let focused_panel = self.panel_manager.focused_panel_id().map(str::to_owned);
         anyhow::ensure!(
             self.focus_replay_demo_source(workspace_id),
             "replay source window is no longer open"
@@ -3735,13 +3737,74 @@ impl Editor {
         if let Err(error) = self.notify_change(runtime).await {
             log!("Replay hunk was applied but change notification failed: {error}");
         }
+        let revision = self.current_buffer().revision();
+        if let Some(panel_id) = focused_panel {
+            self.panel_manager.focus_panel(&panel_id);
+        }
         Ok(json!({
             "ok": true,
             "workspace_id": workspace_id,
             "step_id": step_id,
             "state": "exact",
-            "revision": self.current_buffer().revision(),
+            "revision": revision,
         }))
+    }
+
+    async fn undo_replay_step(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let Some(workspace_id) = self
+            .replay_demo_workspace
+            .as_ref()
+            .map(|workspace| workspace.id.clone())
+        else {
+            self.last_error = Some("No Replay scratch workspace is active".to_string());
+            self.render(render_buffer)?;
+            return Ok(());
+        };
+        let Some(source_index) = self.replay_demo_source_index(&workspace_id) else {
+            self.last_error = Some("The Replay scratch source is no longer open".to_string());
+            self.render(render_buffer)?;
+            return Ok(());
+        };
+        let source = &self.buffer_manager[source_index];
+        if source.undo_history.is_transaction_active() {
+            self.last_error = Some("Finish the active scratch edit before Replay undo".to_string());
+            self.render(render_buffer)?;
+            return Ok(());
+        }
+        let latest_origin = source
+            .undo_history
+            .latest_transaction()
+            .map(|transaction| &transaction.origin);
+        if !matches!(
+            latest_origin,
+            Some(EditOrigin::Replay { session_id, .. }) if session_id == &workspace_id
+        ) {
+            self.last_error = Some(if latest_origin.is_some() {
+                "Newer scratch edits must be undone from the source first".to_string()
+            } else {
+                "No applied Replay hunk is available to undo".to_string()
+            });
+            self.render(render_buffer)?;
+            return Ok(());
+        }
+
+        let focused_panel = self.panel_manager.focused_panel_id().map(str::to_owned);
+        if !self.focus_replay_demo_source(&workspace_id) {
+            self.last_error =
+                Some("The Replay scratch source window is no longer open".to_string());
+            self.render(render_buffer)?;
+            return Ok(());
+        }
+        self.undo_transaction(render_buffer, runtime).await?;
+        if let Some(panel_id) = focused_panel {
+            self.panel_manager.focus_panel(&panel_id);
+            self.render(render_buffer)?;
+        }
+        Ok(())
     }
 
     fn resize_window_layout(&mut self, terminal_size: (usize, usize)) {
@@ -10014,6 +10077,9 @@ impl Editor {
                     }
                     KeyCode::Char('H') => "history",
                     KeyCode::Char('N') => "new",
+                    KeyCode::Char('u') if self.panel_manager.focused_replay_status().is_some() => {
+                        return Some(KeyAction::Single(Action::ReplayUndo));
+                    }
                     KeyCode::Char('a') if !self.panel_manager.focused_row_panel() => {
                         "composer_focus"
                     }
@@ -14041,6 +14107,9 @@ impl Editor {
             }
             Action::Undo => {
                 self.undo_transaction(buffer, runtime).await?;
+            }
+            Action::ReplayUndo => {
+                self.undo_replay_step(buffer, runtime).await?;
             }
             Action::Redo => {
                 self.redo_transaction(buffer, runtime).await?;
@@ -21797,6 +21866,15 @@ mod test {
         assert!(status.contains("REPLAY"));
         assert!(status.contains("PR #482"));
         assert!(status.contains("01/05"));
+        assert_eq!(
+            editor
+                .test_handle_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char('u'),
+                    KeyModifiers::NONE,
+                )))
+                .unwrap(),
+            Some(KeyAction::Single(Action::ReplayUndo)),
+        );
         editor.render(&mut render_buffer).unwrap();
         let (x, y) = editor
             .test_render_cursor_position()
@@ -21858,6 +21936,123 @@ mod test {
             editor.replay_demo_step_validation(&workspace_id, &step.id)["state"],
             "incomplete"
         );
+    }
+
+    #[tokio::test]
+    async fn replay_apply_preserves_the_focused_guide_and_undo_restores_it() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        let mut runtime = Runtime::new();
+        let response = editor
+            .open_replay_demo_workspace(&mut render_buffer)
+            .await
+            .unwrap();
+        let workspace_id = response["workspace_id"].as_str().unwrap().to_string();
+        let step = editor.replay_demo_workspace.as_ref().unwrap().plan.steps[0].clone();
+        let revision = editor.replay_demo_step_validation(&workspace_id, &step.id)["revision"]
+            .as_u64()
+            .unwrap();
+        editor.test_create_text_panel(
+            "replay-coach",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Left,
+                width: 46,
+                title: Some("PR REPLAY".to_string()),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        assert!(editor.test_focus_panel("replay-coach"));
+
+        let applied = editor
+            .apply_replay_demo_step(&workspace_id, &step.id, revision, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(applied["state"], "exact");
+        assert_eq!(editor.test_focused_panel_id(), Some("replay-coach"));
+        assert_eq!(editor.current_buffer().contents(), step.after);
+
+        editor
+            .execute(&Action::ReplayUndo, &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(editor.test_focused_panel_id(), Some("replay-coach"));
+        assert_eq!(editor.current_buffer().contents(), step.before);
+        assert_eq!(
+            editor.replay_demo_step_validation(&workspace_id, &step.id)["state"],
+            "incomplete",
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_undo_never_undoes_a_newer_manual_scratch_edit() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        let mut runtime = Runtime::new();
+        let response = editor
+            .open_replay_demo_workspace(&mut render_buffer)
+            .await
+            .unwrap();
+        let workspace_id = response["workspace_id"].as_str().unwrap().to_string();
+        let step = editor.replay_demo_workspace.as_ref().unwrap().plan.steps[0].clone();
+        let revision = editor.replay_demo_step_validation(&workspace_id, &step.id)["revision"]
+            .as_u64()
+            .unwrap();
+        editor
+            .apply_replay_demo_step(&workspace_id, &step.id, revision, &mut runtime)
+            .await
+            .unwrap();
+
+        let end = editor.current_buffer().char_idx_to_position(usize::MAX);
+        editor.begin_transaction("manual replay scratch edit");
+        editor.replace_range(TextRange::new(end, end), "\n// reviewer observation\n");
+        editor.commit_transaction(editor.cursor_snapshot());
+        let manually_edited = editor.current_buffer().contents();
+        assert!(matches!(
+            editor
+                .current_buffer()
+                .undo_history
+                .latest_transaction()
+                .map(|transaction| &transaction.origin),
+            Some(EditOrigin::User),
+        ));
+        editor.test_create_text_panel(
+            "replay-coach",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Left,
+                width: 46,
+                title: Some("PR REPLAY".to_string()),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        assert!(editor.test_focus_panel("replay-coach"));
+
+        editor
+            .execute(&Action::ReplayUndo, &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), manually_edited);
+        assert!(matches!(
+            editor
+                .current_buffer()
+                .undo_history
+                .latest_transaction()
+                .map(|transaction| &transaction.origin),
+            Some(EditOrigin::User),
+        ));
+        assert_eq!(editor.test_focused_panel_id(), Some("replay-coach"));
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("Newer scratch edits")));
     }
 
     #[tokio::test]

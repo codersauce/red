@@ -569,7 +569,7 @@ fn replay_header_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
     if state.model.help_visible {
         lines.extend(
             wrap_plain_text(
-                "j/k scroll · h/l step · Ctrl-w H/J/K/L dock · Space R h hint · m mode · u undo in source",
+                "j/k scroll · h/l step · a apply · u undo · Ctrl-w H/J/K/L dock · Space R h hint",
                 width.max(1),
                 TextPanelSpanStyle::Muted,
             )
@@ -878,7 +878,10 @@ fn replay_actions() -> Vec<UiAction> {
         UiAction::new("validate", "[v]", "Check")
             .with_priority(ActionPriority::Essential)
             .with_compact_label(""),
-        UiAction::new("apply", "[a]", "Preview")
+        UiAction::new("apply", "[a]", "Apply")
+            .with_priority(ActionPriority::Essential)
+            .with_compact_label(""),
+        UiAction::new("undo", "[u]", "Undo")
             .with_priority(ActionPriority::Essential)
             .with_compact_label(""),
         UiAction::new("navigate", "[h/l]", "Step")
@@ -1211,14 +1214,15 @@ mod tests {
     #[test]
     fn replay_action_bar_keeps_complete_shortcuts_at_narrow_widths() {
         let actions = replay_actions();
-        let layout = ActionBar::new(&actions).layout(/*width*/ 28);
+        let layout = ActionBar::new(&actions).layout(/*width*/ 30);
         let visible = layout.text();
         assert!(visible.contains("[i]"));
         assert!(visible.contains("[v]"));
         assert!(visible.contains("[a]"));
+        assert!(visible.contains("[u]"));
         assert!(visible.contains("[h/l]"));
         assert!(visible.contains("[?]"));
-        assert!(display_width(&visible) <= 28);
+        assert!(display_width(&visible) <= 30);
         assert_eq!(layout.hidden_count(), 0);
     }
 
@@ -1599,7 +1603,7 @@ mod tests {
             assert!(rows[changes_row].starts_with("CHANGES"));
             assert_eq!(layout.change_gap_rows, 1);
             assert!(rows[changes_row - 1].trim().is_empty());
-            for shortcut in ["[i]", "[v]", "[a]", "[h/l]", "[?]"] {
+            for shortcut in ["[i]", "[v]", "[a]", "[u]", "[h/l]", "[?]"] {
                 assert!(
                     footer.contains(shortcut),
                     "missing {shortcut} at {width} columns"

@@ -4183,7 +4183,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bundled_replay_demo_applies_only_a_confirmed_revision_checked_hunk() {
+    async fn bundled_replay_demo_immediately_applies_one_revision_checked_hunk() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
@@ -4200,7 +4200,7 @@ mod tests {
                 assert_eq!(step_id, plan.steps[0].id);
                 request_id
             }
-            _ => panic!("expected source pre-image validation before confirmation"),
+            _ => panic!("expected source pre-image validation before application"),
         };
         runtime
             .resolve_request(
@@ -4215,31 +4215,6 @@ mod tests {
             )
             .await
             .unwrap();
-        let handle = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenCallbackConfirmation {
-                owner,
-                handle,
-                title,
-                message,
-            } => {
-                assert_eq!(owner, "replay");
-                assert_eq!(title, "Apply original replay hunk?");
-                assert!(message.contains("undoable"));
-                assert!(message.contains("No file, branch, or GitHub review"));
-                handle
-            }
-            _ => panic!("expected safe replay confirmation"),
-        };
-        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
-
-        let accept = serde_json::from_value(serde_json::json!({
-            "id": "accept",
-            "label": "Accept",
-        }))
-        .unwrap();
-        assert!(runtime
-            .notify_picker(handle, PickerCallback::Selected(accept))
-            .unwrap());
         let apply_request = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::ReplayDemoApplyStep {
                 request_id,
@@ -4252,7 +4227,7 @@ mod tests {
                 assert_eq!(revision, 7);
                 request_id
             }
-            _ => panic!("expected the explicitly confirmed Rust replay transaction"),
+            _ => panic!("expected the immediate revision-checked Rust replay transaction"),
         };
         runtime
             .resolve_request(
@@ -4271,7 +4246,88 @@ mod tests {
         assert_eq!(guide.completions.len(), 1);
         assert_eq!(guide.completions[0].index, 0);
         assert_eq!(guide.completions[0].completion, "automatically applied");
-        assert!(guide.notice.contains("Press u in the source to undo"));
+        assert!(guide.notice.contains("u to undo"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn bundled_replay_does_not_reapply_an_already_reconstructed_hunk() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let (plan, _) = open_replay_demo(&mut runtime).await;
+
+        runtime.execute_command("ReplayApply").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayDemoValidateStep {
+                request_id,
+                workspace_id,
+                step_id,
+            } => {
+                assert_eq!(workspace_id, "replay-workspace-1");
+                assert_eq!(step_id, plan.steps[0].id);
+                request_id
+            }
+            _ => panic!("expected editor-owned original-hunk validation"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "replay-workspace-1",
+                    "step_id": plan.steps[0].id,
+                    "state": "exact",
+                    "revision": 7,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let guide = recv_replay_guide();
+        assert_eq!(guide.completions.len(), 1);
+        assert_eq!(guide.completions[0].completion, "manually reconstructed");
+        assert!(guide.notice.contains("already present"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn bundled_replay_refuses_to_apply_when_original_preimage_has_changed() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let (plan, _) = open_replay_demo(&mut runtime).await;
+
+        runtime.execute_command("ReplayApply").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayDemoValidateStep {
+                request_id,
+                workspace_id,
+                step_id,
+            } => {
+                assert_eq!(workspace_id, "replay-workspace-1");
+                assert_eq!(step_id, plan.steps[0].id);
+                request_id
+            }
+            _ => panic!("expected original-hunk pre-image validation"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "replay-workspace-1",
+                    "step_id": plan.steps[0].id,
+                    "state": "conflict",
+                    "revision": 7,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let guide = recv_replay_guide();
+        assert!(guide.completions.is_empty());
+        assert!(guide.notice.contains("pre-image"));
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
