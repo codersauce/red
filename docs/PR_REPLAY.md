@@ -54,6 +54,11 @@ only when its exact path, shared repository, local branch, original merge-base
 commit, and clean working tree are independently verified. Replay refuses to
 overwrite saved reviewer changes or adopt an unrelated directory.
 
+If a previous checkout was interrupted after creating the Replay branch, Red
+can also restore its missing scratch worktree. It reuses the branch only when
+the branch still points to the exact verified merge base; an unrelated or
+modified branch is never reset or overwritten.
+
 Replay initially places its dedicated coach panel on the left and the editable
 scratch source on the right, matching the pull-request replay mockup. The
 coach is rendered by Red's panel system; it is not a Markdown file, a scratch

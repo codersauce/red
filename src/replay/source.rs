@@ -823,15 +823,23 @@ pub fn prepare_workspace(
         .status()
         .map_err(|error| ReplayError::Filesystem(error.to_string()))?
         .success();
-    if branch_exists {
+    if branch_exists
+        && git_object(&source.repository.root, &format!("refs/heads/{branch}"))?
+            != source.base_commit
+    {
         return Err(ReplayError::WorkspaceExists(branch));
     }
     let mut command = replay_git_command(&source.repository.root);
-    command
-        .args(["-c", "core.hooksPath=/dev/null", "worktree", "add", "-b"])
-        .arg(&branch)
-        .arg(&root)
-        .arg(source.base_commit.as_str());
+    command.args(["-c", "core.hooksPath=/dev/null", "worktree", "add"]);
+    if branch_exists {
+        command.arg(&root).arg(&branch);
+    } else {
+        command
+            .arg("-b")
+            .arg(&branch)
+            .arg(&root)
+            .arg(source.base_commit.as_str());
+    }
     run_command(&mut command, MAX_COMMAND_DIAGNOSTIC_BYTES)?;
     Ok((
         preview,
@@ -1255,6 +1263,64 @@ mod tests {
             ),
             hook.to_string_lossy(),
             "Replay must never modify repository filesystem-monitor configuration",
+        );
+    }
+
+    #[test]
+    fn resumes_pinned_replay_branch_after_an_interrupted_worktree_checkout() {
+        let (_directory, source) = reusable_workspace_source();
+        let (preview, _) = prepare_workspace(&source, /*confirmed*/ false)
+            .expect("preview the original durable scratch worktree");
+        fixture_git(
+            &source.repository.root,
+            &["branch", &preview.branch, source.base_commit.as_str()],
+        );
+        assert!(
+            !preview.root.exists(),
+            "an interrupted checkout leaves its pinned branch without a worktree",
+        );
+
+        let (resumed_preview, workspace) = prepare_workspace(&source, /*confirmed*/ true)
+            .expect("resume the exact original branch after an interrupted checkout");
+        let workspace = workspace.expect("restore the confirmed Replay worktree");
+
+        assert_eq!(resumed_preview, preview);
+        assert_eq!(workspace.root, preview.root);
+        assert_eq!(workspace.branch, preview.branch);
+        assert_eq!(workspace.base_commit, source.base_commit);
+        assert_eq!(
+            fixture_git(&workspace.root, &["rev-parse", "HEAD"]),
+            source.base_commit.as_str(),
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.root.join("src/token.rs"))
+                .expect("read the completely restored merge-base source"),
+            "pub fn token() -> usize { 1 }\n",
+        );
+    }
+
+    #[test]
+    fn refuses_an_existing_replay_branch_at_a_different_commit() {
+        let (_directory, source) = reusable_workspace_source();
+        let (preview, _) = prepare_workspace(&source, /*confirmed*/ false)
+            .expect("preview the expected Replay branch");
+        fixture_git(
+            &source.repository.root,
+            &["branch", &preview.branch, source.target_commit.as_str()],
+        );
+
+        let error = prepare_workspace(&source, /*confirmed*/ true)
+            .expect_err("a differently pinned branch must never be reused or reset");
+
+        assert!(matches!(error, ReplayError::WorkspaceExists(_)));
+        assert!(!preview.root.exists());
+        assert_eq!(
+            fixture_git(
+                &source.repository.root,
+                &["rev-parse", &format!("refs/heads/{}", preview.branch)],
+            ),
+            source.target_commit.as_str(),
+            "Replay must leave an unrelated existing branch completely untouched",
         );
     }
 
