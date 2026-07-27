@@ -142,18 +142,13 @@ impl PromptBuffer {
         }
         let cursor = self.cursor;
         let inserted = grapheme_len(&text);
-        let changed = self.replace_graphemes(
+        self.replace_user_graphemes(
             cursor,
             cursor,
             &text,
             cursor.saturating_add(inserted),
             "insert into prompt",
-        );
-        if changed {
-            self.history_position = None;
-            self.history_draft = None;
-        }
-        changed
+        )
     }
 
     /// Removes the previous complete extended grapheme.
@@ -162,7 +157,7 @@ impl PromptBuffer {
             return false;
         }
         let start = self.cursor - 1;
-        self.replace_graphemes(start, self.cursor, "", start, "delete prompt grapheme")
+        self.replace_user_graphemes(start, self.cursor, "", start, "delete prompt grapheme")
     }
 
     /// Removes the complete extended grapheme under the cursor.
@@ -170,7 +165,7 @@ impl PromptBuffer {
         if self.cursor >= grapheme_len(&self.text()) {
             return false;
         }
-        self.replace_graphemes(
+        self.replace_user_graphemes(
             self.cursor,
             self.cursor + 1,
             "",
@@ -196,7 +191,7 @@ impl PromptBuffer {
             seen_word |= !whitespace;
             start -= 1;
         }
-        self.replace_graphemes(start, self.cursor, "", start, "delete prompt word")
+        self.replace_user_graphemes(start, self.cursor, "", start, "delete prompt word")
     }
 
     /// Selects the previous submitted prompt while preserving the current draft.
@@ -405,7 +400,7 @@ impl PromptBuffer {
             return match character {
                 'w' => {
                     let target = self.next_word_boundary();
-                    self.replace_graphemes(
+                    self.replace_user_graphemes(
                         self.cursor,
                         target,
                         "",
@@ -450,6 +445,22 @@ impl PromptBuffer {
             _ => return PromptInput::Unhandled,
         }
         PromptInput::Changed
+    }
+
+    fn replace_user_graphemes(
+        &mut self,
+        start: usize,
+        end: usize,
+        replacement: &str,
+        cursor: usize,
+        label: &str,
+    ) -> bool {
+        let changed = self.replace_graphemes(start, end, replacement, cursor, label);
+        if changed {
+            self.history_position = None;
+            self.history_draft = None;
+        }
+        changed
     }
 
     fn replace_graphemes(
@@ -798,6 +809,73 @@ mod tests {
         assert_eq!(prompt.text(), "older");
         assert!(prompt.history_next());
         assert_eq!(prompt.text(), "newer\nentry");
+        assert!(prompt.history_next());
+        assert_eq!(prompt.text(), "unsent draft");
+    }
+
+    #[test]
+    fn history_navigation_detaches_after_successful_prompt_deletions() {
+        type PromptEdit = fn(&mut PromptBuffer) -> bool;
+
+        let scenarios: [(&str, PromptEdit, &str); 4] = [
+            ("backspace", PromptBuffer::backspace, "recalled entr"),
+            (
+                "delete",
+                |prompt| {
+                    prompt.set_cursor(0);
+                    prompt.delete()
+                },
+                "ecalled entry",
+            ),
+            (
+                "delete previous word",
+                PromptBuffer::delete_previous_word,
+                "recalled ",
+            ),
+            (
+                "Vim dw",
+                |prompt| {
+                    prompt.set_cursor(0);
+                    prompt.set_mode(Mode::Normal);
+                    assert_eq!(
+                        prompt.handle_event(&key(KeyCode::Char('d'), KeyModifiers::NONE), 40),
+                        PromptInput::Changed
+                    );
+                    prompt.handle_event(&key(KeyCode::Char('w'), KeyModifiers::NONE), 40)
+                        == PromptInput::Changed
+                },
+                "entry",
+            ),
+        ];
+
+        for (name, edit, expected) in scenarios {
+            let mut prompt =
+                PromptBuffer::with_history("unsent draft", vec!["recalled entry".to_string()]);
+
+            assert!(prompt.history_previous(), "{name}: recall prompt");
+            assert!(edit(&mut prompt), "{name}: apply deletion");
+            assert_eq!(prompt.text(), expected, "{name}: preserve edited text");
+            assert!(
+                !prompt.history_next(),
+                "{name}: deletion must detach history navigation"
+            );
+            assert_eq!(prompt.text(), expected, "{name}: keep edited draft");
+
+            assert!(prompt.history_previous(), "{name}: restart navigation");
+            assert_eq!(prompt.text(), "recalled entry");
+            assert!(prompt.history_next(), "{name}: restore edited draft");
+            assert_eq!(prompt.text(), expected);
+        }
+    }
+
+    #[test]
+    fn unsuccessful_prompt_deletion_preserves_history_navigation() {
+        let mut prompt =
+            PromptBuffer::with_history("unsent draft", vec!["recalled entry".to_string()]);
+
+        assert!(prompt.history_previous());
+        prompt.set_cursor(0);
+        assert!(!prompt.backspace());
         assert!(prompt.history_next());
         assert_eq!(prompt.text(), "unsent draft");
     }

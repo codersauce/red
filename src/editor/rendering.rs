@@ -459,7 +459,8 @@ impl Editor {
             .collect::<Vec<_>>();
 
         self.render_window_rows(buffer, window_id, &rows)?;
-        self.draw_line_diagnostics(buffer, self.buffer_line());
+        self.render_overlays_in_window(buffer, &window)?;
+        self.render_dialog(buffer)?;
         self.update_and_render_overlays(buffer)?;
         Ok(())
     }
@@ -2096,7 +2097,25 @@ mod tests {
         lsp::{LspManager, Position, Range},
         plugin::{Decoration, DecorationAnchor},
         theme::Theme,
+        ui::CompletionUI,
     };
+
+    fn rendering_test_editor(source: Buffer) -> Editor {
+        let config = Config::default();
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let mut editor =
+            Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![source]).unwrap();
+        editor.test_disable_terminal_output();
+        editor
+    }
+
+    fn rendered_rows(buffer: &RenderBuffer) -> Vec<String> {
+        buffer
+            .cells
+            .chunks(buffer.width)
+            .map(|row| row.iter().map(|cell| cell.text.as_str()).collect())
+            .collect()
+    }
 
     fn diagnostic(message: &str) -> Diagnostic {
         Diagnostic {
@@ -2185,6 +2204,72 @@ mod tests {
         assert_eq!(by_line[&4].len(), 2);
         assert_eq!(by_line[&4][0].message, "first visible");
         assert_eq!(by_line[&4][1].message, "second visible");
+    }
+
+    #[test]
+    fn edited_window_rows_preserve_completion_dialog() {
+        let source = Buffer::new(None, "hello\nworld\n".to_string());
+        let mut editor = rendering_test_editor(source);
+        let mut completion = CompletionUI::new();
+        let item = serde_json::from_value(serde_json::json!({ "label": "alpha" })).unwrap();
+        completion.show(vec![item], 0, 0);
+        editor.current_dialog = Some(Box::new(completion));
+        let mut buffer = RenderBuffer::new(60, 12, &Style::default());
+
+        editor.render(&mut buffer).unwrap();
+        assert!(rendered_rows(&buffer)
+            .iter()
+            .any(|row| row.contains("alpha")));
+
+        editor.render_edited_window_rows(&mut buffer).unwrap();
+
+        assert!(
+            rendered_rows(&buffer)
+                .iter()
+                .any(|row| row.contains("alpha")),
+            "edited window rows must repaint the active completion dialog"
+        );
+    }
+
+    #[test]
+    fn edited_window_rows_preserve_all_visible_diagnostics() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("diagnostics.rs");
+        let source = Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "first\nsecond\nthird\n".to_string(),
+        );
+        let mut editor = rendering_test_editor(source);
+        let uri = editor.current_buffer().uri().unwrap().unwrap();
+        let first = diagnostic("first visible diagnostic");
+        let mut second = diagnostic("second visible diagnostic");
+        second.range.start.line = 1;
+        second.range.end.line = 1;
+        editor.diagnostics.insert(uri, vec![first, second]);
+        let mut buffer = RenderBuffer::new(60, 12, &Style::default());
+
+        editor.render(&mut buffer).unwrap();
+        let rows = rendered_rows(&buffer);
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("first visible diagnostic")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("second visible diagnostic")));
+
+        editor.render_edited_window_rows(&mut buffer).unwrap();
+
+        let rows = rendered_rows(&buffer);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("first visible diagnostic")),
+            "edited window rows must repaint the first visible diagnostic"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("second visible diagnostic")),
+            "edited window rows must repaint diagnostics beyond the cursor line"
+        );
     }
 
     #[test]
