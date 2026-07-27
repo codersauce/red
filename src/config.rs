@@ -2790,6 +2790,14 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
             ctrl_w.get("v"),
             Some(&KeyAction::Single(Action::SplitVertical))
         );
+        for (key, action) in [
+            ("+", Action::ResizeWindowDown(1)),
+            ("-", Action::ResizeWindowUp(1)),
+            ("<", Action::ResizeWindowLeft(1)),
+            (">", Action::ResizeWindowRight(1)),
+        ] {
+            assert_eq!(ctrl_w.get(key), Some(&KeyAction::Single(action)));
+        }
         assert_eq!(
             ctrl_w.get("w"),
             Some(&KeyAction::Single(Action::NextWindow))

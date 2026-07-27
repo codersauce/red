@@ -25,12 +25,14 @@ use crate::{
     unicode_utils::{display_width, fit_display_width, grapheme_len, truncate_display_width},
 };
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PanelSide {
     #[default]
     Left,
     Right,
+    Top,
+    Bottom,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,12 +77,24 @@ fn default_composer_rows() -> usize {
 }
 
 fn effective_panel_width(config: &PanelConfig, terminal_width: usize) -> usize {
+    if matches!(config.side, PanelSide::Top | PanelSide::Bottom) {
+        return terminal_width;
+    }
+
     let max_width = if config.composer.is_some() {
         terminal_width.saturating_sub(11).max(1)
     } else {
         terminal_width
     };
     config.width.min(max_width)
+}
+
+fn effective_panel_height(config: &PanelConfig, available_height: usize) -> usize {
+    if matches!(config.side, PanelSide::Top | PanelSide::Bottom) {
+        config.width.min(available_height)
+    } else {
+        available_height
+    }
 }
 
 /// Optional persistent input area rendered at the bottom of a text panel.
@@ -715,10 +729,47 @@ impl PluginPanel {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PanelAxisSize {
+    default: Option<usize>,
+    preferred: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PanelSizes {
+    vertical: PanelAxisSize,
+    horizontal: PanelAxisSize,
+}
+
+impl PanelSizes {
+    fn axis(&self, side: PanelSide) -> &PanelAxisSize {
+        if matches!(side, PanelSide::Left | PanelSide::Right) {
+            &self.vertical
+        } else {
+            &self.horizontal
+        }
+    }
+
+    fn axis_mut(&mut self, side: PanelSide) -> &mut PanelAxisSize {
+        if matches!(side, PanelSide::Left | PanelSide::Right) {
+            &mut self.vertical
+        } else {
+            &mut self.horizontal
+        }
+    }
+
+    fn remember(&mut self, side: PanelSide, size: usize) {
+        let axis = self.axis_mut(side);
+        axis.default.get_or_insert(size);
+        axis.preferred = Some(size);
+    }
+}
+
 #[derive(Default)]
 pub struct PanelManager {
     panels: HashMap<String, PluginPanel>,
     text_panels: HashMap<String, TextPanel>,
+    preferred_sizes: HashMap<String, PanelSizes>,
     z_order: Vec<String>,
     focused: Option<String>,
     animation_state: Vec<(String, u8, u64)>,
@@ -726,6 +777,7 @@ pub struct PanelManager {
 
 impl PanelManager {
     pub fn create_panel(&mut self, id: String, config: PanelConfig) {
+        self.remember_panel_size(&id, config.side, config.width);
         self.text_panels.remove(&id);
         self.panels
             .insert(id.clone(), PluginPanel::new(id.clone(), config));
@@ -735,6 +787,7 @@ impl PanelManager {
     }
 
     pub fn create_text_panel(&mut self, id: String, config: PanelConfig) {
+        self.remember_panel_size(&id, config.side, config.width);
         self.panels.remove(&id);
         self.text_panels
             .insert(id.clone(), TextPanel::new(id.clone(), config));
@@ -752,6 +805,7 @@ impl PanelManager {
     ) {
         if let Some(panel) = self.text_panels.get_mut(id) {
             let width = effective_panel_width(&panel.config, terminal_width);
+            let panel_height = effective_panel_height(&panel.config, panel_height);
             panel.update_blocks(blocks, panel_height, width);
         }
     }
@@ -766,6 +820,7 @@ impl PanelManager {
     ) {
         if let Some(panel) = self.text_panels.get_mut(id) {
             let width = effective_panel_width(&panel.config, terminal_width);
+            let panel_height = effective_panel_height(&panel.config, panel_height);
             panel.append_delta(block_id, delta, panel_height, width);
         }
     }
@@ -776,9 +831,59 @@ impl PanelManager {
         }
     }
 
+    /// Moves or resizes a stable panel without replacing its contents or focus.
+    pub fn update_panel_layout(&mut self, id: &str, side: PanelSide, width: usize) -> bool {
+        let changed = if let Some(panel) = self.panels.get_mut(id) {
+            if panel.config.side == side && panel.config.width == width {
+                return false;
+            }
+            panel.config.side = side;
+            panel.config.width = width;
+            true
+        } else if let Some(panel) = self.text_panels.get_mut(id) {
+            if panel.config.side == side && panel.config.width == width {
+                return false;
+            }
+            panel.config.side = side;
+            panel.config.width = width;
+            true
+        } else {
+            false
+        };
+
+        if changed {
+            self.remember_panel_size(id, side, width);
+        }
+        changed
+    }
+
+    /// Returns the docking edge and requested size of a stable panel.
+    pub fn panel_layout(&self, id: &str) -> Option<(PanelSide, usize)> {
+        self.panel_config(id)
+            .map(|config| (config.side, config.width))
+    }
+
+    /// Returns the last chosen panel size for the requested docking axis.
+    pub fn panel_preferred_size(&self, id: &str, side: PanelSide) -> Option<usize> {
+        self.preferred_sizes.get(id)?.axis(side).preferred
+    }
+
+    /// Returns the first configured panel size for the requested docking axis.
+    pub fn panel_default_size(&self, id: &str, side: PanelSide) -> Option<usize> {
+        self.preferred_sizes.get(id)?.axis(side).default
+    }
+
+    fn remember_panel_size(&mut self, id: &str, side: PanelSide, size: usize) {
+        self.preferred_sizes
+            .entry(id.to_string())
+            .or_default()
+            .remember(side, size);
+    }
+
     pub fn close_panel(&mut self, id: &str) {
         self.panels.remove(id);
         self.text_panels.remove(id);
+        self.preferred_sizes.remove(id);
         self.z_order.retain(|panel_id| panel_id != id);
         if self.focused.as_deref() == Some(id) {
             self.focused = None;
@@ -877,7 +982,7 @@ impl PanelManager {
             })
             .cloned()
             .collect::<Vec<_>>();
-        if side == PanelSide::Right {
+        if matches!(side, PanelSide::Right | PanelSide::Bottom) {
             ids.reverse();
         }
         ids
@@ -905,6 +1010,26 @@ impl PanelManager {
             .sum()
     }
 
+    /// Returns the rows reserved by visible panes above the editor.
+    pub fn reserved_top_height(&self) -> usize {
+        self.z_order
+            .iter()
+            .filter_map(|id| self.panel_config(id))
+            .filter(|config| config.side == PanelSide::Top)
+            .map(|config| config.width.saturating_add(1))
+            .sum()
+    }
+
+    /// Returns the rows reserved by visible panes below the editor.
+    pub fn reserved_bottom_height(&self) -> usize {
+        self.z_order
+            .iter()
+            .filter_map(|id| self.panel_config(id))
+            .filter(|config| config.side == PanelSide::Bottom)
+            .map(|config| config.width.saturating_add(1))
+            .sum()
+    }
+
     pub fn handle_focused_key(
         &mut self,
         action: &str,
@@ -915,6 +1040,7 @@ impl PanelManager {
         let focused = self.focused.clone()?;
         if let Some(panel) = self.text_panels.get_mut(&focused) {
             let width = effective_panel_width(&panel.config, terminal_width);
+            let panel_height = effective_panel_height(&panel.config, panel_height);
             match action {
                 "up" => panel.move_scroll(-1, panel_height, width),
                 "down" => panel.move_scroll(1, panel_height, width),
@@ -968,6 +1094,7 @@ impl PanelManager {
         let action = if delta < 0 { "up" } else { "down" };
         if let Some(panel) = self.text_panels.get_mut(id) {
             let width = effective_panel_width(&panel.config, terminal_width);
+            let panel_height = effective_panel_height(&panel.config, panel_height);
             panel.move_scroll(delta, panel_height, width);
             return Some(PanelEvent {
                 panel_id: panel.id.clone(),
@@ -1002,6 +1129,7 @@ impl PanelManager {
             return false;
         };
         let width = effective_panel_width(&panel.config, terminal_width);
+        let panel_height = effective_panel_height(&panel.config, panel_height);
         if let Some(composer) = panel.composer.as_mut() {
             composer.focused = false;
         }
@@ -1276,7 +1404,10 @@ impl PanelManager {
         let top = placement.height.saturating_sub(panel.composer_height());
         Some((
             placement.x.saturating_add(2).saturating_add(column),
-            top.saturating_add(1)
+            placement
+                .y
+                .saturating_add(top)
+                .saturating_add(1)
                 .saturating_add(row.saturating_sub(first)),
         ))
     }
@@ -1387,6 +1518,52 @@ impl PanelManager {
             })
     }
 
+    /// Finds a visible pane divider without treating the pane contents as a grab target.
+    pub(crate) fn panel_divider_at_position(
+        &self,
+        x: usize,
+        y: usize,
+        terminal_width: usize,
+        terminal_height: usize,
+    ) -> Option<PanelDivider> {
+        if x >= terminal_width || y >= terminal_height.saturating_sub(2) {
+            return None;
+        }
+
+        self.panel_placements(terminal_width, terminal_height)
+            .into_iter()
+            .find_map(|placement| {
+                let config = self.panel_config(&placement.id)?;
+                let on_divider = match config.side {
+                    PanelSide::Left => {
+                        x == placement.x.saturating_add(placement.width)
+                            && y >= placement.y
+                            && y < placement.y.saturating_add(placement.height)
+                    }
+                    PanelSide::Right => {
+                        placement.x.checked_sub(1) == Some(x)
+                            && y >= placement.y
+                            && y < placement.y.saturating_add(placement.height)
+                    }
+                    PanelSide::Top => {
+                        y == placement.y.saturating_add(placement.height)
+                            && x >= placement.x
+                            && x < placement.x.saturating_add(placement.width)
+                    }
+                    PanelSide::Bottom => {
+                        placement.y.checked_sub(1) == Some(y)
+                            && x >= placement.x
+                            && x < placement.x.saturating_add(placement.width)
+                    }
+                };
+
+                on_divider.then_some(PanelDivider {
+                    id: placement.id,
+                    side: config.side,
+                })
+            })
+    }
+
     fn panel_placements(
         &self,
         terminal_width: usize,
@@ -1395,76 +1572,141 @@ impl PanelManager {
         let mut placements = Vec::new();
         let mut left_x: usize = 0;
         let mut right_x = terminal_width;
-        let height = terminal_height.saturating_sub(2);
+        let content_height = terminal_height.saturating_sub(2);
+        let reserved_top = self.reserved_top_height().min(content_height);
+        let reserved_bottom = self
+            .reserved_bottom_height()
+            .min(content_height.saturating_sub(reserved_top));
+        let side_height = content_height
+            .saturating_sub(reserved_top)
+            .saturating_sub(reserved_bottom);
+        let mut top_y = 0usize;
+        let mut bottom_y = content_height;
 
         for id in &self.z_order {
             let Some(config) = self.panel_config(id) else {
                 continue;
             };
 
-            let width = effective_panel_width(config, terminal_width);
-            let x = match config.side {
+            let (x, y, width, height) = match config.side {
                 PanelSide::Left => {
+                    let width = effective_panel_width(config, terminal_width)
+                        .min(right_x.saturating_sub(left_x));
                     let x = left_x;
                     left_x = left_x.saturating_add(width.saturating_add(1));
-                    x
+                    (x, reserved_top, width, side_height)
                 }
                 PanelSide::Right => {
+                    let width = effective_panel_width(config, terminal_width)
+                        .min(right_x.saturating_sub(left_x));
                     right_x = right_x.saturating_sub(width);
                     let x = right_x;
                     right_x = right_x.saturating_sub(1);
-                    x
+                    (x, reserved_top, width, side_height)
+                }
+                PanelSide::Top => {
+                    let height = config.width.min(reserved_top.saturating_sub(top_y));
+                    let y = top_y;
+                    top_y = top_y.saturating_add(height.saturating_add(1));
+                    (0, y, terminal_width, height)
+                }
+                PanelSide::Bottom => {
+                    let available =
+                        bottom_y.saturating_sub(content_height.saturating_sub(reserved_bottom));
+                    let height = config.width.min(available);
+                    let y = bottom_y.saturating_sub(height);
+                    bottom_y = y.saturating_sub(1);
+                    (0, y, terminal_width, height)
                 }
             };
 
-            placements.push(PanelPlacement {
-                id: id.clone(),
-                x,
-                y: 0,
-                width,
-                height,
-            });
+            if width > 0 && height > 0 {
+                placements.push(PanelPlacement {
+                    id: id.clone(),
+                    x,
+                    y,
+                    width,
+                    height,
+                });
+            }
         }
 
         placements
     }
 
     pub fn render(&self, buffer: &mut RenderBuffer, theme: &Theme) {
-        let mut left_x: usize = 0;
-        let mut right_x = buffer.width;
+        self.render_with_active_divider(buffer, theme, None, false);
+    }
 
-        for id in &self.z_order {
-            let Some(config) = self.panel_config(id) else {
+    /// Paints pane chrome while accenting only the divider captured by the editor.
+    pub(crate) fn render_with_active_divider(
+        &self,
+        buffer: &mut RenderBuffer,
+        theme: &Theme,
+        active_divider: Option<&str>,
+        use_ascii: bool,
+    ) {
+        for placement in self.panel_placements(buffer.width, buffer.height) {
+            let Some(config) = self.panel_config(&placement.id) else {
                 continue;
             };
-
-            let width = effective_panel_width(config, buffer.width);
-            let (x, separator_x) = match config.side {
-                PanelSide::Left => {
-                    let x = left_x;
-                    left_x = left_x.saturating_add(width.saturating_add(1));
-                    (x, x.checked_add(width))
-                }
-                PanelSide::Right => {
-                    right_x = right_x.saturating_sub(width);
-                    let x = right_x;
-                    right_x = right_x.saturating_sub(1);
-                    (x, x.checked_sub(1))
-                }
+            let position = Point::new(placement.x, placement.y);
+            let is_active = active_divider == Some(placement.id.as_str());
+            let border_style = panel_style(theme, config.border.as_ref());
+            let border_style = if is_active {
+                theme.active_divider_style(
+                    &border_style,
+                    &panel_style(theme, config.surface.as_ref()),
+                )
+            } else {
+                border_style
             };
-
-            if let Some(separator_x) = separator_x.filter(|x| *x < buffer.width) {
-                let border_style = panel_style(theme, config.border.as_ref());
-                let separator = if config.border.is_some() { "│" } else { " " };
-                for y in 0..buffer.height.saturating_sub(2) {
-                    buffer.set_text(separator_x, y, separator, &border_style);
+            let separator = if is_active
+                || config.border.is_some()
+                || self.text_panels.contains_key(&placement.id)
+            {
+                if matches!(config.side, PanelSide::Left | PanelSide::Right) {
+                    if use_ascii {
+                        "|"
+                    } else {
+                        "│"
+                    }
+                } else if use_ascii {
+                    "-"
+                } else {
+                    "─"
                 }
-            }
+            } else {
+                " "
+            };
+            render_panel_separator(
+                buffer,
+                position,
+                placement.width,
+                placement.height,
+                config.side,
+                &border_style,
+                separator,
+            );
 
-            if let Some(panel) = self.panels.get(id) {
-                render_panel(buffer, panel, Point::new(x, 0), width, theme);
-            } else if let Some(panel) = self.text_panels.get(id) {
-                render_text_panel(buffer, panel, Point::new(x, 0), width, theme);
+            if let Some(panel) = self.panels.get(&placement.id) {
+                render_panel_at(
+                    buffer,
+                    panel,
+                    position,
+                    placement.width,
+                    placement.height,
+                    theme,
+                );
+            } else if let Some(panel) = self.text_panels.get(&placement.id) {
+                render_text_panel(
+                    buffer,
+                    panel,
+                    position,
+                    placement.width,
+                    placement.height,
+                    theme,
+                );
             }
         }
     }
@@ -1486,6 +1728,13 @@ pub struct PanelPlacement {
     pub height: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PanelDivider {
+    pub(crate) id: String,
+    pub(crate) side: PanelSide,
+}
+
+#[cfg(test)]
 fn render_panel(
     buffer: &mut RenderBuffer,
     panel: &PluginPanel,
@@ -1493,11 +1742,28 @@ fn render_panel(
     width: usize,
     theme: &Theme,
 ) {
-    if width == 0 || buffer.height <= 2 {
+    render_panel_at(
+        buffer,
+        panel,
+        position,
+        width,
+        buffer.height.saturating_sub(2),
+        theme,
+    );
+}
+
+fn render_panel_at(
+    buffer: &mut RenderBuffer,
+    panel: &PluginPanel,
+    position: Point,
+    width: usize,
+    height: usize,
+    theme: &Theme,
+) {
+    if width == 0 || height == 0 {
         return;
     }
 
-    let height = buffer.height.saturating_sub(2);
     let surface_style = panel_style(theme, panel.config.surface.as_ref());
     let selection_style = theme.list_selection_style();
     let selected_style = theme.selected_style(
@@ -1511,13 +1777,18 @@ fn render_panel(
     };
 
     for y in 0..height {
-        buffer.set_text(position.x, y, &" ".repeat(width), &surface_style);
+        buffer.set_text(
+            position.x,
+            position.y.saturating_add(y),
+            &" ".repeat(width),
+            &surface_style,
+        );
     }
 
     if let Some(title) = &panel.config.title {
         buffer.set_text(
             position.x,
-            0,
+            position.y,
             &fit_display_width(title, width),
             &title_style,
         );
@@ -1532,7 +1803,7 @@ fn render_panel(
         .take(visible_rows)
         .enumerate()
     {
-        let y = rows_start + screen_row;
+        let y = position.y.saturating_add(rows_start + screen_row);
         let index = panel.scroll + screen_row;
         let selected = index == panel.selected;
         if selected {
@@ -1556,15 +1827,20 @@ fn render_text_panel(
     panel: &TextPanel,
     position: Point,
     width: usize,
+    height: usize,
     theme: &Theme,
 ) {
-    if width == 0 || buffer.height <= 2 {
+    if width == 0 || height == 0 {
         return;
     }
 
-    let height = buffer.height.saturating_sub(2);
     for y in 0..height {
-        buffer.set_text(position.x, y, &" ".repeat(width), &theme.style);
+        buffer.set_text(
+            position.x,
+            position.y.saturating_add(y),
+            &" ".repeat(width),
+            &theme.style,
+        );
     }
 
     let header_actions = text_panel_header_actions(&panel.config, width);
@@ -1579,16 +1855,21 @@ fn render_text_panel(
         };
         buffer.set_text(
             position.x,
-            0,
+            position.y,
             &fit_display_width(title, title_width),
             &title_style,
         );
     }
     for (start, _, label) in header_actions {
         let x = position.x + start;
-        buffer.set_text(x, 0, "[", &theme.ui_style.muted);
-        buffer.set_text(x + 1, 0, label, &theme.ui_style.picker_prompt);
-        buffer.set_text(x + 1 + display_width(label), 0, "]", &theme.ui_style.muted);
+        buffer.set_text(x, position.y, "[", &theme.ui_style.muted);
+        buffer.set_text(x + 1, position.y, label, &theme.ui_style.picker_prompt);
+        buffer.set_text(
+            x + 1 + display_width(label),
+            position.y,
+            "]",
+            &theme.ui_style.muted,
+        );
     }
 
     let composer_height = panel.composer_height();
@@ -1604,7 +1885,7 @@ fn render_text_panel(
         render_text_spans(
             buffer,
             position.x,
-            title_rows + offset,
+            position.y.saturating_add(title_rows + offset),
             width,
             line,
             panel.selected_link,
@@ -1634,15 +1915,6 @@ fn render_text_panel(
             theme,
         );
     }
-
-    render_panel_separator(
-        buffer,
-        position,
-        width,
-        height,
-        &panel.config.side,
-        &theme.style,
-    );
 }
 
 fn render_text_panel_composer(
@@ -1656,6 +1928,7 @@ fn render_text_panel_composer(
     if width == 0 {
         return;
     }
+    let top = position.y.saturating_add(top);
     let divider = "─".repeat(width);
     buffer.set_text(
         position.x,
@@ -1740,7 +2013,12 @@ fn render_text_panel_status(
     } else {
         (status.label.clone(), &theme.ui_style.muted)
     };
-    buffer.set_text(position.x, y, &fit_display_width(&text, width), style);
+    buffer.set_text(
+        position.x,
+        position.y.saturating_add(y),
+        &fit_display_width(&text, width),
+        style,
+    );
 }
 
 fn text_panel_header_actions(config: &PanelConfig, width: usize) -> Vec<(usize, &str, &str)> {
@@ -1866,18 +2144,35 @@ fn render_panel_separator(
     position: Point,
     width: usize,
     height: usize,
-    side: &PanelSide,
+    side: PanelSide,
     style: &Style,
+    separator: &str,
 ) {
-    let separator_x = match side {
-        PanelSide::Left => position.x.checked_add(width),
-        PanelSide::Right => position.x.checked_sub(1),
-    };
-    let Some(separator_x) = separator_x.filter(|x| *x < buffer.width) else {
-        return;
-    };
-    for y in 0..height {
-        buffer.set_text(separator_x, y, "│", style);
+    match side {
+        PanelSide::Left | PanelSide::Right => {
+            let separator_x = if side == PanelSide::Left {
+                position.x.checked_add(width)
+            } else {
+                position.x.checked_sub(1)
+            };
+            let Some(separator_x) = separator_x.filter(|x| *x < buffer.width) else {
+                return;
+            };
+            for y in 0..height {
+                buffer.set_text(separator_x, position.y.saturating_add(y), separator, style);
+            }
+        }
+        PanelSide::Top | PanelSide::Bottom => {
+            let separator_y = if side == PanelSide::Top {
+                position.y.checked_add(height)
+            } else {
+                position.y.checked_sub(1)
+            };
+            let Some(separator_y) = separator_y.filter(|y| *y < buffer.height) else {
+                return;
+            };
+            buffer.set_text(position.x, separator_y, &separator.repeat(width), style);
+        }
     }
 }
 
@@ -2066,6 +2361,25 @@ mod tests {
     }
 
     #[test]
+    fn panel_configuration_round_trips_all_four_docking_edges() {
+        for (name, side) in [
+            ("left", PanelSide::Left),
+            ("right", PanelSide::Right),
+            ("top", PanelSide::Top),
+            ("bottom", PanelSide::Bottom),
+        ] {
+            let config: PanelConfig = serde_json::from_value(serde_json::json!({
+                "side": name,
+                "width": 12,
+            }))
+            .expect("all four pane edges should be valid plugin configuration");
+
+            assert_eq!(config.side, side);
+            assert_eq!(serde_json::to_value(&config).unwrap()["side"], name);
+        }
+    }
+
+    #[test]
     fn left_panels_reserve_width_with_separator() {
         let mut manager = PanelManager::default();
         manager.create_panel(
@@ -2101,6 +2415,398 @@ mod tests {
         );
 
         assert_eq!(manager.reserved_right_width(), 25);
+    }
+
+    #[test]
+    fn top_text_panel_uses_full_terminal_width_and_a_horizontal_separator() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "inspector".to_string(),
+            PanelConfig {
+                side: PanelSide::Top,
+                width: 4,
+                title: Some("Inspector".to_string()),
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_text_panel(
+            "inspector",
+            vec![TextPanelBlock {
+                id: "details".to_string(),
+                kind: TextPanelBlockKind::Text,
+                format: TextPanelBlockFormat::Plain,
+                text: "source-backed details".to_string(),
+            }],
+            /*panel_height*/ 10,
+            /*terminal_width*/ 32,
+        );
+
+        assert_eq!(manager.reserved_top_height(), 5);
+        assert_eq!(
+            manager.panel_at_position(/*x*/ 31, /*y*/ 0, /*width*/ 32, /*height*/ 12),
+            Some(PanelPlacement {
+                id: "inspector".to_string(),
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 4,
+            }),
+        );
+
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(/*width*/ 32, /*height*/ 12, &theme.style);
+        manager.render(&mut buffer, &theme);
+
+        assert!(row_text(&buffer, 0).contains("Inspector"));
+        assert!((1..4).any(|y| row_text(&buffer, y).contains("source-backed details")));
+        assert_eq!(row_text(&buffer, 4), "─".repeat(32));
+    }
+
+    #[test]
+    fn bottom_text_panel_renders_at_its_actual_vertical_origin() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "inspector".to_string(),
+            PanelConfig {
+                side: PanelSide::Bottom,
+                width: 4,
+                title: Some("Inspector".to_string()),
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_text_panel(
+            "inspector",
+            vec![TextPanelBlock {
+                id: "details".to_string(),
+                kind: TextPanelBlockKind::Text,
+                format: TextPanelBlockFormat::Plain,
+                text: "bottom details".to_string(),
+            }],
+            /*panel_height*/ 10,
+            /*terminal_width*/ 32,
+        );
+
+        assert_eq!(manager.reserved_bottom_height(), 5);
+        assert_eq!(
+            manager.panel_at_position(/*x*/ 31, /*y*/ 6, /*width*/ 32, /*height*/ 12),
+            Some(PanelPlacement {
+                id: "inspector".to_string(),
+                x: 0,
+                y: 6,
+                width: 32,
+                height: 4,
+            }),
+        );
+
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(/*width*/ 32, /*height*/ 12, &theme.style);
+        manager.render(&mut buffer, &theme);
+
+        assert_eq!(row_text(&buffer, 5), "─".repeat(32));
+        assert!(row_text(&buffer, 6).contains("Inspector"));
+        assert!((7..10).any(|y| row_text(&buffer, y).contains("bottom details")));
+    }
+
+    #[test]
+    fn four_docking_edges_share_terminal_space_without_overlapping() {
+        let mut manager = PanelManager::default();
+        for (id, side, width) in [
+            ("top", PanelSide::Top, 4),
+            ("left", PanelSide::Left, 12),
+            ("right", PanelSide::Right, 12),
+            ("bottom", PanelSide::Bottom, 4),
+        ] {
+            manager.create_panel(
+                id.to_string(),
+                PanelConfig {
+                    side,
+                    width,
+                    ..PanelConfig::default()
+                },
+            );
+        }
+
+        assert_eq!(manager.reserved_top_height(), 5);
+        assert_eq!(manager.reserved_bottom_height(), 5);
+        assert_eq!(manager.reserved_left_width(), 13);
+        assert_eq!(manager.reserved_right_width(), 13);
+        assert_eq!(
+            manager.panel_placements(/*terminal_width*/ 80, /*terminal_height*/ 24),
+            vec![
+                PanelPlacement {
+                    id: "top".to_string(),
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 4,
+                },
+                PanelPlacement {
+                    id: "left".to_string(),
+                    x: 0,
+                    y: 5,
+                    width: 12,
+                    height: 12,
+                },
+                PanelPlacement {
+                    id: "right".to_string(),
+                    x: 68,
+                    y: 5,
+                    width: 12,
+                    height: 12,
+                },
+                PanelPlacement {
+                    id: "bottom".to_string(),
+                    x: 0,
+                    y: 18,
+                    width: 80,
+                    height: 4,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn panel_divider_hit_testing_covers_all_four_docking_edges() {
+        for (side, divider_x, divider_y) in [
+            (PanelSide::Left, 6, 3),
+            (PanelSide::Right, 33, 3),
+            (PanelSide::Top, 8, 6),
+            (PanelSide::Bottom, 8, 15),
+        ] {
+            let mut manager = PanelManager::default();
+            manager.create_text_panel(
+                "inspector".to_string(),
+                PanelConfig {
+                    side,
+                    width: 6,
+                    ..PanelConfig::default()
+                },
+            );
+
+            let divider = manager
+                .panel_divider_at_position(
+                    divider_x, divider_y, /*terminal_width*/ 40, /*terminal_height*/ 24,
+                )
+                .expect("the actual pane boundary should be draggable");
+
+            assert_eq!(divider.id, "inspector");
+            assert_eq!(divider.side, side);
+            assert!(manager
+                .panel_divider_at_position(
+                    /*x*/ 39, /*y*/ 23, /*terminal_width*/ 40,
+                    /*terminal_height*/ 24,
+                )
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn active_row_panel_dividers_appear_on_all_edges_and_restore_on_release() {
+        let accent = Color::Rgb {
+            r: 203,
+            g: 166,
+            b: 247,
+        };
+
+        for use_ascii in [false, true] {
+            for (side, divider_x, divider_y) in [
+                (PanelSide::Left, 6, 3),
+                (PanelSide::Right, 33, 3),
+                (PanelSide::Top, 8, 6),
+                (PanelSide::Bottom, 8, 15),
+            ] {
+                let mut theme = Theme::default();
+                theme.colors.insert("sash.hoverBorder".to_string(), accent);
+                let mut manager = PanelManager::default();
+                manager.create_panel(
+                    "inspector".to_string(),
+                    PanelConfig {
+                        side,
+                        width: 6,
+                        ..PanelConfig::default()
+                    },
+                );
+                let mut buffer =
+                    RenderBuffer::new(/*width*/ 40, /*height*/ 24, &theme.style);
+                let index = divider_y * buffer.width + divider_x;
+
+                manager.render_with_active_divider(&mut buffer, &theme, None, use_ascii);
+                let inactive = buffer.cells[index].clone();
+                assert_eq!(inactive.c, ' ');
+
+                manager.render_with_active_divider(
+                    &mut buffer,
+                    &theme,
+                    Some("inspector"),
+                    use_ascii,
+                );
+                let active = &buffer.cells[index];
+                let expected = match (side, use_ascii) {
+                    (PanelSide::Left | PanelSide::Right, false) => '│',
+                    (PanelSide::Left | PanelSide::Right, true) => '|',
+                    (PanelSide::Top | PanelSide::Bottom, false) => '─',
+                    (PanelSide::Top | PanelSide::Bottom, true) => '-',
+                };
+
+                assert_eq!(active.c, expected, "{side:?}, ASCII={use_ascii}");
+                assert_eq!(active.style.fg, Some(accent));
+                assert_eq!(active.style.bg, inactive.style.bg);
+                assert!(active.style.bold);
+
+                manager.render_with_active_divider(&mut buffer, &theme, None, use_ascii);
+                assert_eq!(buffer.cells[index], inactive);
+            }
+        }
+    }
+
+    #[test]
+    fn active_text_panel_divider_does_not_highlight_another_pane() {
+        let accent = Color::Rgb {
+            r: 203,
+            g: 166,
+            b: 247,
+        };
+        let mut theme = Theme::default();
+        theme.colors.insert("sash.hoverBorder".to_string(), accent);
+        let mut manager = PanelManager::default();
+        for (id, side) in [("left", PanelSide::Left), ("right", PanelSide::Right)] {
+            manager.create_text_panel(
+                id.to_string(),
+                PanelConfig {
+                    side,
+                    width: 6,
+                    ..PanelConfig::default()
+                },
+            );
+        }
+        let mut buffer = RenderBuffer::new(/*width*/ 40, /*height*/ 24, &theme.style);
+        let left = /*row*/ 3 * buffer.width + /*column*/ 6;
+        let right = /*row*/ 3 * buffer.width + /*column*/ 33;
+        manager.render(&mut buffer, &theme);
+        let inactive_right = buffer.cells[right].clone();
+
+        manager.render_with_active_divider(&mut buffer, &theme, Some("left"), false);
+
+        assert_eq!(buffer.cells[left].c, '│');
+        assert_eq!(buffer.cells[left].style.fg, Some(accent));
+        assert!(buffer.cells[left].style.bold);
+        assert_eq!(buffer.cells[right], inactive_right);
+    }
+
+    #[test]
+    fn moving_a_text_panel_preserves_focus_blocks_and_composer_draft() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "inspector".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 24,
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 2,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_text_panel(
+            "inspector",
+            vec![TextPanelBlock {
+                id: "details".to_string(),
+                kind: TextPanelBlockKind::Text,
+                format: TextPanelBlockFormat::Plain,
+                text: "keep this content".to_string(),
+            }],
+            /*panel_height*/ 20,
+            /*terminal_width*/ 80,
+        );
+        assert!(manager.focus_text_panel_composer("inspector"));
+        manager.handle_focused_text_input(&Event::Paste("keep this draft".to_string()), 80);
+
+        for (side, size) in [
+            (PanelSide::Top, 6),
+            (PanelSide::Bottom, 8),
+            (PanelSide::Left, 20),
+            (PanelSide::Right, 24),
+        ] {
+            assert!(manager.update_panel_layout("inspector", side, size));
+            assert_eq!(manager.focused_panel_id(), Some("inspector"));
+            assert_eq!(manager.panel_layout("inspector"), Some((side, size)));
+            assert_eq!(
+                manager.text_panels["inspector"].blocks[0].text,
+                "keep this content"
+            );
+            let composer = manager.text_panels["inspector"]
+                .composer
+                .as_ref()
+                .expect("moving a pane preserves its composer");
+            assert!(composer.focused);
+            assert_eq!(composer.prompt.text(), "keep this draft");
+        }
+    }
+
+    #[test]
+    fn panel_remembers_independent_vertical_and_horizontal_sizes() {
+        let mut manager = PanelManager::default();
+        manager.create_panel(
+            "tree".to_string(),
+            PanelConfig {
+                side: PanelSide::Left,
+                width: 24,
+                ..PanelConfig::default()
+            },
+        );
+
+        assert_eq!(
+            manager.panel_default_size("tree", PanelSide::Left),
+            Some(24)
+        );
+        assert!(manager.update_panel_layout("tree", PanelSide::Left, 31));
+        assert!(manager.update_panel_layout("tree", PanelSide::Bottom, 8));
+        assert!(manager.update_panel_layout("tree", PanelSide::Bottom, 11));
+
+        assert_eq!(
+            manager.panel_preferred_size("tree", PanelSide::Right),
+            Some(31)
+        );
+        assert_eq!(
+            manager.panel_default_size("tree", PanelSide::Right),
+            Some(24)
+        );
+        assert_eq!(
+            manager.panel_preferred_size("tree", PanelSide::Top),
+            Some(11)
+        );
+        assert_eq!(manager.panel_default_size("tree", PanelSide::Top), Some(8));
+    }
+
+    #[test]
+    fn four_sided_panel_geometry_is_safe_in_tiny_terminals() {
+        for side in [
+            PanelSide::Left,
+            PanelSide::Right,
+            PanelSide::Top,
+            PanelSide::Bottom,
+        ] {
+            let mut manager = PanelManager::default();
+            manager.create_panel(
+                "tree".to_string(),
+                PanelConfig {
+                    side,
+                    width: usize::MAX,
+                    ..PanelConfig::default()
+                },
+            );
+
+            let theme = Theme::default();
+            for (width, height) in [(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)] {
+                let mut buffer = RenderBuffer::new(width, height, &theme.style);
+                manager.render(&mut buffer, &theme);
+                for placement in manager.panel_placements(width, height) {
+                    assert!(placement.x.saturating_add(placement.width) <= width);
+                    assert!(placement.y.saturating_add(placement.height) <= height);
+                }
+            }
+        }
     }
 
     #[test]

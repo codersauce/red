@@ -43,6 +43,53 @@ pub enum Direction {
     Right,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DividerAxis {
+    Vertical,
+    Horizontal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplitBranch {
+    First,
+    Second,
+}
+
+/// Stable split-tree path and original geometry for one draggable window divider.
+#[derive(Debug, Clone)]
+pub(crate) struct WindowDivider {
+    axis: DividerAxis,
+    path: Vec<SplitBranch>,
+    origin: Point,
+    size: (usize, usize),
+}
+
+/// Current terminal-cell segment occupied by one captured split divider.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DividerSpan {
+    axis: DividerAxis,
+    origin: Point,
+    length: usize,
+}
+
+impl DividerSpan {
+    /// Checks one separator cell without confusing neighboring split junctions.
+    pub(crate) fn contains(&self, x: usize, y: usize) -> bool {
+        match self.axis {
+            DividerAxis::Vertical => {
+                x == self.origin.x
+                    && y >= self.origin.y
+                    && y < self.origin.y.saturating_add(self.length)
+            }
+            DividerAxis::Horizontal => {
+                y == self.origin.y
+                    && x >= self.origin.x
+                    && x < self.origin.x.saturating_add(self.length)
+            }
+        }
+    }
+}
+
 /// Represents a single window displaying a buffer
 #[derive(Debug, Clone)]
 pub struct Window {
@@ -151,6 +198,222 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vertical_split_divider_hit_testing_finds_the_actual_shared_column() {
+        let mut manager = WindowManager::new(/*buffer_index*/ 0, (80, 26));
+        manager.split_vertical(/*new_buffer_index*/ 1).unwrap();
+
+        let divider = manager
+            .divider_at_position(/*x*/ 39, /*y*/ 8)
+            .expect("the rendered vertical split should be draggable");
+
+        assert_eq!(divider.axis, DividerAxis::Vertical);
+        assert!(divider.path.is_empty());
+        assert!(manager.divider_at_position(/*x*/ 38, /*y*/ 8).is_none());
+        assert!(manager.divider_at_position(/*x*/ 40, /*y*/ 8).is_none());
+        assert!(manager.divider_at_position(/*x*/ 39, /*y*/ 24).is_none());
+    }
+
+    #[test]
+    fn horizontal_split_divider_hit_testing_finds_the_actual_shared_row() {
+        let mut manager = WindowManager::new(/*buffer_index*/ 0, (80, 26));
+        manager.split_horizontal(/*new_buffer_index*/ 1).unwrap();
+
+        let divider = manager
+            .divider_at_position(/*x*/ 12, /*y*/ 11)
+            .expect("the rendered horizontal split should be draggable");
+
+        assert_eq!(divider.axis, DividerAxis::Horizontal);
+        assert!(manager.divider_at_position(/*x*/ 12, /*y*/ 10).is_none());
+        assert!(manager.divider_at_position(/*x*/ 12, /*y*/ 12).is_none());
+    }
+
+    #[test]
+    fn vertical_divider_span_follows_the_captured_split() {
+        let mut manager = WindowManager::new(/*buffer_index*/ 0, (80, 26));
+        manager.split_vertical(/*new_buffer_index*/ 1).unwrap();
+        let divider = manager
+            .divider_at_position(/*x*/ 39, /*y*/ 8)
+            .expect("the original split must be draggable");
+
+        let original = manager
+            .divider_span(&divider)
+            .expect("the original divider must have a visible span");
+        assert!(original.contains(/*x*/ 39, /*y*/ 0));
+        assert!(original.contains(/*x*/ 39, /*y*/ 23));
+        assert!(!original.contains(/*x*/ 38, /*y*/ 8));
+        assert!(!original.contains(/*x*/ 39, /*y*/ 24));
+
+        assert!(manager.resize_divider(&divider, /*x*/ 54, /*y*/ 8));
+        let moved = manager
+            .divider_span(&divider)
+            .expect("the same captured split must retain a visible span");
+        assert!(moved.contains(/*x*/ 54, /*y*/ 0));
+        assert!(moved.contains(/*x*/ 54, /*y*/ 23));
+        assert!(!moved.contains(/*x*/ 39, /*y*/ 8));
+    }
+
+    #[test]
+    fn horizontal_divider_span_follows_the_captured_split() {
+        let mut manager = WindowManager::new(/*buffer_index*/ 0, (80, 26));
+        manager.split_horizontal(/*new_buffer_index*/ 1).unwrap();
+        let divider = manager
+            .divider_at_position(/*x*/ 12, /*y*/ 11)
+            .expect("the original split must be draggable");
+
+        let original = manager
+            .divider_span(&divider)
+            .expect("the original divider must have a visible span");
+        assert!(original.contains(/*x*/ 0, /*y*/ 11));
+        assert!(original.contains(/*x*/ 79, /*y*/ 11));
+        assert!(!original.contains(/*x*/ 12, /*y*/ 10));
+        assert!(!original.contains(/*x*/ 80, /*y*/ 11));
+
+        assert!(manager.resize_divider(&divider, /*x*/ 12, /*y*/ 16));
+        let moved = manager
+            .divider_span(&divider)
+            .expect("the same captured split must retain a visible span");
+        assert!(moved.contains(/*x*/ 0, /*y*/ 16));
+        assert!(moved.contains(/*x*/ 79, /*y*/ 16));
+        assert!(!moved.contains(/*x*/ 12, /*y*/ 11));
+    }
+
+    #[test]
+    fn dragging_a_vertical_divider_preserves_window_identity_and_focus() {
+        let mut manager = WindowManager::new(/*buffer_index*/ 0, (80, 26));
+        manager.split_vertical(/*new_buffer_index*/ 1).unwrap();
+        let active_id = manager.active_stable_window_id();
+        let divider = manager.divider_at_position(/*x*/ 39, /*y*/ 5).unwrap();
+
+        assert!(manager.resize_divider(&divider, /*x*/ 54, /*y*/ 5));
+
+        assert_eq!(manager.active_stable_window_id(), active_id);
+        assert_eq!(manager.windows()[0].size.0, 54);
+        assert_eq!(manager.windows()[1].position.x, 55);
+        assert_eq!(manager.windows()[1].size.0, 25);
+        assert!(manager.divider_at_position(/*x*/ 54, /*y*/ 5).is_some());
+    }
+
+    #[test]
+    fn vim_width_resize_grows_and_shrinks_either_side_by_exact_cells() {
+        for active_window in [0, 1] {
+            let mut manager = WindowManager::new(/*buffer_index*/ 0, (80, 26));
+            manager.split_vertical(/*new_buffer_index*/ 1).unwrap();
+            manager.set_active(active_window);
+            let before = manager.active_window().unwrap().size.0;
+
+            assert!(manager.resize_window_by_cells(Direction::Right, /*amount*/ 3));
+            assert_eq!(manager.active_window().unwrap().size.0, before + 3);
+
+            assert!(manager.resize_window_by_cells(Direction::Left, /*amount*/ 3));
+            assert_eq!(manager.active_window().unwrap().size.0, before);
+            assert_eq!(manager.active_window_id(), active_window);
+        }
+    }
+
+    #[test]
+    fn vim_height_resize_grows_and_shrinks_either_side_by_exact_cells() {
+        for active_window in [0, 1] {
+            let mut manager = WindowManager::new(/*buffer_index*/ 0, (80, 26));
+            manager.split_horizontal(/*new_buffer_index*/ 1).unwrap();
+            manager.set_active(active_window);
+            let before = manager.active_window().unwrap().size.1;
+
+            assert!(manager.resize_window_by_cells(Direction::Down, /*amount*/ 2));
+            assert_eq!(manager.active_window().unwrap().size.1, before + 2);
+
+            assert!(manager.resize_window_by_cells(Direction::Up, /*amount*/ 2));
+            assert_eq!(manager.active_window().unwrap().size.1, before);
+            assert_eq!(manager.active_window_id(), active_window);
+        }
+    }
+
+    #[test]
+    fn dragging_a_nested_divider_preserves_unrelated_split_ratios() {
+        let mut manager = nested_window_manager();
+        let active_id = manager.active_stable_window_id();
+        let divider = manager
+            .divider_at_position(/*x*/ 5, /*y*/ 11)
+            .expect("the nested left-hand horizontal divider should be draggable");
+
+        assert_eq!(divider.axis, DividerAxis::Horizontal);
+        assert_eq!(divider.path, vec![SplitBranch::First]);
+        assert!(manager.resize_divider(&divider, /*x*/ 5, /*y*/ 16));
+
+        assert_eq!(manager.active_stable_window_id(), active_id);
+        assert!(contains_split_ratio(&manager.root, 0.3));
+        assert!(matches!(
+            &manager.root,
+            Split::Vertical { ratio, .. } if (*ratio - 0.5).abs() < f32::EPSILON
+        ));
+        assert!(manager.divider_at_position(/*x*/ 5, /*y*/ 16).is_some());
+    }
+
+    #[test]
+    fn nested_divider_span_excludes_the_outer_split_and_follows_resize() {
+        let mut manager = nested_window_manager();
+        let divider = manager
+            .divider_at_position(/*x*/ 5, /*y*/ 11)
+            .expect("the nested divider must be draggable");
+
+        let original = manager
+            .divider_span(&divider)
+            .expect("the nested divider must have a visible span");
+        assert!(original.contains(/*x*/ 0, /*y*/ 11));
+        assert!(original.contains(/*x*/ 38, /*y*/ 11));
+        assert!(!original.contains(/*x*/ 39, /*y*/ 11));
+        assert!(!original.contains(/*x*/ 40, /*y*/ 11));
+
+        assert!(manager.resize_divider(&divider, /*x*/ 5, /*y*/ 16));
+        let moved = manager
+            .divider_span(&divider)
+            .expect("the nested divider must follow its current split geometry");
+        assert!(moved.contains(/*x*/ 0, /*y*/ 16));
+        assert!(moved.contains(/*x*/ 38, /*y*/ 16));
+        assert!(!moved.contains(/*x*/ 39, /*y*/ 16));
+        assert!(!moved.contains(/*x*/ 5, /*y*/ 11));
+    }
+
+    #[test]
+    fn dragging_a_split_preserves_nonzero_editor_origin() {
+        let mut manager = WindowManager::new(/*buffer_index*/ 0, (80, 26));
+        manager.split_vertical(/*new_buffer_index*/ 1).unwrap();
+        manager.resize_with_origin(Point::new(/*x*/ 20, /*y*/ 3), (60, 25));
+        let divider = manager
+            .divider_at_position(/*x*/ 49, /*y*/ 8)
+            .expect("a panel-offset editor divider should remain draggable");
+
+        assert!(manager.resize_divider(&divider, /*x*/ 55, /*y*/ 8));
+
+        assert_eq!(manager.windows()[0].position, Point::new(20, 3));
+        assert_eq!(manager.windows()[0].size.0, 35);
+        assert_eq!(manager.windows()[1].position, Point::new(56, 3));
+        assert!(manager.windows().into_iter().all(|window| {
+            window.position.x >= 20
+                && window.position.x.saturating_add(window.size.0) <= 80
+                && window.position.y >= 3
+                && window.position.y.saturating_add(window.size.1) <= 26
+        }));
+    }
+
+    #[test]
+    fn extreme_divider_drags_preserve_nonempty_child_windows() {
+        let mut manager = WindowManager::new(/*buffer_index*/ 0, (8, 8));
+        manager.split_vertical(/*new_buffer_index*/ 1).unwrap();
+        let divider = manager.divider_at_position(/*x*/ 3, /*y*/ 2).unwrap();
+
+        assert!(manager.resize_divider(&divider, /*x*/ 0, /*y*/ 2));
+        assert!(manager
+            .windows()
+            .into_iter()
+            .all(|window| window.size.0 >= 1));
+        assert!(manager.resize_divider(&divider, usize::MAX, /*y*/ 2));
+        assert!(manager
+            .windows()
+            .into_iter()
+            .all(|window| window.size.0 >= 1));
+    }
 
     #[test]
     fn resize_reaches_nested_split_after_outer_membership_check() {
@@ -1027,6 +1290,317 @@ impl WindowManager {
             .map(|(id, w)| (id, *w))
     }
 
+    /// Finds the split divider actually painted at a terminal-cell position.
+    pub(crate) fn divider_at_position(&self, x: usize, y: usize) -> Option<WindowDivider> {
+        let (origin, size) = self.layout_geometry()?;
+        let mut path = Vec::new();
+        Self::find_divider(&self.root, origin, size, x, y, &mut path)
+    }
+
+    /// Resolves a captured divider against the current split-tree geometry.
+    pub(crate) fn divider_span(&self, divider: &WindowDivider) -> Option<DividerSpan> {
+        let (origin, size) = self.layout_geometry()?;
+        Self::find_divider_span(&self.root, origin, size, &divider.path, divider.axis)
+    }
+
+    /// Resizes only the captured divider while preserving root origin and focus.
+    pub(crate) fn resize_divider(&mut self, divider: &WindowDivider, x: usize, y: usize) -> bool {
+        let Some((root_origin, root_size)) = self.layout_geometry() else {
+            return false;
+        };
+
+        let (available, requested, preferred_minimum) = match divider.axis {
+            DividerAxis::Vertical => (
+                divider.size.0.saturating_sub(1),
+                x.saturating_sub(divider.origin.x),
+                10usize,
+            ),
+            DividerAxis::Horizontal => (
+                divider.size.1.saturating_sub(1),
+                y.saturating_sub(divider.origin.y),
+                3usize,
+            ),
+        };
+        if available < 2 {
+            return false;
+        }
+
+        let minimum = if available >= preferred_minimum.saturating_mul(2) {
+            preferred_minimum
+        } else {
+            1
+        };
+        let split = requested.clamp(minimum, available.saturating_sub(minimum));
+        let next_ratio = (split as f32 + 0.5) / available as f32;
+        let Some(ratio) = Self::divider_ratio_mut(&mut self.root, &divider.path, divider.axis)
+        else {
+            return false;
+        };
+        if (*ratio - next_ratio).abs() <= f32::EPSILON {
+            return false;
+        }
+
+        *ratio = next_ratio;
+        self.root.layout(root_origin, root_size);
+        self.set_active(self.active_window_id);
+        true
+    }
+
+    /// Grows or shrinks the active split by terminal cells, independent of its side.
+    pub(crate) fn resize_window_by_cells(&mut self, direction: Direction, amount: usize) -> bool {
+        if amount == 0 {
+            return false;
+        }
+
+        let (axis, grow) = match direction {
+            Direction::Right => (DividerAxis::Vertical, true),
+            Direction::Left => (DividerAxis::Vertical, false),
+            Direction::Down => (DividerAxis::Horizontal, true),
+            Direction::Up => (DividerAxis::Horizontal, false),
+        };
+        let Some(window) = self.active_window().cloned() else {
+            return false;
+        };
+        let Some((divider, position, positive_edge)) = self
+            .window_divider_on_edge(&window, axis, /*positive_edge*/ true)
+            .map(|(divider, position)| (divider, position, true))
+            .or_else(|| {
+                self.window_divider_on_edge(&window, axis, /*positive_edge*/ false)
+                    .map(|(divider, position)| (divider, position, false))
+            })
+        else {
+            return false;
+        };
+
+        let toward_higher_coordinates = grow == positive_edge;
+        let (x, y) = match axis {
+            DividerAxis::Vertical => (
+                if toward_higher_coordinates {
+                    position.x.saturating_add(amount)
+                } else {
+                    position.x.saturating_sub(amount)
+                },
+                position.y,
+            ),
+            DividerAxis::Horizontal => (
+                position.x,
+                if toward_higher_coordinates {
+                    position.y.saturating_add(amount)
+                } else {
+                    position.y.saturating_sub(amount)
+                },
+            ),
+        };
+
+        self.resize_divider(&divider, x, y)
+    }
+
+    fn window_divider_on_edge(
+        &self,
+        window: &Window,
+        axis: DividerAxis,
+        positive_edge: bool,
+    ) -> Option<(WindowDivider, Point)> {
+        match axis {
+            DividerAxis::Vertical => {
+                let x = if positive_edge {
+                    window.position.x.saturating_add(window.size.0)
+                } else {
+                    window.position.x.checked_sub(1)?
+                };
+                let end = window.position.y.saturating_add(window.size.1);
+                (window.position.y..end).find_map(|y| {
+                    let divider = self.divider_at_position(x, y)?;
+                    (divider.axis == axis).then_some((divider, Point::new(x, y)))
+                })
+            }
+            DividerAxis::Horizontal => {
+                let y = if positive_edge {
+                    window.position.y.saturating_add(window.size.1)
+                } else {
+                    window.position.y.checked_sub(1)?
+                };
+                let end = window.position.x.saturating_add(window.size.0);
+                (window.position.x..end).find_map(|x| {
+                    let divider = self.divider_at_position(x, y)?;
+                    (divider.axis == axis).then_some((divider, Point::new(x, y)))
+                })
+            }
+        }
+    }
+
+    fn find_divider(
+        node: &Split,
+        origin: Point,
+        size: (usize, usize),
+        x: usize,
+        y: usize,
+        path: &mut Vec<SplitBranch>,
+    ) -> Option<WindowDivider> {
+        if x < origin.x
+            || x >= origin.x.saturating_add(size.0)
+            || y < origin.y
+            || y >= origin.y.saturating_add(size.1)
+        {
+            return None;
+        }
+
+        match node {
+            Split::Window(_) => None,
+            Split::Vertical { left, right, ratio } => {
+                let available_width = size.0.saturating_sub(1);
+                let split_x = (available_width as f32 * *ratio) as usize;
+                let separator_x = origin.x.saturating_add(split_x);
+                if x == separator_x {
+                    return Some(WindowDivider {
+                        axis: DividerAxis::Vertical,
+                        path: path.clone(),
+                        origin,
+                        size,
+                    });
+                }
+
+                let (branch, child, child_origin, child_size) = if x < separator_x {
+                    (SplitBranch::First, left.as_ref(), origin, (split_x, size.1))
+                } else {
+                    (
+                        SplitBranch::Second,
+                        right.as_ref(),
+                        Point::new(separator_x.saturating_add(1), origin.y),
+                        (available_width.saturating_sub(split_x), size.1),
+                    )
+                };
+                path.push(branch);
+                let found = Self::find_divider(child, child_origin, child_size, x, y, path);
+                path.pop();
+                found
+            }
+            Split::Horizontal { top, bottom, ratio } => {
+                let available_height = size.1.saturating_sub(1);
+                let split_y = (available_height as f32 * *ratio) as usize;
+                let separator_y = origin.y.saturating_add(split_y);
+                if y == separator_y {
+                    return Some(WindowDivider {
+                        axis: DividerAxis::Horizontal,
+                        path: path.clone(),
+                        origin,
+                        size,
+                    });
+                }
+
+                let (branch, child, child_origin, child_size) = if y < separator_y {
+                    (SplitBranch::First, top.as_ref(), origin, (size.0, split_y))
+                } else {
+                    (
+                        SplitBranch::Second,
+                        bottom.as_ref(),
+                        Point::new(origin.x, separator_y.saturating_add(1)),
+                        (size.0, available_height.saturating_sub(split_y)),
+                    )
+                };
+                path.push(branch);
+                let found = Self::find_divider(child, child_origin, child_size, x, y, path);
+                path.pop();
+                found
+            }
+        }
+    }
+
+    fn find_divider_span(
+        node: &Split,
+        origin: Point,
+        size: (usize, usize),
+        path: &[SplitBranch],
+        axis: DividerAxis,
+    ) -> Option<DividerSpan> {
+        match node {
+            Split::Window(_) => None,
+            Split::Vertical { left, right, ratio } => {
+                let available_width = size.0.saturating_sub(1);
+                let split_x = (available_width as f32 * *ratio) as usize;
+                let separator_x = origin.x.saturating_add(split_x);
+
+                if let Some((branch, remaining)) = path.split_first() {
+                    let (child, child_origin, child_size) = match branch {
+                        SplitBranch::First => (left.as_ref(), origin, (split_x, size.1)),
+                        SplitBranch::Second => (
+                            right.as_ref(),
+                            Point::new(separator_x.saturating_add(1), origin.y),
+                            (available_width.saturating_sub(split_x), size.1),
+                        ),
+                    };
+                    return Self::find_divider_span(
+                        child,
+                        child_origin,
+                        child_size,
+                        remaining,
+                        axis,
+                    );
+                }
+
+                (axis == DividerAxis::Vertical && size.0 > 1 && size.1 > 0).then_some(DividerSpan {
+                    axis,
+                    origin: Point::new(separator_x, origin.y),
+                    length: size.1,
+                })
+            }
+            Split::Horizontal { top, bottom, ratio } => {
+                let available_height = size.1.saturating_sub(1);
+                let split_y = (available_height as f32 * *ratio) as usize;
+                let separator_y = origin.y.saturating_add(split_y);
+
+                if let Some((branch, remaining)) = path.split_first() {
+                    let (child, child_origin, child_size) = match branch {
+                        SplitBranch::First => (top.as_ref(), origin, (size.0, split_y)),
+                        SplitBranch::Second => (
+                            bottom.as_ref(),
+                            Point::new(origin.x, separator_y.saturating_add(1)),
+                            (size.0, available_height.saturating_sub(split_y)),
+                        ),
+                    };
+                    return Self::find_divider_span(
+                        child,
+                        child_origin,
+                        child_size,
+                        remaining,
+                        axis,
+                    );
+                }
+
+                (axis == DividerAxis::Horizontal && size.0 > 0 && size.1 > 1).then_some(
+                    DividerSpan {
+                        axis,
+                        origin: Point::new(origin.x, separator_y),
+                        length: size.0,
+                    },
+                )
+            }
+        }
+    }
+
+    fn divider_ratio_mut<'a>(
+        node: &'a mut Split,
+        path: &[SplitBranch],
+        axis: DividerAxis,
+    ) -> Option<&'a mut f32> {
+        let Some((branch, remaining)) = path.split_first() else {
+            return match (node, axis) {
+                (Split::Vertical { ratio, .. }, DividerAxis::Vertical)
+                | (Split::Horizontal { ratio, .. }, DividerAxis::Horizontal) => Some(ratio),
+                _ => None,
+            };
+        };
+
+        let child = match (node, branch) {
+            (Split::Vertical { left, .. }, SplitBranch::First) => left.as_mut(),
+            (Split::Vertical { right, .. }, SplitBranch::Second) => right.as_mut(),
+            (Split::Horizontal { top, .. }, SplitBranch::First) => top.as_mut(),
+            (Split::Horizontal { bottom, .. }, SplitBranch::Second) => bottom.as_mut(),
+            (Split::Window(_), _) => return None,
+        };
+        Self::divider_ratio_mut(child, remaining, axis)
+    }
+
     /// Splits the active window horizontally
     pub fn split_horizontal(&mut self, new_buffer_index: usize) -> Option<()> {
         use crate::log;
@@ -1036,7 +1610,7 @@ impl WindowManager {
         );
 
         // Get the current terminal bounds from the root split
-        let (width, height) = self.get_terminal_bounds();
+        let (origin, (width, height)) = self.layout_geometry()?;
         log!("Terminal bounds: {}x{}", width, height);
         log!("Active window id before split: {}", self.active_window_id);
 
@@ -1049,7 +1623,7 @@ impl WindowManager {
             true,
         )?;
         self.root = new_root;
-        self.root.layout(Point::new(0, 0), (width, height));
+        self.root.layout(origin, (width, height));
 
         // Update active window to the new window
         let windows = self.root.windows();
@@ -1073,7 +1647,7 @@ impl WindowManager {
         );
 
         // Get the current terminal bounds from the root split
-        let (width, height) = self.get_terminal_bounds();
+        let (origin, (width, height)) = self.layout_geometry()?;
         log!("Active window id before split: {}", self.active_window_id);
 
         let new_window_id = WindowId::next();
@@ -1085,7 +1659,7 @@ impl WindowManager {
             false,
         )?;
         self.root = new_root;
-        self.root.layout(Point::new(0, 0), (width, height));
+        self.root.layout(origin, (width, height));
 
         // Update active window to the new window
         let windows = self.root.windows();
@@ -1204,12 +1778,12 @@ impl WindowManager {
         );
 
         // Get the terminal bounds before modification
-        let (width, height) = self.get_terminal_bounds();
+        let (origin, (width, height)) = self.layout_geometry()?;
 
         // Remove the window from the tree
         if let Some(new_root) = self.remove_window(&self.root, self.active_window_id) {
             self.root = new_root;
-            self.root.layout(Point::new(0, 0), (width, height));
+            self.root.layout(origin, (width, height));
 
             // Update active window ID
             let new_window_count = self.root.windows().len();
@@ -1310,7 +1884,7 @@ impl WindowManager {
         use crate::log;
 
         // Get the terminal bounds before modification
-        let (width, height) = self.get_terminal_bounds();
+        let (origin, (width, height)) = self.layout_geometry()?;
 
         // Find the split containing the active window and adjust its ratio
         let active_id = self.active_window_id;
@@ -1338,7 +1912,7 @@ impl WindowManager {
 
         if Self::adjust_split_ratio(&mut self.root, active_id, direction, amount, window_info) {
             // Recalculate layout after adjusting ratios
-            self.root.layout(Point::new(0, 0), (width, height));
+            self.root.layout(origin, (width, height));
             log!(
                 "Window resized successfully in direction {:?} by {}",
                 direction,
@@ -1360,9 +1934,9 @@ impl WindowManager {
             return None;
         }
 
-        let (width, height) = self.get_terminal_bounds();
+        let (origin, (width, height)) = self.layout_geometry()?;
         Self::balance_split(&mut self.root);
-        self.root.layout(Point::new(0, 0), (width, height));
+        self.root.layout(origin, (width, height));
         self.set_active(self.active_window_id);
         Some(())
     }
@@ -1389,13 +1963,13 @@ impl WindowManager {
             return None;
         }
 
-        let (width, height) = self.get_terminal_bounds();
+        let (origin, (width, height)) = self.layout_geometry()?;
         let mut current_id = 0;
         let maximized =
             Self::maximize_window_recursive(&mut self.root, &mut current_id, self.active_window_id);
 
         if maximized {
-            self.root.layout(Point::new(0, 0), (width, height));
+            self.root.layout(origin, (width, height));
             self.set_active(self.active_window_id);
             Some(())
         } else {
@@ -1447,8 +2021,8 @@ impl WindowManager {
         }
 
         let mut window = self.active_window()?.clone();
-        let (width, height) = self.get_terminal_bounds();
-        window.position = Point::new(0, 0);
+        let (origin, (width, height)) = self.layout_geometry()?;
+        window.position = origin;
         window.size = (width, height);
         window.active = true;
 
@@ -1769,22 +2343,29 @@ impl WindowManager {
         best_candidate.map(|(id, _)| id)
     }
 
-    /// Get the total terminal bounds by finding the maximum extents
-    fn get_terminal_bounds(&self) -> (usize, usize) {
+    /// Returns the current editor origin and dimensions without including docked panes.
+    fn layout_geometry(&self) -> Option<(Point, (usize, usize))> {
         let windows = self.root.windows();
         if windows.is_empty() {
-            return (80, 24); // Default size
+            return None;
         }
 
+        let mut min_x = usize::MAX;
+        let mut min_y = usize::MAX;
         let mut max_x = 0;
         let mut max_y = 0;
 
         for window in windows {
-            max_x = max_x.max(window.position.x + window.size.0);
-            max_y = max_y.max(window.position.y + window.size.1);
+            min_x = min_x.min(window.position.x);
+            min_y = min_y.min(window.position.y);
+            max_x = max_x.max(window.position.x.saturating_add(window.size.0));
+            max_y = max_y.max(window.position.y.saturating_add(window.size.1));
         }
 
-        (max_x, max_y)
+        Some((
+            Point::new(min_x, min_y),
+            (max_x.saturating_sub(min_x), max_y.saturating_sub(min_y)),
+        ))
     }
 
     /// Helper method to split a node in the tree

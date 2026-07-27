@@ -1,6 +1,6 @@
 # Red Vim compatibility matrix
 
-**Matrix version:** 1.2
+**Matrix version:** 1.3
 **Validated against:** Red 0.2.4, July 2026
 **Status vocabulary:** **supported**, **intentional difference**, **not yet supported**
 
@@ -12,7 +12,7 @@ the corresponding integration tests.
 
 | Area | Status | Red behavior |
 |---|---|---|
-| Counts | **supported** | Decimal prefixes apply to motions, joins, line-end edits, substitute/delete-character aliases, macro playback, dot-repeat, find/till, and `r`. Nested mappings preserve the prefix until their final key. |
+| Counts | **supported** | Decimal prefixes apply to motions, joins, line-end edits, substitute/delete-character aliases, macro playback, dot-repeat, find/till, `r`, and pane or split resizing. Nested mappings preserve the prefix until their final key, including `5 Ctrl-w >`. |
 | Basic motions | **supported** | `h j k l`, arrows, `0`, `^`, `$`, `w`, `W`, `b`, `e`, `ge`, `B`, `E`, `gE`, `gg`, `G`, viewport-relative `H`, `M`, and `L`, screen-line motions, full/half-page motions, and file percentages use grapheme-safe cursor positions. Counted `H` and `L` honor the visible viewport. |
 | Character motions | **supported** | `f{char}`, `t{char}`, `F{char}`, `T{char}`, counted forms, `;` forward-repeat, and `,` reverse-repeat; delete, change, and yank accept the same suffixes. |
 | Operators | **supported** | `d`, `c`, and `y` with horizontal, line, vertical, file-boundary, line-start/end, small/big-word, previous-word-end, find/till, match, and supported text-object targets. Counted word operators treat blank lines as Neovim motion boundaries; `cw` and `cW` preserve trailing whitespace like Vim. |
@@ -71,8 +71,9 @@ the corresponding integration tests.
 | Unicode graphemes | **supported** | Cursoring, replacement, selection, paste, undo, and marks are tested with multi-codepoint graphemes. Rust-regex offsets are converted to character coordinates before editing. |
 | Empty buffers | **supported** | The synthetic editable line remains cursor-safe across insert, delete, render, and undo. |
 | Final line / trailing newline | **supported** | Both forms render and edit without exposing a phantom gutter line. |
-| Multi-window | **supported** | Active-buffer cursor, viewport, wrapping, gutter width, and focus-cycle state are window-aware; `Ctrl-w H/J/K/L` move the active window to the corresponding outer edge. |
-| Multi-window Vim window command parity | **intentional difference** | Red supports its published `Ctrl-w` subset; arbitrary Vim layouts and every resizing command are not promised. |
+| Multi-window and docked panes | **supported** | Active-buffer cursor, viewport, wrapping, gutter width, and focus-cycle state are window-aware. `Ctrl-w h/j/k/l` moves between editor windows and panes; `Ctrl-w H/J/K/L` moves the focused editor window, row pane, or text pane to the corresponding outer edge without replacing its identity, content, or draft. |
+| Window and pane resizing | **supported** | `Ctrl-w >` / `<` grow or shrink vertical panes and editor splits; `Ctrl-w +` / `-` grow or shrink horizontal panes and editor splits. Counts are supported. `Ctrl-w =` balances editor splits or restores the focused pane's original size. Mouse dragging immediately highlights the captured pane or nested split divider without stealing focus; release or `Esc` restores its normal appearance. |
+| Multi-window Vim window command parity | **intentional difference** | Red supports the documented navigation, edge-movement, resizing, and balancing commands; arbitrary Vim layouts and undocumented window commands are not promised. |
 
 ## Release gate
 
