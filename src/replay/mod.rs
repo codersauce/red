@@ -6,6 +6,7 @@
 
 mod demo;
 mod patch;
+mod plan;
 mod session;
 mod source;
 
@@ -17,6 +18,7 @@ pub use demo::{replay_demo_plan, ReplayDemoPlan, ReplayDemoStep};
 pub use patch::{
     parse_patch, ReplayChangeKind, ReplayFilePatch, ReplayHunk, ReplayHunkRange, ReplayPatch,
 };
+pub use plan::replay_plan_from_session;
 pub use session::{
     ReplayCompletion, ReplayController, ReplayMode, ReplayNote, ReplayNoteCategory,
     ReplayRecoverySnapshot, ReplaySession, ReplaySessionState, ReplayStage, ReplayStep,
