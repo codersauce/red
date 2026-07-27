@@ -385,6 +385,24 @@ impl ReplayController {
         self.session(&id)
     }
 
+    /// Attaches an already verified, editor-owned source session.
+    ///
+    /// Production sessions are normally installed by [`Self::create_session`].
+    /// The editor may also receive a session that was independently constructed
+    /// from a pinned source, such as an isolated integration fixture.
+    pub(crate) fn adopt_session(&mut self, session: ReplaySession) {
+        let id = session.id.clone();
+        self.sources
+            .entry(session.source.id.clone())
+            .or_insert_with(|| session.source.clone());
+        self.workspaces
+            .entry(session.source.id.clone())
+            .or_insert_with(|| session.workspace.clone());
+        self.sessions.entry(id.clone()).or_insert(session);
+        self.active_session = Some(id);
+        self.advance_generation();
+    }
+
     /// Returns a bounded editor-owned session without transferring authority.
     pub fn session(&self, id: &str) -> Result<&ReplaySession, ReplayError> {
         self.sessions
@@ -543,6 +561,36 @@ impl ReplayController {
         }) {
             session.state = ReplaySessionState::Completed;
         }
+        self.advance_generation();
+        Ok(())
+    }
+
+    /// Restores an automatically undone hunk to active, recoverable progress.
+    ///
+    /// A completed dependent step prevents reopening its prerequisite; the
+    /// caller must undo or reopen the dependent original change first.
+    pub fn reopen_step(&mut self, session_id: &str, step_id: &str) -> Result<(), ReplayError> {
+        let session = self.session_mut(session_id)?;
+        if session.steps.iter().any(|candidate| {
+            candidate.status == ReplayStepStatus::Done
+                && candidate
+                    .dependencies
+                    .iter()
+                    .any(|dependency| dependency == step_id)
+        }) {
+            return Err(ReplayError::DependencyBlocked);
+        }
+
+        let index = session
+            .steps
+            .iter()
+            .position(|step| step.id == step_id)
+            .ok_or_else(|| missing("replay step", step_id))?;
+        session.steps[index].status = ReplayStepStatus::Active;
+        session.steps[index].completion = None;
+        session.active_step = Some(step_id.to_string());
+        session.state = ReplaySessionState::Active;
+        session.generation = session.generation.saturating_add(1);
         self.advance_generation();
         Ok(())
     }
@@ -886,7 +934,7 @@ fn has_equidistant_hunk_candidates(text: &str, pattern: &str, old_start: usize) 
     closest_count > 1
 }
 
-pub(super) fn anchored_hunk_offset(
+pub(crate) fn anchored_hunk_offset(
     text: &str,
     pattern: &str,
     old_start: usize,
@@ -1154,6 +1202,64 @@ mod tests {
             ),
             Err(ReplayError::StalePreview)
         ));
+    }
+
+    #[test]
+    fn undone_original_hunk_reopens_recoverable_session_progress() {
+        let (mut controller, session_id, step_id) = controller_with_session();
+        controller
+            .complete_step(&session_id, &step_id, ReplayCompletion::Automatic)
+            .expect("complete the exact automatically applied original hunk");
+        assert_eq!(
+            controller.session(&session_id).unwrap().state,
+            ReplaySessionState::Completed,
+        );
+
+        controller
+            .reopen_step(&session_id, &step_id)
+            .expect("return the undone original hunk to recoverable active progress");
+
+        let session = controller.session(&session_id).unwrap();
+        assert_eq!(session.state, ReplaySessionState::Active);
+        assert_eq!(session.active_step.as_deref(), Some(step_id.as_str()));
+        assert_eq!(session.steps[0].status, ReplayStepStatus::Active);
+        assert_eq!(session.steps[0].completion, None);
+        let recovered = controller
+            .recovery_snapshot()
+            .expect("preserve reopened replay progress in crash recovery");
+        assert_eq!(
+            recovered.sessions[0].steps[0].status,
+            ReplayStepStatus::Active
+        );
+    }
+
+    #[test]
+    fn never_reopens_an_original_hunk_beneath_a_completed_dependent() {
+        let (mut controller, session_id, first_id) = controller_with_session();
+        let second_id = "dependent-original-hunk".to_string();
+        let session = controller.sessions.get_mut(&session_id).unwrap();
+        let mut dependent = session.steps[0].clone();
+        dependent.id = second_id.clone();
+        dependent.ordinal = 2;
+        dependent.dependencies = vec![first_id.clone()];
+        dependent.status = ReplayStepStatus::Pending;
+        dependent.completion = None;
+        session.steps.push(dependent);
+        controller
+            .complete_step(&session_id, &first_id, ReplayCompletion::Automatic)
+            .expect("complete the original prerequisite");
+        controller
+            .complete_step(&session_id, &second_id, ReplayCompletion::Manual)
+            .expect("retain the reviewer-authored dependent change");
+
+        assert!(matches!(
+            controller.reopen_step(&session_id, &first_id),
+            Err(ReplayError::DependencyBlocked),
+        ));
+        let session = controller.session(&session_id).unwrap();
+        assert_eq!(session.steps[0].status, ReplayStepStatus::Done);
+        assert_eq!(session.steps[1].status, ReplayStepStatus::Done);
+        assert_eq!(session.steps[1].completion, Some(ReplayCompletion::Manual));
     }
 
     #[test]

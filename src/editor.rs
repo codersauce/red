@@ -1792,12 +1792,19 @@ impl ActionOnSelection {
 }
 
 #[derive(Debug, Clone)]
+struct ReplayAppliedStep {
+    source_buffer: BufferId,
+    step_id: String,
+}
+
+#[derive(Debug, Clone)]
 struct ReplayDemoWorkspaceState {
     id: String,
     plan: crate::replay::ReplayDemoPlan,
     source_buffer: BufferId,
     source_buffers: HashMap<String, BufferId>,
     source_window: WindowId,
+    applied_steps: Vec<ReplayAppliedStep>,
 }
 
 #[derive(Debug, Clone)]
@@ -3885,13 +3892,17 @@ impl Editor {
             .window_manager
             .active_stable_window_id()
             .ok_or_else(|| anyhow::anyhow!("Replay source has no active editor window"))?;
-        let id = session.id;
+        let id = session.id.clone();
+        if self.replay_controller.session(&id).is_err() {
+            self.replay_controller.adopt_session(session);
+        }
         self.replay_demo_workspace = Some(ReplayDemoWorkspaceState {
             id: id.clone(),
             plan,
             source_buffer,
             source_buffers,
             source_window,
+            applied_steps: Vec::new(),
         });
         Ok(json!({
             "ok": true,
@@ -3946,6 +3957,7 @@ impl Editor {
             source_buffer,
             source_buffers,
             source_window,
+            applied_steps: Vec::new(),
         });
         Ok(json!({
             "ok": true,
@@ -3955,14 +3967,20 @@ impl Editor {
         }))
     }
 
-    fn replay_demo_step_validation(&self, workspace_id: &str, step_id: &str) -> Value {
+    fn replay_demo_step_validation(&mut self, workspace_id: &str, step_id: &str) -> Value {
         let Some(workspace) = self.replay_demo_workspace.as_ref() else {
             return json!({ "ok": false, "error": "replay workspace is not active" });
         };
         if workspace.id != workspace_id {
             return json!({ "ok": false, "error": "replay workspace is stale" });
         }
-        let Some(step) = workspace.plan.steps.iter().find(|step| step.id == step_id) else {
+        let Some(step) = workspace
+            .plan
+            .steps
+            .iter()
+            .find(|step| step.id == step_id)
+            .cloned()
+        else {
             return json!({ "ok": false, "error": "replay step is not part of the original source" });
         };
         let Some(index) = self.replay_step_source_index(workspace_id, step_id) else {
@@ -3970,7 +3988,52 @@ impl Editor {
         };
         let source = &self.buffer_manager[index];
         let contents = source.contents();
-        let state = if contents == step.after {
+        let revision = source.revision();
+        let state = if self.replay_controller.session(workspace_id).is_ok() {
+            let validation = match self.replay_controller.validate_step(
+                workspace_id,
+                step_id,
+                Path::new(&step.path),
+                &contents,
+            ) {
+                Ok(validation) => validation,
+                Err(error) => {
+                    return json!({ "ok": false, "error": error.to_string() });
+                }
+            };
+            match validation {
+                crate::replay::ReplayValidation::Exact => {
+                    let completed = self
+                        .replay_controller
+                        .session(workspace_id)
+                        .ok()
+                        .and_then(|session| {
+                            session
+                                .steps
+                                .iter()
+                                .find(|candidate| candidate.id == step_id)
+                        })
+                        .is_some_and(|candidate| {
+                            candidate.status == crate::replay::ReplayStepStatus::Done
+                        });
+                    if !completed {
+                        if let Err(error) = self.replay_controller.complete_step(
+                            workspace_id,
+                            step_id,
+                            crate::replay::ReplayCompletion::Manual,
+                        ) {
+                            return json!({ "ok": false, "error": error.to_string() });
+                        }
+                    }
+                    "exact"
+                }
+                crate::replay::ReplayValidation::Incomplete => "incomplete",
+                crate::replay::ReplayValidation::Ambiguous => "ambiguous",
+                crate::replay::ReplayValidation::Conflict => "conflict",
+                crate::replay::ReplayValidation::Blocked => "blocked",
+                crate::replay::ReplayValidation::Unsupported => "unsupported",
+            }
+        } else if contents == step.after {
             "exact"
         } else if contents == step.before {
             "incomplete"
@@ -3982,7 +4045,7 @@ impl Editor {
             "workspace_id": workspace_id,
             "step_id": step_id,
             "state": state,
-            "revision": source.revision(),
+            "revision": revision,
         })
     }
 
@@ -4014,21 +4077,64 @@ impl Editor {
             "finish the active source transaction before applying a replay hunk"
         );
         anyhow::ensure!(source.revision() == revision, "replay preview is stale");
-        anyhow::ensure!(
-            source.contents() == step.before,
-            "replay source no longer matches the original hunk pre-image"
-        );
+        let source_buffer = source.id();
+        let contents = source.contents();
+        let real_session = self.replay_controller.session(workspace_id).is_ok();
+        let (range, replacement) = if real_session {
+            let path = Path::new(&step.path);
+            let stage = self.replay_controller.stage_step(
+                workspace_id,
+                step_id,
+                path,
+                &contents,
+                revision,
+            )?;
+            let stage =
+                self.replay_controller
+                    .consume_stage(&stage.token, path, &contents, revision)?;
+            (stage.range, stage.replacement)
+        } else {
+            anyhow::ensure!(
+                contents == step.before,
+                "replay source no longer matches the original hunk pre-image"
+            );
+            let patch = crate::replay::parse_patch(&step.diff, self.replay_controller.limits())?;
+            anyhow::ensure!(
+                patch.files.len() == 1
+                    && patch.files[0].path() == Some(Path::new(&step.path))
+                    && patch.files[0].hunks.len() == 1,
+                "replay step does not contain its exact original source hunk"
+            );
+            let hunk = &patch.files[0].hunks[0];
+            let start = if hunk.before.is_empty() {
+                anyhow::ensure!(
+                    contents.is_empty(),
+                    "replay source is not an empty new file"
+                );
+                0
+            } else {
+                crate::replay::anchored_hunk_offset(&contents, &hunk.before, hunk.old_range.start)?
+            };
+            let start_char = contents[..start].chars().count();
+            let end_char = start_char + hunk.before.chars().count();
+            (
+                TextRange::new(
+                    source.char_idx_to_position(start_char),
+                    source.char_idx_to_position(end_char),
+                ),
+                hunk.after.clone(),
+            )
+        };
         let focused_panel = self.panel_manager.focused_panel_id().map(str::to_owned);
         anyhow::ensure!(
             self.focus_replay_step_source(workspace_id, step_id),
             "replay source window is no longer open"
         );
         anyhow::ensure!(
-            self.current_buffer().id() == self.buffer_manager[source_index].id(),
+            self.current_buffer().id() == source_buffer,
             "replay source focus changed before application"
         );
 
-        let end = self.current_buffer().char_idx_to_position(usize::MAX);
         self.begin_transaction_with_origin(
             "apply PR replay hunk",
             EditOrigin::Replay {
@@ -4036,11 +4142,21 @@ impl Editor {
                 step_id: step_id.to_string(),
             },
         );
-        self.replace_range(
-            TextRange::new(TextPosition::new(/*line*/ 0, /*character*/ 0), end),
-            &step.after,
-        );
+        self.replace_range(range, &replacement);
         self.commit_transaction(self.cursor_snapshot());
+        if real_session {
+            self.replay_controller.complete_step(
+                workspace_id,
+                step_id,
+                crate::replay::ReplayCompletion::Automatic,
+            )?;
+        }
+        if let Some(workspace) = self.replay_demo_workspace.as_mut() {
+            workspace.applied_steps.push(ReplayAppliedStep {
+                source_buffer,
+                step_id: step_id.to_string(),
+            });
+        }
         if let Err(error) = self.notify_change(runtime).await {
             log!("Replay hunk was applied but change notification failed: {error}");
         }
@@ -4062,16 +4178,22 @@ impl Editor {
         render_buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
-        let Some(workspace_id) = self
-            .replay_demo_workspace
-            .as_ref()
-            .map(|workspace| workspace.id.clone())
-        else {
+        let Some(workspace) = self.replay_demo_workspace.as_ref() else {
             self.last_error = Some("No Replay scratch workspace is active".to_string());
             self.render(render_buffer)?;
             return Ok(());
         };
-        let Some(source_index) = self.replay_demo_source_index(&workspace_id) else {
+        let workspace_id = workspace.id.clone();
+        let Some(applied) = workspace.applied_steps.last().cloned() else {
+            self.last_error = Some("No applied Replay hunk is available to undo".to_string());
+            self.render(render_buffer)?;
+            return Ok(());
+        };
+        let Some(source_index) = self
+            .buffer_manager
+            .iter()
+            .position(|source| source.id() == applied.source_buffer)
+        else {
             self.last_error = Some("The Replay scratch source is no longer open".to_string());
             self.render(render_buffer)?;
             return Ok(());
@@ -4086,11 +4208,11 @@ impl Editor {
             .undo_history
             .latest_transaction()
             .map(|transaction| &transaction.origin);
-        let step_id = match latest_origin {
+        match latest_origin {
             Some(EditOrigin::Replay {
                 session_id,
                 step_id,
-            }) if session_id == &workspace_id => step_id.clone(),
+            }) if session_id == &workspace_id && step_id == &applied.step_id => {}
             _ => {
                 self.last_error = Some(if latest_origin.is_some() {
                     "Newer scratch edits must be undone from the source first".to_string()
@@ -4100,16 +4222,39 @@ impl Editor {
                 self.render(render_buffer)?;
                 return Ok(());
             }
-        };
+        }
+
+        if let Ok(session) = self.replay_controller.session(&workspace_id) {
+            if session.steps.iter().any(|candidate| {
+                candidate.status == crate::replay::ReplayStepStatus::Done
+                    && candidate
+                        .dependencies
+                        .iter()
+                        .any(|dependency| dependency == &applied.step_id)
+            }) {
+                self.last_error = Some(
+                    "Undo the completed dependent replay hunk before its prerequisite".to_string(),
+                );
+                self.render(render_buffer)?;
+                return Ok(());
+            }
+        }
 
         let focused_panel = self.panel_manager.focused_panel_id().map(str::to_owned);
-        if !self.focus_replay_demo_source(&workspace_id) {
+        if !self.focus_replay_step_source(&workspace_id, &applied.step_id) {
             self.last_error =
                 Some("The Replay scratch source window is no longer open".to_string());
             self.render(render_buffer)?;
             return Ok(());
         }
         self.undo_transaction(render_buffer, runtime).await?;
+        if self.replay_controller.session(&workspace_id).is_ok() {
+            self.replay_controller
+                .reopen_step(&workspace_id, &applied.step_id)?;
+        }
+        if let Some(workspace) = self.replay_demo_workspace.as_mut() {
+            workspace.applied_steps.pop();
+        }
         if let Some(panel_id) = focused_panel {
             self.panel_manager.focus_panel(&panel_id);
             self.render(render_buffer)?;
@@ -4120,7 +4265,7 @@ impl Editor {
                 "replay:undone",
                 json!({
                     "workspace_id": workspace_id,
-                    "step_id": step_id,
+                    "step_id": applied.step_id,
                 }),
             )
             .await?;
@@ -22172,7 +22317,10 @@ mod test {
         std::fs::create_dir(root.join("src")).expect("fixture source directory");
         std::fs::write(
             root.join("src/first.rs"),
-            "fn first() {\n    before_first();\n}\n",
+            concat!(
+                "fn first() {\n    before_first();\n}\n\n",
+                "fn unrelated_original_source() {\n    preserve_me();\n}\n",
+            ),
         )
         .expect("first merge-base source");
         std::fs::write(
@@ -22307,6 +22455,204 @@ mod test {
             std::fs::read_to_string(directory.path().join("src/second.rs"))
                 .unwrap()
                 .contains("before_second()")
+        );
+    }
+
+    #[tokio::test]
+    async fn real_replay_applies_only_the_original_hunk_transaction() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let (_directory, session, workspace) = real_replay_session_fixture();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        let mut runtime = Runtime::new();
+        let response = editor
+            .install_replay_source_session(session, "feature/replay", workspace, &mut render_buffer)
+            .await
+            .expect("open the original source-backed review session");
+        let workspace_id = response["workspace_id"].as_str().unwrap();
+        let step_id = response["plan"]["steps"][0]["id"].as_str().unwrap();
+        let original = editor.current_buffer().contents();
+        let revision = editor.replay_demo_step_validation(workspace_id, step_id)["revision"]
+            .as_u64()
+            .unwrap();
+
+        editor
+            .apply_replay_demo_step(workspace_id, step_id, revision, &mut runtime)
+            .await
+            .expect("apply exactly the pinned original source hunk");
+
+        let transaction = editor
+            .current_buffer()
+            .undo_history
+            .latest_transaction()
+            .expect("one attributed original-hunk transaction");
+        assert_eq!(transaction.edits.len(), 1);
+        match &transaction.edits[0] {
+            crate::undo::TextEdit::Replace {
+                old_text, new_text, ..
+            } => {
+                assert_eq!(old_text, "fn first() {\n    before_first();\n}\n");
+                assert_eq!(new_text, "fn first() {\n    after_first();\n}\n");
+                assert!(old_text.len() < original.len());
+            }
+        }
+        assert!(editor
+            .current_buffer()
+            .contents()
+            .contains("fn unrelated_original_source() {\n    preserve_me();\n}"));
+        let step = &editor
+            .replay_controller
+            .session(workspace_id)
+            .unwrap()
+            .steps[0];
+        assert_eq!(step.status, crate::replay::ReplayStepStatus::Done);
+        assert_eq!(
+            step.completion,
+            Some(crate::replay::ReplayCompletion::Automatic),
+        );
+    }
+
+    #[tokio::test]
+    async fn real_replay_undo_follows_the_applied_file_after_cross_file_navigation() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let (directory, session, workspace) = real_replay_session_fixture();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        let mut runtime = Runtime::new();
+        let response = editor
+            .install_replay_source_session(session, "feature/replay", workspace, &mut render_buffer)
+            .await
+            .expect("open both original scratch source files");
+        let workspace_id = response["workspace_id"].as_str().unwrap().to_string();
+        let first = response["plan"]["steps"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let second = response["plan"]["steps"][1]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let revision = editor.replay_demo_step_validation(&workspace_id, &first)["revision"]
+            .as_u64()
+            .unwrap();
+        editor
+            .apply_replay_demo_step(&workspace_id, &first, revision, &mut runtime)
+            .await
+            .expect("apply the first file's exact original hunk");
+        assert!(editor.focus_replay_step_source(&workspace_id, &second));
+        assert!(editor.current_buffer().name().ends_with("/src/second.rs"));
+        editor.test_create_text_panel(
+            "replay-coach",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Left,
+                width: 46,
+                title: Some("PR REPLAY".to_string()),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        assert!(editor.test_focus_panel("replay-coach"));
+
+        editor
+            .execute(&Action::ReplayUndo, &mut render_buffer, &mut runtime)
+            .await
+            .expect("undo the latest actual applied source hunk from another file");
+
+        assert_eq!(editor.test_focused_panel_id(), Some("replay-coach"));
+        assert!(editor.current_buffer().name().ends_with("/src/first.rs"));
+        assert!(editor
+            .current_buffer()
+            .contents()
+            .contains("before_first()"));
+        assert!(!editor.current_buffer().contents().contains("after_first()"));
+        assert!(editor
+            .current_buffer()
+            .contents()
+            .contains("unrelated_original_source"));
+        assert!(editor
+            .replay_demo_workspace
+            .as_ref()
+            .unwrap()
+            .applied_steps
+            .is_empty());
+        let step = &editor
+            .replay_controller
+            .session(&workspace_id)
+            .unwrap()
+            .steps[0];
+        assert_eq!(step.status, crate::replay::ReplayStepStatus::Active);
+        assert_eq!(step.completion, None);
+        assert!(
+            std::fs::read_to_string(directory.path().join("src/first.rs"))
+                .unwrap()
+                .contains("before_first()")
+        );
+    }
+
+    #[tokio::test]
+    async fn real_cross_file_undo_never_overwrites_a_newer_original_file_edit() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let (_directory, session, workspace) = real_replay_session_fixture();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        let mut runtime = Runtime::new();
+        let response = editor
+            .install_replay_source_session(session, "feature/replay", workspace, &mut render_buffer)
+            .await
+            .expect("open both original scratch source files");
+        let workspace_id = response["workspace_id"].as_str().unwrap().to_string();
+        let first = response["plan"]["steps"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let second = response["plan"]["steps"][1]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let revision = editor.replay_demo_step_validation(&workspace_id, &first)["revision"]
+            .as_u64()
+            .unwrap();
+        editor
+            .apply_replay_demo_step(&workspace_id, &first, revision, &mut runtime)
+            .await
+            .expect("apply the first original hunk");
+        let end = editor.current_buffer().char_idx_to_position(usize::MAX);
+        editor.begin_transaction("manual cross-file replay observation");
+        editor.replace_range(TextRange::new(end, end), "\n// keep my review note\n");
+        editor.commit_transaction(editor.cursor_snapshot());
+        let manually_edited = editor.current_buffer().contents();
+        assert!(editor.focus_replay_step_source(&workspace_id, &second));
+
+        editor
+            .execute(&Action::ReplayUndo, &mut render_buffer, &mut runtime)
+            .await
+            .expect("refuse to undo through a newer reviewer-authored transaction");
+
+        let first_index = editor
+            .replay_step_source_index(&workspace_id, &first)
+            .expect("preserved first source buffer");
+        assert_eq!(
+            editor.buffer_manager[first_index].contents(),
+            manually_edited
+        );
+        assert!(editor.current_buffer().name().ends_with("/src/second.rs"));
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("Newer scratch edits")));
+        assert_eq!(
+            editor
+                .replay_demo_workspace
+                .as_ref()
+                .unwrap()
+                .applied_steps
+                .len(),
+            1,
         );
     }
 

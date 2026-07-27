@@ -22,6 +22,7 @@ pub use plan::{
     replay_plan_from_session, replay_presentation_plan, ReplayPresentationPlan,
     ReplayPresentationStep,
 };
+pub(crate) use session::anchored_hunk_offset;
 pub use session::{
     ReplayCompletion, ReplayController, ReplayMode, ReplayNote, ReplayNoteCategory,
     ReplayRecoverySnapshot, ReplaySession, ReplaySessionState, ReplayStage, ReplayStep,
