@@ -15,6 +15,12 @@ unrelated plugins continue. While Red is pre-1.0:
 - removing or incompatibly changing a call requires a host-API minor bump, a change
   manifest entry, and a migration note.
 
+Host API `0.5.1` preserves the complete `0.4.0` contract. Existing filesystem
+plugins declaring `"red_api_version": "^0.4.0"` therefore continue to load
+without editing their metadata; plugins that require the new Replay host calls
+must explicitly declare the `0.5.x` version that introduced those calls. Older
+unsupported minor ranges and future incompatible versions remain quarantined.
+
 Load runs parse, name resolution, and type checking against Red's host declarations
 before activation. Diagnostics retain source spans and use stable families:
 `HUSK-P0001` for parsing, `HUSK-T0001` for semantic/type errors, and `HUSK-A0001` for a
@@ -52,6 +58,8 @@ window. Hiding the coach preserves both the panel and replay session.
 in-memory scratch source against the Rust-owned original hunk.
 `ReplayDemoApplyStep(callback, workspace_id, step_id, revision)` rejects a stale
 workspace, changed source, nested user transaction, or nonmatching pre-image.
+Its `revision` is a nonnegative, full-width `i64`; it is never narrowed to a
+32-bit integer before reaching the editor's checked buffer revision.
 Successful application becomes exactly one attributed, undoable editor
 transaction. These preview calls never create files or branches, fetch GitHub,
 stage changes, save buffers, or submit reviews.

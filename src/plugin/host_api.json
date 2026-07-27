@@ -92,7 +92,7 @@
     { "name": "ReplayDemoPlan", "kind": "request", "signature": "(callback: fn(Json))", "introduced": "0.5.0" },
     { "name": "ReplayDemoOpenWorkspace", "kind": "request", "signature": "(callback: fn(Json))", "introduced": "0.5.0" },
     { "name": "ReplayDemoValidateStep", "kind": "request", "signature": "(callback: fn(Json), workspace_id: String, step_id: String)", "introduced": "0.5.0" },
-    { "name": "ReplayDemoApplyStep", "kind": "request", "signature": "(callback: fn(Json), workspace_id: String, step_id: String, revision: i32)", "introduced": "0.5.0" },
+    { "name": "ReplayDemoApplyStep", "kind": "request", "signature": "(callback: fn(Json), workspace_id: String, step_id: String, revision: i64)", "introduced": "0.5.0" },
     { "name": "ReplayResolvePullRequest", "kind": "request", "signature": "(callback: fn(Json), input: String)", "introduced": "0.5.1" },
     { "name": "ReplayResolveLocalBranch", "kind": "request", "signature": "(callback: fn(Json), head: String, base: String)", "introduced": "0.5.1" },
     { "name": "ReplayFetchPullRequestObjects", "kind": "request", "signature": "(callback: fn(Json), source_id: String, confirmed: bool)", "introduced": "0.5.1" },

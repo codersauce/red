@@ -435,7 +435,7 @@ fn literal_matches(expected: &str, actual: &str) -> bool {
     match expected {
         "String" => actual == "string",
         "bool" => actual == "boolean",
-        "i32" | "u32" | "usize" => actual == "number",
+        "i32" | "i64" | "u32" | "usize" => actual == "number",
         ty if ty.starts_with('[') => actual == "array",
         ty if ty.starts_with("fn(") => false,
         "Json" => true,
@@ -764,6 +764,10 @@ mod tests {
             (
                 "DisplayColumnToCharIndex",
                 "(callback: fn(Json), column: i32, y: i32)",
+            ),
+            (
+                "ReplayDemoApplyStep",
+                "(callback: fn(Json), workspace_id: String, step_id: String, revision: i64)",
             ),
         ];
         for (name, signature) in expected {

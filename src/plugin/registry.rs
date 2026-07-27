@@ -34,6 +34,9 @@ pub struct PluginRegistry {
 /// Host API version used for plugin compatibility checks.
 pub const RED_HOST_API_VERSION: &str = "0.5.1";
 
+/// Most recent pre-Replay host API whose complete contract remains available.
+const RED_BACKWARDS_COMPATIBLE_HOST_API_VERSION: &str = "0.4.0";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PluginModification {
     source: Option<SystemTime>,
@@ -783,8 +786,9 @@ fn check_api_compatibility(metadata: &PluginMetadata) -> anyhow::Result<()> {
     let requirement = VersionReq::parse(requirement)
         .map_err(|error| anyhow::anyhow!("invalid red_api_version `{requirement}`: {error}"))?;
     let current = Version::parse(RED_HOST_API_VERSION)?;
+    let backwards_compatible = Version::parse(RED_BACKWARDS_COMPATIBLE_HOST_API_VERSION)?;
     anyhow::ensure!(
-        requirement.matches(&current),
+        requirement.matches(&current) || requirement.matches(&backwards_compatible),
         "plugin requires Red host API `{requirement}`, but this release provides `{current}`; see docs/PLUGIN_API.md"
     );
     Ok(())
@@ -1186,6 +1190,9 @@ mod tests {
     #[test]
     fn pre_one_minor_host_api_requirements_do_not_cross_minor_versions() {
         let mut metadata = PluginMetadata::minimal("composer-plugin".to_string());
+        metadata.red_api_version = Some("^0.4.0".to_string());
+        check_api_compatibility(&metadata).unwrap();
+
         metadata.red_api_version = Some("^0.5.0".to_string());
         check_api_compatibility(&metadata).unwrap();
 
@@ -1404,7 +1411,7 @@ mod tests {
         ));
         assert_eq!(runtime.command_plugin("FutureCommand"), None);
 
-        fs::write(&metadata, r#"{"name":"future","red_api_version":"^0.5.0"}"#).unwrap();
+        fs::write(&metadata, r#"{"name":"future","red_api_version":"^0.4.0"}"#).unwrap();
         registry.reload(&mut runtime).await.unwrap();
 
         assert_eq!(
@@ -1657,7 +1664,7 @@ mod tests {
         .unwrap();
         fs::write(
             &metadata,
-            r#"{"name":"metadata","red_api_version":"^0.5.0"}"#,
+            r#"{"name":"metadata","red_api_version":"^0.4.0"}"#,
         )
         .unwrap();
         let mut registry = PluginRegistry::new();

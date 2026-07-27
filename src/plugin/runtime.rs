@@ -5067,6 +5067,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_hunk_application_preserves_revisions_larger_than_i32() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let (plan, _) = open_replay_demo(&mut runtime).await;
+        let revision = u64::from(u32::MAX) + 17;
+
+        runtime.execute_command("ReplayApply").await.unwrap();
+        let validation = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayDemoValidateStep { request_id, .. } => request_id,
+            _ => panic!("expected validation of the original full-width source revision"),
+        };
+        runtime
+            .resolve_request(
+                validation,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "replay-workspace-1",
+                    "step_id": plan.steps[0].id,
+                    "state": "incomplete",
+                    "revision": revision,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ReplayDemoApplyStep {
+                workspace_id,
+                step_id,
+                revision: applied_revision,
+                ..
+            } if workspace_id == "replay-workspace-1"
+                && step_id == plan.steps[0].id
+                && applied_revision == revision
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
     async fn bundled_replay_does_not_reapply_an_already_reconstructed_hunk() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
