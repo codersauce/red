@@ -1,19 +1,31 @@
-// Safe, bundled preview of the pull-request reconstruction coach.
+// Source-backed pull-request and local-branch reconstruction coach.
 //
-// Rust owns the complete demo patch, editable scratch source, source validation,
-// preview revisions, and undoable application. The coach is a dedicated,
-// source-backed, read-only plugin panel, not an editable editor buffer.
-// This plugin owns presentation, learning mode, and local observations.
-// No demo action fetches GitHub, creates a branch, writes a file, or posts a review.
+// Rust owns trusted GitHub and Git resolution, immutable author hunks, explicit
+// worktree creation, editable scratch sources, validation, and undo transactions.
+// The coach remains a dedicated read-only plugin panel. Creating a worktree or
+// fetching missing PR objects always requires a separate explicit confirmation.
+// No Replay action pushes, saves, commits, or submits a GitHub review.
 
 pub fn activate() {
     red::add_command("Replay", open, Json {
         title: "Open PR Replay Coach",
         category: "PR Replay",
-        description: "Try the safe, mock-backed pull request reconstruction coach",
+        description: "Choose a GitHub pull request, local branch, or safe Replay demo",
         aliases: ["pr replay", "replay coach"],
     });
-    red::add_command("ReplayDemo", open, Json {
+    red::add_command("ReplayPR", open_pull_request, Json {
+        title: "Replay a GitHub pull request",
+        category: "PR Replay",
+        description: "Reconstruct a GitHub PR by number or its canonical URL",
+        aliases: ["replay pull request", "github replay"],
+    });
+    red::add_command("ReplayBranch", open_local_branch, Json {
+        title: "Replay a local branch",
+        category: "PR Replay",
+        description: "Reconstruct a local feature branch against its real merge base",
+        aliases: ["replay local branch", "replay against base"],
+    });
+    red::add_command("ReplayDemo", open_demo, Json {
         title: "Open PR Replay demo",
         category: "PR Replay",
         description: "Open the bundled coach without GitHub or file changes",
@@ -45,9 +57,9 @@ pub fn activate() {
         description: "Switch between Challenge and original-author Snippet modes",
     });
     red::add_command("ReplayValidate", validate, Json {
-        title: "Validate demo replay step",
+        title: "Validate the current replay step",
         category: "PR Replay",
-        description: "Preview the manual reconstruction completion flow",
+        description: "Check the scratch source against the exact original hunk",
     });
     red::add_command("ReplayApply", apply, Json {
         title: "Apply the current original replay hunk",
@@ -62,7 +74,7 @@ pub fn activate() {
     red::add_command("ReplayNote", open_note, Json {
         title: "Add a local replay observation",
         category: "PR Replay",
-        description: "Record a demo-only reviewer observation in memory",
+        description: "Record a private, source-linked reviewer observation",
     });
     red::add_command("ReplayFindings", findings, Json {
         title: "Show local replay findings",
@@ -77,15 +89,19 @@ pub fn activate() {
     red::add_command("ReplayClose", close, Json {
         title: "Hide PR Replay Coach",
         category: "PR Replay",
-        description: "Hide the dedicated coach while preserving this demo session",
+        description: "Hide the dedicated coach while preserving the Replay session",
     });
 
     red::on("panel:event:replay-coach", panel_event);
     red::on("buffer:changed", source_changed);
+    red::on("replay:undone", replay_undone);
     red::state_set("replay_panel_created", false);
     red::state_set("replay_panel_open", false);
     red::state_set("replay_workspace_id", "");
     red::state_set("replay_source_buffer_index", -1);
+    red::state_set("replay_source_kind", "demo");
+    red::state_set("replay_pending_source_id", "");
+    red::state_set("replay_pending_head", "HEAD");
     red::state_set("replay_pull_request", 0);
     red::state_set("replay_author", "");
     red::state_set("replay_branch", "");
@@ -110,20 +126,196 @@ fn open() {
         red::execute("FocusPanel", "replay-coach");
         return;
     }
+    red::execute("OpenPicker", "Start PR Replay", [
+        PickerItem {
+            id: "github",
+            label: "GitHub pull request",
+            data: Json {},
+        },
+        PickerItem {
+            id: "local",
+            label: "Local branch against its base",
+            data: Json {},
+        },
+        PickerItem {
+            id: "demo",
+            label: "Safe in-memory demo",
+            data: Json {},
+        },
+    ], PickerOptions {
+        status: "No branch is changed until you confirm a scratch worktree.",
+    }, PickerHandlers {
+        selected: source_selected,
+        cancelled: source_picker_cancelled,
+    });
+}
+
+fn source_selected(item: PickerItem) {
+    if item.id == "github" {
+        open_pull_request();
+    } else if item.id == "local" {
+        open_local_branch();
+    } else if item.id == "demo" {
+        open_demo();
+    }
+}
+
+fn source_picker_cancelled(event: PickerCancelled) {}
+
+fn open_demo() {
+    if red::string(red::state("replay_workspace_id"), "") != "" {
+        open();
+        return;
+    }
+    red::state_set("replay_source_kind", "demo");
     red::request("ReplayDemoPlan", demo_plan_loaded);
 }
 
-fn demo_plan_loaded(plan: Json) {
-    if red::len(plan.steps) == 0 {
-        red::execute("Print", "Replay demo could not load its original unified hunks");
+fn open_pull_request() {
+    red::execute("OpenInput", "GitHub PR number or URL", "", ComposerHandlers {
+        submitted: pull_request_submitted,
+        cancelled: source_input_cancelled,
+    });
+}
+
+fn pull_request_submitted(value: String) {
+    let input = red::trim(value);
+    if input == "" {
+        red::execute("Print", "Enter a GitHub pull request number or canonical PR URL");
         return;
+    }
+    red::request("ReplayResolvePullRequest", source_resolved, input);
+}
+
+fn open_local_branch() {
+    red::execute("OpenInput", "Local branch to replay", "HEAD", ComposerHandlers {
+        submitted: local_branch_submitted,
+        cancelled: source_input_cancelled,
+    });
+}
+
+fn local_branch_submitted(value: String) {
+    let head = red::trim(value);
+    if head == "" {
+        head = "HEAD";
+    }
+    red::state_set("replay_pending_head", head);
+    red::execute("OpenInput", "Base branch (blank detects the default)", "", ComposerHandlers {
+        submitted: local_base_submitted,
+        cancelled: source_input_cancelled,
+    });
+}
+
+fn local_base_submitted(value: String) {
+    red::request(
+        "ReplayResolveLocalBranch",
+        source_resolved,
+        red::string(red::state("replay_pending_head"), "HEAD"),
+        red::trim(value)
+    );
+}
+
+fn source_input_cancelled(event: ComposerCancelled) {}
+
+fn source_error(result: Json, fallback: String) -> String {
+    return red::string(result.error, red::string(result.message, fallback));
+}
+
+fn source_resolved(result: Json) {
+    if !red::bool(result.ok, false) {
+        red::execute("Print", "Replay source could not be resolved: " + source_error(result, "unknown error"));
+        return;
+    }
+    red::state_set("replay_pending_source_id", red::string(result.source_id, ""));
+    if red::int(result.missing_object_count, 0) > 0 {
+        let message = "Fetch the pinned original objects for PR #" + red::int(result.pull_request, 0)
+            + "? This updates only Replay-owned local Git refs; it never checks out or changes your branch.";
+        red::execute("OpenConfirm", "Fetch original PR objects?", message, PickerHandlers {
+            selected: source_fetch_selected,
+            cancelled: source_fetch_cancelled,
+        });
+        return;
+    }
+    confirm_workspace(result);
+}
+
+fn source_fetch_selected(item: PickerItem) {
+    if item.id != "accept" {
+        return;
+    }
+    red::request(
+        "ReplayFetchPullRequestObjects",
+        source_resolved,
+        red::string(red::state("replay_pending_source_id"), ""),
+        true
+    );
+}
+
+fn source_fetch_cancelled(event: PickerCancelled) {}
+
+fn confirm_workspace(source: Json) {
+    let message = "Create local branch " + red::string(source.workspace_branch, "")
+        + " at the original merge base?\n\n"
+        + red::string(source.workspace_root, "")
+        + "\n\nYour current branch is unchanged. Replay never saves, commits, pushes, or submits a review.";
+    red::state_set("replay_pending_source_id", red::string(source.source_id, ""));
+    red::state_set("replay_source_kind", red::string(source.source_kind, "local_range"));
+    red::execute("OpenConfirm", "Create Replay scratch worktree?", message, PickerHandlers {
+        selected: workspace_creation_selected,
+        cancelled: workspace_creation_cancelled,
+    });
+}
+
+fn workspace_creation_selected(item: PickerItem) {
+    if item.id != "accept" {
+        return;
+    }
+    red::request(
+        "ReplayCreateWorkspace",
+        source_workspace_opened,
+        red::string(red::state("replay_pending_source_id"), ""),
+        true
+    );
+}
+
+fn workspace_creation_cancelled(event: PickerCancelled) {
+    red::state_set("replay_pending_source_id", "");
+}
+
+fn source_workspace_opened(event: Json) {
+    if !red::bool(event.ok, false) {
+        red::execute("Print", "Replay could not create its scratch workspace: " + source_error(event, "unknown error"));
+        return;
+    }
+    if !load_plan(event.plan) {
+        return;
+    }
+    red::state_set("replay_pending_source_id", "");
+    workspace_opened(event);
+}
+
+fn load_plan(plan: Json) -> bool {
+    if red::len(plan.steps) == 0 {
+        red::execute("Print", "Replay could not load its original unified hunks");
+        return false;
     }
     red::state_set("replay_pull_request", red::int(plan.pull_request, 0));
     red::state_set("replay_author", red::string(plan.author, ""));
     red::state_set("replay_branch", red::string(plan.branch, ""));
     red::state_set("replay_title", red::string(plan.title, ""));
     red::state_set("replay_steps", plan.steps);
+    red::state_set("replay_index", 0);
+    red::state_set("replay_notes", []);
+    red::state_set("replay_completions", []);
+    red::state_set("replay_notice", "");
     red::state_set("replay_view", "guide");
+    return true;
+}
+
+fn demo_plan_loaded(plan: Json) {
+    if !load_plan(plan) {
+        return;
+    }
     red::request("ReplayDemoOpenWorkspace", demo_workspace_opened);
 }
 
@@ -132,6 +324,10 @@ fn demo_workspace_opened(event: Json) {
         red::execute("Print", "Replay could not open its scratch source: " + red::string(event.error, "unknown error"));
         return;
     }
+    workspace_opened(event);
+}
+
+fn workspace_opened(event: Json) {
     red::state_set("replay_workspace_id", red::string(event.workspace_id, ""));
     red::state_set("replay_source_buffer_index", red::int(event.source_buffer_index, -1));
     ensure_panel();
@@ -201,6 +397,7 @@ fn next() {
     }
     red::state_set("replay_view", "guide");
     render();
+    sync_selected_source();
 }
 
 fn previous() {
@@ -215,6 +412,24 @@ fn previous() {
     }
     red::state_set("replay_view", "guide");
     render();
+    sync_selected_source();
+}
+
+fn sync_selected_source() {
+    if red::string(red::state("replay_source_kind"), "demo") == "demo" {
+        return;
+    }
+    let steps = red::state("replay_steps");
+    let index = red::int(red::state("replay_index"), 0);
+    if index < 0 || index >= red::len(steps) {
+        return;
+    }
+    red::execute(
+        "ReplayFocusStepSource",
+        red::string(red::state("replay_workspace_id"), ""),
+        red::string(steps[index].id, "")
+    );
+    red::execute("FocusPanel", "replay-coach");
 }
 
 fn toggle_hint() {
@@ -266,11 +481,22 @@ fn source_changed(event: Json) {
     if red::string(red::state("replay_workspace_id"), "") == "" {
         return;
     }
-    if red::int(event.buffer_id, -1) != red::int(red::state("replay_source_buffer_index"), -1) {
+    let index = red::int(red::state("replay_index"), 0);
+    let steps = red::state("replay_steps");
+    if index < 0 || index >= red::len(steps) {
         return;
     }
-
-    let index = red::int(red::state("replay_index"), 0);
+    let source_matches = red::int(event.buffer_id, -1)
+        == red::int(red::state("replay_source_buffer_index"), -1);
+    if red::string(red::state("replay_source_kind"), "demo") != "demo" {
+        source_matches = red::ends_with(
+            red::string(event.buffer_name, ""),
+            "/" + red::string(steps[index].path, "")
+        );
+    }
+    if !source_matches {
+        return;
+    }
     let current_completed = false;
     for completion in red::state("replay_completions") {
         if red::int(completion.index, -1) == index {
@@ -283,6 +509,25 @@ fn source_changed(event: Json) {
 
     remove_completed(index);
     red::state_set("replay_notice", "Scratch source changed; check this step again.");
+    render();
+}
+
+fn replay_undone(event: Json) {
+    if red::string(event.workspace_id, "")
+        != red::string(red::state("replay_workspace_id"), "") {
+        return;
+    }
+    let index = red::int(red::state("replay_index"), 0);
+    let steps = red::state("replay_steps");
+    if index < 0 || index >= red::len(steps) {
+        return;
+    }
+    if red::string(event.step_id, "") != red::string(steps[index].id, "") {
+        return;
+    }
+
+    remove_completed(index);
+    red::state_set("replay_notice", "Undid the original hunk; scratch source restored.");
     render();
 }
 
@@ -424,7 +669,16 @@ fn edit_manually() {
     if !ensure_workspace() {
         return;
     }
-    red::execute("ReplayDemoFocusSource", red::string(red::state("replay_workspace_id"), ""));
+    let workspace = red::string(red::state("replay_workspace_id"), "");
+    if red::string(red::state("replay_source_kind"), "demo") == "demo" {
+        red::execute("ReplayDemoFocusSource", workspace);
+        return;
+    }
+    let steps = red::state("replay_steps");
+    let index = red::int(red::state("replay_index"), 0);
+    if index >= 0 && index < red::len(steps) {
+        red::execute("ReplayFocusStepSource", workspace, red::string(steps[index].id, ""));
+    }
 }
 
 fn close() {
@@ -477,9 +731,14 @@ fn findings_content() -> String {
     let notes = red::state("replay_notes");
     let steps = red::state("replay_steps");
     let content = "# Local reviewer findings\n\n";
-    content = content + "**Mock PR #" + red::int(red::state("replay_pull_request"), 0);
-    content = content + " · @" + red::string(red::state("replay_author"), "original-author") + "**\n\n";
-    content = content + "These observations exist only in the demo session. Nothing is sent to GitHub.\n\n";
+    let pull_request = red::int(red::state("replay_pull_request"), 0);
+    if pull_request > 0 {
+        content = content + "**PR #" + pull_request;
+        content = content + " · @" + red::string(red::state("replay_author"), "original-author") + "**\n\n";
+    } else {
+        content = content + "**Local branch · " + red::string(red::state("replay_branch"), "") + "**\n\n";
+    }
+    content = content + "These observations remain private. Nothing is sent to GitHub.\n\n";
 
     if red::len(notes) == 0 {
         content = content + "No observations yet. Use `Space R o` to add one.\n\n";
@@ -493,6 +752,6 @@ fn findings_content() -> String {
     }
 
     content = content + "`Space R g` return · `Space R o` add note · `Space R q` close\n\n";
-    content = content + "**Safe preview:** no network, branch, file writes, or submitted review.";
+    content = content + "**Private review:** notes never save files, push, or submit a GitHub review.";
     return content;
 }

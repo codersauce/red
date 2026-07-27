@@ -777,6 +777,29 @@ pub enum PluginRequest {
         step_id: String,
         revision: u64,
     },
+    ReplayResolvePullRequest {
+        request_id: RequestId,
+        input: String,
+    },
+    ReplayResolveLocalBranch {
+        request_id: RequestId,
+        head: String,
+        base: String,
+    },
+    ReplayFetchPullRequestObjects {
+        request_id: RequestId,
+        source_id: String,
+        confirmed: bool,
+    },
+    ReplayCreateWorkspace {
+        request_id: RequestId,
+        source_id: String,
+        confirmed: bool,
+    },
+    ReplayFocusStepSource {
+        workspace_id: String,
+        step_id: String,
+    },
     CloseScratchBuffer {
         buffer_index: usize,
     },
@@ -1021,6 +1044,11 @@ impl PluginRequest {
             Self::ReplayDemoFocusSource { .. } => "ReplayDemoFocusSource",
             Self::ReplayDemoValidateStep { .. } => "ReplayDemoValidateStep",
             Self::ReplayDemoApplyStep { .. } => "ReplayDemoApplyStep",
+            Self::ReplayResolvePullRequest { .. } => "ReplayResolvePullRequest",
+            Self::ReplayResolveLocalBranch { .. } => "ReplayResolveLocalBranch",
+            Self::ReplayFetchPullRequestObjects { .. } => "ReplayFetchPullRequestObjects",
+            Self::ReplayCreateWorkspace { .. } => "ReplayCreateWorkspace",
+            Self::ReplayFocusStepSource { .. } => "ReplayFocusStepSource",
             Self::CloseScratchBuffer { .. } => "CloseScratchBuffer",
             Self::GetViewportLayout { .. } => "GetViewportLayout",
             Self::GetWindows { .. } => "GetWindows",
@@ -1768,7 +1796,14 @@ struct ReplayDemoWorkspaceState {
     id: String,
     plan: crate::replay::ReplayDemoPlan,
     source_buffer: BufferId,
+    source_buffers: HashMap<String, BufferId>,
     source_window: WindowId,
+}
+
+#[derive(Debug, Clone)]
+struct ReplaySourceDisplay {
+    head_ref: String,
+    base_ref: String,
 }
 
 /// Single-task owner of Red's interactive application state.
@@ -1791,6 +1826,12 @@ pub struct Editor {
 
     /// Editor-owned original hunks and a stable, fileless scratch-source identity.
     replay_demo_workspace: Option<ReplayDemoWorkspaceState>,
+
+    /// Pinned pull-request sources, confirmed scratch worktrees, and review sessions.
+    replay_controller: crate::replay::ReplayController,
+
+    /// Verified original branch names associated with editor-owned source handles.
+    replay_source_displays: HashMap<String, ReplaySourceDisplay>,
 
     /// LSP client for code intelligence features
     lsp: Box<dyn LspClient>,
@@ -2995,6 +3036,8 @@ impl Editor {
             lsp_coordinator,
             agent_manager,
             replay_demo_workspace: None,
+            replay_controller: crate::replay::ReplayController::default(),
+            replay_source_displays: HashMap::new(),
             lsp,
             config,
             config_diagnostics: Vec::new(),
@@ -3584,6 +3627,22 @@ impl Editor {
             .position(|buffer| buffer.id() == workspace.source_buffer)
     }
 
+    fn replay_step_source_index(&self, workspace_id: &str, step_id: &str) -> Option<usize> {
+        let workspace = self.replay_demo_workspace.as_ref()?;
+        if workspace.id != workspace_id {
+            return None;
+        }
+        let step = workspace
+            .plan
+            .steps
+            .iter()
+            .find(|step| step.id == step_id)?;
+        let source_buffer = workspace.source_buffers.get(&step.path)?;
+        self.buffer_manager
+            .iter()
+            .position(|buffer| buffer.id() == *source_buffer)
+    }
+
     fn focus_replay_demo_source(&mut self, workspace_id: &str) -> bool {
         let Some(workspace) = self.replay_demo_workspace.as_ref() else {
             return false;
@@ -3597,6 +3656,250 @@ impl Editor {
         self.panel_manager.focus_editor();
         self.set_active_window(window_index);
         true
+    }
+
+    fn focus_replay_step_source(&mut self, workspace_id: &str, step_id: &str) -> bool {
+        let Some(source_index) = self.replay_step_source_index(workspace_id, step_id) else {
+            return false;
+        };
+        let Some(workspace) = self.replay_demo_workspace.as_ref() else {
+            return false;
+        };
+        let Some(window_index) = self.window_manager.window_index(workspace.source_window) else {
+            return false;
+        };
+        let source_buffer = self.buffer_manager[source_index].id();
+        let source_vtop = self.buffer_manager[source_index].vtop;
+        let (source_cx, source_cy) = self.buffer_manager[source_index].pos;
+
+        self.panel_manager.focus_editor();
+        self.set_active_window(window_index);
+        self.sync_to_window();
+        let Some(window) = self.window_manager.active_window_mut() else {
+            return false;
+        };
+        window.buffer_index = source_index;
+        window.vtop = source_vtop;
+        window.vleft = 0;
+        window.skipcol = 0;
+        window.cx = source_cx;
+        window.cy = source_cy;
+        window.cursor_goal = CursorGoal::default();
+        self.sync_with_window();
+        if let Some(workspace) = self.replay_demo_workspace.as_mut() {
+            workspace.source_buffer = source_buffer;
+        }
+        true
+    }
+
+    fn replay_source_preview(
+        &mut self,
+        source_id: &str,
+    ) -> Result<Value, crate::replay::ReplayError> {
+        let source = self.replay_controller.source(source_id)?.clone();
+        let (preview, _) = self
+            .replay_controller
+            .prepare_workspace(source_id, /*confirmed*/ false)?;
+        let display = self.replay_source_displays.get(source_id).ok_or_else(|| {
+            crate::replay::ReplayError::NotFound {
+                kind: "replay source display",
+                id: source_id.to_string(),
+            }
+        })?;
+        let patch = crate::replay::parse_patch(&source.patch, self.replay_controller.limits())?;
+        let step_count = patch
+            .files
+            .iter()
+            .filter(|file| file.kind.supports_text_replay())
+            .map(|file| file.hunks.len())
+            .sum::<usize>();
+        if step_count == 0 {
+            return Err(crate::replay::ReplayError::UnsupportedOperation(
+                "the selected source contains no replayable text hunks".to_string(),
+            ));
+        }
+        let context = source.review_context.as_ref();
+        let pull_request = source.pull_request.as_ref();
+        Ok(json!({
+            "ok": true,
+            "source_id": source.id,
+            "source_kind": source.kind,
+            "pull_request": pull_request.map_or(0, |request| request.number),
+            "author": context
+                .and_then(|context| context.author.as_deref())
+                .or_else(|| pull_request.and_then(|request| request.author.as_deref()))
+                .unwrap_or("local"),
+            "title": context
+                .map(|context| context.title.as_str())
+                .unwrap_or("Local branch replay"),
+            "branch": display.head_ref,
+            "base_ref": display.base_ref,
+            "base_commit": source.base_commit.as_str(),
+            "target_commit": source.target_commit.as_str(),
+            "changed_files": patch.files.len(),
+            "step_count": step_count,
+            "missing_object_count": 0,
+            "workspace_root": preview.root,
+            "workspace_branch": preview.branch,
+        }))
+    }
+
+    fn resolve_replay_pull_request(
+        &mut self,
+        input: &str,
+    ) -> Result<Value, crate::replay::ReplayError> {
+        let cwd = std::env::current_dir()
+            .map_err(|error| crate::replay::ReplayError::RepositoryMissing(error.to_string()))?;
+        let resolved =
+            crate::replay::resolve_pull_request(&cwd, input, self.replay_controller.limits())?;
+        let source_id = resolved.source_id.clone();
+        self.replay_source_displays.insert(
+            source_id.clone(),
+            ReplaySourceDisplay {
+                head_ref: resolved.pull_request.head_ref.clone(),
+                base_ref: resolved.pull_request.base_ref.clone(),
+            },
+        );
+        let missing_objects = resolved
+            .missing_objects
+            .iter()
+            .map(|object| object.as_str().to_string())
+            .collect::<Vec<_>>();
+        let pending = json!({
+            "ok": true,
+            "source_id": source_id,
+            "source_kind": "github_pull_request",
+            "pull_request": resolved.pull_request.number,
+            "author": resolved.pull_request.author,
+            "title": resolved.context.title,
+            "branch": resolved.pull_request.head_ref,
+            "base_ref": resolved.pull_request.base_ref,
+            "missing_object_count": missing_objects.len(),
+            "missing_objects": missing_objects,
+        });
+        self.replay_controller.register_pull_request(resolved);
+        if pending["missing_object_count"].as_u64() == Some(0) {
+            self.replay_source_preview(&source_id)
+        } else {
+            Ok(pending)
+        }
+    }
+
+    fn resolve_replay_local_branch(
+        &mut self,
+        head: &str,
+        base: &str,
+    ) -> Result<Value, crate::replay::ReplayError> {
+        let cwd = std::env::current_dir()
+            .map_err(|error| crate::replay::ReplayError::RepositoryMissing(error.to_string()))?;
+        let resolved = crate::replay::resolve_local_branch_source(
+            &cwd,
+            head,
+            (!base.trim().is_empty()).then_some(base),
+            self.replay_controller.limits(),
+        )?;
+        let source_id = resolved.source.id.clone();
+        self.replay_source_displays.insert(
+            source_id.clone(),
+            ReplaySourceDisplay {
+                head_ref: resolved.head_ref,
+                base_ref: resolved.base_ref,
+            },
+        );
+        self.replay_controller.register_source(resolved.source);
+        self.replay_source_preview(&source_id)
+    }
+
+    fn fetch_replay_pull_request_objects(
+        &mut self,
+        source_id: &str,
+        confirmed: bool,
+    ) -> Result<Value, crate::replay::ReplayError> {
+        self.replay_controller.fetch_source(source_id, confirmed)?;
+        self.replay_source_preview(source_id)
+    }
+
+    async fn open_replay_source_workspace(
+        &mut self,
+        source_id: &str,
+        confirmed: bool,
+        render_buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<Value> {
+        if !confirmed {
+            return Ok(crate::replay::ReplayError::WorkspaceConfirmationRequired.payload());
+        }
+        let (_, workspace) = self
+            .replay_controller
+            .prepare_workspace(source_id, /*confirmed*/ true)?;
+        let workspace =
+            workspace.ok_or(crate::replay::ReplayError::WorkspaceConfirmationRequired)?;
+        let session = self.replay_controller.create_session(source_id)?.clone();
+        let branch = self
+            .replay_source_displays
+            .get(source_id)
+            .map(|display| display.head_ref.clone())
+            .unwrap_or_else(|| "local".to_string());
+        self.install_replay_source_session(session, &branch, workspace, render_buffer)
+            .await
+    }
+
+    async fn install_replay_source_session(
+        &mut self,
+        session: crate::replay::ReplaySession,
+        branch: &str,
+        workspace: crate::replay::ReplayWorkspace,
+        render_buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<Value> {
+        let plan = crate::replay::replay_plan_from_session(
+            &session,
+            branch,
+            self.replay_controller.limits(),
+        )?;
+
+        let mut source_buffers = HashMap::new();
+        for step in &plan.steps {
+            if source_buffers.contains_key(&step.path) {
+                continue;
+            }
+            let path = workspace.root.join(&step.path);
+            let source = Buffer::new(
+                Some(path.to_string_lossy().into_owned()),
+                step.before.clone(),
+            );
+            let source_id = source.id();
+            self.buffer_manager.push_buffer(source);
+            source_buffers.insert(step.path.clone(), source_id);
+        }
+        let source_buffer = *source_buffers
+            .get(&plan.source_path)
+            .ok_or_else(|| anyhow::anyhow!("Replay has no initial scratch source"))?;
+        let source_index = self
+            .buffer_manager
+            .iter()
+            .position(|buffer| buffer.id() == source_buffer)
+            .ok_or_else(|| anyhow::anyhow!("Replay scratch source was not opened"))?;
+        self.set_current_buffer(render_buffer, source_index).await?;
+        let source_window = self
+            .window_manager
+            .active_stable_window_id()
+            .ok_or_else(|| anyhow::anyhow!("Replay source has no active editor window"))?;
+        let id = session.id;
+        self.replay_demo_workspace = Some(ReplayDemoWorkspaceState {
+            id: id.clone(),
+            plan: plan.clone(),
+            source_buffer,
+            source_buffers,
+            source_window,
+        });
+        Ok(json!({
+            "ok": true,
+            "workspace_id": id,
+            "source_buffer_index": source_index,
+            "source_window_id": source_window.0,
+            "workspace_root": workspace.root,
+            "workspace_branch": workspace.branch,
+            "plan": plan,
+        }))
     }
 
     async fn open_replay_demo_workspace(
@@ -3634,10 +3937,12 @@ impl Editor {
             .ok_or_else(|| anyhow::anyhow!("replay source has no active editor window"))?;
 
         let id = uuid::Uuid::new_v4().to_string();
+        let source_buffers = HashMap::from([(plan.source_path.clone(), source_buffer)]);
         self.replay_demo_workspace = Some(ReplayDemoWorkspaceState {
             id: id.clone(),
             plan,
             source_buffer,
+            source_buffers,
             source_window,
         });
         Ok(json!({
@@ -3658,7 +3963,7 @@ impl Editor {
         let Some(step) = workspace.plan.steps.iter().find(|step| step.id == step_id) else {
             return json!({ "ok": false, "error": "replay step is not part of the original source" });
         };
-        let Some(index) = self.replay_demo_source_index(workspace_id) else {
+        let Some(index) = self.replay_step_source_index(workspace_id, step_id) else {
             return json!({ "ok": false, "error": "replay scratch source is no longer open" });
         };
         let source = &self.buffer_manager[index];
@@ -3699,7 +4004,7 @@ impl Editor {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("replay step does not belong to the original source"))?;
         let source_index = self
-            .replay_demo_source_index(workspace_id)
+            .replay_step_source_index(workspace_id, step_id)
             .ok_or_else(|| anyhow::anyhow!("replay scratch source is no longer open"))?;
         let source = &self.buffer_manager[source_index];
         anyhow::ensure!(
@@ -3713,7 +4018,7 @@ impl Editor {
         );
         let focused_panel = self.panel_manager.focused_panel_id().map(str::to_owned);
         anyhow::ensure!(
-            self.focus_replay_demo_source(workspace_id),
+            self.focus_replay_step_source(workspace_id, step_id),
             "replay source window is no longer open"
         );
         anyhow::ensure!(
@@ -3779,18 +4084,21 @@ impl Editor {
             .undo_history
             .latest_transaction()
             .map(|transaction| &transaction.origin);
-        if !matches!(
-            latest_origin,
-            Some(EditOrigin::Replay { session_id, .. }) if session_id == &workspace_id
-        ) {
-            self.last_error = Some(if latest_origin.is_some() {
-                "Newer scratch edits must be undone from the source first".to_string()
-            } else {
-                "No applied Replay hunk is available to undo".to_string()
-            });
-            self.render(render_buffer)?;
-            return Ok(());
-        }
+        let step_id = match latest_origin {
+            Some(EditOrigin::Replay {
+                session_id,
+                step_id,
+            }) if session_id == &workspace_id => step_id.clone(),
+            _ => {
+                self.last_error = Some(if latest_origin.is_some() {
+                    "Newer scratch edits must be undone from the source first".to_string()
+                } else {
+                    "No applied Replay hunk is available to undo".to_string()
+                });
+                self.render(render_buffer)?;
+                return Ok(());
+            }
+        };
 
         let focused_panel = self.panel_manager.focused_panel_id().map(str::to_owned);
         if !self.focus_replay_demo_source(&workspace_id) {
@@ -3804,6 +4112,16 @@ impl Editor {
             self.panel_manager.focus_panel(&panel_id);
             self.render(render_buffer)?;
         }
+        self.plugin_registry
+            .notify(
+                runtime,
+                "replay:undone",
+                json!({
+                    "workspace_id": workspace_id,
+                    "step_id": step_id,
+                }),
+            )
+            .await?;
         Ok(())
     }
 
@@ -7306,6 +7624,65 @@ impl Editor {
                     self.plugin_registry
                         .resolve_request(runtime, request_id, payload)
                         .await?;
+                }
+                PluginRequest::ReplayResolvePullRequest { request_id, input } => {
+                    let payload = self
+                        .resolve_replay_pull_request(&input)
+                        .unwrap_or_else(|error| error.payload());
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
+                }
+                PluginRequest::ReplayResolveLocalBranch {
+                    request_id,
+                    head,
+                    base,
+                } => {
+                    let payload = self
+                        .resolve_replay_local_branch(&head, &base)
+                        .unwrap_or_else(|error| error.payload());
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
+                }
+                PluginRequest::ReplayFetchPullRequestObjects {
+                    request_id,
+                    source_id,
+                    confirmed,
+                } => {
+                    let payload = self
+                        .fetch_replay_pull_request_objects(&source_id, confirmed)
+                        .unwrap_or_else(|error| error.payload());
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
+                }
+                PluginRequest::ReplayCreateWorkspace {
+                    request_id,
+                    source_id,
+                    confirmed,
+                } => {
+                    let payload = match self
+                        .open_replay_source_workspace(&source_id, confirmed, buffer)
+                        .await
+                    {
+                        Ok(payload) => {
+                            needs_render = true;
+                            payload
+                        }
+                        Err(error) => json!({ "ok": false, "error": error.to_string() }),
+                    };
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
+                }
+                PluginRequest::ReplayFocusStepSource {
+                    workspace_id,
+                    step_id,
+                } => {
+                    if self.focus_replay_step_source(&workspace_id, &step_id) {
+                        needs_render = true;
+                    }
                 }
                 PluginRequest::CloseScratchBuffer { buffer_index } => {
                     if buffer_index == self.buffer_manager.active_index() {
@@ -21760,6 +22137,166 @@ mod test {
             }
         }
         prints
+    }
+
+    fn real_replay_session_fixture() -> (
+        tempfile::TempDir,
+        crate::replay::ReplaySession,
+        crate::replay::ReplayWorkspace,
+    ) {
+        const PATCH: &str = concat!(
+            "diff --git a/src/first.rs b/src/first.rs\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/src/first.rs\n",
+            "+++ b/src/first.rs\n",
+            "@@ -1,3 +1,3 @@ fn first\n",
+            " fn first() {\n",
+            "-    before_first();\n",
+            "+    after_first();\n",
+            " }\n",
+            "diff --git a/src/second.rs b/src/second.rs\n",
+            "index 3333333..4444444 100644\n",
+            "--- a/src/second.rs\n",
+            "+++ b/src/second.rs\n",
+            "@@ -1,3 +1,3 @@ fn second\n",
+            " fn second() {\n",
+            "-    before_second();\n",
+            "+    after_second();\n",
+            " }\n",
+        );
+
+        let directory = tempfile::tempdir().expect("isolated multi-file replay source fixture");
+        let root = directory.path();
+        std::fs::create_dir(root.join("src")).expect("fixture source directory");
+        std::fs::write(
+            root.join("src/first.rs"),
+            "fn first() {\n    before_first();\n}\n",
+        )
+        .expect("first merge-base source");
+        std::fs::write(
+            root.join("src/second.rs"),
+            "fn second() {\n    before_second();\n}\n",
+        )
+        .expect("second merge-base source");
+        let base = crate::replay::GitObjectId::parse(&"a".repeat(40)).unwrap();
+        let source = crate::replay::ReplaySource {
+            id: "real-replay-source".to_string(),
+            repository: crate::replay::ReplayRepository {
+                root: root.to_path_buf(),
+                common_directory: root.join(".git"),
+                host: "github.com".to_string(),
+                owner: "example".to_string(),
+                name: "repository".to_string(),
+            },
+            kind: crate::replay::ReplaySourceKind::LocalRange,
+            base_commit: base.clone(),
+            target_commit: crate::replay::GitObjectId::parse(&"b".repeat(40)).unwrap(),
+            patch: PATCH.to_string(),
+            patch_digest: crate::replay::digest(PATCH.as_bytes()),
+            pull_request: None,
+            review_context: None,
+        };
+        let workspace = crate::replay::ReplayWorkspace {
+            root: root.to_path_buf(),
+            branch: "replay/revision-bbbbbbb".to_string(),
+            base_commit: base,
+            created_by_replay: true,
+        };
+        let session = crate::replay::ReplaySession::from_source(
+            source,
+            workspace.clone(),
+            crate::replay::ReplayLimits::default(),
+        )
+        .expect("source-backed multi-file review session");
+        (directory, session, workspace)
+    }
+
+    #[tokio::test]
+    async fn real_replay_workspace_requires_confirmation_before_touching_editor_state() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+
+        let result = editor
+            .open_replay_source_workspace(
+                "unconfirmed-source",
+                /*confirmed*/ false,
+                &mut render_buffer,
+            )
+            .await
+            .expect("unconfirmed Replay request fails without creating a workspace");
+
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["code"], "workspace_confirmation_required");
+        assert_eq!(editor.buffer_manager.len(), 1);
+        assert!(editor.replay_demo_workspace.is_none());
+    }
+
+    #[tokio::test]
+    async fn real_replay_opens_each_original_file_without_modifying_the_scratch_worktree() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let (directory, session, workspace) = real_replay_session_fixture();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        let mut runtime = Runtime::new();
+
+        let response = editor
+            .install_replay_source_session(session, "feature/replay", workspace, &mut render_buffer)
+            .await
+            .expect("open the actual multi-file scratch source");
+
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["plan"]["branch"], "feature/replay");
+        assert_eq!(response["plan"]["steps"].as_array().unwrap().len(), 2);
+        assert_eq!(editor.buffer_manager.len(), 3);
+        assert!(editor.current_buffer().name().ends_with("/src/first.rs"));
+        assert!(editor
+            .current_buffer()
+            .contents()
+            .contains("before_first()"));
+
+        let workspace_id = response["workspace_id"].as_str().unwrap();
+        let first = response["plan"]["steps"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let second = response["plan"]["steps"][1]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let first_revision = editor.replay_demo_step_validation(workspace_id, &first)["revision"]
+            .as_u64()
+            .unwrap();
+        editor
+            .apply_replay_demo_step(workspace_id, &first, first_revision, &mut runtime)
+            .await
+            .expect("apply one original hunk to the scratch editor only");
+
+        assert!(editor.current_buffer().contents().contains("after_first()"));
+        assert!(
+            std::fs::read_to_string(directory.path().join("src/first.rs"))
+                .unwrap()
+                .contains("before_first()")
+        );
+        assert!(editor.focus_replay_step_source(workspace_id, &second));
+        assert!(editor.current_buffer().name().ends_with("/src/second.rs"));
+        assert!(editor
+            .current_buffer()
+            .contents()
+            .contains("before_second()"));
+        assert_eq!(
+            editor.replay_demo_step_validation(workspace_id, &second)["state"],
+            "incomplete",
+        );
+        assert!(
+            std::fs::read_to_string(directory.path().join("src/second.rs"))
+                .unwrap()
+                .contains("before_second()")
+        );
     }
 
     #[tokio::test]

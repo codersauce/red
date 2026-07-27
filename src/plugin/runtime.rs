@@ -1316,6 +1316,24 @@ impl RedHost {
                     .to_string();
                 self.send_request(PluginRequest::ReplayDemoFocusSource { workspace_id });
             }
+            "ReplayFocusStepSource" => {
+                let workspace_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ReplayFocusStepSource requires a workspace id")
+                    })?
+                    .to_string();
+                let step_id = args
+                    .get(/*index*/ 1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayFocusStepSource requires a step id"))?
+                    .to_string();
+                self.send_request(PluginRequest::ReplayFocusStepSource {
+                    workspace_id,
+                    step_id,
+                });
+            }
             "SetPanelVisible" => {
                 let id = args
                     .first()
@@ -1502,6 +1520,61 @@ impl RedHost {
                     .get(/*index*/ 2)
                     .and_then(value_to_u64)
                     .ok_or_else(|| anyhow::anyhow!("ReplayDemoApplyStep requires a revision"))?,
+            },
+            "ReplayResolvePullRequest" => PluginRequest::ReplayResolvePullRequest {
+                request_id,
+                input: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ReplayResolvePullRequest requires a pull request")
+                    })?
+                    .to_string(),
+            },
+            "ReplayResolveLocalBranch" => PluginRequest::ReplayResolveLocalBranch {
+                request_id,
+                head: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayResolveLocalBranch requires a branch"))?
+                    .to_string(),
+                base: args
+                    .get(/*index*/ 1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayResolveLocalBranch requires a base"))?
+                    .to_string(),
+            },
+            "ReplayFetchPullRequestObjects" => PluginRequest::ReplayFetchPullRequestObjects {
+                request_id,
+                source_id: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ReplayFetchPullRequestObjects requires a source id")
+                    })?
+                    .to_string(),
+                confirmed: args
+                    .get(/*index*/ 1)
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "ReplayFetchPullRequestObjects requires explicit confirmation"
+                        )
+                    })?,
+            },
+            "ReplayCreateWorkspace" => PluginRequest::ReplayCreateWorkspace {
+                request_id,
+                source_id: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayCreateWorkspace requires a source id"))?
+                    .to_string(),
+                confirmed: args
+                    .get(/*index*/ 1)
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ReplayCreateWorkspace requires explicit confirmation")
+                    })?,
             },
             "GetConfig" => PluginRequest::GetConfig {
                 request_id,
@@ -3237,7 +3310,7 @@ mod tests {
             .load_plugin("replay", include_str!("../../plugins/replay.hk"))
             .await
             .unwrap();
-        runtime.execute_command("Replay").await.unwrap();
+        runtime.execute_command("ReplayDemo").await.unwrap();
 
         let plan_request = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::ReplayDemoPlan { request_id } => request_id,
@@ -3903,6 +3976,409 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_launcher_offers_github_local_branch_and_safe_demo_sources() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("replay", include_str!("../../plugins/replay.hk"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("Replay").await.unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                owner,
+                title,
+                items,
+                options,
+                ..
+            } => {
+                assert_eq!(owner, "replay");
+                assert_eq!(title.as_deref(), Some("Start PR Replay"));
+                assert_eq!(
+                    items
+                        .iter()
+                        .map(|item| item.id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["github", "local", "demo"],
+                );
+                assert!(options
+                    .status
+                    .as_deref()
+                    .is_some_and(|status| status.contains("confirm")));
+            }
+            _ => panic!("expected a GitHub, local branch, and safe-demo source picker"),
+        }
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_pull_request_command_requests_only_trusted_metadata() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("replay", include_str!("../../plugins/replay.hk"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("ReplayPR").await.unwrap();
+        let handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackInput {
+                owner,
+                handle,
+                title,
+                initial,
+            } => {
+                assert_eq!(owner, "replay");
+                assert_eq!(title, "GitHub PR number or URL");
+                assert!(initial.is_empty());
+                handle
+            }
+            _ => panic!("expected a GitHub PR number or canonical URL input"),
+        };
+        assert!(runtime
+            .notify_composer(handle, ComposerCallback::Submitted("159".to_string()))
+            .unwrap());
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ReplayResolvePullRequest { input, .. } if input == "159"
+        ));
+        assert!(
+            ACTION_DISPATCHER.try_recv_request().is_none(),
+            "PR input must not implicitly fetch or create a worktree",
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_local_branch_requires_explicit_scratch_worktree_confirmation() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("replay", include_str!("../../plugins/replay.hk"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("ReplayBranch").await.unwrap();
+        let branch_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackInput {
+                title,
+                initial,
+                handle,
+                ..
+            } => {
+                assert_eq!(title, "Local branch to replay");
+                assert_eq!(initial, "HEAD");
+                handle
+            }
+            _ => panic!("expected the original local feature branch input"),
+        };
+        assert!(runtime
+            .notify_composer(
+                branch_handle,
+                ComposerCallback::Submitted("feature/replay".to_string()),
+            )
+            .unwrap());
+        let base_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackInput {
+                title,
+                initial,
+                handle,
+                ..
+            } => {
+                assert_eq!(title, "Base branch (blank detects the default)");
+                assert!(initial.is_empty());
+                handle
+            }
+            _ => panic!("expected an explicit or automatically detected local base"),
+        };
+        assert!(runtime
+            .notify_composer(
+                base_handle,
+                ComposerCallback::Submitted("origin/master".to_string()),
+            )
+            .unwrap());
+        let resolve_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayResolveLocalBranch {
+                request_id,
+                head,
+                base,
+            } => {
+                assert_eq!(head, "feature/replay");
+                assert_eq!(base, "origin/master");
+                request_id
+            }
+            _ => panic!("expected editor-owned local merge-base resolution"),
+        };
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime
+            .resolve_request(
+                resolve_id,
+                serde_json::json!({
+                    "ok": true,
+                    "source_id": "source-local-1",
+                    "source_kind": "local_range",
+                    "branch": "feature/replay",
+                    "base_ref": "origin/master",
+                    "missing_object_count": 0,
+                    "workspace_root": "/workspace/repository.replay-revision-1234567",
+                    "workspace_branch": "replay/revision-1234567",
+                }),
+            )
+            .await
+            .unwrap();
+        let handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackConfirmation {
+                owner,
+                handle,
+                title,
+                message,
+            } => {
+                assert_eq!(owner, "replay");
+                assert_eq!(title, "Create Replay scratch worktree?");
+                assert!(message.contains("replay/revision-1234567"));
+                assert!(message.contains("repository.replay-revision-1234567"));
+                assert!(message.contains("current branch is unchanged"));
+                handle
+            }
+            _ => panic!("expected explicit confirmation of the durable scratch worktree"),
+        };
+        assert!(
+            ACTION_DISPATCHER.try_recv_request().is_none(),
+            "previewing a Replay workspace must not create it",
+        );
+
+        let accept = serde_json::from_value(serde_json::json!({
+            "id": "accept",
+            "label": "Accept",
+        }))
+        .unwrap();
+        assert!(runtime
+            .notify_picker(handle, PickerCallback::Selected(accept))
+            .unwrap());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ReplayCreateWorkspace {
+                source_id,
+                confirmed: true,
+                ..
+            } if source_id == "source-local-1"
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_missing_pr_objects_are_fetched_only_after_confirmation() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("replay", include_str!("../../plugins/replay.hk"))
+            .await
+            .unwrap();
+        runtime.execute_command("ReplayPR").await.unwrap();
+        let input_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackInput { handle, .. } => handle,
+            _ => panic!("expected GitHub pull request input"),
+        };
+        assert!(runtime
+            .notify_composer(input_handle, ComposerCallback::Submitted("159".to_string()))
+            .unwrap());
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayResolvePullRequest { request_id, .. } => request_id,
+            _ => panic!("expected trusted pull request metadata resolution"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "source_id": "source-pr-159",
+                    "source_kind": "github_pull_request",
+                    "pull_request": 159,
+                    "branch": "feature/replay",
+                    "missing_object_count": 2,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackConfirmation {
+                owner,
+                handle,
+                title,
+                message,
+            } => {
+                assert_eq!(owner, "replay");
+                assert_eq!(title, "Fetch original PR objects?");
+                assert!(message.contains("PR #159"));
+                assert!(message.contains("never checks out"));
+                handle
+            }
+            _ => panic!("expected explicit authorization to fetch pinned PR objects"),
+        };
+        assert!(
+            ACTION_DISPATCHER.try_recv_request().is_none(),
+            "missing Git objects must not be fetched implicitly",
+        );
+
+        let accept = serde_json::from_value(serde_json::json!({
+            "id": "accept",
+            "label": "Accept",
+        }))
+        .unwrap();
+        assert!(runtime
+            .notify_picker(handle, PickerCallback::Selected(accept))
+            .unwrap());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ReplayFetchPullRequestObjects {
+                source_id,
+                confirmed: true,
+                ..
+            } if source_id == "source-pr-159"
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn confirmed_real_replay_renders_a_dedicated_guide_and_follows_step_files() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("replay", include_str!("../../plugins/replay.hk"))
+            .await
+            .unwrap();
+        runtime.execute_command("ReplayBranch").await.unwrap();
+        let branch_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackInput { handle, .. } => handle,
+            _ => panic!("expected original local branch input"),
+        };
+        assert!(runtime
+            .notify_composer(
+                branch_handle,
+                ComposerCallback::Submitted("feature/replay".to_string()),
+            )
+            .unwrap());
+        let base_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackInput { handle, .. } => handle,
+            _ => panic!("expected optional local base input"),
+        };
+        assert!(runtime
+            .notify_composer(base_handle, ComposerCallback::Submitted(String::new()))
+            .unwrap());
+        let resolve_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayResolveLocalBranch { request_id, .. } => request_id,
+            _ => panic!("expected immutable local merge-base resolution"),
+        };
+        runtime
+            .resolve_request(
+                resolve_id,
+                serde_json::json!({
+                    "ok": true,
+                    "source_id": "source-local-1",
+                    "source_kind": "local_range",
+                    "branch": "feature/replay",
+                    "base_ref": "origin/master",
+                    "missing_object_count": 0,
+                    "workspace_root": "/workspace/repository.replay-revision-1234567",
+                    "workspace_branch": "replay/revision-1234567",
+                }),
+            )
+            .await
+            .unwrap();
+        let confirmation = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackConfirmation { handle, .. } => handle,
+            _ => panic!("expected explicit scratch-worktree confirmation"),
+        };
+        let accept = serde_json::from_value(serde_json::json!({
+            "id": "accept",
+            "label": "Accept",
+        }))
+        .unwrap();
+        assert!(runtime
+            .notify_picker(confirmation, PickerCallback::Selected(accept))
+            .unwrap());
+        let workspace_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayCreateWorkspace {
+                request_id,
+                source_id,
+                confirmed,
+            } => {
+                assert_eq!(source_id, "source-local-1");
+                assert!(confirmed);
+                request_id
+            }
+            _ => panic!("expected editor-owned creation of the confirmed scratch worktree"),
+        };
+        let mut plan = crate::replay::replay_demo_plan().unwrap();
+        plan.pull_request = 0;
+        plan.author = "local".to_string();
+        plan.branch = "feature/replay".to_string();
+        runtime
+            .resolve_request(
+                workspace_request,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "real-workspace-1",
+                    "source_buffer_index": 1,
+                    "source_window_id": 11,
+                    "workspace_root": "/workspace/repository.replay-revision-1234567",
+                    "workspace_branch": "replay/revision-1234567",
+                    "plan": plan,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::CreateTextPanel { id, config }
+                if id == "replay-coach"
+                    && config.side == crate::plugin::PanelSide::Left
+                    && config.composer.is_none()
+        ));
+        let guide = recv_replay_guide();
+        assert_eq!(guide.pull_request, 0);
+        assert_eq!(guide.branch, "feature/replay");
+        assert!(guide.current_step().unwrap().diff.contains("\n@@ "));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusPanel { id } if id == "replay-coach"
+        ));
+
+        runtime
+            .notify(
+                "panel:event:replay-coach",
+                serde_json::json!({ "action": "expand" }),
+            )
+            .await
+            .unwrap();
+        let next = recv_replay_guide();
+        let next_step = next.current_step().unwrap();
+        assert_eq!(next.index, 1);
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ReplayFocusStepSource {
+                workspace_id,
+                step_id,
+            } if workspace_id == "real-workspace-1" && step_id == next_step.id
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusPanel { id } if id == "replay-coach"
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
     async fn bundled_replay_demo_opens_a_dedicated_panel_with_real_per_step_diffs() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -4137,6 +4613,93 @@ mod tests {
         assert_eq!(guide.completions.len(), 1);
         assert_eq!(guide.completions[0].index, 0);
         assert!(guide.notice.contains("check this step again"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn bundled_replay_undo_reports_a_restored_source_without_a_manual_edit_warning() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let (plan, _) = open_replay_demo(&mut runtime).await;
+
+        runtime.execute_command("ReplayValidate").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayDemoValidateStep {
+                request_id,
+                workspace_id,
+                step_id,
+            } => {
+                assert_eq!(workspace_id, "replay-workspace-1");
+                assert_eq!(step_id, plan.steps[0].id);
+                request_id
+            }
+            _ => panic!("expected editor-owned original replay hunk validation"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "replay-workspace-1",
+                    "step_id": plan.steps[0].id,
+                    "state": "exact",
+                    "revision": 1,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recv_replay_guide().completions.len(), 1);
+
+        runtime
+            .notify(
+                "buffer:changed",
+                serde_json::json!({ "buffer_id": 1, "revision": 2 }),
+            )
+            .await
+            .unwrap();
+        let changed = recv_replay_guide();
+        assert!(changed.completions.is_empty());
+        assert!(changed.notice.contains("check this step again"));
+
+        runtime
+            .notify(
+                "replay:undone",
+                serde_json::json!({
+                    "workspace_id": "another-replay-workspace",
+                    "step_id": plan.steps[0].id,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime
+            .notify(
+                "replay:undone",
+                serde_json::json!({
+                    "workspace_id": "replay-workspace-1",
+                    "step_id": plan.steps[1].id,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime
+            .notify(
+                "replay:undone",
+                serde_json::json!({
+                    "workspace_id": "replay-workspace-1",
+                    "step_id": plan.steps[0].id,
+                }),
+            )
+            .await
+            .unwrap();
+        let restored = recv_replay_guide();
+        assert!(restored.completions.is_empty());
+        assert!(restored.notice.contains("scratch source restored"));
+        assert!(!restored.notice.contains("check this step again"));
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 

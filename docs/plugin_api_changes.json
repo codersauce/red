@@ -1,6 +1,12 @@
 {
-  "api_version": "0.5.0",
+  "api_version": "0.5.1",
   "changes": [
+    {
+      "version": "0.5.1",
+      "kind": "introduced",
+      "symbols": ["ReplayResolvePullRequest", "ReplayResolveLocalBranch", "ReplayFetchPullRequestObjects", "ReplayCreateWorkspace", "ReplayFocusStepSource"],
+      "migration_note": "docs/PLUGIN_API.md#source-backed-pull-request-replay"
+    },
     {
       "version": "0.5.0",
       "kind": "introduced",

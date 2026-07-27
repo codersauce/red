@@ -508,20 +508,20 @@ fn replay_header_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
         model.reviewed_count(),
         model.steps.len()
     );
-    let metadata = if model.notes.is_empty() {
+    let identity = if model.pull_request == 0 {
+        "LOCAL BRANCH".to_string()
+    } else {
         format!("#{} · @{}", model.pull_request, model.author)
+    };
+    let metadata = if model.notes.is_empty() {
+        identity
     } else {
         let suffix = if model.notes.len() == 1 {
             "note"
         } else {
             "notes"
         };
-        format!(
-            "#{} · @{} · {} {suffix}",
-            model.pull_request,
-            model.author,
-            model.notes.len(),
-        )
+        format!("{identity} · {} {suffix}", model.notes.len())
     };
     let mut lines = vec![
         aligned_line(
@@ -1433,6 +1433,30 @@ mod tests {
         assert!(metadata.contains("#482 · @original-author"));
         assert!(metadata.ends_with("1 / 5 reviewed"));
         assert!(!title.contains("reviewed"));
+    }
+
+    #[test]
+    fn local_branch_review_is_not_presented_as_a_fictional_pull_request() {
+        let mut replay = model();
+        replay.pull_request = 0;
+        replay.author = "local".to_string();
+        replay.branch = "feature/replay".to_string();
+        let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+        let lines = replay_header_lines(&state, /*width*/ 46);
+        let metadata = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        let branch = lines[1]
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+
+        assert!(metadata.starts_with("LOCAL BRANCH"));
+        assert!(!metadata.contains("#0"));
+        assert_eq!(branch, "feature/replay");
     }
 
     #[test]

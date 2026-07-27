@@ -1,6 +1,6 @@
 # Husk plugin compatibility
 
-Red host API version `0.5.0` is defined by
+Red host API version `0.5.1` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -58,6 +58,47 @@ stage changes, save buffers, or submit reviews.
 
 Plugins declaring a host API requirement for these calls should use
 `"red_api_version": "^0.5.0"`.
+
+## Source-backed pull request replay
+
+Host API `0.5.1` adds real, editor-owned GitHub and local-branch review without
+changing or invalidating the `0.5.0` preview contract. Existing plugins that
+declare `^0.5.0` remain compatible.
+
+`ReplayResolvePullRequest(callback, input)` accepts a positive PR number or a
+canonical HTTPS pull-request URL for the current repository. The editor reads
+bounded `gh pr view` metadata, validates the repository and original author
+head, pins both Git object identities, and reports missing objects without
+implicitly fetching. `ReplayFetchPullRequestObjects(callback, source_id,
+confirmed)` fetches only verified, Replay-namespaced refs and refuses to run
+without explicit user confirmation. The real PR diff is produced from the
+original pinned merge base and target commit.
+
+`ReplayResolveLocalBranch(callback, head, base)` resolves a locally present
+feature branch without checking it out. Pass an empty base to prefer the
+locally present `origin/HEAD` target, followed by `origin/main`,
+`origin/master`, `main`, and `master`. Resolution pins both references and
+computes their actual merge base; unrelated later changes on the default
+branch are excluded. Neither source-resolution call creates a worktree.
+
+Both resolution calls provide a durable sibling-worktree preview.
+`ReplayCreateWorkspace(callback, source_id, confirmed)` creates the displayed
+local scratch branch only after the reviewer explicitly confirms. Its response
+contains the real source-backed plan, complete original per-step unified
+hunks, and editable scratch-file identities. `ReplayFocusStepSource(workspace_id,
+step_id)` switches the existing source window to the exact scratch file for a
+multi-file step without turning the dedicated guide into an editor buffer.
+
+Automatic step application remains a single revision- and pre-image-checked
+editor transaction; `a` requires no additional modal, and Replay undo refuses
+to discard newer reviewer-authored changes. After a successful Replay undo, the
+editor sends `replay:undone` with the original workspace and step identities,
+allowing the coach to distinguish restored source from a new manual edit. No
+Replay host call automatically
+saves, commits, pushes, posts a comment, or submits a GitHub review.
+
+Plugins requiring these additive source-backed calls should declare
+`"red_api_version": "^0.5.1"`.
 
 ## Workspace file operations
 

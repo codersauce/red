@@ -1,13 +1,13 @@
-# PR Replay Coach: UI checkpoint
+# PR Replay Coach
 
 PR Replay helps reviewers understand a pull request by reconstructing the
-original author's changes, step by step, in a separate scratch workspace. This
-checkpoint contains a real, editor-owned reconstruction workflow using an
-in-memory mock pull request. Each step has a complete original unified diff,
-the coach is a dedicated read-only panel, and the scratch source is the only
-editable editor buffer.
+original author's changes, step by step, in a separate scratch workspace.
+Choose a real GitHub pull request, a local feature branch against its actual
+merge base, or a safe in-memory demonstration. Every step has its own complete
+original unified diff. The coach is a dedicated read-only panel, and
+reconstruction happens only in editable scratch-source buffers.
 
-## Run the mock
+## Start Replay
 
 From the dedicated worktree:
 
@@ -16,15 +16,39 @@ cd ~/code/red.fcoury-pr-replay
 env CARGO_TARGET_DIR=/private/tmp/red-pr-replay-target cargo run -p red
 ```
 
-Open the command palette and run `Replay`, or enter `:Replay`. In normal mode,
-press `Space R g` to open the same panel.
+Open the command palette and run `Replay`, enter `:Replay`, or press `Space R g`.
+The source picker offers:
+
+- **GitHub pull request:** enter its PR number, such as `159`, or its canonical
+  URL. Red verifies the PR belongs to the current repository and pins the
+  original author head and merge base. If immutable source objects are missing,
+  it requests permission before fetching only Replay-owned Git refs.
+- **Local branch:** enter a feature branch or use `HEAD`, then enter an explicit
+  base such as `origin/master`. Leave the base blank to detect the local
+  `origin/HEAD`, `origin/main`, `origin/master`, `main`, or `master`. Red uses
+  the actual merge base, not the current default-branch tip.
+- **Safe in-memory demo:** inspect the original five-step mock without Git,
+  network access, file writes, or worktree creation.
+
+Use `:ReplayPR` or `:ReplayBranch` to go directly to the corresponding source
+input, or `:ReplayDemo` to bypass the picker and open the no-side-effect mock.
+
+For real sources, Red displays the exact proposed sibling worktree and scratch
+branch. Nothing is created until the reviewer accepts that specific
+confirmation. Original branches are never checked out, modified, reset,
+committed, or pushed.
 
 Replay initially places its dedicated coach panel on the left and the editable
-Rust scratch source on the right, matching the pull-request replay mockup. The
+scratch source on the right, matching the pull-request replay mockup. The
 coach is rendered by Red's panel system; it is not a Markdown file, a scratch
-document, or an editable editor split. It contains a five-step mock PR, its
-original author and branch, the actual unified diff for each individual step,
-the reconstruction task, optional hints, and progress.
+document, or an editable editor split. It contains the verified source, original
+author and branch, the actual unified diff for each individual step, the
+reconstruction task, optional hints, and progress.
+
+For a multi-file review, `h` and `l` select the previous and next original hunk
+and switch the existing editor window to that hunk's actual scratch file.
+Changes from different files stay in their own buffers; no unrelated file tree,
+editable guide, or extra pane is created.
 
 The coach is a structured editor surface, not a rendered Markdown document. PR
 context and the current reconstruction task stay at the top. The exact original
@@ -102,7 +126,8 @@ only when it belongs to the current Replay session. If newer manual edits are
 present, Replay refuses to skip over them; return to the source and use normal
 Vim `u` first. Undoing or subsequently editing a completed current step
 automatically removes its completion mark without disturbing earlier
-reconstructed steps.
+reconstructed steps. Replay explicitly confirms when undo restores the original
+scratch source; it reserves the revalidation warning for subsequent manual edits.
 
 To apply it manually, use `Space R i`, edit the visible Rust buffer to match the
 original diff, return to normal mode, and press `Space R v`. A step is marked
@@ -113,11 +138,9 @@ diagnostic parameter with `:10` and `Enter`, press `o`, type
 `visible_start: usize,`, press `Enter`, type `visible_end: usize,`, and press
 `Esc`. Then press `Space R v`. The guide displays `✓ 01` and `1 / 5 reviewed`.
 
-Observations are local demo state and are never posted as GitHub comments or
-reviews. The editable source has a display name but no associated file path or
-URI; the dedicated coach is not a buffer at all. Opening the mock, applying a
-hunk, moving the pane, and hiding or reopening the coach never write a file,
-launch source-file LSP, create a branch, fetch a pull request, or contact
-GitHub. Restarting the editor clears the mock session. Live GitHub source
-resolution, durable scratch worktrees, and recoverable observations remain the
-next checkpoint after this UI has been reviewed.
+Observations stay local and are never posted as GitHub comments or reviews.
+The demo source has a display name but no associated file path or URI; opening
+or using the demo never fetches, creates a branch, writes a file, or contacts
+GitHub. Real Replay buffers refer only to files inside the explicitly confirmed
+scratch worktree. Applying a hunk modifies an in-memory editor buffer; it does
+not save the file, stage changes, commit, push, or submit a review.

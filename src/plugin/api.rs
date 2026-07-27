@@ -496,6 +496,21 @@ mod tests {
             .expect("agent archive must be present in the host API schema");
         assert_eq!(archive.signature, "(session_id: String)");
         assert_eq!(archive.introduced, "0.2.0");
+
+        for (kind, name) in [
+            ("request", "ReplayResolvePullRequest"),
+            ("request", "ReplayResolveLocalBranch"),
+            ("request", "ReplayFetchPullRequestObjects"),
+            ("request", "ReplayCreateWorkspace"),
+            ("execute", "ReplayFocusStepSource"),
+        ] {
+            let call = HOST_API
+                .calls
+                .iter()
+                .find(|call| call.kind == kind && call.name == name)
+                .unwrap_or_else(|| panic!("source-backed Replay host call is missing: {name}"));
+            assert_eq!(call.introduced, "0.5.1");
+        }
     }
 
     #[test]
