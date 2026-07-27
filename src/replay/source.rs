@@ -530,9 +530,8 @@ pub fn fetch_pull_request_objects(
     );
     let base = format!("refs/heads/{}:{namespace}/base", request.base_ref);
     let head = format!("refs/pull/{}/head:{namespace}/head", request.number);
-    let mut command = Command::new("git");
+    let mut command = replay_git_command(&resolved.repository.root);
     command
-        .current_dir(&resolved.repository.root)
         .args(["-c", "core.hooksPath=/dev/null", "fetch"])
         .args([
             "--no-tags",
@@ -747,9 +746,8 @@ fn build_source(seed: ReplaySourceSeed, limits: ReplayLimits) -> Result<ReplaySo
         pull_request,
         review_context,
     } = seed;
-    let mut command = Command::new("git");
+    let mut command = replay_git_command(&repository.root);
     command
-        .current_dir(&repository.root)
         .args([
             "-c",
             "core.hooksPath=/dev/null",
@@ -818,8 +816,7 @@ pub fn prepare_workspace(
         let workspace = existing_workspace(source, &root, &branch)?;
         return Ok((preview, Some(workspace)));
     }
-    let branch_exists = Command::new("git")
-        .current_dir(&source.repository.root)
+    let branch_exists = replay_git_command(&source.repository.root)
         .args(["show-ref", "--verify", "--quiet"])
         .arg(format!("refs/heads/{branch}"))
         .stdin(Stdio::null())
@@ -829,9 +826,8 @@ pub fn prepare_workspace(
     if branch_exists {
         return Err(ReplayError::WorkspaceExists(branch));
     }
-    let mut command = Command::new("git");
+    let mut command = replay_git_command(&source.repository.root);
     command
-        .current_dir(&source.repository.root)
         .args(["-c", "core.hooksPath=/dev/null", "worktree", "add", "-b"])
         .arg(&branch)
         .arg(&root)
@@ -1004,8 +1000,7 @@ fn git_object(root: &Path, reference: &str) -> Result<GitObjectId, ReplayError> 
 }
 
 fn has_git_commit(root: &Path, object: &GitObjectId) -> Result<bool, ReplayError> {
-    Command::new("git")
-        .current_dir(root)
+    replay_git_command(root)
         .args(["cat-file", "-e"])
         .arg(format!("{}^{{commit}}", object.as_str()))
         .stdin(Stdio::null())
@@ -1019,9 +1014,22 @@ fn has_git_commit(root: &Path, object: &GitObjectId) -> Result<bool, ReplayError
         })
 }
 
-fn git_text(root: &Path, args: &[&str], limit: usize) -> Result<String, ReplayError> {
+/// Build an isolated Git command without depending on a repository fsmonitor daemon.
+///
+/// Git propagates command-line configuration to its child processes, including
+/// the `git reset` used by `git worktree add`. Keeping this override local to
+/// Replay avoids hanging on an unavailable monitor without changing Git config.
+fn replay_git_command(root: &Path) -> Command {
     let mut command = Command::new("git");
-    command.current_dir(root).args(args);
+    command
+        .current_dir(root)
+        .args(["-c", "core.fsmonitor=false"]);
+    command
+}
+
+fn git_text(root: &Path, args: &[&str], limit: usize) -> Result<String, ReplayError> {
+    let mut command = replay_git_command(root);
+    command.args(args);
     let output = run_command(&mut command, limit)?;
     String::from_utf8(output).map_err(|_| ReplayError::CommandFailed {
         program: "git".to_string(),
@@ -1179,6 +1187,74 @@ mod tests {
         assert_eq!(
             fixture_git(&resumed.root, &["branch", "--show-current"]),
             resumed.branch,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_worktree_creation_and_resume_do_not_invoke_repository_fsmonitor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (directory, source) = reusable_workspace_source();
+        let hook = directory.path().join("replay-test-fsmonitor");
+        let marker = directory.path().join("replay-fsmonitor-invoked");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nprintf invoked > '{}'\nprintf 'replay-test\\0'\n",
+                marker.display(),
+            ),
+        )
+        .expect("write the isolated repository filesystem-monitor fixture");
+        let mut permissions = std::fs::metadata(&hook)
+            .expect("read the filesystem-monitor fixture permissions")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hook, permissions)
+            .expect("make the isolated filesystem-monitor fixture executable");
+        fixture_git(
+            &source.repository.root,
+            &[
+                "config",
+                "core.fsmonitor",
+                hook.to_str().expect("UTF-8 filesystem-monitor fixture"),
+            ],
+        );
+
+        let (_, created) = prepare_workspace(&source, /*confirmed*/ true)
+            .expect("create a Replay worktree without calling repository fsmonitor");
+        let created = created.expect("confirmed Replay creates its scratch worktree");
+
+        assert!(
+            !marker.exists(),
+            "Replay worktree checkout must not wait on the repository filesystem monitor",
+        );
+        assert_eq!(
+            std::fs::read_to_string(created.root.join("src/token.rs"))
+                .expect("read the fully checked-out merge-base source"),
+            "pub fn token() -> usize { 1 }\n",
+        );
+
+        let (_, resumed) = prepare_workspace(&source, /*confirmed*/ true)
+            .expect("resume a Replay worktree without calling repository fsmonitor");
+
+        assert_eq!(
+            resumed
+                .expect("resume the exact clean scratch worktree")
+                .root,
+            created.root,
+        );
+        assert!(
+            !marker.exists(),
+            "Replay worktree verification must not wait on repository fsmonitor",
+        );
+        assert_eq!(
+            fixture_git(
+                &source.repository.root,
+                &["config", "--get", "core.fsmonitor"]
+            ),
+            hook.to_string_lossy(),
+            "Replay must never modify repository filesystem-monitor configuration",
         );
     }
 
