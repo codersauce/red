@@ -29,8 +29,9 @@ current OS user: Red uses a private Unix socket and reconnect token, and does no
 expose a TCP port.
 
 The attach protocol is version 3. It preserves native mouse clicks, scrolling,
-and pane or editor-divider dragging, chunks large bracketed pastes into one
-editor transaction, and sends only changed frame rows during ordinary input.
+and pane or editor-divider dragging, including immediate, theme-aware highlight
+and release frames. It chunks large bracketed pastes into one editor transaction
+and sends only changed frame rows during ordinary input.
 Frames are capped at 2 MiB, pending paste is capped at
 16 MiB and cleared on disconnect, terminal dimensions are capped at 12,288 cells
 before allocation, and stalled handshakes/reads/writes time out. Stop an older

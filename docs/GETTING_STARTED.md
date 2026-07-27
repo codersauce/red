@@ -149,7 +149,9 @@ The command palette includes descriptions, effective keymaps, and accepted
 - `Ctrl-w >` and `Ctrl-w <` grow or shrink a vertical pane or editor split.
 - `Ctrl-w +` and `Ctrl-w -` grow or shrink a horizontal pane or editor split.
 - Prefix a resize with a count, such as `5 Ctrl-w >`, to move five cells.
-- Drag a pane or editor-split divider with the mouse to resize it directly.
+- Drag a pane or editor-split divider with the mouse to resize it directly. The
+  captured divider highlights immediately, follows the mouse, and returns to its
+  normal appearance when released. Press `Esc` to cancel the drag.
 - `Ctrl-w w` selects the next window.
 - `Ctrl-w c` closes a window.
 - `Ctrl-w =` balances editor splits or restores a focused pane's original size.

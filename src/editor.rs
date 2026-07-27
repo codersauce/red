@@ -9439,6 +9439,19 @@ impl Editor {
         ev: &event::Event,
         runtime: Option<&Runtime>,
     ) -> anyhow::Result<Option<KeyAction>> {
+        if self.divider_drag.is_some()
+            && matches!(
+                ev,
+                Event::Key(KeyEvent {
+                    code: KeyCode::Esc,
+                    ..
+                })
+            )
+        {
+            self.divider_drag = None;
+            return Ok(Some(KeyAction::Single(Action::Refresh)));
+        }
+
         if self.consume_reactivation_click(ev) {
             return Ok(None);
         }
@@ -9623,9 +9636,12 @@ impl Editor {
     ) -> anyhow::Result<bool> {
         match ev {
             Event::FocusLost => {
+                let divider_was_active = self.divider_drag.take().is_some();
                 self.suppress_reactivation_click = false;
                 if self.is_focused {
                     self.is_focused = false;
+                    self.render(buffer)?;
+                } else if divider_was_active {
                     self.render(buffer)?;
                 } else {
                     self.draw_cursor()?;
@@ -9791,12 +9807,12 @@ impl Editor {
                         origin: Point::new(x, y),
                         initial_size,
                     });
-                    return Some(KeyAction::None);
+                    return Some(KeyAction::Single(Action::Refresh));
                 }
 
                 if let Some(divider) = self.window_manager.divider_at_position(x, y) {
                     self.divider_drag = Some(DividerDrag::Window { divider });
-                    return Some(KeyAction::None);
+                    return Some(KeyAction::Single(Action::Refresh));
                 }
 
                 None
@@ -9850,7 +9866,7 @@ impl Editor {
             }
             MouseEventKind::Up(MouseButton::Left) if self.divider_drag.is_some() => {
                 self.divider_drag = None;
-                Some(KeyAction::None)
+                Some(KeyAction::Single(Action::Refresh))
             }
             _ => None,
         }
@@ -22302,6 +22318,11 @@ mod test {
     async fn detached_mouse_drag_resizes_each_docked_pane_without_stealing_focus() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
+        let accent = Color::Rgb {
+            r: 203,
+            g: 166,
+            b: 247,
+        };
 
         for (side, initial_size, start, end, expected_size) in [
             (plugin::PanelSide::Left, 20, (20, 4), (25, 4), 25),
@@ -22310,6 +22331,10 @@ mod test {
             (plugin::PanelSide::Bottom, 6, (12, 15), (12, 12), 9),
         ] {
             let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+            editor
+                .theme
+                .colors
+                .insert("sash.hoverBorder".to_string(), accent);
             editor.test_create_panel(
                 "inspector",
                 plugin::PanelConfig {
@@ -22322,23 +22347,74 @@ mod test {
             assert!(editor.test_focus_panel("inspector"));
             let mut core = DetachedEditorCore::new(editor).await.unwrap();
             let original_revision = core.snapshot(None).revision;
+            let original_index =
+                usize::from(start.1) * core.render_buffer.width + usize::from(start.0);
+            let inactive = core.render_buffer.cells[original_index].clone();
+            assert_eq!(inactive.c, ' ');
 
-            for (kind, (column, row)) in [
-                (MouseEventKind::Down(MouseButton::Left), start),
-                (MouseEventKind::Drag(MouseButton::Left), end),
-                (MouseEventKind::Up(MouseButton::Left), end),
-            ] {
-                core.input(crate::headless::InputEvent::Mouse {
+            let pressed = core
+                .input(crate::headless::InputEvent::Mouse {
                     event: MouseEvent {
-                        kind,
-                        column,
-                        row,
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: start.0,
+                        row: start.1,
                         modifiers: KeyModifiers::NONE,
                     },
                 })
                 .await
                 .unwrap();
-            }
+            let expected_glyph =
+                if matches!(side, plugin::PanelSide::Left | plugin::PanelSide::Right) {
+                    '│'
+                } else {
+                    '─'
+                };
+            let active = &core.render_buffer.cells[original_index];
+            assert_eq!(active.c, expected_glyph);
+            assert_eq!(active.style.fg, Some(accent));
+            assert!(active.style.bold);
+            assert!(pressed.revision > original_revision);
+            assert!(pressed.lines.iter().any(|line| {
+                line.row == usize::from(start.1)
+                    && line.spans.iter().any(|span| {
+                        span.style.fg == Some(accent) && span.text.contains(expected_glyph)
+                    })
+            }));
+
+            let dragged = core
+                .input(crate::headless::InputEvent::Mouse {
+                    event: MouseEvent {
+                        kind: MouseEventKind::Drag(MouseButton::Left),
+                        column: end.0,
+                        row: end.1,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                })
+                .await
+                .unwrap();
+            let moved_index = usize::from(end.1) * core.render_buffer.width + usize::from(end.0);
+            let moved = &core.render_buffer.cells[moved_index];
+            assert_eq!(moved.c, expected_glyph);
+            assert_eq!(moved.style.fg, Some(accent));
+            assert!(dragged.revision > pressed.revision);
+
+            let released = core
+                .input(crate::headless::InputEvent::Mouse {
+                    event: MouseEvent {
+                        kind: MouseEventKind::Up(MouseButton::Left),
+                        column: end.0,
+                        row: end.1,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                })
+                .await
+                .unwrap();
+            assert_eq!(core.render_buffer.cells[moved_index], inactive);
+            assert!(released.revision > dragged.revision);
+            assert!(released.lines.iter().any(|line| {
+                line.row == usize::from(end.1)
+                    && line.spans.iter().all(|span| span.style.fg != Some(accent))
+            }));
 
             assert_eq!(
                 core.editor.panel_manager.panel_layout("inspector"),
@@ -22356,12 +22432,21 @@ mod test {
     async fn detached_mouse_drag_resizes_vertical_and_horizontal_editor_splits() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
+        let accent = Color::Rgb {
+            r: 203,
+            g: 166,
+            b: 247,
+        };
 
         for (vertical, start, end, expected_position, expected_size) in [
             (true, (39, 4), (53, 4), (54, 0), (26, 22)),
             (false, (8, 10), (8, 14), (0, 15), (80, 7)),
         ] {
             let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+            editor
+                .theme
+                .colors
+                .insert("sash.hoverBorder".to_string(), accent);
             let split = if vertical {
                 editor
                     .update_window_layout(|windows| windows.split_vertical(/*buffer_index*/ 0))
@@ -22373,23 +22458,63 @@ mod test {
             assert!(split);
             let original_window = editor.window_manager.active_stable_window_id();
             let mut core = DetachedEditorCore::new(editor).await.unwrap();
+            let original_index =
+                usize::from(start.1) * core.render_buffer.width + usize::from(start.0);
+            let inactive = core.render_buffer.cells[original_index].clone();
+            let expected_glyph = if vertical { '│' } else { '─' };
+            assert_eq!(inactive.c, expected_glyph);
 
-            for (kind, (column, row)) in [
-                (MouseEventKind::Down(MouseButton::Left), start),
-                (MouseEventKind::Drag(MouseButton::Left), end),
-                (MouseEventKind::Up(MouseButton::Left), end),
-            ] {
-                core.input(crate::headless::InputEvent::Mouse {
+            let pressed = core
+                .input(crate::headless::InputEvent::Mouse {
                     event: MouseEvent {
-                        kind,
-                        column,
-                        row,
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: start.0,
+                        row: start.1,
                         modifiers: KeyModifiers::NONE,
                     },
                 })
                 .await
                 .unwrap();
-            }
+            let active = &core.render_buffer.cells[original_index];
+            assert_eq!(active.c, expected_glyph);
+            assert_eq!(active.style.fg, Some(accent));
+            assert!(active.style.bold);
+            assert!(pressed.lines.iter().any(|line| {
+                line.row == usize::from(start.1)
+                    && line.spans.iter().any(|span| {
+                        span.style.fg == Some(accent) && span.text.contains(expected_glyph)
+                    })
+            }));
+
+            let dragged = core
+                .input(crate::headless::InputEvent::Mouse {
+                    event: MouseEvent {
+                        kind: MouseEventKind::Drag(MouseButton::Left),
+                        column: end.0,
+                        row: end.1,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                })
+                .await
+                .unwrap();
+            let moved_index = usize::from(end.1) * core.render_buffer.width + usize::from(end.0);
+            let moved = &core.render_buffer.cells[moved_index];
+            assert_eq!(moved.c, expected_glyph);
+            assert_eq!(moved.style.fg, Some(accent));
+
+            let released = core
+                .input(crate::headless::InputEvent::Mouse {
+                    event: MouseEvent {
+                        kind: MouseEventKind::Up(MouseButton::Left),
+                        column: end.0,
+                        row: end.1,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                })
+                .await
+                .unwrap();
+            assert_eq!(core.render_buffer.cells[moved_index], inactive);
+            assert!(released.revision > dragged.revision);
 
             let active = core.editor.window_manager.active_window().unwrap();
             assert_eq!((active.position.x, active.position.y), expected_position);
@@ -22397,6 +22522,66 @@ mod test {
             assert_eq!(
                 core.editor.window_manager.active_stable_window_id(),
                 original_window,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_focus_loss_and_terminal_resize_cancel_active_divider_highlights() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let accent = Color::Rgb {
+            r: 203,
+            g: 166,
+            b: 247,
+        };
+
+        for resize in [false, true] {
+            let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+            editor
+                .theme
+                .colors
+                .insert("sash.hoverBorder".to_string(), accent);
+            editor.test_create_panel(
+                "inspector",
+                plugin::PanelConfig {
+                    side: plugin::PanelSide::Left,
+                    width: 20,
+                    ..plugin::PanelConfig::default()
+                },
+            );
+            assert!(editor.test_focus_panel("inspector"));
+            let mut core = DetachedEditorCore::new(editor).await.unwrap();
+
+            let pressed = core
+                .input(crate::headless::InputEvent::Mouse {
+                    event: MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: 20,
+                        row: 4,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                })
+                .await
+                .unwrap();
+            let index = /*row*/ 4 * core.render_buffer.width + /*column*/ 20;
+            assert_eq!(core.render_buffer.cells[index].c, '│');
+            assert_eq!(core.render_buffer.cells[index].style.fg, Some(accent));
+
+            let cancelled = if resize {
+                core.resize(/*columns*/ 90, /*rows*/ 26).await.unwrap()
+            } else {
+                core.focus(/*focused*/ false).await.unwrap()
+            };
+
+            let index = /*row*/ 4 * core.render_buffer.width + /*column*/ 20;
+            assert!(core.editor.divider_drag.is_none());
+            assert_eq!(core.render_buffer.cells[index].c, ' ');
+            assert_ne!(core.render_buffer.cells[index].style.fg, Some(accent));
+            assert!(cancelled.revision > pressed.revision);
+            assert_eq!(
+                core.editor.panel_manager.panel_layout("inspector"),
+                Some((plugin::PanelSide::Left, 20)),
             );
         }
     }

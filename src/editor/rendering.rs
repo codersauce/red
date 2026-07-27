@@ -260,7 +260,16 @@ impl Editor {
         // Startup splash over the pristine scratch window (docs/SPLASH.md)
         self.render_splash(buffer);
 
-        self.panel_manager.render(buffer, &self.theme);
+        let active_panel_divider = match self.divider_drag.as_ref() {
+            Some(super::DividerDrag::Panel { id, .. }) => Some(id.as_str()),
+            _ => None,
+        };
+        self.panel_manager.render_with_active_divider(
+            buffer,
+            &self.theme,
+            active_panel_divider,
+            self.config.window_borders_ascii,
+        );
 
         // Render global UI elements
         let chrome_span = super::perf::PerfSpan::start("render:chrome");
@@ -780,6 +789,16 @@ impl Editor {
             bold: false,
             italic: false,
         };
+        let active_divider = match self.divider_drag.as_ref() {
+            Some(super::DividerDrag::Window { divider }) => {
+                self.window_manager.divider_span(divider)
+            }
+            _ => None,
+        };
+        let active_separator_style = active_divider.as_ref().map(|_| {
+            self.theme
+                .active_divider_style(&separator_style, &self.theme.style)
+        });
 
         // Get terminal size for bounds checking
         let (term_width, term_height) = (self.size.0 as usize, self.size.1 as usize);
@@ -947,7 +966,12 @@ impl Editor {
                 }
             };
 
-            buffer.set_char(*x, *y, junction_char, &separator_style, &self.theme);
+            let style = active_divider
+                .as_ref()
+                .filter(|span| span.contains(*x, *y))
+                .and(active_separator_style.as_ref())
+                .unwrap_or(&separator_style);
+            buffer.set_char(*x, *y, junction_char, style, &self.theme);
         }
 
         Ok(())
@@ -2401,6 +2425,110 @@ mod tests {
         assert_eq!(cell(1, horizontal_y), '─');
         assert_eq!(cell(inner_x, horizontal_y), '┴');
         assert_eq!(cell(outer_x, horizontal_y), '┤');
+    }
+
+    #[test]
+    fn active_split_dividers_use_the_theme_accent_in_ascii_and_unicode() {
+        let accent = Color::Rgb {
+            r: 203,
+            g: 166,
+            b: 247,
+        };
+
+        for use_ascii in [false, true] {
+            for vertical in [false, true] {
+                let config = Config {
+                    window_borders_ascii: use_ascii,
+                    ..Config::default()
+                };
+                let lsp = Box::new(LspManager::new(config.lsp.clone()));
+                let source = Buffer::new(None, "content\n".to_string());
+                let mut theme = Theme::default();
+                theme.colors.insert("sash.hoverBorder".to_string(), accent);
+                let mut editor =
+                    Editor::with_size(lsp, 40, 10, config, theme, vec![source]).unwrap();
+                let (x, y, expected) = if vertical {
+                    editor.window_manager.split_vertical(0).unwrap();
+                    (19, 2, if use_ascii { '|' } else { '│' })
+                } else {
+                    editor.window_manager.split_horizontal(0).unwrap();
+                    (5, 3, if use_ascii { '-' } else { '─' })
+                };
+                let divider = editor
+                    .window_manager
+                    .divider_at_position(x, y)
+                    .expect("the visible split must be draggable");
+                editor.divider_drag = Some(super::super::DividerDrag::Window { divider });
+                let mut buffer = RenderBuffer::new(40, 10, &Style::default());
+
+                editor.render_all_window_separators(&mut buffer).unwrap();
+
+                let active = &buffer.cells[y * buffer.width + x];
+                assert_eq!(active.c, expected);
+                assert_eq!(active.style.fg, Some(accent));
+                assert!(active.style.bold);
+
+                editor.divider_drag = None;
+                editor.render_all_window_separators(&mut buffer).unwrap();
+
+                let released = &buffer.cells[y * buffer.width + x];
+                assert_eq!(released.c, expected);
+                assert_eq!(
+                    released.style.fg,
+                    Some(Color::Rgb {
+                        r: 100,
+                        g: 100,
+                        b: 100,
+                    }),
+                );
+                assert!(!released.style.bold);
+            }
+        }
+    }
+
+    #[test]
+    fn active_nested_divider_preserves_junctions_and_unrelated_split_styles() {
+        let accent = Color::Rgb {
+            r: 203,
+            g: 166,
+            b: 247,
+        };
+        let config = Config::default();
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let source = Buffer::new(None, "content\n".to_string());
+        let mut theme = Theme::default();
+        theme.colors.insert("sash.hoverBorder".to_string(), accent);
+        let mut editor = Editor::with_size(lsp, 40, 10, config, theme, vec![source]).unwrap();
+        editor.window_manager.split_vertical(0).unwrap();
+        editor.window_manager.set_active(0);
+        editor.window_manager.split_horizontal(0).unwrap();
+        editor.window_manager.set_active(0);
+        editor.window_manager.split_vertical(0).unwrap();
+        let windows = editor.window_manager.windows();
+        let top_left = windows[0];
+        let top_right = windows[1];
+        let bottom_left = windows[2];
+        let inner_x = top_left.position.x + top_left.size.0;
+        let outer_x = bottom_left.position.x + bottom_left.size.0;
+        let horizontal_y = top_right.position.y + top_right.size.1;
+        let divider = editor
+            .window_manager
+            .divider_at_position(/*x*/ 1, horizontal_y)
+            .expect("the nested horizontal separator must be draggable");
+        editor.divider_drag = Some(super::super::DividerDrag::Window { divider });
+        let mut buffer = RenderBuffer::new(40, 10, &Style::default());
+
+        editor.render_all_window_separators(&mut buffer).unwrap();
+
+        let cell = |x: usize, y: usize| &buffer.cells[y * buffer.width + x];
+        assert_eq!(cell(1, horizontal_y).c, '─');
+        assert_eq!(cell(1, horizontal_y).style.fg, Some(accent));
+        assert_eq!(cell(inner_x, horizontal_y).c, '┴');
+        assert_eq!(cell(inner_x, horizontal_y).style.fg, Some(accent));
+        assert_eq!(cell(outer_x, horizontal_y).c, '┤');
+        assert_ne!(cell(outer_x, horizontal_y).style.fg, Some(accent));
+        assert_eq!(cell(inner_x, 1).c, '│');
+        assert_ne!(cell(inner_x, 1).style.fg, Some(accent));
     }
 
     #[test]

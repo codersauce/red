@@ -72,7 +72,7 @@ the corresponding integration tests.
 | Empty buffers | **supported** | The synthetic editable line remains cursor-safe across insert, delete, render, and undo. |
 | Final line / trailing newline | **supported** | Both forms render and edit without exposing a phantom gutter line. |
 | Multi-window and docked panes | **supported** | Active-buffer cursor, viewport, wrapping, gutter width, and focus-cycle state are window-aware. `Ctrl-w h/j/k/l` moves between editor windows and panes; `Ctrl-w H/J/K/L` moves the focused editor window, row pane, or text pane to the corresponding outer edge without replacing its identity, content, or draft. |
-| Window and pane resizing | **supported** | `Ctrl-w >` / `<` grow or shrink vertical panes and editor splits; `Ctrl-w +` / `-` grow or shrink horizontal panes and editor splits. Counts are supported. `Ctrl-w =` balances editor splits or restores the focused pane's original size. Dragging a visible pane or nested split divider works without stealing focus. |
+| Window and pane resizing | **supported** | `Ctrl-w >` / `<` grow or shrink vertical panes and editor splits; `Ctrl-w +` / `-` grow or shrink horizontal panes and editor splits. Counts are supported. `Ctrl-w =` balances editor splits or restores the focused pane's original size. Mouse dragging immediately highlights the captured pane or nested split divider without stealing focus; release or `Esc` restores its normal appearance. |
 | Multi-window Vim window command parity | **intentional difference** | Red supports the documented navigation, edge-movement, resizing, and balancing commands; arbitrary Vim layouts and undocumented window commands are not promised. |
 
 ## Release gate

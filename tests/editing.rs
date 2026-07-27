@@ -6190,6 +6190,151 @@ async fn mouse_click_in_editor_clears_panel_focus() {
 }
 
 #[tokio::test]
+async fn pane_divider_highlight_follows_press_drag_and_release_on_all_edges() {
+    for (side, initial_size, start, end, expected_glyph) in [
+        (PanelSide::Left, 20, (20, 4), (25, 4), '│'),
+        (PanelSide::Right, 20, (59, 4), (54, 4), '│'),
+        (PanelSide::Top, 6, (12, 6), (12, 9), '─'),
+        (PanelSide::Bottom, 6, (12, 15), (12, 12), '─'),
+    ] {
+        let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness.editor.test_create_panel(
+            "inspector",
+            PanelConfig {
+                side,
+                width: initial_size,
+                ..PanelConfig::default()
+            },
+        );
+        assert!(harness.editor.test_focus_panel("inspector"));
+
+        assert_eq!(
+            harness
+                .render_row(usize::from(start.1))
+                .unwrap()
+                .chars()
+                .nth(usize::from(start.0)),
+            Some(' '),
+        );
+
+        harness
+            .execute_event(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: start.0,
+                row: start.1,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            harness
+                .render_row(usize::from(start.1))
+                .unwrap()
+                .chars()
+                .nth(usize::from(start.0)),
+            Some(expected_glyph),
+            "the {side:?} divider should highlight immediately on mouse-down",
+        );
+
+        harness
+            .execute_event(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: end.0,
+                row: end.1,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            harness
+                .render_row(usize::from(end.1))
+                .unwrap()
+                .chars()
+                .nth(usize::from(end.0)),
+            Some(expected_glyph),
+            "the {side:?} highlight should follow its moved divider",
+        );
+
+        harness
+            .execute_event(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: end.0,
+                row: end.1,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            harness
+                .render_row(usize::from(end.1))
+                .unwrap()
+                .chars()
+                .nth(usize::from(end.0)),
+            Some(' '),
+            "the {side:?} divider should restore its idle appearance on mouse-up",
+        );
+        assert_eq!(harness.editor.test_focused_panel_id(), Some("inspector"));
+    }
+}
+
+#[tokio::test]
+async fn escape_cancels_a_pane_divider_drag_without_stealing_focus() {
+    let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.test_create_panel(
+        "inspector",
+        PanelConfig {
+            side: PanelSide::Left,
+            width: 20,
+            ..PanelConfig::default()
+        },
+    );
+    assert!(harness.editor.test_focus_panel("inspector"));
+
+    harness
+        .execute_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 20,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(harness.render_row(4).unwrap().chars().nth(20), Some('│'));
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.render_row(4).unwrap().chars().nth(20), Some(' '));
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Left, 20)),
+    );
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("inspector"));
+
+    let passive_drag = harness
+        .editor
+        .test_handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 25,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .unwrap();
+    assert_eq!(passive_drag, None);
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Left, 20)),
+    );
+}
+
+#[tokio::test]
 async fn mouse_drag_resizes_all_four_docked_pane_edges_without_stealing_focus() {
     for (side, initial_size, start, end, expected_size) in [
         (PanelSide::Left, 20, (20, 4), (25, 4), 25),

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 pub use vscode::parse_vscode_theme;
 pub use vscode::parse_vscode_theme_contents;
 
-use crate::color::{blend_color, ensure_minimum_contrast, Color};
+use crate::color::{blend_color, contrast_ratio, ensure_minimum_contrast, Color};
 
 pub(crate) const MINIMUM_SELECTION_STATE_CONTRAST: f32 = 3.0;
 pub(crate) const MINIMUM_SELECTION_TEXT_CONTRAST: f32 = 4.5;
@@ -153,6 +153,85 @@ impl Theme {
             )),
             bg: Some(background),
             ..style.clone()
+        }
+    }
+
+    /// Resolves a visible drag accent without assuming the theme is dark.
+    pub(crate) fn active_divider_style(&self, inactive: &Style, surface: &Style) -> Style {
+        let black = Color::Rgb { r: 0, g: 0, b: 0 };
+        let white = Color::Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        };
+        let editor_background = blend_color(self.style.bg.unwrap_or(black), black);
+        let background = blend_color(
+            inactive.bg.or(surface.bg).unwrap_or(editor_background),
+            editor_background,
+        );
+        let inactive_foreground = blend_color(
+            inactive
+                .fg
+                .or(surface.fg)
+                .or(self.style.fg)
+                .unwrap_or(white),
+            background,
+        );
+
+        let accent = [
+            self.colors.get("sash.hoverBorder").copied(),
+            self.colors.get("panelTitle.activeBorder").copied(),
+            self.colors.get("focusBorder").copied(),
+            self.ui_style.picker_prompt.fg,
+            self.colors.get("editorCursor.foreground").copied(),
+            self.cursor_style.as_ref().and_then(|style| style.fg),
+            self.ui_style.popup_border.fg,
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|candidate| {
+            if matches!(candidate, Color::Rgba { a: 0, .. }) {
+                return None;
+            }
+
+            let candidate = blend_color(candidate, background);
+            (candidate != inactive_foreground
+                && contrast_ratio(candidate, background) >= MINIMUM_SELECTION_STATE_CONTRAST)
+                .then_some(candidate)
+        })
+        .unwrap_or_else(|| {
+            let adjusted = ensure_minimum_contrast(
+                inactive_foreground,
+                background,
+                MINIMUM_SELECTION_STATE_CONTRAST,
+            );
+            if adjusted != inactive_foreground {
+                return adjusted;
+            }
+
+            let strongest =
+                if contrast_ratio(black, background) >= contrast_ratio(white, background) {
+                    black
+                } else {
+                    white
+                };
+            let alternative = if strongest == inactive_foreground {
+                if strongest == black {
+                    white
+                } else {
+                    black
+                }
+            } else {
+                strongest
+            };
+
+            ensure_minimum_contrast(alternative, background, MINIMUM_SELECTION_STATE_CONTRAST)
+        });
+
+        Style {
+            fg: Some(accent),
+            bold: true,
+            ..inactive.clone()
         }
     }
 
@@ -547,6 +626,187 @@ mod tests {
             }),
             ..Theme::default()
         }
+    }
+
+    #[test]
+    fn active_divider_prefers_the_theme_sash_accent() {
+        let sash = Color::Rgb {
+            r: 203,
+            g: 166,
+            b: 247,
+        };
+        let panel = Color::Rgb {
+            r: 137,
+            g: 220,
+            b: 235,
+        };
+        let mut theme = Theme::default();
+        theme.colors.insert("sash.hoverBorder".to_string(), sash);
+        theme
+            .colors
+            .insert("panelTitle.activeBorder".to_string(), panel);
+        let inactive = Style {
+            fg: Some(Color::Rgb {
+                r: 100,
+                g: 100,
+                b: 100,
+            }),
+            bg: theme.style.bg,
+            italic: true,
+            ..Style::default()
+        };
+
+        let active = theme.active_divider_style(&inactive, &theme.style);
+
+        assert_eq!(active.fg, Some(sash));
+        assert_eq!(active.bg, inactive.bg);
+        assert!(active.bold);
+        assert!(active.italic);
+    }
+
+    #[test]
+    fn active_divider_skips_invisible_identical_and_low_contrast_accents() {
+        let idle = Color::Rgb {
+            r: 100,
+            g: 100,
+            b: 100,
+        };
+        let cursor = Color::Rgb {
+            r: 250,
+            g: 208,
+            b: 0,
+        };
+        let mut theme = Theme::default();
+        theme.colors.insert(
+            "sash.hoverBorder".to_string(),
+            Color::Rgba {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 0,
+            },
+        );
+        theme
+            .colors
+            .insert("panelTitle.activeBorder".to_string(), idle);
+        theme.colors.insert(
+            "focusBorder".to_string(),
+            Color::Rgb {
+                r: 20,
+                g: 20,
+                b: 20,
+            },
+        );
+        theme.ui_style.picker_prompt.fg = Some(Color::Rgb {
+            r: 25,
+            g: 25,
+            b: 25,
+        });
+        theme
+            .colors
+            .insert("editorCursor.foreground".to_string(), cursor);
+        let inactive = Style {
+            fg: Some(idle),
+            ..Style::default()
+        };
+
+        let active = theme.active_divider_style(&inactive, &theme.style);
+
+        assert_eq!(active.fg, Some(cursor));
+        assert!(active.bold);
+    }
+
+    #[test]
+    fn active_divider_fallback_remains_distinct_on_dark_and_light_themes() {
+        let black = Color::Rgb { r: 0, g: 0, b: 0 };
+        let white = Color::Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        };
+
+        for (background, idle) in [
+            (
+                black,
+                Color::Rgb {
+                    r: 25,
+                    g: 25,
+                    b: 25,
+                },
+            ),
+            (
+                white,
+                Color::Rgb {
+                    r: 245,
+                    g: 245,
+                    b: 245,
+                },
+            ),
+            (black, white),
+            (white, black),
+        ] {
+            let mut theme = Theme::default();
+            theme.style.bg = Some(background);
+            theme.ui_style.picker_prompt.fg = None;
+            theme.ui_style.popup_border.fg = None;
+            let inactive = Style {
+                fg: Some(idle),
+                bg: Some(background),
+                ..Style::default()
+            };
+
+            let active = theme.active_divider_style(&inactive, &theme.style);
+            let foreground = active.fg.expect("active dividers have a foreground");
+
+            assert_ne!(foreground, idle);
+            assert!(contrast_ratio(foreground, background) >= MINIMUM_SELECTION_STATE_CONTRAST);
+            assert_eq!(active.bg, Some(background));
+            assert!(active.bold);
+        }
+    }
+
+    #[test]
+    fn active_divider_checks_accents_against_the_actual_surface() {
+        let white = Color::Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        };
+        let blue = Color::Rgb {
+            r: 3,
+            g: 73,
+            b: 180,
+        };
+        let mut theme = Theme::default();
+        theme.colors.insert(
+            "sash.hoverBorder".to_string(),
+            Color::Rgb {
+                r: 240,
+                g: 240,
+                b: 210,
+            },
+        );
+        theme
+            .colors
+            .insert("panelTitle.activeBorder".to_string(), blue);
+        let surface = Style {
+            bg: Some(white),
+            ..Style::default()
+        };
+        let inactive = Style {
+            fg: Some(Color::Rgb {
+                r: 100,
+                g: 100,
+                b: 100,
+            }),
+            ..Style::default()
+        };
+
+        let active = theme.active_divider_style(&inactive, &surface);
+
+        assert_eq!(active.fg, Some(blue));
+        assert!(contrast_ratio(blue, white) >= MINIMUM_SELECTION_STATE_CONTRAST);
+        assert_eq!(active.bg, inactive.bg);
     }
 
     #[test]
