@@ -5,7 +5,10 @@
 //! preserved for validation even though the native panel presents only the
 //! syntax-highlighted source.
 
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -238,7 +241,7 @@ pub fn replay_plan_from_session(
                 kind: replay_kind(source_step.kind).to_string(),
                 title: replay_title(source_step, &display_path),
                 why: replay_rationale(session, source_step, &display_path),
-                task: format!("Reconstruct the exact original change in {display_path}."),
+                task: replay_task(source_step, &display_path),
                 hint: String::new(),
                 before,
                 after,
@@ -375,36 +378,494 @@ const fn replay_kind(kind: ReplayStepKind) -> &'static str {
     }
 }
 
+const MAX_REPLAY_RATIONALE_CHARS: usize = 240;
+const MAX_SEMANTIC_SOURCE_LINES: usize = 32;
+const MAX_SEMANTIC_SOURCE_CHARS: usize = 8 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReviewSection {
+    Motivation,
+    Changes,
+    Other,
+}
+
 fn replay_title(step: &ReplayStep, path: &str) -> String {
-    let heading = step.heading.trim();
-    if heading.is_empty() {
-        format!("Update {path}")
-    } else {
-        heading.to_string()
+    if let Some((field, container)) = changed_field(step) {
+        return named_change_title(step.kind, field, container);
+    }
+
+    if let Some((kind, symbol)) = source_symbol(&step.heading) {
+        if matches!(kind, "fn" | "impl") {
+            if let Some(function) = changed_function(step) {
+                if function != symbol {
+                    return named_change_title(step.kind, function, symbol);
+                }
+            }
+            if let Some(binding) = changed_binding(step) {
+                return named_change_title(step.kind, binding, symbol);
+            }
+        }
+        return format!("Update {symbol}");
+    }
+
+    let source_path = Path::new(path);
+    if source_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "md" | "markdown" | "mdown" | "mdx" | "rst"
+            )
+        })
+    {
+        if let Some(subject) = changed_markdown_subject(step) {
+            if let Some(endpoint) = markdown_endpoint(step) {
+                return format!("Document {endpoint} {subject}");
+            }
+            return format!("Document {subject}");
+        }
+        if let Some(component) = source_path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+        {
+            return format!("Update {component} documentation");
+        }
+        return "Update documentation".to_string();
+    }
+
+    if let Some(module) = changed_module(step) {
+        return format!("{} {module} module", replay_action(step.kind));
+    }
+
+    let file = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path);
+    match step.kind {
+        ReplayStepKind::AddFile => format!("Add {file}"),
+        ReplayStepKind::Add | ReplayStepKind::Change | ReplayStepKind::Remove => {
+            format!("Update {file}")
+        }
     }
 }
 
-fn replay_rationale(session: &ReplaySession, step: &ReplayStep, path: &str) -> String {
-    if let Some(description) = session
-        .source
-        .review_context
-        .as_ref()
-        .and_then(|context| context.body.lines().find(|line| !line.trim().is_empty()))
-    {
-        return description.trim().chars().take(240).collect();
+fn replay_task(step: &ReplayStep, path: &str) -> String {
+    if let Some((field, container)) = changed_field(step) {
+        return named_change_task(step.kind, field, "field", container);
     }
+
+    if let Some((kind, symbol)) = source_symbol(&step.heading) {
+        if matches!(kind, "fn" | "impl") {
+            if let Some(function) = changed_function(step) {
+                if function != symbol {
+                    return named_change_task(step.kind, function, "function", symbol);
+                }
+            }
+            if let Some(binding) = changed_binding(step) {
+                return named_change_task(step.kind, binding, "binding", symbol);
+            }
+        }
+        return format!("Reconstruct the original change to {symbol} in {path}.");
+    }
+
+    format!("Reconstruct the exact original change in {path}.")
+}
+
+const fn replay_action(kind: ReplayStepKind) -> &'static str {
+    match kind {
+        ReplayStepKind::Add | ReplayStepKind::AddFile => "Add",
+        ReplayStepKind::Change => "Update",
+        ReplayStepKind::Remove => "Remove",
+    }
+}
+
+const fn replay_container_preposition(kind: ReplayStepKind) -> &'static str {
+    match kind {
+        ReplayStepKind::Add | ReplayStepKind::AddFile => "to",
+        ReplayStepKind::Change => "in",
+        ReplayStepKind::Remove => "from",
+    }
+}
+
+fn named_change_title(kind: ReplayStepKind, name: &str, container: &str) -> String {
+    format!(
+        "{} {name} {} {container}",
+        replay_action(kind),
+        replay_container_preposition(kind),
+    )
+}
+
+fn named_change_task(kind: ReplayStepKind, name: &str, noun: &str, container: &str) -> String {
+    format!(
+        "{} the {name} {noun} {} {container}.",
+        replay_action(kind),
+        replay_container_preposition(kind),
+    )
+}
+
+fn replay_rationale(session: &ReplaySession, step: &ReplayStep, path: &str) -> String {
+    if let Some(documentation) = added_documentation(step) {
+        return bounded_rationale(&documentation);
+    }
+
+    if let Some(context) = session.source.review_context.as_ref() {
+        if let Some(description) = review_body_rationale(&context.body, step, path) {
+            return bounded_rationale(&description);
+        }
+
+        for commit in &context.commits {
+            if let Some(description) = review_body_rationale(&commit.body, step, path) {
+                return bounded_rationale(&description);
+            }
+            if !commit.headline.trim().is_empty() {
+                return bounded_rationale(commit.headline.trim());
+            }
+        }
+    }
+
     format!(
         "Study the original {} hunk in {path} before reconstructing it.",
         replay_kind(step.kind),
     )
 }
 
+fn bounded_rationale(text: &str) -> String {
+    text.chars().take(MAX_REPLAY_RATIONALE_CHARS).collect()
+}
+
+fn changed_source_lines(step: &ReplayStep) -> Vec<&str> {
+    let (original, changed) = if step.kind == ReplayStepKind::Remove {
+        (&step.after, &step.before)
+    } else {
+        (&step.before, &step.after)
+    };
+    let mut remaining = HashMap::<&str, usize>::new();
+    for line in original.lines() {
+        *remaining.entry(line).or_default() += 1;
+    }
+
+    let mut result = Vec::new();
+    for line in changed.lines() {
+        match remaining.get_mut(line) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => result.push(line),
+        }
+    }
+    result
+}
+
+fn source_symbol(heading: &str) -> Option<(&str, &str)> {
+    let mut words =
+        heading.split(|character: char| !character.is_ascii_alphanumeric() && character != '_');
+
+    while let Some(word) = words.next() {
+        if matches!(word, "struct" | "enum" | "trait" | "fn" | "impl") {
+            let name = words.find(|candidate| is_source_identifier(candidate))?;
+            return Some((word, name));
+        }
+    }
+
+    None
+}
+
+fn is_source_identifier(value: &str) -> bool {
+    let mut characters = value.chars();
+    matches!(characters.next(), Some(character) if character == '_' || character.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn changed_field(step: &ReplayStep) -> Option<(&str, &str)> {
+    let (kind, container) = source_symbol(&step.heading)?;
+    if !matches!(kind, "struct" | "enum") {
+        return None;
+    }
+
+    changed_source_lines(step).into_iter().find_map(|line| {
+        let line = line.trim();
+        if line.starts_with("//") || line.starts_with('#') || line.starts_with('*') {
+            return None;
+        }
+
+        let (declaration, _) = line.split_once(':')?;
+        if declaration.contains(':') {
+            return None;
+        }
+        let field = declaration.split_whitespace().last()?;
+        is_source_identifier(field).then_some((field, container))
+    })
+}
+
+fn changed_function(step: &ReplayStep) -> Option<&str> {
+    changed_source_lines(step).into_iter().find_map(|line| {
+        let (kind, name) = source_symbol(line.trim())?;
+        (kind == "fn").then_some(name)
+    })
+}
+
+fn changed_binding(step: &ReplayStep) -> Option<&str> {
+    changed_source_lines(step).into_iter().find_map(|line| {
+        let declaration = line.trim().strip_prefix("let ")?.trim_start();
+        let declaration = declaration.strip_prefix("mut ").unwrap_or(declaration);
+        let (name, _) = declaration.split_once('=')?;
+        let name = name.split_once(':').map_or(name, |(name, _)| name).trim();
+        (name != "_" && is_source_identifier(name)).then_some(name)
+    })
+}
+
+fn changed_module(step: &ReplayStep) -> Option<&str> {
+    changed_source_lines(step).into_iter().find_map(|line| {
+        let mut words = line
+            .trim()
+            .split(|character: char| !character.is_ascii_alphanumeric() && character != '_');
+        while let Some(word) = words.next() {
+            if word == "mod" {
+                let name = words.find(|candidate| is_source_identifier(candidate))?;
+                return Some(name);
+            }
+        }
+        None
+    })
+}
+
+fn inline_code_spans(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().flat_map(|line| {
+        line.split('`')
+            .enumerate()
+            .filter_map(|(index, span)| (index % 2 == 1).then_some(span.trim()))
+            .filter(|span| !span.is_empty())
+    })
+}
+
+fn changed_markdown_subject(step: &ReplayStep) -> Option<&str> {
+    let (original, changed) = if step.kind == ReplayStepKind::Remove {
+        (&step.after, &step.before)
+    } else {
+        (&step.before, &step.after)
+    };
+    let mut remaining = HashMap::<&str, usize>::new();
+    for span in inline_code_spans(original) {
+        *remaining.entry(span).or_default() += 1;
+    }
+
+    inline_code_spans(changed).find_map(|span| {
+        if let Some(count) = remaining.get_mut(span) {
+            if *count > 0 {
+                *count -= 1;
+                return None;
+            }
+        }
+
+        let name = span
+            .split(|character: char| character == ':' || character.is_ascii_whitespace())
+            .next()?;
+        is_source_identifier(name).then_some(name)
+    })
+}
+
+fn markdown_endpoint(step: &ReplayStep) -> Option<&str> {
+    inline_code_spans(&step.heading)
+        .chain(inline_code_spans(&step.after))
+        .find(|span| span.starts_with("thread/") && !span.chars().any(char::is_whitespace))
+}
+
+fn added_documentation(step: &ReplayStep) -> Option<String> {
+    let mut lines = Vec::new();
+
+    for line in changed_source_lines(step) {
+        let line = line.trim();
+        if let Some(documentation) = line
+            .strip_prefix("///")
+            .or_else(|| line.strip_prefix("//!"))
+        {
+            let documentation = documentation.trim();
+            if !documentation.is_empty() {
+                lines.push(documentation);
+            }
+        } else if !lines.is_empty() {
+            break;
+        }
+    }
+
+    (!lines.is_empty()).then(|| lines.join(" "))
+}
+
+fn review_body_rationale(body: &str, step: &ReplayStep, path: &str) -> Option<String> {
+    let keywords = replay_semantic_tokens(step, path);
+    let mut section = ReviewSection::Other;
+    let mut fenced = false;
+    let mut motivation = String::new();
+    let mut first_prose = String::new();
+    let mut best_change: Option<(usize, String)> = None;
+
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+
+        if let Some(heading) = markdown_heading(trimmed) {
+            section = review_section(heading);
+            continue;
+        }
+
+        if trimmed.is_empty()
+            || trimmed.starts_with("<!--")
+            || trimmed.starts_with("-->")
+            || trimmed.starts_with("![")
+        {
+            continue;
+        }
+
+        if let Some(bullet) = markdown_bullet(trimmed) {
+            if section == ReviewSection::Changes {
+                let score = semantic_tokens(bullet).intersection(&keywords).count();
+                if score >= 2
+                    && best_change
+                        .as_ref()
+                        .is_none_or(|(best_score, _)| score > *best_score)
+                {
+                    best_change = Some((score, bullet.trim_matches('`').trim().to_string()));
+                }
+            }
+            continue;
+        }
+
+        if section == ReviewSection::Motivation && motivation.is_empty() {
+            motivation = trimmed.to_string();
+        }
+        if first_prose.is_empty() {
+            first_prose = trimmed.to_string();
+        }
+    }
+
+    best_change
+        .map(|(_, change)| change)
+        .or_else(|| (!motivation.is_empty()).then_some(motivation))
+        .or_else(|| (!first_prose.is_empty()).then_some(first_prose))
+}
+
+fn markdown_heading(line: &str) -> Option<&str> {
+    let heading = line.strip_prefix('#')?;
+    let heading = heading.trim_start_matches('#');
+    if !heading.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let heading = heading.trim().trim_end_matches('#').trim();
+    (!heading.is_empty()).then_some(heading)
+}
+
+fn review_section(heading: &str) -> ReviewSection {
+    let heading = heading.to_ascii_lowercase();
+    if matches!(
+        heading.as_str(),
+        "why" | "motivation" | "background" | "problem" | "context" | "overview"
+    ) {
+        ReviewSection::Motivation
+    } else if matches!(
+        heading.as_str(),
+        "what changed" | "what changes" | "changes" | "implementation" | "solution"
+    ) {
+        ReviewSection::Changes
+    } else {
+        ReviewSection::Other
+    }
+}
+
+fn markdown_bullet(line: &str) -> Option<&str> {
+    line.strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix("+ "))
+        .map(str::trim)
+        .filter(|bullet| !bullet.is_empty())
+}
+
+fn replay_semantic_tokens(step: &ReplayStep, path: &str) -> HashSet<String> {
+    let mut source = String::new();
+    source.push_str(&step.heading);
+    source.push(' ');
+    source.push_str(path);
+
+    for line in changed_source_lines(step)
+        .into_iter()
+        .take(MAX_SEMANTIC_SOURCE_LINES)
+    {
+        let remaining = MAX_SEMANTIC_SOURCE_CHARS.saturating_sub(source.len());
+        if remaining == 0 {
+            break;
+        }
+        source.push(' ');
+        for character in line.chars() {
+            if source.len().saturating_add(character.len_utf8()) > MAX_SEMANTIC_SOURCE_CHARS {
+                break;
+            }
+            source.push(character);
+        }
+    }
+
+    semantic_tokens(&source)
+}
+
+fn semantic_tokens(text: &str) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+    let mut current = String::new();
+    let mut previous_lowercase = false;
+
+    for character in text.chars().take(MAX_SEMANTIC_SOURCE_CHARS) {
+        if character.is_ascii_alphanumeric() {
+            if character.is_ascii_uppercase() && previous_lowercase {
+                push_semantic_token(&mut tokens, &mut current);
+            }
+            current.push(character.to_ascii_lowercase());
+            previous_lowercase = character.is_ascii_lowercase();
+        } else {
+            push_semantic_token(&mut tokens, &mut current);
+            previous_lowercase = false;
+        }
+    }
+    push_semantic_token(&mut tokens, &mut current);
+
+    tokens
+}
+
+fn push_semantic_token(tokens: &mut HashSet<String>, current: &mut String) {
+    if current.len() >= 3
+        && !matches!(
+            current.as_str(),
+            "add"
+                | "and"
+                | "are"
+                | "change"
+                | "changes"
+                | "for"
+                | "from"
+                | "let"
+                | "new"
+                | "pub"
+                | "src"
+                | "the"
+                | "this"
+                | "use"
+                | "with"
+        )
+    {
+        tokens.insert(std::mem::take(current));
+    } else {
+        current.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::replay::{
-        digest, replay_demo_plan, GitObjectId, ReplayRepository, ReplaySource, ReplaySourceKind,
-        ReplayWorkspace,
+        digest, replay_demo_plan, GitObjectId, ReplayRepository, ReplayReviewContext, ReplaySource,
+        ReplaySourceKind, ReplayWorkspace,
     };
 
     const MULTI_FILE_PATCH: &str = concat!(
@@ -430,6 +891,45 @@ mod tests {
         "-assert_eq!(token(), 1);\n",
         "+assert_eq!(token(), 2);\n",
     );
+
+    const DOCUMENTED_FIELD_PATCH: &str = concat!(
+        "diff --git a/src/token.rs b/src/token.rs\n",
+        "index 1111111..2222222 100644\n",
+        "--- a/src/token.rs\n",
+        "+++ b/src/token.rs\n",
+        "@@ -1,4 +1,8 @@ pub struct ThreadResumeParams {\n",
+        " pub struct ThreadResumeParams {\n",
+        "     pub exclude_turns: bool,\n",
+        "+    /// Replay cached token usage after the response without loading all thread turns.\n",
+        "+    #[experimental(\"thread/resume.restoreTokenUsage\")]\n",
+        "+    #[serde(default, skip_serializing_if = \"std::ops::Not::not\")]\n",
+        "+    pub restore_token_usage: bool,\n",
+        "     pub initial_turns_page: Option<usize>,\n",
+        " }\n",
+    );
+
+    const UNDOCUMENTED_FIELD_PATCH: &str = concat!(
+        "diff --git a/src/token.rs b/src/token.rs\n",
+        "index 1111111..2222222 100644\n",
+        "--- a/src/token.rs\n",
+        "+++ b/src/token.rs\n",
+        "@@ -1,4 +1,5 @@ pub struct ThreadResumeParams {\n",
+        " pub struct ThreadResumeParams {\n",
+        "     pub exclude_turns: bool,\n",
+        "+    pub restore_token_usage: bool,\n",
+        "     pub initial_turns_page: Option<usize>,\n",
+        " }\n",
+    );
+
+    fn codex_review_context(body: &str) -> ReplayReviewContext {
+        ReplayReviewContext {
+            title: "feat(tui): paginate session history by scrollback budget".to_string(),
+            body: body.to_string(),
+            author: Some("fcoury-oai".to_string()),
+            commits: Vec::new(),
+            changed_files: 21,
+        }
+    }
 
     fn source_session(patch: &str) -> (tempfile::TempDir, ReplaySession) {
         let directory = tempfile::tempdir().expect("isolated replay source fixture");
@@ -470,6 +970,219 @@ mod tests {
         let session = ReplaySession::from_source(source, workspace, ReplayLimits::default())
             .expect("source-linked replay session");
         (directory, session)
+    }
+
+    #[test]
+    fn real_plan_explains_the_actual_added_field_instead_of_its_raw_hunk_heading() {
+        let (directory, mut session) = source_session(DOCUMENTED_FIELD_PATCH);
+        std::fs::write(
+            directory.path().join("src/token.rs"),
+            concat!(
+                "pub struct ThreadResumeParams {\n",
+                "    pub exclude_turns: bool,\n",
+                "    pub initial_turns_page: Option<usize>,\n",
+                "}\n",
+            ),
+        )
+        .expect("write the real original thread-resume source");
+        session.source.review_context = Some(codex_review_context(concat!(
+            "## Why\n\n",
+            "Resuming a long session must not replay more history than the terminal can retain.\n\n",
+            "## What changed\n\n",
+            "- Add experimental restoreTokenUsage support so token totals remain available.\n",
+        )));
+
+        let plan = replay_plan_from_session(
+            &session,
+            "fcoury/tui-paginated-history",
+            ReplayLimits::default(),
+        )
+        .expect("compile a source-grounded learning step");
+        let step = &plan.steps[0];
+
+        assert_eq!(step.title, "Add restore_token_usage to ThreadResumeParams");
+        assert_eq!(
+            step.why,
+            "Replay cached token usage after the response without loading all thread turns.",
+        );
+        assert_eq!(
+            step.task,
+            "Add the restore_token_usage field to ThreadResumeParams.",
+        );
+        assert!(!step.why.starts_with('#'));
+    }
+
+    #[test]
+    fn real_plan_skips_markdown_headings_when_extracting_pull_request_rationale() {
+        let (_directory, mut session) = source_session(MULTI_FILE_PATCH);
+        let rationale =
+            "Resuming a long session must not replay more history than the terminal can retain.";
+        session.source.review_context = Some(codex_review_context(&format!(
+            "## Why\n\n{rationale}\n\n## What changed\n\n- Update the implementation.\n",
+        )));
+
+        let plan = replay_plan_from_session(&session, "feature/replay", ReplayLimits::default())
+            .expect("compile a Markdown-aware replay plan");
+
+        assert_eq!(plan.steps[0].why, rationale);
+        assert!(plan.steps.iter().all(|step| !step.why.starts_with('#')));
+    }
+
+    #[test]
+    fn real_plan_prefers_the_relevant_author_written_change_description() {
+        let (directory, mut session) = source_session(UNDOCUMENTED_FIELD_PATCH);
+        std::fs::write(
+            directory.path().join("src/token.rs"),
+            concat!(
+                "pub struct ThreadResumeParams {\n",
+                "    pub exclude_turns: bool,\n",
+                "    pub initial_turns_page: Option<usize>,\n",
+                "}\n",
+            ),
+        )
+        .expect("write the original thread-resume source");
+        let relevant = "Add experimental restoreTokenUsage support so token totals remain available without materializing the entire transcript.";
+        session.source.review_context = Some(codex_review_context(&format!(
+            concat!(
+                "## Why\n\n",
+                "Long sessions should only load history that the terminal can display.\n\n",
+                "## What changed\n\n",
+                "- Preserve the visible transcript scroll anchor.\n",
+                "- {}\n",
+                "- Keep the terminal history budget bounded.\n",
+            ),
+            relevant,
+        )));
+
+        let plan = replay_plan_from_session(
+            &session,
+            "fcoury/tui-paginated-history",
+            ReplayLimits::default(),
+        )
+        .expect("compile a change-specific author-written rationale");
+
+        assert_eq!(plan.steps[0].why, relevant);
+    }
+
+    #[test]
+    fn real_plan_distinguishes_the_actual_resume_and_fork_documentation_changes() {
+        let (_directory, session) = source_session(MULTI_FILE_PATCH);
+        let mut resume = session.steps[0].clone();
+        resume.heading = "Valid `personality` values are friendly and pragmatic.".to_string();
+        resume.before = concat!(
+            "By default, `thread/resume` skips restored ",
+            "`thread/tokenUsage/updated`.\n",
+        )
+        .to_string();
+        resume.after = concat!(
+            "By default, `thread/resume` skips restored ",
+            "`thread/tokenUsage/updated` unless `restoreTokenUsage: true` is provided.\n",
+        )
+        .to_string();
+
+        assert_eq!(
+            replay_title(&resume, "codex-rs/app-server/README.md"),
+            "Document thread/resume restoreTokenUsage",
+        );
+
+        let mut fork = resume.clone();
+        fork.heading = "To branch from a stored session, call `thread/fork`.".to_string();
+        fork.before = concat!(
+            "Like `thread/resume`, call `thread/fork` ",
+            "without replaying `thread/tokenUsage/updated`.\n",
+        )
+        .to_string();
+        fork.after = concat!(
+            "Like `thread/resume`, call `thread/fork` ",
+            "without replaying `thread/tokenUsage/updated` ",
+            "unless `restoreTokenUsage: true` is provided.\n",
+        )
+        .to_string();
+
+        assert_eq!(
+            replay_title(&fork, "codex-rs/app-server/README.md"),
+            "Document thread/fork restoreTokenUsage",
+        );
+    }
+
+    #[test]
+    fn real_plan_distinguishes_relocated_bindings_within_the_same_function() {
+        let (_directory, session) = source_session(MULTI_FILE_PATCH);
+        let mut removal = session.steps[0].clone();
+        removal.kind = ReplayStepKind::Remove;
+        removal.heading = "pub(super) async fn handle_pending_thread_resume_request(".to_string();
+        removal.before = concat!(
+            "    let token_usage_turn_id = pending.include_turns;\n",
+            "    continue_resume();\n",
+        )
+        .to_string();
+        removal.after = "    continue_resume();\n".to_string();
+
+        assert_eq!(
+            replay_title(&removal, "src/thread_lifecycle.rs"),
+            "Remove token_usage_turn_id from handle_pending_thread_resume_request",
+        );
+        assert_eq!(
+            replay_task(&removal, "src/thread_lifecycle.rs"),
+            "Remove the token_usage_turn_id binding from handle_pending_thread_resume_request.",
+        );
+
+        let mut addition = removal.clone();
+        addition.kind = ReplayStepKind::Add;
+        addition.before = "    continue_resume();\n".to_string();
+        addition.after = concat!(
+            "    let token_usage_turn_id = pending.restore_token_usage;\n",
+            "    continue_resume();\n",
+        )
+        .to_string();
+
+        assert_eq!(
+            replay_title(&addition, "src/thread_lifecycle.rs"),
+            "Add token_usage_turn_id to handle_pending_thread_resume_request",
+        );
+    }
+
+    #[test]
+    fn real_plan_identifies_functions_added_inside_existing_implementations() {
+        let (_directory, session) = source_session(MULTI_FILE_PATCH);
+        let mut step = session.steps[0].clone();
+        step.kind = ReplayStepKind::Add;
+        step.heading = "impl TranscriptOverlay {".to_string();
+        step.before = "impl TranscriptOverlay {\n}\n".to_string();
+        step.after = concat!(
+            "impl TranscriptOverlay {\n",
+            "    /// Return whether the transcript needs an older history page.\n",
+            "    pub(crate) fn should_load_older(&self) -> bool {\n",
+            "        true\n",
+            "    }\n",
+            "}\n",
+        )
+        .to_string();
+
+        assert_eq!(
+            replay_title(&step, "src/pager_overlay.rs"),
+            "Add should_load_older to TranscriptOverlay",
+        );
+        assert_eq!(
+            replay_task(&step, "src/pager_overlay.rs"),
+            "Add the should_load_older function to TranscriptOverlay.",
+        );
+    }
+
+    #[test]
+    fn real_plan_keeps_new_file_names_visible_in_narrow_panels() {
+        let (_directory, session) = source_session(MULTI_FILE_PATCH);
+        let mut step = session.steps[0].clone();
+        step.kind = ReplayStepKind::AddFile;
+        step.heading.clear();
+        step.before.clear();
+        step.after =
+            "//! Load older transcript pages without rewriting terminal scrollback.\n".to_string();
+
+        assert_eq!(
+            replay_title(&step, "codex-rs/tui/src/app/history_pagination.rs"),
+            "Add history_pagination.rs",
+        );
     }
 
     #[test]

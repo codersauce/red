@@ -66,6 +66,15 @@ document, or an editable editor split. It contains the verified source, original
 author and branch, the actual unified diff for each individual step, the
 reconstruction task, optional hints, and progress.
 
+The panel also shows the original pull-request title. Real learning-step titles
+and reconstruction tasks identify the changed source symbol rather than exposing
+Git's raw hunk heading. Explanations prefer the author's documentation on the
+exact changed source, then the matching author-written pull-request change, and
+finally the pull request's actual motivation. Markdown headings are never
+presented as explanations. This guidance is derived from the pinned original
+source and review context; it does not invent or attribute undocumented intent
+to the author.
+
 For a multi-file review, `h` and `l` select the previous and next original hunk
 and switch the existing editor window to that hunk's actual scratch file.
 The source cursor and viewport jump directly to the original hunk, even when

@@ -536,6 +536,18 @@ fn replay_header_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
             truncate_display_width_with_marker(&model.branch, width, "…", TruncationSide::Right),
             TextPanelSpanStyle::Muted,
         ),
+    ];
+    let title = model.title.trim();
+    if !title.is_empty()
+        && title != model.branch
+        && title.strip_prefix("Replay ") != Some(model.branch.as_str())
+    {
+        lines.push(RenderedTextLine::plain(
+            truncate_display_width_with_marker(title, width, "…", TruncationSide::Right),
+            TextPanelSpanStyle::Text,
+        ));
+    }
+    lines.extend([
         RenderedTextLine::plain(String::new(), TextPanelSpanStyle::Text),
         aligned_line(
             "CURRENT CHANGE",
@@ -551,7 +563,7 @@ fn replay_header_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
         ),
         RenderedTextLine::plain(String::new(), TextPanelSpanStyle::Text),
         RenderedTextLine::plain("WHY".to_string(), TextPanelSpanStyle::Heading),
-    ];
+    ]);
     lines.extend(
         wrap_plain_text(&step.why, width.max(1), TextPanelSpanStyle::Muted)
             .into_iter()
@@ -1433,6 +1445,33 @@ mod tests {
         assert!(metadata.contains("#482 · @original-author"));
         assert!(metadata.ends_with("1 / 5 reviewed"));
         assert!(!title.contains("reviewed"));
+    }
+
+    #[test]
+    fn original_pull_request_title_is_visible_above_the_current_change() {
+        let mut replay = model();
+        replay.title = "feat(tui): paginate session history by scrollback budget".to_string();
+        let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+        let lines = replay_header_lines(&state, /*width*/ 64)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let title = lines
+            .iter()
+            .position(|line| line == "feat(tui): paginate session history by scrollback budget")
+            .expect("original pull request title");
+        let current_change = lines
+            .iter()
+            .position(|line| line.starts_with("CURRENT CHANGE"))
+            .expect("current learning step");
+
+        assert_eq!(title, 2);
+        assert!(title < current_change);
     }
 
     #[test]
