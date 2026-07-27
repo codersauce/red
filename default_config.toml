@@ -328,6 +328,8 @@ Esc = { EnterMode = "Normal" }
 "s" = { PluginCommand = "ReplaySummary" }
 "e" = { PluginCommand = "ReplayEditDraft" }
 "d" = { PluginCommand = "ReplayDiscardDraft" }
+"S" = { PluginCommand = "ReplaySaveReview" }
+"L" = { PluginCommand = "ReplayLoadReview" }
 "q" = { PluginCommand = "ReplayClose" }
 
 [keys.normal." "."d"]

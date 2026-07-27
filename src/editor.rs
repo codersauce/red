@@ -834,6 +834,24 @@ pub enum PluginRequest {
         workspace_id: String,
         draft_id: String,
     },
+    ReplaySaveReview {
+        request_id: RequestId,
+        workspace_id: String,
+        path: String,
+        overwrite: bool,
+    },
+    ReplayPreviewReview {
+        request_id: RequestId,
+        workspace_id: String,
+        path: String,
+    },
+    ReplayLoadReview {
+        request_id: RequestId,
+        workspace_id: String,
+        path: String,
+        bundle_digest: String,
+        confirmed: bool,
+    },
     ReplaySetMode {
         request_id: RequestId,
         workspace_id: String,
@@ -1047,8 +1065,9 @@ pub enum PluginRequest {
 
 /// Trusted results returned from bounded, background Replay source operations.
 ///
-/// Background workers perform GitHub and Git I/O only. The interactive editor
-/// remains the exclusive owner of source handles, review state, and buffers.
+/// Background workers perform GitHub, Git, and explicitly requested private
+/// review-file I/O only. The interactive editor remains the exclusive owner of
+/// source handles, review state, draft merges, and buffers.
 #[doc(hidden)]
 pub enum ReplayBackgroundResult {
     /// Verified GitHub metadata and, when locally available, its pinned source.
@@ -1082,6 +1101,31 @@ pub enum ReplayBackgroundResult {
         review_id: String,
         /// Safely decoded owner snapshot with original Replay metadata.
         snapshot: Box<SessionSnapshot>,
+    },
+    /// An immutable editor-owned review snapshot saved to a user-selected file.
+    SavedReviewBundle {
+        /// Stable editor-owned review whose contents were explicitly saved.
+        workspace_id: String,
+        /// Exact private file and original-source-linked outcome counts.
+        saved: Box<crate::replay::ReplayReviewBundleSaved>,
+    },
+    /// Read-only validation of a user-selected, original-source-linked review.
+    ReviewBundlePreview {
+        /// Stable editor-owned review against which the file was checked.
+        workspace_id: String,
+        /// Session generation observed before bounded background validation.
+        generation: u64,
+        /// Exact file digest and non-destructive original-source merge counts.
+        preview: Box<crate::replay::ReplayReviewBundlePreview>,
+    },
+    /// A confirmed private bundle; only the main editor may merge its outcomes.
+    ReviewBundleImport {
+        /// Stable editor-owned review against which the file was checked.
+        workspace_id: String,
+        /// Bounded and completely validated original-source review file.
+        bundle: Box<crate::replay::ReplayReviewBundle>,
+        /// Exact user-confirmed, content-pinned import preview.
+        preview: Box<crate::replay::ReplayReviewBundlePreview>,
     },
     /// A verified legacy pull-request worktree reopened without creating one.
     RecoveredPullRequest {
@@ -1152,6 +1196,9 @@ impl PluginRequest {
             Self::ReplayAddDraft { .. } => "ReplayAddDraft",
             Self::ReplayUpdateDraft { .. } => "ReplayUpdateDraft",
             Self::ReplayRemoveDraft { .. } => "ReplayRemoveDraft",
+            Self::ReplaySaveReview { .. } => "ReplaySaveReview",
+            Self::ReplayPreviewReview { .. } => "ReplayPreviewReview",
+            Self::ReplayLoadReview { .. } => "ReplayLoadReview",
             Self::ReplaySetMode { .. } => "ReplaySetMode",
             Self::ReplayBackgroundCompleted { .. } => "ReplayBackgroundCompleted",
             Self::ReplayFocusStepSource { .. } => "ReplayFocusStepSource",
@@ -3906,6 +3953,7 @@ impl Editor {
             "viewer": pull_request.and_then(|request| request.capabilities.viewer.as_deref()),
             "head_ref": pull_request.map(|request| request.head_ref.as_str()),
             "head_commit": session.source.target_commit.as_str(),
+            "review_bundle_path": crate::replay::suggested_review_bundle_path(&session.source),
             "head_permission": pull_request.map(|request| request.capabilities.head_permission),
             "drafts": drafts,
             "outbox": {
@@ -4351,6 +4399,7 @@ impl Editor {
             "review_role": recovered.review.role,
             "viewer": pull_request.and_then(|request| request.capabilities.viewer.as_deref()),
             "head_commit": recovered.source.target_commit.as_str(),
+            "review_bundle_path": crate::replay::suggested_review_bundle_path(&recovered.source),
             "head_permission": pull_request.map(|request| request.capabilities.head_permission),
             "drafts": recovered.review.drafts,
             "plan": presentation,
@@ -8619,6 +8668,110 @@ impl Editor {
                         .resolve_request(runtime, request_id, payload)
                         .await?;
                 }
+                PluginRequest::ReplaySaveReview {
+                    request_id,
+                    workspace_id,
+                    path,
+                    overwrite,
+                } => {
+                    let started = self
+                        .replay_controller
+                        .prepare_review_bundle(&workspace_id)
+                        .and_then(|bundle| {
+                            self.spawn_replay_background(request_id, "review-save", move || {
+                                let path = expand_user_path(&path).map_err(|error| {
+                                    crate::replay::ReplayError::Filesystem(format!(
+                                        "cannot expand the selected local review path: {error}",
+                                    ))
+                                })?;
+                                let saved = crate::replay::write_prepared_review_bundle(
+                                    &bundle, &path, overwrite,
+                                )?;
+                                Ok(ReplayBackgroundResult::SavedReviewBundle {
+                                    workspace_id,
+                                    saved: Box::new(saved),
+                                })
+                            })
+                        });
+                    if let Err(error) = started {
+                        self.plugin_registry
+                            .resolve_request(runtime, request_id, error.payload())
+                            .await?;
+                    }
+                }
+                PluginRequest::ReplayPreviewReview {
+                    request_id,
+                    workspace_id,
+                    path,
+                } => {
+                    let limits = self.replay_controller.limits();
+                    let started = self
+                        .replay_controller
+                        .session(&workspace_id)
+                        .cloned()
+                        .and_then(|session| {
+                            self.spawn_replay_background(request_id, "review-preview", move || {
+                                let path = expand_user_path(&path).map_err(|error| {
+                                    crate::replay::ReplayError::Filesystem(format!(
+                                        "cannot expand the selected local review path: {error}",
+                                    ))
+                                })?;
+                                let preview = crate::replay::preview_review_bundle_snapshot(
+                                    &session, limits, &path,
+                                )?;
+                                Ok(ReplayBackgroundResult::ReviewBundlePreview {
+                                    workspace_id,
+                                    generation: session.generation,
+                                    preview: Box::new(preview),
+                                })
+                            })
+                        });
+                    if let Err(error) = started {
+                        self.plugin_registry
+                            .resolve_request(runtime, request_id, error.payload())
+                            .await?;
+                    }
+                }
+                PluginRequest::ReplayLoadReview {
+                    request_id,
+                    workspace_id,
+                    path,
+                    bundle_digest,
+                    confirmed,
+                } => {
+                    let limits = self.replay_controller.limits();
+                    let started = self
+                        .replay_controller
+                        .session(&workspace_id)
+                        .cloned()
+                        .and_then(|session| {
+                            self.spawn_replay_background(request_id, "review-load", move || {
+                                let path = expand_user_path(&path).map_err(|error| {
+                                    crate::replay::ReplayError::Filesystem(format!(
+                                        "cannot expand the selected local review path: {error}",
+                                    ))
+                                })?;
+                                let (bundle, preview) =
+                                    crate::replay::prepare_review_bundle_import(
+                                        &session,
+                                        limits,
+                                        &path,
+                                        &bundle_digest,
+                                        confirmed,
+                                    )?;
+                                Ok(ReplayBackgroundResult::ReviewBundleImport {
+                                    workspace_id,
+                                    bundle: Box::new(bundle),
+                                    preview: Box::new(preview),
+                                })
+                            })
+                        });
+                    if let Err(error) = started {
+                        self.plugin_registry
+                            .resolve_request(runtime, request_id, error.payload())
+                            .await?;
+                    }
+                }
                 PluginRequest::ReplaySetMode {
                     request_id,
                     workspace_id,
@@ -8673,6 +8826,68 @@ impl Editor {
                                 payload
                             }
                             Err(error) => json!({ "ok": false, "error": error.to_string() }),
+                        },
+                        Ok(ReplayBackgroundResult::SavedReviewBundle {
+                            workspace_id,
+                            saved,
+                        }) => json!({
+                            "ok": true,
+                            "workspace_id": workspace_id,
+                            "path": saved.path,
+                            "note_count": saved.note_count,
+                            "draft_count": saved.draft_count,
+                        }),
+                        Ok(ReplayBackgroundResult::ReviewBundlePreview {
+                            workspace_id,
+                            generation,
+                            preview,
+                        }) => match self.replay_controller.session(&workspace_id) {
+                            Ok(session) if session.generation == generation => json!({
+                                "ok": true,
+                                "workspace_id": workspace_id,
+                                "preview": preview,
+                            }),
+                            Ok(_) => crate::replay::ReplayError::StalePreview.payload(),
+                            Err(error) => error.payload(),
+                        },
+                        Ok(ReplayBackgroundResult::ReviewBundleImport {
+                            workspace_id,
+                            bundle,
+                            preview,
+                        }) => match self.replay_controller.merge_review_bundle(
+                            &workspace_id,
+                            *bundle,
+                            *preview,
+                        ) {
+                            Ok(preview) => match self.replay_controller.session(&workspace_id) {
+                                Ok(session) => {
+                                    let notes = session
+                                        .notes
+                                        .iter()
+                                        .filter_map(|note| {
+                                            let step_id = note.step_id.as_deref()?;
+                                            let index = session
+                                                .steps
+                                                .iter()
+                                                .position(|step| step.id == step_id)?;
+                                            Some(json!({
+                                                "index": index,
+                                                "text": note.text,
+                                            }))
+                                        })
+                                        .collect::<Vec<_>>();
+                                    needs_render = true;
+                                    json!({
+                                        "ok": true,
+                                        "workspace_id": workspace_id,
+                                        "drafts": session.review.drafts,
+                                        "notes": notes,
+                                        "preview": preview,
+                                    })
+                                }
+                                Err(error) => error.payload(),
+                            },
+                            Err(error) => error.payload(),
                         },
                         Ok(ReplayBackgroundResult::RecoveredPullRequest {
                             resolved,

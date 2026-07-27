@@ -4,7 +4,8 @@
 // worktree creation, editable scratch sources, validation, and undo transactions.
 // The coach remains a dedicated read-only plugin panel. Creating a worktree or
 // fetching missing PR objects always requires a separate explicit confirmation.
-// No Replay action pushes, saves, commits, or submits a GitHub review.
+// No Replay action pushes, commits, or submits a GitHub review. Private review
+// bundles are saved or loaded only after the user explicitly chooses a file.
 
 pub fn activate() {
     red::add_command("Replay", open, Json {
@@ -121,6 +122,18 @@ pub fn activate() {
         category: "PR Replay",
         description: "Remove the selected local draft without changing the PR or review source",
     });
+    red::add_command("ReplaySaveReview", save_review, Json {
+        title: "Save a private PR review",
+        category: "PR Replay",
+        description: "Save source-anchored local drafts and findings to a portable private file",
+        aliases: ["save replay review", "export private review"],
+    });
+    red::add_command("ReplayLoadReview", load_review, Json {
+        title: "Load a private PR review",
+        category: "PR Replay",
+        description: "Preview and safely merge a portable review for this exact original PR",
+        aliases: ["load replay review", "import private review"],
+    });
     red::add_command("ReplayFocusGuide", focus, Json {
         title: "Focus the PR Replay guide",
         category: "PR Replay",
@@ -150,6 +163,7 @@ pub fn activate() {
     red::state_set("replay_branch", "");
     red::state_set("replay_review_role", red::null());
     red::state_set("replay_head_commit", "");
+    red::state_set("replay_review_path", "");
     red::state_set("replay_title", "");
     red::state_set("replay_index", 0);
     red::state_set("replay_mode", "challenge");
@@ -162,6 +176,8 @@ pub fn activate() {
     red::state_set("replay_pending_draft_kind", "");
     red::state_set("replay_pending_draft_id", "");
     red::state_set("replay_pending_draft_step_id", "");
+    red::state_set("replay_pending_bundle_path", "");
+    red::state_set("replay_pending_bundle_digest", "");
     red::state_set("replay_completions", []);
     red::state_set("replay_notice", "");
     red::state_set("replay_steps", []);
@@ -536,6 +552,7 @@ fn load_plan(plan: Json) -> bool {
     red::state_set("replay_index", 0);
     red::state_set("replay_review_role", red::null());
     red::state_set("replay_head_commit", "");
+    red::state_set("replay_review_path", "");
     red::state_set("replay_notes", []);
     red::state_set("replay_drafts", []);
     red::state_set("replay_outbox_index", 0);
@@ -565,6 +582,7 @@ fn workspace_opened(event: Json) {
     red::state_set("replay_workspace_root", red::string(event.workspace_root, ""));
     red::state_set("replay_source_buffer_index", red::int(event.source_buffer_index, -1));
     red::state_set("replay_head_commit", red::string(event.head_commit, ""));
+    red::state_set("replay_review_path", red::string(event.review_bundle_path, ""));
     let role = red::string(event.review_role, "");
     if role == "" {
         red::state_set("replay_review_role", red::null());
@@ -659,6 +677,10 @@ fn panel_event(event: Json) {
         edit_draft();
     } else if action == "d" || action == "discard_draft" {
         discard_draft();
+    } else if action == "S" || action == "save_review" {
+        save_review();
+    } else if action == "L" || action == "load_review" {
+        load_review();
     }
 }
 
@@ -1278,6 +1300,274 @@ fn review_draft_removed(result: Json) {
     red::state_set("replay_pending_draft_id", "");
     red::state_set("replay_notice", "Local draft discarded · the PR remains unchanged.");
     red::state_set("replay_view", "outbox");
+    render();
+}
+
+fn portable_review_ready() -> bool {
+    if !ensure_workspace() {
+        return false;
+    }
+    if red::string(red::state("replay_source_kind"), "demo") == "demo" {
+        red::state_set(
+            "replay_notice",
+            "Open a real PR or local branch before saving or loading a private review."
+        );
+        render();
+        return false;
+    }
+    return true;
+}
+
+fn suggested_review_path() -> String {
+    return red::string(red::state("replay_review_path"), "");
+}
+
+fn review_outcome_count(count: int, singular: String, plural: String) -> String {
+    if count == 1 {
+        return count + " " + singular;
+    }
+    return count + " " + plural;
+}
+
+fn save_review() {
+    if !portable_review_ready() {
+        return;
+    }
+    if red::len(red::state("replay_drafts")) == 0
+        && red::len(red::state("replay_notes")) == 0 {
+        red::state_set(
+            "replay_notice",
+            "Nothing to save yet. Add a local comment, summary, fix, or observation first."
+        );
+        red::state_set("replay_view", "outbox");
+        render();
+        return;
+    }
+    let path = suggested_review_path();
+    if path == "" {
+        red::state_set(
+            "replay_notice",
+            "The private review location could not be verified. Reopen the original review before saving."
+        );
+        red::state_set("replay_view", "outbox");
+        render();
+        return;
+    }
+    red::execute(
+        "OpenInput",
+        "Save private review file · never sent to GitHub",
+        path,
+        ComposerHandlers {
+            submitted: save_review_path_submitted,
+            cancelled: review_file_cancelled,
+        }
+    );
+}
+
+fn save_review_path_submitted(value: String) {
+    let path = red::trim(value);
+    if path == "" {
+        red::state_set("replay_notice", "Choose a filename to save this private review.");
+        render();
+        return;
+    }
+    red::state_set("replay_pending_bundle_path", path);
+    red::request(
+        "ReplaySaveReview",
+        review_saved,
+        red::string(red::state("replay_workspace_id"), ""),
+        path,
+        false
+    );
+}
+
+fn review_saved(result: Json) {
+    if !red::bool(result.ok, false) {
+        if red::string(result.code, "") == "review_bundle_exists" {
+            red::execute(
+                "OpenConfirm",
+                "Replace saved local review?",
+                "This private review file already exists. Replace its contents? No GitHub review, branch, or source file will change.",
+                PickerHandlers {
+                    selected: replace_review_selected,
+                    cancelled: review_file_picker_cancelled,
+                }
+            );
+            return;
+        }
+        red::state_set("replay_pending_bundle_path", "");
+        red::state_set(
+            "replay_notice",
+            source_error(result, "Could not save the private local review")
+        );
+        render();
+        return;
+    }
+    red::state_set("replay_pending_bundle_path", "");
+    red::state_set("replay_review_path", red::string(result.path, ""));
+    red::state_set(
+        "replay_notice",
+        "Saved " + review_outcome_count(red::int(result.draft_count, 0), "draft", "drafts")
+            + " and "
+            + review_outcome_count(red::int(result.note_count, 0), "observation", "observations")
+            + " locally · nothing sent to GitHub."
+    );
+    red::state_set("replay_view", "outbox");
+    render();
+}
+
+fn replace_review_selected(item: PickerItem) {
+    if item.id != "accept" {
+        red::state_set("replay_pending_bundle_path", "");
+        render();
+        return;
+    }
+    red::request(
+        "ReplaySaveReview",
+        review_saved,
+        red::string(red::state("replay_workspace_id"), ""),
+        red::string(red::state("replay_pending_bundle_path"), ""),
+        true
+    );
+}
+
+fn load_review() {
+    if !portable_review_ready() {
+        return;
+    }
+    red::execute(
+        "OpenInput",
+        "Load private review file · preview before changes",
+        suggested_review_path(),
+        ComposerHandlers {
+            submitted: load_review_path_submitted,
+            cancelled: review_file_cancelled,
+        }
+    );
+}
+
+fn load_review_path_submitted(value: String) {
+    let path = red::trim(value);
+    if path == "" {
+        red::state_set("replay_notice", "Choose the private review file you want to load.");
+        render();
+        return;
+    }
+    red::state_set("replay_pending_bundle_path", path);
+    red::request(
+        "ReplayPreviewReview",
+        review_file_previewed,
+        red::string(red::state("replay_workspace_id"), ""),
+        path
+    );
+}
+
+fn review_file_previewed(result: Json) {
+    if !red::bool(result.ok, false) {
+        red::state_set("replay_pending_bundle_path", "");
+        red::state_set("replay_pending_bundle_digest", "");
+        red::state_set(
+            "replay_notice",
+            source_error(result, "This private review file does not match the original PR")
+        );
+        render();
+        return;
+    }
+    let preview = result.preview;
+    let new_drafts = red::int(preview.drafts_to_add, 0);
+    let new_notes = red::int(preview.notes_to_add, 0);
+    let existing_drafts = red::int(preview.drafts_already_present, 0);
+    let existing_notes = red::int(preview.notes_already_present, 0);
+    if new_drafts == 0 && new_notes == 0 {
+        red::state_set("replay_pending_bundle_path", "");
+        red::state_set("replay_pending_bundle_digest", "");
+        red::state_set(
+            "replay_notice",
+            "All " + review_outcome_count(existing_drafts, "draft", "drafts") + " and "
+                + review_outcome_count(existing_notes, "observation", "observations")
+                + " are already here · nothing sent to GitHub."
+        );
+        red::state_set("replay_view", "outbox");
+        render();
+        return;
+    }
+    red::state_set("replay_pending_bundle_path", red::string(preview.path, ""));
+    red::state_set("replay_pending_bundle_digest", red::string(preview.bundle_digest, ""));
+    let message = "Add " + review_outcome_count(new_drafts, "local draft", "local drafts")
+        + " and " + review_outcome_count(new_notes, "observation", "observations") + ". "
+        + review_outcome_count(existing_drafts, "draft", "drafts") + " and "
+        + review_outcome_count(existing_notes, "observation", "observations")
+        + " are already present. "
+        + "Existing review text is preserved. Nothing is sent to GitHub.";
+    red::execute(
+        "OpenConfirm",
+        "Load saved local review?",
+        message,
+        PickerHandlers {
+            selected: load_review_selected,
+            cancelled: review_file_picker_cancelled,
+        }
+    );
+}
+
+fn load_review_selected(item: PickerItem) {
+    if item.id != "accept" {
+        red::state_set("replay_pending_bundle_path", "");
+        red::state_set("replay_pending_bundle_digest", "");
+        render();
+        return;
+    }
+    red::request(
+        "ReplayLoadReview",
+        review_file_loaded,
+        red::string(red::state("replay_workspace_id"), ""),
+        red::string(red::state("replay_pending_bundle_path"), ""),
+        red::string(red::state("replay_pending_bundle_digest"), ""),
+        true
+    );
+}
+
+fn review_file_loaded(result: Json) {
+    red::state_set("replay_pending_bundle_path", "");
+    red::state_set("replay_pending_bundle_digest", "");
+    if !red::bool(result.ok, false) {
+        red::state_set(
+            "replay_notice",
+            source_error(result, "Could not safely load the private review file")
+        );
+        render();
+        return;
+    }
+    red::state_set("replay_drafts", result.drafts);
+    red::state_set("replay_notes", result.notes);
+    red::state_set("replay_review_path", red::string(result.preview.path, ""));
+    let index = red::int(red::state("replay_outbox_index"), 0);
+    if red::len(result.drafts) == 0 {
+        red::state_set("replay_outbox_index", 0);
+    } else if index >= red::len(result.drafts) && index > 0 {
+        red::state_set("replay_outbox_index", red::len(result.drafts) - 1);
+    }
+    red::state_set(
+        "replay_notice",
+        "Loaded "
+            + review_outcome_count(red::int(result.preview.drafts_to_add, 0), "draft", "drafts")
+            + " and "
+            + review_outcome_count(red::int(result.preview.notes_to_add, 0), "observation", "observations")
+            + " · existing drafts kept · nothing sent to GitHub."
+    );
+    red::state_set("replay_view", "outbox");
+    render();
+}
+
+fn review_file_cancelled(event: ComposerCancelled) {
+    red::state_set("replay_pending_bundle_path", "");
+    red::state_set("replay_pending_bundle_digest", "");
+    render();
+}
+
+fn review_file_picker_cancelled(event: PickerCancelled) {
+    red::state_set("replay_pending_bundle_path", "");
+    red::state_set("replay_pending_bundle_digest", "");
     render();
 }
 

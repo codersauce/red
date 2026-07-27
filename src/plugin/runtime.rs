@@ -1665,6 +1665,66 @@ impl RedHost {
                     .ok_or_else(|| anyhow::anyhow!("ReplayRemoveDraft requires a draft id"))?
                     .to_string(),
             },
+            "ReplaySaveReview" => PluginRequest::ReplaySaveReview {
+                request_id,
+                workspace_id: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplaySaveReview requires a workspace id"))?
+                    .to_string(),
+                path: args
+                    .get(/*index*/ 1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplaySaveReview requires a local file path"))?
+                    .to_string(),
+                overwrite: args
+                    .get(/*index*/ 2)
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ReplaySaveReview requires explicit overwrite consent")
+                    })?,
+            },
+            "ReplayPreviewReview" => PluginRequest::ReplayPreviewReview {
+                request_id,
+                workspace_id: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayPreviewReview requires a workspace id"))?
+                    .to_string(),
+                path: args
+                    .get(/*index*/ 1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ReplayPreviewReview requires a local file path")
+                    })?
+                    .to_string(),
+            },
+            "ReplayLoadReview" => PluginRequest::ReplayLoadReview {
+                request_id,
+                workspace_id: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayLoadReview requires a workspace id"))?
+                    .to_string(),
+                path: args
+                    .get(/*index*/ 1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayLoadReview requires a local file path"))?
+                    .to_string(),
+                bundle_digest: args
+                    .get(/*index*/ 2)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ReplayLoadReview requires the exact previewed file digest")
+                    })?
+                    .to_string(),
+                confirmed: args
+                    .get(/*index*/ 3)
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ReplayLoadReview requires explicit import confirmation")
+                    })?,
+            },
             "ReplaySetMode" => PluginRequest::ReplaySetMode {
                 request_id,
                 workspace_id: args
@@ -3441,6 +3501,54 @@ mod tests {
         })
     }
 
+    async fn add_source_backed_review_summary(
+        runtime: &mut Runtime,
+        plan: &crate::replay::ReplayPresentationPlan,
+        id: &str,
+        text: &str,
+    ) {
+        runtime
+            .execute_command("ReplaySummary")
+            .await
+            .expect("open the private original-source summary composer");
+        let composer = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer { handle, .. } => handle,
+            _ => panic!("expected an explicitly composed local review summary"),
+        };
+        assert!(runtime
+            .notify_composer(composer, ComposerCallback::Submitted(text.to_string()))
+            .unwrap());
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayAddDraft {
+                request_id,
+                workspace_id,
+                step_id,
+                kind,
+                text: submitted,
+            } => {
+                assert_eq!(workspace_id, "real-workspace-1");
+                assert!(step_id.is_empty());
+                assert_eq!(kind, crate::replay::ReplayReviewDraftKind::ReviewSummary);
+                assert_eq!(submitted, text);
+                request_id
+            }
+            _ => panic!("expected only a local editor-owned review summary"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "real-workspace-1",
+                    "draft": source_backed_review_draft(plan, id, "review_summary", text),
+                }),
+            )
+            .await
+            .unwrap();
+        let outbox = recv_replay_outbox();
+        assert!(outbox.drafts.iter().any(|draft| draft.id == id));
+    }
+
     fn recv_replay_source_focus(expected_workspace: &str, expected_step: &str) {
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::ReplayFocusStepSource {
@@ -3781,6 +3889,8 @@ mod tests {
                     "workspace_branch": "replay/revision-1234567",
                     "review_role": review_role,
                     "head_commit": "b".repeat(40),
+                    "review_bundle_path":
+                        "/workspace/repository/.git/red/replay-reviews/local-bbbbbbb.red-review.json",
                     "drafts": [],
                     "plan": serde_json::to_value(&plan).unwrap(),
                 }),
@@ -6062,6 +6172,470 @@ mod tests {
             crate::plugin::replay_panel::ReplayPanelView::Guide,
         );
         assert_eq!(guide.index, 0);
+    }
+
+    #[tokio::test]
+    async fn empty_replay_reviews_do_not_open_or_save_portable_files() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        open_source_backed_replay(&mut runtime).await;
+
+        runtime.execute_command("ReplaySaveReview").await.unwrap();
+
+        let outbox = recv_replay_outbox();
+        assert!(outbox.notice.contains("Nothing to save yet"));
+        assert!(outbox.drafts.is_empty());
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_saves_only_after_the_user_explicitly_selects_a_private_file() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_source_backed_replay(&mut runtime).await;
+        add_source_backed_review_summary(
+            &mut runtime,
+            &plan,
+            "portable-summary-1",
+            "Keep this review private and portable.",
+        )
+        .await;
+
+        runtime.execute_command("ReplaySaveReview").await.unwrap();
+        let input = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackInput {
+                handle,
+                title,
+                initial,
+                ..
+            } => {
+                assert!(title.contains("private review"));
+                assert!(title.contains("never sent to GitHub"));
+                assert_eq!(
+                    initial,
+                    "/workspace/repository/.git/red/replay-reviews/local-bbbbbbb.red-review.json",
+                );
+                handle
+            }
+            _ => panic!("expected an explicit local review filename prompt"),
+        };
+        assert!(runtime
+            .notify_composer(
+                input,
+                ComposerCallback::Submitted("/portable/review.red-review.json".into()),
+            )
+            .unwrap());
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplaySaveReview {
+                request_id,
+                workspace_id,
+                path,
+                overwrite,
+            } => {
+                assert_eq!(workspace_id, "real-workspace-1");
+                assert_eq!(path, "/portable/review.red-review.json");
+                assert!(!overwrite);
+                request_id
+            }
+            _ => panic!("expected only a user-selected editor-owned local review save"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "real-workspace-1",
+                    "path": "/portable/review.red-review.json",
+                    "draft_count": 1,
+                    "note_count": 0,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let outbox = recv_replay_outbox();
+        assert_eq!(outbox.drafts.len(), 1);
+        assert!(outbox.notice.contains("Saved 1 draft"));
+        assert!(outbox.notice.contains("nothing sent to GitHub"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_never_falls_back_to_saving_review_text_in_the_worktree() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_source_backed_replay(&mut runtime).await;
+        add_source_backed_review_summary(
+            &mut runtime,
+            &plan,
+            "portable-summary-1",
+            "Never make a private review visible to Git.",
+        )
+        .await;
+        {
+            let mut inner = runtime
+                .inner
+                .lock()
+                .expect("inspect only the initialized Replay host state");
+            inner
+                .host
+                .policy_mut()
+                .plugin_states
+                .get_mut("replay")
+                .expect("inspect only the initialized Replay plugin state")
+                .insert(
+                    "replay_review_path".to_string(),
+                    Value::String(String::new()),
+                );
+        }
+
+        runtime.execute_command("ReplaySaveReview").await.unwrap();
+
+        let outbox = recv_replay_outbox();
+        assert!(outbox.notice.contains("could not be verified"));
+        assert_eq!(outbox.drafts.len(), 1);
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_requires_confirmation_before_replacing_a_private_review_file() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_source_backed_replay(&mut runtime).await;
+        add_source_backed_review_summary(
+            &mut runtime,
+            &plan,
+            "portable-summary-1",
+            "Do not overwrite this private review without approval.",
+        )
+        .await;
+
+        runtime.execute_command("ReplaySaveReview").await.unwrap();
+        let input = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackInput { handle, .. } => handle,
+            _ => panic!("expected an explicit local filename prompt"),
+        };
+        assert!(runtime
+            .notify_composer(
+                input,
+                ComposerCallback::Submitted("/portable/review.json".into()),
+            )
+            .unwrap());
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplaySaveReview {
+                request_id,
+                overwrite,
+                ..
+            } => {
+                assert!(!overwrite);
+                request_id
+            }
+            _ => panic!("expected a safe no-clobber local save"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": false,
+                    "code": "review_bundle_exists",
+                    "message": "the local review file already exists",
+                }),
+            )
+            .await
+            .unwrap();
+        let confirmation = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackConfirmation {
+                handle,
+                title,
+                message,
+                ..
+            } => {
+                assert!(title.contains("Replace saved local review"));
+                assert!(message.contains("No GitHub review"));
+                handle
+            }
+            _ => panic!("expected explicit confirmation before replacing a private review"),
+        };
+        let accept = serde_json::from_value(serde_json::json!({
+            "id": "accept",
+            "label": "Accept",
+        }))
+        .unwrap();
+        assert!(runtime
+            .notify_picker(confirmation, PickerCallback::Selected(accept))
+            .unwrap());
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplaySaveReview {
+                request_id,
+                workspace_id,
+                path,
+                overwrite,
+            } => {
+                assert_eq!(workspace_id, "real-workspace-1");
+                assert_eq!(path, "/portable/review.json");
+                assert!(overwrite);
+                request_id
+            }
+            _ => panic!("expected only the explicitly approved local-file replacement"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "real-workspace-1",
+                    "path": "/portable/review.json",
+                    "draft_count": 1,
+                    "note_count": 0,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(recv_replay_outbox()
+            .notice
+            .contains("nothing sent to GitHub"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_previews_a_portable_review_and_honors_cancellation() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        open_source_backed_replay(&mut runtime).await;
+
+        runtime.execute_command("ReplayLoadReview").await.unwrap();
+        let input = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackInput { handle, title, .. } => {
+                assert!(title.contains("preview before changes"));
+                handle
+            }
+            _ => panic!("expected a user-selected private review filename"),
+        };
+        assert!(runtime
+            .notify_composer(
+                input,
+                ComposerCallback::Submitted("/portable/review.json".into()),
+            )
+            .unwrap());
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayPreviewReview {
+                request_id,
+                workspace_id,
+                path,
+            } => {
+                assert_eq!(workspace_id, "real-workspace-1");
+                assert_eq!(path, "/portable/review.json");
+                request_id
+            }
+            _ => panic!("expected read-only original-source review validation"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "real-workspace-1",
+                    "preview": {
+                        "path": "/portable/review.json",
+                        "bundle_digest": "a".repeat(64),
+                        "notes_to_add": 1,
+                        "notes_already_present": 0,
+                        "drafts_to_add": 2,
+                        "drafts_already_present": 1,
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+        let confirmation = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackConfirmation {
+                handle,
+                title,
+                message,
+                ..
+            } => {
+                assert!(title.contains("Load saved local review"));
+                assert!(message.contains("2 local drafts"));
+                assert!(message.contains("1 observation"));
+                assert!(message.contains("Existing review text is preserved"));
+                assert!(message.contains("Nothing is sent to GitHub"));
+                handle
+            }
+            _ => panic!("expected a non-destructive, counted private import preview"),
+        };
+        assert!(runtime
+            .notify_picker(confirmation, PickerCallback::Cancelled)
+            .unwrap());
+        let guide = recv_replay_guide();
+        assert!(guide.drafts.is_empty());
+        assert!(guide.notes.is_empty());
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_loads_only_the_explicitly_confirmed_content_pinned_preview() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_source_backed_replay(&mut runtime).await;
+
+        runtime.execute_command("ReplayLoadReview").await.unwrap();
+        let input = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackInput { handle, .. } => handle,
+            _ => panic!("expected a private review filename prompt"),
+        };
+        assert!(runtime
+            .notify_composer(
+                input,
+                ComposerCallback::Submitted("/portable/review.json".into()),
+            )
+            .unwrap());
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayPreviewReview { request_id, .. } => request_id,
+            _ => panic!("expected an identity-verified import preview"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "real-workspace-1",
+                    "preview": {
+                        "path": "/portable/review.json",
+                        "bundle_digest": "a".repeat(64),
+                        "notes_to_add": 1,
+                        "notes_already_present": 0,
+                        "drafts_to_add": 1,
+                        "drafts_already_present": 0,
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+        let confirmation = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackConfirmation { handle, .. } => handle,
+            _ => panic!("expected explicit private import confirmation"),
+        };
+        let accept = serde_json::from_value(serde_json::json!({
+            "id": "accept",
+            "label": "Accept",
+        }))
+        .unwrap();
+        assert!(runtime
+            .notify_picker(confirmation, PickerCallback::Selected(accept))
+            .unwrap());
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayLoadReview {
+                request_id,
+                workspace_id,
+                path,
+                bundle_digest,
+                confirmed,
+            } => {
+                assert_eq!(workspace_id, "real-workspace-1");
+                assert_eq!(path, "/portable/review.json");
+                assert_eq!(bundle_digest, "a".repeat(64));
+                assert!(confirmed);
+                request_id
+            }
+            _ => panic!("expected only the exact, explicitly confirmed private review file"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "real-workspace-1",
+                    "drafts": [source_backed_review_draft(
+                        &plan,
+                        "portable-summary-1",
+                        "review_summary",
+                        "Preserve my portable original-source review.",
+                    )],
+                    "notes": [{
+                        "index": 0,
+                        "text": "Check the original changed viewport.",
+                    }],
+                    "preview": {
+                        "path": "/portable/review.json",
+                        "bundle_digest": "a".repeat(64),
+                        "notes_to_add": 1,
+                        "notes_already_present": 0,
+                        "drafts_to_add": 1,
+                        "drafts_already_present": 0,
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+
+        let outbox = recv_replay_outbox();
+        assert_eq!(outbox.drafts.len(), 1);
+        assert_eq!(outbox.notes.len(), 1);
+        assert!(outbox.notice.contains("Loaded 1 draft"));
+        assert!(outbox.notice.contains("existing drafts kept"));
+        assert!(outbox.notice.contains("nothing sent to GitHub"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_deduplicated_import_does_not_request_confirmation_or_mutation() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_source_backed_replay(&mut runtime).await;
+        add_source_backed_review_summary(
+            &mut runtime,
+            &plan,
+            "portable-summary-1",
+            "This review already exists locally.",
+        )
+        .await;
+
+        runtime.execute_command("ReplayLoadReview").await.unwrap();
+        let input = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackInput { handle, .. } => handle,
+            _ => panic!("expected a private review filename prompt"),
+        };
+        assert!(runtime
+            .notify_composer(
+                input,
+                ComposerCallback::Submitted("/portable/review.json".into()),
+            )
+            .unwrap());
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayPreviewReview { request_id, .. } => request_id,
+            _ => panic!("expected a read-only duplicate inspection"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "real-workspace-1",
+                    "preview": {
+                        "path": "/portable/review.json",
+                        "bundle_digest": "a".repeat(64),
+                        "notes_to_add": 0,
+                        "notes_already_present": 0,
+                        "drafts_to_add": 0,
+                        "drafts_already_present": 1,
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+
+        let outbox = recv_replay_outbox();
+        assert_eq!(outbox.drafts.len(), 1);
+        assert!(outbox.notice.contains("already here"));
+        assert!(outbox.notice.contains("nothing sent to GitHub"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
     #[tokio::test]

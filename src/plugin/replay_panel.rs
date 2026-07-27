@@ -741,7 +741,7 @@ fn replay_header_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
     if state.model.help_visible {
         lines.extend(
             wrap_plain_text(
-                "j/k scroll · h/l step · [/] file · a apply · u undo · c comment · r outbox · Ctrl-w H/J/K/L dock · Space R h hint",
+                "j/k scroll · h/l step · [/] file · a apply · u undo · c comment · r outbox · S save · L load · Ctrl-w H/J/K/L dock · Space R h hint",
                 width.max(1),
                 TextPanelSpanStyle::Muted,
             )
@@ -1036,10 +1036,30 @@ fn replay_outbox_actions(model: &ReplayPanelModel) -> Vec<UiAction> {
             })
             .with_compact_label("Sum"),
     );
+    if has_drafts || !model.notes.is_empty() {
+        actions.push(
+            UiAction::new("save_review", "[S]", "Save")
+                .with_priority(if has_drafts {
+                    ActionPriority::Essential
+                } else {
+                    ActionPriority::Secondary
+                })
+                .with_compact_label("Sv"),
+        );
+    }
+    actions.push(
+        UiAction::new("load_review", "[L]", "Load")
+            .with_priority(if has_drafts {
+                ActionPriority::Secondary
+            } else {
+                ActionPriority::Essential
+            })
+            .with_compact_label("Load"),
+    );
     actions.push(
         UiAction::new("outbox", "[r]", "Return")
             .with_priority(ActionPriority::Essential)
-            .with_compact_label("Back"),
+            .with_compact_label("↩"),
     );
     if model.review_role == Some(ReplayReviewRole::Author) {
         actions.insert(
@@ -1809,7 +1829,9 @@ mod tests {
 
         assert!(visible.contains("[c]"));
         assert!(visible.contains("[s]"));
+        assert!(visible.contains("[L]"));
         assert!(visible.contains("[r]"));
+        assert!(!visible.contains("[S]"));
         assert!(!visible.contains("[h/l]"));
         assert!(!visible.contains("[e]"));
         assert!(!visible.contains("[d]"));
@@ -1828,13 +1850,51 @@ mod tests {
         let layout = ActionBar::new(&actions).layout(/*width*/ 46);
         let visible = layout.text();
 
-        for key in ["[h/l]", "[c]", "[e]", "[d]", "[r]"] {
+        for key in ["[h/l]", "[c]", "[e]", "[d]", "[S]", "[r]"] {
             assert!(
                 visible.contains(key),
                 "missing essential outbox action {key}"
             );
         }
         assert!(display_width(&visible) <= 46);
+    }
+
+    #[test]
+    fn wide_outbox_exposes_private_review_save_and_load_without_hiding_editor_actions() {
+        let mut replay = model();
+        replay.drafts = vec![outbox_draft(
+            ReplayReviewDraftKind::InlineComment,
+            "Keep the original visible viewport bounded.",
+        )];
+        replay.draft_count = replay.drafts.len();
+        let actions = replay_outbox_actions(&replay);
+        let layout = ActionBar::new(&actions).layout(/*width*/ 120);
+        let visible = layout.text();
+
+        for key in ["[h/l]", "[c]", "[e]", "[d]", "[s]", "[S]", "[L]", "[r]"] {
+            assert!(visible.contains(key), "missing private review action {key}");
+        }
+        assert_eq!(layout.hidden_count(), 0);
+    }
+
+    #[test]
+    fn finding_only_outbox_can_save_without_offering_invalid_draft_actions() {
+        let mut replay = model();
+        replay.notes.push(ReplayPanelNote {
+            index: 0,
+            text: "Preserve this private original-source observation.".to_string(),
+        });
+        let actions = replay_outbox_actions(&replay);
+        let layout = ActionBar::new(&actions).layout(/*width*/ 80);
+        let visible = layout.text();
+
+        assert!(visible.contains("[S]"));
+        assert!(visible.contains("[L]"));
+        assert!(visible.contains("[r]"));
+        assert!(!visible.contains("[h/l]"));
+        assert!(!visible.contains("[e]"));
+        assert!(!visible.contains("[d]"));
+        assert_eq!(layout.hidden_count(), 0);
     }
 
     #[test]

@@ -1052,13 +1052,13 @@ impl ReplayController {
         self.generation
     }
 
-    fn session_mut(&mut self, id: &str) -> Result<&mut ReplaySession, ReplayError> {
+    pub(super) fn session_mut(&mut self, id: &str) -> Result<&mut ReplaySession, ReplayError> {
         self.sessions
             .get_mut(id)
             .ok_or_else(|| missing("replay session", id))
     }
 
-    fn advance_generation(&mut self) {
+    pub(super) fn advance_generation(&mut self) {
         self.generation = self.generation.saturating_add(1);
     }
 }
@@ -1297,7 +1297,7 @@ impl ReplaySession {
         })
     }
 
-    fn original_review_anchor(
+    pub(super) fn original_review_anchor(
         &self,
         step: &ReplayStep,
         limits: ReplayLimits,
@@ -1576,7 +1576,10 @@ fn missing(kind: &'static str, id: &str) -> ReplayError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::replay::{ReplayRepository, ReplaySourceKind};
+    use crate::replay::{
+        ReplayRepository, ReplayReviewBundle, ReplaySourceKind, MAX_REPLAY_REVIEW_BUNDLE_BYTES,
+        REPLAY_REVIEW_BUNDLE_VERSION,
+    };
 
     const CHANGE: &str = "diff --git a/src/token.rs b/src/token.rs\nindex 1111111..2222222 100644\n--- a/src/token.rs\n+++ b/src/token.rs\n@@ -1,3 +1,3 @@ fn refresh\n fn refresh() {\n-    old();\n+    new();\n }\n";
 
@@ -1661,6 +1664,18 @@ mod tests {
         let mut controller = ReplayController::default();
         controller.sessions.insert(session_id.clone(), session);
         (controller, session_id, step_id)
+    }
+
+    fn read_portable_review(path: &Path) -> ReplayReviewBundle {
+        let bytes = std::fs::read(path).expect("read the explicitly saved private review");
+        serde_json::from_slice(&bytes).expect("decode the versioned portable private review")
+    }
+
+    fn replace_portable_review(path: &Path, bundle: &ReplayReviewBundle) {
+        let encoded = serde_json::to_vec_pretty(bundle)
+            .expect("encode an intentionally modified private review fixture");
+        std::fs::write(path, encoded)
+            .expect("replace only the isolated temporary private review fixture");
     }
 
     #[test]
@@ -2281,6 +2296,579 @@ mod tests {
             Err(ReplayError::InvalidReviewNote(_)),
         ));
         assert!(restored.sessions().is_empty());
+    }
+
+    #[test]
+    fn portable_review_saves_only_versioned_private_original_source_outcomes() {
+        let directory = tempfile::tempdir().expect("create isolated private review storage");
+        let path = directory
+            .path()
+            .join("private")
+            .join("pr-482-bbbbbbb.red-review.json");
+        let (mut controller, session_id, step_id) =
+            controller_with_pull_request("alice", Some("reviewer"));
+        controller
+            .add_note(
+                &session_id,
+                Some(&step_id),
+                ReplayNoteCategory::TestGap,
+                "Cover the original refresh boundary.",
+            )
+            .unwrap();
+        controller
+            .add_review_draft(
+                &session_id,
+                Some(&step_id),
+                ReplayReviewDraftKind::InlineComment,
+                "Please add a boundary regression test.",
+            )
+            .unwrap();
+
+        let saved = controller
+            .save_review_bundle(&session_id, &path, /*overwrite*/ false)
+            .expect("explicitly save only the original-source review outcomes");
+        let bundle = read_portable_review(&saved.path);
+
+        assert_eq!(bundle.version, REPLAY_REVIEW_BUNDLE_VERSION);
+        assert_eq!(bundle.identity.repository, "github.com/owner/repository");
+        assert_eq!(bundle.identity.pull_request, Some(482));
+        assert_eq!(
+            bundle.identity.source_kind,
+            ReplaySourceKind::GitHubPullRequest
+        );
+        assert_eq!(saved.note_count, 1);
+        assert_eq!(saved.draft_count, 1);
+        assert_eq!(bundle.notes.len(), 1);
+        assert_eq!(bundle.drafts.len(), 1);
+        assert_eq!(
+            bundle.drafts[0].anchor.as_ref().unwrap().path,
+            Path::new("src/token.rs")
+        );
+        let encoded = std::fs::read_to_string(saved.path).unwrap();
+        assert!(!encoded.contains("/workspace/repository"));
+        assert!(!encoded.contains("pending_review"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600,
+            );
+            assert_eq!(
+                std::fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700,
+            );
+        }
+    }
+
+    #[test]
+    fn portable_review_merges_across_machine_specific_repository_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pr-482.red-review.json");
+        let (mut original, original_id, original_step) =
+            controller_with_pull_request("alice", Some("reviewer"));
+        original
+            .add_note(
+                &original_id,
+                Some(&original_step),
+                ReplayNoteCategory::Observation,
+                "The original branch rotates its refresh token.",
+            )
+            .unwrap();
+        let imported_draft = original
+            .add_review_draft(
+                &original_id,
+                Some(&original_step),
+                ReplayReviewDraftKind::InlineComment,
+                "What prevents repeated rotation?",
+            )
+            .unwrap();
+        original
+            .save_review_bundle(&original_id, &path, /*overwrite*/ false)
+            .unwrap();
+
+        let (mut other_machine, other_id, _) =
+            controller_with_pull_request("alice", Some("reviewer"));
+        {
+            let session = other_machine.session_mut(&other_id).unwrap();
+            session.source.repository.root = PathBuf::from("/another/computer/repository");
+            session.source.repository.common_directory =
+                PathBuf::from("/another/computer/repository/.git");
+        }
+        let existing = other_machine
+            .add_review_draft(
+                &other_id,
+                None,
+                ReplayReviewDraftKind::ReviewSummary,
+                "Keep my existing independent review.",
+            )
+            .unwrap();
+        let preview = other_machine
+            .preview_review_bundle(&other_id, &path)
+            .expect("match host, repository, PR, commits, and original diff across computers");
+        assert_eq!(preview.notes_to_add, 1);
+        assert_eq!(preview.drafts_to_add, 1);
+
+        let merged = other_machine
+            .import_review_bundle(
+                &other_id,
+                &path,
+                &preview.bundle_digest,
+                /*confirmed*/ true,
+            )
+            .unwrap();
+        let session = other_machine.session(&other_id).unwrap();
+        assert_eq!(merged.notes_to_add, 1);
+        assert_eq!(merged.drafts_to_add, 1);
+        assert_eq!(session.notes.len(), 1);
+        assert_eq!(session.review.drafts.len(), 2);
+        assert_eq!(session.review.drafts[0], existing);
+        assert_eq!(session.review.drafts[1], imported_draft);
+        assert_eq!(session.review.role, ReplayReviewRole::Reviewer);
+    }
+
+    #[test]
+    fn reloading_an_identical_review_never_duplicates_or_rewrites_outcomes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.json");
+        let (mut controller, session_id, step_id) = controller_with_session();
+        controller
+            .add_note(
+                &session_id,
+                Some(&step_id),
+                ReplayNoteCategory::Observation,
+                "Preserve the original local observation.",
+            )
+            .unwrap();
+        controller
+            .add_review_draft(
+                &session_id,
+                Some(&step_id),
+                ReplayReviewDraftKind::InlineComment,
+                "Preserve the original local comment.",
+            )
+            .unwrap();
+        controller
+            .save_review_bundle(&session_id, &path, /*overwrite*/ false)
+            .unwrap();
+        let generation = controller.generation();
+        let preview = controller
+            .preview_review_bundle(&session_id, &path)
+            .unwrap();
+
+        assert_eq!(preview.notes_to_add, 0);
+        assert_eq!(preview.notes_already_present, 1);
+        assert_eq!(preview.drafts_to_add, 0);
+        assert_eq!(preview.drafts_already_present, 1);
+        controller
+            .import_review_bundle(
+                &session_id,
+                &path,
+                &preview.bundle_digest,
+                /*confirmed*/ true,
+            )
+            .unwrap();
+        assert_eq!(controller.generation(), generation);
+        assert_eq!(controller.session(&session_id).unwrap().notes.len(), 1);
+        assert_eq!(
+            controller.session(&session_id).unwrap().review.drafts.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn portable_review_rejects_a_moved_original_pr_head_before_merging() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.json");
+        let (mut controller, session_id, step_id) =
+            controller_with_pull_request("alice", Some("reviewer"));
+        controller
+            .add_review_draft(
+                &session_id,
+                Some(&step_id),
+                ReplayReviewDraftKind::InlineComment,
+                "This comment belongs to the original head.",
+            )
+            .unwrap();
+        controller
+            .save_review_bundle(&session_id, &path, /*overwrite*/ false)
+            .unwrap();
+        let mut bundle = read_portable_review(&path);
+        bundle.identity.target_commit = GitObjectId::parse(&"c".repeat(40)).unwrap();
+        replace_portable_review(&path, &bundle);
+
+        assert!(matches!(
+            controller.preview_review_bundle(&session_id, &path),
+            Err(ReplayError::InvalidReviewBundle(_)),
+        ));
+        assert_eq!(
+            controller.session(&session_id).unwrap().review.drafts.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn portable_review_rejects_a_foreign_repository_and_unknown_format() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.json");
+        let (mut controller, session_id, step_id) = controller_with_session();
+        controller
+            .add_review_draft(
+                &session_id,
+                Some(&step_id),
+                ReplayReviewDraftKind::InlineComment,
+                "Keep the original source identity.",
+            )
+            .unwrap();
+        controller
+            .save_review_bundle(&session_id, &path, /*overwrite*/ false)
+            .unwrap();
+        let original = read_portable_review(&path);
+        let mut foreign = original.clone();
+        foreign.identity.repository = "github.com/another/repository".to_string();
+        replace_portable_review(&path, &foreign);
+        assert!(matches!(
+            controller.preview_review_bundle(&session_id, &path),
+            Err(ReplayError::InvalidReviewBundle(_)),
+        ));
+
+        let mut future = original;
+        future.version = REPLAY_REVIEW_BUNDLE_VERSION.saturating_add(1);
+        replace_portable_review(&path, &future);
+        assert!(matches!(
+            controller.preview_review_bundle(&session_id, &path),
+            Err(ReplayError::InvalidReviewBundle(_)),
+        ));
+    }
+
+    #[test]
+    fn portable_review_rejects_changed_original_diff_coordinates() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.json");
+        let (mut controller, session_id, step_id) = controller_with_session();
+        controller
+            .add_review_draft(
+                &session_id,
+                Some(&step_id),
+                ReplayReviewDraftKind::InlineComment,
+                "Keep this exact original changed line.",
+            )
+            .unwrap();
+        controller
+            .save_review_bundle(&session_id, &path, /*overwrite*/ false)
+            .unwrap();
+        let mut bundle = read_portable_review(&path);
+        bundle.drafts[0].anchor.as_mut().unwrap().start_line += 1;
+        replace_portable_review(&path, &bundle);
+
+        assert!(matches!(
+            controller.preview_review_bundle(&session_id, &path),
+            Err(ReplayError::InvalidReviewBundle(_)),
+        ));
+    }
+
+    #[test]
+    fn portable_review_rejects_duplicate_source_draft_identities() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.json");
+        let (mut controller, session_id, step_id) = controller_with_session();
+        controller
+            .add_review_draft(
+                &session_id,
+                Some(&step_id),
+                ReplayReviewDraftKind::InlineComment,
+                "Each imported review has a stable independent identity.",
+            )
+            .unwrap();
+        controller
+            .save_review_bundle(&session_id, &path, /*overwrite*/ false)
+            .unwrap();
+        let mut bundle = read_portable_review(&path);
+        bundle.drafts.push(bundle.drafts[0].clone());
+        replace_portable_review(&path, &bundle);
+
+        assert!(matches!(
+            controller.preview_review_bundle(&session_id, &path),
+            Err(ReplayError::InvalidReviewBundle(_)),
+        ));
+    }
+
+    #[test]
+    fn portable_review_conflicts_preserve_every_existing_local_outcome() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.json");
+        let (mut original, original_id, step_id) = controller_with_session();
+        let imported = original
+            .add_review_draft(
+                &original_id,
+                Some(&step_id),
+                ReplayReviewDraftKind::InlineComment,
+                "Original review text.",
+            )
+            .unwrap();
+        original
+            .add_note(
+                &original_id,
+                Some(&step_id),
+                ReplayNoteCategory::Question,
+                "This observation must not be partially merged.",
+            )
+            .unwrap();
+        original
+            .save_review_bundle(&original_id, &path, /*overwrite*/ false)
+            .unwrap();
+
+        let (mut destination, destination_id, _) = controller_with_session();
+        let mut conflicting = imported;
+        conflicting.text = "Independently edited local review text.".to_string();
+        destination
+            .session_mut(&destination_id)
+            .unwrap()
+            .review
+            .drafts
+            .push(conflicting.clone());
+        let before = destination.session(&destination_id).unwrap().clone();
+
+        assert!(matches!(
+            destination.preview_review_bundle(&destination_id, &path),
+            Err(ReplayError::ReviewBundleConflict(_)),
+        ));
+        assert_eq!(destination.session(&destination_id).unwrap(), &before);
+        assert!(destination
+            .session(&destination_id)
+            .unwrap()
+            .notes
+            .is_empty());
+    }
+
+    #[test]
+    fn portable_fix_proposals_require_the_locally_verified_original_author() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("author-review.json");
+        let (mut author, author_id, author_step) =
+            controller_with_pull_request("alice", Some("alice"));
+        author
+            .add_review_draft(
+                &author_id,
+                Some(&author_step),
+                ReplayReviewDraftKind::CodeFix,
+                "Bound the original PR refresh.",
+            )
+            .unwrap();
+        author
+            .save_review_bundle(&author_id, &path, /*overwrite*/ false)
+            .unwrap();
+
+        let (reviewer, reviewer_id, _) = controller_with_pull_request("alice", Some("bob"));
+        assert!(matches!(
+            reviewer.preview_review_bundle(&reviewer_id, &path),
+            Err(ReplayError::InvalidReviewBundle(_)),
+        ));
+        assert!(reviewer
+            .session(&reviewer_id)
+            .unwrap()
+            .review
+            .drafts
+            .is_empty());
+    }
+
+    #[test]
+    fn loading_a_portable_review_requires_explicit_preview_confirmation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.json");
+        let (mut original, original_id, step_id) = controller_with_session();
+        original
+            .add_review_draft(
+                &original_id,
+                Some(&step_id),
+                ReplayReviewDraftKind::InlineComment,
+                "Import only after the reviewer accepts the exact preview.",
+            )
+            .unwrap();
+        original
+            .save_review_bundle(&original_id, &path, /*overwrite*/ false)
+            .unwrap();
+        let (mut destination, destination_id, _) = controller_with_session();
+        let preview = destination
+            .preview_review_bundle(&destination_id, &path)
+            .unwrap();
+
+        assert!(matches!(
+            destination.import_review_bundle(
+                &destination_id,
+                &path,
+                &preview.bundle_digest,
+                /*confirmed*/ false,
+            ),
+            Err(ReplayError::ReviewBundleConfirmationRequired),
+        ));
+        assert!(destination
+            .session(&destination_id)
+            .unwrap()
+            .review
+            .drafts
+            .is_empty());
+    }
+
+    #[test]
+    fn portable_review_rejects_a_file_changed_after_the_import_preview() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.json");
+        let (mut original, original_id, step_id) = controller_with_session();
+        original
+            .add_review_draft(
+                &original_id,
+                Some(&step_id),
+                ReplayReviewDraftKind::InlineComment,
+                "Pin the exact original reviewed file contents.",
+            )
+            .unwrap();
+        original
+            .save_review_bundle(&original_id, &path, /*overwrite*/ false)
+            .unwrap();
+        let (mut destination, destination_id, _) = controller_with_session();
+        let preview = destination
+            .preview_review_bundle(&destination_id, &path)
+            .unwrap();
+        let mut changed = read_portable_review(&path);
+        changed.exported_at_ms = changed.exported_at_ms.saturating_add(1);
+        replace_portable_review(&path, &changed);
+
+        assert!(matches!(
+            destination.import_review_bundle(
+                &destination_id,
+                &path,
+                &preview.bundle_digest,
+                /*confirmed*/ true,
+            ),
+            Err(ReplayError::InvalidReviewBundle(_)),
+        ));
+        assert!(destination
+            .session(&destination_id)
+            .unwrap()
+            .review
+            .drafts
+            .is_empty());
+    }
+
+    #[test]
+    fn replacing_a_saved_review_file_requires_explicit_overwrite_confirmation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.json");
+        let (mut controller, session_id, step_id) = controller_with_session();
+        controller
+            .add_review_draft(
+                &session_id,
+                Some(&step_id),
+                ReplayReviewDraftKind::InlineComment,
+                "Keep the original review until replacement is accepted.",
+            )
+            .unwrap();
+        controller
+            .save_review_bundle(&session_id, &path, /*overwrite*/ false)
+            .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        controller
+            .add_review_draft(
+                &session_id,
+                None,
+                ReplayReviewDraftKind::ReviewSummary,
+                "Include a separately reviewed PR summary.",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            controller.save_review_bundle(&session_id, &path, /*overwrite*/ false),
+            Err(ReplayError::ReviewBundleExists(_)),
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let saved = controller
+            .save_review_bundle(&session_id, &path, /*overwrite*/ true)
+            .unwrap();
+        assert_eq!(saved.draft_count, 2);
+        assert_eq!(read_portable_review(&path).drafts.len(), 2);
+    }
+
+    #[test]
+    fn empty_portable_reviews_never_create_a_file_or_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing").join("review.json");
+        let (controller, session_id, _) = controller_with_session();
+
+        assert!(matches!(
+            controller.save_review_bundle(&session_id, &path, /*overwrite*/ false),
+            Err(ReplayError::InvalidReviewBundle(_)),
+        ));
+        assert!(!path.exists());
+        assert!(!path.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn portable_review_rejects_oversized_files_before_reading_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oversized.json");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_REPLAY_REVIEW_BUNDLE_BYTES.saturating_add(1))
+            .unwrap();
+        let (controller, session_id, _) = controller_with_session();
+
+        assert!(matches!(
+            controller.preview_review_bundle(&session_id, &path),
+            Err(ReplayError::LimitExceeded { .. }),
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_review_never_follows_symbolic_link_files() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let original_path = directory.path().join("original.json");
+        let linked_path = directory.path().join("linked.json");
+        let (mut controller, session_id, step_id) = controller_with_session();
+        controller
+            .add_review_draft(
+                &session_id,
+                Some(&step_id),
+                ReplayReviewDraftKind::InlineComment,
+                "Do not open or replace a symbolic link.",
+            )
+            .unwrap();
+        controller
+            .save_review_bundle(&session_id, &original_path, /*overwrite*/ false)
+            .unwrap();
+        symlink(&original_path, &linked_path).unwrap();
+
+        assert!(matches!(
+            controller.preview_review_bundle(&session_id, &linked_path),
+            Err(ReplayError::InvalidReviewBundle(_)),
+        ));
+        assert!(matches!(
+            controller.save_review_bundle(&session_id, &linked_path, /*overwrite*/ true),
+            Err(ReplayError::InvalidReviewBundle(_)),
+        ));
+        assert_eq!(read_portable_review(&original_path).drafts.len(), 1);
+    }
+
+    #[test]
+    fn suggested_portable_review_stays_inside_shared_git_metadata() {
+        let (controller, session_id, _) = controller_with_pull_request("alice", Some("reviewer"));
+        let session = controller.session(&session_id).unwrap();
+        let suggested = super::super::suggested_review_bundle_path(&session.source);
+
+        assert!(suggested.starts_with(&session.source.repository.common_directory));
+        assert!(!suggested.starts_with(&session.workspace.root));
+        assert_eq!(
+            suggested.file_name().unwrap(),
+            "pr-482-bbbbbbb.red-review.json",
+        );
     }
 
     #[test]

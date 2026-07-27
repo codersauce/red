@@ -4,6 +4,7 @@
 //! staged edits, and recovery under the Rust editor. The bundled Husk plugin
 //! receives bounded presentation snapshots rather than process permissions.
 
+mod bundle;
 mod demo;
 mod patch;
 mod plan;
@@ -14,6 +15,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+pub(crate) use bundle::{
+    prepare_review_bundle_import, preview_review_bundle_snapshot, write_prepared_review_bundle,
+};
+pub use bundle::{
+    suggested_review_bundle_path, ReplayReviewBundle, ReplayReviewBundleIdentity,
+    ReplayReviewBundlePreview, ReplayReviewBundleSaved, MAX_REPLAY_REVIEW_BUNDLE_BYTES,
+    REPLAY_REVIEW_BUNDLE_VERSION,
+};
 pub use demo::{replay_demo_plan, ReplayDemoPlan, ReplayDemoStep};
 pub use patch::{
     parse_patch, ReplayChangeKind, ReplayFilePatch, ReplayHunk, ReplayHunkRange, ReplayPatch,
@@ -154,6 +163,18 @@ pub enum ReplayError {
     /// A local review draft is empty, unauthorized, or not source anchored.
     #[error("invalid local review draft: {0}")]
     InvalidReviewDraft(String),
+    /// A portable review is malformed or does not match the pinned source.
+    #[error("invalid local review file: {0}")]
+    InvalidReviewBundle(String),
+    /// Replacing an existing review file requires explicit user confirmation.
+    #[error("the local review file already exists: {0}")]
+    ReviewBundleExists(String),
+    /// A same-ID imported finding conflicts with existing local reviewer text.
+    #[error("the local review file conflicts with this review: {0}")]
+    ReviewBundleConflict(String),
+    /// Importing private review outcomes always requires explicit confirmation.
+    #[error("loading a local review file requires explicit confirmation")]
+    ReviewBundleConfirmationRequired,
     /// A safe local filesystem operation could not be completed.
     #[error("replay filesystem operation failed: {0}")]
     Filesystem(String),
@@ -184,6 +205,10 @@ impl ReplayError {
             Self::InvalidMetadata(_) => "pull_request_metadata_invalid",
             Self::InvalidReviewNote(_) => "review_note_invalid",
             Self::InvalidReviewDraft(_) => "review_draft_invalid",
+            Self::InvalidReviewBundle(_) => "review_bundle_invalid",
+            Self::ReviewBundleExists(_) => "review_bundle_exists",
+            Self::ReviewBundleConflict(_) => "review_bundle_conflict",
+            Self::ReviewBundleConfirmationRequired => "review_bundle_confirmation_required",
             Self::Filesystem(_) => "replay_filesystem_failed",
         }
     }
