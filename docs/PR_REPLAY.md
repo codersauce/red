@@ -9,17 +9,16 @@ reconstruction happens only in editable scratch-source buffers.
 
 ## Start Replay
 
-From the dedicated worktree:
+Start Red from a checkout of the repository you want to review:
 
 ```sh
-cd ~/code/red.fcoury-pr-replay
-env CARGO_TARGET_DIR=/private/tmp/red-pr-replay-target cargo run -p red
+cargo run -p red
 ```
 
 Open the command palette and run `Replay`, enter `:Replay`, or press `Space R g`.
 The source picker offers:
 
-- **GitHub pull request:** enter its PR number, such as `159`, or its canonical
+- **GitHub pull request:** enter its PR number, such as `145`, or its canonical
   URL. Red verifies the PR belongs to the current repository and pins the
   original author head and merge base. If immutable source objects are missing,
   it requests permission before fetching only Replay-owned Git refs.
@@ -38,6 +37,11 @@ branch. Nothing is created until the reviewer accepts that specific
 confirmation. Original branches are never checked out, modified, reset,
 committed, or pushed.
 
+Returning to the same pull request safely resumes its existing scratch worktree
+only when its exact path, shared repository, local branch, original merge-base
+commit, and clean working tree are independently verified. Replay refuses to
+overwrite saved reviewer changes or adopt an unrelated directory.
+
 Replay initially places its dedicated coach panel on the left and the editable
 scratch source on the right, matching the pull-request replay mockup. The
 coach is rendered by Red's panel system; it is not a Markdown file, a scratch
@@ -47,6 +51,8 @@ reconstruction task, optional hints, and progress.
 
 For a multi-file review, `h` and `l` select the previous and next original hunk
 and switch the existing editor window to that hunk's actual scratch file.
+The source cursor and viewport jump directly to the original hunk, even when
+the change occurs thousands of lines into a large file.
 Changes from different files stay in their own buffers; no unrelated file tree,
 editable guide, or extra pane is created.
 
@@ -118,12 +124,15 @@ being copied into every guide step.
 
 To apply a step automatically, press `a` while the guide is focused, or use
 `Space R a` from either surface. Rust checks the original step, scratch-buffer
-revision, complete pre-image, and transaction boundary before immediately
-applying the exact original hunk as one editor transaction. Focus stays where
-the action started; no confirmation interrupts the reconstruction.
+revision, authenticated hunk pre-image, and transaction boundary before
+immediately applying only that original hunk as one editor transaction.
+Unrelated source text is never replaced. Focus stays where the action started;
+no confirmation interrupts the reconstruction.
 
 Press `u` in the focused guide or `Space R u` to undo the latest transaction
-only when it belongs to the current Replay session. If newer manual edits are
+only when it belongs to the current Replay session. If a different file is
+selected, Replay returns to the exact file and step where that hunk was applied.
+If newer manual edits are
 present, Replay refuses to skip over them; return to the source and use normal
 Vim `u` first. Undoing or subsequently editing a completed current step
 automatically removes its completion mark without disturbing earlier
