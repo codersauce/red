@@ -10619,7 +10619,7 @@ impl Editor {
                 return Ok(None);
             }
             if (self.panel_manager.focused_text_panel_has_composer()
-                || self.panel_manager.focused_replay_status().is_some())
+                || self.panel_manager.focused_panel_id() == Some("replay-coach"))
                 && !self.panel_manager.focused_text_input_active()
             {
                 if let Some(action) = self.panel_global_key_action(ev) {
