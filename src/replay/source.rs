@@ -318,6 +318,17 @@ pub struct ReplaySource {
     pub review_context: Option<ReplayReviewContext>,
 }
 
+/// Pinned local feature branch and its explicitly selected or detected base.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayResolvedLocalBranch {
+    /// Validated reviewer-selected feature reference.
+    pub head_ref: String,
+    /// Validated explicit base or detected origin default branch.
+    pub base_ref: String,
+    /// Immutable merge-base-to-feature source and its complete original patch.
+    pub source: ReplaySource,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GitHubMetadata {
@@ -631,6 +642,91 @@ pub fn resolve_local_source(
     )
 }
 
+/// Resolves a local feature branch against its real merge base without a checkout.
+///
+/// When no base is supplied, the verified `origin/HEAD` target is preferred,
+/// followed by locally present `origin/main`, `origin/master`, `main`, and
+/// `master` references. Both endpoints are pinned before computing the merge
+/// base, so newer changes on the base branch never enter the reviewer patch.
+///
+/// # Errors
+///
+/// Returns an error when the repository, references, merge base, or complete
+/// bounded canonical patch cannot be resolved entirely from local Git objects.
+pub fn resolve_local_branch_source(
+    cwd: &Path,
+    head: &str,
+    base: Option<&str>,
+    limits: ReplayLimits,
+) -> Result<ReplayResolvedLocalBranch, ReplayError> {
+    let repository = ReplayRepository::discover(cwd)?;
+    let head_ref = head.trim();
+    validate_git_reference(head_ref)?;
+    let target_commit = git_object(&repository.root, head_ref)?;
+
+    let base_ref = match base
+        .map(str::trim)
+        .filter(|reference| !reference.is_empty())
+    {
+        Some(reference) => {
+            validate_git_reference(reference)?;
+            reference.to_string()
+        }
+        None => default_local_base(&repository.root)?,
+    };
+    let base_tip = git_object(&repository.root, &base_ref)?;
+    let merge_base = git_text(
+        &repository.root,
+        &["merge-base", base_tip.as_str(), target_commit.as_str()],
+        /*limit*/ 1024,
+    )?;
+    let base_commit = GitObjectId::parse(merge_base.trim())?;
+    let source = build_source(
+        ReplaySourceSeed {
+            id: uuid::Uuid::new_v4().to_string(),
+            repository,
+            kind: ReplaySourceKind::LocalRange,
+            base_commit,
+            target_commit,
+            pull_request: None,
+            review_context: None,
+        },
+        limits,
+    )?;
+
+    Ok(ReplayResolvedLocalBranch {
+        head_ref: head_ref.to_string(),
+        base_ref,
+        source,
+    })
+}
+
+fn default_local_base(root: &Path) -> Result<String, ReplayError> {
+    if let Ok(reference) = git_text(
+        root,
+        &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+        /*limit*/ 1024,
+    ) {
+        let reference = reference.trim();
+        if validate_git_reference(reference).is_ok() && git_object(root, reference).is_ok() {
+            return Ok(reference
+                .strip_prefix("refs/remotes/")
+                .unwrap_or(reference)
+                .to_string());
+        }
+    }
+
+    for reference in ["origin/main", "origin/master", "main", "master"] {
+        if git_object(root, reference).is_ok() {
+            return Ok(reference.to_string());
+        }
+    }
+
+    Err(ReplayError::RepositoryMissing(
+        "no local default base branch is available; specify an explicit base".to_string(),
+    ))
+}
+
 struct ReplaySourceSeed {
     id: String,
     repository: ReplayRepository,
@@ -895,6 +991,67 @@ fn run_command(command: &mut Command, limit: usize) -> Result<Vec<u8>, ReplayErr
 mod tests {
     use super::*;
 
+    fn fixture_git(root: &Path, arguments: &[&str]) -> String {
+        let output = Command::new("git")
+            .current_dir(root)
+            .args(arguments)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("Git is available for the local replay repository fixture");
+        assert!(
+            output.status.success(),
+            "fixture Git command {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        String::from_utf8(output.stdout)
+            .expect("fixture Git output is UTF-8")
+            .trim()
+            .to_string()
+    }
+
+    fn diverged_local_repository() -> (tempfile::TempDir, GitObjectId, GitObjectId) {
+        let directory = tempfile::tempdir().expect("isolated local replay Git fixture");
+        let root = directory.path();
+        fixture_git(root, &["init", "--initial-branch=master"]);
+        fixture_git(root, &["config", "user.name", "Replay Fixture"]);
+        fixture_git(root, &["config", "user.email", "replay@example.test"]);
+        fixture_git(
+            root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/replay-fixture.git",
+            ],
+        );
+        std::fs::create_dir(root.join("src")).expect("fixture source directory");
+        std::fs::write(root.join("src/token.rs"), "pub fn token() -> usize { 1 }\n")
+            .expect("fixture merge-base source");
+        fixture_git(root, &["add", "src/token.rs"]);
+        fixture_git(
+            root,
+            &["commit", "--quiet", "-m", "create replay merge base"],
+        );
+        let merge_base = GitObjectId::parse(&fixture_git(root, &["rev-parse", "HEAD"]))
+            .expect("immutable fixture merge base");
+
+        fixture_git(root, &["checkout", "--quiet", "-b", "feature/replay"]);
+        std::fs::write(root.join("src/token.rs"), "pub fn token() -> usize { 2 }\n")
+            .expect("fixture original feature change");
+        fixture_git(root, &["add", "src/token.rs"]);
+        fixture_git(root, &["commit", "--quiet", "-m", "change feature token"]);
+        let feature_head = GitObjectId::parse(&fixture_git(root, &["rev-parse", "HEAD"]))
+            .expect("immutable fixture feature head");
+
+        fixture_git(root, &["checkout", "--quiet", "master"]);
+        std::fs::write(root.join("unrelated.txt"), "new work on master\n")
+            .expect("fixture divergent default branch");
+        fixture_git(root, &["add", "unrelated.txt"]);
+        fixture_git(root, &["commit", "--quiet", "-m", "advance default branch"]);
+
+        (directory, merge_base, feature_head)
+    }
+
     #[test]
     fn pull_request_input_accepts_positive_numbers() {
         assert_eq!(
@@ -970,5 +1127,93 @@ mod tests {
         assert!(GitObjectId::parse(&"g".repeat(40)).is_err());
         let object = GitObjectId::parse(&"a".repeat(40)).unwrap();
         assert_eq!(object.short(), "aaaaaaa");
+    }
+
+    #[test]
+    fn local_feature_replay_uses_merge_base_and_preserves_the_checked_out_branch() {
+        let (repository, merge_base, feature_head) = diverged_local_repository();
+        let resolved = resolve_local_branch_source(
+            repository.path(),
+            "feature/replay",
+            Some("master"),
+            ReplayLimits::default(),
+        )
+        .expect("resolve a diverged feature against its actual merge base");
+
+        assert_eq!(resolved.head_ref, "feature/replay");
+        assert_eq!(resolved.base_ref, "master");
+        assert_eq!(resolved.source.kind, ReplaySourceKind::LocalRange);
+        assert_eq!(resolved.source.base_commit, merge_base);
+        assert_eq!(resolved.source.target_commit, feature_head);
+        assert!(resolved.source.patch.contains("diff --git a/src/token.rs"));
+        assert!(resolved
+            .source
+            .patch
+            .contains("+pub fn token() -> usize { 2 }"));
+        assert!(!resolved.source.patch.contains("unrelated.txt"));
+        assert_eq!(
+            fixture_git(repository.path(), &["branch", "--show-current"]),
+            "master",
+        );
+    }
+
+    #[test]
+    fn local_feature_replay_prefers_the_pinned_origin_default_branch() {
+        let (repository, merge_base, feature_head) = diverged_local_repository();
+        let master = fixture_git(repository.path(), &["rev-parse", "master"]);
+        fixture_git(
+            repository.path(),
+            &["update-ref", "refs/remotes/origin/master", &master],
+        );
+        fixture_git(
+            repository.path(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/master",
+            ],
+        );
+
+        let resolved = resolve_local_branch_source(
+            repository.path(),
+            "feature/replay",
+            /*base*/ None,
+            ReplayLimits::default(),
+        )
+        .expect("detect the locally pinned origin default branch");
+
+        assert_eq!(resolved.base_ref, "origin/master");
+        assert_eq!(resolved.source.base_commit, merge_base);
+        assert_eq!(resolved.source.target_commit, feature_head);
+        assert!(!resolved.source.patch.contains("unrelated.txt"));
+    }
+
+    #[test]
+    fn local_feature_replay_rejects_unsafe_or_missing_branch_references() {
+        let (repository, _, _) = diverged_local_repository();
+
+        for reference in ["", "-feature", "../feature", "feature@{1}"] {
+            assert!(
+                resolve_local_branch_source(
+                    repository.path(),
+                    reference,
+                    Some("master"),
+                    ReplayLimits::default(),
+                )
+                .is_err(),
+                "unsafe feature reference was accepted: {reference}",
+            );
+        }
+        assert!(resolve_local_branch_source(
+            repository.path(),
+            "feature/replay",
+            Some("../master"),
+            ReplayLimits::default(),
+        )
+        .is_err());
+        assert_eq!(
+            fixture_git(repository.path(), &["branch", "--show-current"]),
+            "master",
+        );
     }
 }
