@@ -1023,6 +1023,14 @@ impl PanelManager {
             .is_some_and(|replay| replay.model.view == ReplayPanelView::Guide)
     }
 
+    /// Returns draft selection only when the local review outbox owns focus.
+    pub(crate) fn focused_replay_outbox_position(&self) -> Option<(usize, usize)> {
+        let id = self.focused.as_deref()?;
+        let replay = self.text_panels.get(id)?.replay.as_ref()?;
+        (replay.model.view == ReplayPanelView::Outbox)
+            .then_some((replay.model.outbox_index, replay.model.drafts.len()))
+    }
+
     pub fn focused_text_input_active(&self) -> bool {
         self.focused
             .as_deref()
@@ -3171,6 +3179,7 @@ mod tests {
         assert_eq!(buffer.cells[46].text, "│");
         assert_eq!(manager.focused_replay_status(), None);
         assert!(!manager.focused_replay_is_guide());
+        assert_eq!(manager.focused_replay_outbox_position(), None);
 
         assert!(manager.focus_panel("replay-coach"));
         manager.render(&mut buffer, &theme);
@@ -3185,6 +3194,7 @@ mod tests {
             Some((482, "feat/viewport-diagnostics", 0, 5)),
         );
         assert!(manager.focused_replay_is_guide());
+        assert_eq!(manager.focused_replay_outbox_position(), None);
         let (x, y) = manager
             .focused_text_panel_cursor_position(
                 /*terminal_width*/ 100, /*terminal_height*/ 28,
@@ -3198,6 +3208,7 @@ mod tests {
         assert_eq!(buffer.cells[46].text, "│");
         assert_eq!(manager.focused_replay_status(), None);
         assert!(!manager.focused_replay_is_guide());
+        assert_eq!(manager.focused_replay_outbox_position(), None);
         assert_eq!(
             manager.focused_text_panel_cursor_position(
                 /*terminal_width*/ 100, /*terminal_height*/ 28,
@@ -3266,6 +3277,7 @@ mod tests {
             Some((482, "feat/viewport-diagnostics", 0, 5)),
         );
         assert!(!manager.focused_replay_is_guide());
+        assert_eq!(manager.focused_replay_outbox_position(), Some((0, 1)));
         let (x, y) = manager
             .focused_text_panel_cursor_position(
                 /*terminal_width*/ 100, /*terminal_height*/ 28,

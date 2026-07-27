@@ -24696,6 +24696,10 @@ mod test {
         );
         assert!(editor.test_focus_panel("replay-coach"));
         assert!(!editor.panel_manager.focused_replay_is_guide());
+        let status = editor.test_statusline_row();
+        assert!(status.contains("REPLAY"));
+        assert!(status.contains("OUTBOX"));
+        assert!(!status.contains("01/05"));
 
         for key in ['u', '[', ']'] {
             let action = editor

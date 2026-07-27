@@ -1771,6 +1771,7 @@ impl Editor {
             return;
         }
 
+        let outbox_position = self.panel_manager.focused_replay_outbox_position();
         let replay_status = self.panel_manager.focused_replay_status().map(
             |(pull_request, branch, index, total)| {
                 let file = if pull_request == 0 {
@@ -1778,7 +1779,14 @@ impl Editor {
                 } else {
                     format!(" PR #{pull_request}")
                 };
-                (file, format!(" {:02}/{:02} ", index + 1, total))
+                let position = match outbox_position {
+                    Some((_, 0)) => " OUTBOX ".to_string(),
+                    Some((selected, count)) => {
+                        format!(" OUTBOX {:02}/{:02} ", selected + 1, count)
+                    }
+                    None => format!(" {:02}/{:02} ", index + 1, total),
+                };
+                (file, position)
             },
         );
         let mode = if replay_status.is_some() {
