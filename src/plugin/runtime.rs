@@ -3285,6 +3285,132 @@ mod tests {
         }
     }
 
+    fn recv_replay_workspace_preparation(expected_pull_request: u64) {
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::CreateTextPanel { id, config } => {
+                assert_eq!(id, "replay-coach");
+                assert_eq!(config.side, crate::plugin::PanelSide::Left);
+                assert!(config.composer.is_none());
+            }
+            _ => panic!("expected the dedicated Replay panel before scratch checkout"),
+        }
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdateTextPanel { id, blocks } => {
+                assert_eq!(id, "replay-coach");
+                assert_eq!(blocks.len(), 1);
+                let block = &blocks[0];
+                assert_eq!(block.id, "replay-current-change");
+                assert_eq!(block.format, crate::plugin::TextPanelBlockFormat::Markdown);
+                assert!(block.text.contains("Preparing scratch worktree"));
+                if expected_pull_request > 0 {
+                    assert!(block.text.contains(&format!("PR #{expected_pull_request}")));
+                }
+            }
+            _ => panic!("expected visible Replay checkout progress"),
+        }
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus {
+                id,
+                status: Some(status),
+            } if id == "replay-coach"
+                && status.busy
+                && status.label == "Preparing scratch worktree…"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusPanel { id } if id == "replay-coach"
+        ));
+    }
+
+    async fn accept_codex_pull_request_replay(runtime: &mut Runtime) -> RequestId {
+        runtime
+            .load_plugin("replay", include_str!("../../plugins/replay.hk"))
+            .await
+            .expect("load the source-backed Replay plugin");
+        runtime
+            .execute_command("ReplayPR")
+            .await
+            .expect("open the GitHub PR replay input");
+        let input = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackInput { handle, .. } => handle,
+            _ => panic!("expected the GitHub pull request input"),
+        };
+        assert!(runtime
+            .notify_composer(
+                input,
+                ComposerCallback::Submitted(
+                    "https://github.com/openai/codex-internal/pull/2733".to_string(),
+                ),
+            )
+            .expect("submit the original Codex pull request"));
+        let resolve = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayResolvePullRequest { request_id, input } => {
+                assert_eq!(input, "https://github.com/openai/codex-internal/pull/2733");
+                request_id
+            }
+            _ => panic!("expected immutable GitHub pull request resolution"),
+        };
+        runtime
+            .resolve_request(
+                resolve,
+                serde_json::json!({
+                    "ok": true,
+                    "source_id": "source-codex-pr-2733",
+                    "source_kind": "github_pull_request",
+                    "pull_request": 2733,
+                    "author": "fcoury",
+                    "title": "Paginate session history by scrollback budget",
+                    "branch": "fcoury/tui-paginated-history",
+                    "base_ref": "main",
+                    "missing_object_count": 0,
+                    "workspace_root": "/workspace/codex-internal.replay-pr-2733-15c4957",
+                    "workspace_branch": "replay/pr-2733-15c4957",
+                }),
+            )
+            .await
+            .expect("resolve the original pull request without creating a worktree");
+        let confirmation = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackConfirmation {
+                handle,
+                title,
+                message,
+                ..
+            } => {
+                assert_eq!(title, "Create Replay scratch worktree?");
+                assert!(message.contains("replay/pr-2733-15c4957"));
+                handle
+            }
+            _ => panic!("expected explicit Codex scratch-worktree confirmation"),
+        };
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        let accept = serde_json::from_value(serde_json::json!({
+            "id": "accept",
+            "label": "Accept",
+        }))
+        .expect("construct the selected Accept action");
+        assert!(runtime
+            .notify_picker(confirmation, PickerCallback::Selected(accept))
+            .expect("accept the original Codex pull request from the keyboard"));
+        recv_replay_workspace_preparation(/*expected_pull_request*/ 2733);
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayCreateWorkspace {
+                request_id,
+                source_id,
+                confirmed,
+            } => {
+                assert_eq!(source_id, "source-codex-pr-2733");
+                assert!(confirmed);
+                request_id
+            }
+            _ => panic!("expected the explicitly accepted Codex scratch checkout"),
+        }
+    }
+
     fn recv_replay_findings() -> String {
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdateTextPanel { id, blocks } => {
@@ -3417,6 +3543,7 @@ mod tests {
         assert!(runtime
             .notify_picker(confirmation, PickerCallback::Selected(accept))
             .unwrap());
+        recv_replay_workspace_preparation(/*expected_pull_request*/ 0);
         let workspace = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::ReplayCreateWorkspace {
                 request_id,
@@ -3457,7 +3584,8 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::CreateTextPanel { id, .. } if id == "replay-coach"
+            PluginRequest::SetTextPanelStatus { id, status: None }
+                if id == "replay-coach"
         ));
         let guide = recv_replay_guide();
         assert_eq!(guide.index, 0);
@@ -4165,6 +4293,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepted_github_replay_immediately_opens_a_visible_busy_scratch_panel() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+
+        let _request_id = accept_codex_pull_request_replay(&mut runtime).await;
+
+        assert!(
+            ACTION_DISPATCHER.try_recv_request().is_none(),
+            "Replay must remain visibly busy while the confirmed checkout runs",
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_github_replay_checkout_stays_visible_in_the_dedicated_panel() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let request_id = accept_codex_pull_request_replay(&mut runtime).await;
+
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": false,
+                    "code": "replay_filesystem_failed",
+                    "message": "the scratch checkout could not be completed",
+                }),
+            )
+            .await
+            .expect("deliver a bounded trusted scratch-checkout failure");
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: None }
+                if id == "replay-coach"
+        ));
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdateTextPanel { id, blocks } => {
+                assert_eq!(id, "replay-coach");
+                assert_eq!(blocks.len(), 1);
+                let block = &blocks[0];
+                assert_eq!(block.format, crate::plugin::TextPanelBlockFormat::Markdown);
+                assert!(block.text.contains("Unable to start PR Replay"));
+                assert!(block
+                    .text
+                    .contains("the scratch checkout could not be completed"));
+            }
+            _ => panic!("expected a persistent Replay checkout error"),
+        }
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusPanel { id } if id == "replay-coach"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message))
+                if message.contains("the scratch checkout could not be completed")
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
     async fn replay_local_branch_requires_explicit_scratch_worktree_confirmation() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -4272,6 +4463,7 @@ mod tests {
         assert!(runtime
             .notify_picker(handle, PickerCallback::Selected(accept))
             .unwrap());
+        recv_replay_workspace_preparation(/*expected_pull_request*/ 0);
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::ReplayCreateWorkspace {
@@ -4417,6 +4609,7 @@ mod tests {
         assert!(runtime
             .notify_picker(confirmation, PickerCallback::Selected(accept))
             .unwrap());
+        recv_replay_workspace_preparation(/*expected_pull_request*/ 0);
         let workspace_request = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::ReplayCreateWorkspace {
                 request_id,
@@ -4451,10 +4644,8 @@ mod tests {
 
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::CreateTextPanel { id, config }
+            PluginRequest::SetTextPanelStatus { id, status: None }
                 if id == "replay-coach"
-                    && config.side == crate::plugin::PanelSide::Left
-                    && config.composer.is_none()
         ));
         let guide = recv_replay_guide();
         assert_eq!(guide.pull_request, 0);

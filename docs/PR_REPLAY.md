@@ -31,7 +31,15 @@ The source picker offers:
 
 GitHub metadata, local Git resolution, explicitly confirmed fetches, and
 scratch-worktree creation run in bounded background workers. Normal editor
-input remains responsive while the original review source is loading.
+input remains responsive while the original review source is loading. Accepting
+a real source immediately opens the dedicated Replay panel, displays the
+selected PR or branch and exact scratch path, and shows an animated checkout
+status until the original review is ready. If checkout fails, its explanation
+remains visible in that same panel.
+
+Replay disables Git's filesystem monitor only for its own Git commands. This
+prevents an unavailable repository monitor from stalling scratch checkout
+without changing the repository's Git configuration.
 
 Use `:ReplayPR` or `:ReplayBranch` to go directly to the corresponding source
 input, or `:ReplayDemo` to bypass the picker and open the no-side-effect mock.
