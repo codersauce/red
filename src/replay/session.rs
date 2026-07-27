@@ -369,6 +369,30 @@ impl ReplayController {
         Ok((preview, workspace))
     }
 
+    /// Registers a scratch worktree verified by the bounded background worker.
+    ///
+    /// The source handle, expected durable sibling path, branch, and immutable
+    /// merge base are checked again before editor state adopts the worktree.
+    pub(crate) fn adopt_workspace(
+        &mut self,
+        source_id: &str,
+        workspace: ReplayWorkspace,
+    ) -> Result<(), ReplayError> {
+        let source = self.source(source_id)?.clone();
+        let (preview, _) = prepare_workspace(&source, /*confirmed*/ false)?;
+        if workspace.root != preview.root
+            || workspace.branch != preview.branch
+            || workspace.base_commit != preview.base_commit
+        {
+            return Err(ReplayError::WorkspaceExists(
+                workspace.root.display().to_string(),
+            ));
+        }
+        self.workspaces.insert(source_id.to_string(), workspace);
+        self.advance_generation();
+        Ok(())
+    }
+
     /// Creates a deterministic reviewer session for a confirmed workspace.
     pub fn create_session(&mut self, source_id: &str) -> Result<&ReplaySession, ReplayError> {
         let source = self.source(source_id)?.clone();
@@ -1260,6 +1284,58 @@ mod tests {
         assert_eq!(session.steps[0].status, ReplayStepStatus::Done);
         assert_eq!(session.steps[1].status, ReplayStepStatus::Done);
         assert_eq!(session.steps[1].completion, Some(ReplayCompletion::Manual));
+    }
+
+    #[test]
+    fn adopts_only_the_background_worktree_for_its_pinned_source() {
+        let original = sample_session();
+        let source_id = original.source.id.clone();
+        let mut controller = ReplayController::default();
+        controller.register_source(original.source.clone());
+        let (preview, _) = controller
+            .prepare_workspace(&source_id, /*confirmed*/ false)
+            .expect("derive the exact original scratch-worktree identity");
+        let workspace = ReplayWorkspace {
+            root: preview.root,
+            branch: preview.branch,
+            base_commit: preview.base_commit,
+            created_by_replay: true,
+        };
+
+        controller
+            .adopt_workspace(&source_id, workspace.clone())
+            .expect("adopt only the verified original background worktree");
+
+        let session = controller
+            .create_session(&source_id)
+            .expect("create a session from the editor-owned pinned source");
+        assert_eq!(session.workspace, workspace);
+    }
+
+    #[test]
+    fn rejects_a_background_worktree_for_an_unrelated_source_path() {
+        let original = sample_session();
+        let source_id = original.source.id.clone();
+        let mut controller = ReplayController::default();
+        controller.register_source(original.source.clone());
+        let (preview, _) = controller
+            .prepare_workspace(&source_id, /*confirmed*/ false)
+            .expect("derive the exact pinned original worktree identity");
+        let foreign = ReplayWorkspace {
+            root: PathBuf::from("/workspace/unrelated-scratch"),
+            branch: preview.branch,
+            base_commit: preview.base_commit,
+            created_by_replay: true,
+        };
+
+        assert!(matches!(
+            controller.adopt_workspace(&source_id, foreign),
+            Err(ReplayError::WorkspaceExists(_)),
+        ));
+        assert!(matches!(
+            controller.create_session(&source_id),
+            Err(ReplayError::WorkspaceConfirmationRequired),
+        ));
     }
 
     #[test]

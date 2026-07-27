@@ -127,6 +127,7 @@ const JUMPLIST_SIZE: usize = 100;
 const REPEATED_MOTION_DRAIN_BUDGET_MS: u64 = 50;
 const TERMINAL_SIZE_RECONCILE_INTERVAL: Duration = Duration::from_millis(100);
 const PLUGIN_REQUESTS_PER_TICK: usize = 64;
+const MAX_REPLAY_BACKGROUND_OPERATIONS: usize = 4;
 const AGENT_EVENTS_PER_TICK: usize = 64;
 const GUTTER_SIGN_COLUMN_WIDTH: usize = 2;
 const MAX_HIGHLIGHT_SLICE_BYTES: usize = 512 * 1024;
@@ -796,6 +797,11 @@ pub enum PluginRequest {
         source_id: String,
         confirmed: bool,
     },
+    #[doc(hidden)]
+    ReplayBackgroundCompleted {
+        request_id: RequestId,
+        result: Result<ReplayBackgroundResult, crate::replay::ReplayError>,
+    },
     ReplayFocusStepSource {
         workspace_id: String,
         step_id: String,
@@ -997,6 +1003,37 @@ pub enum PluginRequest {
     },
 }
 
+/// Trusted results returned from bounded, background Replay source operations.
+///
+/// Background workers perform GitHub and Git I/O only. The interactive editor
+/// remains the exclusive owner of source handles, review state, and buffers.
+#[doc(hidden)]
+pub enum ReplayBackgroundResult {
+    /// Verified GitHub metadata and, when locally available, its pinned source.
+    PullRequest {
+        /// Original immutable GitHub pull-request metadata.
+        resolved: Box<crate::replay::ReplayResolvedPullRequest>,
+        /// Complete locally available merge-base source, if no fetch is needed.
+        source: Option<Box<crate::replay::ReplaySource>>,
+    },
+    /// Original feature branch, merge base, and bounded local Git diff.
+    LocalBranch(Box<crate::replay::ReplayResolvedLocalBranch>),
+    /// Explicitly confirmed pinned-object fetch and its complete source.
+    FetchedPullRequest {
+        /// Refetched, immutable original metadata.
+        resolved: Box<crate::replay::ReplayResolvedPullRequest>,
+        /// Exact bounded source finalized from the fetched original objects.
+        source: Box<crate::replay::ReplaySource>,
+    },
+    /// Explicitly confirmed, verified durable sibling scratch worktree.
+    Workspace {
+        /// Stable editor-owned immutable source handle.
+        source_id: String,
+        /// Newly created or safely resumed original scratch worktree.
+        workspace: Box<crate::replay::ReplayWorkspace>,
+    },
+}
+
 impl PluginRequest {
     /// Variant name used by the `RED_PERF` instrumentation.
     fn label(&self) -> &'static str {
@@ -1048,6 +1085,7 @@ impl PluginRequest {
             Self::ReplayResolveLocalBranch { .. } => "ReplayResolveLocalBranch",
             Self::ReplayFetchPullRequestObjects { .. } => "ReplayFetchPullRequestObjects",
             Self::ReplayCreateWorkspace { .. } => "ReplayCreateWorkspace",
+            Self::ReplayBackgroundCompleted { .. } => "ReplayBackgroundCompleted",
             Self::ReplayFocusStepSource { .. } => "ReplayFocusStepSource",
             Self::CloseScratchBuffer { .. } => "CloseScratchBuffer",
             Self::GetViewportLayout { .. } => "GetViewportLayout",
@@ -1839,6 +1877,9 @@ pub struct Editor {
 
     /// Verified original branch names associated with editor-owned source handles.
     replay_source_displays: HashMap<String, ReplaySourceDisplay>,
+
+    /// Bounded one-shot source requests currently running outside the UI loop.
+    pending_replay_requests: HashSet<RequestId>,
 
     /// LSP client for code intelligence features
     lsp: Box<dyn LspClient>,
@@ -3045,6 +3086,7 @@ impl Editor {
             replay_demo_workspace: None,
             replay_controller: crate::replay::ReplayController::default(),
             replay_source_displays: HashMap::new(),
+            pending_replay_requests: HashSet::new(),
             lsp,
             config,
             config_diagnostics: Vec::new(),
@@ -3809,14 +3851,46 @@ impl Editor {
         }))
     }
 
-    fn resolve_replay_pull_request(
+    fn spawn_replay_background(
         &mut self,
-        input: &str,
+        request_id: RequestId,
+        operation: &'static str,
+        work: impl FnOnce() -> Result<ReplayBackgroundResult, crate::replay::ReplayError>
+            + Send
+            + 'static,
+    ) -> Result<(), crate::replay::ReplayError> {
+        if self.pending_replay_requests.len() >= MAX_REPLAY_BACKGROUND_OPERATIONS {
+            return Err(crate::replay::ReplayError::LimitExceeded {
+                kind: "concurrent Replay source operations",
+                limit: MAX_REPLAY_BACKGROUND_OPERATIONS,
+            });
+        }
+        if !self.pending_replay_requests.insert(request_id) {
+            return Err(crate::replay::ReplayError::StalePreview);
+        }
+
+        let result = std::thread::Builder::new()
+            .name(format!("red-replay-{operation}"))
+            .spawn(move || {
+                ACTION_DISPATCHER.send_request(PluginRequest::ReplayBackgroundCompleted {
+                    request_id,
+                    result: work(),
+                });
+            });
+        if let Err(error) = result {
+            self.pending_replay_requests.remove(&request_id);
+            return Err(crate::replay::ReplayError::Filesystem(format!(
+                "could not start the Replay {operation} worker: {error}",
+            )));
+        }
+        Ok(())
+    }
+
+    fn finish_replay_pull_request(
+        &mut self,
+        resolved: crate::replay::ReplayResolvedPullRequest,
+        source: Option<crate::replay::ReplaySource>,
     ) -> Result<Value, crate::replay::ReplayError> {
-        let cwd = std::env::current_dir()
-            .map_err(|error| crate::replay::ReplayError::RepositoryMissing(error.to_string()))?;
-        let resolved =
-            crate::replay::resolve_pull_request(&cwd, input, self.replay_controller.limits())?;
         let source_id = resolved.source_id.clone();
         self.replay_source_displays.insert(
             source_id.clone(),
@@ -3843,26 +3917,18 @@ impl Editor {
             "missing_objects": missing_objects,
         });
         self.replay_controller.register_pull_request(resolved);
-        if pending["missing_object_count"].as_u64() == Some(0) {
+        if let Some(source) = source {
+            self.replay_controller.register_source(source);
             self.replay_source_preview(&source_id)
         } else {
             Ok(pending)
         }
     }
 
-    fn resolve_replay_local_branch(
+    fn finish_replay_local_branch(
         &mut self,
-        head: &str,
-        base: &str,
+        resolved: crate::replay::ReplayResolvedLocalBranch,
     ) -> Result<Value, crate::replay::ReplayError> {
-        let cwd = std::env::current_dir()
-            .map_err(|error| crate::replay::ReplayError::RepositoryMissing(error.to_string()))?;
-        let resolved = crate::replay::resolve_local_branch_source(
-            &cwd,
-            head,
-            (!base.trim().is_empty()).then_some(base),
-            self.replay_controller.limits(),
-        )?;
         let source_id = resolved.source.id.clone();
         self.replay_source_displays.insert(
             source_id.clone(),
@@ -3875,15 +3941,18 @@ impl Editor {
         self.replay_source_preview(&source_id)
     }
 
-    fn fetch_replay_pull_request_objects(
+    fn finish_replay_pull_request_fetch(
         &mut self,
-        source_id: &str,
-        confirmed: bool,
+        resolved: crate::replay::ReplayResolvedPullRequest,
+        source: crate::replay::ReplaySource,
     ) -> Result<Value, crate::replay::ReplayError> {
-        self.replay_controller.fetch_source(source_id, confirmed)?;
-        self.replay_source_preview(source_id)
+        let source_id = source.id.clone();
+        self.replay_controller.register_pull_request(resolved);
+        self.replay_controller.register_source(source);
+        self.replay_source_preview(&source_id)
     }
 
+    #[cfg(test)]
     async fn open_replay_source_workspace(
         &mut self,
         source_id: &str,
@@ -3898,6 +3967,18 @@ impl Editor {
             .prepare_workspace(source_id, /*confirmed*/ true)?;
         let workspace =
             workspace.ok_or(crate::replay::ReplayError::WorkspaceConfirmationRequired)?;
+        self.install_prepared_replay_source_workspace(source_id, workspace, render_buffer)
+            .await
+    }
+
+    async fn install_prepared_replay_source_workspace(
+        &mut self,
+        source_id: &str,
+        workspace: crate::replay::ReplayWorkspace,
+        render_buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<Value> {
+        self.replay_controller
+            .adopt_workspace(source_id, workspace.clone())?;
         let session = self.replay_controller.create_session(source_id)?.clone();
         let branch = self
             .replay_source_displays
@@ -7840,51 +7921,151 @@ impl Editor {
                         .await?;
                 }
                 PluginRequest::ReplayResolvePullRequest { request_id, input } => {
-                    let payload = self
-                        .resolve_replay_pull_request(&input)
-                        .unwrap_or_else(|error| error.payload());
-                    self.plugin_registry
-                        .resolve_request(runtime, request_id, payload)
-                        .await?;
+                    let limits = self.replay_controller.limits();
+                    let started = std::env::current_dir()
+                        .map_err(|error| {
+                            crate::replay::ReplayError::RepositoryMissing(error.to_string())
+                        })
+                        .and_then(|cwd| {
+                            self.spawn_replay_background(request_id, "pull-request", move || {
+                                let resolved =
+                                    crate::replay::resolve_pull_request(&cwd, &input, limits)?;
+                                let source = if resolved.missing_objects.is_empty() {
+                                    Some(Box::new(crate::replay::finalize_pull_request(
+                                        &resolved, limits,
+                                    )?))
+                                } else {
+                                    None
+                                };
+                                Ok(ReplayBackgroundResult::PullRequest {
+                                    resolved: Box::new(resolved),
+                                    source,
+                                })
+                            })
+                        });
+                    if let Err(error) = started {
+                        self.plugin_registry
+                            .resolve_request(runtime, request_id, error.payload())
+                            .await?;
+                    }
                 }
                 PluginRequest::ReplayResolveLocalBranch {
                     request_id,
                     head,
                     base,
                 } => {
-                    let payload = self
-                        .resolve_replay_local_branch(&head, &base)
-                        .unwrap_or_else(|error| error.payload());
-                    self.plugin_registry
-                        .resolve_request(runtime, request_id, payload)
-                        .await?;
+                    let limits = self.replay_controller.limits();
+                    let started = std::env::current_dir()
+                        .map_err(|error| {
+                            crate::replay::ReplayError::RepositoryMissing(error.to_string())
+                        })
+                        .and_then(|cwd| {
+                            self.spawn_replay_background(request_id, "local-branch", move || {
+                                let resolved = crate::replay::resolve_local_branch_source(
+                                    &cwd,
+                                    &head,
+                                    (!base.trim().is_empty()).then_some(base.as_str()),
+                                    limits,
+                                )?;
+                                Ok(ReplayBackgroundResult::LocalBranch(Box::new(resolved)))
+                            })
+                        });
+                    if let Err(error) = started {
+                        self.plugin_registry
+                            .resolve_request(runtime, request_id, error.payload())
+                            .await?;
+                    }
                 }
                 PluginRequest::ReplayFetchPullRequestObjects {
                     request_id,
                     source_id,
                     confirmed,
                 } => {
-                    let payload = self
-                        .fetch_replay_pull_request_objects(&source_id, confirmed)
-                        .unwrap_or_else(|error| error.payload());
-                    self.plugin_registry
-                        .resolve_request(runtime, request_id, payload)
-                        .await?;
+                    let limits = self.replay_controller.limits();
+                    let pending = if confirmed {
+                        self.replay_controller
+                            .pending_pull_request(&source_id)
+                            .cloned()
+                    } else {
+                        Err(crate::replay::ReplayError::WorkspaceConfirmationRequired)
+                    };
+                    let started = pending.and_then(|mut resolved| {
+                        self.spawn_replay_background(request_id, "fetch", move || {
+                            crate::replay::fetch_pull_request_objects(
+                                &mut resolved,
+                                /*confirmed*/ true,
+                            )?;
+                            let source = crate::replay::finalize_pull_request(&resolved, limits)?;
+                            Ok(ReplayBackgroundResult::FetchedPullRequest {
+                                resolved: Box::new(resolved),
+                                source: Box::new(source),
+                            })
+                        })
+                    });
+                    if let Err(error) = started {
+                        self.plugin_registry
+                            .resolve_request(runtime, request_id, error.payload())
+                            .await?;
+                    }
                 }
                 PluginRequest::ReplayCreateWorkspace {
                     request_id,
                     source_id,
                     confirmed,
                 } => {
-                    let payload = match self
-                        .open_replay_source_workspace(&source_id, confirmed, buffer)
-                        .await
-                    {
-                        Ok(payload) => {
-                            needs_render = true;
-                            payload
-                        }
-                        Err(error) => json!({ "ok": false, "error": error.to_string() }),
+                    let source = if confirmed {
+                        self.replay_controller.source(&source_id).cloned()
+                    } else {
+                        Err(crate::replay::ReplayError::WorkspaceConfirmationRequired)
+                    };
+                    let started = source.and_then(|source| {
+                        self.spawn_replay_background(request_id, "worktree", move || {
+                            let (_, workspace) =
+                                crate::replay::prepare_workspace(&source, /*confirmed*/ true)?;
+                            let workspace = workspace
+                                .ok_or(crate::replay::ReplayError::WorkspaceConfirmationRequired)?;
+                            Ok(ReplayBackgroundResult::Workspace {
+                                source_id,
+                                workspace: Box::new(workspace),
+                            })
+                        })
+                    });
+                    if let Err(error) = started {
+                        self.plugin_registry
+                            .resolve_request(runtime, request_id, error.payload())
+                            .await?;
+                    }
+                }
+                PluginRequest::ReplayBackgroundCompleted { request_id, result } => {
+                    if !self.pending_replay_requests.remove(&request_id) {
+                        continue;
+                    }
+                    let payload = match result {
+                        Ok(ReplayBackgroundResult::PullRequest { resolved, source }) => self
+                            .finish_replay_pull_request(*resolved, source.map(|source| *source))
+                            .unwrap_or_else(|error| error.payload()),
+                        Ok(ReplayBackgroundResult::LocalBranch(resolved)) => self
+                            .finish_replay_local_branch(*resolved)
+                            .unwrap_or_else(|error| error.payload()),
+                        Ok(ReplayBackgroundResult::FetchedPullRequest { resolved, source }) => self
+                            .finish_replay_pull_request_fetch(*resolved, *source)
+                            .unwrap_or_else(|error| error.payload()),
+                        Ok(ReplayBackgroundResult::Workspace {
+                            source_id,
+                            workspace,
+                        }) => match self
+                            .install_prepared_replay_source_workspace(
+                                &source_id, *workspace, buffer,
+                            )
+                            .await
+                        {
+                            Ok(payload) => {
+                                needs_render = true;
+                                payload
+                            }
+                            Err(error) => json!({ "ok": false, "error": error.to_string() }),
+                        },
+                        Err(error) => error.payload(),
                     };
                     self.plugin_registry
                         .resolve_request(runtime, request_id, payload)
@@ -22450,6 +22631,48 @@ mod test {
         assert_eq!(result["code"], "workspace_confirmation_required");
         assert_eq!(editor.buffer_manager.len(), 1);
         assert!(editor.replay_demo_workspace.is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_git_operations_never_block_interactive_editor_input() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let request_id = RequestId::from_raw(/*value*/ 27145);
+        let (started, ready) = std::sync::mpsc::channel();
+        let (release, wait_for_release) = std::sync::mpsc::channel();
+
+        editor
+            .spawn_replay_background(request_id, "responsiveness-test", move || {
+                started.send(()).expect("signal that Git work is pending");
+                wait_for_release
+                    .recv()
+                    .expect("wait without blocking the editor owner");
+                Err(crate::replay::ReplayError::MissingObjects)
+            })
+            .expect("start an isolated bounded Replay worker");
+        ready
+            .recv_timeout(Duration::from_secs(/*secs*/ 2))
+            .expect("the isolated Replay worker starts independently");
+
+        assert!(editor.pending_replay_requests.contains(&request_id));
+        editor
+            .test_handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('j'),
+                KeyModifiers::NONE,
+            )))
+            .expect("the editor handles input while the Git operation is still blocked");
+
+        release
+            .send(())
+            .expect("finish the bounded background Replay operation");
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ReplayBackgroundCompleted {
+                request_id: completed,
+                result: Err(crate::replay::ReplayError::MissingObjects),
+            } if completed == request_id
+        ));
     }
 
     #[tokio::test]

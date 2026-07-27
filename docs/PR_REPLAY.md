@@ -29,6 +29,10 @@ The source picker offers:
 - **Safe in-memory demo:** inspect the original five-step mock without Git,
   network access, file writes, or worktree creation.
 
+GitHub metadata, local Git resolution, explicitly confirmed fetches, and
+scratch-worktree creation run in bounded background workers. Normal editor
+input remains responsive while the original review source is loading.
+
 Use `:ReplayPR` or `:ReplayBranch` to go directly to the corresponding source
 input, or `:ReplayDemo` to bypass the picker and open the no-side-effect mock.
 
