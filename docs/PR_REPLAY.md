@@ -109,6 +109,22 @@ status line reads `REPLAY`. Focusing the source restores the normal editor
 status line; the guide, its original diff, and syntax highlighting remain
 visible.
 
+The guide also inherits Red's generic pane resizing. Use `Ctrl-w >` and
+`Ctrl-w <` to grow or shrink a left or right Replay pane; use `Ctrl-w +` and
+`Ctrl-w -` when the pane is docked above or below the source. Prefix either
+binding with a count, such as `5 Ctrl-w >`, for a larger adjustment.
+`Ctrl-w =` restores the pane's original size. You can also drag its dividing
+line with the mouse; the captured divider brightens immediately and returns to
+its normal focus appearance when released.
+
+Real review progress is included in Red's crash-safe editor session. Restart
+Red with `--resume` to reopen the verified scratch buffers, original source
+guide, selected change, completed hunks, private observations, learning mode,
+and attributed Replay undo history. Resume does not create or overwrite a
+worktree, save the scratch files, or reuse an automatic-application token. If
+the pinned source, hunk, worktree, or undo attribution cannot be verified, Red
+recovers the normal editor buffers and refuses only the unsafe Replay session.
+
 ## Key bindings
 
 All replay bindings use `Space R`; the existing `Space r` rename binding is
@@ -126,7 +142,7 @@ unchanged.
 | `Space R v` | Validate the real scratch source against the original hunk. |
 | `Space R a` | Immediately apply one exact, undoable original hunk. |
 | `Space R u` | Safely undo the most recent Replay-authored scratch hunk. |
-| `Space R o` | Add a local, in-memory reviewer observation. |
+| `Space R o` | Add a private, recoverable source-linked observation. |
 | `Space R f` | Show local reviewer observations. |
 | `Space R q` | Hide the coach without touching the scratch source or progress. |
 
@@ -174,7 +190,8 @@ diagnostic parameter with `:10` and `Enter`, press `o`, type
 `visible_start: usize,`, press `Enter`, type `visible_end: usize,`, and press
 `Esc`. Then press `Space R v`. The guide displays `✓ 01` and `1 / 5 reviewed`.
 
-Observations stay local and are never posted as GitHub comments or reviews.
+Real-source observations stay local, survive `--resume`, and are never posted
+as GitHub comments or reviews.
 The demo source has a display name but no associated file path or URI; opening
 or using the demo never fetches, creates a branch, writes a file, or contacts
 GitHub. Real Replay buffers refer only to files inside the explicitly confirmed

@@ -92,6 +92,7 @@ pub fn activate() {
         description: "Hide the dedicated coach while preserving the Replay session",
     });
 
+    red::on("editor:ready", restore_active_session);
     red::on("panel:event:replay-coach", panel_event);
     red::on("buffer:changed", source_changed);
     red::on("replay:undone", replay_undone);
@@ -117,6 +118,28 @@ pub fn activate() {
     red::state_set("replay_completions", []);
     red::state_set("replay_notice", "");
     red::state_set("replay_steps", []);
+}
+
+fn restore_active_session(event: Json) {
+    if red::string(red::state("replay_workspace_id"), "") == "" {
+        red::request("ReplayActiveSession", active_session_restored);
+    }
+}
+
+fn active_session_restored(result: Json) {
+    if !red::bool(result.ok, false) || !red::bool(result.active, false) {
+        return;
+    }
+    if !load_plan(result.plan) {
+        return;
+    }
+    red::state_set("replay_source_kind", red::string(result.source_kind, "local_range"));
+    red::state_set("replay_index", red::int(result.index, 0));
+    red::state_set("replay_mode", red::string(result.mode, "challenge"));
+    red::state_set("replay_notes", result.notes);
+    red::state_set("replay_completions", result.completions);
+    red::state_set("replay_notice", "Review restored · progress and private observations recovered.");
+    workspace_opened(result);
 }
 
 fn open() {
@@ -513,10 +536,29 @@ fn toggle_mode() {
     if !ensure_workspace() {
         return;
     }
-    if red::string(red::state("replay_mode"), "challenge") == "challenge" {
-        red::state_set("replay_mode", "snippet");
+    let mode = "snippet";
+    if red::string(red::state("replay_mode"), "challenge") != "challenge" {
+        mode = "challenge";
+    }
+    if red::string(red::state("replay_source_kind"), "demo") != "demo" {
+        red::request(
+            "ReplaySetMode",
+            mode_changed,
+            red::string(red::state("replay_workspace_id"), ""),
+            mode
+        );
+        return;
+    }
+    red::state_set("replay_mode", mode);
+    red::state_set("replay_view", "guide");
+    render();
+}
+
+fn mode_changed(result: Json) {
+    if !red::bool(result.ok, false) {
+        red::state_set("replay_notice", source_error(result, "Could not change the review mode"));
     } else {
-        red::state_set("replay_mode", "challenge");
+        red::state_set("replay_mode", red::string(result.mode, "challenge"));
     }
     red::state_set("replay_view", "guide");
     render();
@@ -705,10 +747,33 @@ fn note_submitted(value: String) {
         render();
         return;
     }
+    if red::string(red::state("replay_source_kind"), "demo") != "demo" {
+        let index = red::int(red::state("replay_index"), 0);
+        let step = red::state("replay_steps")[index];
+        red::request(
+            "ReplayAddNote",
+            note_recorded,
+            red::string(red::state("replay_workspace_id"), ""),
+            red::string(step.id, ""),
+            "observation",
+            observation
+        );
+        return;
+    }
     red::state_set("replay_notes", red::push(red::state("replay_notes"), Json {
         index: red::int(red::state("replay_index"), 0),
         text: observation,
     }));
+    render();
+}
+
+fn note_recorded(result: Json) {
+    if !red::bool(result.ok, false) {
+        red::state_set("replay_notice", source_error(result, "Could not save the private review observation"));
+    } else {
+        red::state_set("replay_notes", red::push(red::state("replay_notes"), result.note));
+        red::state_set("replay_notice", "Private observation saved with this original source hunk.");
+    }
     render();
 }
 

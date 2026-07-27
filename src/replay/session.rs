@@ -1,7 +1,7 @@
 //! Editor-owned replay sessions, source-linked observations, and one-shot stages.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -442,6 +442,36 @@ impl ReplayController {
         sessions
     }
 
+    /// Returns the selected original-source review without transferring ownership.
+    #[must_use]
+    pub fn active_session(&self) -> Option<&ReplaySession> {
+        self.active_session
+            .as_deref()
+            .and_then(|id| self.sessions.get(id))
+    }
+
+    /// Remembers a browsed original hunk without applying its prerequisites.
+    ///
+    /// Reviewers may inspect an independent or currently blocked step without
+    /// claiming that its patch is eligible for automatic application.
+    pub fn select_step(&mut self, session_id: &str, step_id: &str) -> Result<(), ReplayError> {
+        let session = self.session_mut(session_id)?;
+        if !session.steps.iter().any(|step| step.id == step_id) {
+            return Err(missing("replay step", step_id));
+        }
+        if session.active_step.as_deref() == Some(step_id) {
+            return Ok(());
+        }
+
+        session.active_step = Some(step_id.to_string());
+        if session.state != ReplaySessionState::Completed {
+            session.state = ReplaySessionState::Active;
+        }
+        session.generation = session.generation.saturating_add(1);
+        self.advance_generation();
+        Ok(())
+    }
+
     /// Selects an existing eligible learning step.
     pub fn activate_step(
         &mut self,
@@ -724,6 +754,26 @@ impl ReplayController {
                 "unsupported replay recovery version".to_string(),
             ));
         }
+
+        let mut session_ids = HashSet::with_capacity(snapshot.sessions.len());
+        for session in &snapshot.sessions {
+            if !session_ids.insert(session.id.as_str()) {
+                return Err(ReplayError::InvalidMetadata(
+                    "replay recovery contains a duplicate session".to_string(),
+                ));
+            }
+            validate_recovered_session(session, self.limits)?;
+        }
+        if snapshot
+            .active_session
+            .as_deref()
+            .is_some_and(|id| !session_ids.contains(id))
+        {
+            return Err(ReplayError::InvalidMetadata(
+                "replay recovery selects an unknown session".to_string(),
+            ));
+        }
+
         self.staged.clear();
         self.sessions.clear();
         self.sources.clear();
@@ -759,6 +809,85 @@ impl ReplayController {
     fn advance_generation(&mut self) {
         self.generation = self.generation.saturating_add(1);
     }
+}
+
+fn validate_recovered_session(
+    session: &ReplaySession,
+    limits: ReplayLimits,
+) -> Result<(), ReplayError> {
+    if session.source.patch_digest != digest(session.source.patch.as_bytes()) {
+        return Err(ReplayError::InvalidPatch(
+            "the recovered original patch no longer matches its pinned digest".to_string(),
+        ));
+    }
+    if session.workspace.base_commit != session.source.base_commit {
+        return Err(ReplayError::InvalidMetadata(
+            "the recovered scratch worktree does not match the original merge base".to_string(),
+        ));
+    }
+
+    let expected =
+        ReplaySession::from_source(session.source.clone(), session.workspace.clone(), limits)?;
+    if session.steps.len() != expected.steps.len()
+        || session.informational_changes != expected.informational_changes
+        || session
+            .steps
+            .iter()
+            .zip(&expected.steps)
+            .any(|(recovered, original)| {
+                recovered.id != original.id
+                    || recovered.ordinal != original.ordinal
+                    || recovered.kind != original.kind
+                    || recovered.path != original.path
+                    || recovered.target_commit != original.target_commit
+                    || recovered.hunk_digest != original.hunk_digest
+                    || recovered.heading != original.heading
+                    || recovered.before != original.before
+                    || recovered.after != original.after
+                    || recovered.old_start != original.old_start
+                    || recovered.dependencies != original.dependencies
+                    || (recovered.status == ReplayStepStatus::Done)
+                        != recovered.completion.is_some()
+            })
+    {
+        return Err(ReplayError::InvalidPatch(
+            "recovered learning steps no longer match the pinned original patch".to_string(),
+        ));
+    }
+    if session
+        .active_step
+        .as_deref()
+        .is_some_and(|id| !session.steps.iter().any(|step| step.id == id))
+    {
+        return Err(ReplayError::InvalidMetadata(
+            "replay recovery selects an unknown original hunk".to_string(),
+        ));
+    }
+
+    for note in &session.notes {
+        if note.target_commit != session.source.target_commit
+            || note.text.trim().is_empty()
+            || note.text.len() > limits.max_note_bytes
+        {
+            return Err(ReplayError::InvalidReviewNote(
+                "the recovered observation is not linked to the pinned original source".to_string(),
+            ));
+        }
+        let expected_path = note.step_id.as_deref().map(|id| {
+            session
+                .steps
+                .iter()
+                .find(|step| step.id == id)
+                .map(|step| step.path.as_path())
+        });
+        if matches!(expected_path, Some(None)) || note.path.as_deref() != expected_path.flatten() {
+            return Err(ReplayError::InvalidReviewNote(
+                "the recovered observation does not match its original source hunk".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 impl ReplaySession {
@@ -1379,6 +1508,84 @@ mod tests {
             restored.consume_stage(&stage.token, Path::new("src/token.rs"), old, 7),
             Err(ReplayError::StalePreview)
         ));
+    }
+
+    #[test]
+    fn browsing_an_original_hunk_does_not_claim_its_prerequisite_is_complete() {
+        let (mut controller, session_id, first_id) = controller_with_session();
+        let second_id = "dependent-original-hunk".to_string();
+        let session = controller.sessions.get_mut(&session_id).unwrap();
+        let mut dependent = session.steps[0].clone();
+        dependent.id = second_id.clone();
+        dependent.ordinal = 2;
+        dependent.dependencies = vec![first_id];
+        dependent.status = ReplayStepStatus::Pending;
+        dependent.completion = None;
+        session.steps.push(dependent);
+
+        controller
+            .select_step(&session_id, &second_id)
+            .expect("reviewers may inspect a blocked original hunk");
+
+        let session = controller.session(&session_id).unwrap();
+        assert_eq!(session.active_step.as_deref(), Some(second_id.as_str()));
+        assert_eq!(session.steps[1].status, ReplayStepStatus::Pending);
+        assert_eq!(session.steps[1].completion, None);
+        assert_eq!(
+            controller
+                .validate_step(
+                    &session_id,
+                    &second_id,
+                    Path::new("src/token.rs"),
+                    "fn refresh() {\n    old();\n}\n",
+                )
+                .unwrap(),
+            ReplayValidation::Blocked,
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_a_modified_original_patch_before_adopting_session_state() {
+        let (controller, _, _) = controller_with_session();
+        let mut snapshot = controller
+            .recovery_snapshot()
+            .expect("capture the pinned original reviewer session");
+        snapshot.sessions[0]
+            .source
+            .patch
+            .push_str("untrusted extra source\n");
+
+        let mut restored = ReplayController::default();
+        assert!(matches!(
+            restored.restore(&snapshot),
+            Err(ReplayError::InvalidPatch(_)),
+        ));
+        assert!(restored.sessions().is_empty());
+        assert!(restored.active_session().is_none());
+    }
+
+    #[test]
+    fn recovery_rejects_an_observation_reassigned_to_another_original_file() {
+        let (mut controller, session_id, step_id) = controller_with_session();
+        controller
+            .add_note(
+                &session_id,
+                Some(&step_id),
+                ReplayNoteCategory::Observation,
+                "Keep the refresh bounded.",
+            )
+            .expect("record one original-source observation");
+        let mut snapshot = controller
+            .recovery_snapshot()
+            .expect("capture the source-linked observation");
+        snapshot.sessions[0].notes[0].path = Some(PathBuf::from("src/unrelated.rs"));
+
+        let mut restored = ReplayController::default();
+        assert!(matches!(
+            restored.restore(&snapshot),
+            Err(ReplayError::InvalidReviewNote(_)),
+        ));
+        assert!(restored.sessions().is_empty());
     }
 
     #[test]

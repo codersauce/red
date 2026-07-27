@@ -98,7 +98,8 @@ use crate::{
     session::{
         capture_session_disk_fingerprint, detect_disk_divergence, read_session_disk_contents,
         RecoveryDivergence, SessionAnchorAffinity, SessionBufferSnapshot, SessionDiskFingerprint,
-        SessionJump, SessionMark, SessionSnapshot, SessionStore, SESSION_SCHEMA_VERSION,
+        SessionJump, SessionMark, SessionReplayAppliedStep, SessionReplaySnapshot,
+        SessionReplaySourceDisplay, SessionSnapshot, SessionStore, SESSION_SCHEMA_VERSION,
     },
     theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
     ui::{
@@ -797,6 +798,21 @@ pub enum PluginRequest {
         source_id: String,
         confirmed: bool,
     },
+    ReplayActiveSession {
+        request_id: RequestId,
+    },
+    ReplayAddNote {
+        request_id: RequestId,
+        workspace_id: String,
+        step_id: String,
+        category: crate::replay::ReplayNoteCategory,
+        text: String,
+    },
+    ReplaySetMode {
+        request_id: RequestId,
+        workspace_id: String,
+        mode: crate::replay::ReplayMode,
+    },
     #[doc(hidden)]
     ReplayBackgroundCompleted {
         request_id: RequestId,
@@ -1085,6 +1101,9 @@ impl PluginRequest {
             Self::ReplayResolveLocalBranch { .. } => "ReplayResolveLocalBranch",
             Self::ReplayFetchPullRequestObjects { .. } => "ReplayFetchPullRequestObjects",
             Self::ReplayCreateWorkspace { .. } => "ReplayCreateWorkspace",
+            Self::ReplayActiveSession { .. } => "ReplayActiveSession",
+            Self::ReplayAddNote { .. } => "ReplayAddNote",
+            Self::ReplaySetMode { .. } => "ReplaySetMode",
             Self::ReplayBackgroundCompleted { .. } => "ReplayBackgroundCompleted",
             Self::ReplayFocusStepSource { .. } => "ReplayFocusStepSource",
             Self::CloseScratchBuffer { .. } => "CloseScratchBuffer",
@@ -3717,6 +3736,14 @@ impl Editor {
         let Some(window_index) = self.window_manager.window_index(workspace.source_window) else {
             return false;
         };
+        if self.replay_controller.session(workspace_id).is_ok()
+            && self
+                .replay_controller
+                .select_step(workspace_id, step_id)
+                .is_err()
+        {
+            return false;
+        }
         let source_buffer = self.buffer_manager[source_index].id();
         let source_line = self.replay_step_source_line(workspace_id, step_id, source_index);
         let (source_vtop, source_cx, source_cy) = source_line.map_or_else(
@@ -3748,6 +3775,82 @@ impl Editor {
             workspace.source_buffer = source_buffer;
         }
         true
+    }
+
+    fn active_replay_session_payload(&self) -> Value {
+        let Some(session) = self.replay_controller.active_session() else {
+            return json!({ "ok": true, "active": false });
+        };
+        let Some(workspace) = self
+            .replay_demo_workspace
+            .as_ref()
+            .filter(|workspace| workspace.id == session.id)
+        else {
+            return json!({
+                "ok": false,
+                "error": "the recovered Replay scratch source is not available",
+            });
+        };
+        let presentation = match crate::replay::replay_presentation_plan(
+            &workspace.plan,
+            self.replay_controller.limits(),
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return error.payload(),
+        };
+        let index = session
+            .active_step
+            .as_deref()
+            .and_then(|id| workspace.plan.steps.iter().position(|step| step.id == id))
+            .unwrap_or_default();
+        let notes = session
+            .notes
+            .iter()
+            .filter_map(|note| {
+                let step_id = note.step_id.as_deref()?;
+                let index = workspace
+                    .plan
+                    .steps
+                    .iter()
+                    .position(|step| step.id == step_id)?;
+                Some(json!({
+                    "index": index,
+                    "text": note.text,
+                }))
+            })
+            .collect::<Vec<_>>();
+        let completions = session
+            .steps
+            .iter()
+            .enumerate()
+            .filter_map(|(index, step)| {
+                let completion = match step.completion? {
+                    crate::replay::ReplayCompletion::Manual => "manually reconstructed",
+                    crate::replay::ReplayCompletion::Automatic => "automatically applied",
+                };
+                Some(json!({ "index": index, "completion": completion }))
+            })
+            .collect::<Vec<_>>();
+        let source_buffer_index = self
+            .buffer_manager
+            .iter()
+            .position(|buffer| buffer.id() == workspace.source_buffer);
+
+        json!({
+            "ok": true,
+            "active": true,
+            "workspace_id": session.id,
+            "workspace_root": session.workspace.root,
+            "workspace_branch": session.workspace.branch,
+            "source_kind": session.source.kind,
+            "source_buffer_index": source_buffer_index,
+            "source_window_id": workspace.source_window.0,
+            "index": index,
+            "mode": session.mode,
+            "notes": notes,
+            "completions": completions,
+            "plan": presentation,
+        })
     }
 
     fn replay_step_source_line(
@@ -8035,6 +8138,71 @@ impl Editor {
                             .resolve_request(runtime, request_id, error.payload())
                             .await?;
                     }
+                }
+                PluginRequest::ReplayActiveSession { request_id } => {
+                    let payload = self.active_replay_session_payload();
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
+                }
+                PluginRequest::ReplayAddNote {
+                    request_id,
+                    workspace_id,
+                    step_id,
+                    category,
+                    text,
+                } => {
+                    let result = self.replay_controller.add_note(
+                        &workspace_id,
+                        Some(&step_id),
+                        category,
+                        &text,
+                    );
+                    let payload = match result {
+                        Ok(note) => {
+                            let index = self
+                                .replay_controller
+                                .session(&workspace_id)
+                                .ok()
+                                .and_then(|session| {
+                                    session.steps.iter().position(|step| step.id == step_id)
+                                })
+                                .unwrap_or_default();
+                            needs_render = true;
+                            json!({
+                                "ok": true,
+                                "workspace_id": workspace_id,
+                                "note": {
+                                    "index": index,
+                                    "text": note.text,
+                                },
+                            })
+                        }
+                        Err(error) => error.payload(),
+                    };
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
+                }
+                PluginRequest::ReplaySetMode {
+                    request_id,
+                    workspace_id,
+                    mode,
+                } => {
+                    let payload = match self.replay_controller.set_mode(&workspace_id, mode) {
+                        Ok(()) => {
+                            needs_render = true;
+                            json!({
+                                "ok": true,
+                                "workspace_id": workspace_id,
+                                "mode": mode,
+                            })
+                        }
+                        Err(error) => error.payload(),
+                    };
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
                 }
                 PluginRequest::ReplayBackgroundCompleted { request_id, result } => {
                     if !self.pending_replay_requests.remove(&request_id) {
@@ -19728,6 +19896,16 @@ impl Editor {
                 );
             }
         }
+        if let Some(replay) = &snapshot.replay {
+            if let Err(error) = self.restore_replay_session_snapshot(replay) {
+                self.replay_controller = crate::replay::ReplayController::default();
+                self.replay_demo_workspace = None;
+                self.replay_source_displays.clear();
+                self.last_error = Some(format!(
+                    "Recovered editor state, but PR Replay could not be safely resumed: {error}",
+                ));
+            }
+        }
         if !divergences.is_empty() {
             let mut warning = format!(
                 "Recovered unsaved state; {} file(s) changed on disk (see recovery report)",
@@ -19746,6 +19924,157 @@ impl Editor {
         self.sync_with_window();
         self.check_bounds();
         Ok(divergences)
+    }
+
+    fn restore_replay_session_snapshot(
+        &mut self,
+        snapshot: &SessionReplaySnapshot,
+    ) -> Result<(), crate::replay::ReplayError> {
+        let mut controller = crate::replay::ReplayController::new(self.replay_controller.limits());
+        controller.restore(&snapshot.controller)?;
+
+        let source_displays = snapshot
+            .source_displays
+            .iter()
+            .map(|(id, display)| {
+                (
+                    id.clone(),
+                    ReplaySourceDisplay {
+                        head_ref: display.head_ref.clone(),
+                        base_ref: display.base_ref.clone(),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let Some(session) = controller.active_session().cloned() else {
+            self.replay_controller = controller;
+            self.replay_source_displays = source_displays;
+            return Ok(());
+        };
+
+        let workspace_metadata = std::fs::symlink_metadata(&session.workspace.root)
+            .map_err(|error| crate::replay::ReplayError::Filesystem(error.to_string()))?;
+        if !workspace_metadata.file_type().is_dir() {
+            return Err(crate::replay::ReplayError::UnsafePath(
+                session.workspace.root.display().to_string(),
+            ));
+        }
+
+        let branch = source_displays
+            .get(&session.source.id)
+            .map(|display| display.head_ref.as_str())
+            .or_else(|| {
+                session
+                    .source
+                    .pull_request
+                    .as_ref()
+                    .map(|request| request.head_ref.as_str())
+            })
+            .unwrap_or("local");
+        let plan = crate::replay::replay_plan_from_session(&session, branch, controller.limits())?;
+        let mut source_buffers = HashMap::new();
+        for step in &plan.steps {
+            if source_buffers.contains_key(&step.path) {
+                continue;
+            }
+            let source_path = session.workspace.root.join(&step.path);
+            let source_buffer = self
+                .buffer_manager
+                .iter()
+                .find(|buffer| {
+                    buffer
+                        .file
+                        .as_deref()
+                        .is_some_and(|path| Path::new(path) == source_path.as_path())
+                })
+                .map(Buffer::id)
+                .ok_or_else(|| {
+                    crate::replay::ReplayError::Filesystem(format!(
+                        "recovered scratch buffer is missing: {}",
+                        source_path.display(),
+                    ))
+                })?;
+            source_buffers.insert(step.path.clone(), source_buffer);
+        }
+
+        let selected = session
+            .active_step
+            .as_deref()
+            .and_then(|id| plan.steps.iter().find(|step| step.id == id))
+            .or_else(|| plan.steps.first())
+            .ok_or_else(|| {
+                crate::replay::ReplayError::UnsupportedOperation(
+                    "the recovered review contains no original source hunks".to_string(),
+                )
+            })?;
+        let source_buffer = *source_buffers.get(&selected.path).ok_or_else(|| {
+            crate::replay::ReplayError::NotFound {
+                kind: "recovered replay source buffer",
+                id: selected.path.clone(),
+            }
+        })?;
+        let source_window = self
+            .window_manager
+            .windows()
+            .into_iter()
+            .find(|window| {
+                self.buffer_manager
+                    .get(window.buffer_index)
+                    .is_some_and(|buffer| source_buffers.values().any(|id| *id == buffer.id()))
+            })
+            .map(|window| window.id)
+            .ok_or_else(|| crate::replay::ReplayError::NotFound {
+                kind: "recovered replay source window",
+                id: session.id.clone(),
+            })?;
+
+        let mut applied_steps = Vec::with_capacity(snapshot.applied_steps.len());
+        let mut applied_ids = HashSet::with_capacity(snapshot.applied_steps.len());
+        for applied in &snapshot.applied_steps {
+            let step = session
+                .steps
+                .iter()
+                .find(|step| step.id == applied.step_id)
+                .filter(|step| {
+                    applied.session_id == session.id
+                        && step.path == applied.path
+                        && step.status == crate::replay::ReplayStepStatus::Done
+                        && step.completion == Some(crate::replay::ReplayCompletion::Automatic)
+                })
+                .ok_or_else(|| {
+                    crate::replay::ReplayError::InvalidMetadata(
+                        "recovered Replay undo does not match an applied original hunk".to_string(),
+                    )
+                })?;
+            if !applied_ids.insert(step.id.as_str()) {
+                return Err(crate::replay::ReplayError::InvalidMetadata(
+                    "recovered Replay undo contains a duplicate original hunk".to_string(),
+                ));
+            }
+            let source_buffer = *source_buffers
+                .get(&step.path.to_string_lossy().into_owned())
+                .ok_or_else(|| crate::replay::ReplayError::NotFound {
+                    kind: "recovered replay source buffer",
+                    id: step.path.display().to_string(),
+                })?;
+            applied_steps.push(ReplayAppliedStep {
+                source_buffer,
+                step_id: step.id.clone(),
+            });
+        }
+
+        self.replay_controller = controller;
+        self.replay_source_displays = source_displays;
+        self.replay_demo_workspace = Some(ReplayDemoWorkspaceState {
+            id: session.id,
+            plan,
+            source_buffer,
+            source_buffers,
+            source_window,
+            applied_steps,
+        });
+        Ok(())
     }
 
     fn restore_session_mark(
@@ -19869,6 +20198,7 @@ impl Editor {
             .plugin_storage("agent", &scoped_plugin_storage_key("agent", "transcript"))
             .and_then(Value::as_str)
             .map(str::to_string);
+        let replay = self.capture_replay_session_snapshot();
 
         (
             SessionSnapshot {
@@ -19896,9 +20226,85 @@ impl Editor {
                 agent_transcript,
                 agent_workspace,
                 agent_session_resumable: false,
+                replay,
             },
             disk_fingerprints,
         )
+    }
+
+    fn capture_replay_session_snapshot(&self) -> Option<SessionReplaySnapshot> {
+        let controller = self.replay_controller.recovery_snapshot()?;
+        let mut source_displays = self
+            .replay_source_displays
+            .iter()
+            .filter(|(id, _)| {
+                controller
+                    .sessions
+                    .iter()
+                    .any(|session| session.source.id == **id)
+            })
+            .map(|(id, display)| {
+                (
+                    id.clone(),
+                    SessionReplaySourceDisplay {
+                        head_ref: display.head_ref.clone(),
+                        base_ref: display.base_ref.clone(),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let applied_steps = self
+            .replay_demo_workspace
+            .as_ref()
+            .filter(|workspace| {
+                controller
+                    .sessions
+                    .iter()
+                    .any(|session| session.id == workspace.id)
+            })
+            .map(|workspace| {
+                if let Some(session) = controller
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == workspace.id)
+                {
+                    source_displays
+                        .entry(session.source.id.clone())
+                        .or_insert_with(|| SessionReplaySourceDisplay {
+                            head_ref: workspace.plan.branch.clone(),
+                            base_ref: session
+                                .source
+                                .pull_request
+                                .as_ref()
+                                .map(|request| request.base_ref.clone())
+                                .unwrap_or_default(),
+                        });
+                }
+                workspace
+                    .applied_steps
+                    .iter()
+                    .filter_map(|applied| {
+                        workspace
+                            .plan
+                            .steps
+                            .iter()
+                            .find(|step| step.id == applied.step_id)
+                            .map(|step| SessionReplayAppliedStep {
+                                session_id: workspace.id.clone(),
+                                step_id: step.id.clone(),
+                                path: PathBuf::from(&step.path),
+                            })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Some(SessionReplaySnapshot {
+            controller,
+            source_displays,
+            applied_steps,
+        })
     }
 
     fn snapshot_mark(
@@ -19945,6 +20351,7 @@ impl Editor {
                     .ok()
                     .map(|workspace| workspace.generation())
             }),
+            Some(self.replay_controller.generation()),
         );
         if !force
             && self
@@ -22631,6 +23038,182 @@ mod test {
         assert_eq!(result["code"], "workspace_confirmation_required");
         assert_eq!(editor.buffer_manager.len(), 1);
         assert!(editor.replay_demo_workspace.is_none());
+    }
+
+    #[tokio::test]
+    async fn real_replay_crash_recovery_preserves_source_progress_notes_and_exact_undo() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let (directory, session, workspace) = real_replay_session_fixture();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        let mut runtime = Runtime::new();
+
+        let opened = editor
+            .install_replay_source_session(session, "feature/replay", workspace, &mut render_buffer)
+            .await
+            .expect("open the confirmed original-source review");
+        let workspace_id = opened["workspace_id"].as_str().unwrap().to_string();
+        let first_id = opened["plan"]["steps"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let second_id = opened["plan"]["steps"][1]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let revision = editor.replay_demo_step_validation(&workspace_id, &first_id)["revision"]
+            .as_u64()
+            .unwrap();
+        editor
+            .apply_replay_demo_step(&workspace_id, &first_id, revision, &mut runtime)
+            .await
+            .expect("apply exactly one undoable original hunk");
+        editor
+            .replay_controller
+            .add_note(
+                &workspace_id,
+                Some(&second_id),
+                crate::replay::ReplayNoteCategory::Observation,
+                "Check how the second source is bounded.",
+            )
+            .expect("retain a private finding on the actual original hunk");
+        editor
+            .replay_controller
+            .set_mode(&workspace_id, crate::replay::ReplayMode::Snippet)
+            .expect("retain the selected review mode");
+        assert!(editor.focus_replay_step_source(&workspace_id, &second_id));
+
+        let snapshot = editor.test_session_snapshot();
+        let replay = snapshot
+            .replay
+            .as_ref()
+            .expect("real review state belongs to the core recovery snapshot");
+        assert_eq!(replay.controller.sessions.len(), 1);
+        assert_eq!(replay.controller.sessions[0].notes.len(), 1);
+        assert_eq!(replay.applied_steps.len(), 1);
+        assert_eq!(replay.applied_steps[0].step_id, first_id);
+        assert_eq!(
+            replay.source_displays["real-replay-source"].head_ref,
+            "feature/replay",
+        );
+
+        let buffers = Editor::buffers_from_session_snapshot(&snapshot);
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut recovered = Editor::with_size(
+            lsp,
+            /*width*/ 100,
+            /*height*/ 28,
+            config,
+            Theme::default(),
+            buffers,
+        )
+        .expect("reconstruct the editor-owned scratch buffers");
+        recovered.test_disable_terminal_output();
+        let divergences = recovered
+            .restore_session_snapshot(&snapshot)
+            .expect("recover the editor without writing the scratch worktree");
+
+        assert!(divergences.is_empty());
+        let restored = recovered.active_replay_session_payload();
+        assert_eq!(restored["ok"], true);
+        assert_eq!(
+            restored["active"], true,
+            "recovered original review was refused: {:?}",
+            recovered.last_error,
+        );
+        assert_eq!(restored["index"], 1);
+        assert_eq!(restored["mode"], "snippet");
+        assert_eq!(restored["plan"]["branch"], "feature/replay");
+        assert_eq!(restored["notes"][0]["index"], 1);
+        assert_eq!(
+            restored["notes"][0]["text"],
+            "Check how the second source is bounded.",
+        );
+        assert_eq!(restored["completions"][0]["index"], 0);
+        assert_eq!(
+            restored["completions"][0]["completion"],
+            "automatically applied",
+        );
+
+        recovered
+            .undo_replay_step(&mut render_buffer, &mut runtime)
+            .await
+            .expect("recovered Replay undo follows the exact original source transaction");
+        assert!(recovered.current_buffer().name().ends_with("/src/first.rs"));
+        assert!(recovered
+            .current_buffer()
+            .contents()
+            .contains("before_first()"));
+        assert!(
+            std::fs::read_to_string(directory.path().join("src/first.rs"))
+                .unwrap()
+                .contains("before_first()")
+        );
+        assert_eq!(
+            recovered
+                .replay_controller
+                .session(&workspace_id)
+                .unwrap()
+                .notes
+                .len(),
+            1,
+        );
+    }
+
+    #[tokio::test]
+    async fn unsafe_replay_recovery_keeps_regular_editor_buffers_without_writing_files() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let (directory, session, workspace) = real_replay_session_fixture();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        editor
+            .install_replay_source_session(session, "feature/replay", workspace, &mut render_buffer)
+            .await
+            .expect("open the actual source-backed review");
+        let mut snapshot = editor.test_session_snapshot();
+        snapshot
+            .replay
+            .as_mut()
+            .expect("capture the original review")
+            .controller
+            .sessions[0]
+            .source
+            .patch
+            .push_str("untrusted recovered change\n");
+
+        let buffers = Editor::buffers_from_session_snapshot(&snapshot);
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut recovered = Editor::with_size(
+            lsp,
+            /*width*/ 100,
+            /*height*/ 28,
+            config,
+            Theme::default(),
+            buffers,
+        )
+        .expect("keep the normal recovered editor available");
+        recovered.test_disable_terminal_output();
+        recovered
+            .restore_session_snapshot(&snapshot)
+            .expect("invalid replay metadata does not discard recovered editor buffers");
+
+        assert!(recovered.replay_controller.active_session().is_none());
+        assert!(recovered.replay_demo_workspace.is_none());
+        assert!(recovered
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("PR Replay could not be safely resumed")));
+        assert!(
+            std::fs::read_to_string(directory.path().join("src/first.rs"))
+                .unwrap()
+                .contains("before_first()")
+        );
     }
 
     #[tokio::test]

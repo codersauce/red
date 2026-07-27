@@ -99,6 +99,17 @@ copied into every plugin-visible step. `ReplayFocusStepSource(workspace_id,
 step_id)` switches the existing source window to the exact scratch file for a
 multi-file step without turning the dedicated guide into an editor buffer.
 
+`ReplayActiveSession(callback)` returns the authoritative recovered source,
+bounded original presentation, selected hunk, learning mode, completed
+exercises, and private observations. The bundled coach requests this snapshot
+on `editor:ready`, so `--resume` restores the dedicated guide without fetching,
+creating another worktree, or exposing reusable application tokens.
+`ReplayAddNote(callback, workspace_id, step_id, category, text)` validates and
+stores a reviewer observation against the exact original author commit and
+source hunk. `ReplaySetMode(callback, workspace_id, mode)` records the selected
+Challenge or Snippet mode in the same editor-owned session. All three calls
+belong to the unreleased source-backed `0.5.1` contract.
+
 Automatic step application remains a single revision- and pre-image-checked
 editor transaction; `a` requires no additional modal, and Replay undo refuses
 to discard newer reviewer-authored changes. After a successful Replay undo, the

@@ -502,6 +502,9 @@ mod tests {
             ("request", "ReplayResolveLocalBranch"),
             ("request", "ReplayFetchPullRequestObjects"),
             ("request", "ReplayCreateWorkspace"),
+            ("request", "ReplayActiveSession"),
+            ("request", "ReplayAddNote"),
+            ("request", "ReplaySetMode"),
             ("execute", "ReplayFocusStepSource"),
         ] {
             let call = HOST_API

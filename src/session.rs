@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     agent_workspace::ProposalWorkspaceSnapshot,
     editor::Content,
+    replay::ReplayRecoverySnapshot,
     undo::{TextPosition, UndoHistory},
     window::WindowManagerSnapshot,
 };
@@ -113,6 +114,47 @@ pub struct SessionSnapshot {
     /// invents Codex thread resume support that the adapter did not negotiate.
     #[serde(default)]
     pub agent_session_resumable: bool,
+    /// Pinned review sessions, private findings, and recoverable scratch state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay: Option<SessionReplaySnapshot>,
+}
+
+/// Editor-owned state required to safely reopen a real pull-request replay.
+///
+/// Scratch contents and their attributed undo trees remain in the surrounding
+/// [`SessionSnapshot::buffers`]. This snapshot records only their original
+/// source identities, reviewer progress, and strictly attributed Replay undo
+/// order. It never contains reusable one-shot application tokens.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionReplaySnapshot {
+    /// Pinned original sources and authoritative reviewer sessions.
+    pub controller: ReplayRecoverySnapshot,
+    /// Original feature and base references indexed by immutable source ID.
+    #[serde(default)]
+    pub source_displays: HashMap<String, SessionReplaySourceDisplay>,
+    /// Chronological, source-linked automatic changes available to Replay undo.
+    #[serde(default)]
+    pub applied_steps: Vec<SessionReplayAppliedStep>,
+}
+
+/// Original human-readable references retained beside an immutable source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionReplaySourceDisplay {
+    /// Author's original GitHub or local feature branch.
+    pub head_ref: String,
+    /// Explicit or automatically detected original base branch.
+    pub base_ref: String,
+}
+
+/// One exact, editor-attributed original hunk eligible for safe Replay undo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionReplayAppliedStep {
+    /// Stable editor-owned review session.
+    pub session_id: String,
+    /// Stable original unified-hunk identity.
+    pub step_id: String,
+    /// Validated repository-relative original source path.
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2257,7 +2299,21 @@ mod tests {
             agent_transcript: None,
             agent_workspace: None,
             agent_session_resumable: false,
+            replay: None,
         }
+    }
+
+    #[test]
+    fn older_editor_snapshots_remain_readable_without_replay_recovery() {
+        let original = snapshot("existing unsaved source\n");
+        let value = serde_json::to_value(&original)
+            .expect("serialize a backwards-compatible editor snapshot");
+        assert!(value.get("replay").is_none());
+
+        let recovered: SessionSnapshot =
+            serde_json::from_value(value).expect("load snapshots created before PR Replay");
+        assert!(recovered.replay.is_none());
+        assert_eq!(recovered.buffers[0].contents, "existing unsaved source\n");
     }
 
     #[test]
