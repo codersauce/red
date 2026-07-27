@@ -503,6 +503,8 @@ mod tests {
             ("request", "ReplayFetchPullRequestObjects"),
             ("request", "ReplayCreateWorkspace"),
             ("request", "ReplayActiveSession"),
+            ("request", "ReplayListReviews"),
+            ("request", "ReplayResumeReview"),
             ("request", "ReplayAddNote"),
             ("request", "ReplaySetMode"),
             ("execute", "ReplayFocusStepSource"),

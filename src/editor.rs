@@ -98,8 +98,9 @@ use crate::{
     session::{
         capture_session_disk_fingerprint, detect_disk_divergence, read_session_disk_contents,
         RecoveryDivergence, SessionAnchorAffinity, SessionBufferSnapshot, SessionDiskFingerprint,
-        SessionJump, SessionMark, SessionReplayAppliedStep, SessionReplaySnapshot,
-        SessionReplaySourceDisplay, SessionSnapshot, SessionStore, SESSION_SCHEMA_VERSION,
+        SessionJump, SessionMark, SessionReplayAppliedStep, SessionReplayReview,
+        SessionReplaySnapshot, SessionReplaySourceDisplay, SessionSnapshot, SessionStore,
+        SESSION_SCHEMA_VERSION,
     },
     theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
     ui::{
@@ -801,6 +802,13 @@ pub enum PluginRequest {
     ReplayActiveSession {
         request_id: RequestId,
     },
+    ReplayListReviews {
+        request_id: RequestId,
+    },
+    ReplayResumeReview {
+        request_id: RequestId,
+        review_id: String,
+    },
     ReplayAddNote {
         request_id: RequestId,
         workspace_id: String,
@@ -1048,6 +1056,24 @@ pub enum ReplayBackgroundResult {
         /// Newly created or safely resumed original scratch worktree.
         workspace: Box<crate::replay::ReplayWorkspace>,
     },
+    /// Bounded, source-linked review summaries from readable owner snapshots.
+    Reviews(Vec<SessionReplayReview>),
+    /// A verified persisted editor snapshot chosen in the reviews picker.
+    ReviewSnapshot {
+        /// Stable original scratch-worktree review identity.
+        review_id: String,
+        /// Safely decoded owner snapshot with original Replay metadata.
+        snapshot: Box<SessionSnapshot>,
+    },
+    /// A verified legacy pull-request worktree reopened without creating one.
+    RecoveredPullRequest {
+        /// Read-only original GitHub pull-request provenance.
+        resolved: Box<crate::replay::ReplayResolvedPullRequest>,
+        /// Complete source reconstructed from the pinned local Git objects.
+        source: Box<crate::replay::ReplaySource>,
+        /// Existing, independently verified scratch worktree.
+        workspace: Box<crate::replay::ReplayWorkspace>,
+    },
 }
 
 impl PluginRequest {
@@ -1102,6 +1128,8 @@ impl PluginRequest {
             Self::ReplayFetchPullRequestObjects { .. } => "ReplayFetchPullRequestObjects",
             Self::ReplayCreateWorkspace { .. } => "ReplayCreateWorkspace",
             Self::ReplayActiveSession { .. } => "ReplayActiveSession",
+            Self::ReplayListReviews { .. } => "ReplayListReviews",
+            Self::ReplayResumeReview { .. } => "ReplayResumeReview",
             Self::ReplayAddNote { .. } => "ReplayAddNote",
             Self::ReplaySetMode { .. } => "ReplaySetMode",
             Self::ReplayBackgroundCompleted { .. } => "ReplayBackgroundCompleted",
@@ -1896,6 +1924,9 @@ pub struct Editor {
 
     /// Verified original branch names associated with editor-owned source handles.
     replay_source_displays: HashMap<String, ReplaySourceDisplay>,
+
+    /// Verified picker identities and recovery snapshots discovered by workers.
+    replay_reviews: HashMap<String, SessionReplayReview>,
 
     /// Bounded one-shot source requests currently running outside the UI loop.
     pending_replay_requests: HashSet<RequestId>,
@@ -3105,6 +3136,7 @@ impl Editor {
             replay_demo_workspace: None,
             replay_controller: crate::replay::ReplayController::default(),
             replay_source_displays: HashMap::new(),
+            replay_reviews: HashMap::new(),
             pending_replay_requests: HashSet::new(),
             lsp,
             config,
@@ -3850,6 +3882,100 @@ impl Editor {
             "notes": notes,
             "completions": completions,
             "plan": presentation,
+        })
+    }
+
+    fn live_replay_reviews(&self) -> Vec<SessionReplayReview> {
+        let owner = self
+            .session_manager
+            .store()
+            .and_then(|store| {
+                store
+                    .latest_path()
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(OsStr::to_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        let last_activity_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .unwrap_or_default();
+        let active = self
+            .replay_controller
+            .active_session()
+            .map(|session| &session.id);
+
+        self.replay_controller
+            .sessions()
+            .into_iter()
+            .map(|session| {
+                let branch = self
+                    .replay_source_displays
+                    .get(&session.source.id)
+                    .map(|display| display.head_ref.clone())
+                    .or_else(|| {
+                        session
+                            .source
+                            .pull_request
+                            .as_ref()
+                            .map(|request| request.head_ref.clone())
+                    })
+                    .unwrap_or_else(|| session.workspace.branch.clone());
+                SessionReplayReview {
+                    id: format!(
+                        "review-{}",
+                        crate::replay::digest(session.workspace.root.to_string_lossy().as_bytes())
+                    ),
+                    owner: owner.clone(),
+                    session_id: Some(session.id.clone()),
+                    repository_root: session.source.repository.root.clone(),
+                    repository: format!(
+                        "{}/{}",
+                        session.source.repository.owner, session.source.repository.name
+                    ),
+                    workspace_root: session.workspace.root.clone(),
+                    workspace_branch: session.workspace.branch.clone(),
+                    pull_request: session
+                        .source
+                        .pull_request
+                        .as_ref()
+                        .map_or(0, |request| request.number),
+                    title: session
+                        .source
+                        .review_context
+                        .as_ref()
+                        .map(|context| context.title.clone())
+                        .unwrap_or_else(|| format!("Local branch {branch}")),
+                    branch,
+                    reviewed_steps: session
+                        .steps
+                        .iter()
+                        .filter(|step| step.completion.is_some())
+                        .count(),
+                    total_steps: session.steps.len(),
+                    note_count: session.notes.len(),
+                    dirty: self.buffer_manager.iter().any(|buffer| {
+                        buffer.dirty
+                            && buffer.file.as_deref().is_some_and(|path| {
+                                Path::new(path).starts_with(&session.workspace.root)
+                            })
+                    }),
+                    last_activity_ms,
+                    active: active.is_some_and(|id| id == &session.id),
+                    legacy: false,
+                }
+            })
+            .collect()
+    }
+
+    fn replay_review_is_active(&self, review: &SessionReplayReview) -> bool {
+        review.session_id.as_deref().is_some_and(|review_id| {
+            self.replay_controller
+                .active_session()
+                .is_some_and(|session| session.id == review_id)
         })
     }
 
@@ -8145,6 +8271,150 @@ impl Editor {
                         .resolve_request(runtime, request_id, payload)
                         .await?;
                 }
+                PluginRequest::ReplayListReviews { request_id } => {
+                    let root = self
+                        .session_manager
+                        .store()
+                        .map(|store| store.namespace_root().to_path_buf())
+                        .unwrap_or_else(|| Config::path("sessions"));
+                    let live = self.live_replay_reviews();
+                    let active = self
+                        .replay_controller
+                        .active_session()
+                        .map(|session| session.workspace.root.clone());
+                    let started =
+                        self.spawn_replay_background(request_id, "review-discovery", move || {
+                            let mut reviews =
+                                SessionStore::list_replay_reviews(&root, active.as_deref())
+                                    .map_err(|error| {
+                                        crate::replay::ReplayError::Filesystem(error.to_string())
+                                    })?;
+                            for review in live {
+                                if let Some(existing) =
+                                    reviews.iter_mut().find(|entry| entry.id == review.id)
+                                {
+                                    *existing = review;
+                                } else {
+                                    reviews.push(review);
+                                }
+                            }
+                            reviews.sort_by(|left, right| {
+                                right
+                                    .active
+                                    .cmp(&left.active)
+                                    .then_with(|| {
+                                        right.last_activity_ms.cmp(&left.last_activity_ms)
+                                    })
+                                    .then_with(|| left.id.cmp(&right.id))
+                            });
+                            Ok(ReplayBackgroundResult::Reviews(reviews))
+                        });
+                    if let Err(error) = started {
+                        self.plugin_registry
+                            .resolve_request(runtime, request_id, error.payload())
+                            .await?;
+                    }
+                }
+                PluginRequest::ReplayResumeReview {
+                    request_id,
+                    review_id,
+                } => {
+                    let review = self.replay_reviews.get(&review_id).cloned();
+                    let Some(review) = review else {
+                        let error = crate::replay::ReplayError::NotFound {
+                            kind: "recoverable Replay review",
+                            id: review_id,
+                        };
+                        self.plugin_registry
+                            .resolve_request(runtime, request_id, error.payload())
+                            .await?;
+                        continue;
+                    };
+                    if self.replay_review_is_active(&review) {
+                        let payload = self.active_replay_session_payload();
+                        self.plugin_registry
+                            .resolve_request(runtime, request_id, payload)
+                            .await?;
+                        continue;
+                    }
+
+                    let limits = self.replay_controller.limits();
+                    let root = self
+                        .session_manager
+                        .store()
+                        .map(|store| store.namespace_root().to_path_buf())
+                        .unwrap_or_else(|| Config::path("sessions"));
+                    let started = if review.legacy {
+                        self.spawn_replay_background(request_id, "review-reopen", move || {
+                            let input = review.pull_request.to_string();
+                            let resolved = crate::replay::resolve_pull_request(
+                                &review.repository_root,
+                                &input,
+                                limits,
+                            )?;
+                            if !resolved.missing_objects.is_empty() {
+                                return Err(crate::replay::ReplayError::MissingObjects);
+                            }
+                            let source = crate::replay::finalize_pull_request(&resolved, limits)?;
+                            let workspace = crate::replay::reopen_existing_workspace(&source)?;
+                            if workspace.root != review.workspace_root
+                                || workspace.branch != review.workspace_branch
+                            {
+                                return Err(crate::replay::ReplayError::WorkspaceExists(
+                                    review.workspace_root.display().to_string(),
+                                ));
+                            }
+                            Ok(ReplayBackgroundResult::RecoveredPullRequest {
+                                resolved: Box::new(resolved),
+                                source: Box::new(source),
+                                workspace: Box::new(workspace),
+                            })
+                        })
+                    } else {
+                        self.spawn_replay_background(request_id, "review-recovery", move || {
+                            let store = if review.owner.is_empty() {
+                                SessionStore::new(&root)
+                            } else {
+                                SessionStore::for_owner(&root, &review.owner).map_err(|error| {
+                                    crate::replay::ReplayError::Filesystem(error.to_string())
+                                })?
+                            };
+                            let snapshot = store.load().map_err(|error| {
+                                crate::replay::ReplayError::Filesystem(error.to_string())
+                            })?;
+                            let session = snapshot
+                                .replay
+                                .as_ref()
+                                .and_then(|recovery| {
+                                    recovery.controller.sessions.iter().find(|session| {
+                                        Some(session.id.as_str()) == review.session_id.as_deref()
+                                    })
+                                })
+                                .ok_or_else(|| crate::replay::ReplayError::NotFound {
+                                    kind: "persisted Replay review",
+                                    id: review.id.clone(),
+                                })?;
+                            let workspace =
+                                crate::replay::reopen_existing_workspace(&session.source)?;
+                            if workspace.root != review.workspace_root
+                                || workspace.branch != review.workspace_branch
+                            {
+                                return Err(crate::replay::ReplayError::WorkspaceExists(
+                                    review.workspace_root.display().to_string(),
+                                ));
+                            }
+                            Ok(ReplayBackgroundResult::ReviewSnapshot {
+                                review_id: review.id,
+                                snapshot: Box::new(snapshot),
+                            })
+                        })
+                    };
+                    if let Err(error) = started {
+                        self.plugin_registry
+                            .resolve_request(runtime, request_id, error.payload())
+                            .await?;
+                    }
+                }
                 PluginRequest::ReplayAddNote {
                     request_id,
                     workspace_id,
@@ -8218,6 +8488,51 @@ impl Editor {
                         Ok(ReplayBackgroundResult::FetchedPullRequest { resolved, source }) => self
                             .finish_replay_pull_request_fetch(*resolved, *source)
                             .unwrap_or_else(|error| error.payload()),
+                        Ok(ReplayBackgroundResult::Reviews(reviews)) => {
+                            self.replay_reviews = reviews
+                                .iter()
+                                .cloned()
+                                .map(|review| (review.id.clone(), review))
+                                .collect();
+                            json!({ "ok": true, "reviews": reviews })
+                        }
+                        Ok(ReplayBackgroundResult::ReviewSnapshot {
+                            review_id,
+                            snapshot,
+                        }) => match self
+                            .resume_snapshot_replay_review(&review_id, &snapshot, buffer)
+                            .await
+                        {
+                            Ok(payload) => {
+                                needs_render = true;
+                                payload
+                            }
+                            Err(error) => json!({ "ok": false, "error": error.to_string() }),
+                        },
+                        Ok(ReplayBackgroundResult::RecoveredPullRequest {
+                            resolved,
+                            source,
+                            workspace,
+                        }) => {
+                            let source_id = source.id.clone();
+                            match self.finish_replay_pull_request(*resolved, Some(*source)) {
+                                Ok(_) => match self
+                                    .install_prepared_replay_source_workspace(
+                                        &source_id, *workspace, buffer,
+                                    )
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        needs_render = true;
+                                        self.active_replay_session_payload()
+                                    }
+                                    Err(error) => {
+                                        json!({ "ok": false, "error": error.to_string() })
+                                    }
+                                },
+                                Err(error) => error.payload(),
+                            }
+                        }
                         Ok(ReplayBackgroundResult::Workspace {
                             source_id,
                             workspace,
@@ -19932,6 +20247,154 @@ impl Editor {
         Ok(divergences)
     }
 
+    async fn resume_snapshot_replay_review(
+        &mut self,
+        review_id: &str,
+        snapshot: &SessionSnapshot,
+        render_buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<Value> {
+        let review = self
+            .replay_reviews
+            .get(review_id)
+            .ok_or_else(|| anyhow::anyhow!("the selected Replay review is no longer available"))?;
+        let mut recovery = snapshot
+            .replay
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("the selected review has no Replay recovery state"))?;
+        let session = recovery
+            .controller
+            .sessions
+            .iter()
+            .find(|session| Some(session.id.as_str()) == review.session_id.as_deref())
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("the selected original review is no longer present"))?;
+        anyhow::ensure!(
+            session.workspace.root == review.workspace_root
+                && session.workspace.branch == review.workspace_branch
+                && session.source.repository.root == review.repository_root,
+            "the selected review no longer matches its original scratch worktree"
+        );
+
+        let mut verified = crate::replay::ReplayController::new(self.replay_controller.limits());
+        verified.restore(&recovery.controller)?;
+        let branch = recovery
+            .source_displays
+            .get(&session.source.id)
+            .map(|display| display.head_ref.as_str())
+            .or_else(|| {
+                session
+                    .source
+                    .pull_request
+                    .as_ref()
+                    .map(|request| request.head_ref.as_str())
+            })
+            .unwrap_or("local");
+        let plan = crate::replay::replay_plan_from_session(
+            &session,
+            branch,
+            self.replay_controller.limits(),
+        )?;
+        let selected = session
+            .active_step
+            .as_deref()
+            .and_then(|id| plan.steps.iter().find(|step| step.id == id))
+            .or_else(|| plan.steps.first())
+            .ok_or_else(|| anyhow::anyhow!("the selected review contains no original hunks"))?;
+        let selected_path = session.workspace.root.join(&selected.path);
+
+        let mut recovered_buffers = Vec::new();
+        let mut recovered_paths = HashSet::new();
+        for step in &plan.steps {
+            let path = session.workspace.root.join(&step.path);
+            if !recovered_paths.insert(path.clone()) {
+                continue;
+            }
+            let saved = snapshot
+                .buffers
+                .iter()
+                .find(|buffer| {
+                    buffer
+                        .path
+                        .as_deref()
+                        .is_some_and(|candidate| Path::new(candidate) == path.as_path())
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "the selected review is missing its original scratch buffer: {}",
+                        path.display()
+                    )
+                })?;
+            if let Some(existing) = self.buffer_manager.iter().find(|buffer| {
+                buffer
+                    .file
+                    .as_deref()
+                    .is_some_and(|candidate| Path::new(candidate) == path.as_path())
+            }) {
+                if existing.contents() == saved.contents {
+                    continue;
+                }
+                anyhow::ensure!(
+                    !existing.dirty,
+                    "the selected review would replace unsaved scratch work in {}",
+                    path.display()
+                );
+            }
+            recovered_buffers.push(Buffer::from_session_snapshot(
+                saved.path.clone(),
+                saved.contents.clone(),
+                saved.dirty,
+                saved.revision,
+                saved.undo_history.clone(),
+            ));
+        }
+
+        recovery.controller.active_session = Some(session.id.clone());
+        recovery
+            .applied_steps
+            .retain(|applied| applied.session_id == session.id);
+        if let Some(existing) = self.replay_controller.recovery_snapshot() {
+            for previous in existing.sessions {
+                if !recovery
+                    .controller
+                    .sessions
+                    .iter()
+                    .any(|candidate| candidate.id == previous.id)
+                {
+                    recovery.controller.sessions.push(previous);
+                }
+            }
+            for (id, display) in &self.replay_source_displays {
+                recovery
+                    .source_displays
+                    .entry(id.clone())
+                    .or_insert_with(|| SessionReplaySourceDisplay {
+                        head_ref: display.head_ref.clone(),
+                        base_ref: display.base_ref.clone(),
+                    });
+            }
+        }
+
+        for recovered in recovered_buffers {
+            self.buffer_manager.push_buffer(recovered);
+        }
+        let source_index = self
+            .buffer_manager
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, buffer)| {
+                buffer
+                    .file
+                    .as_deref()
+                    .is_some_and(|path| Path::new(path) == selected_path.as_path())
+            })
+            .map(|(index, _)| index)
+            .ok_or_else(|| anyhow::anyhow!("the selected scratch source could not be reopened"))?;
+        self.set_current_buffer(render_buffer, source_index).await?;
+        self.restore_replay_session_snapshot(&recovery)?;
+        Ok(self.active_replay_session_payload())
+    }
+
     fn restore_replay_session_snapshot(
         &mut self,
         snapshot: &SessionReplaySnapshot,
@@ -19988,6 +20451,7 @@ impl Editor {
             let source_buffer = self
                 .buffer_manager
                 .iter()
+                .rev()
                 .find(|buffer| {
                     buffer
                         .file
@@ -23047,6 +23511,37 @@ mod test {
     }
 
     #[tokio::test]
+    async fn legacy_replay_review_without_a_session_id_is_not_already_active() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let (_directory, session, workspace) = real_replay_session_fixture();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+
+        editor
+            .install_replay_source_session(session, "feature/replay", workspace, &mut render_buffer)
+            .await
+            .expect("open the real source-backed review");
+        let review = editor
+            .live_replay_reviews()
+            .into_iter()
+            .next()
+            .expect("list the active review");
+        assert!(editor.replay_review_is_active(&review));
+
+        let mut legacy = review.clone();
+        legacy.session_id = None;
+        legacy.legacy = true;
+        assert!(!editor.replay_review_is_active(&legacy));
+
+        let inactive = test_editor(/*width*/ 100, /*height*/ 28);
+        assert!(!inactive.replay_review_is_active(&review));
+        assert!(inactive.replay_controller.active_session().is_none());
+        assert!(!inactive.replay_review_is_active(&legacy));
+    }
+
+    #[tokio::test]
     async fn real_replay_crash_recovery_preserves_source_progress_notes_and_exact_undo() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
@@ -23167,6 +23662,162 @@ mod test {
                 .len(),
             1,
         );
+    }
+
+    #[tokio::test]
+    async fn reopening_a_saved_replay_review_preserves_unrelated_unsaved_buffers() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let (directory, session, workspace) = real_replay_session_fixture();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        let mut runtime = Runtime::new();
+
+        let opened = editor
+            .install_replay_source_session(session, "feature/replay", workspace, &mut render_buffer)
+            .await
+            .expect("open the original multi-file review");
+        let workspace_id = opened["workspace_id"].as_str().unwrap().to_string();
+        let first_id = opened["plan"]["steps"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let second_id = opened["plan"]["steps"][1]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let revision = editor.replay_demo_step_validation(&workspace_id, &first_id)["revision"]
+            .as_u64()
+            .unwrap();
+        editor
+            .apply_replay_demo_step(&workspace_id, &first_id, revision, &mut runtime)
+            .await
+            .expect("retain an exact undoable original hunk");
+        editor
+            .replay_controller
+            .add_note(
+                &workspace_id,
+                Some(&second_id),
+                crate::replay::ReplayNoteCategory::Observation,
+                "Keep this review observation.",
+            )
+            .expect("retain the selected review observation");
+        editor
+            .replay_controller
+            .set_mode(&workspace_id, crate::replay::ReplayMode::Snippet)
+            .expect("retain the selected review mode");
+        assert!(editor.focus_replay_step_source(&workspace_id, &second_id));
+
+        let review = editor
+            .live_replay_reviews()
+            .into_iter()
+            .next()
+            .expect("list the exact source-backed review");
+        let snapshot = editor.test_session_snapshot();
+
+        let mut recovered = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut unrelated = Buffer::named_scratch(
+            "unrelated unsaved work",
+            "keep my existing editor changes\n".to_string(),
+        );
+        unrelated.dirty = true;
+        let unrelated_id = unrelated.id();
+        recovered.buffer_manager.push_buffer(unrelated);
+        recovered
+            .replay_reviews
+            .insert(review.id.clone(), review.clone());
+
+        let restored = recovered
+            .resume_snapshot_replay_review(&review.id, &snapshot, &mut render_buffer)
+            .await
+            .expect("reopen the chosen review without replacing regular editor state");
+
+        assert_eq!(restored["active"], true);
+        assert_eq!(restored["workspace_id"], workspace_id);
+        assert_eq!(restored["index"], 1);
+        assert_eq!(restored["mode"], "snippet");
+        assert_eq!(
+            restored["notes"][0]["text"],
+            "Keep this review observation."
+        );
+        assert_eq!(restored["completions"][0]["index"], 0);
+        let unrelated = recovered
+            .buffer_manager
+            .iter()
+            .find(|buffer| buffer.id() == unrelated_id)
+            .expect("keep the unrelated unsaved buffer open");
+        assert!(unrelated.dirty);
+        assert_eq!(unrelated.contents(), "keep my existing editor changes\n");
+
+        recovered
+            .undo_replay_step(&mut render_buffer, &mut runtime)
+            .await
+            .expect("preserve the original replay undo transaction");
+        assert!(recovered
+            .current_buffer()
+            .contents()
+            .contains("before_first()"));
+        assert!(
+            std::fs::read_to_string(directory.path().join("src/first.rs"))
+                .unwrap()
+                .contains("before_first()")
+        );
+    }
+
+    #[tokio::test]
+    async fn reopening_a_saved_replay_review_refuses_to_replace_unsaved_scratch_work() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let (directory, session, workspace) = real_replay_session_fixture();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+
+        editor
+            .install_replay_source_session(session, "feature/replay", workspace, &mut render_buffer)
+            .await
+            .expect("open the original multi-file review");
+        let review = editor
+            .live_replay_reviews()
+            .into_iter()
+            .next()
+            .expect("list the exact source-backed review");
+        let snapshot = editor.test_session_snapshot();
+
+        let mut recovered = test_editor(/*width*/ 100, /*height*/ 28);
+        let path = directory.path().join("src/first.rs");
+        let mut conflicting = Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "keep my newer scratch changes\n".to_string(),
+        );
+        conflicting.dirty = true;
+        let conflicting_id = conflicting.id();
+        recovered.buffer_manager.push_buffer(conflicting);
+        recovered
+            .replay_reviews
+            .insert(review.id.clone(), review.clone());
+        let original_buffer_count = recovered.buffer_manager.len();
+
+        let error = recovered
+            .resume_snapshot_replay_review(&review.id, &snapshot, &mut render_buffer)
+            .await
+            .expect_err("never overwrite newer unsaved scratch work");
+
+        assert!(error.to_string().contains("unsaved scratch work"));
+        assert_eq!(recovered.buffer_manager.len(), original_buffer_count);
+        assert!(recovered.replay_controller.active_session().is_none());
+        assert!(recovered.replay_demo_workspace.is_none());
+        let conflicting = recovered
+            .buffer_manager
+            .iter()
+            .find(|buffer| buffer.id() == conflicting_id)
+            .expect("keep the existing unsaved scratch buffer");
+        assert!(conflicting.dirty);
+        assert_eq!(conflicting.contents(), "keep my newer scratch changes\n");
+        assert!(std::fs::read_to_string(path)
+            .unwrap()
+            .contains("before_first()"));
     }
 
     #[tokio::test]

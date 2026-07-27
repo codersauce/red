@@ -30,6 +30,7 @@ use crate::{
 pub const SESSION_SCHEMA_VERSION: u32 = 2;
 const MAX_SESSION_DISK_CONTENT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SESSION_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_RECOVERABLE_REPLAY_REVIEWS: usize = 256;
 static NEXT_TEMPORARY_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +156,49 @@ pub struct SessionReplayAppliedStep {
     pub step_id: String,
     /// Validated repository-relative original source path.
     pub path: PathBuf,
+}
+
+/// Provenance and progress for an independently recoverable Replay review.
+///
+/// The listing deliberately excludes scratch contents, undo trees, and any
+/// authority to mutate or create a worktree. Those remain editor-owned and are
+/// verified again when a reviewer chooses the entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionReplayReview {
+    /// Stable identity derived from the exact scratch-worktree path.
+    pub id: String,
+    /// Owner namespace containing the recoverable editor snapshot.
+    pub owner: String,
+    /// Original editor-owned session, if this review has recovery metadata.
+    pub session_id: Option<String>,
+    /// Originating repository root.
+    pub repository_root: PathBuf,
+    /// Human-readable GitHub repository identity.
+    pub repository: String,
+    /// Exact durable scratch-worktree path.
+    pub workspace_root: PathBuf,
+    /// Original Replay-owned scratch branch.
+    pub workspace_branch: String,
+    /// GitHub pull request number, or zero for a local review.
+    pub pull_request: u64,
+    /// Original pull request title, when available.
+    pub title: String,
+    /// Original author feature branch, when recorded.
+    pub branch: String,
+    /// Number of reconstructed original source hunks.
+    pub reviewed_steps: usize,
+    /// Number of original source hunks.
+    pub total_steps: usize,
+    /// Number of private reviewer observations.
+    pub note_count: usize,
+    /// Whether the scratch buffers include unsaved reviewer changes.
+    pub dirty: bool,
+    /// Last snapshot capture time in Unix epoch milliseconds.
+    pub last_activity_ms: u64,
+    /// Whether the exact review is already active in this editor.
+    pub active: bool,
+    /// Whether the snapshot predates source-linked Replay recovery metadata.
+    pub legacy: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -366,6 +410,87 @@ impl SessionStore {
                 last_error
                     .unwrap_or_else(|| anyhow::anyhow!("no recoverable session snapshots found"))
             })
+    }
+
+    /// Returns the validated namespace that owns this snapshot store.
+    #[must_use]
+    pub fn namespace_root(&self) -> &Path {
+        self.namespace_root
+            .as_deref()
+            .unwrap_or(self.directory.as_path())
+    }
+
+    /// Lists safely readable, original-source Replay reviews across owners.
+    ///
+    /// The scanner loads at most one bounded snapshot at a time and never
+    /// writes a buffer, fetches a Git object, or creates a scratch worktree.
+    /// Older snapshots without Replay metadata contribute a GitHub review only
+    /// when their original repository and scratch worktree have the same
+    /// independently discovered Git identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the snapshot root is unsafe or cannot be traversed.
+    /// Individual corrupt or obsolete owner snapshots are skipped.
+    pub fn list_replay_reviews(
+        directory: impl AsRef<Path>,
+        active_workspace: Option<&Path>,
+    ) -> anyhow::Result<Vec<SessionReplayReview>> {
+        let directory = directory.as_ref();
+        if let Ok(metadata) = fs::symlink_metadata(directory) {
+            anyhow::ensure!(
+                !metadata.file_type().is_symlink(),
+                "session snapshot root must not be a symlink"
+            );
+        }
+        #[cfg(not(unix))]
+        match portable_session_directory(directory, /*create*/ false) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        let mut stores = vec![Self::new(directory)];
+        match fs::read_dir(directory) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    if entry.file_type()?.is_dir() {
+                        stores.push(Self {
+                            directory: entry.path(),
+                            namespace_root: Some(directory.to_path_buf()),
+                        });
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        let mut reviews = HashMap::new();
+        for store in stores {
+            let Ok(snapshot) = store.load() else {
+                continue;
+            };
+            let owner = store
+                .namespace_root
+                .as_ref()
+                .and_then(|_| store.directory.file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            collect_snapshot_replay_reviews(&snapshot, owner, active_workspace, &mut reviews);
+        }
+
+        let mut reviews = reviews.into_values().collect::<Vec<_>>();
+        reviews.sort_by(|left, right| {
+            right
+                .active
+                .cmp(&left.active)
+                .then_with(|| right.last_activity_ms.cmp(&left.last_activity_ms))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        reviews.truncate(MAX_RECOVERABLE_REPLAY_REVIEWS);
+        Ok(reviews)
     }
 
     #[must_use]
@@ -2154,6 +2279,197 @@ fn windows_session_disk_fingerprint(file: &File) -> io::Result<SessionDiskFinger
     })
 }
 
+fn collect_snapshot_replay_reviews(
+    snapshot: &SessionSnapshot,
+    owner: &str,
+    active_workspace: Option<&Path>,
+    reviews: &mut HashMap<String, SessionReplayReview>,
+) {
+    if let Some(recovery) = &snapshot.replay {
+        let mut controller = crate::replay::ReplayController::default();
+        if controller.restore(&recovery.controller).is_ok() {
+            for session in controller.sessions() {
+                let Ok(workspace_repository) =
+                    crate::replay::ReplayRepository::discover(&session.workspace.root)
+                else {
+                    continue;
+                };
+                if workspace_repository.root != session.workspace.root
+                    || workspace_repository.common_directory
+                        != session.source.repository.common_directory
+                {
+                    continue;
+                }
+
+                let display = recovery.source_displays.get(&session.source.id);
+                let branch = display
+                    .map(|display| display.head_ref.clone())
+                    .or_else(|| {
+                        session
+                            .source
+                            .pull_request
+                            .as_ref()
+                            .map(|request| request.head_ref.clone())
+                    })
+                    .unwrap_or_else(|| session.workspace.branch.clone());
+                let title = session
+                    .source
+                    .review_context
+                    .as_ref()
+                    .map(|context| context.title.clone())
+                    .unwrap_or_else(|| format!("Local branch {branch}"));
+                let review = SessionReplayReview {
+                    id: replay_workspace_review_id(&session.workspace.root),
+                    owner: owner.to_string(),
+                    session_id: Some(session.id.clone()),
+                    repository_root: session.source.repository.root.clone(),
+                    repository: format!(
+                        "{}/{}",
+                        session.source.repository.owner, session.source.repository.name
+                    ),
+                    workspace_root: session.workspace.root.clone(),
+                    workspace_branch: session.workspace.branch.clone(),
+                    pull_request: session
+                        .source
+                        .pull_request
+                        .as_ref()
+                        .map_or(0, |request| request.number),
+                    title,
+                    branch,
+                    reviewed_steps: session
+                        .steps
+                        .iter()
+                        .filter(|step| step.completion.is_some())
+                        .count(),
+                    total_steps: session.steps.len(),
+                    note_count: session.notes.len(),
+                    dirty: snapshot.buffers.iter().any(|buffer| {
+                        buffer.dirty
+                            && buffer.path.as_deref().is_some_and(|path| {
+                                Path::new(path).starts_with(&session.workspace.root)
+                            })
+                    }),
+                    last_activity_ms: snapshot.saved_at_ms,
+                    active: active_workspace
+                        .is_some_and(|workspace| workspace == session.workspace.root.as_path()),
+                    legacy: false,
+                };
+                insert_snapshot_replay_review(reviews, review);
+            }
+        }
+    }
+
+    let mut originating_repository = None;
+    for buffer in &snapshot.buffers {
+        let Some(path) = buffer.path.as_deref() else {
+            continue;
+        };
+        let Some((workspace_root, number, short_head)) =
+            legacy_pull_request_workspace(Path::new(path))
+        else {
+            continue;
+        };
+        let id = replay_workspace_review_id(&workspace_root);
+        if reviews.get(&id).is_some_and(|review| {
+            !review.legacy
+                || (review.owner == owner && review.last_activity_ms == snapshot.saved_at_ms)
+        }) {
+            continue;
+        }
+        let repository = originating_repository
+            .get_or_insert_with(|| {
+                crate::replay::ReplayRepository::discover(Path::new(&snapshot.cwd)).ok()
+            })
+            .as_ref();
+        let Some(repository) = repository else {
+            continue;
+        };
+        let Ok(workspace_repository) = crate::replay::ReplayRepository::discover(&workspace_root)
+        else {
+            continue;
+        };
+        if workspace_repository.root != workspace_root
+            || workspace_repository.common_directory != repository.common_directory
+        {
+            continue;
+        }
+        let workspace_branch = format!("replay/pr-{number}-{short_head}");
+        let dirty = snapshot.buffers.iter().any(|saved| {
+            saved.dirty
+                && saved
+                    .path
+                    .as_deref()
+                    .is_some_and(|path| Path::new(path).starts_with(&workspace_root))
+        });
+        insert_snapshot_replay_review(
+            reviews,
+            SessionReplayReview {
+                id,
+                owner: owner.to_string(),
+                session_id: None,
+                repository_root: repository.root.clone(),
+                repository: format!("{}/{}", repository.owner, repository.name),
+                workspace_root: workspace_root.clone(),
+                workspace_branch: workspace_branch.clone(),
+                pull_request: number,
+                title: format!("Pull request #{number}"),
+                branch: workspace_branch,
+                reviewed_steps: 0,
+                total_steps: 0,
+                note_count: 0,
+                dirty,
+                last_activity_ms: snapshot.saved_at_ms,
+                active: active_workspace
+                    .is_some_and(|workspace| workspace == workspace_root.as_path()),
+                legacy: true,
+            },
+        );
+    }
+}
+
+fn replay_workspace_review_id(workspace: &Path) -> String {
+    format!(
+        "review-{}",
+        crate::replay::digest(workspace.to_string_lossy().as_bytes())
+    )
+}
+
+fn legacy_pull_request_workspace(path: &Path) -> Option<(PathBuf, u64, String)> {
+    for ancestor in path.ancestors().skip(1) {
+        let Some(name) = ancestor.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some((_, slug)) = name.rsplit_once(".replay-pr-") else {
+            continue;
+        };
+        let (number, short_head) = slug.split_once('-')?;
+        let number = number.parse::<u64>().ok().filter(|number| *number > 0)?;
+        if !(7..=40).contains(&short_head.len())
+            || !short_head.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        return Some((ancestor.to_path_buf(), number, short_head.to_string()));
+    }
+    None
+}
+
+fn insert_snapshot_replay_review(
+    reviews: &mut HashMap<String, SessionReplayReview>,
+    candidate: SessionReplayReview,
+) {
+    let replace = reviews.get(&candidate.id).is_none_or(|current| {
+        (
+            !candidate.legacy,
+            candidate.active,
+            candidate.last_activity_ms,
+        ) > (!current.legacy, current.active, current.last_activity_ms)
+    });
+    if replace {
+        reviews.insert(candidate.id.clone(), candidate);
+    }
+}
+
 fn validate_snapshot(mut snapshot: SessionSnapshot) -> anyhow::Result<SessionSnapshot> {
     anyhow::ensure!(
         snapshot.version <= SESSION_SCHEMA_VERSION,
@@ -2257,6 +2573,7 @@ mod tests {
     use super::*;
     use crate::agent_workspace::ProposalWorkspace;
     use crate::window::{SplitSnapshot, WindowManagerSnapshot};
+    use std::process::Command;
 
     fn snapshot(contents: &str) -> SessionSnapshot {
         SessionSnapshot {
@@ -2303,6 +2620,108 @@ mod tests {
         }
     }
 
+    fn replay_fixture_git(root: &Path, arguments: &[&str]) -> String {
+        let output = Command::new("git")
+            .current_dir(root)
+            .args(arguments)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("run an isolated Replay recovery Git fixture");
+        assert!(
+            output.status.success(),
+            "Replay recovery fixture Git command {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        String::from_utf8(output.stdout)
+            .expect("Replay recovery fixture Git output is UTF-8")
+            .trim()
+            .to_string()
+    }
+
+    fn recoverable_replay_snapshot(
+        name: &str,
+    ) -> (
+        tempfile::TempDir,
+        SessionSnapshot,
+        crate::replay::ReplayWorkspace,
+    ) {
+        let directory = tempfile::tempdir().expect("create an isolated replay recovery fixture");
+        let root = directory.path().join(name);
+        fs::create_dir(&root).expect("create the original fixture repository");
+        replay_fixture_git(&root, &["init", "--quiet", "--initial-branch=master"]);
+        replay_fixture_git(&root, &["config", "user.name", "Replay Recovery Fixture"]);
+        replay_fixture_git(
+            &root,
+            &["config", "user.email", "replay-recovery@example.test"],
+        );
+        replay_fixture_git(
+            &root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/recovery-fixture.git",
+            ],
+        );
+        fs::create_dir(root.join("src")).expect("create the original fixture source directory");
+        fs::write(root.join("src/token.rs"), "pub fn token() -> usize { 1 }\n")
+            .expect("write the original merge-base source");
+        replay_fixture_git(&root, &["add", "src/token.rs"]);
+        replay_fixture_git(&root, &["commit", "--quiet", "-m", "create replay base"]);
+        replay_fixture_git(&root, &["checkout", "--quiet", "-b", "feature/recovery"]);
+        fs::write(root.join("src/token.rs"), "pub fn token() -> usize { 2 }\n")
+            .expect("write the original author change");
+        replay_fixture_git(&root, &["add", "src/token.rs"]);
+        replay_fixture_git(&root, &["commit", "--quiet", "-m", "change replay token"]);
+        replay_fixture_git(&root, &["checkout", "--quiet", "master"]);
+
+        let resolved = crate::replay::resolve_local_branch_source(
+            &root,
+            "feature/recovery",
+            Some("master"),
+            crate::replay::ReplayLimits::default(),
+        )
+        .expect("resolve the pinned original local replay source");
+        let (_, workspace) =
+            crate::replay::prepare_workspace(&resolved.source, /*confirmed*/ true)
+                .expect("create the confirmed isolated replay fixture worktree");
+        let workspace = workspace.expect("the confirmed replay fixture has a scratch worktree");
+        let session = crate::replay::ReplaySession::from_source(
+            resolved.source.clone(),
+            workspace.clone(),
+            crate::replay::ReplayLimits::default(),
+        )
+        .expect("compile the original recovery fixture hunk");
+        let mut controller = crate::replay::ReplayController::default();
+        controller.adopt_session(session);
+
+        let path = workspace.root.join("src/token.rs");
+        let contents = fs::read_to_string(&path).expect("read the pinned scratch source");
+        let mut saved = snapshot(&contents);
+        saved.cwd = resolved
+            .source
+            .repository
+            .root
+            .to_string_lossy()
+            .into_owned();
+        saved.buffers[0].path = Some(path.to_string_lossy().into_owned());
+        saved.buffers[0].dirty = false;
+        saved.replay = Some(SessionReplaySnapshot {
+            controller: controller
+                .recovery_snapshot()
+                .expect("the isolated review has durable source metadata"),
+            source_displays: HashMap::from([(
+                resolved.source.id,
+                SessionReplaySourceDisplay {
+                    head_ref: "feature/recovery".to_string(),
+                    base_ref: "master".to_string(),
+                },
+            )]),
+            applied_steps: Vec::new(),
+        });
+        (directory, saved, workspace)
+    }
+
     #[test]
     fn older_editor_snapshots_remain_readable_without_replay_recovery() {
         let original = snapshot("existing unsaved source\n");
@@ -2314,6 +2733,128 @@ mod tests {
             serde_json::from_value(value).expect("load snapshots created before PR Replay");
         assert!(recovered.replay.is_none());
         assert_eq!(recovered.buffers[0].contents, "existing unsaved source\n");
+    }
+
+    #[test]
+    fn discovers_verified_replay_reviews_without_selecting_unrelated_dirty_work() {
+        let (directory, mut review, workspace) = recoverable_replay_snapshot("review-repository");
+        let root = directory.path().join("sessions");
+        review.saved_at_ms = 10;
+        let store = SessionStore::for_owner(&root, "editor-review").unwrap();
+        store.write(&mut review).unwrap();
+
+        let mut unrelated = snapshot("unsaved work in another editor");
+        unrelated.saved_at_ms = 20;
+        SessionStore::for_owner(&root, "editor-unrelated")
+            .unwrap()
+            .write(&mut unrelated)
+            .unwrap();
+
+        let reviews = SessionStore::list_replay_reviews(&root, /*active_workspace*/ None)
+            .expect("discover reviews without restoring unrelated buffers");
+
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].owner, "editor-review");
+        assert_eq!(reviews[0].workspace_root, workspace.root);
+        assert_eq!(reviews[0].branch, "feature/recovery");
+        assert_eq!(reviews[0].total_steps, 1);
+        assert!(!reviews[0].legacy);
+        assert_eq!(
+            SessionStore::load_latest(&root).unwrap().buffers[0].contents,
+            "unsaved work in another editor",
+            "ordinary --resume must still preserve the newer unrelated dirty work",
+        );
+    }
+
+    #[test]
+    fn review_discovery_deduplicates_owner_snapshots_and_marks_unsaved_source() {
+        let (directory, mut older, workspace) = recoverable_replay_snapshot("dedupe-repository");
+        let root = directory.path().join("sessions");
+        older.saved_at_ms = 10;
+        SessionStore::for_owner(&root, "editor-older")
+            .unwrap()
+            .write(&mut older)
+            .unwrap();
+
+        let mut newer = older.clone();
+        newer.saved_at_ms = 20;
+        newer.buffers[0].dirty = true;
+        SessionStore::for_owner(&root, "editor-newer")
+            .unwrap()
+            .write(&mut newer)
+            .unwrap();
+
+        let reviews = SessionStore::list_replay_reviews(&root, Some(&workspace.root))
+            .expect("deduplicate snapshots belonging to the same original worktree");
+
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].owner, "editor-newer");
+        assert!(reviews[0].active);
+        assert!(reviews[0].dirty);
+        assert_eq!(reviews[0].last_activity_ms, 20);
+    }
+
+    #[test]
+    fn review_discovery_ignores_unnamed_demo_and_regular_editor_snapshots() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sessions");
+        let mut demo = snapshot("pub fn diagnostics_by_visible_line() {}\n");
+        SessionStore::for_owner(&root, "editor-demo")
+            .unwrap()
+            .write(&mut demo)
+            .unwrap();
+
+        assert!(
+            SessionStore::list_replay_reviews(&root, /*active_workspace*/ None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn recognizes_verified_github_worktrees_from_legacy_review_snapshots() {
+        let (directory, mut legacy, _) = recoverable_replay_snapshot("legacy-repository");
+        let repository = PathBuf::from(&legacy.cwd);
+        let workspace = repository
+            .parent()
+            .unwrap()
+            .join("recovery-fixture.replay-pr-2733-1234abc");
+        let workspace_argument = workspace.to_string_lossy().into_owned();
+        replay_fixture_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "replay/pr-2733-1234abc",
+                &workspace_argument,
+                "master",
+            ],
+        );
+        legacy.replay = None;
+        legacy.saved_at_ms = 25;
+        legacy.buffers[0].path = Some(
+            workspace
+                .join("src/token.rs")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        legacy.buffers[0].dirty = false;
+        let root = directory.path().join("sessions");
+        SessionStore::for_owner(&root, "editor-legacy")
+            .unwrap()
+            .write(&mut legacy)
+            .unwrap();
+
+        let reviews = SessionStore::list_replay_reviews(&root, /*active_workspace*/ None)
+            .expect("recognize a verified PR worktree created before recovery metadata");
+
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].pull_request, 2733);
+        assert_eq!(reviews[0].workspace_branch, "replay/pr-2733-1234abc");
+        assert_eq!(reviews[0].workspace_root, workspace);
+        assert!(reviews[0].legacy);
     }
 
     #[test]

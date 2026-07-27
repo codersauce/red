@@ -1577,6 +1577,15 @@ impl RedHost {
                     })?,
             },
             "ReplayActiveSession" => PluginRequest::ReplayActiveSession { request_id },
+            "ReplayListReviews" => PluginRequest::ReplayListReviews { request_id },
+            "ReplayResumeReview" => PluginRequest::ReplayResumeReview {
+                request_id,
+                review_id: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayResumeReview requires a review id"))?
+                    .to_string(),
+            },
             "ReplayAddNote" => PluginRequest::ReplayAddNote {
                 request_id,
                 workspace_id: args
@@ -3341,6 +3350,28 @@ mod tests {
         ));
     }
 
+    fn recovered_review(
+        id: &str,
+        number: u64,
+        title: &str,
+        reviewed: usize,
+        total: usize,
+        active: bool,
+        dirty: bool,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "pull_request": number,
+            "title": title,
+            "repository": "example/repository",
+            "reviewed_steps": reviewed,
+            "total_steps": total,
+            "note_count": 2,
+            "active": active,
+            "dirty": dirty,
+        })
+    }
+
     fn recv_replay_workspace_preparation(expected_pull_request: u64) {
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::CreateTextPanel { id, config } => {
@@ -4281,6 +4312,14 @@ mod tests {
             .unwrap();
 
         runtime.execute_command("Replay").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayListReviews { request_id } => request_id,
+            _ => panic!("expected read-only discovery of existing Replay reviews"),
+        };
+        runtime
+            .resolve_request(request_id, serde_json::json!({ "ok": true, "reviews": [] }))
+            .await
+            .unwrap();
 
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::OpenCallbackPicker {
@@ -4305,6 +4344,196 @@ mod tests {
                     .is_some_and(|status| status.contains("confirm")));
             }
             _ => panic!("expected a GitHub, local branch, and safe-demo source picker"),
+        }
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_launcher_reopens_its_only_verified_review_without_a_picker() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("replay", include_str!("../../plugins/replay.hk"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("Replay").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayListReviews { request_id } => request_id,
+            _ => panic!("expected source-linked existing-review discovery"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "reviews": [recovered_review(
+                        "review-original-pr",
+                        2733,
+                        "Paginate session history",
+                        3,
+                        49,
+                        false,
+                        true,
+                    )],
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ReplayResumeReview { review_id, .. }
+                if review_id == "review-original-pr"
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_launcher_presents_multiple_original_reviews_and_safe_new_review_action() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("replay", include_str!("../../plugins/replay.hk"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("Replay").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayListReviews { request_id } => request_id,
+            _ => panic!("expected existing-review discovery before opening a picker"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "reviews": [
+                        recovered_review(
+                            "review-active-pr",
+                            2733,
+                            "Paginate session history",
+                            3,
+                            49,
+                            true,
+                            true,
+                        ),
+                        recovered_review(
+                            "review-another-pr",
+                            145,
+                            "Bound diagnostics rendering",
+                            7,
+                            11,
+                            false,
+                            false,
+                        ),
+                    ],
+                }),
+            )
+            .await
+            .unwrap();
+
+        let (handle, items) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                owner,
+                handle,
+                title,
+                items,
+                options,
+            } => {
+                assert_eq!(owner, "replay");
+                assert_eq!(title.as_deref(), Some("PR Replay Reviews"));
+                assert!(options
+                    .status
+                    .as_deref()
+                    .is_some_and(|status| status.contains("No branch is changed")));
+                (handle, items)
+            }
+            _ => panic!("expected a picker of original, independently recoverable reviews"),
+        };
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["review-active-pr", "review-another-pr", "start-new"]
+        );
+        assert!(items[0].label.contains("#2733"));
+        assert!(items[0].label.contains("3/49"));
+        assert!(items[0].label.contains("2 notes"));
+        assert!(items[0].label.contains("unsaved"));
+        assert!(items[0].label.contains("active"));
+        assert!(items[1].label.contains("#145"));
+        assert!(items[1].label.contains("7/11"));
+
+        assert!(runtime
+            .notify_picker(handle, PickerCallback::Selected(items[1].clone()))
+            .unwrap());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ReplayResumeReview { review_id, .. }
+                if review_id == "review-another-pr"
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_reviews_picker_can_start_a_new_source_without_touching_saved_reviews() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("replay", include_str!("../../plugins/replay.hk"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("Replay").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayListReviews { request_id } => request_id,
+            _ => panic!("expected existing-review discovery"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "reviews": [
+                        recovered_review("review-one", 2733, "First review", 1, 4, false, false),
+                        recovered_review("review-two", 145, "Second review", 2, 6, false, false),
+                    ],
+                }),
+            )
+            .await
+            .unwrap();
+
+        let (handle, start_new) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, items, .. } => (
+                handle,
+                items
+                    .into_iter()
+                    .find(|item| item.id == "start-new")
+                    .expect("explicit new-review action"),
+            ),
+            _ => panic!("expected the existing-review picker"),
+        };
+        assert!(runtime
+            .notify_picker(handle, PickerCallback::Selected(start_new))
+            .unwrap());
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { title, items, .. } => {
+                assert_eq!(title.as_deref(), Some("Start PR Replay"));
+                assert_eq!(
+                    items
+                        .iter()
+                        .map(|item| item.id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["github", "local", "demo"],
+                );
+            }
+            _ => panic!("expected the unchanged GitHub, local-branch, and demo source picker"),
         }
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }

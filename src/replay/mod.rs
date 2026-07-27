@@ -30,10 +30,10 @@ pub use session::{
 };
 pub use source::{
     fetch_pull_request_objects, finalize_pull_request, prepare_workspace,
-    resolve_local_branch_source, resolve_local_source, resolve_pull_request, GitObjectId,
-    PullRequestInput, ReplayCommitSummary, ReplayPullRequest, ReplayRepository,
-    ReplayResolvedLocalBranch, ReplayResolvedPullRequest, ReplayReviewContext, ReplaySource,
-    ReplaySourceKind,
+    reopen_existing_workspace, resolve_local_branch_source, resolve_local_source,
+    resolve_pull_request, GitObjectId, PullRequestInput, ReplayCommitSummary, ReplayPullRequest,
+    ReplayRepository, ReplayResolvedLocalBranch, ReplayResolvedPullRequest, ReplayReviewContext,
+    ReplaySource, ReplaySourceKind,
 };
 
 /// Upper bounds enforced before a source becomes a replayable plan.

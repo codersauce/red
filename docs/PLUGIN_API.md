@@ -104,10 +104,16 @@ bounded original presentation, selected hunk, learning mode, completed
 exercises, and private observations. The bundled coach requests this snapshot
 on `editor:ready`, so `--resume` restores the dedicated guide without fetching,
 creating another worktree, or exposing reusable application tokens.
+`ReplayListReviews(callback)` discovers editor-owned and safely identified
+legacy scratch reviews in a bounded background worker, returning provenance,
+completion, note counts, and unsaved or active state without exposing source
+buffers. `ReplayResumeReview(callback, review_id)` rechecks the selected
+snapshot, immutable source, and exact original scratch worktree before opening
+its guide. Reopening never creates a branch or discards unrelated dirty buffers.
 `ReplayAddNote(callback, workspace_id, step_id, category, text)` validates and
 stores a reviewer observation against the exact original author commit and
 source hunk. `ReplaySetMode(callback, workspace_id, mode)` records the selected
-Challenge or Snippet mode in the same editor-owned session. All three calls
+Challenge or Snippet mode in the same editor-owned session. All five calls
 belong to the unreleased source-backed `0.5.1` contract.
 
 Automatic step application remains a single revision- and pre-image-checked

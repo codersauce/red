@@ -16,6 +16,15 @@ cargo run -p red
 ```
 
 Open the command palette and run `Replay`, enter `:Replay`, or press `Space R g`.
+Replay first discovers safely recoverable reviews across editor sessions:
+
+- If no review exists, the source picker opens immediately.
+- If exactly one review exists, its original guide and scratch source reopen
+  directly.
+- If multiple reviews exist, a review picker shows their pull request or branch,
+  repository, actual completion, private-note count, and unsaved or active
+  state. Choose a review or select **Start a new review**.
+
 The source picker offers:
 
 - **GitHub pull request:** enter its PR number, such as `145`, or its canonical
@@ -51,8 +60,10 @@ committed, or pushed.
 
 Returning to the same pull request safely resumes its existing scratch worktree
 only when its exact path, shared repository, local branch, original merge-base
-commit, and clean working tree are independently verified. Replay refuses to
-overwrite saved reviewer changes or adopt an unrelated directory.
+commit, and clean working tree are independently verified. The review picker
+also recognizes GitHub scratch worktrees created before source-linked recovery
+metadata existed. Reopening an existing review never creates a replacement
+branch, overwrites saved reviewer changes, or adopts an unrelated directory.
 
 If a previous checkout was interrupted after creating the Replay branch, Red
 can also restore its missing scratch worktree. It reuses the branch only when
@@ -136,7 +147,7 @@ unchanged.
 | Keys | Action |
 | --- | --- |
 | `Space R ?` | Show or hide the compact Replay keyboard help. |
-| `Space R g` | Open or return to the guide. |
+| `Space R g` | Reopen the current review or choose among existing reviews. |
 | `Space R [` | Jump to the first change in the previous file. |
 | `Space R ]` | Jump to the first change in the next file. |
 | `Space R n` | Next reconstruction step. |

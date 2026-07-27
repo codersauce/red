@@ -852,6 +852,22 @@ pub fn prepare_workspace(
     ))
 }
 
+/// Reopens an existing, independently verified original review worktree.
+///
+/// Unlike [`prepare_workspace`], this operation never creates a worktree or
+/// branch. It verifies the canonical scratch path, shared repository, original
+/// branch, merge base, and clean working tree.
+///
+/// # Errors
+///
+/// Returns an error if the worktree is absent, unsafe, associated with another
+/// repository or branch, no longer at its original merge base, or contains
+/// saved or untracked reviewer changes.
+pub fn reopen_existing_workspace(source: &ReplaySource) -> Result<ReplayWorkspace, ReplayError> {
+    let (preview, _) = prepare_workspace(source, /*confirmed*/ false)?;
+    existing_workspace(source, &preview.root, &preview.branch)
+}
+
 fn existing_workspace(
     source: &ReplaySource,
     root: &Path,
@@ -1196,6 +1212,37 @@ mod tests {
             fixture_git(&resumed.root, &["branch", "--show-current"]),
             resumed.branch,
         );
+    }
+
+    #[test]
+    fn reopens_the_verified_original_workspace_without_creating_a_worktree() {
+        let (_directory, source) = reusable_workspace_source();
+        let (_, created) = prepare_workspace(&source, /*confirmed*/ true)
+            .expect("create the explicitly confirmed original scratch worktree");
+        let created = created.expect("confirmed Replay creates its original worktree");
+
+        let reopened = reopen_existing_workspace(&source)
+            .expect("reopen the same independently verified original worktree");
+
+        assert_eq!(reopened.root, created.root);
+        assert_eq!(reopened.branch, created.branch);
+        assert_eq!(reopened.base_commit, source.base_commit);
+        assert!(!reopened.created_by_replay);
+    }
+
+    #[test]
+    fn reopening_a_missing_workspace_never_creates_a_branch_or_directory() {
+        let (_directory, source) = reusable_workspace_source();
+        let (preview, _) = prepare_workspace(&source, /*confirmed*/ false)
+            .expect("compute the original scratch preview without side effects");
+
+        assert!(reopen_existing_workspace(&source).is_err());
+        assert!(!preview.root.exists());
+        assert!(fixture_git(
+            &source.repository.root,
+            &["branch", "--list", &preview.branch],
+        )
+        .is_empty());
     }
 
     #[cfg(unix)]

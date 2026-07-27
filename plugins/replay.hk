@@ -154,13 +154,107 @@ fn active_session_restored(result: Json) {
 
 fn open() {
     let workspace = red::string(red::state("replay_workspace_id"), "");
-    if workspace != "" {
+    if workspace != "" && red::string(red::state("replay_source_kind"), "demo") == "demo" {
         ensure_panel();
         red::state_set("replay_view", "guide");
         render();
         red::execute("FocusPanel", "replay-coach");
         return;
     }
+    red::request("ReplayListReviews", reviews_listed);
+}
+
+fn reviews_listed(result: Json) {
+    if !red::bool(result.ok, false) {
+        red::execute(
+            "Print",
+            "Replay reviews could not be loaded: " + source_error(result, "unknown error")
+        );
+        return;
+    }
+    let reviews = result.reviews;
+    if red::len(reviews) == 0 {
+        open_source_picker();
+        return;
+    }
+    if red::len(reviews) == 1 {
+        resume_review(reviews[0]);
+        return;
+    }
+
+    let items = [];
+    for review in reviews {
+        let number = red::int(review.pull_request, 0);
+        let label = red::string(review.title, "Local branch review");
+        if number > 0 {
+            label = "#" + number + "  " + label;
+        }
+        let repository = red::string(review.repository, "");
+        if repository != "" {
+            label = label + "  ·  " + repository;
+        }
+        let total = red::int(review.total_steps, 0);
+        if total > 0 {
+            label = label + "  ·  " + red::int(review.reviewed_steps, 0) + "/" + total;
+        }
+        let notes = red::int(review.note_count, 0);
+        if notes > 0 {
+            label = label + "  ·  " + notes + " notes";
+        }
+        if red::bool(review.dirty, false) {
+            label = label + "  ·  unsaved";
+        }
+        if red::bool(review.active, false) {
+            label = label + "  ·  active";
+        }
+        items = red::push(items, PickerItem {
+            id: red::string(review.id, ""),
+            label: label,
+            data: review,
+        });
+    }
+    items = red::push(items, PickerItem {
+        id: "start-new",
+        label: "Start a new review",
+        data: Json {},
+    });
+    red::execute("OpenPicker", "PR Replay Reviews", items, PickerOptions {
+        status: "Choose a verified review or start a new one. No branch is changed.",
+    }, PickerHandlers {
+        selected: review_selected,
+        cancelled: source_picker_cancelled,
+    });
+}
+
+fn review_selected(item: PickerItem) {
+    if item.id == "start-new" {
+        open_source_picker();
+        return;
+    }
+    resume_review(item.data);
+}
+
+fn resume_review(review: Json) {
+    let id = red::string(review.id, "");
+    if id == "" {
+        red::execute("Print", "Replay review could not be verified");
+        return;
+    }
+    red::request("ReplayResumeReview", review_resumed, id);
+}
+
+fn review_resumed(result: Json) {
+    if !red::bool(result.ok, false) {
+        red::execute(
+            "Print",
+            "Replay review could not be reopened: " + source_error(result, "unknown error")
+        );
+        return;
+    }
+    active_session_restored(result);
+}
+
+fn open_source_picker() {
     red::execute("OpenPicker", "Start PR Replay", [
         PickerItem {
             id: "github",
