@@ -804,6 +804,17 @@ mod tests {
     }
 
     #[test]
+    fn resolves_fish_files_to_the_default_fish_language_server() {
+        let manager = LspManager::new(LspConfig::default());
+
+        let document = manager.resolve_document("config.fish").unwrap();
+
+        assert_eq!(document.language_id, "fish");
+        assert_eq!(document.server_name, "fish");
+        assert_eq!(document.uri, file_uri(&document.path).unwrap());
+    }
+
+    #[test]
     fn unresolved_language_returns_none() {
         let manager = LspManager::new(LspConfig {
             enabled: true,

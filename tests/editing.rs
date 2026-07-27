@@ -443,6 +443,7 @@ async fn comment_blockwise_visual_selection_toggles_whole_lines() {
 #[tokio::test]
 async fn comment_templates_follow_the_active_language() {
     for (file, contents, commented) in [
+        ("config.fish", "    set name fish", "    # set name fish"),
         ("main.py", "    value = 1", "    # value = 1"),
         ("main.lua", "    local value = 1", "    -- local value = 1"),
         (
