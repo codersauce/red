@@ -509,12 +509,11 @@ fn replay_document(model: &ReplayPanelModel) -> Option<WorkspaceDocument> {
             let old = old_line;
             old_line = old_line.saturating_add(1);
             ("removed", text, Some(old), None)
-        } else if let Some(text) = line.strip_prefix('+') {
+        } else {
+            let text = line.strip_prefix('+')?;
             let new = new_line;
             new_line = new_line.saturating_add(1);
             ("added", text, None, Some(new))
-        } else {
-            return None;
         };
         lines.push(WorkspaceDocumentLine {
             id: format!("{}:line:{}", step.id, lines.len()),

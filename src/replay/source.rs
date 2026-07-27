@@ -995,7 +995,9 @@ pub fn prepare_workspace(
         source.repository.root.parent().ok_or_else(|| {
             ReplayError::UnsafePath("repository has no durable parent".to_string())
         })?;
-    let root = parent.join(format!("{repository_name}.replay-{slug}"));
+    let directory_name = format!("{repository_name}.replay-{slug}");
+    let root = parent.join(&directory_name);
+    let relative_root = Path::new("..").join(&directory_name);
     let preview = ReplayWorkspacePreview {
         repository_root: source.repository.root.clone(),
         root: root.clone(),
@@ -1025,12 +1027,12 @@ pub fn prepare_workspace(
     let mut command = replay_git_command(&source.repository.root);
     command.args(["-c", "core.hooksPath=/dev/null", "worktree", "add"]);
     if branch_exists {
-        command.arg(&root).arg(&branch);
+        command.arg(&relative_root).arg(&branch);
     } else {
         command
             .arg("-b")
             .arg(&branch)
-            .arg(&root)
+            .arg(&relative_root)
             .arg(source.base_commit.as_str());
     }
     run_command(&mut command, MAX_COMMAND_DIAGNOSTIC_BYTES)?;
@@ -1492,6 +1494,33 @@ mod tests {
         )
         .expect("resolve the isolated original feature");
         (directory, source.source)
+    }
+
+    #[test]
+    fn creates_the_exact_canonical_sibling_workspace_on_every_platform() {
+        let (_directory, source) = reusable_workspace_source();
+        let expected_root = source
+            .repository
+            .root
+            .parent()
+            .expect("the original repository has a durable parent")
+            .join(format!(
+                "{}.replay-revision-{}",
+                source.repository.name,
+                source.target_commit.short(),
+            ));
+
+        let (preview, workspace) = prepare_workspace(&source, /*confirmed*/ true)
+            .expect("create the confirmed sibling workspace on every platform");
+        let workspace = workspace.expect("a confirmed workspace is created");
+        let git_root = fixture_git(&workspace.root, &["rev-parse", "--show-toplevel"]);
+
+        assert_eq!(preview.root, expected_root);
+        assert_eq!(workspace.root, expected_root);
+        assert_eq!(
+            std::fs::canonicalize(git_root).expect("canonicalize the Git worktree root"),
+            expected_root,
+        );
     }
 
     #[test]
