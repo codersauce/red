@@ -84,7 +84,7 @@ impl ReplayChangeState {
             Self::Pending => "○",
             Self::Noted => "✎",
             Self::ManuallyChecked => "✓",
-            Self::AutomaticallyApplied => "+",
+            Self::AutomaticallyApplied => "●",
         }
     }
 
@@ -93,7 +93,7 @@ impl ReplayChangeState {
             Self::Pending => "PENDING",
             Self::Noted => "NOTE ADDED",
             Self::ManuallyChecked => "CHECKED BY HAND",
-            Self::AutomaticallyApplied => "HUNK APPLIED",
+            Self::AutomaticallyApplied => "APPLIED",
         }
     }
 
@@ -103,6 +103,20 @@ impl ReplayChangeState {
             Self::Noted => TextPanelSpanStyle::Heading,
             Self::ManuallyChecked | Self::AutomaticallyApplied => TextPanelSpanStyle::Success,
         }
+    }
+}
+
+/// Distinct, valid review completions attributed to their actual reconstruction method.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ReplayCompletionSummary {
+    manually_checked: usize,
+    automatically_applied: usize,
+}
+
+impl ReplayCompletionSummary {
+    const fn reviewed_count(self) -> usize {
+        self.manually_checked
+            .saturating_add(self.automatically_applied)
     }
 }
 
@@ -173,17 +187,27 @@ impl ReplayPanelModel {
             .find(|completion| completion.index == index)
     }
 
-    fn current_completion(&self) -> Option<&ReplayPanelCompletion> {
-        self.completion(self.index)
+    fn completion_summary(&self) -> ReplayCompletionSummary {
+        let mut summary = ReplayCompletionSummary::default();
+        let mut seen = HashSet::with_capacity(self.completions.len().min(self.steps.len()));
+
+        for completion in &self.completions {
+            if completion.index >= self.steps.len() || !seen.insert(completion.index) {
+                continue;
+            }
+
+            if completion.completion == "automatically applied" {
+                summary.automatically_applied = summary.automatically_applied.saturating_add(1);
+            } else {
+                summary.manually_checked = summary.manually_checked.saturating_add(1);
+            }
+        }
+
+        summary
     }
 
     fn reviewed_count(&self) -> usize {
-        self.completions
-            .iter()
-            .filter(|completion| completion.index < self.steps.len())
-            .map(|completion| completion.index)
-            .collect::<HashSet<_>>()
-            .len()
+        self.completion_summary().reviewed_count()
     }
 
     pub(super) fn is_complete(&self) -> bool {
@@ -750,6 +774,7 @@ pub(super) fn render_replay_panel(
     let diff_top = source_top.saturating_add(layout.source_rows);
     let highlights = highlight_document(Some(&state.document), theme);
     let intraline = replay_intraline_highlights(&state.document, theme);
+    let dual_gutter = replay_uses_dual_gutter(&state.document, width);
     for (offset, ((line, spans), changed_spans)) in state
         .document
         .lines
@@ -762,11 +787,16 @@ pub(super) fn render_replay_panel(
     {
         render_replay_diff_line(
             buffer,
-            (position.x, diff_top.saturating_add(offset), width),
+            ReplayDiffLineViewport {
+                x: position.x,
+                y: diff_top.saturating_add(offset),
+                width,
+                horizontal_offset: state.model.horizontal_offset,
+                dual_gutter,
+            },
             line,
             spans,
             changed_spans,
-            state.model.horizontal_offset,
             theme,
         );
     }
@@ -1023,6 +1053,71 @@ fn replay_header_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
     lines
 }
 
+fn append_replay_progress_detail(progress: &mut String, detail: &str, width: usize) {
+    const MINIMUM_SOURCE_METADATA_WIDTH: usize = 18;
+
+    let combined_width = display_width(progress)
+        .saturating_add(display_width(" · "))
+        .saturating_add(display_width(detail))
+        .saturating_add(MINIMUM_SOURCE_METADATA_WIDTH);
+    if combined_width <= width {
+        progress.push_str(" · ");
+        progress.push_str(detail);
+    }
+}
+
+fn replay_review_progress(model: &ReplayPanelModel, width: usize) -> String {
+    let summary = model.completion_summary();
+    let reviewed = summary.reviewed_count();
+    let complete = !model.steps.is_empty() && reviewed == model.steps.len();
+    let mut progress = if complete {
+        format!("✓ {reviewed}/{} complete", model.steps.len())
+    } else {
+        format!("{reviewed}/{} reviewed", model.steps.len())
+    };
+
+    if summary.automatically_applied > 0 {
+        append_replay_progress_detail(
+            &mut progress,
+            &format!("{} applied", summary.automatically_applied),
+            width,
+        );
+    }
+    if summary.manually_checked > 0 {
+        append_replay_progress_detail(
+            &mut progress,
+            &format!("{} checked", summary.manually_checked),
+            width,
+        );
+    }
+    if !model.notes.is_empty() {
+        let suffix = if model.notes.len() == 1 {
+            "note"
+        } else {
+            "notes"
+        };
+        append_replay_progress_detail(
+            &mut progress,
+            &format!("{} {suffix}", model.notes.len()),
+            width,
+        );
+    }
+    if model.draft_count > 0 {
+        let suffix = if model.draft_count == 1 {
+            "draft"
+        } else {
+            "drafts"
+        };
+        append_replay_progress_detail(
+            &mut progress,
+            &format!("{} {suffix}", model.draft_count),
+            width,
+        );
+    }
+
+    progress
+}
+
 fn replay_pinned_header_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTextLine> {
     let model = &state.model;
     let identity = if model.pull_request == 0 {
@@ -1047,40 +1142,37 @@ fn replay_pinned_header_lines(state: &ReplayPanelState, width: usize) -> Vec<Ren
         Some(ReplayReviewRole::Reviewer) => "REVIEW",
         None => "",
     };
+    let complete = model.is_complete();
+    let progress = replay_review_progress(model, width);
+    let progress_width = display_width(&progress);
+    let source_width = if progress_width.saturating_add(2) < width {
+        width.saturating_sub(progress_width).saturating_sub(1)
+    } else {
+        width
+    };
     let mut source = if model.pull_request == 0 {
         model.branch.clone()
     } else {
         format!("@{} · {}", model.author, model.branch)
     };
     if !model.head_commit.is_empty() {
-        source.push_str(" · ");
-        source.extend(model.head_commit.chars().take(7));
-    }
-    let complete = model.is_complete();
-    let mut progress = if complete {
-        format!(
-            "✓ {}/{} complete",
-            model.reviewed_count(),
-            model.steps.len()
-        )
-    } else {
-        format!("{}/{} reviewed", model.reviewed_count(), model.steps.len())
-    };
-    if !model.notes.is_empty() {
-        let suffix = if model.notes.len() == 1 {
-            "note"
+        let short_commit = model.head_commit.chars().take(7).collect::<String>();
+        let commit_suffix = format!(" · {short_commit}");
+        let source_prefix_width = source_width.saturating_sub(display_width(&commit_suffix));
+        if source_prefix_width > 0 {
+            source = format!(
+                "{}{}",
+                truncate_display_width_with_marker(
+                    &source,
+                    source_prefix_width,
+                    "…",
+                    TruncationSide::Right,
+                ),
+                commit_suffix,
+            );
         } else {
-            "notes"
-        };
-        progress.push_str(&format!(" · {} {suffix}", model.notes.len()));
-    }
-    if model.draft_count > 0 {
-        let suffix = if model.draft_count == 1 {
-            "draft"
-        } else {
-            "drafts"
-        };
-        progress.push_str(&format!(" · {} {suffix}", model.draft_count));
+            source.push_str(&commit_suffix);
+        }
     }
 
     vec![
@@ -1641,16 +1733,52 @@ fn aligned_line(
     RenderedTextLine { spans }
 }
 
+/// Actual viewport and hunk-wide line-number policy for one original diff row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplayDiffLineViewport {
+    x: usize,
+    y: usize,
+    width: usize,
+    horizontal_offset: usize,
+    dual_gutter: bool,
+}
+
+fn replay_uses_dual_gutter(document: &WorkspaceDocument, width: usize) -> bool {
+    if width < 90 {
+        return false;
+    }
+
+    let mut has_added = false;
+    let mut has_removed = false;
+    for line in &document.lines {
+        match line.kind.as_str() {
+            "added" => has_added = true,
+            "removed" => has_removed = true,
+            _ => {}
+        }
+        if has_added && has_removed {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn render_replay_diff_line(
     buffer: &mut RenderBuffer,
-    rect: (usize, usize, usize),
+    viewport: ReplayDiffLineViewport,
     line: &WorkspaceDocumentLine,
     highlights: &[crate::editor::StyleInfo],
     intraline: &[crate::editor::StyleInfo],
-    horizontal_offset: usize,
     theme: &Theme,
 ) {
-    let (x, y, width) = rect;
+    let ReplayDiffLineViewport {
+        x,
+        y,
+        width,
+        horizontal_offset,
+        dual_gutter,
+    } = viewport;
     if width == 0 || y >= buffer.height {
         return;
     }
@@ -1673,7 +1801,7 @@ fn render_replay_diff_line(
         return;
     }
 
-    let wide_gutter = width >= 72;
+    let wide_gutter = dual_gutter;
     let gutter_width = if wide_gutter {
         13.min(width)
     } else {
@@ -1986,14 +2114,11 @@ fn render_replay_footer_status(
         return;
     }
 
-    let message = if model.notice.trim().is_empty() {
-        model
-            .current_completion()
-            .map(|completion| completion.completion.as_str())
-    } else if model.notice.trim().starts_with("Review restored") {
+    let notice = model.notice.trim();
+    let message = if notice.is_empty() || notice.starts_with("Review restored") {
         None
     } else {
-        Some(model.notice.trim())
+        Some(notice)
     };
     let Some(message) = message else {
         buffer.set_text(x, y, &" ".repeat(width), &theme.style);
@@ -2168,7 +2293,7 @@ fn render_change_row(
 
     let change_state = state.model.change_state(index);
     let marker = change_state.marker();
-    let marker_style = if matches!(marker, "✓" | "+") {
+    let marker_style = if matches!(marker, "✓" | "●") {
         change_kind_style("add", theme)
     } else if marker == "✎" {
         theme.ui_style.picker_prompt.clone()
@@ -2240,6 +2365,7 @@ fn change_kind_style(kind: &str, theme: &Theme) -> Style {
 }
 
 fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
+    let review_complete = model.is_complete();
     let has_multiple_files = model
         .current_file_position()
         .is_some_and(|(_, count)| count > 1);
@@ -2265,7 +2391,11 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
 
     actions.extend([
         UiAction::new("edit", "i", "Edit")
-            .with_priority(ActionPriority::Essential)
+            .with_priority(if review_complete {
+                ActionPriority::Primary
+            } else {
+                ActionPriority::Essential
+            })
             .with_compact_label("Edit"),
         UiAction::new("undo", "u", "Undo")
             .with_priority(ActionPriority::Essential)
@@ -2275,7 +2405,9 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
             "v",
             if width >= 90 { "Validate" } else { "Check" },
         )
-        .with_priority(if width >= 46 {
+        .with_priority(if review_complete {
+            ActionPriority::Secondary
+        } else if width >= 46 {
             ActionPriority::Essential
         } else {
             ActionPriority::Primary
@@ -2286,7 +2418,11 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
             "a",
             if width >= 90 { "Apply hunk" } else { "Apply" },
         )
-        .with_priority(ActionPriority::Essential)
+        .with_priority(if review_complete {
+            ActionPriority::Primary
+        } else {
+            ActionPriority::Essential
+        })
         .with_compact_label("Apply"),
     ]);
 
@@ -2302,13 +2438,24 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
         );
         actions.push(
             UiAction::new("outbox", "r", "Outbox")
-                .with_priority(if width >= 58 {
+                .with_priority(if review_complete {
+                    ActionPriority::Essential
+                } else if width >= 58 {
                     ActionPriority::Primary
                 } else {
                     ActionPriority::Secondary
                 })
                 .with_compact_label("Outbox"),
         );
+        if review_complete
+            && (!model.drafts.is_empty() || !model.notes.is_empty() || !model.receipts.is_empty())
+        {
+            actions.push(
+                UiAction::new("save_review", "S", "Save")
+                    .with_priority(ActionPriority::Essential)
+                    .with_compact_label("Save"),
+            );
+        }
     }
 
     if model.author_workspace_available {
@@ -2337,7 +2484,9 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
 
     actions.push(
         UiAction::new("zoom", "z", "Zoom")
-            .with_priority(if width >= 75 {
+            .with_priority(if review_complete {
+                ActionPriority::Secondary
+            } else if width >= 75 {
                 ActionPriority::Essential
             } else {
                 ActionPriority::Primary
@@ -2476,6 +2625,20 @@ mod tests {
     fn state() -> ReplayPanelState {
         let text = serde_json::to_string(&model()).expect("serializable replay model");
         ReplayPanelState::parse(&text).expect("valid source-backed replay state")
+    }
+
+    fn completed_model() -> ReplayPanelModel {
+        let mut replay = model();
+        replay.completions = replay
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(index, _)| ReplayPanelCompletion {
+                index,
+                completion: "automatically applied".to_string(),
+            })
+            .collect();
+        replay
     }
 
     fn source_step(
@@ -2774,11 +2937,16 @@ mod tests {
         let mut buffer = RenderBuffer::new(/*width*/ 60, /*height*/ 1, &theme.style);
         render_replay_diff_line(
             &mut buffer,
-            (/*x*/ 0, /*y*/ 0, /*width*/ 60),
+            ReplayDiffLineViewport {
+                x: 0,
+                y: 0,
+                width: 60,
+                horizontal_offset: 0,
+                dual_gutter: false,
+            },
             added,
             &highlights[index],
             &[],
-            /*horizontal_offset*/ 0,
             &theme,
         );
         let added_background = diff_line_style("added", &theme).bg;
@@ -2842,6 +3010,96 @@ mod tests {
     }
 
     #[test]
+    fn additive_original_hunks_keep_a_single_line_number_at_every_width() {
+        let state = state();
+        assert!(state.document.lines.iter().any(|line| line.kind == "added"));
+        assert!(state
+            .document
+            .lines
+            .iter()
+            .all(|line| line.kind != "removed"));
+
+        for width in [46, 79, 90, 120] {
+            assert!(
+                !replay_uses_dual_gutter(&state.document, width),
+                "an additive original hunk must not reserve an empty old-line gutter at {width} columns",
+            );
+        }
+
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let line = WorkspaceDocumentLine {
+            id: "wide-added-source".to_string(),
+            text: "    keep_the_original_added_source_visible();".to_string(),
+            kind: "added".to_string(),
+            new_line: Some(120),
+            ..WorkspaceDocumentLine::default()
+        };
+        let mut buffer = RenderBuffer::new(/*width*/ 100, /*height*/ 1, &theme.style);
+        render_replay_diff_line(
+            &mut buffer,
+            ReplayDiffLineViewport {
+                x: 0,
+                y: 0,
+                width: 100,
+                horizontal_offset: 0,
+                dual_gutter: replay_uses_dual_gutter(&state.document, /*width*/ 100),
+            },
+            &line,
+            &[],
+            &[],
+            &theme,
+        );
+
+        let rendered = &rendered_rows(&buffer)[0];
+        assert!(rendered.starts_with(" 120 + "));
+        assert!(rendered.contains("keep_the_original_added_source_visible"));
+    }
+
+    #[test]
+    fn mixed_original_hunks_show_both_line_numbers_only_when_they_fit() {
+        let state = state();
+        let mut mixed = state.document.clone();
+        mixed.lines.push(WorkspaceDocumentLine {
+            id: "original-removed-source".to_string(),
+            text: "    previous_original_source();".to_string(),
+            kind: "removed".to_string(),
+            old_line: Some(119),
+            ..WorkspaceDocumentLine::default()
+        });
+
+        assert!(!replay_uses_dual_gutter(&mixed, /*width*/ 89));
+        assert!(replay_uses_dual_gutter(&mixed, /*width*/ 90));
+
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let line = WorkspaceDocumentLine {
+            id: "original-added-source".to_string(),
+            text: "    replacement_original_source();".to_string(),
+            kind: "added".to_string(),
+            new_line: Some(120),
+            ..WorkspaceDocumentLine::default()
+        };
+        let mut buffer = RenderBuffer::new(/*width*/ 100, /*height*/ 1, &theme.style);
+        render_replay_diff_line(
+            &mut buffer,
+            ReplayDiffLineViewport {
+                x: 0,
+                y: 0,
+                width: 100,
+                horizontal_offset: 0,
+                dual_gutter: replay_uses_dual_gutter(&mixed, /*width*/ 100),
+            },
+            &line,
+            &[],
+            &[],
+            &theme,
+        );
+
+        let rendered = &rendered_rows(&buffer)[0];
+        assert!(rendered.starts_with("      120 + "));
+        assert!(rendered.contains("replacement_original_source"));
+    }
+
+    #[test]
     fn long_source_lines_keep_their_indentation_and_end_with_a_truncation_marker() {
         let theme = parse_vscode_theme("themes/red.json").unwrap();
         let line = WorkspaceDocumentLine {
@@ -2856,11 +3114,16 @@ mod tests {
 
         render_replay_diff_line(
             &mut buffer,
-            (/*x*/ 0, /*y*/ 0, /*width*/ 25),
+            ReplayDiffLineViewport {
+                x: 0,
+                y: 0,
+                width: 25,
+                horizontal_offset: 0,
+                dual_gutter: false,
+            },
             &line,
             &[],
             &[],
-            /*horizontal_offset*/ 0,
             &theme,
         );
 
@@ -2891,11 +3154,16 @@ mod tests {
         let mut initial = RenderBuffer::new(/*width*/ 36, /*height*/ 1, &theme.style);
         render_replay_diff_line(
             &mut initial,
-            (/*x*/ 0, /*y*/ 0, /*width*/ 36),
+            ReplayDiffLineViewport {
+                x: 0,
+                y: 0,
+                width: 36,
+                horizontal_offset: 0,
+                dual_gutter: false,
+            },
             &line,
             &[],
             &[],
-            /*horizontal_offset*/ 0,
             &theme,
         );
         let initial_text = rendered_rows(&initial)[0].clone();
@@ -2910,11 +3178,16 @@ mod tests {
         let mut panned = RenderBuffer::new(/*width*/ 36, /*height*/ 1, &theme.style);
         render_replay_diff_line(
             &mut panned,
-            (/*x*/ 0, /*y*/ 0, /*width*/ 36),
+            ReplayDiffLineViewport {
+                x: 0,
+                y: 0,
+                width: 36,
+                horizontal_offset: offset,
+                dual_gutter: false,
+            },
             &line,
             &[],
             &[],
-            offset,
             &theme,
         );
         let panned_text = &rendered_rows(&panned)[0];
@@ -3208,6 +3481,97 @@ mod tests {
         assert!(visible.contains("v Check"));
         assert!(!visible.contains("Chk"));
         assert_eq!(layout.hidden_count(), 0);
+    }
+
+    #[test]
+    fn completed_review_keeps_its_outbox_visible_at_every_usable_width() {
+        let mut replay = completed_model();
+        replay.review_role = Some(ReplayReviewRole::Reviewer);
+        replay.head_commit = "b".repeat(40);
+
+        for width in [30, 46, 62, 86] {
+            let actions = replay_actions(&replay, width);
+            let layout = ActionBar::new(&actions).layout(width);
+
+            assert!(
+                has_visible_key(&layout, "r"),
+                "a completed review must keep its outbox visible at {width} columns: {}",
+                layout.text(),
+            );
+            assert!(
+                has_visible_key(&layout, "u"),
+                "a completed review must retain safe undo at {width} columns: {}",
+                layout.text(),
+            );
+            assert!(
+                has_visible_key(&layout, "?"),
+                "a completed review must retain help at {width} columns: {}",
+                layout.text(),
+            );
+            assert!(actions.iter().all(|action| action.id != "save_review"));
+            assert_eq!(layout.hidden_count(), 0);
+            assert_labeled_actions(&layout);
+        }
+    }
+
+    #[test]
+    fn completed_review_offers_save_only_for_real_private_review_content() {
+        let mut replay = completed_model();
+        replay.review_role = Some(ReplayReviewRole::Reviewer);
+        replay.head_commit = "b".repeat(40);
+
+        assert!(replay_actions(&replay, /*width*/ 46)
+            .iter()
+            .all(|action| action.id != "save_review"));
+
+        replay.notes.push(ReplayPanelNote {
+            index: 0,
+            text: "Preserve this original-source observation.".to_string(),
+        });
+
+        for width in [46, 62, 86] {
+            let actions = replay_actions(&replay, width);
+            let layout = ActionBar::new(&actions).layout(width);
+
+            assert!(
+                has_visible_key(&layout, "S"),
+                "real private review content must remain saveable at {width} columns: {}",
+                layout.text(),
+            );
+            assert!(has_visible_key(&layout, "r"));
+            assert!(has_visible_key(&layout, "u"));
+            assert_eq!(layout.hidden_count(), 0);
+            assert_labeled_actions(&layout);
+        }
+    }
+
+    #[test]
+    fn completed_author_review_keeps_source_edit_and_outbox_ahead_of_zoom() {
+        let mut replay = multi_file_model();
+        replay.completions = replay
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(index, _)| ReplayPanelCompletion {
+                index,
+                completion: "automatically applied".to_string(),
+            })
+            .collect();
+        replay.review_role = Some(ReplayReviewRole::Author);
+        replay.head_commit = "b".repeat(40);
+        replay.author_workspace_available = true;
+        let actions = replay_actions(&replay, /*width*/ 79);
+        let layout = ActionBar::new(&actions).layout(/*width*/ 79);
+
+        for key in ["j/k", "h/l", "i", "u", "r", "W", "?"] {
+            assert!(
+                has_visible_key(&layout, key),
+                "the completed author review must retain {key}: {}",
+                layout.text(),
+            );
+        }
+        assert_eq!(layout.hidden_count(), 0);
+        assert_labeled_actions(&layout);
     }
 
     #[test]
@@ -3717,7 +4081,7 @@ mod tests {
 
         let rows = rendered_rows(&buffer);
         assert!(rows.iter().any(|row| row.trim_start().starts_with("✓ 01 ")));
-        assert!(rows.iter().any(|row| row.trim_start().starts_with("+ 02 ")));
+        assert!(rows.iter().any(|row| row.trim_start().starts_with("● 02 ")));
         assert!(rows.iter().any(|row| row.starts_with("▶ ○ 03 ")));
         assert!(!rows.iter().any(|row| row.starts_with("▶ ●")));
         assert!(!rows.iter().any(|row| row.contains(" ADD ")));
@@ -4361,6 +4725,84 @@ mod tests {
         ];
 
         assert_eq!(replay.reviewed_count(), 1);
+        assert_eq!(
+            replay.completion_summary(),
+            ReplayCompletionSummary {
+                manually_checked: 1,
+                automatically_applied: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn review_progress_counts_distinct_automatic_and_manual_completions() {
+        let mut replay = model();
+        replay.completions = vec![
+            ReplayPanelCompletion {
+                index: 0,
+                completion: "automatically applied".to_string(),
+            },
+            ReplayPanelCompletion {
+                index: 1,
+                completion: "manually reconstructed".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            replay.completion_summary(),
+            ReplayCompletionSummary {
+                manually_checked: 1,
+                automatically_applied: 1,
+            },
+        );
+        assert_eq!(
+            replay_review_progress(&replay, /*width*/ 72),
+            "2/5 reviewed · 1 applied · 1 checked",
+        );
+    }
+
+    #[test]
+    fn compact_completion_summary_preserves_space_for_real_source_metadata() {
+        let replay = completed_model();
+
+        assert_eq!(
+            replay_review_progress(&replay, /*width*/ 62),
+            "✓ 5/5 complete · 5 applied",
+        );
+        assert_eq!(
+            replay_review_progress(&replay, /*width*/ 30),
+            "✓ 5/5 complete",
+        );
+    }
+
+    #[test]
+    fn completed_steps_do_not_repeat_their_status_as_a_notice() {
+        let mut replay = completed_model();
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let mut buffer = RenderBuffer::new(/*width*/ 55, /*height*/ 1, &theme.style);
+
+        render_replay_footer_status(
+            &mut buffer,
+            &replay,
+            /*x*/ 0,
+            /*y*/ 0,
+            /*width*/ 55,
+            &theme,
+        );
+        assert!(rendered_rows(&buffer)[0].trim().is_empty());
+
+        replay.notice = "Could not validate the original source.".to_string();
+        render_replay_footer_status(
+            &mut buffer,
+            &replay,
+            /*x*/ 0,
+            /*y*/ 0,
+            /*width*/ 55,
+            &theme,
+        );
+        let notice = &rendered_rows(&buffer)[0];
+        assert!(notice.starts_with('✕'));
+        assert!(notice.contains("Could not validate"));
     }
 
     #[test]
@@ -4386,12 +4828,9 @@ mod tests {
         let change = replay_current_change_lines(&state, /*width*/ 62);
 
         assert!(state.model.is_complete());
-        assert_eq!(progress.text, "✓ 5/5 complete");
+        assert_eq!(progress.text, "✓ 5/5 complete · 5 applied");
         assert_eq!(progress.style, TextPanelSpanStyle::Success);
-        assert!(change[0]
-            .spans
-            .iter()
-            .any(|span| span.text == "HUNK APPLIED"));
+        assert!(change[0].spans.iter().any(|span| span.text == "APPLIED"));
         assert!(!change[0]
             .spans
             .iter()
@@ -4399,11 +4838,41 @@ mod tests {
     }
 
     #[test]
+    fn completed_header_preserves_the_pinned_commit_alongside_method_counts() {
+        let mut replay = completed_model();
+        replay.review_role = Some(ReplayReviewRole::Author);
+        replay.branch = "fcoury/tui-paginated-history".to_string();
+        replay.head_commit = "15c49574d325c0cb783a12cadab7b25fb089ed3e".to_string();
+        let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+
+        for width in [46, 62, 79] {
+            let metadata = replay_pinned_header_lines(&state, width)[1]
+                .spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>();
+
+            assert!(
+                metadata.contains("15c4957"),
+                "the pinned original head disappeared at {width} columns: {metadata}",
+            );
+            assert!(
+                metadata.contains("✓ 5/5 complete"),
+                "the actual review progress disappeared at {width} columns: {metadata}",
+            );
+            assert!(
+                metadata.contains("5 applied"),
+                "the reconstruction method disappeared at {width} columns: {metadata}",
+            );
+        }
+    }
+
+    #[test]
     fn current_change_status_distinguishes_automatic_and_manual_reconstruction() {
         let mut replay = model();
 
         for (completion, expected_label, expected_marker) in [
-            ("automatically applied", "HUNK APPLIED", "+"),
+            ("automatically applied", "APPLIED", "●"),
             ("manually reconstructed", "CHECKED BY HAND", "✓"),
         ] {
             replay.completions = vec![ReplayPanelCompletion {

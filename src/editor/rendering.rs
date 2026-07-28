@@ -40,6 +40,9 @@ use super::{
     Point, Rect, RenderBuffer, StyleCursor, GUTTER_SIGN_COLUMN_WIDTH, MAX_HIGHLIGHT_SLICE_BYTES,
 };
 
+/// Keep verified Replay lines recognizable without drowning out genuine source syntax.
+const REPLAY_SOURCE_HUNK_TINT_ALPHA: u8 = 18;
+
 fn diagnostic_row(diagnostics: &[&Diagnostic], available_width: usize) -> Option<String> {
     let diagnostic = diagnostics.first()?;
     if available_width == 0 {
@@ -751,7 +754,7 @@ impl Editor {
         Ok(())
     }
 
-    /// Tints verified original hunk lines without replacing editor text or syntax.
+    /// Marks verified hunk lines without obscuring source syntax or existing gutter signs.
     fn render_replay_source_hunk_highlight(
         &self,
         buffer: &mut RenderBuffer,
@@ -772,10 +775,50 @@ impl Editor {
         }) else {
             return;
         };
-        let Some(background) = crate::plugin::workspace::diff_line_style("added", &self.theme).bg
+        let Some(inserted_background) =
+            crate::plugin::workspace::diff_line_style("added", &self.theme).bg
         else {
             return;
         };
+        let background = match inserted_background {
+            Color::Rgb { r, g, b } => Color::Rgba {
+                r,
+                g,
+                b,
+                a: REPLAY_SOURCE_HUNK_TINT_ALPHA,
+            },
+            Color::Rgba { r, g, b, a } => Color::Rgba {
+                r,
+                g,
+                b,
+                a: a.min(REPLAY_SOURCE_HUNK_TINT_ALPHA),
+            },
+        };
+        let gutter_style = self.theme.gutter_style.fallback_bg(&self.theme.style);
+        let gutter_marker_style = self.theme.ensure_text_contrast(&Style {
+            fg: self
+                .theme
+                .colors
+                .get("editorGutter.addedBackground")
+                .copied()
+                .or_else(|| {
+                    self.theme
+                        .colors
+                        .get("editorGutter.addedForeground")
+                        .copied()
+                })
+                .or_else(|| {
+                    self.theme
+                        .colors
+                        .get("gitDecoration.addedResourceForeground")
+                        .copied()
+                })
+                .or(self.theme.ui_style.picker_prompt.fg)
+                .or(gutter_style.fg),
+            bg: gutter_style.bg,
+            bold: true,
+            italic: false,
+        });
 
         let content_start = window
             .position
@@ -800,6 +843,20 @@ impl Editor {
                 continue;
             }
             let y = self.window_to_terminal_y(window, segment.row);
+            let marker_x = if segment.first_segment {
+                self.gutter_sign_manager
+                    .visible_sign(window.buffer_index, segment.line)
+                    .map_or(Some(window.position.x), |sign| {
+                        let sign_width = display_width(&sign.text);
+                        (sign_width < GUTTER_SIGN_COLUMN_WIDTH)
+                            .then_some(window.position.x.saturating_add(sign_width))
+                    })
+            } else {
+                Some(window.position.x)
+            };
+            if let Some(marker_x) = marker_x {
+                buffer.set_text(marker_x, y, "▎", &gutter_marker_style);
+            }
             buffer.set_bg_for_range(
                 Point::new(content_start, y),
                 Point::new(content_end, y),

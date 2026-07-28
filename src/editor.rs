@@ -25583,16 +25583,55 @@ mod test {
             .window_manager
             .window(workspace.source_window)
             .expect("retain the ordinary scratch editor window");
+        let gutter_x = window.position.x;
+        let source_buffer_index = window.buffer_index;
         let content_x = window.position.x + editor.gutter_width_for_window(window) + 1;
         let changed_y = editor.window_to_terminal_y(window, hunk.start_line);
         let context_y =
             editor.window_to_terminal_y(window, hunk.start_line.saturating_add(hunk.line_count));
         let changed = &render_buffer.cells[changed_y * render_buffer.width + content_x];
         let context = &render_buffer.cells[context_y * render_buffer.width + content_x];
+        let changed_sign = &render_buffer.cells[changed_y * render_buffer.width + gutter_x];
+        let changed_marker = &render_buffer.cells[changed_y * render_buffer.width + gutter_x + 1];
+        let context_sign = &render_buffer.cells[context_y * render_buffer.width + gutter_x];
+        let context_marker = &render_buffer.cells[context_y * render_buffer.width + gutter_x + 1];
+        let original_diff_background =
+            crate::plugin::workspace::diff_line_style("added", &editor.theme)
+                .bg
+                .map(|background| {
+                    crate::color::blend_color(background, editor.theme.style.bg.unwrap_or_default())
+                });
 
         assert_ne!(changed.style.bg, editor.theme.style.bg);
+        assert_ne!(changed.style.bg, original_diff_background);
         assert_eq!(context.style.bg, editor.theme.style.bg);
+        assert_eq!(changed_sign.text, "▸");
+        assert_eq!(changed_marker.text, "▎");
+        assert_ne!(context_sign.text, "▎");
+        assert_ne!(context_marker.text, "▎");
         assert!(editor.current_buffer().contents().contains("after_first()"));
+
+        assert!(editor.gutter_sign_manager.set(
+            "replay-source-hunk-test".to_string(),
+            vec![crate::plugin::GutterSign {
+                buffer_index: source_buffer_index,
+                line: hunk.start_line,
+                text: "!".to_string(),
+                style: editor.theme.ui_style.picker_prompt.clone(),
+                priority: 40,
+            }],
+        ));
+        editor
+            .render(&mut render_buffer)
+            .expect("preserve real editor gutter signs over the Replay hunk indicator");
+        assert_eq!(
+            render_buffer.cells[changed_y * render_buffer.width + gutter_x].text,
+            "!",
+        );
+        assert_eq!(
+            render_buffer.cells[changed_y * render_buffer.width + gutter_x + 1].text,
+            "▎",
+        );
     }
 
     #[tokio::test]
