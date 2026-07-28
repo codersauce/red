@@ -1087,6 +1087,15 @@ impl PanelManager {
             .is_some_and(|replay| replay.model.view == ReplayPanelView::Guide)
     }
 
+    /// Whether the focused Replay surface is displaying a Codex answer.
+    pub(crate) fn focused_replay_is_answer(&self) -> bool {
+        self.focused
+            .as_deref()
+            .and_then(|id| self.text_panels.get(id))
+            .and_then(|panel| panel.replay.as_ref())
+            .is_some_and(|replay| replay.model.view == ReplayPanelView::Answer)
+    }
+
     /// Returns draft selection only when the local review outbox owns focus.
     pub(crate) fn focused_replay_outbox_position(&self) -> Option<(usize, usize)> {
         let id = self.focused.as_deref()?;
@@ -1560,6 +1569,9 @@ impl PanelManager {
                         .saturating_add(title_rows)
                         .saturating_add(selected),
                 ));
+            }
+            if replay.model.view == ReplayPanelView::Answer {
+                return Some((placement.x, placement.y.saturating_add(title_rows)));
             }
             let layout = ReplayPanelLayout::calculate(
                 replay,
@@ -2650,6 +2662,9 @@ mod tests {
             submission_state: None,
             outbox_index: 0,
             view: ReplayPanelView::Guide,
+            agent_question: String::new(),
+            agent_answer: String::new(),
+            agent_phase: String::new(),
             title: plan.title,
             index: 0,
             mode,

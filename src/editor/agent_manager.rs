@@ -306,4 +306,38 @@ mod tests {
             .unwrap()
             .contains("codex-author-1"));
     }
+
+    #[test]
+    fn explicit_reviewer_draft_sessions_remain_strictly_read_only() {
+        for (index, scope) in [
+            ReplayAgentScope::InlineComment,
+            ReplayAgentScope::ReviewSummary,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut manager = AgentManager::new();
+            let session_id = format!("codex-review-draft-{index}");
+            manager
+                .register_replay_session(
+                    session_id.clone(),
+                    ReplayAgentSession {
+                        workspace_id: "review-1".to_string(),
+                        step_id: "step-1".to_string(),
+                        scope,
+                        prompt: "Draft a review observation.".to_string(),
+                        target_commit: GitObjectId::parse(&"a".repeat(40)).unwrap(),
+                    },
+                )
+                .unwrap();
+
+            assert!(!scope.answers_question());
+            assert!(!scope.permits_source_proposals());
+            assert!(manager
+                .read_only_sessions()
+                .lock()
+                .unwrap()
+                .contains(&session_id));
+        }
+    }
 }

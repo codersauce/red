@@ -7490,13 +7490,27 @@ impl Editor {
                 anyhow::anyhow!("the selected original change is no longer available")
             })?;
 
-        let task = if session.scope.permits_source_proposals() {
-            "You are helping the verified original pull-request author. Inspect the entire repository when needed. Use the provided editor tools or write_file only to STAGE reviewable source proposals against the verified original PR worktree. Never save files, commit, push, call GitHub, or claim changes were applied. The human must inspect and explicitly accept every proposed source change."
-        } else {
-            "You are assisting a human pull-request reviewer. This session is strictly read-only: do not edit files, use mutating editor tools, contact GitHub, post comments, or claim that a review was submitted. Produce exactly one JSON object and no Markdown fences: {\"kind\":\"inline_comment\",\"text\":\"proposed concise human review comment\"} for a selected change, or {\"kind\":\"review_summary\",\"text\":\"proposed pull-request-level review summary\"} when asked about the whole pull request. The object is only an unapproved suggestion, never a saved draft."
+        let task = match session.scope {
+            crate::replay::ReplayAgentScope::CurrentChange
+            | crate::replay::ReplayAgentScope::PullRequest => {
+                "You are answering a human pull-request reviewer's question. Answer the specific question directly in clear, concise Markdown prose addressed to the reviewer. Explain relevant implementation details, cross-file relationships, and design rationale. This session is strictly read-only: do not edit files, use mutating editor tools, contact GitHub, post comments, or claim that a review was submitted. Do not draft a review comment, repeat the question, or output JSON."
+            }
+            crate::replay::ReplayAgentScope::InlineComment => {
+                "You are assisting a human pull-request reviewer who explicitly requested an inline review-comment suggestion. This session is strictly read-only: do not edit files, use mutating editor tools, contact GitHub, post comments, or claim that a review was submitted. Produce exactly one JSON object and no Markdown fences: {\"kind\":\"inline_comment\",\"text\":\"proposed concise actionable human review comment\"}. This is only an unapproved suggestion, never a saved draft."
+            }
+            crate::replay::ReplayAgentScope::ReviewSummary => {
+                "You are assisting a human pull-request reviewer who explicitly requested a pull-request-level review-summary suggestion. This session is strictly read-only: do not edit files, use mutating editor tools, contact GitHub, post comments, or claim that a review was submitted. Produce exactly one JSON object and no Markdown fences: {\"kind\":\"review_summary\",\"text\":\"proposed pull-request-level review summary\"}. This is only an unapproved suggestion, never a saved draft."
+            }
+            crate::replay::ReplayAgentScope::AuthorFix => {
+                "You are helping the verified original pull-request author. Inspect the entire repository when needed. Use the provided editor tools or write_file only to STAGE reviewable source proposals against the verified original PR worktree. Never save files, commit, push, call GitHub, or claim changes were applied. The human must inspect and explicitly accept every proposed source change."
+            }
         };
         let review_context = review.source.review_context.as_ref();
-        let patch = if session.scope == crate::replay::ReplayAgentScope::CurrentChange {
+        let patch = if matches!(
+            session.scope,
+            crate::replay::ReplayAgentScope::CurrentChange
+                | crate::replay::ReplayAgentScope::InlineComment
+        ) {
             format!(
                 "--- before ---\n{}\n--- after ---\n{}",
                 step.before, step.after
@@ -13173,6 +13187,7 @@ impl Editor {
                     }
                 }
                 let action = match event.code {
+                    KeyCode::Esc if self.panel_manager.focused_replay_is_answer() => "dismiss",
                     KeyCode::Esc => {
                         self.panel_manager.focus_editor();
                         return Some(KeyAction::Single(Action::Refresh));
@@ -13200,6 +13215,16 @@ impl Editor {
                             && self.panel_manager.focused_replay_is_guide() =>
                     {
                         "horizontal_right"
+                    }
+                    KeyCode::Up | KeyCode::Char('k')
+                        if self.panel_manager.focused_replay_is_answer() =>
+                    {
+                        "up"
+                    }
+                    KeyCode::Down | KeyCode::Char('j')
+                        if self.panel_manager.focused_replay_is_answer() =>
+                    {
+                        "down"
                     }
                     KeyCode::Up | KeyCode::Char('k')
                         if self.panel_manager.focused_replay_status().is_some() =>
@@ -13271,8 +13296,16 @@ impl Editor {
                     KeyCode::Char('a') if !self.panel_manager.focused_row_panel() => {
                         "composer_focus"
                     }
-                    KeyCode::Char('x') if self.panel_manager.focused_replay_is_guide() => "codex",
-                    KeyCode::Char('X') if self.panel_manager.focused_replay_is_guide() => {
+                    KeyCode::Char('x')
+                        if self.panel_manager.focused_replay_is_guide()
+                            || self.panel_manager.focused_replay_is_answer() =>
+                    {
+                        "codex"
+                    }
+                    KeyCode::Char('X')
+                        if self.panel_manager.focused_replay_is_guide()
+                            || self.panel_manager.focused_replay_is_answer() =>
+                    {
                         "codex_scope"
                     }
                     KeyCode::Char('x') if !self.panel_manager.focused_row_panel() => "clear",
@@ -25582,10 +25615,41 @@ mod test {
             )
             .unwrap();
         assert_eq!(review_root, scratch.root);
+        assert!(review.scope.answers_question());
         assert!(!review.scope.permits_source_proposals());
         let prompt = editor.replay_agent_prompt(&review).unwrap();
         assert!(prompt.contains("strictly read-only"));
+        assert!(prompt.contains("Answer the specific question directly"));
+        assert!(prompt.contains("Do not draft a review comment"));
+        assert!(!prompt.contains("Produce exactly one JSON object"));
         assert!(prompt.contains(&step_id));
+
+        for (scope, expected_kind) in [
+            (
+                crate::replay::ReplayAgentScope::InlineComment,
+                "\"kind\":\"inline_comment\"",
+            ),
+            (
+                crate::replay::ReplayAgentScope::ReviewSummary,
+                "\"kind\":\"review_summary\"",
+            ),
+        ] {
+            let (draft_root, draft) = editor
+                .prepare_replay_agent_session(
+                    &workspace_id,
+                    &step_id,
+                    scope,
+                    "Draft an explicitly requested review observation.",
+                )
+                .unwrap();
+            assert_eq!(draft_root, scratch.root);
+            assert!(!draft.scope.answers_question());
+            assert!(!draft.scope.permits_source_proposals());
+            let prompt = editor.replay_agent_prompt(&draft).unwrap();
+            assert!(prompt.contains("strictly read-only"));
+            assert!(prompt.contains("Produce exactly one JSON object"));
+            assert!(prompt.contains(expected_kind));
+        }
 
         let error = editor
             .prepare_replay_agent_session(
@@ -27513,6 +27577,84 @@ mod test {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn focused_replay_answer_scrolls_without_switching_the_original_change() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        editor
+            .open_replay_demo_workspace(&mut render_buffer)
+            .await
+            .unwrap();
+        let plan = editor.replay_demo_workspace.as_ref().unwrap().plan.clone();
+        editor.test_create_text_panel(
+            "replay-coach",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Left,
+                width: 46,
+                title: Some("PR REPLAY".to_string()),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        editor.panel_manager.update_text_panel(
+            "replay-coach",
+            vec![plugin::TextPanelBlock {
+                id: "replay-current-change".to_string(),
+                kind: plugin::TextPanelBlockKind::Text,
+                format: plugin::TextPanelBlockFormat::Replay,
+                text: json!({
+                    "pull_request": plan.pull_request,
+                    "author": plan.author,
+                    "branch": plan.branch,
+                    "title": plan.title,
+                    "index": 2,
+                    "view": "answer",
+                    "agent_question": "How does thread resumption restore token usage?",
+                    "agent_answer": "It restores the persisted accounting after loading history.",
+                    "agent_phase": "complete",
+                    "steps": plan.steps,
+                })
+                .to_string(),
+            }],
+            /*panel_height*/ 26,
+            /*terminal_width*/ 100,
+        );
+        assert!(editor.test_focus_panel("replay-coach"));
+        assert!(editor.panel_manager.focused_replay_is_answer());
+        assert!(!editor.panel_manager.focused_replay_is_guide());
+
+        for (code, expected_action) in [
+            (KeyCode::Char('j'), "down"),
+            (KeyCode::Down, "down"),
+            (KeyCode::Char('k'), "up"),
+            (KeyCode::Up, "up"),
+            (KeyCode::Char('x'), "codex"),
+            (KeyCode::Esc, "dismiss"),
+        ] {
+            let action = editor
+                .test_handle_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+                .expect("dispatch answer-specific navigation without switching review steps");
+
+            assert!(matches!(
+                action,
+                Some(KeyAction::Multiple(actions)) if actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        Action::NotifyPlugins(event, payload)
+                            if event == "panel:event:replay-coach"
+                                && payload["action"] == expected_action
+                    )
+                })
+            ));
+        }
+        assert_eq!(
+            editor.panel_manager.focused_replay_status(),
+            Some((482, "feat/viewport-diagnostics", 2, 5)),
+        );
     }
 
     #[test]

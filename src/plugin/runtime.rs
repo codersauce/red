@@ -3675,6 +3675,15 @@ mod tests {
         model
     }
 
+    fn recv_replay_answer() -> crate::plugin::replay_panel::ReplayPanelModel {
+        let model = recv_replay_guide();
+        assert_eq!(
+            model.view,
+            crate::plugin::replay_panel::ReplayPanelView::Answer
+        );
+        model
+    }
+
     fn source_backed_review_draft(
         plan: &crate::replay::ReplayPresentationPlan,
         id: &str,
@@ -6905,7 +6914,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_codex_comments_remain_transient_until_the_human_accepts_them() {
+    async fn replay_codex_answers_stream_before_explicit_comment_promotion() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
@@ -6914,7 +6923,7 @@ mod tests {
         runtime.execute_command("ReplayAsk").await.unwrap();
         let prompt = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::OpenCallbackComposer { handle, title, .. } => {
-                assert!(title.unwrap().contains("local suggestion only"));
+                assert!(title.unwrap().contains("Ask Codex"));
                 handle
             }
             _ => panic!("expected a focused Codex review-question composer"),
@@ -6925,6 +6934,15 @@ mod tests {
                 ComposerCallback::Submitted("Check the viewport bounds.".to_string()),
             )
             .unwrap());
+        let pending = recv_replay_answer();
+        assert_eq!(pending.agent_question, "Check the viewport bounds.");
+        assert_eq!(pending.agent_phase, "asking");
+        assert!(pending.agent_answer.is_empty());
+        assert!(pending.drafts.is_empty());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusPanel { id } if id == "replay-coach"
+        ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetTextPanelStatus { status: Some(status), .. }
@@ -6961,11 +6979,15 @@ mod tests {
                 serde_json::json!({
                     "workspace_id": "real-workspace-1",
                     "session_id": "codex-review-1",
-                    "text": "{\"kind\":\"inline_comment\",\"text\":\"Could the viewport bounds be inclusive?\"}",
+                    "text": "The viewport bounds must be inclusive because the last visible row also owns diagnostics.",
                 }),
             )
             .await
             .unwrap();
+        let streaming = recv_replay_answer();
+        assert_eq!(streaming.agent_phase, "streaming");
+        assert!(streaming.agent_answer.contains("last visible row"));
+        assert!(streaming.drafts.is_empty());
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
 
         runtime
@@ -6976,9 +6998,19 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetTextPanelStatus { status: None, .. }
         ));
-        let guide = recv_replay_guide();
-        assert!(guide.drafts.is_empty());
-        assert!(guide.notice.contains("explicitly accept"));
+        let answer = recv_replay_answer();
+        assert_eq!(answer.agent_phase, "complete");
+        assert!(answer.drafts.is_empty());
+        assert!(answer.notice.contains("Answer ready"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime
+            .notify(
+                "panel:event:replay-coach",
+                serde_json::json!({ "action": "comment" }),
+            )
+            .await
+            .unwrap();
         let approval = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::OpenCallbackComposer {
                 handle,
@@ -6986,8 +7018,11 @@ mod tests {
                 query,
                 ..
             } => {
-                assert!(title.unwrap().contains("Codex inline suggestion"));
-                assert_eq!(query, "Could the viewport bounds be inclusive?");
+                assert!(title.unwrap().contains("inline comment"));
+                assert_eq!(
+                    query,
+                    "The viewport bounds must be inclusive because the last visible row also owns diagnostics."
+                );
                 handle
             }
             _ => panic!("expected human inspection before an agent draft can exist"),
@@ -7047,7 +7082,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discarded_codex_review_suggestions_never_enter_the_outbox() {
+    async fn replay_codex_dismissed_answers_never_enter_the_outbox() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
@@ -7064,6 +7099,11 @@ mod tests {
                 ComposerCallback::Submitted("Review this change.".into())
             )
             .unwrap());
+        assert_eq!(recv_replay_answer().agent_phase, "asking");
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusPanel { .. }
+        ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetTextPanelStatus { .. }
@@ -7085,15 +7125,247 @@ mod tests {
             .unwrap();
         runtime
             .notify(
+                "panel:event:replay-coach",
+                serde_json::json!({ "action": "codex" }),
+            )
+            .await
+            .unwrap();
+        let busy = recv_replay_answer();
+        assert_eq!(busy.agent_phase, "asking");
+        assert!(busy.notice.contains("already answering"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        runtime
+            .notify(
                 "replay:agent_update",
                 serde_json::json!({
                     "workspace_id": "real-workspace-1",
                     "session_id": "codex-review-2",
-                    "text": "{\"kind\":\"inline_comment\",\"text\":\"Possible edge case\"}",
+                    "text": "The inclusive boundary is the potential edge case.",
                 }),
             )
             .await
             .unwrap();
+        assert!(recv_replay_answer().agent_answer.contains("edge case"));
+        runtime
+            .notify("replay:agent_completed", identity)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: None, .. }
+        ));
+        assert!(recv_replay_answer().drafts.is_empty());
+        runtime
+            .notify(
+                "panel:event:replay-coach",
+                serde_json::json!({ "action": "comment" }),
+            )
+            .await
+            .unwrap();
+        let promotion = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer { handle, query, .. } => {
+                assert!(query.contains("potential edge case"));
+                handle
+            }
+            _ => panic!("expected an explicitly requested, still-unsaved answer promotion"),
+        };
+        assert!(runtime
+            .notify_composer(promotion, ComposerCallback::Cancelled)
+            .unwrap());
+        let retained = recv_replay_answer();
+        assert!(retained.agent_answer.contains("potential edge case"));
+        assert!(retained.drafts.is_empty());
+        assert!(retained.notice.contains("still available"));
+
+        runtime
+            .notify(
+                "panel:event:replay-coach",
+                serde_json::json!({ "action": "dismiss" }),
+            )
+            .await
+            .unwrap();
+
+        let guide = recv_replay_guide();
+        assert!(guide.drafts.is_empty());
+        assert_eq!(
+            guide.view,
+            crate::plugin::replay_panel::ReplayPanelView::Guide
+        );
+        assert!(guide.agent_answer.is_empty());
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_codex_answer_cancellation_never_creates_a_review_draft() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_source_backed_replay(&mut runtime).await;
+
+        runtime.execute_command("ReplayAsk").await.unwrap();
+        let prompt = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer { handle, .. } => handle,
+            _ => panic!("expected the focused Codex question composer"),
+        };
+        assert!(runtime
+            .notify_composer(
+                prompt,
+                ComposerCallback::Submitted("Explain the cancellation boundary.".into()),
+            )
+            .unwrap());
+        assert_eq!(recv_replay_answer().agent_phase, "asking");
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusPanel { .. }
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus {
+                status: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ReplayAgentStart { .. }
+        ));
+
+        let identity = serde_json::json!({
+            "workspace_id": "real-workspace-1",
+            "session_id": "codex-cancel-1",
+            "step_id": plan.steps[0].id,
+            "scope": "current_change",
+        });
+        runtime
+            .notify("replay:agent_started", identity.clone())
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "panel:event:replay-coach",
+                serde_json::json!({ "action": "dismiss" }),
+            )
+            .await
+            .unwrap();
+        let cancelling = recv_replay_answer();
+        assert_eq!(cancelling.agent_phase, "cancelled");
+        assert!(cancelling.drafts.is_empty());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentCancel { session_id } if session_id == "codex-cancel-1"
+        ));
+        runtime
+            .notify(
+                "replay:agent_update",
+                serde_json::json!({
+                    "workspace_id": "real-workspace-1",
+                    "session_id": "codex-cancel-1",
+                    "text": "This stale answer must never reappear after cancellation.",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime
+            .notify("replay:agent_cancelled", identity)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: None, .. }
+        ));
+        let cancelled = recv_replay_answer();
+        assert_eq!(cancelled.agent_phase, "cancelled");
+        assert!(cancelled.drafts.is_empty());
+
+        runtime
+            .notify(
+                "panel:event:replay-coach",
+                serde_json::json!({ "action": "dismiss" }),
+            )
+            .await
+            .unwrap();
+        let guide = recv_replay_guide();
+        assert_eq!(
+            guide.view,
+            crate::plugin::replay_panel::ReplayPanelView::Guide
+        );
+        assert!(guide.drafts.is_empty());
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_codex_explicit_inline_suggestions_remain_approval_gated() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_source_backed_replay(&mut runtime).await;
+
+        runtime.execute_command("ReplayAskScope").await.unwrap();
+        let (picker, inline_comment) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, items, .. } => (
+                handle,
+                items
+                    .into_iter()
+                    .find(|item| item.id == "inline_comment")
+                    .expect("offer explicitly selected inline review-comment generation"),
+            ),
+            _ => panic!("expected distinct question and review-draft actions"),
+        };
+        assert!(runtime
+            .notify_picker(picker, PickerCallback::Selected(inline_comment))
+            .unwrap());
+        let prompt = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer { handle, title, .. } => {
+                assert!(title.unwrap().contains("draft an inline review comment"));
+                handle
+            }
+            _ => panic!("expected an explicitly selected comment-request composer"),
+        };
+        assert!(runtime
+            .notify_composer(
+                prompt,
+                ComposerCallback::Submitted("Suggest a boundary-regression comment.".into()),
+            )
+            .unwrap());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus {
+                status: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ReplayAgentStart {
+                scope: crate::replay::ReplayAgentScope::InlineComment,
+                ..
+            }
+        ));
+
+        let identity = serde_json::json!({
+            "workspace_id": "real-workspace-1",
+            "session_id": "codex-inline-1",
+            "step_id": plan.steps[0].id,
+            "scope": "inline_comment",
+        });
+        runtime
+            .notify("replay:agent_started", identity.clone())
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "replay:agent_update",
+                serde_json::json!({
+                    "workspace_id": "real-workspace-1",
+                    "session_id": "codex-inline-1",
+                    "text": "{\"kind\":\"inline_comment\",\"text\":\"Please cover the inclusive viewport boundary.\"}",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
         runtime
             .notify("replay:agent_completed", identity)
             .await
@@ -7104,13 +7376,15 @@ mod tests {
         ));
         assert!(recv_replay_guide().drafts.is_empty());
         let approval = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenCallbackComposer { handle, .. } => handle,
-            _ => panic!("expected the unapproved Codex suggestion"),
+            PluginRequest::OpenCallbackComposer { handle, query, .. } => {
+                assert_eq!(query, "Please cover the inclusive viewport boundary.");
+                handle
+            }
+            _ => panic!("expected explicit human approval of the generated local comment"),
         };
         assert!(runtime
             .notify_composer(approval, ComposerCallback::Cancelled)
             .unwrap());
-
         let guide = recv_replay_guide();
         assert!(guide.drafts.is_empty());
         assert!(guide.notice.contains("discarded"));
@@ -7130,6 +7404,8 @@ mod tests {
                 assert_eq!(title.as_deref(), Some("Ask Codex"));
                 assert!(items.iter().any(|item| item.id == "current_change"));
                 assert!(items.iter().any(|item| item.id == "pull_request"));
+                assert!(items.iter().any(|item| item.id == "inline_comment"));
+                assert!(items.iter().any(|item| item.id == "review_summary"));
                 assert!(!items.iter().any(|item| item.id == "author_fix"));
             }
             _ => panic!("expected scoped read-only Codex choices for a reviewer"),
@@ -7160,7 +7436,7 @@ mod tests {
             .unwrap());
         let prompt = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::OpenCallbackComposer { handle, title, .. } => {
-                assert!(title.unwrap().contains("whole PR"));
+                assert!(title.unwrap().contains("whole pull request"));
                 handle
             }
             _ => panic!("expected a PR-level review question"),
@@ -7171,6 +7447,12 @@ mod tests {
                 ComposerCallback::Submitted("Summarize correctness and missing tests.".into()),
             )
             .unwrap());
+        let pending = recv_replay_answer();
+        assert_eq!(pending.agent_phase, "asking");
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusPanel { .. }
+        ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetTextPanelStatus {
@@ -7202,11 +7484,14 @@ mod tests {
                 serde_json::json!({
                     "workspace_id": "github-workspace-482",
                     "session_id": "codex-review-pr",
-                    "text": "{\"kind\":\"review_summary\",\"text\":\"Please add cross-file regression coverage.\"}",
+                    "text": "The change needs cross-file regression coverage for its resume and fork flows.",
                 }),
             )
             .await
             .unwrap();
+        assert!(recv_replay_answer()
+            .agent_answer
+            .contains("resume and fork"));
         runtime
             .notify("replay:agent_completed", event)
             .await
@@ -7215,7 +7500,15 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetTextPanelStatus { status: None, .. }
         ));
-        assert!(recv_replay_guide().drafts.is_empty());
+        let answer = recv_replay_answer();
+        assert!(answer.drafts.is_empty());
+        runtime
+            .notify(
+                "panel:event:replay-coach",
+                serde_json::json!({ "action": "summary" }),
+            )
+            .await
+            .unwrap();
         let approval = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::OpenCallbackComposer { handle, title, .. } => {
                 assert!(title.unwrap().contains("PR summary"));

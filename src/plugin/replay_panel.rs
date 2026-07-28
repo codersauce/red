@@ -58,6 +58,8 @@ pub(crate) enum ReplayPanelView {
     /// The original diff, source guidance, and learning-step list.
     #[default]
     Guide,
+    /// The current question and its ephemeral, streaming Codex answer.
+    Answer,
     /// The recoverable, original-source-anchored local review outbox.
     Outbox,
 }
@@ -175,6 +177,12 @@ pub(crate) struct ReplayPanelModel {
     pub(crate) outbox_index: usize,
     #[serde(default)]
     pub(crate) view: ReplayPanelView,
+    #[serde(default)]
+    pub(crate) agent_question: String,
+    #[serde(default)]
+    pub(crate) agent_answer: String,
+    #[serde(default)]
+    pub(crate) agent_phase: String,
     pub(crate) title: String,
     pub(crate) index: usize,
     #[serde(default)]
@@ -516,10 +524,10 @@ pub(super) fn render_replay_panel_title(
     } else {
         title.to_string()
     };
-    let title = if state.model.view == ReplayPanelView::Guide {
-        format!("{title} · {}", state.model.mode.label())
-    } else {
-        title
+    let title = match state.model.view {
+        ReplayPanelView::Guide => format!("{title} · {}", state.model.mode.label()),
+        ReplayPanelView::Answer => format!("{title} · CODEX"),
+        ReplayPanelView::Outbox => title,
     };
     let position_label = if state.model.view == ReplayPanelView::Outbox {
         if state.model.drafts.is_empty() {
@@ -597,9 +605,16 @@ pub(super) fn render_replay_panel(
     if width == 0 || height == 0 {
         return;
     }
-    if state.model.view == ReplayPanelView::Outbox {
-        render_replay_outbox(buffer, state, position, width, height, viewport, theme);
-        return;
+    match state.model.view {
+        ReplayPanelView::Outbox => {
+            render_replay_outbox(buffer, state, position, width, height, viewport, theme);
+            return;
+        }
+        ReplayPanelView::Answer => {
+            render_replay_answer(buffer, state, position, width, height, viewport, theme);
+            return;
+        }
+        ReplayPanelView::Guide => {}
     }
     let layout = ReplayPanelLayout::calculate(state, width, height);
 
@@ -1402,16 +1417,19 @@ fn replay_rationale_lines(state: &ReplayPanelState, width: usize) -> Vec<Rendere
 
 /// Returns the complete scrollable row count of the selected Replay surface.
 pub(super) fn replay_content_line_count(state: &ReplayPanelState, width: usize) -> usize {
-    if state.model.view == ReplayPanelView::Outbox {
-        replay_outbox_lines(state, width).len()
-    } else {
-        state.document.lines.len()
+    match state.model.view {
+        ReplayPanelView::Guide => state.document.lines.len(),
+        ReplayPanelView::Answer => replay_answer_lines(state, width).len(),
+        ReplayPanelView::Outbox => replay_outbox_lines(state, width).len(),
     }
 }
 
 /// Returns native viewport rows while retaining the selected surface's footer.
 pub(super) fn replay_visible_rows(state: &ReplayPanelState, width: usize, height: usize) -> usize {
-    if state.model.view == ReplayPanelView::Outbox {
+    if matches!(
+        state.model.view,
+        ReplayPanelView::Outbox | ReplayPanelView::Answer
+    ) {
         height
             .saturating_sub(replay_outbox_footer_rows(height))
             .max(1)
@@ -1652,6 +1670,138 @@ fn render_replay_outbox(
             theme,
         );
     }
+}
+
+fn replay_answer_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTextLine> {
+    let width = width.max(1);
+    let mut lines = vec![RenderedTextLine::plain(
+        "QUESTION".to_string(),
+        TextPanelSpanStyle::Heading,
+    )];
+    lines.extend(wrap_plain_text(
+        &state.model.agent_question,
+        width,
+        TextPanelSpanStyle::Strong,
+    ));
+    lines.push(RenderedTextLine::plain(
+        String::new(),
+        TextPanelSpanStyle::Text,
+    ));
+    lines.push(RenderedTextLine::plain(
+        "CODEX ANSWER".to_string(),
+        TextPanelSpanStyle::Heading,
+    ));
+
+    if state.model.agent_answer.trim().is_empty() {
+        let (message, style) = match state.model.agent_phase.as_str() {
+            "failed" => (
+                "Codex could not answer this question.",
+                TextPanelSpanStyle::Error,
+            ),
+            "cancelled" => ("Codex request cancelled.", TextPanelSpanStyle::Muted),
+            _ => ("Asking Codex…", TextPanelSpanStyle::Muted),
+        };
+        lines.extend(wrap_plain_text(message, width, style));
+    } else {
+        lines.extend(wrap_plain_text(
+            &state.model.agent_answer,
+            width,
+            TextPanelSpanStyle::Text,
+        ));
+    }
+
+    if !state.model.notice.trim().is_empty()
+        && matches!(state.model.agent_phase.as_str(), "failed" | "cancelled")
+    {
+        lines.push(RenderedTextLine::plain(
+            String::new(),
+            TextPanelSpanStyle::Text,
+        ));
+        lines.extend(wrap_plain_text(
+            &state.model.notice,
+            width,
+            if state.model.agent_phase == "failed" {
+                TextPanelSpanStyle::Error
+            } else {
+                TextPanelSpanStyle::Muted
+            },
+        ));
+    }
+
+    lines
+}
+
+fn render_replay_answer(
+    buffer: &mut RenderBuffer,
+    state: &ReplayPanelState,
+    position: Point,
+    width: usize,
+    height: usize,
+    viewport: ReplayPanelViewport,
+    theme: &Theme,
+) {
+    let footer_rows = replay_outbox_footer_rows(height);
+    let visible_rows = height.saturating_sub(footer_rows);
+    for (offset, line) in replay_answer_lines(state, width)
+        .iter()
+        .skip(viewport.scroll)
+        .take(visible_rows)
+        .enumerate()
+    {
+        render_text_spans_on_surface(
+            buffer,
+            position.x,
+            position.y.saturating_add(offset),
+            width,
+            line,
+            theme,
+            &theme.style,
+        );
+    }
+
+    if footer_rows > 1 {
+        render_replay_footer_status(
+            buffer,
+            &state.model,
+            position.x,
+            position
+                .y
+                .saturating_add(height.saturating_sub(footer_rows)),
+            width,
+            theme,
+        );
+    }
+    if footer_rows > 0 {
+        let actions = replay_answer_actions();
+        render_replay_action_bar(
+            buffer,
+            position.x,
+            position.y.saturating_add(height.saturating_sub(1)),
+            width,
+            &actions,
+            theme,
+        );
+    }
+}
+
+fn replay_answer_actions() -> Vec<UiAction> {
+    vec![
+        UiAction::new("scroll", "j/k", "Scroll")
+            .with_priority(ActionPriority::Essential)
+            .with_compact_label("Move"),
+        UiAction::new("comment", "c", "Comment")
+            .with_priority(ActionPriority::Essential)
+            .with_compact_label("Note"),
+        UiAction::new("summary", "s", "Summary")
+            .with_priority(ActionPriority::Primary)
+            .with_compact_label("Sum"),
+        UiAction::new("codex", "x", "Ask")
+            .with_priority(ActionPriority::Essential)
+            .with_compact_label("Ask"),
+        UiAction::new("dismiss", "d", "Back")
+            .with_priority(ActionPriority::Essential)
+            .with_compact_label("Back"),
+    ]
 }
 
 fn replay_outbox_actions(model: &ReplayPanelModel) -> Vec<UiAction> {
@@ -2626,6 +2776,9 @@ mod tests {
             submission_state: None,
             outbox_index: 0,
             view: ReplayPanelView::Guide,
+            agent_question: String::new(),
+            agent_answer: String::new(),
+            agent_phase: String::new(),
             title: plan.title,
             index: 0,
             mode: ReplayPanelMode::Challenge,
@@ -4610,6 +4763,116 @@ mod tests {
                 })
                 .unwrap(),
         );
+    }
+
+    #[test]
+    fn native_codex_answer_keeps_question_answer_and_promotion_actions_visible() {
+        let mut replay = model();
+        replay.view = ReplayPanelView::Answer;
+        replay.agent_question =
+            "Why do resume and fork need additional protocol changes?".to_string();
+        replay.agent_answer =
+            "Resume restores token usage, while fork must preserve the original thread history."
+                .to_string();
+        replay.agent_phase = "complete".to_string();
+        replay.notice = "Answer ready · c comment · s summary · d back".to_string();
+
+        let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let width = 88;
+        let height = 14;
+        let mut buffer = RenderBuffer::new(width, height, &theme.style);
+
+        render_replay_panel_title(
+            &mut buffer,
+            &state,
+            "PR REPLAY",
+            Point::new(0, 0),
+            width,
+            /*focused*/ true,
+            &theme,
+        );
+        render_replay_panel(
+            &mut buffer,
+            &state,
+            Point::new(0, 1),
+            width,
+            height - 1,
+            ReplayPanelViewport {
+                scroll: 0,
+                focused: true,
+            },
+            &theme,
+        );
+
+        let rows = rendered_rows(&buffer);
+        assert!(rows[0].starts_with("▌ PR REPLAY · CODEX"));
+        assert!(rows.iter().any(|row| row.contains("QUESTION")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("Why do resume and fork")));
+        assert!(rows.iter().any(|row| row.contains("CODEX ANSWER")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("Resume restores token usage")));
+        assert!(rows[height - 1].contains("j/k"));
+        assert!(rows[height - 1].contains("c "));
+        assert!(rows[height - 1].contains("s "));
+        assert!(rows[height - 1].contains("x "));
+        assert!(rows[height - 1].contains("d "));
+    }
+
+    #[test]
+    fn native_codex_answers_scroll_without_losing_private_promotion_actions() {
+        let mut replay = model();
+        replay.view = ReplayPanelView::Answer;
+        replay.agent_question = "Explain every review boundary.".to_string();
+        replay.agent_answer = (0..20)
+            .map(|index| format!("Boundary {index}: source edits require explicit approval."))
+            .collect::<Vec<_>>()
+            .join("\n");
+        replay.agent_phase = "complete".to_string();
+        let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let width = 62;
+        let height = 10;
+        let mut top = RenderBuffer::new(width, height, &theme.style);
+        let mut scrolled = RenderBuffer::new(width, height, &theme.style);
+        let max_scroll = replay_content_line_count(&state, width)
+            .saturating_sub(replay_visible_rows(&state, width, height));
+
+        render_replay_panel(
+            &mut top,
+            &state,
+            Point::new(0, 0),
+            width,
+            height,
+            ReplayPanelViewport {
+                scroll: 0,
+                focused: true,
+            },
+            &theme,
+        );
+        render_replay_panel(
+            &mut scrolled,
+            &state,
+            Point::new(0, 0),
+            width,
+            height,
+            ReplayPanelViewport {
+                scroll: max_scroll,
+                focused: true,
+            },
+            &theme,
+        );
+
+        let top_rows = rendered_rows(&top);
+        let scrolled_rows = rendered_rows(&scrolled);
+        assert!(max_scroll > 0);
+        assert!(top_rows.iter().any(|row| row.contains("QUESTION")));
+        assert!(scrolled_rows.iter().any(|row| row.contains("Boundary 19")));
+        assert_eq!(top_rows[height - 1], scrolled_rows[height - 1]);
+        assert!(scrolled_rows[height - 1].contains("d "));
     }
 
     #[test]

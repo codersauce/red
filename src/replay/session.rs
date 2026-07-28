@@ -238,15 +238,25 @@ pub enum ReplayReviewDraftKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplayAgentScope {
-    /// Inspect the selected original change without staging source edits.
+    /// Answer a question about the selected original change without editing it.
     CurrentChange,
-    /// Inspect the complete pinned pull request without staging source edits.
+    /// Answer a question about the complete pinned pull request without editing it.
     PullRequest,
+    /// Explicitly propose one original-source inline review comment.
+    InlineComment,
+    /// Explicitly propose one pull-request-level review summary.
+    ReviewSummary,
     /// Propose reviewable edits against the verified original author's worktree.
     AuthorFix,
 }
 
 impl ReplayAgentScope {
+    /// Whether this turn should answer the reviewer directly in prose.
+    #[must_use]
+    pub const fn answers_question(self) -> bool {
+        matches!(self, Self::CurrentChange | Self::PullRequest)
+    }
+
     /// Whether this turn may stage original-author source proposals.
     #[must_use]
     pub const fn permits_source_proposals(self) -> bool {

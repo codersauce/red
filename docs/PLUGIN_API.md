@@ -150,9 +150,12 @@ hunks.
 
 `ReplayAgentStart(workspace_id, step_id, scope, prompt)` starts an isolated
 Codex turn owned by the exact Replay session. The `current_change` and
-`pull_request` scopes are enforced as read-only: their dynamic-tool host
-rejects source proposals and editor mutations, and generated text remains a
-transient suggestion. Only the reviewer's explicit acceptance may call
+`pull_request` scopes stream direct, private answers into the dedicated Replay
+pane. The explicitly selected `inline_comment` and `review_summary` scopes
+instead generate review-draft suggestions. All four scopes are enforced as
+read-only: their dynamic-tool host rejects source proposals and editor
+mutations, and generated text remains transient. Only the reviewer's explicit
+decision to promote and accept an answer or suggestion may call
 `ReplayAcceptAgentDraft(callback, workspace_id, step_id, kind, text)`, which
 creates an original-source-anchored local draft marked with `agent` provenance.
 PR-level summaries pass an empty step identity. Agent-generated source fixes
