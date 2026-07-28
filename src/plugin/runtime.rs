@@ -4045,10 +4045,7 @@ mod tests {
         ));
         let guide = recv_replay_guide();
         assert_eq!(guide.index, 0);
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::FocusPanel { id } if id == "replay-coach"
-        ));
+        recv_replay_source_focus("real-workspace-1", &plan.steps[0].id);
         plan
     }
 
@@ -4173,10 +4170,7 @@ mod tests {
             }),
             Some(review_role)
         );
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::FocusPanel { id } if id == "replay-coach"
-        ));
+        recv_replay_source_focus("github-workspace-482", &plan.steps[0].id);
         plan
     }
 
@@ -5441,10 +5435,7 @@ mod tests {
         assert_eq!(guide.pull_request, 0);
         assert_eq!(guide.branch, "feature/replay");
         assert!(guide.current_step().unwrap().diff.contains("\n@@ "));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::FocusPanel { id } if id == "replay-coach"
-        ));
+        recv_replay_source_focus("real-workspace-1", &plan.steps[0].id);
 
         runtime
             .notify(
@@ -5456,17 +5447,7 @@ mod tests {
         let next = recv_replay_guide();
         let next_step = next.current_step().unwrap();
         assert_eq!(next.index, 1);
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::ReplayFocusStepSource {
-                workspace_id,
-                step_id,
-            } if workspace_id == "real-workspace-1" && step_id == next_step.id
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::FocusPanel { id } if id == "replay-coach"
-        ));
+        recv_replay_source_focus("real-workspace-1", &next_step.id);
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
@@ -5684,6 +5665,83 @@ mod tests {
         assert_eq!(next_file.index, 1);
         assert!(next_file.notice.is_empty());
         recv_replay_source_focus("real-workspace-1", &plan.steps[1].id);
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_unreviewed_navigation_skips_only_genuinely_completed_changes() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let (plan, _) = open_replay_demo(&mut runtime).await;
+
+        runtime.execute_command("ReplayNext").await.unwrap();
+        assert_eq!(recv_replay_guide().index, 1);
+
+        runtime.execute_command("ReplayValidate").await.unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayDemoValidateStep {
+                request_id,
+                workspace_id,
+                step_id,
+            } => {
+                assert_eq!(workspace_id, "replay-workspace-1");
+                assert_eq!(step_id, plan.steps[1].id);
+                request_id
+            }
+            _ => panic!("expected validation of the actual second original hunk"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "replay-workspace-1",
+                    "step_id": plan.steps[1].id,
+                    "state": "exact",
+                    "revision": 1,
+                }),
+            )
+            .await
+            .unwrap();
+        let reviewed = recv_replay_guide();
+        assert_eq!(reviewed.completions.len(), 1);
+        assert_eq!(reviewed.completions[0].index, 1);
+
+        runtime.execute_command("ReplayPrevious").await.unwrap();
+        assert_eq!(recv_replay_guide().index, 0);
+
+        runtime
+            .execute_command("ReplayNextUnreviewed")
+            .await
+            .unwrap();
+        let next = recv_replay_guide();
+        assert_eq!(next.index, 2);
+        assert!(next.notice.is_empty());
+
+        runtime
+            .execute_command("ReplayPreviousUnreviewed")
+            .await
+            .unwrap();
+        assert_eq!(recv_replay_guide().index, 0);
+
+        runtime
+            .notify(
+                "panel:event:replay-coach",
+                serde_json::json!({ "action": "next_unreviewed" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recv_replay_guide().index, 2);
+
+        runtime
+            .notify(
+                "panel:event:replay-coach",
+                serde_json::json!({ "action": "previous_unreviewed" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recv_replay_guide().index, 0);
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
@@ -6175,10 +6233,7 @@ mod tests {
         assert_eq!(guide.head_commit, "b".repeat(40));
         assert_eq!(guide.draft_count, 1);
         assert!(guide.notice.contains("Review restored"));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::FocusPanel { id } if id == "replay-coach"
-        ));
+        recv_replay_source_focus("recovered-real-review", &plan.steps[1].id);
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
 
         runtime.execute_command("ReplayOutbox").await.unwrap();

@@ -3888,6 +3888,27 @@ impl Editor {
         }
         let source_buffer = self.buffer_manager[source_index].id();
         let source_line = self.replay_step_source_line(workspace_id, step_id, source_index);
+        let changed_line = source_line.map(|line| {
+            let offset = workspace
+                .plan
+                .steps
+                .iter()
+                .find(|step| step.id == step_id)
+                .and_then(|step| {
+                    crate::replay::parse_patch(&step.diff, self.replay_controller.limits()).ok()
+                })
+                .and_then(|patch| {
+                    let hunk = patch.files.first()?.hunks.first()?;
+                    hunk.removed_range
+                        .map(|range| range.start.saturating_sub(hunk.old_range.start))
+                        .or_else(|| {
+                            hunk.added_range
+                                .map(|range| range.start.saturating_sub(hunk.new_range.start))
+                        })
+                })
+                .unwrap_or_default();
+            line.saturating_add(offset)
+        });
         let (source_vtop, source_cx, source_cy) = source_line.map_or_else(
             || {
                 let source = &self.buffer_manager[source_index];
@@ -3913,6 +3934,18 @@ impl Editor {
         window.cy = source_cy;
         window.cursor_goal = CursorGoal::default();
         self.sync_with_window();
+        if let Some(line) = changed_line {
+            self.gutter_sign_manager.set(
+                "pr-replay-current-hunk".to_string(),
+                vec![plugin::GutterSign {
+                    buffer_index: source_index,
+                    line,
+                    text: "▸".to_string(),
+                    style: self.theme.ui_style.picker_prompt.clone(),
+                    priority: 25,
+                }],
+            );
+        }
         if let Some(workspace) = self.replay_demo_workspace.as_mut() {
             workspace.source_buffer = source_buffer;
         }
@@ -12035,6 +12068,18 @@ impl Editor {
                     {
                         "down"
                     }
+                    KeyCode::Left
+                        if event.modifiers.contains(KeyModifiers::SHIFT)
+                            && self.panel_manager.focused_replay_is_guide() =>
+                    {
+                        "horizontal_left"
+                    }
+                    KeyCode::Right
+                        if event.modifiers.contains(KeyModifiers::SHIFT)
+                            && self.panel_manager.focused_replay_is_guide() =>
+                    {
+                        "horizontal_right"
+                    }
                     KeyCode::Up | KeyCode::Char('k')
                         if self.panel_manager.focused_replay_status().is_some() =>
                     {
@@ -12047,6 +12092,18 @@ impl Editor {
                     }
                     KeyCode::Char('K') if self.panel_manager.focused_replay_is_guide() => "up",
                     KeyCode::Char('J') if self.panel_manager.focused_replay_is_guide() => "down",
+                    KeyCode::Char('H') if self.panel_manager.focused_replay_is_guide() => {
+                        "horizontal_left"
+                    }
+                    KeyCode::Char('L') if self.panel_manager.focused_replay_is_guide() => {
+                        "horizontal_right"
+                    }
+                    KeyCode::Char('n') if self.panel_manager.focused_replay_is_guide() => {
+                        "next_unreviewed"
+                    }
+                    KeyCode::Char('N') if self.panel_manager.focused_replay_is_guide() => {
+                        "previous_unreviewed"
+                    }
                     KeyCode::Up | KeyCode::Char('k') => "up",
                     KeyCode::Down | KeyCode::Char('j') => "down",
                     KeyCode::PageUp => "page_up",
@@ -25140,11 +25197,35 @@ mod test {
         assert!(editor.focus_replay_step_source(&workspace_id, &second));
         assert!(Path::new(editor.current_buffer().name()).ends_with("src/second.rs"));
         assert_eq!(editor.vtop + editor.cy, 0);
+        let second_index = editor
+            .replay_step_source_index(&workspace_id, &second)
+            .expect("second original source buffer");
+        assert_eq!(
+            editor
+                .gutter_sign_manager
+                .visible_sign(second_index, /*line*/ 1)
+                .map(|sign| sign.text.as_str()),
+            Some("▸"),
+        );
 
         assert!(editor.focus_replay_step_source(&workspace_id, &first));
         assert!(Path::new(editor.current_buffer().name()).ends_with("src/first.rs"));
         assert_eq!(editor.vtop + editor.cy, 120);
         assert_eq!(editor.vtop, 117);
+        let first_index = editor
+            .replay_step_source_index(&workspace_id, &first)
+            .expect("first original source buffer");
+        assert_eq!(
+            editor
+                .gutter_sign_manager
+                .visible_sign(first_index, /*line*/ 121)
+                .map(|sign| sign.text.as_str()),
+            Some("▸"),
+        );
+        assert!(editor
+            .gutter_sign_manager
+            .visible_sign(second_index, /*line*/ 1)
+            .is_none());
     }
 
     #[tokio::test]
@@ -25427,7 +25508,7 @@ mod test {
         let status = editor.test_statusline_row();
         assert!(status.contains("REPLAY"));
         assert!(status.contains("PR #482"));
-        assert!(status.contains("01/05"));
+        assert!(status.contains("CHANGE 01/05"));
         for (code, modifiers, expected_action) in [
             (KeyCode::Char('j'), KeyModifiers::NONE, "next"),
             (KeyCode::Down, KeyModifiers::NONE, "next"),
@@ -25435,6 +25516,16 @@ mod test {
             (KeyCode::Up, KeyModifiers::NONE, "previous"),
             (KeyCode::Char('J'), KeyModifiers::SHIFT, "down"),
             (KeyCode::Char('K'), KeyModifiers::SHIFT, "up"),
+            (KeyCode::Char('H'), KeyModifiers::SHIFT, "horizontal_left"),
+            (KeyCode::Char('L'), KeyModifiers::SHIFT, "horizontal_right"),
+            (KeyCode::Left, KeyModifiers::SHIFT, "horizontal_left"),
+            (KeyCode::Right, KeyModifiers::SHIFT, "horizontal_right"),
+            (KeyCode::Char('n'), KeyModifiers::NONE, "next_unreviewed"),
+            (
+                KeyCode::Char('N'),
+                KeyModifiers::SHIFT,
+                "previous_unreviewed",
+            ),
             (KeyCode::Char('d'), KeyModifiers::CONTROL, "half_page_down"),
             (KeyCode::Char('u'), KeyModifiers::CONTROL, "half_page_up"),
             (KeyCode::Enter, KeyModifiers::NONE, "activate"),

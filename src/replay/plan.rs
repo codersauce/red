@@ -113,7 +113,7 @@ pub fn replay_presentation_plan(
                 ordinal: step.ordinal,
                 path: step.path.clone(),
                 kind: step.kind.clone(),
-                title: step.title.clone(),
+                title: refined_presentation_title(step, &hunk.before, &hunk.after),
                 why: step.why.clone(),
                 task: step.task.clone(),
                 hint: step.hint.clone(),
@@ -142,6 +142,19 @@ pub fn replay_presentation_plan(
     }
 
     Ok(presentation)
+}
+
+fn refined_presentation_title(step: &ReplayDemoStep, before: &str, after: &str) -> String {
+    let filename = Path::new(&step.path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&step.path);
+    if step.title == format!("Update {filename}") {
+        if let Some(title) = invocation_change_title(before, after) {
+            return title;
+        }
+    }
+    step.title.clone()
 }
 
 /// Compiles exact, source-backed presentation steps for a confirmed worktree.
@@ -405,6 +418,9 @@ fn replay_title(step: &ReplayStep, path: &str) -> String {
                 return named_change_title(step.kind, binding, symbol);
             }
         }
+        if let Some(title) = invocation_change_title(&step.before, &step.after) {
+            return title;
+        }
         return format!("Update {symbol}");
     }
 
@@ -433,6 +449,10 @@ fn replay_title(step: &ReplayStep, path: &str) -> String {
             return format!("Update {component} documentation");
         }
         return "Update documentation".to_string();
+    }
+
+    if let Some(title) = invocation_change_title(&step.before, &step.after) {
+        return title;
     }
 
     if let Some(module) = changed_module(step) {
@@ -610,6 +630,121 @@ fn changed_source_lines(step: &ReplayStep) -> Vec<&str> {
         }
     }
     result
+}
+
+/// Describe an actual changed function argument without inventing author intent.
+fn invocation_change_title(before: &str, after: &str) -> Option<String> {
+    let original = source_invocations(before);
+    for (name, updated_arguments) in source_invocations(after) {
+        let Some((_, original_arguments)) = original
+            .iter()
+            .find(|(original_name, _)| original_name == &name)
+        else {
+            continue;
+        };
+        if original_arguments == &updated_arguments {
+            continue;
+        }
+
+        let added = updated_arguments
+            .iter()
+            .filter(|argument| !original_arguments.contains(argument))
+            .collect::<Vec<_>>();
+        let removed = original_arguments
+            .iter()
+            .filter(|argument| !updated_arguments.contains(argument))
+            .collect::<Vec<_>>();
+        if added.len() == 1 && removed.is_empty() {
+            return Some(format!("Pass {} to {name}", added[0]));
+        }
+        if removed.len() == 1 && added.is_empty() {
+            return Some(format!("Stop passing {} to {name}", removed[0]));
+        }
+        return Some(format!("Update {name} arguments"));
+    }
+    None
+}
+
+fn source_invocations(source: &str) -> Vec<(String, Vec<String>)> {
+    let source = source
+        .char_indices()
+        .nth(MAX_SEMANTIC_SOURCE_CHARS)
+        .map_or(source, |(end, _)| &source[..end]);
+    let bytes = source.as_bytes();
+    let mut invocations = Vec::new();
+
+    for (open, character) in source.char_indices() {
+        if character != '(' {
+            continue;
+        }
+        let mut end = open;
+        while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        let mut start = end;
+        while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+            start -= 1;
+        }
+        let name = &source[start..end];
+        if !is_source_identifier(name)
+            || matches!(
+                name,
+                "if" | "while" | "for" | "match" | "loop" | "Some" | "None" | "Ok" | "Err"
+            )
+            || source[..start].split_whitespace().last() == Some("fn")
+        {
+            continue;
+        }
+
+        let mut depth = 1_usize;
+        let mut close = open + 1;
+        while close < bytes.len() && depth > 0 {
+            match bytes[close] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            close += 1;
+        }
+        if depth != 0 {
+            continue;
+        }
+        invocations.push((
+            name.to_string(),
+            invocation_arguments(&source[open + 1..close - 1]),
+        ));
+    }
+
+    invocations
+}
+
+fn invocation_arguments(source: &str) -> Vec<String> {
+    let mut arguments = Vec::new();
+    let mut start = 0;
+    let mut depth = 0_usize;
+    for (index, character) in source.char_indices() {
+        match character {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                if let Some(argument) = invocation_argument(&source[start..index]) {
+                    arguments.push(argument.to_string());
+                }
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if let Some(argument) = invocation_argument(&source[start..]) {
+        arguments.push(argument.to_string());
+    }
+    arguments
+}
+
+fn invocation_argument(argument: &str) -> Option<&str> {
+    argument
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .find(|word| is_source_identifier(word) && !matches!(*word, "mut" | "ref" | "self"))
 }
 
 fn source_symbol(heading: &str) -> Option<(&str, &str)> {
@@ -1246,6 +1381,71 @@ mod tests {
         assert_eq!(
             replay_hint(&step, "src/pager_overlay.rs"),
             "At src/pager_overlay.rs:1, add `should_load_older` to `TranscriptOverlay`; preserve the surrounding original implementation.",
+        );
+    }
+
+    #[test]
+    fn real_plan_names_the_actual_added_function_argument() {
+        let (_directory, session) = source_session(MULTI_FILE_PATCH);
+        let mut step = session.steps[0].clone();
+        step.heading.clear();
+        step.before =
+            "let _ = self.handle_backtrack_overlay_event(tui, event).await?;\n".to_string();
+        step.after = concat!(
+            "let _ = self\n",
+            "    .handle_backtrack_overlay_event(tui, app_server, event)\n",
+            "    .await?;\n",
+        )
+        .to_string();
+
+        assert_eq!(
+            replay_title(&step, "codex-rs/tui/src/app.rs"),
+            "Pass app_server to handle_backtrack_overlay_event",
+        );
+    }
+
+    #[test]
+    fn recovered_generic_title_is_refined_from_the_unchanged_original_hunk() {
+        let mut plan = replay_demo_plan().expect("source-backed original replay plan");
+        let step = &mut plan.steps[0];
+        step.title = "Update rendering.rs".to_string();
+        step.diff = concat!(
+            "diff --git a/src/editor/rendering.rs b/src/editor/rendering.rs\n",
+            "--- a/src/editor/rendering.rs\n",
+            "+++ b/src/editor/rendering.rs\n",
+            "@@ -1 +1,3 @@\n",
+            "-let _ = self.handle_backtrack_overlay_event(tui, event).await?;\n",
+            "+let _ = self\n",
+            "+    .handle_backtrack_overlay_event(tui, app_server, event)\n",
+            "+    .await?;\n",
+        )
+        .to_string();
+        let original_patch = step.diff.clone();
+
+        let presentation = replay_presentation_plan(&plan, ReplayLimits::default())
+            .expect("preserve and project the independently parseable original hunk");
+
+        assert_eq!(
+            presentation.steps[0].title,
+            "Pass app_server to handle_backtrack_overlay_event",
+        );
+        assert_eq!(presentation.steps[0].diff, original_patch);
+        assert_eq!(plan.steps[0].title, "Update rendering.rs");
+    }
+
+    #[test]
+    fn recovered_explicit_change_title_is_never_replaced_by_a_heuristic() {
+        let mut step = replay_demo_plan()
+            .expect("source-backed original replay plan")
+            .steps
+            .remove(0);
+        step.title = "Preserve the explicitly reviewed application boundary".to_string();
+        let before = "handle_backtrack_overlay_event(tui, event);\n";
+        let after = "handle_backtrack_overlay_event(tui, app_server, event);\n";
+
+        assert_eq!(
+            refined_presentation_title(&step, before, after),
+            "Preserve the explicitly reviewed application boundary",
         );
     }
 

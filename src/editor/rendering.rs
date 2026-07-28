@@ -1772,19 +1772,26 @@ impl Editor {
         }
 
         let outbox_position = self.panel_manager.focused_replay_outbox_position();
+        let restored_review = self
+            .panel_manager
+            .focused_replay_notice()
+            .is_some_and(|notice| notice.starts_with("Review restored"));
         let replay_status = self.panel_manager.focused_replay_status().map(
             |(pull_request, branch, index, total)| {
-                let file = if pull_request == 0 {
+                let mut file = if pull_request == 0 {
                     format!(" {branch}")
                 } else {
                     format!(" PR #{pull_request}")
                 };
+                if restored_review {
+                    file.push_str(" · ✓ restored");
+                }
                 let position = match outbox_position {
                     Some((_, 0)) => " OUTBOX ".to_string(),
                     Some((selected, count)) => {
                         format!(" OUTBOX {:02}/{:02} ", selected + 1, count)
                     }
-                    None => format!(" {:02}/{:02} ", index + 1, total),
+                    None => format!(" CHANGE {:02}/{:02} ", index + 1, total),
                 };
                 (file, position)
             },

@@ -415,6 +415,28 @@ impl TextPanel {
         self.move_scroll(delta.saturating_mul(half_page), panel_height, panel_width);
     }
 
+    fn move_replay_horizontal(&mut self, delta: isize, panel_width: usize) {
+        let Some(replay) = self.replay.as_mut() else {
+            return;
+        };
+        let gutter_width = if panel_width >= 72 { 13 } else { 7 };
+        let code_width = panel_width.saturating_sub(gutter_width);
+        let maximum_offset = replay
+            .document
+            .lines
+            .iter()
+            .filter(|line| line.kind != "hunk")
+            .map(|line| display_width(&line.text))
+            .max()
+            .unwrap_or_default()
+            .saturating_sub(code_width.saturating_sub(1));
+        replay.model.horizontal_offset = replay
+            .model
+            .horizontal_offset
+            .saturating_add_signed(delta)
+            .min(maximum_offset);
+    }
+
     fn scroll_to_top(&mut self) {
         self.viewport.scroll_to_top();
         self.scroll = self.viewport.offset();
@@ -1038,6 +1060,20 @@ impl PanelManager {
         ))
     }
 
+    /// Return the active review notice only while the Replay pane owns focus.
+    pub(crate) fn focused_replay_notice(&self) -> Option<&str> {
+        let id = self.focused.as_deref()?;
+        let notice = self
+            .text_panels
+            .get(id)?
+            .replay
+            .as_ref()?
+            .model
+            .notice
+            .as_str();
+        (!notice.trim().is_empty()).then_some(notice)
+    }
+
     /// Whether the focused Replay surface owns source-reconstruction actions.
     pub(crate) fn focused_replay_is_guide(&self) -> bool {
         self.focused
@@ -1154,6 +1190,8 @@ impl PanelManager {
                 "down" => panel.move_scroll(1, panel_height, width),
                 "half_page_up" => panel.half_page_scroll(-1, panel_height, width),
                 "half_page_down" => panel.half_page_scroll(1, panel_height, width),
+                "horizontal_left" => panel.move_replay_horizontal(-12, width),
+                "horizontal_right" => panel.move_replay_horizontal(12, width),
                 "page_up" => {
                     panel.page_scroll(-1, panel_height, width);
                 }
@@ -2601,6 +2639,7 @@ mod tests {
             mode,
             hint_visible: false,
             rationale_expanded: false,
+            horizontal_offset: 0,
             help_visible: false,
             notice: String::new(),
             notes: Vec::new(),
@@ -3179,7 +3218,8 @@ mod tests {
             .expect("pinned change list");
         let footer_row = placement.y + placement.height - 1;
         assert!(rows[0].contains("PR REPLAY"));
-        assert!(rows[0].contains("01 / 05"));
+        assert!(!rows[0].contains("01 / 05"));
+        assert!(rows[change_row].contains("01/05"));
         assert!(rows.iter().any(|line| line.starts_with("WHY")));
         assert!(rows.iter().any(|line| line.contains("visible_start")));
         assert!(rows.iter().all(|line| !line.contains("diff --git")));
@@ -3298,6 +3338,63 @@ mod tests {
     }
 
     #[test]
+    fn replay_horizontal_panning_keeps_original_source_and_selected_step() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "replay-coach".to_string(),
+            PanelConfig {
+                side: PanelSide::Left,
+                width: 24,
+                title: Some("PR REPLAY".to_string()),
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_text_panel(
+            "replay-coach",
+            vec![structured_replay_block(ReplayPanelMode::Challenge)],
+            /*panel_height*/ 22,
+            /*terminal_width*/ 60,
+        );
+        assert!(manager.focus_panel("replay-coach"));
+        let original_patch = manager.text_panels["replay-coach"]
+            .replay
+            .as_ref()
+            .unwrap()
+            .model
+            .steps[0]
+            .diff
+            .clone();
+
+        let event = manager
+            .handle_focused_key(
+                "horizontal_right",
+                /*panel_height*/ 22,
+                /*terminal_width*/ 60,
+                /*scrolloff*/ 0,
+            )
+            .expect("pan the exact original source to the right");
+        assert_eq!(event.action, "horizontal_right");
+        let replay = manager.text_panels["replay-coach"].replay.as_ref().unwrap();
+        assert!(replay.model.horizontal_offset > 0);
+        assert_eq!(replay.model.index, 0);
+        assert_eq!(replay.model.steps[0].diff, original_patch);
+
+        let event = manager
+            .handle_focused_key(
+                "horizontal_left",
+                /*panel_height*/ 22,
+                /*terminal_width*/ 60,
+                /*scrolloff*/ 0,
+            )
+            .expect("return the original source to its unchanged first column");
+        assert_eq!(event.action, "horizontal_left");
+        let replay = manager.text_panels["replay-coach"].replay.as_ref().unwrap();
+        assert_eq!(replay.model.horizontal_offset, 0);
+        assert_eq!(replay.model.index, 0);
+        assert_eq!(replay.model.steps[0].diff, original_patch);
+    }
+
+    #[test]
     fn focused_replay_exposes_its_caret_status_and_theme_derived_separator() {
         let mut manager = PanelManager::default();
         manager.create_text_panel(
@@ -3359,6 +3456,45 @@ mod tests {
             ),
             None,
         );
+    }
+
+    #[test]
+    fn recovered_review_notice_is_exposed_only_while_replay_has_focus() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "replay-coach".to_string(),
+            PanelConfig {
+                side: PanelSide::Left,
+                width: 46,
+                title: Some("PR REPLAY".to_string()),
+                ..PanelConfig::default()
+            },
+        );
+        let mut block = structured_replay_block(ReplayPanelMode::Challenge);
+        let mut model: ReplayPanelModel = serde_json::from_str(&block.text).unwrap();
+        model.notice = "Review restored · progress, findings, and drafts recovered.".to_string();
+        block.text = serde_json::to_string(&model).unwrap();
+        manager.update_text_panel(
+            "replay-coach",
+            vec![block],
+            /*panel_height*/ 26,
+            /*terminal_width*/ 100,
+        );
+
+        assert_eq!(manager.focused_replay_notice(), None);
+        assert!(manager.focus_panel("replay-coach"));
+        assert_eq!(
+            manager.focused_replay_notice(),
+            Some("Review restored · progress, findings, and drafts recovered."),
+        );
+
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let mut buffer = RenderBuffer::new(/*width*/ 100, /*height*/ 28, &theme.style);
+        manager.render(&mut buffer, &theme);
+        assert!(!(0..28).any(|row| row_text(&buffer, row).contains("Review restored")));
+
+        manager.focus_editor();
+        assert_eq!(manager.focused_replay_notice(), None);
     }
 
     #[test]

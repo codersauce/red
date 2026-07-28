@@ -43,6 +43,16 @@ pub fn activate() {
         category: "PR Replay",
         description: "Show the previous pull request reconstruction exercise",
     });
+    red::add_command("ReplayNextUnreviewed", next_unreviewed, Json {
+        title: "Next unreviewed replay step",
+        category: "PR Replay",
+        description: "Jump to the next original change that has not been reviewed",
+    });
+    red::add_command("ReplayPreviousUnreviewed", previous_unreviewed, Json {
+        title: "Previous unreviewed replay step",
+        category: "PR Replay",
+        description: "Jump to the previous original change that has not been reviewed",
+    });
     red::add_command("ReplayNextFile", next_file, Json {
         title: "Next replay file",
         category: "PR Replay",
@@ -633,7 +643,11 @@ fn workspace_opened(event: Json) {
     }
     ensure_panel();
     render();
-    red::execute("FocusPanel", "replay-coach");
+    if red::string(red::state("replay_source_kind"), "demo") == "demo" {
+        red::execute("FocusPanel", "replay-coach");
+    } else {
+        sync_selected_source();
+    }
 }
 
 fn ensure_panel() {
@@ -705,6 +719,10 @@ fn panel_event(event: Json) {
         } else {
             previous();
         }
+    } else if action == "next_unreviewed" && !in_outbox {
+        next_unreviewed();
+    } else if action == "previous_unreviewed" && !in_outbox {
+        previous_unreviewed();
     } else if action == "activate" && !in_outbox {
         toggle_rationale();
     } else if action == "next_file" || action == "]" {
@@ -786,6 +804,50 @@ fn previous() {
     red::state_set("replay_view", "guide");
     render();
     sync_selected_source();
+}
+
+fn next_unreviewed() {
+    if !ensure_workspace() {
+        return;
+    }
+    let steps = red::state("replay_steps");
+    let candidate = red::int(red::state("replay_index"), 0) + 1;
+    while candidate < red::len(steps) {
+        if !step_is_reviewed(candidate) {
+            select_file_step(candidate);
+            return;
+        }
+        candidate = candidate + 1;
+    }
+    red::state_set("replay_notice", "No later unreviewed changes.");
+    red::state_set("replay_view", "guide");
+    render();
+}
+
+fn previous_unreviewed() {
+    if !ensure_workspace() {
+        return;
+    }
+    let candidate = red::int(red::state("replay_index"), 0) - 1;
+    while candidate >= 0 {
+        if !step_is_reviewed(candidate) {
+            select_file_step(candidate);
+            return;
+        }
+        candidate = candidate - 1;
+    }
+    red::state_set("replay_notice", "No earlier unreviewed changes.");
+    red::state_set("replay_view", "guide");
+    render();
+}
+
+fn step_is_reviewed(index: int) -> bool {
+    for completion in red::state("replay_completions") {
+        if red::int(completion.index, -1) == index {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn next_file() {
@@ -897,8 +959,18 @@ fn toggle_help() {
             data: Json {},
         },
         PickerItem {
+            id: "unreviewed",
+            label: "NAV   n / N           next / previous unreviewed",
+            data: Json {},
+        },
+        PickerItem {
             id: "scroll-lines",
             label: "NAV   J/K             scroll the diff",
+            data: Json {},
+        },
+        PickerItem {
+            id: "scroll-horizontal",
+            label: "NAV   H/L · ⇧←/→      pan clipped source",
             data: Json {},
         },
         PickerItem {

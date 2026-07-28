@@ -156,7 +156,7 @@ For a GitHub pull request, the guide verifies the authenticated GitHub viewer
 against the original pull-request author, repository, head branch, and exact
 head commit. The header then shows one honest role:
 
-- `AUTHOR`: you are the verified original PR author. You can draft inline
+- `YOUR PR`: you are the verified original PR author. You can draft inline
   comments, PR-level summaries, and proposed fixes to your own PR.
 - `REVIEW`: you are reviewing another user's PR, or ownership could not be
   verified. You can draft inline comments and PR-level summaries; proposing a
@@ -199,7 +199,7 @@ the preview preserves the exact author-owned fork and original remote branch;
 it never substitutes the base repository's `origin`.
 
 The selected original source file opens as a real, editable Red buffer. The
-Replay pane displays **AUTHOR · PR HEAD** so it cannot be mistaken for a
+Replay pane displays **YOUR PR · PR HEAD** so it cannot be mistaken for a
 merge-base learning source. The editor can open and edit any real file in the
 author worktree through its normal buffer lifecycle; the existing learning
 scratch, progress, private review, and original checkout remain untouched.
@@ -323,24 +323,27 @@ unchanged.
 | `Space R q` | Hide the coach without touching the scratch source or progress. |
 
 While the dedicated coach is focused, `j` and `k` or the down and up arrows
-select the next and previous reconstruction steps. `J` and `K` scroll the
-original hunk one line, `Ctrl-d` and `Ctrl-u` scroll it half a page, and
+select the next and previous reconstruction steps. `n` and `N` jump to the next
+and previous genuinely unreviewed changes. `J` and `K` scroll the original hunk
+one line, `Ctrl-d` and `Ctrl-u` scroll it half a page, and
 `Ctrl-f`, `Ctrl-b`, Page Down, and Page Up scroll it a full page. The mouse wheel
 also scrolls the hunk without changing the selected step. `[` and `]` jump
-between changed files, as do the left and right arrows or `h` and `l`. Press
-`Enter` to expand or collapse the full rationale. Outside the focused coach,
-those keys retain their existing editor and Git-hunk motions. The older `p`/`n`
-step bindings remain compatibility aliases. Use `Space R h` for a hint; it replaces
+between changed files, as do the left and right arrows or `h` and `l`. `H` and
+`L`, or Shift-Left and Shift-Right, pan long original diff lines without wrapping,
+changing, or hiding the original hunk. Press `Enter` to expand or collapse the
+full rationale. Outside the focused coach, those keys retain their existing
+editor and Git-hunk motions. The older `Space R n` and `Space R p` step bindings
+remain compatibility aliases. Use `Space R h` for a hint; it replaces
 the rationale in place without moving the change list or the diff. `i`, `a`,
 `u`, `m`, `v`, `o`, `f`, `c`, `F`, `W`, `r`, `s`, `e`, `d`, `P`, `S`, `L`, `q`,
 and `?` act directly on the Replay pane. The `?` key opens an Esc-closeable
 shortcut popup and restores focus to the Replay pane on dismissal. The pinned
 action bar uses theme-colored, unbracketed keys and keeps source editing,
 validation, immediate application, safe undo, change navigation, and help
-discoverable without rearranging the review. The title shows the selected step
-separately from the number of genuinely reviewed changes. A `✓` identifies a
-manually reconstructed step; `⊕` identifies an automatic
-application.
+discoverable without rearranging the review. The changes heading shows the
+selected position, while the review metadata reports genuinely completed
+changes. A `✓` identifies a manually reconstructed step, `⊕` identifies an
+automatic application, and `✎` identifies an actual private note or inline draft.
 
 Every step always displays its exact, independently parseable unified diff.
 Challenge mode emphasizes manually reconstructing the hunk in the real source
