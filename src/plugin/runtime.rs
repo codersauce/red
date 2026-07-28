@@ -999,6 +999,12 @@ impl RedHost {
                 let status = args.get(1).map(value_to_string);
                 self.send_request(PluginRequest::UpdatePickerStatus { id, status });
             }
+            "UpdatePickerBusy" => {
+                let id = args.first().and_then(value_to_i32).unwrap_or(1);
+                self.ensure_picker_owner(plugin, id, "UpdatePickerBusy")?;
+                let busy = args.get(1).and_then(Value::as_bool).unwrap_or(false);
+                self.send_request(PluginRequest::UpdatePickerBusy { id, busy });
+            }
             "ClosePicker" => {
                 let id = args.first().and_then(value_to_i32).unwrap_or(1);
                 self.ensure_picker_owner(plugin, id, "ClosePicker")?;
@@ -3774,6 +3780,7 @@ mod tests {
                     options.status.as_deref(),
                     Some("Looking for saved reviews…")
                 );
+                assert!(options.busy);
                 handle
             }
             _ => panic!("expected visible Replay loading feedback before review discovery"),
@@ -3786,6 +3793,11 @@ mod tests {
     }
 
     fn recv_replay_review_items(handle: PickerHandle) -> Vec<PickerItem> {
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerBusy { id, busy }
+                if id == handle.get() && !busy
+        ));
         let items = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdatePickerItems { id, items } => {
                 assert_eq!(id, handle.get());
@@ -5078,6 +5090,11 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerBusy { id, busy }
+                if id == handle.get() && !busy
+        ));
         let start_new = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdatePickerItems { id, mut items } => {
                 assert_eq!(id, handle.get());
@@ -15339,6 +15356,68 @@ mod tests {
         assert!(!runtime
             .notify_picker(stale_handle, PickerCallback::Cancelled)
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn picker_busy_updates_remain_scoped_to_the_callback_owner() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let owner = r#"
+            pub fn activate() {
+                red::add_command("OpenBusyPicker", open);
+                red::add_command("StopBusyPicker", stop);
+            }
+            fn open() {
+                let picker = red::execute("OpenPicker", "Loading", [], PickerOptions {
+                    status: "Loading saved reviews",
+                    busy: true,
+                }, PickerHandlers { cancelled: cancelled });
+                red::state_set("busy_picker", picker);
+            }
+            fn stop() {
+                red::execute("UpdatePickerBusy", red::state("busy_picker"), false);
+            }
+            fn cancelled(event: PickerCancelled) {}
+        "#;
+        let intruder = r#"
+            pub fn activate() { red::add_command("StopForeignPicker", stop); }
+            fn stop() { red::execute("UpdatePickerBusy", 1, false); }
+        "#;
+        let mut runtime = Runtime::new();
+        runtime.load_plugin("owner", owner).await.unwrap();
+        runtime.load_plugin("intruder", intruder).await.unwrap();
+
+        runtime.execute_command("OpenBusyPicker").await.unwrap();
+        let handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                owner,
+                handle,
+                options,
+                ..
+            } => {
+                assert_eq!(owner, "owner");
+                assert!(options.busy);
+                handle
+            }
+            _ => panic!("expected an owner-scoped picker with an active spinner"),
+        };
+        assert_eq!(handle.get(), 1);
+
+        let error = runtime
+            .execute_command("StopForeignPicker")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot mutate picker 1 owned by plugin `owner`"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime.execute_command("StopBusyPicker").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerBusy { id, busy }
+                if id == handle.get() && !busy
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
     #[tokio::test]

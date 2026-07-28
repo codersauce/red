@@ -21,7 +21,7 @@ use std::{
     io::{self, BufRead as _, BufReader, Read as _, Seek as _, SeekFrom},
     path::PathBuf,
     sync::Arc,
-    time::SystemTime,
+    time::{Instant, SystemTime},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -38,7 +38,8 @@ use crate::{
 };
 
 use super::{
-    dialog::BorderStyle, first_prompt_line, Component, Dialog, IconCatalog, List, ScreenRect,
+    dialog::BorderStyle, first_prompt_line, spinner_frame, Component, Dialog, IconCatalog, List,
+    ScreenRect, SPINNER_FRAME_INTERVAL_MS,
 };
 
 type SelectAction = Box<dyn Fn(String) -> Action + Send>;
@@ -145,6 +146,8 @@ pub struct PickerOptions {
     #[serde(default)]
     pub status: Option<String>,
     #[serde(default)]
+    pub busy: bool,
+    #[serde(default)]
     pub actions: Vec<PickerKeyAction>,
     #[serde(default)]
     pub preview: Option<PickerPreview>,
@@ -174,6 +177,7 @@ pub enum PickerUpdate {
     Items(Vec<PickerItem>),
     Query(String),
     Status(Option<String>),
+    Busy(bool),
     Preview(Option<PickerPreview>),
 }
 
@@ -288,6 +292,8 @@ pub struct Picker {
     command_column_widths: Cell<Option<CommandColumns>>,
     external_filter: bool,
     status: Option<String>,
+    busy_since: Option<Instant>,
+    busy_frame: u64,
     key_actions: Vec<PickerKeyAction>,
     preview: Option<PickerPreview>,
     item_preview_root: Option<PathBuf>,
@@ -434,6 +440,8 @@ impl Picker {
             command_column_widths: Cell::new(None),
             external_filter: false,
             status: None,
+            busy_since: None,
+            busy_frame: 0,
             key_actions: Vec::new(),
             preview: None,
             item_preview_root: None,
@@ -504,6 +512,7 @@ impl Picker {
         picker.external_filter = options.external_filter;
         picker.placeholder = options.placeholder;
         picker.status = options.status;
+        picker.set_busy(options.busy);
         picker.key_actions = options.actions;
         picker.preview = options.preview;
         picker.search = options.initial_query;
@@ -687,6 +696,7 @@ impl Picker {
                 self.reset_preview_scroll_if_selection_changed(previous);
             }
             PickerUpdate::Status(status) => self.status = status,
+            PickerUpdate::Busy(busy) => self.set_busy(busy),
             PickerUpdate::Preview(preview) => self.preview = preview,
         }
         true
@@ -718,6 +728,18 @@ impl Picker {
 
     pub fn set_status(&mut self, status: Option<String>) {
         self.status = status;
+    }
+
+    fn set_busy(&mut self, busy: bool) {
+        if busy {
+            if self.busy_since.is_none() {
+                self.busy_since = Some(Instant::now());
+                self.busy_frame = 0;
+            }
+        } else {
+            self.busy_since = None;
+            self.busy_frame = 0;
+        }
     }
 
     pub(crate) fn query(&self) -> &str {
@@ -1386,7 +1408,15 @@ impl Picker {
             .or(self.status.as_deref())
             .or(file_status.as_deref())
         {
-            let status = truncate_display_width(status, self.width.saturating_sub(4));
+            let status = if let Some(since) = self.busy_since {
+                Cow::Owned(format!(
+                    "{} {status}",
+                    spinner_frame(since.elapsed().as_millis() as u64)
+                ))
+            } else {
+                Cow::Borrowed(status)
+            };
+            let status = truncate_display_width(&status, self.width.saturating_sub(4));
             let status = format!(" {status} ");
             let status_x = self.x + self.width + 1 - display_width(&status);
             buffer.set_text(
@@ -2660,6 +2690,18 @@ fn merge_preview_style(base: &Style, syntax: &Style) -> Style {
 }
 
 impl Component for Picker {
+    fn tick(&mut self) -> anyhow::Result<bool> {
+        let Some(since) = self.busy_since else {
+            return Ok(false);
+        };
+        let frame = since.elapsed().as_millis() as u64 / SPINNER_FRAME_INTERVAL_MS;
+        if frame == self.busy_frame {
+            return Ok(false);
+        }
+        self.busy_frame = frame;
+        Ok(true)
+    }
+
     fn update_picker(&mut self, id: i32, update: PickerUpdate) -> bool {
         self.apply_update(id, update)
     }
@@ -3468,6 +3510,43 @@ mod tests {
         picker.draw(&mut buffer).unwrap();
 
         assert!(render_row(&buffer, picker.y + 1).contains("Loading files..."));
+    }
+
+    #[test]
+    fn busy_picker_animates_a_shared_braille_spinner_in_its_status() {
+        let editor = test_editor();
+        let mut picker = Picker::new_dynamic(
+            Some("Reviews".to_string()),
+            &editor,
+            Vec::new(),
+            42,
+            PickerOptions {
+                status: Some("Looking for saved reviews…".to_string()),
+                busy: true,
+                ..PickerOptions::default()
+            },
+        );
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+        let status_y = picker.layout().separator_y;
+
+        picker.draw(&mut buffer).unwrap();
+        assert!(render_row(&buffer, status_y).contains("⠋ Looking for saved reviews…"));
+        assert!(!picker.tick().unwrap());
+
+        picker.busy_since = Some(
+            std::time::Instant::now()
+                - std::time::Duration::from_millis(super::SPINNER_FRAME_INTERVAL_MS),
+        );
+        assert!(picker.tick().unwrap());
+        picker.draw(&mut buffer).unwrap();
+        assert!(render_row(&buffer, status_y).contains("⠙ Looking for saved reviews…"));
+
+        assert!(picker.apply_update(42, PickerUpdate::Busy(false)));
+        assert!(!picker.tick().unwrap());
+        picker.draw(&mut buffer).unwrap();
+        let status = render_row(&buffer, status_y);
+        assert!(status.contains("Looking for saved reviews…"));
+        assert!(!status.contains('⠙'));
     }
 
     #[test]

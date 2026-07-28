@@ -271,6 +271,7 @@ fn open() {
     let picker = red::execute("OpenPicker", "PR Replay Reviews", [], PickerOptions {
         placeholder: "Filter saved reviews",
         status: "Looking for saved reviews…",
+        busy: true,
     }, PickerHandlers {
         selected: review_selected,
         cancelled: review_picker_cancelled,
@@ -290,6 +291,7 @@ fn reviews_listed(result: Json, request_id: i32) {
         return;
     }
     if !red::bool(result.ok, false) {
+        red::execute("UpdatePickerBusy", picker, false);
         red::execute("UpdatePickerItems", picker, [PickerItem {
             id: "start-new",
             label: "Start a new review",
@@ -350,6 +352,7 @@ fn reviews_listed(result: Json, request_id: i32) {
         label: "Start a new review",
         data: Json {},
     });
+    red::execute("UpdatePickerBusy", picker, false);
     red::execute("UpdatePickerItems", picker, items);
     red::execute(
         "UpdatePickerStatus",

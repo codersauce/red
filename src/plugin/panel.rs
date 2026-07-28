@@ -26,7 +26,10 @@ use super::text_link::{TextPanelLink, TextPanelLinkTarget};
 use crate::{
     editor::{render_buffer::RenderBuffer, Point},
     theme::{SelectionForegroundPriority, Style, Theme, ThemeStyleSpec},
-    ui::{paint_rich_text, wrap_text, FollowTailViewport, PromptBuffer, PROMPT_MAX_BYTES},
+    ui::{
+        paint_rich_text, spinner_frame, wrap_text, FollowTailViewport, PromptBuffer,
+        PROMPT_MAX_BYTES, SPINNER_FRAME_COUNT, SPINNER_FRAME_INTERVAL_MS,
+    },
     unicode_utils::{display_width, fit_display_width, grapheme_len, truncate_display_width},
 };
 
@@ -226,14 +229,6 @@ pub struct TextPanel {
     status: Option<TextPanelStatus>,
     busy_since: Option<Instant>,
     selected_link: Option<u64>,
-}
-
-const TEXT_PANEL_SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const TEXT_PANEL_SPINNER_INTERVAL_MS: u64 = 120;
-
-fn spinner_frame(elapsed_ms: u64) -> &'static str {
-    let index = (elapsed_ms / TEXT_PANEL_SPINNER_INTERVAL_MS) as usize;
-    TEXT_PANEL_SPINNER_FRAMES[index % TEXT_PANEL_SPINNER_FRAMES.len()]
 }
 
 fn format_elapsed(seconds: u64) -> String {
@@ -1419,8 +1414,7 @@ impl PanelManager {
                     return None;
                 }
                 let elapsed_ms = panel.busy_since?.elapsed().as_millis() as u64;
-                let frame = (elapsed_ms / TEXT_PANEL_SPINNER_INTERVAL_MS)
-                    % TEXT_PANEL_SPINNER_FRAMES.len() as u64;
+                let frame = (elapsed_ms / SPINNER_FRAME_INTERVAL_MS) % SPINNER_FRAME_COUNT as u64;
                 Some((id.clone(), frame as u8, elapsed_ms / 1000))
             })
             .collect::<Vec<_>>();

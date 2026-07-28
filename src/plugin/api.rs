@@ -489,6 +489,14 @@ mod tests {
         assert_eq!(picker.introduced, "0.3.0");
         assert!(picker.signature.contains("PickerHandlers"));
 
+        let picker_busy = HOST_API
+            .calls
+            .iter()
+            .find(|call| call.kind == "execute" && call.name == "UpdatePickerBusy")
+            .expect("picker loading animation must be present in the host API schema");
+        assert_eq!(picker_busy.signature, "(id: i32, busy: bool)");
+        assert_eq!(picker_busy.introduced, "0.5.1");
+
         let archive = HOST_API
             .calls
             .iter()

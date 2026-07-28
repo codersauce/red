@@ -23,6 +23,7 @@ mod picker;
 mod prompt_buffer;
 mod rich_text;
 mod selection;
+mod spinner;
 
 pub use action_bar::{
     ActionBar, ActionBarLayout, ActionBarRole, ActionBarSpan, ActionMode, ActionPriority, UiAction,
@@ -50,6 +51,7 @@ pub(crate) use prompt_buffer::{
 };
 pub(crate) use rich_text::paint_rich_text;
 pub(crate) use selection::{FollowTailViewport, SelectionViewport};
+pub(crate) use spinner::{spinner_frame, SPINNER_FRAME_COUNT, SPINNER_FRAME_INTERVAL_MS};
 
 use crate::{
     config::KeyAction,

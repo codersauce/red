@@ -213,7 +213,7 @@ effective configuration. Existing two-argument registrations continue to work.
 New pickers should use
 `OpenPicker(title: String, items: [PickerItem], options: PickerOptions, handlers: PickerHandlers)`.
 The host returns an opaque integer handle that may be passed to `UpdatePickerItems`,
-`UpdatePickerQuery`, `UpdatePickerStatus`, and `ClosePicker`. Plugins
+`UpdatePickerQuery`, `UpdatePickerStatus`, `UpdatePickerBusy`, and `ClosePicker`. Plugins
 must not assign or interpret this handle.
 
 ```husk
@@ -232,6 +232,10 @@ repeatedly. Selection and cancellation are terminal: the host consumes every han
 that picker before invoking the terminal callback. Closing or replacing the dialog,
 reloading its plugin, or unloading its plugin also releases the handlers. Stale handles
 are ignored.
+
+Set `busy: true` in `PickerOptions` to display an animated Braille spinner before the
+picker status. Call `UpdatePickerBusy(handle, false)` when the asynchronous operation
+finishes; the editor owns spinner timing and redraws, so plugins do not need timers.
 
 Callbacks are retained by the runtime and delivered only to the plugin that opened the
 picker. They do not use global `picker:*:<id>` subscriptions. Picker items and callback

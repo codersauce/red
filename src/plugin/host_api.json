@@ -40,6 +40,7 @@
     { "name": "UpdatePickerItems", "kind": "execute", "signature": "(id: i32, items: [PickerItem])", "introduced": "0.1.0" },
     { "name": "UpdatePickerQuery", "kind": "execute", "signature": "(id: i32, query: String)", "introduced": "0.1.0" },
     { "name": "UpdatePickerStatus", "kind": "execute", "signature": "(id: i32, status: String)", "introduced": "0.1.0" },
+    { "name": "UpdatePickerBusy", "kind": "execute", "signature": "(id: i32, busy: bool)", "introduced": "0.5.1" },
     { "name": "ClosePicker", "kind": "execute", "signature": "(id: i32)", "introduced": "0.1.0" },
     { "name": "OpenLocation", "kind": "execute", "signature": "(location: Location, target?: String)", "introduced": "0.1.0" },
     { "name": "OpenBuffer", "kind": "execute", "signature": "(name: String)", "introduced": "0.1.0" },
