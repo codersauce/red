@@ -180,6 +180,9 @@ pub fn activate() {
     red::on("replay:undone", replay_undone);
     red::state_set("replay_panel_created", false);
     red::state_set("replay_panel_open", false);
+    red::state_set("replay_review_picker", red::null());
+    red::state_set("replay_review_request", -1);
+    red::state_set("replay_resume_request", -1);
     red::state_set("replay_workspace_id", "");
     red::state_set("replay_workspace_root", "");
     red::state_set("replay_source_buffer_index", -1);
@@ -259,23 +262,54 @@ fn open() {
         red::execute("FocusPanel", "replay-coach");
         return;
     }
-    red::request("ReplayListReviews", reviews_listed);
+    let previous_picker = red::state("replay_review_picker");
+    if previous_picker != red::null() {
+        red::execute("ClosePicker", previous_picker);
+    }
+    red::state_set("replay_review_request", -1);
+    red::state_set("replay_resume_request", -1);
+    let picker = red::execute("OpenPicker", "PR Replay Reviews", [], PickerOptions {
+        placeholder: "Filter saved reviews",
+        status: "Looking for saved reviews…",
+    }, PickerHandlers {
+        selected: review_selected,
+        cancelled: review_picker_cancelled,
+    });
+    red::state_set("replay_review_picker", picker);
+    let request = red::request("ReplayListReviews", reviews_listed);
+    red::state_set("replay_review_request", request);
 }
 
-fn reviews_listed(result: Json) {
+fn reviews_listed(result: Json, request_id: i32) {
+    if request_id != red::int(red::state("replay_review_request"), -1) {
+        return;
+    }
+    red::state_set("replay_review_request", -1);
+    let picker = red::state("replay_review_picker");
+    if picker == red::null() {
+        return;
+    }
     if !red::bool(result.ok, false) {
+        red::execute("UpdatePickerItems", picker, [PickerItem {
+            id: "start-new",
+            label: "Start a new review",
+            data: Json {},
+        }]);
         red::execute(
-            "Print",
-            "Replay reviews could not be loaded: " + source_error(result, "unknown error")
+            "UpdatePickerStatus",
+            picker,
+            "Saved reviews unavailable: " + source_error(result, "unknown error")
         );
         return;
     }
     let reviews = result.reviews;
     if red::len(reviews) == 0 {
+        red::state_set("replay_review_picker", red::null());
         open_source_picker();
         return;
     }
     if red::len(reviews) == 1 {
+        red::execute("UpdatePickerStatus", picker, "Reopening saved review…");
         resume_review(reviews[0]);
         return;
     }
@@ -316,15 +350,16 @@ fn reviews_listed(result: Json) {
         label: "Start a new review",
         data: Json {},
     });
-    red::execute("OpenPicker", "PR Replay Reviews", items, PickerOptions {
-        status: "Choose a verified review or start a new one. No branch is changed.",
-    }, PickerHandlers {
-        selected: review_selected,
-        cancelled: source_picker_cancelled,
-    });
+    red::execute("UpdatePickerItems", picker, items);
+    red::execute(
+        "UpdatePickerStatus",
+        picker,
+        "Choose a verified review or start a new one. No branch is changed."
+    );
 }
 
 fn review_selected(item: PickerItem) {
+    red::state_set("replay_review_picker", red::null());
     if item.id == "start-new" {
         open_source_picker();
         return;
@@ -338,10 +373,20 @@ fn resume_review(review: Json) {
         red::execute("Print", "Replay review could not be verified");
         return;
     }
-    red::request("ReplayResumeReview", review_resumed, id);
+    let request = red::request("ReplayResumeReview", review_resumed, id);
+    red::state_set("replay_resume_request", request);
 }
 
-fn review_resumed(result: Json) {
+fn review_resumed(result: Json, request_id: i32) {
+    if request_id != red::int(red::state("replay_resume_request"), -1) {
+        return;
+    }
+    red::state_set("replay_resume_request", -1);
+    let picker = red::state("replay_review_picker");
+    if picker != red::null() {
+        red::state_set("replay_review_picker", red::null());
+        red::execute("ClosePicker", picker);
+    }
     if !red::bool(result.ok, false) {
         red::execute(
             "Print",
@@ -350,6 +395,12 @@ fn review_resumed(result: Json) {
         return;
     }
     active_session_restored(result);
+}
+
+fn review_picker_cancelled(event: PickerCancelled) {
+    red::state_set("replay_review_picker", red::null());
+    red::state_set("replay_review_request", -1);
+    red::state_set("replay_resume_request", -1);
 }
 
 fn open_source_picker() {
