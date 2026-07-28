@@ -10,13 +10,13 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use super::{
-    digest, now_ms, GitObjectId, ReplayController, ReplayError, ReplayLimits, ReplayNote,
-    ReplayReviewDraft, ReplayReviewDraftKind, ReplayReviewRole, ReplaySession, ReplaySource,
-    ReplaySourceKind,
+    digest, now_ms, GitObjectId, ReplayController, ReplayDraftState, ReplayError, ReplayLimits,
+    ReplayNote, ReplayReviewDraft, ReplayReviewDraftKind, ReplayReviewReceipt, ReplayReviewRole,
+    ReplaySession, ReplaySource, ReplaySourceKind,
 };
 
 /// Current, deliberately versioned portable review-bundle format.
-pub const REPLAY_REVIEW_BUNDLE_VERSION: u32 = 1;
+pub const REPLAY_REVIEW_BUNDLE_VERSION: u32 = 2;
 
 /// Upper bound applied before a local review file is read or decoded.
 pub const MAX_REPLAY_REVIEW_BUNDLE_BYTES: u64 = 16 * 1024 * 1024;
@@ -85,6 +85,9 @@ pub struct ReplayReviewBundle {
     pub notes: Vec<ReplayNote>,
     /// Original-hunk-anchored private comments, summaries, and fix proposals.
     pub drafts: Vec<ReplayReviewDraft>,
+    /// Provider-confirmed receipts for explicitly submitted original PR reviews.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receipts: Vec<ReplayReviewReceipt>,
     /// Unix-millisecond time at which the user explicitly saved the file.
     pub exported_at_ms: u64,
 }
@@ -98,6 +101,8 @@ pub struct ReplayReviewBundleSaved {
     pub note_count: usize,
     /// Number of original-source-anchored local drafts in the resulting file.
     pub draft_count: usize,
+    /// Number of verified submitted-review receipts in the resulting file.
+    pub receipt_count: usize,
 }
 
 /// Verified import preview; committing requires its exact file-content digest.
@@ -115,6 +120,10 @@ pub struct ReplayReviewBundlePreview {
     pub drafts_to_add: usize,
     /// Identical original-source drafts already present in the review.
     pub drafts_already_present: usize,
+    /// Verified submitted-review receipts that would be added to this session.
+    pub receipts_to_add: usize,
+    /// Identical provider-confirmed receipts already retained by this session.
+    pub receipts_already_present: usize,
 }
 
 impl ReplayController {
@@ -190,7 +199,7 @@ impl ReplayController {
         if preview != expected {
             return Err(ReplayError::StalePreview);
         }
-        if preview.notes_to_add == 0 && preview.drafts_to_add == 0 {
+        if preview.notes_to_add == 0 && preview.drafts_to_add == 0 && preview.receipts_to_add == 0 {
             return Ok(preview);
         }
 
@@ -208,6 +217,16 @@ impl ReplayController {
                 .any(|existing| existing.id == draft.id)
             {
                 session.review.drafts.push(draft);
+            }
+        }
+        for receipt in bundle.receipts {
+            if !session
+                .review
+                .receipts
+                .iter()
+                .any(|existing| existing.id == receipt.id)
+            {
+                session.review.receipts.push(receipt);
             }
         }
         session.generation = session.generation.saturating_add(1);
@@ -258,7 +277,10 @@ pub(crate) fn prepare_review_bundle_import(
 
 impl ReplayReviewBundle {
     fn from_session(session: &ReplaySession, limits: ReplayLimits) -> Result<Self, ReplayError> {
-        if session.notes.is_empty() && session.review.drafts.is_empty() {
+        if session.notes.is_empty()
+            && session.review.drafts.is_empty()
+            && session.review.receipts.is_empty()
+        {
             return Err(ReplayError::InvalidReviewBundle(
                 "there are no local review comments, summaries, proposals, or observations to save"
                     .to_string(),
@@ -269,6 +291,7 @@ impl ReplayReviewBundle {
             identity: ReplayReviewBundleIdentity::from_source(&session.source),
             notes: session.notes.clone(),
             drafts: session.review.drafts.clone(),
+            receipts: session.review.receipts.clone(),
             exported_at_ms: now_ms(),
         };
         bundle.validate_for(session, limits)?;
@@ -280,7 +303,7 @@ impl ReplayReviewBundle {
         session: &ReplaySession,
         limits: ReplayLimits,
     ) -> Result<(), ReplayError> {
-        if self.version != REPLAY_REVIEW_BUNDLE_VERSION {
+        if !(1..=REPLAY_REVIEW_BUNDLE_VERSION).contains(&self.version) {
             return Err(ReplayError::InvalidReviewBundle(format!(
                 "unsupported review bundle version {}; this Red version supports version {}",
                 self.version, REPLAY_REVIEW_BUNDLE_VERSION,
@@ -298,7 +321,7 @@ impl ReplayReviewBundle {
                     .to_string(),
             ));
         }
-        if self.notes.is_empty() && self.drafts.is_empty() {
+        if self.notes.is_empty() && self.drafts.is_empty() && self.receipts.is_empty() {
             return Err(ReplayError::InvalidReviewBundle(
                 "the review file does not contain any local observations or drafts".to_string(),
             ));
@@ -312,6 +335,12 @@ impl ReplayReviewBundle {
         if self.drafts.len() > limits.max_steps {
             return Err(ReplayError::LimitExceeded {
                 kind: "portable review drafts",
+                limit: limits.max_steps,
+            });
+        }
+        if self.receipts.len() > limits.max_steps {
+            return Err(ReplayError::LimitExceeded {
+                kind: "portable submitted-review receipts",
                 limit: limits.max_steps,
             });
         }
@@ -406,6 +435,46 @@ impl ReplayReviewBundle {
                 }
             }
         }
+        let mut receipt_ids = HashSet::with_capacity(self.receipts.len());
+        let mut submitted_draft_ids = HashSet::new();
+        for receipt in &self.receipts {
+            if receipt.id == 0
+                || !receipt_ids.insert(receipt.id)
+                || receipt.target_commit != session.source.target_commit
+                || receipt.viewer.trim().is_empty()
+                || receipt.submitted_at.trim().is_empty()
+                || receipt.payload_digest.len() != 64
+                || !receipt
+                    .payload_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+                || receipt.draft_ids.is_empty()
+            {
+                return Err(ReplayError::InvalidReviewBundle(
+                    "a submitted-review receipt is duplicated or does not match the pinned original head"
+                        .to_string(),
+                ));
+            }
+            for draft_id in &receipt.draft_ids {
+                if !draft_ids.contains(draft_id.as_str())
+                    || !submitted_draft_ids.insert(draft_id.as_str())
+                {
+                    return Err(ReplayError::InvalidReviewBundle(
+                        "a submitted-review receipt does not identify unique original review drafts"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        if self.drafts.iter().any(|draft| {
+            (draft.state == ReplayDraftState::Submitted)
+                != submitted_draft_ids.contains(draft.id.as_str())
+        }) {
+            return Err(ReplayError::InvalidReviewBundle(
+                "a published review draft does not have its matching GitHub review receipt"
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -424,6 +493,8 @@ impl ReplayReviewBundle {
             notes_already_present: 0,
             drafts_to_add: 0,
             drafts_already_present: 0,
+            receipts_to_add: 0,
+            receipts_already_present: 0,
         };
 
         for note in &self.notes {
@@ -455,6 +526,23 @@ impl ReplayReviewBundle {
                 None => preview.drafts_to_add += 1,
             }
         }
+        for receipt in &self.receipts {
+            match session
+                .review
+                .receipts
+                .iter()
+                .find(|existing| existing.id == receipt.id)
+            {
+                Some(existing) if existing == receipt => preview.receipts_already_present += 1,
+                Some(_) => {
+                    return Err(ReplayError::ReviewBundleConflict(
+                        "an imported review receipt conflicts with a different submitted review"
+                            .to_string(),
+                    ));
+                }
+                None => preview.receipts_to_add += 1,
+            }
+        }
 
         if session.notes.len().saturating_add(preview.notes_to_add) > limits.max_steps {
             return Err(ReplayError::LimitExceeded {
@@ -471,6 +559,18 @@ impl ReplayReviewBundle {
         {
             return Err(ReplayError::LimitExceeded {
                 kind: "merged review drafts",
+                limit: limits.max_steps,
+            });
+        }
+        if session
+            .review
+            .receipts
+            .len()
+            .saturating_add(preview.receipts_to_add)
+            > limits.max_steps
+        {
+            return Err(ReplayError::LimitExceeded {
+                kind: "merged submitted-review receipts",
                 limit: limits.max_steps,
             });
         }
@@ -621,6 +721,7 @@ fn write_review_bundle(
         path,
         note_count: bundle.notes.len(),
         draft_count: bundle.drafts.len(),
+        receipt_count: bundle.receipts.len(),
     })
 }
 

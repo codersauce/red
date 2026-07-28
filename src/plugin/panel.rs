@@ -2570,6 +2570,7 @@ mod tests {
             head_commit: String::new(),
             draft_count: 0,
             drafts: Vec::new(),
+            receipts: Vec::new(),
             outbox_index: 0,
             view: ReplayPanelView::Guide,
             title: plan.title,

@@ -19,8 +19,8 @@ use super::{
 use crate::{
     editor::{render_buffer::RenderBuffer, Point},
     replay::{
-        parse_patch, GitObjectId, ReplayDemoStep, ReplayLimits, ReplayReviewDraft,
-        ReplayReviewDraftKind, ReplayReviewRole,
+        parse_patch, GitObjectId, ReplayDemoStep, ReplayDraftState, ReplayLimits,
+        ReplayReviewDraft, ReplayReviewDraftKind, ReplayReviewReceipt, ReplayReviewRole,
     },
     theme::{SelectionForegroundPriority, Style, Theme},
     ui::{ActionBar, ActionPriority, UiAction},
@@ -92,6 +92,8 @@ pub(crate) struct ReplayPanelModel {
     pub(crate) draft_count: usize,
     #[serde(default)]
     pub(crate) drafts: Vec<ReplayReviewDraft>,
+    #[serde(default)]
+    pub(crate) receipts: Vec<ReplayReviewReceipt>,
     #[serde(default)]
     pub(crate) outbox_index: usize,
     #[serde(default)]
@@ -170,6 +172,7 @@ impl ReplayPanelState {
         if model.steps.len() > limits.max_steps
             || model.draft_count > limits.max_steps
             || model.drafts.len() > limits.max_steps
+            || model.receipts.len() > limits.max_steps
             || model.current_step().is_none()
             || (!model.head_commit.is_empty() && GitObjectId::parse(&model.head_commit).is_err())
             || (!model.drafts.is_empty() && model.outbox_index >= model.drafts.len())
@@ -836,10 +839,16 @@ fn replay_outbox_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
         String::new(),
         TextPanelSpanStyle::Text,
     ));
-    let count = if model.drafts.len() == 1 {
+    let count = if model.receipts.is_empty() && model.drafts.len() == 1 {
         "1 draft".to_string()
-    } else {
+    } else if model.receipts.is_empty() {
         format!("{} drafts", model.drafts.len())
+    } else {
+        format!(
+            "{} drafts · {} posted",
+            model.drafts.len(),
+            model.receipts.len()
+        )
     };
     lines.push(aligned_line(
         "LOCAL OUTBOX",
@@ -849,8 +858,13 @@ fn replay_outbox_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
         None,
         width,
     ));
+    let privacy = if model.receipts.is_empty() {
+        "Local only · nothing sent to GitHub"
+    } else {
+        "Local drafts stay private · posted comments have verified receipts"
+    };
     lines.extend(wrap_plain_text(
-        "Local only · nothing sent to GitHub",
+        privacy,
         width.max(1),
         TextPanelSpanStyle::Muted,
     ));
@@ -897,6 +911,11 @@ fn replay_outbox_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
             ReplayReviewDraftKind::ReviewSummary => "REVIEW SUMMARY",
         };
         let label = format!("{marker} {kind}");
+        let publication = if draft.state == ReplayDraftState::Submitted {
+            "POSTED"
+        } else {
+            "LOCAL"
+        };
         lines.push(aligned_line(
             &label,
             if index == model.outbox_index {
@@ -904,8 +923,12 @@ fn replay_outbox_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
             } else {
                 TextPanelSpanStyle::Text
             },
-            "LOCAL",
-            TextPanelSpanStyle::Muted,
+            publication,
+            if draft.state == ReplayDraftState::Submitted {
+                TextPanelSpanStyle::Heading
+            } else {
+                TextPanelSpanStyle::Muted
+            },
             None,
             width,
         ));
@@ -1002,6 +1025,16 @@ fn render_replay_outbox(
 
 fn replay_outbox_actions(model: &ReplayPanelModel) -> Vec<UiAction> {
     let has_drafts = !model.drafts.is_empty();
+    let selected_is_local = model
+        .drafts
+        .get(model.outbox_index)
+        .is_some_and(|draft| draft.state == ReplayDraftState::Local);
+    let can_publish = model.pull_request > 0
+        && model.review_role.is_some()
+        && !model.head_commit.is_empty()
+        && model.drafts.iter().any(|draft| {
+            draft.state == ReplayDraftState::Local && draft.kind != ReplayReviewDraftKind::CodeFix
+        });
     let mut actions = Vec::new();
     if has_drafts {
         actions.push(
@@ -1015,16 +1048,16 @@ fn replay_outbox_actions(model: &ReplayPanelModel) -> Vec<UiAction> {
             .with_priority(ActionPriority::Essential)
             .with_compact_label("+"),
     );
-    if has_drafts {
+    if selected_is_local {
         actions.push(
             UiAction::new("edit_draft", "[e]", "Edit")
                 .with_priority(ActionPriority::Essential)
-                .with_compact_label("Ed"),
+                .with_compact_label(""),
         );
         actions.push(
             UiAction::new("discard_draft", "[d]", "Discard")
                 .with_priority(ActionPriority::Essential)
-                .with_compact_label("Del"),
+                .with_compact_label(""),
         );
     }
     actions.push(
@@ -1040,7 +1073,14 @@ fn replay_outbox_actions(model: &ReplayPanelModel) -> Vec<UiAction> {
         actions.push(
             UiAction::new("save_review", "[S]", "Save")
                 .with_priority(ActionPriority::Essential)
-                .with_compact_label("Sv"),
+                .with_compact_label(""),
+        );
+    }
+    if can_publish {
+        actions.push(
+            UiAction::new("publish_review", "[P]", "Publish")
+                .with_priority(ActionPriority::Essential)
+                .with_compact_label("↗"),
         );
     }
     actions.push(
@@ -1413,6 +1453,7 @@ mod tests {
             head_commit: String::new(),
             draft_count: 0,
             drafts: Vec::new(),
+            receipts: Vec::new(),
             outbox_index: 0,
             view: ReplayPanelView::Guide,
             title: plan.title,
@@ -1832,6 +1873,100 @@ mod tests {
         assert!(!visible.contains("[e]"));
         assert!(!visible.contains("[d]"));
         assert_eq!(layout.hidden_count(), 0);
+    }
+
+    #[test]
+    fn narrow_github_outbox_keeps_publish_save_and_return_visible() {
+        let mut replay = model();
+        replay.review_role = Some(ReplayReviewRole::Reviewer);
+        replay.head_commit = "b".repeat(40);
+        replay.drafts = vec![outbox_draft(
+            ReplayReviewDraftKind::InlineComment,
+            "Publish only the exact original review comment.",
+        )];
+        replay.draft_count = replay.drafts.len();
+        let actions = replay_outbox_actions(&replay);
+        let layout = ActionBar::new(&actions).layout(/*width*/ 46);
+        let visible = layout.text();
+
+        for key in ["[h/l]", "[c]", "[e]", "[d]", "[S]", "[P]", "[r]"] {
+            assert!(
+                visible.contains(key),
+                "missing essential original-PR outbox action {key}: {visible}"
+            );
+        }
+        assert!(display_width(&visible) <= 46);
+    }
+
+    #[test]
+    fn local_and_fix_only_outboxes_never_offer_github_publication() {
+        let mut local = model();
+        local.drafts = vec![outbox_draft(
+            ReplayReviewDraftKind::InlineComment,
+            "Keep this local-range comment private.",
+        )];
+        local.draft_count = local.drafts.len();
+        assert!(!replay_outbox_actions(&local)
+            .iter()
+            .any(|action| action.id == "publish_review"));
+
+        let mut author = model();
+        author.review_role = Some(ReplayReviewRole::Author);
+        author.head_commit = "b".repeat(40);
+        author.drafts = vec![outbox_draft(
+            ReplayReviewDraftKind::CodeFix,
+            "Keep this original-PR fix out of the GitHub review.",
+        )];
+        author.draft_count = author.drafts.len();
+        assert!(!replay_outbox_actions(&author)
+            .iter()
+            .any(|action| action.id == "publish_review"));
+    }
+
+    #[test]
+    fn submitted_comments_are_clearly_posted_and_cannot_be_edited_or_reposted() {
+        let mut replay = model();
+        replay.review_role = Some(ReplayReviewRole::Reviewer);
+        replay.head_commit = "b".repeat(40);
+        replay.view = ReplayPanelView::Outbox;
+        let mut draft = outbox_draft(
+            ReplayReviewDraftKind::InlineComment,
+            "This comment was explicitly approved and posted.",
+        );
+        draft.state = ReplayDraftState::Submitted;
+        replay.receipts = vec![ReplayReviewReceipt {
+            id: 71,
+            url: "https://github.com/example/replay/pull/482#pullrequestreview-71".to_string(),
+            outcome: crate::replay::ReplayReviewOutcome::Comment,
+            target_commit: draft.target_commit.clone(),
+            viewer: "reviewer".to_string(),
+            draft_ids: vec![draft.id.clone()],
+            payload_digest: "a".repeat(64),
+            submitted_at: "2026-07-27T20:00:00Z".to_string(),
+        }];
+        replay.drafts = vec![draft];
+        replay.draft_count = replay.drafts.len();
+        let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap())
+            .expect("accept an original-head-linked posted review and its receipt");
+        let lines = replay_outbox_lines(&state, /*width*/ 46)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let actions = replay_outbox_actions(&replay);
+
+        assert!(lines.iter().any(|line| line.contains("1 posted")));
+        assert!(lines.iter().any(|line| line.contains("POSTED")));
+        assert!(lines.iter().any(|line| line.contains("verified receipts")));
+        assert!(actions.iter().any(|action| action.id == "save_review"));
+        assert!(actions.iter().any(|action| action.id == "outbox"));
+        for action in ["edit_draft", "discard_draft", "publish_review"] {
+            assert!(!actions.iter().any(|candidate| candidate.id == action));
+        }
     }
 
     #[test]

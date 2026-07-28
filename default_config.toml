@@ -328,6 +328,7 @@ Esc = { EnterMode = "Normal" }
 "s" = { PluginCommand = "ReplaySummary" }
 "e" = { PluginCommand = "ReplayEditDraft" }
 "d" = { PluginCommand = "ReplayDiscardDraft" }
+"P" = { PluginCommand = "ReplayPublish" }
 "S" = { PluginCommand = "ReplaySaveReview" }
 "L" = { PluginCommand = "ReplayLoadReview" }
 "q" = { PluginCommand = "ReplayClose" }

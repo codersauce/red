@@ -38,13 +38,14 @@ The source picker offers:
 - **Safe in-memory demo:** inspect the original five-step mock without Git,
   network access, file writes, or worktree creation.
 
-GitHub metadata, local Git resolution, explicitly confirmed fetches, and
-scratch-worktree creation run in bounded background workers. Normal editor
-input remains responsive while the original review source is loading. Accepting
-a real source immediately opens the dedicated Replay panel, displays the
-selected PR or branch and exact scratch path, and shows an animated checkout
-status until the original review is ready. If checkout fails, its explanation
-remains visible in that same panel.
+GitHub metadata, local Git resolution, explicitly confirmed fetches,
+scratch-worktree creation, private review-file operations, and human-confirmed
+review submission run in bounded background workers. Normal editor input
+remains responsive while the original review source is loading. Accepting a
+real source immediately opens the dedicated Replay panel, displays the selected
+PR or branch and exact scratch path, and shows an animated checkout status until
+the original review is ready. If checkout fails, its explanation remains
+visible in that same panel.
 
 Replay disables Git's filesystem monitor only for its own Git commands. This
 prevents an unavailable repository monitor from stalling scratch checkout
@@ -168,21 +169,75 @@ or `RIGHT` side. Scratch-buffer cursor positions and later edits never replace
 those coordinates. A proposed fix is only text in this first milestone: it does
 not edit either the original PR or its learning scratch source.
 
-Press `r` to open the local review outbox. It shows the verified role, original
+Press `r` to open the review outbox. It shows the verified role, original
 branch and commit, source-linked comments, author fix proposals, PR summaries,
-and a clear `nothing sent to GitHub` status. Use `h` and `l` to select drafts,
-`e` to edit the selected draft, and `d` to discard it after a local confirmation.
-Press `r` again to return to the original guide. Every draft is part of the
-crash-safe editor session and survives `--resume`. The outbox is the same
-structured, dedicated Replay pane as the source guide; it preserves the
-focused `▌ PR REPLAY` title, highlighted divider, `REPLAY` status, real selected
-draft cursor, scrollable content, and pinned review action bar.
+and whether each outcome is `LOCAL` or already `POSTED`. Until you explicitly
+approve a GitHub submission, its status reads `nothing sent to GitHub`. Use `h`
+and `l` to select drafts, `e` to edit a local draft, and `d` to discard one
+after a local confirmation. Posted review comments are read-only and cannot
+be silently discarded or submitted twice. Press `r` again to return to the
+original guide.
 
-The outbox is local-only. Creating, editing, or discarding a draft does not
-create a GitHub `PENDING` review, publish an inline comment, submit a review,
-start an agent, edit the original PR branch, stage files, commit, or push.
-Explicit portable draft save/load, approved PR updates, GitHub submission, and
-agent-proposed outcomes will be introduced in later milestones.
+Every local draft and verified GitHub receipt is part of the crash-safe editor
+session and survives `--resume`. The outbox is the same structured, dedicated
+Replay pane as the source guide; it preserves the focused `▌ PR REPLAY` title,
+highlighted divider, `REPLAY` status, real selected draft cursor, scrollable
+content, and pinned review action bar. At the default 46-column width, the
+relevant `P` publish, `S` save, and `r` return actions remain visible.
+
+### Save or move a private review
+
+Use `S` in the focused outbox or `Space R S` to save comments, PR-level
+summaries, local observations, author fix proposals, and verified submission
+receipts into a private portable review file. Red suggests a path inside the
+repository's shared `.git/red/replay-reviews/` metadata, so saving never dirties
+the scratch worktree or original repository. You can choose a different private
+location explicitly.
+
+Use `L` or `Space R L` to load a review on the same or another computer. Red
+first checks the exact original host, repository, PR, base, head commit, and
+complete diff. It previews the new drafts, observations, and receipts, requires
+confirmation before merging, and refuses conflicting text or a file that changes
+after the preview. Existing version-one private review files remain readable.
+Neither saving nor loading sends anything to GitHub.
+
+### Publish an explicitly approved GitHub review
+
+For a verified GitHub pull request, add at least one local inline comment or
+PR-level summary. Press `P` in the outbox or `Space R P` to choose:
+
+- **Comment only:** submit feedback without changing the PR's approval state.
+- **Approve:** approve another author's exact original PR head.
+- **Request changes:** request changes to another author's PR. Add a PR-level
+  summary with `s` so the author receives a clear explanation.
+
+The original PR author can choose **Comment only**; self-approval and requesting
+changes on your own PR are not offered. Author `F` fix proposals always stay
+local and are never inserted into a review comment. Local branch reviews and
+the demo cannot publish to GitHub.
+
+Selecting an outcome does not post anything. Red first shows a
+`NOTHING POSTED YET` confirmation containing the exact original repository,
+PR number, full pinned head, authenticated GitHub viewer, selected outcome,
+PR-level body, and every included human- or agent-proposed inline comment. It
+also identifies any original-PR fix proposals that will stay local. Cancel
+preserves all drafts. Only explicitly accepting this confirmation starts the
+background GitHub request.
+
+Immediately before publication, Red verifies the original PR head and viewer
+again. It sends all selected comments and the chosen outcome in one atomic,
+event-bearing GitHub review request; it never creates a remote `PENDING`
+review. If the head, reviewer, original diff anchor, or previewed draft changes,
+submission fails without claiming success. On a verified response, Red marks
+the exact submitted drafts `POSTED` and retains their portable GitHub review
+receipt. Private notes, the scratch worktree, and the original PR branch are
+never modified by review publication.
+
+If a network or provider failure happens after the review request may have
+reached GitHub, Red explicitly reports that the review might already be posted.
+It never claims that nothing happened or silently retries. A second confirmation
+requires you to inspect the original PR before choosing whether to preview
+another submission.
 
 ## Key bindings
 
@@ -211,6 +266,9 @@ unchanged.
 | `Space R s` | Draft a pull-request-level review summary. |
 | `Space R e` | Edit the selected local review draft. |
 | `Space R d` | Discard the selected local review draft after confirmation. |
+| `Space R P` | Preview and explicitly confirm publishing a GitHub PR review. |
+| `Space R S` | Save a private portable review, observations, and submission receipts. |
+| `Space R L` | Preview and load a source-verified portable private review. |
 | `Space R q` | Hide the coach without touching the scratch source or progress. |
 
 While the dedicated coach is focused, `j` and `k` scroll the current source
@@ -219,8 +277,8 @@ hunk, `h` and `l` select the previous and next reconstruction steps, and `[` and
 their existing editor and Git-hunk motions. The older `p` and `n` step bindings
 remain compatibility aliases. Use `Space R h`
 for a hint so horizontal navigation never unexpectedly changes the exercise
-instead. `i`, `a`, `u`, `m`, `v`, `o`, `f`, `c`, `F`, `r`, `s`, `e`, `d`, `q`,
-and `?` act directly on the Replay pane. The pinned action bar keeps
+instead. `i`, `a`, `u`, `m`, `v`, `o`, `f`, `c`, `F`, `r`, `s`, `e`, `d`, `P`,
+`S`, `L`, `q`, and `?` act directly on the Replay pane. The pinned action bar keeps
 scratch-source focus, manual
 validation, immediate application, safe undo, `h/l` step navigation, and help
 visible even when the panel is narrow. The title shows the selected step

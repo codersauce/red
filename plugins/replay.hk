@@ -4,8 +4,9 @@
 // worktree creation, editable scratch sources, validation, and undo transactions.
 // The coach remains a dedicated read-only plugin panel. Creating a worktree or
 // fetching missing PR objects always requires a separate explicit confirmation.
-// No Replay action pushes, commits, or submits a GitHub review. Private review
-// bundles are saved or loaded only after the user explicitly chooses a file.
+// Scratch replay never pushes, commits, or changes an original PR branch.
+// Publishing an original-source GitHub review requires an exact preview and a
+// separate explicit human confirmation. Private bundles stay user-selected.
 
 pub fn activate() {
     red::add_command("Replay", open, Json {
@@ -112,6 +113,12 @@ pub fn activate() {
         category: "PR Replay",
         description: "Inspect original-source comments, fix proposals, and review summaries",
     });
+    red::add_command("ReplayPublish", publish_review, Json {
+        title: "Preview and publish a GitHub PR review",
+        category: "PR Replay",
+        description: "Choose an outcome, inspect the pinned original review, and explicitly confirm posting",
+        aliases: ["publish replay review", "submit pull request review"],
+    });
     red::add_command("ReplayEditDraft", edit_draft, Json {
         title: "Edit a local PR review draft",
         category: "PR Replay",
@@ -172,12 +179,17 @@ pub fn activate() {
     red::state_set("replay_view", "guide");
     red::state_set("replay_notes", []);
     red::state_set("replay_drafts", []);
+    red::state_set("replay_receipts", []);
     red::state_set("replay_outbox_index", 0);
     red::state_set("replay_pending_draft_kind", "");
     red::state_set("replay_pending_draft_id", "");
     red::state_set("replay_pending_draft_step_id", "");
     red::state_set("replay_pending_bundle_path", "");
     red::state_set("replay_pending_bundle_digest", "");
+    red::state_set("replay_pending_submission_outcome", "");
+    red::state_set("replay_pending_submission_digest", "");
+    red::state_set("replay_submission_pending", false);
+    red::state_set("replay_submission_uncertain", false);
     red::state_set("replay_completions", []);
     red::state_set("replay_notice", "");
     red::state_set("replay_steps", []);
@@ -450,7 +462,7 @@ fn confirm_workspace(source: Json) {
     let message = "Create local branch " + red::string(source.workspace_branch, "")
         + " at the original merge base?\n\n"
         + red::string(source.workspace_root, "")
-        + "\n\nYour current branch is unchanged. Replay never saves, commits, pushes, or submits a review.";
+        + "\n\nYour current branch is unchanged. Creating this scratch worktree does not save, commit, push, or submit a review.";
     red::state_set("replay_pending_source_id", red::string(source.source_id, ""));
     red::state_set("replay_pending_workspace_root", red::string(source.workspace_root, ""));
     red::state_set("replay_source_kind", red::string(source.source_kind, "local_range"));
@@ -555,7 +567,12 @@ fn load_plan(plan: Json) -> bool {
     red::state_set("replay_review_path", "");
     red::state_set("replay_notes", []);
     red::state_set("replay_drafts", []);
+    red::state_set("replay_receipts", []);
     red::state_set("replay_outbox_index", 0);
+    red::state_set("replay_pending_submission_outcome", "");
+    red::state_set("replay_pending_submission_digest", "");
+    red::state_set("replay_submission_pending", false);
+    red::state_set("replay_submission_uncertain", false);
     red::state_set("replay_completions", []);
     red::state_set("replay_notice", "");
     red::state_set("replay_view", "guide");
@@ -591,6 +608,9 @@ fn workspace_opened(event: Json) {
     }
     if event.drafts != red::null() {
         red::state_set("replay_drafts", event.drafts);
+    }
+    if event.receipts != red::null() {
+        red::state_set("replay_receipts", event.receipts);
     }
     ensure_panel();
     render();
@@ -677,6 +697,8 @@ fn panel_event(event: Json) {
         edit_draft();
     } else if action == "d" || action == "discard_draft" {
         discard_draft();
+    } else if action == "P" || action == "publish_review" {
+        publish_review();
     } else if action == "S" || action == "save_review" {
         save_review();
     } else if action == "L" || action == "load_review" {
@@ -1096,8 +1118,24 @@ fn open_summary() {
     open_review_draft("review_summary", "Local pull request review summary", "");
 }
 
+fn review_mutation_available() -> bool {
+    if red::state_bool("replay_submission_pending") {
+        red::state_set(
+            "replay_notice",
+            "Wait for the confirmed GitHub review to finish before changing or exporting drafts."
+        );
+        red::state_set("replay_view", "outbox");
+        render();
+        return false;
+    }
+    return true;
+}
+
 fn open_review_draft(kind: String, title: String, text: String) {
     if !ensure_workspace() {
+        return;
+    }
+    if !review_mutation_available() {
         return;
     }
     if red::string(red::state("replay_source_kind"), "demo") == "demo" {
@@ -1126,6 +1164,9 @@ fn open_review_draft(kind: String, title: String, text: String) {
 }
 
 fn review_draft_submitted(value: String) {
+    if !review_mutation_available() {
+        return;
+    }
     let text = red::trim(value);
     if text == "" {
         red::state_set("replay_notice", "A local review draft cannot be empty.");
@@ -1221,6 +1262,9 @@ fn edit_draft() {
     if !ensure_workspace() {
         return;
     }
+    if !review_mutation_available() {
+        return;
+    }
     let drafts = red::state("replay_drafts");
     let index = red::int(red::state("replay_outbox_index"), 0);
     if index < 0 || index >= red::len(drafts) {
@@ -1229,6 +1273,11 @@ fn edit_draft() {
         return;
     }
     let draft = drafts[index];
+    if red::string(draft.state, "local") != "local" {
+        red::state_set("replay_notice", "Published GitHub review comments are read-only. Their original receipt is saved.");
+        render();
+        return;
+    }
     red::state_set("replay_pending_draft_id", red::string(draft.id, ""));
     open_review_draft(
         red::string(draft.kind, "inline_comment"),
@@ -1241,6 +1290,9 @@ fn discard_draft() {
     if !ensure_workspace() {
         return;
     }
+    if !review_mutation_available() {
+        return;
+    }
     let drafts = red::state("replay_drafts");
     let index = red::int(red::state("replay_outbox_index"), 0);
     if index < 0 || index >= red::len(drafts) {
@@ -1249,6 +1301,11 @@ fn discard_draft() {
         return;
     }
     let draft = drafts[index];
+    if red::string(draft.state, "local") != "local" {
+        red::state_set("replay_notice", "A published GitHub review cannot be discarded locally.");
+        render();
+        return;
+    }
     red::state_set("replay_pending_draft_id", red::string(draft.id, ""));
     red::execute(
         "OpenConfirm",
@@ -1303,6 +1360,264 @@ fn review_draft_removed(result: Json) {
     render();
 }
 
+fn publish_review() {
+    if !ensure_workspace() {
+        return;
+    }
+    if red::state_bool("replay_submission_pending") {
+        red::state_set("replay_notice", "A confirmed GitHub review is already being submitted.");
+        render();
+        return;
+    }
+    if red::state_bool("replay_submission_uncertain") {
+        red::execute(
+            "OpenConfirm",
+            "Check GitHub before retrying",
+            "The previous review may already have been posted. Inspect the original pull request first. Accept only if you verified that the review was not submitted and want to preview a new request.",
+            PickerHandlers {
+                selected: review_submission_retry_selected,
+                cancelled: review_submission_retry_cancelled,
+            }
+        );
+        return;
+    }
+    if red::string(red::state("replay_source_kind"), "demo") != "git_hub_pull_request"
+        && red::string(red::state("replay_source_kind"), "demo") != "github_pull_request" {
+        red::state_set("replay_notice", "Only a verified GitHub pull request can receive a published review.");
+        red::state_set("replay_view", "outbox");
+        render();
+        return;
+    }
+
+    let publishable = false;
+    for draft in red::state("replay_drafts") {
+        if red::string(draft.state, "local") == "local"
+            && red::string(draft.kind, "") != "code_fix" {
+            publishable = true;
+        }
+    }
+    if !publishable {
+        red::state_set(
+            "replay_notice",
+            "Add a local inline comment or PR summary first. Proposed code fixes remain private."
+        );
+        red::state_set("replay_view", "outbox");
+        render();
+        return;
+    }
+
+    let items = [PickerItem {
+        id: "comment",
+        label: "Comment only · post without approval",
+        data: Json {},
+    }];
+    if red::string(red::state("replay_review_role"), "") != "author" {
+        items = red::push(items, PickerItem {
+            id: "approve",
+            label: "Approve · accept this original PR",
+            data: Json {},
+        });
+        items = red::push(items, PickerItem {
+            id: "request_changes",
+            label: "Request changes · requires a PR summary",
+            data: Json {},
+        });
+    }
+    red::execute("OpenPicker", "Choose GitHub review outcome", items, PickerOptions {
+        status: "Nothing posted. Choose an outcome to preview; final confirmation follows.",
+    }, PickerHandlers {
+        selected: review_outcome_selected,
+        cancelled: review_submission_cancelled,
+    });
+}
+
+fn review_outcome_selected(item: PickerItem) {
+    let outcome = red::string(item.id, "");
+    if outcome != "comment" && outcome != "approve" && outcome != "request_changes" {
+        clear_pending_review_submission();
+        render();
+        return;
+    }
+    red::state_set("replay_pending_submission_outcome", outcome);
+    red::request(
+        "ReplayPreviewSubmission",
+        review_submission_previewed,
+        red::string(red::state("replay_workspace_id"), ""),
+        outcome
+    );
+}
+
+fn review_submission_retry_selected(item: PickerItem) {
+    if item.id != "accept" {
+        red::state_set(
+            "replay_notice",
+            "Previous review may already be on GitHub · inspect the PR before retrying."
+        );
+        red::state_set("replay_view", "outbox");
+        render();
+        return;
+    }
+    red::state_set("replay_submission_uncertain", false);
+    publish_review();
+}
+
+fn review_submission_retry_cancelled(event: PickerCancelled) {
+    red::state_set(
+        "replay_notice",
+        "Previous review may already be on GitHub · inspect the PR before retrying."
+    );
+    red::state_set("replay_view", "outbox");
+    render();
+}
+
+fn review_outcome_label(outcome: String) -> String {
+    if outcome == "approve" {
+        return "APPROVE";
+    }
+    if outcome == "request_changes" {
+        return "REQUEST CHANGES";
+    }
+    return "COMMENT ONLY";
+}
+
+fn review_submission_previewed(result: Json) {
+    if !red::bool(result.ok, false) {
+        clear_pending_review_submission();
+        red::state_set(
+            "replay_notice",
+            source_error(result, "The original GitHub review could not be safely previewed")
+        );
+        red::state_set("replay_view", "outbox");
+        render();
+        return;
+    }
+
+    let preview = result.preview;
+    red::state_set("replay_pending_submission_outcome", red::string(preview.outcome, ""));
+    red::state_set("replay_pending_submission_digest", red::string(preview.preview_digest, ""));
+    let message = "NOTHING POSTED YET\n\n"
+        + "To: " + red::string(preview.repository, "")
+        + " · PR #" + red::int(preview.pull_request, 0)
+        + "\nCommit: " + red::string(preview.target_commit, "")
+        + "\nAs: @" + red::string(preview.viewer, "")
+        + "\nOutcome: " + review_outcome_label(red::string(preview.outcome, ""))
+        + "\nWill post: "
+        + review_outcome_count(red::int(preview.inline_comment_count, 0), "inline comment", "inline comments")
+        + " and "
+        + review_outcome_count(red::int(preview.summary_count, 0), "PR summary", "PR summaries");
+
+    let agents = red::int(preview.agent_draft_count, 0);
+    if agents > 0 {
+        message = message + "\nIncludes "
+            + review_outcome_count(agents, "agent-proposed draft", "agent-proposed drafts")
+            + " · requires your approval";
+    }
+    let fixes = red::int(preview.local_fix_count, 0);
+    if fixes > 0 {
+        message = message + "\nStays local: "
+            + review_outcome_count(fixes, "original-PR fix proposal", "original-PR fix proposals");
+    }
+
+    let body = red::string(preview.body, "");
+    if body != "" {
+        message = message + "\n\nPR-level review:\n" + body;
+    }
+    for draft in preview.drafts {
+        if red::string(draft.kind, "") == "inline_comment" {
+            let anchor = draft.anchor;
+            let origin = red::string(draft.origin, "human");
+            message = message + "\n\n"
+                + red::string(anchor.path, red::string(draft.path, ""))
+                + ":" + red::int(anchor.start_line, 0)
+                + " [" + red::string(anchor.side, "") + " · " + origin + "]\n"
+                + red::string(draft.text, "");
+        }
+    }
+    message = message
+        + "\n\nAccept posts this exact review to GitHub. Cancel keeps every draft private.";
+    red::execute(
+        "OpenConfirm",
+        "Publish this review to GitHub?",
+        message,
+        PickerHandlers {
+            selected: review_submission_confirmed,
+            cancelled: review_submission_cancelled,
+        }
+    );
+}
+
+fn review_submission_confirmed(item: PickerItem) {
+    if item.id != "accept" {
+        clear_pending_review_submission();
+        render();
+        return;
+    }
+    let outcome = red::string(red::state("replay_pending_submission_outcome"), "");
+    let digest = red::string(red::state("replay_pending_submission_digest"), "");
+    if outcome == "" || digest == "" {
+        clear_pending_review_submission();
+        red::state_set("replay_notice", "That review preview has expired. Preview the exact review again.");
+        render();
+        return;
+    }
+    red::state_set("replay_submission_pending", true);
+    red::state_set("replay_view", "outbox");
+    red::state_set("replay_notice", "Posting your confirmed review to GitHub…");
+    render();
+    red::request(
+        "ReplaySubmitReview",
+        review_submission_finished,
+        red::string(red::state("replay_workspace_id"), ""),
+        outcome,
+        digest,
+        true
+    );
+}
+
+fn clear_pending_review_submission() {
+    red::state_set("replay_pending_submission_outcome", "");
+    red::state_set("replay_pending_submission_digest", "");
+    red::state_set("replay_submission_pending", false);
+}
+
+fn review_submission_cancelled(event: PickerCancelled) {
+    clear_pending_review_submission();
+    red::state_set("replay_notice", "Review not posted · every draft remains local.");
+    red::state_set("replay_view", "outbox");
+    render();
+}
+
+fn review_submission_finished(result: Json) {
+    clear_pending_review_submission();
+    if !red::bool(result.ok, false) {
+        let uncertain = red::string(result.code, "") == "review_submission_uncertain";
+        red::state_set("replay_submission_uncertain", uncertain);
+        let fallback = "GitHub could not confirm this review; all local drafts are preserved";
+        if uncertain {
+            fallback = "This review may already be on GitHub. Check the pull request before retrying.";
+        }
+        red::state_set(
+            "replay_notice",
+            source_error(result, fallback)
+        );
+        red::state_set("replay_view", "outbox");
+        render();
+        return;
+    }
+
+    red::state_set("replay_submission_uncertain", false);
+    red::state_set("replay_drafts", result.drafts);
+    red::state_set("replay_receipts", result.receipts);
+    red::state_set(
+        "replay_notice",
+        "Posted " + review_outcome_label(red::string(result.receipt.outcome, ""))
+            + " · verified GitHub receipt"
+            + " · use S to save your private review and receipt."
+    );
+    red::state_set("replay_view", "outbox");
+    render();
+}
+
 fn portable_review_ready() -> bool {
     if !ensure_workspace() {
         return false;
@@ -1330,11 +1645,15 @@ fn review_outcome_count(count: int, singular: String, plural: String) -> String 
 }
 
 fn save_review() {
+    if !review_mutation_available() {
+        return;
+    }
     if !portable_review_ready() {
         return;
     }
     if red::len(red::state("replay_drafts")) == 0
-        && red::len(red::state("replay_notes")) == 0 {
+        && red::len(red::state("replay_notes")) == 0
+        && red::len(red::state("replay_receipts")) == 0 {
         red::state_set(
             "replay_notice",
             "Nothing to save yet. Add a local comment, summary, fix, or observation first."
@@ -1405,11 +1724,17 @@ fn review_saved(result: Json) {
     }
     red::state_set("replay_pending_bundle_path", "");
     red::state_set("replay_review_path", red::string(result.path, ""));
+    let receipt_copy = "";
+    if red::int(result.receipt_count, 0) > 0 {
+        receipt_copy = " and "
+            + review_outcome_count(red::int(result.receipt_count, 0), "GitHub receipt", "GitHub receipts");
+    }
     red::state_set(
         "replay_notice",
         "Saved " + review_outcome_count(red::int(result.draft_count, 0), "draft", "drafts")
             + " and "
             + review_outcome_count(red::int(result.note_count, 0), "observation", "observations")
+            + receipt_copy
             + " locally · nothing sent to GitHub."
     );
     red::state_set("replay_view", "outbox");
@@ -1432,6 +1757,9 @@ fn replace_review_selected(item: PickerItem) {
 }
 
 fn load_review() {
+    if !review_mutation_available() {
+        return;
+    }
     if !portable_review_ready() {
         return;
     }
@@ -1476,9 +1804,10 @@ fn review_file_previewed(result: Json) {
     let preview = result.preview;
     let new_drafts = red::int(preview.drafts_to_add, 0);
     let new_notes = red::int(preview.notes_to_add, 0);
+    let new_receipts = red::int(preview.receipts_to_add, 0);
     let existing_drafts = red::int(preview.drafts_already_present, 0);
     let existing_notes = red::int(preview.notes_already_present, 0);
-    if new_drafts == 0 && new_notes == 0 {
+    if new_drafts == 0 && new_notes == 0 && new_receipts == 0 {
         red::state_set("replay_pending_bundle_path", "");
         red::state_set("replay_pending_bundle_digest", "");
         red::state_set(
@@ -1494,7 +1823,8 @@ fn review_file_previewed(result: Json) {
     red::state_set("replay_pending_bundle_path", red::string(preview.path, ""));
     red::state_set("replay_pending_bundle_digest", red::string(preview.bundle_digest, ""));
     let message = "Add " + review_outcome_count(new_drafts, "local draft", "local drafts")
-        + " and " + review_outcome_count(new_notes, "observation", "observations") + ". "
+        + ", " + review_outcome_count(new_notes, "observation", "observations")
+        + ", and " + review_outcome_count(new_receipts, "verified GitHub receipt", "verified GitHub receipts") + ". "
         + review_outcome_count(existing_drafts, "draft", "drafts") + " and "
         + review_outcome_count(existing_notes, "observation", "observations")
         + " are already present. "
@@ -1539,6 +1869,9 @@ fn review_file_loaded(result: Json) {
         return;
     }
     red::state_set("replay_drafts", result.drafts);
+    if result.receipts != red::null() {
+        red::state_set("replay_receipts", result.receipts);
+    }
     red::state_set("replay_notes", result.notes);
     red::state_set("replay_review_path", red::string(result.preview.path, ""));
     let index = red::int(red::state("replay_outbox_index"), 0);
@@ -1634,6 +1967,7 @@ fn guide_content() -> String {
         head_commit: red::string(red::state("replay_head_commit"), ""),
         draft_count: red::len(red::state("replay_drafts")),
         drafts: red::state("replay_drafts"),
+        receipts: red::state("replay_receipts"),
         outbox_index: red::int(red::state("replay_outbox_index"), 0),
         view: red::string(red::state("replay_view"), "guide"),
         title: red::string(red::state("replay_title"), ""),

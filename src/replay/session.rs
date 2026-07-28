@@ -251,6 +251,8 @@ pub enum ReplayDraftState {
     /// The draft exists only in the local, recoverable Replay session.
     #[default]
     Local,
+    /// GitHub accepted this draft in a verified, explicitly submitted review.
+    Submitted,
 }
 
 /// Original GitHub diff image to which an inline review draft belongs.
@@ -319,6 +321,9 @@ pub struct ReplayReviewState {
     pub role: ReplayReviewRole,
     /// Locally persisted comments, proposed fixes, and PR-level summaries.
     pub drafts: Vec<ReplayReviewDraft>,
+    /// Verified receipts for reviews explicitly submitted to the original PR.
+    #[serde(default)]
+    pub receipts: Vec<super::ReplayReviewReceipt>,
 }
 
 /// Complete reviewer session and original author source context.
@@ -950,6 +955,11 @@ impl ReplayController {
             .iter_mut()
             .find(|draft| draft.id == draft_id)
             .ok_or_else(|| missing("local replay review draft", draft_id))?;
+        if draft.state != ReplayDraftState::Local {
+            return Err(ReplayError::InvalidReviewDraft(
+                "a published review comment cannot be edited locally".to_string(),
+            ));
+        }
         draft.text = text.to_string();
         draft.updated_at_ms = now_ms().max(draft.created_at_ms);
         let draft = draft.clone();
@@ -971,6 +981,11 @@ impl ReplayController {
             .iter()
             .position(|draft| draft.id == draft_id)
             .ok_or_else(|| missing("local replay review draft", draft_id))?;
+        if session.review.drafts[index].state != ReplayDraftState::Local {
+            return Err(ReplayError::InvalidReviewDraft(
+                "a published review comment cannot be discarded locally".to_string(),
+            ));
+        }
         let draft = session.review.drafts.remove(index);
         session.generation = session.generation.saturating_add(1);
         self.advance_generation();
@@ -1151,6 +1166,12 @@ fn validate_recovered_session(
             limit: limits.max_steps,
         });
     }
+    if session.review.receipts.len() > limits.max_steps {
+        return Err(ReplayError::LimitExceeded {
+            kind: "submitted review receipts",
+            limit: limits.max_steps,
+        });
+    }
     let mut draft_ids = HashSet::with_capacity(session.review.drafts.len());
     for draft in &session.review.drafts {
         if !draft_ids.insert(draft.id.as_str())
@@ -1206,6 +1227,49 @@ fn validate_recovered_session(
                 }
             }
         }
+    }
+
+    let mut receipt_ids = HashSet::with_capacity(session.review.receipts.len());
+    let mut submitted_draft_ids = HashSet::new();
+    for receipt in &session.review.receipts {
+        if receipt.id == 0
+            || !receipt_ids.insert(receipt.id)
+            || receipt.target_commit != session.source.target_commit
+            || receipt.viewer.trim().is_empty()
+            || receipt.submitted_at.trim().is_empty()
+            || receipt.payload_digest.len() != 64
+            || !receipt
+                .payload_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || receipt.draft_ids.is_empty()
+        {
+            return Err(ReplayError::InvalidReviewDraft(
+                "a recovered submitted-review receipt does not match the original PR head"
+                    .to_string(),
+            ));
+        }
+        for draft_id in &receipt.draft_ids {
+            if !draft_ids.contains(draft_id.as_str())
+                || !submitted_draft_ids.insert(draft_id.as_str())
+            {
+                return Err(ReplayError::InvalidReviewDraft(
+                    "a recovered submitted review contains an unrelated or duplicate draft"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    if session.review.drafts.iter().any(|draft| {
+        (draft.state == ReplayDraftState::Submitted)
+            != submitted_draft_ids.contains(draft.id.as_str())
+            || (draft.state == ReplayDraftState::Submitted
+                && draft.kind == ReplayReviewDraftKind::CodeFix)
+    }) {
+        return Err(ReplayError::InvalidReviewDraft(
+            "a published review draft does not have a matching submitted GitHub review receipt"
+                .to_string(),
+        ));
     }
 
     Ok(())
@@ -1292,6 +1356,7 @@ impl ReplaySession {
             review: ReplayReviewState {
                 role,
                 drafts: Vec::new(),
+                receipts: Vec::new(),
             },
             generation: 0,
         })
@@ -1577,7 +1642,8 @@ fn missing(kind: &'static str, id: &str) -> ReplayError {
 mod tests {
     use super::*;
     use crate::replay::{
-        ReplayRepository, ReplayReviewBundle, ReplaySourceKind, MAX_REPLAY_REVIEW_BUNDLE_BYTES,
+        ReplayRepository, ReplayReviewBundle, ReplayReviewOutcome, ReplayReviewReceipt,
+        ReplayReviewSubmissionPreview, ReplaySourceKind, MAX_REPLAY_REVIEW_BUNDLE_BYTES,
         REPLAY_REVIEW_BUNDLE_VERSION,
     };
 
@@ -1676,6 +1742,23 @@ mod tests {
             .expect("encode an intentionally modified private review fixture");
         std::fs::write(path, encoded)
             .expect("replace only the isolated temporary private review fixture");
+    }
+
+    fn submitted_review_receipt(preview: &ReplayReviewSubmissionPreview) -> ReplayReviewReceipt {
+        ReplayReviewReceipt {
+            id: 71,
+            url: "https://github.com/owner/repository/pull/482#pullrequestreview-71".to_string(),
+            outcome: preview.outcome,
+            target_commit: preview.target_commit.clone(),
+            viewer: preview.viewer.clone(),
+            draft_ids: preview
+                .drafts
+                .iter()
+                .map(|draft| draft.id.clone())
+                .collect(),
+            payload_digest: digest(b"explicitly approved original PR review"),
+            submitted_at: "2026-07-27T20:00:00Z".to_string(),
+        }
     }
 
     #[test]
@@ -2365,6 +2448,183 @@ mod tests {
                 0o700,
             );
         }
+    }
+
+    #[test]
+    fn portable_reviews_preserve_verified_github_submission_receipts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("submitted-pr-482.red-review.json");
+        let (mut original, original_id, original_step) =
+            controller_with_pull_request("alice", Some("reviewer"));
+        original
+            .add_review_draft(
+                &original_id,
+                Some(&original_step),
+                ReplayReviewDraftKind::InlineComment,
+                "Please cover the original refresh boundary.",
+            )
+            .unwrap();
+        let preview = original
+            .preview_review_submission(&original_id, ReplayReviewOutcome::Comment)
+            .unwrap();
+        let receipt = submitted_review_receipt(&preview);
+        original
+            .record_review_submission(&original_id, &preview, receipt.clone())
+            .unwrap();
+        let saved = original
+            .save_review_bundle(&original_id, &path, /*overwrite*/ false)
+            .unwrap();
+        let bundle = read_portable_review(&path);
+
+        assert_eq!(bundle.version, REPLAY_REVIEW_BUNDLE_VERSION);
+        assert_eq!(saved.receipt_count, 1);
+        assert_eq!(bundle.receipts, vec![receipt.clone()]);
+        assert_eq!(bundle.drafts[0].state, ReplayDraftState::Submitted);
+
+        let (mut destination, destination_id, _) =
+            controller_with_pull_request("alice", Some("reviewer"));
+        let import = destination
+            .preview_review_bundle(&destination_id, &path)
+            .unwrap();
+        assert_eq!(import.drafts_to_add, 1);
+        assert_eq!(import.receipts_to_add, 1);
+        destination
+            .import_review_bundle(
+                &destination_id,
+                &path,
+                &import.bundle_digest,
+                /*confirmed*/ true,
+            )
+            .unwrap();
+        let recovered = destination.session(&destination_id).unwrap();
+        assert_eq!(recovered.review.receipts, vec![receipt]);
+        assert_eq!(
+            recovered.review.drafts[0].state,
+            ReplayDraftState::Submitted
+        );
+        assert!(matches!(
+            destination.preview_review_submission(&destination_id, ReplayReviewOutcome::Comment),
+            Err(ReplayError::InvalidReviewDraft(_)),
+        ));
+    }
+
+    #[test]
+    fn original_version_one_private_review_files_remain_loadable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy-pr-482.red-review.json");
+        let (mut original, original_id, original_step) =
+            controller_with_pull_request("alice", Some("reviewer"));
+        original
+            .add_review_draft(
+                &original_id,
+                Some(&original_step),
+                ReplayReviewDraftKind::InlineComment,
+                "Keep the original portable review backward compatible.",
+            )
+            .unwrap();
+        original
+            .save_review_bundle(&original_id, &path, /*overwrite*/ false)
+            .unwrap();
+        let mut legacy = read_portable_review(&path);
+        legacy.version = 1;
+        replace_portable_review(&path, &legacy);
+
+        let (mut destination, destination_id, _) =
+            controller_with_pull_request("alice", Some("reviewer"));
+        let preview = destination
+            .preview_review_bundle(&destination_id, &path)
+            .expect("continue to recognize an existing version-one private review file");
+        destination
+            .import_review_bundle(
+                &destination_id,
+                &path,
+                &preview.bundle_digest,
+                /*confirmed*/ true,
+            )
+            .unwrap();
+
+        assert_eq!(
+            destination
+                .session(&destination_id)
+                .unwrap()
+                .review
+                .drafts
+                .len(),
+            1
+        );
+        assert!(destination
+            .session(&destination_id)
+            .unwrap()
+            .review
+            .receipts
+            .is_empty());
+    }
+
+    #[test]
+    fn submitted_drafts_cannot_be_imported_without_their_verified_github_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tampered-pr-482.red-review.json");
+        let (mut original, original_id, original_step) =
+            controller_with_pull_request("alice", Some("reviewer"));
+        original
+            .add_review_draft(
+                &original_id,
+                Some(&original_step),
+                ReplayReviewDraftKind::InlineComment,
+                "The original published comment needs its exact receipt.",
+            )
+            .unwrap();
+        let preview = original
+            .preview_review_submission(&original_id, ReplayReviewOutcome::Comment)
+            .unwrap();
+        original
+            .record_review_submission(&original_id, &preview, submitted_review_receipt(&preview))
+            .unwrap();
+        original
+            .save_review_bundle(&original_id, &path, /*overwrite*/ false)
+            .unwrap();
+        let mut tampered = read_portable_review(&path);
+        tampered.receipts.clear();
+        replace_portable_review(&path, &tampered);
+
+        let (destination, destination_id, _) =
+            controller_with_pull_request("alice", Some("reviewer"));
+        assert!(matches!(
+            destination.preview_review_bundle(&destination_id, &path),
+            Err(ReplayError::InvalidReviewBundle(_)),
+        ));
+    }
+
+    #[test]
+    fn crash_recovery_restores_verified_submitted_reviews_without_reposting() {
+        let (mut original, session_id, step_id) =
+            controller_with_pull_request("alice", Some("reviewer"));
+        original
+            .add_review_draft(
+                &session_id,
+                Some(&step_id),
+                ReplayReviewDraftKind::InlineComment,
+                "Preserve the exact original published review across recovery.",
+            )
+            .unwrap();
+        let preview = original
+            .preview_review_submission(&session_id, ReplayReviewOutcome::Comment)
+            .unwrap();
+        let receipt = submitted_review_receipt(&preview);
+        original
+            .record_review_submission(&session_id, &preview, receipt.clone())
+            .unwrap();
+        let snapshot = original.recovery_snapshot().unwrap();
+
+        let mut recovered = ReplayController::default();
+        recovered.restore(&snapshot).unwrap();
+        let session = recovered.session(&session_id).unwrap();
+        assert_eq!(session.review.receipts, vec![receipt]);
+        assert_eq!(session.review.drafts[0].state, ReplayDraftState::Submitted);
+        assert!(matches!(
+            recovered.preview_review_submission(&session_id, ReplayReviewOutcome::Comment),
+            Err(ReplayError::InvalidReviewDraft(_)),
+        ));
     }
 
     #[test]

@@ -834,6 +834,18 @@ pub enum PluginRequest {
         workspace_id: String,
         draft_id: String,
     },
+    ReplayPreviewSubmission {
+        request_id: RequestId,
+        workspace_id: String,
+        outcome: crate::replay::ReplayReviewOutcome,
+    },
+    ReplaySubmitReview {
+        request_id: RequestId,
+        workspace_id: String,
+        outcome: crate::replay::ReplayReviewOutcome,
+        preview_digest: String,
+        confirmed: bool,
+    },
     ReplaySaveReview {
         request_id: RequestId,
         workspace_id: String,
@@ -1102,6 +1114,15 @@ pub enum ReplayBackgroundResult {
         /// Safely decoded owner snapshot with original Replay metadata.
         snapshot: Box<SessionSnapshot>,
     },
+    /// One atomically submitted, confirmed, original-source GitHub review.
+    SubmittedReview {
+        /// Stable editor-owned review whose drafts were explicitly published.
+        workspace_id: String,
+        /// Exact identity, event, drafts, and generation the user confirmed.
+        preview: Box<crate::replay::ReplayReviewSubmissionPreview>,
+        /// Provider-verified, non-pending review receipt.
+        receipt: Box<crate::replay::ReplayReviewReceipt>,
+    },
     /// An immutable editor-owned review snapshot saved to a user-selected file.
     SavedReviewBundle {
         /// Stable editor-owned review whose contents were explicitly saved.
@@ -1196,6 +1217,8 @@ impl PluginRequest {
             Self::ReplayAddDraft { .. } => "ReplayAddDraft",
             Self::ReplayUpdateDraft { .. } => "ReplayUpdateDraft",
             Self::ReplayRemoveDraft { .. } => "ReplayRemoveDraft",
+            Self::ReplayPreviewSubmission { .. } => "ReplayPreviewSubmission",
+            Self::ReplaySubmitReview { .. } => "ReplaySubmitReview",
             Self::ReplaySaveReview { .. } => "ReplaySaveReview",
             Self::ReplayPreviewReview { .. } => "ReplayPreviewReview",
             Self::ReplayLoadReview { .. } => "ReplayLoadReview",
@@ -3956,6 +3979,7 @@ impl Editor {
             "review_bundle_path": crate::replay::suggested_review_bundle_path(&session.source),
             "head_permission": pull_request.map(|request| request.capabilities.head_permission),
             "drafts": drafts,
+            "receipts": session.review.receipts,
             "outbox": {
                 "draft_count": drafts.len(),
                 "inline_count": drafts
@@ -4402,6 +4426,7 @@ impl Editor {
             "review_bundle_path": crate::replay::suggested_review_bundle_path(&recovered.source),
             "head_permission": pull_request.map(|request| request.capabilities.head_permission),
             "drafts": recovered.review.drafts,
+            "receipts": recovered.review.receipts,
             "plan": presentation,
         }))
     }
@@ -8668,6 +8693,59 @@ impl Editor {
                         .resolve_request(runtime, request_id, payload)
                         .await?;
                 }
+                PluginRequest::ReplayPreviewSubmission {
+                    request_id,
+                    workspace_id,
+                    outcome,
+                } => {
+                    let payload = match self
+                        .replay_controller
+                        .preview_review_submission(&workspace_id, outcome)
+                    {
+                        Ok(preview) => json!({
+                            "ok": true,
+                            "workspace_id": workspace_id,
+                            "preview": preview,
+                        }),
+                        Err(error) => error.payload(),
+                    };
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
+                }
+                PluginRequest::ReplaySubmitReview {
+                    request_id,
+                    workspace_id,
+                    outcome,
+                    preview_digest,
+                    confirmed,
+                } => {
+                    let limits = self.replay_controller.limits();
+                    let started = self
+                        .replay_controller
+                        .prepare_review_submission(
+                            &workspace_id,
+                            outcome,
+                            &preview_digest,
+                            confirmed,
+                        )
+                        .and_then(|submission| {
+                            self.spawn_replay_background(request_id, "review-submit", move || {
+                                let (preview, receipt) =
+                                    crate::replay::submit_prepared_review(submission, limits)?;
+                                Ok(ReplayBackgroundResult::SubmittedReview {
+                                    workspace_id,
+                                    preview: Box::new(preview),
+                                    receipt: Box::new(receipt),
+                                })
+                            })
+                        });
+                    if let Err(error) = started {
+                        self.plugin_registry
+                            .resolve_request(runtime, request_id, error.payload())
+                            .await?;
+                    }
+                }
                 PluginRequest::ReplaySaveReview {
                     request_id,
                     workspace_id,
@@ -8827,6 +8905,30 @@ impl Editor {
                             }
                             Err(error) => json!({ "ok": false, "error": error.to_string() }),
                         },
+                        Ok(ReplayBackgroundResult::SubmittedReview {
+                            workspace_id,
+                            preview,
+                            receipt,
+                        }) => match self.replay_controller.record_review_submission(
+                            &workspace_id,
+                            &preview,
+                            *receipt,
+                        ) {
+                            Ok(receipt) => match self.replay_controller.session(&workspace_id) {
+                                Ok(session) => {
+                                    needs_render = true;
+                                    json!({
+                                        "ok": true,
+                                        "workspace_id": workspace_id,
+                                        "receipt": receipt,
+                                        "drafts": session.review.drafts,
+                                        "receipts": session.review.receipts,
+                                    })
+                                }
+                                Err(error) => error.payload(),
+                            },
+                            Err(error) => error.payload(),
+                        },
                         Ok(ReplayBackgroundResult::SavedReviewBundle {
                             workspace_id,
                             saved,
@@ -8836,6 +8938,7 @@ impl Editor {
                             "path": saved.path,
                             "note_count": saved.note_count,
                             "draft_count": saved.draft_count,
+                            "receipt_count": saved.receipt_count,
                         }),
                         Ok(ReplayBackgroundResult::ReviewBundlePreview {
                             workspace_id,
@@ -8881,6 +8984,7 @@ impl Editor {
                                         "ok": true,
                                         "workspace_id": workspace_id,
                                         "drafts": session.review.drafts,
+                                        "receipts": session.review.receipts,
                                         "notes": notes,
                                         "preview": preview,
                                     })

@@ -2,8 +2,9 @@
 
 use std::{
     ffi::OsStr,
+    io::Write as _,
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
 };
 
 use serde::{Deserialize, Serialize};
@@ -1266,6 +1267,63 @@ fn run_command(command: &mut Command, limit: usize) -> Result<Vec<u8>, ReplayErr
             program: program.clone(),
             message: error.to_string(),
         })?;
+    bounded_command_output(program, output, limit)
+}
+
+/// Runs one bounded command with an explicitly supplied, noninteractive body.
+pub(super) fn run_command_with_input(
+    command: &mut Command,
+    input: &[u8],
+    limit: usize,
+) -> Result<Vec<u8>, ReplayError> {
+    if input.len() > limit {
+        return Err(ReplayError::LimitExceeded {
+            kind: "GitHub review submission",
+            limit,
+        });
+    }
+
+    let program = command.get_program().to_string_lossy().into_owned();
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .spawn()
+        .map_err(|error| ReplayError::CommandFailed {
+            program: program.clone(),
+            message: error.to_string(),
+        })?;
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or_else(|| ReplayError::CommandFailed {
+            program: program.clone(),
+            message: "could not open the GitHub review request body".to_string(),
+        })?
+        .write_all(input);
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(ReplayError::CommandFailed {
+            program,
+            message: format!("could not send the GitHub review request body: {error}"),
+        });
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| ReplayError::CommandFailed {
+            program: program.clone(),
+            message: error.to_string(),
+        })?;
+    bounded_command_output(program, output, limit)
+}
+
+fn bounded_command_output(
+    program: String,
+    output: Output,
+    limit: usize,
+) -> Result<Vec<u8>, ReplayError> {
     if output.stdout.len() > limit {
         return Err(ReplayError::LimitExceeded {
             kind: "source command output",

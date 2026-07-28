@@ -8,6 +8,7 @@ mod bundle;
 mod demo;
 mod patch;
 mod plan;
+mod review;
 mod session;
 mod source;
 
@@ -31,6 +32,8 @@ pub use plan::{
     replay_plan_from_session, replay_presentation_plan, ReplayPresentationPlan,
     ReplayPresentationStep,
 };
+pub(crate) use review::submit_prepared_review;
+pub use review::{ReplayReviewOutcome, ReplayReviewReceipt, ReplayReviewSubmissionPreview};
 pub(crate) use session::anchored_hunk_offset;
 pub use session::{
     ReplayCompletion, ReplayController, ReplayDiffSide, ReplayDraftOrigin, ReplayDraftState,
@@ -175,6 +178,12 @@ pub enum ReplayError {
     /// Importing private review outcomes always requires explicit confirmation.
     #[error("loading a local review file requires explicit confirmation")]
     ReviewBundleConfirmationRequired,
+    /// Publishing a review is permitted only after explicit human confirmation.
+    #[error("publishing a GitHub review requires explicit confirmation")]
+    ReviewSubmissionConfirmationRequired,
+    /// GitHub may have accepted a request even though its receipt was unavailable.
+    #[error("GitHub review may already have been submitted: {0}; check the pull request before retrying")]
+    ReviewSubmissionUncertain(String),
     /// A safe local filesystem operation could not be completed.
     #[error("replay filesystem operation failed: {0}")]
     Filesystem(String),
@@ -209,6 +218,8 @@ impl ReplayError {
             Self::ReviewBundleExists(_) => "review_bundle_exists",
             Self::ReviewBundleConflict(_) => "review_bundle_conflict",
             Self::ReviewBundleConfirmationRequired => "review_bundle_confirmation_required",
+            Self::ReviewSubmissionConfirmationRequired => "review_submission_confirmation_required",
+            Self::ReviewSubmissionUncertain(_) => "review_submission_uncertain",
             Self::Filesystem(_) => "replay_filesystem_failed",
         }
     }
