@@ -3904,11 +3904,6 @@ impl Editor {
         };
 
         let width = window.inner_width();
-        let role = if width < 34 {
-            " SCRATCH "
-        } else {
-            " SCRATCH SOURCE "
-        };
         let applied_in_demo = workspace
             .applied_steps
             .iter()
@@ -3948,6 +3943,17 @@ impl Editor {
                 ("INSERT HERE", "editorWarning.foreground")
             }
             _ => ("BEFORE APPLY", "editorWarning.foreground"),
+        };
+        let basename = step.path.rsplit('/').next().unwrap_or(&step.path);
+        let role = if display_width(" SCRATCH SOURCE ")
+            .saturating_add(display_width(source_status))
+            .saturating_add(display_width(basename))
+            .saturating_add(/*separator widths*/ 6)
+            <= width
+        {
+            " SCRATCH SOURCE "
+        } else {
+            " SCRATCH "
         };
         let reserved = display_width(role)
             .saturating_add(display_width(source_status))
@@ -25762,6 +25768,69 @@ mod test {
             .unwrap();
         assert_eq!(source_window.position.x, 47);
         assert_eq!(editor.buffer_manager[0].contents(), "hello");
+    }
+
+    #[tokio::test]
+    async fn replay_scratch_title_preserves_filename_and_status_when_the_pane_is_narrow() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+        editor
+            .open_replay_demo_workspace(&mut render_buffer)
+            .await
+            .expect("open the editor-owned Replay source");
+        editor.test_create_text_panel(
+            "replay-coach",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Left,
+                width: 39,
+                title: Some("PR REPLAY".to_string()),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        let source_window = editor
+            .replay_demo_workspace
+            .as_ref()
+            .expect("the scratch source remains active")
+            .source_window;
+        let width = editor
+            .window_manager
+            .window(source_window)
+            .expect("the source window remains open")
+            .inner_width();
+        let narrow_bar = editor
+            .window_bar_manager
+            .render(source_window, width)
+            .expect("a narrow source retains its native title");
+        let narrow_title = narrow_bar
+            .segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert!(narrow_title.contains("SCRATCH"));
+        assert!(narrow_title.contains("rendering.rs"));
+        assert!(narrow_title.contains("INSERT HERE"));
+
+        assert!(editor.set_panel_size("replay-coach", plugin::PanelSide::Left, 20));
+        let width = editor
+            .window_manager
+            .window(source_window)
+            .expect("resizing never replaces the source window")
+            .inner_width();
+        let wide_bar = editor
+            .window_bar_manager
+            .render(source_window, width)
+            .expect("the expanded source retains its native title");
+        let wide_title = wide_bar
+            .segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert!(wide_title.contains("SCRATCH SOURCE"));
+        assert!(wide_title.contains("rendering.rs"));
+        assert!(wide_title.contains("INSERT HERE"));
     }
 
     #[tokio::test]
