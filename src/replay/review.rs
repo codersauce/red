@@ -662,6 +662,7 @@ mod tests {
             capabilities: ReplayGitHubCapabilities {
                 viewer: viewer.map(str::to_string),
                 head_permission: ReplayRepositoryPermission::Write,
+                warning: None,
             },
             captured_at_ms: 1,
         };

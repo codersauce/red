@@ -775,6 +775,10 @@ mod tests {
                 "(callback: fn(Json), column: i32, y: i32)",
             ),
             (
+                "ReplayApplyStep",
+                "(callback: fn(Json), workspace_id: String, step_id: String, revision: i64)",
+            ),
+            (
                 "ReplayDemoApplyStep",
                 "(callback: fn(Json), workspace_id: String, step_id: String, revision: i64)",
             ),

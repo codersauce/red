@@ -362,11 +362,14 @@ selected position, while the review metadata reports genuinely completed
 changes. A `✓` identifies a manually reconstructed step, `⊕` identifies an
 automatic application, and `✎` identifies an actual private note or inline draft.
 
-Every step always displays its exact, independently parseable unified diff.
-Challenge mode emphasizes manually reconstructing the hunk in the real source
-buffer. Snippet mode additionally reveals the complete resulting original-author
-source for that hunk. Full scratch-file images remain editor-owned instead of
-being copied into every guide step.
+Every step always displays its exact, independently parseable unified diff,
+including additions and deletions. Challenge mode does not hide the change; it
+asks you to reconstruct that visible hunk yourself in the editable scratch
+source. Snippet mode keeps the same diff and adds an **ORIGINAL AUTHOR SOURCE**
+section containing the resulting original-author text for that hunk. Full
+scratch-file images remain editor-owned instead of being copied into every guide
+step. Both modes keep the dedicated guide movable and separately focusable from
+the real source buffer.
 
 To apply a step automatically, press `a` while the guide is focused, or use
 `Space R a` from either surface. Rust checks the original step, scratch-buffer

@@ -191,6 +191,7 @@ pub fn activate() {
     red::state_set("replay_author", "");
     red::state_set("replay_branch", "");
     red::state_set("replay_review_role", red::null());
+    red::state_set("replay_viewer_verified", red::null());
     red::state_set("replay_head_commit", "");
     red::state_set("replay_head_permission", "");
     red::state_set("replay_author_workspace_root", "");
@@ -220,6 +221,7 @@ pub fn activate() {
     red::state_set("replay_submission_uncertain", false);
     red::state_set("replay_completions", []);
     red::state_set("replay_notice", "");
+    red::state_set("replay_notice_severity", "info");
     red::state_set("replay_steps", []);
 }
 
@@ -236,12 +238,14 @@ fn active_session_restored(result: Json) {
     if !load_plan(result.plan) {
         return;
     }
-    red::state_set("replay_source_kind", red::string(result.source_kind, "local_range"));
+    red::state_set("replay_source_kind", normalize_source_kind(
+        red::string(result.source_kind, "local_range")
+    ));
     red::state_set("replay_index", red::int(result.index, 0));
     red::state_set("replay_mode", red::string(result.mode, "challenge"));
     red::state_set("replay_notes", result.notes);
     red::state_set("replay_completions", result.completions);
-    red::state_set("replay_notice", "Review restored · progress, findings, and drafts recovered.");
+    set_notice("Review restored · progress, findings, and drafts recovered.", "success");
     workspace_opened(result);
 }
 
@@ -443,6 +447,18 @@ fn source_error(result: Json, fallback: String) -> String {
     return red::string(result.error, red::string(result.message, fallback));
 }
 
+fn normalize_source_kind(kind: String) -> String {
+    if kind == "git_hub_pull_request" {
+        return "github_pull_request";
+    }
+    return kind;
+}
+
+fn set_notice(message: String, severity: String) {
+    red::state_set("replay_notice", message);
+    red::state_set("replay_notice_severity", severity);
+}
+
 fn source_resolved(result: Json) {
     if !red::bool(result.ok, false) {
         red::execute("Print", "Replay source could not be resolved: " + source_error(result, "unknown error"));
@@ -454,6 +470,11 @@ fn source_resolved(result: Json) {
     red::state_set("replay_branch", red::string(result.branch, ""));
     red::state_set("replay_head_commit", red::string(result.head_commit, ""));
     red::state_set("replay_head_permission", red::string(result.head_permission, ""));
+    if red::int(result.pull_request, 0) > 0 {
+        red::state_set("replay_viewer_verified", red::string(result.viewer, "") != "");
+    } else {
+        red::state_set("replay_viewer_verified", red::null());
+    }
     let role = red::string(result.review_role, "");
     if role == "" {
         red::state_set("replay_review_role", red::null());
@@ -494,7 +515,9 @@ fn confirm_workspace(source: Json) {
         + "\n\nYour current branch is unchanged. Creating this scratch worktree does not save, commit, push, or submit a review.";
     red::state_set("replay_pending_source_id", red::string(source.source_id, ""));
     red::state_set("replay_pending_workspace_root", red::string(source.workspace_root, ""));
-    red::state_set("replay_source_kind", red::string(source.source_kind, "local_range"));
+    red::state_set("replay_source_kind", normalize_source_kind(
+        red::string(source.source_kind, "local_range")
+    ));
     red::execute("OpenConfirm", "Create Replay scratch worktree?", message, PickerHandlers {
         selected: workspace_creation_selected,
         cancelled: workspace_creation_cancelled,
@@ -592,6 +615,7 @@ fn load_plan(plan: Json) -> bool {
     red::state_set("replay_steps", plan.steps);
     red::state_set("replay_index", 0);
     red::state_set("replay_review_role", red::null());
+    red::state_set("replay_viewer_verified", red::null());
     red::state_set("replay_head_commit", "");
     red::state_set("replay_head_permission", "");
     red::state_set("replay_author_workspace_root", "");
@@ -608,7 +632,7 @@ fn load_plan(plan: Json) -> bool {
     red::state_set("replay_submission_pending", false);
     red::state_set("replay_submission_uncertain", false);
     red::state_set("replay_completions", []);
-    red::state_set("replay_notice", "");
+    set_notice("", "info");
     red::state_set("replay_view", "guide");
     return true;
 }
@@ -634,6 +658,9 @@ fn workspace_opened(event: Json) {
     red::state_set("replay_source_buffer_index", red::int(event.source_buffer_index, -1));
     red::state_set("replay_head_commit", red::string(event.head_commit, ""));
     red::state_set("replay_head_permission", red::string(event.head_permission, ""));
+    if red::int(red::state("replay_pull_request"), 0) > 0 {
+        red::state_set("replay_viewer_verified", red::string(event.viewer, "") != "");
+    }
     red::state_set("replay_review_path", red::string(event.review_bundle_path, ""));
     let role = red::string(event.review_role, "");
     if role == "" {
@@ -646,6 +673,10 @@ fn workspace_opened(event: Json) {
     }
     if event.receipts != red::null() {
         red::state_set("replay_receipts", event.receipts);
+    }
+    let capability_warning = red::string(event.capability_warning, "");
+    if capability_warning != "" {
+        set_notice(capability_warning, "warning");
     }
     ensure_panel();
     render();
@@ -791,7 +822,7 @@ fn next() {
         red::state_set("replay_index", index + 1);
         red::state_set("replay_hint_visible", false);
         red::state_set("replay_rationale_expanded", false);
-        red::state_set("replay_notice", "");
+        set_notice("", "info");
     }
     red::state_set("replay_view", "guide");
     render();
@@ -807,7 +838,7 @@ fn previous() {
         red::state_set("replay_index", index - 1);
         red::state_set("replay_hint_visible", false);
         red::state_set("replay_rationale_expanded", false);
-        red::state_set("replay_notice", "");
+        set_notice("", "info");
     }
     red::state_set("replay_view", "guide");
     render();
@@ -827,7 +858,7 @@ fn next_unreviewed() {
         }
         candidate = candidate + 1;
     }
-    red::state_set("replay_notice", "No later unreviewed changes.");
+    set_notice("No later unreviewed changes.", "warning");
     red::state_set("replay_view", "guide");
     render();
 }
@@ -844,7 +875,7 @@ fn previous_unreviewed() {
         }
         candidate = candidate - 1;
     }
-    red::state_set("replay_notice", "No earlier unreviewed changes.");
+    set_notice("No earlier unreviewed changes.", "warning");
     red::state_set("replay_view", "guide");
     render();
 }
@@ -876,7 +907,7 @@ fn next_file() {
         }
         candidate = candidate + 1;
     }
-    red::state_set("replay_notice", "Already at the last changed file.");
+    set_notice("Already at the last changed file.", "warning");
     red::state_set("replay_view", "guide");
     render();
 }
@@ -903,7 +934,7 @@ fn previous_file() {
         }
         candidate = candidate - 1;
     }
-    red::state_set("replay_notice", "Already at the first changed file.");
+    set_notice("Already at the first changed file.", "warning");
     red::state_set("replay_view", "guide");
     render();
 }
@@ -912,7 +943,7 @@ fn select_file_step(index: int) {
     red::state_set("replay_index", index);
     red::state_set("replay_hint_visible", false);
     red::state_set("replay_rationale_expanded", false);
-    red::state_set("replay_notice", "");
+    set_notice("", "info");
     red::state_set("replay_view", "guide");
     render();
     sync_selected_source();
@@ -1095,7 +1126,7 @@ fn toggle_mode() {
 
 fn mode_changed(result: Json) {
     if !red::bool(result.ok, false) {
-        red::state_set("replay_notice", source_error(result, "Could not change the review mode"));
+        set_notice(source_error(result, "Could not change the review mode"), "error");
     } else {
         red::state_set("replay_mode", red::string(result.mode, "challenge"));
     }
@@ -1110,7 +1141,7 @@ fn validate() {
     let index = red::int(red::state("replay_index"), 0);
     let step = red::state("replay_steps")[index];
     red::request(
-        "ReplayDemoValidateStep",
+        "ReplayValidateStep",
         validation_completed,
         red::string(red::state("replay_workspace_id"), ""),
         red::string(step.id, "")
@@ -1129,13 +1160,17 @@ fn source_changed(event: Json) {
     let source_matches = red::int(event.buffer_id, -1)
         == red::int(red::state("replay_source_buffer_index"), -1);
     if red::string(red::state("replay_source_kind"), "demo") != "demo" {
-        let expected_path = red::string(red::state("replay_workspace_root"), "")
-            + "/" + red::string(steps[index].path, "");
+        let expected_path = red::string(red::neotree_core(
+            "path_join",
+            red::string(red::state("replay_workspace_root"), ""),
+            red::string(steps[index].path, "")
+        ), "");
         let changed_path = red::string(
             event.file_path,
             red::string(event.buffer_name, "")
         );
-        source_matches = changed_path == expected_path;
+        source_matches = red::string(red::neotree_core("normalize_path", changed_path), "")
+            == red::string(red::neotree_core("normalize_path", expected_path), "");
     }
     if !source_matches {
         return;
@@ -1151,7 +1186,7 @@ fn source_changed(event: Json) {
     }
 
     remove_completed(index);
-    red::state_set("replay_notice", "Scratch source changed; check this step again.");
+    set_notice("Scratch source changed; check this step again.", "warning");
     render();
 }
 
@@ -1175,24 +1210,24 @@ fn replay_undone(event: Json) {
 
     red::state_set("replay_index", index);
     remove_completed(index);
-    red::state_set("replay_notice", "Undid the original hunk; scratch source restored.");
+    set_notice("Undid the original hunk; scratch source restored.", "success");
     render();
     sync_selected_source();
 }
 
 fn validation_completed(result: Json) {
     if !red::bool(result.ok, false) {
-        red::state_set("replay_notice", red::string(result.error, "Could not validate the scratch source"));
+        set_notice(red::string(result.error, "Could not validate the scratch source"), "error");
         render();
         return;
     }
     if red::string(result.state, "") == "exact" {
         mark_completed(red::int(red::state("replay_index"), 0), "manually reconstructed");
-        red::state_set("replay_notice", "Original hunk reconstructed in the scratch buffer.");
+        set_notice("Original hunk reconstructed in the scratch buffer.", "success");
     } else if red::string(result.state, "") == "incomplete" {
-        red::state_set("replay_notice", "The source still matches the original pre-image; implement the shown diff first.");
+        set_notice("The source still matches the original pre-image; implement the shown diff first.", "warning");
     } else {
-        red::state_set("replay_notice", "The source does not match this step. Finish its prerequisite or adjust your reconstruction.");
+        set_notice("The source does not match this step. Finish its prerequisite or adjust your reconstruction.", "error");
     }
     render();
 }
@@ -1203,7 +1238,7 @@ fn apply() {
     }
     let step = red::state("replay_steps")[red::int(red::state("replay_index"), 0)];
     red::request(
-        "ReplayDemoValidateStep",
+        "ReplayValidateStep",
         apply_prepared,
         red::string(red::state("replay_workspace_id"), ""),
         red::string(step.id, "")
@@ -1212,23 +1247,23 @@ fn apply() {
 
 fn apply_prepared(result: Json) {
     if !red::bool(result.ok, false) {
-        red::state_set("replay_notice", red::string(result.error, "Could not prepare the hunk"));
+        set_notice(red::string(result.error, "Could not prepare the hunk"), "error");
         render();
         return;
     }
     if red::string(result.state, "") == "exact" {
         mark_completed(red::int(red::state("replay_index"), 0), "manually reconstructed");
-        red::state_set("replay_notice", "This original hunk is already present in the scratch buffer.");
+        set_notice("This original hunk is already present in the scratch buffer.", "warning");
         render();
         return;
     }
     if red::string(result.state, "") != "incomplete" {
-        red::state_set("replay_notice", "The scratch source does not match this hunk's pre-image.");
+        set_notice("The scratch source does not match this hunk's pre-image.", "error");
         render();
         return;
     }
     red::request(
-        "ReplayDemoApplyStep",
+        "ReplayApplyStep",
         apply_completed,
         red::string(red::state("replay_workspace_id"), ""),
         red::string(result.step_id, ""),
@@ -1239,9 +1274,9 @@ fn apply_prepared(result: Json) {
 fn apply_completed(result: Json) {
     if red::bool(result.ok, false) && red::string(result.state, "") == "exact" {
         mark_completed(red::int(red::state("replay_index"), 0), "automatically applied");
-        red::state_set("replay_notice", "Applied the original hunk · u to undo.");
+        set_notice("Applied the original hunk · u to undo.", "success");
     } else {
-        red::state_set("replay_notice", red::string(result.error, "The original hunk could not be safely applied."));
+        set_notice(red::string(result.error, "The original hunk could not be safely applied."), "error");
     }
     render();
 }
@@ -1308,10 +1343,10 @@ fn note_submitted(value: String) {
 
 fn note_recorded(result: Json) {
     if !red::bool(result.ok, false) {
-        red::state_set("replay_notice", source_error(result, "Could not save the private review observation"));
+        set_notice(source_error(result, "Could not save the private review observation"), "error");
     } else {
         red::state_set("replay_notes", red::push(red::state("replay_notes"), result.note));
-        red::state_set("replay_notice", "Private observation saved with this original source hunk.");
+        set_notice("Private observation saved with this original source hunk.", "success");
     }
     render();
 }
@@ -1337,9 +1372,9 @@ fn open_fix() {
         return;
     }
     if red::string(red::state("replay_review_role"), "") != "author" {
-        red::state_set(
-            "replay_notice",
-            "Only the verified original PR author can draft changes to that PR. Use c for a review comment."
+        set_notice(
+            "Only the verified original PR author can draft changes to that PR. Use c for a review comment.",
+            "warning"
         );
         render();
         return;
@@ -1349,7 +1384,7 @@ fn open_fix() {
 
 fn author_workspace_available() -> bool {
     let source_kind = red::string(red::state("replay_source_kind"), "demo");
-    if source_kind != "github_pull_request" && source_kind != "git_hub_pull_request" {
+    if normalize_source_kind(source_kind) != "github_pull_request" {
         return false;
     }
     if red::string(red::state("replay_review_role"), "") != "author" {
@@ -1364,9 +1399,9 @@ fn open_original_workspace() {
         return;
     }
     if !author_workspace_available() {
-        red::state_set(
-            "replay_notice",
-            "Only the verified original PR author with head-repository write access can open real PR code."
+        set_notice(
+            "Only the verified original PR author with head-repository write access can open real PR code.",
+            "warning"
         );
         render();
         return;
@@ -1374,13 +1409,13 @@ fn open_original_workspace() {
     let index = red::int(red::state("replay_index"), 0);
     let steps = red::state("replay_steps");
     if index < 0 || index >= red::len(steps) {
-        red::state_set("replay_notice", "Select an original PR change before opening its real source.");
+        set_notice("Select an original PR change before opening its real source.", "warning");
         render();
         return;
     }
     let step_id = red::string(steps[index].id, "");
     if step_id == "" {
-        red::state_set("replay_notice", "The selected original PR change could not be verified.");
+        set_notice("The selected original PR change could not be verified.", "error");
         render();
         return;
     }
@@ -1396,16 +1431,16 @@ fn open_original_workspace() {
 
 fn original_workspace_previewed(preview: Json) {
     if !red::bool(preview.ok, false) {
-        red::state_set(
-            "replay_notice",
-            source_error(preview, "The original PR author workspace could not be verified.")
+        set_notice(
+            source_error(preview, "The original PR author workspace could not be verified."),
+            "error"
         );
         render();
         return;
     }
     if red::string(preview.workspace_id, "")
         != red::string(red::state("replay_workspace_id"), "") {
-        red::state_set("replay_notice", "This original PR workspace preview has expired.");
+        set_notice("This original PR workspace preview has expired.", "error");
         render();
         return;
     }
@@ -1448,7 +1483,7 @@ fn original_workspace_creation_selected(item: PickerItem) {
     let step_id = red::string(red::state("replay_pending_author_step_id"), "");
     let preview_digest = red::string(red::state("replay_pending_author_preview_digest"), "");
     if step_id == "" || preview_digest == "" {
-        red::state_set("replay_notice", "The original PR worktree preview has expired.");
+        set_notice("The original PR worktree preview has expired.", "error");
         render();
         return;
     }
@@ -1477,9 +1512,9 @@ fn original_workspace_opened(result: Json) {
     red::state_set("replay_pending_author_step_id", "");
     red::state_set("replay_pending_author_preview_digest", "");
     if !red::bool(result.ok, false) {
-        red::state_set(
-            "replay_notice",
-            source_error(result, "The original PR worktree could not be safely opened.")
+        set_notice(
+            source_error(result, "The original PR worktree could not be safely opened."),
+            "error"
         );
         render();
         return;
@@ -1498,7 +1533,7 @@ fn original_workspace_opened(result: Json) {
         notice = result_label
             + " · selected file is absent at the PR head; opened another original source · learning scratch unchanged.";
     }
-    red::state_set("replay_notice", notice);
+    set_notice(notice, "success");
     render();
     red::execute("FocusEditor");
 }
@@ -1509,9 +1544,9 @@ fn open_summary() {
 
 fn review_mutation_available() -> bool {
     if red::state_bool("replay_submission_pending") {
-        red::state_set(
-            "replay_notice",
-            "Wait for the confirmed GitHub review to finish before changing or exporting drafts."
+        set_notice(
+            "Wait for the confirmed GitHub review to finish before changing or exporting drafts.",
+            "warning"
         );
         red::state_set("replay_view", "outbox");
         render();
@@ -1528,7 +1563,7 @@ fn open_review_draft(kind: String, title: String, text: String) {
         return;
     }
     if red::string(red::state("replay_source_kind"), "demo") == "demo" {
-        red::state_set("replay_notice", "Open a real PR or local review before creating a recoverable draft.");
+        set_notice("Open a real PR or local review before creating a recoverable draft.", "warning");
         render();
         return;
     }
@@ -1538,7 +1573,7 @@ fn open_review_draft(kind: String, title: String, text: String) {
         let index = red::int(red::state("replay_index"), 0);
         let steps = red::state("replay_steps");
         if index < 0 || index >= red::len(steps) {
-            red::state_set("replay_notice", "Select an original source change before drafting an inline outcome.");
+            set_notice("Select an original source change before drafting an inline outcome.", "warning");
             render();
             return;
         }
@@ -1558,7 +1593,7 @@ fn review_draft_submitted(value: String) {
     }
     let text = red::trim(value);
     if text == "" {
-        red::state_set("replay_notice", "A local review draft cannot be empty.");
+        set_notice("A local review draft cannot be empty.", "warning");
         render();
         return;
     }
@@ -1580,7 +1615,7 @@ fn review_draft_submitted(value: String) {
 
 fn review_draft_recorded(result: Json) {
     if !red::bool(result.ok, false) {
-        red::state_set("replay_notice", source_error(result, "Could not save the local review draft"));
+        set_notice(source_error(result, "Could not save the local review draft"), "error");
         render();
         return;
     }
@@ -1606,7 +1641,7 @@ fn review_draft_recorded(result: Json) {
     red::state_set("replay_pending_draft_id", "");
     red::state_set("replay_pending_draft_kind", "");
     red::state_set("replay_pending_draft_step_id", "");
-    red::state_set("replay_notice", "Draft saved locally · nothing sent to GitHub.");
+    set_notice("Draft saved locally · nothing sent to GitHub.", "success");
     red::state_set("replay_view", "outbox");
     render();
 }
@@ -1657,13 +1692,13 @@ fn edit_draft() {
     let drafts = red::state("replay_drafts");
     let index = red::int(red::state("replay_outbox_index"), 0);
     if index < 0 || index >= red::len(drafts) {
-        red::state_set("replay_notice", "Choose a local review draft before editing it.");
+        set_notice("Choose a local review draft before editing it.", "warning");
         render();
         return;
     }
     let draft = drafts[index];
     if red::string(draft.state, "local") != "local" {
-        red::state_set("replay_notice", "Published GitHub review comments are read-only. Their original receipt is saved.");
+        set_notice("Published GitHub review comments are read-only. Their original receipt is saved.", "warning");
         render();
         return;
     }
@@ -1685,13 +1720,13 @@ fn discard_draft() {
     let drafts = red::state("replay_drafts");
     let index = red::int(red::state("replay_outbox_index"), 0);
     if index < 0 || index >= red::len(drafts) {
-        red::state_set("replay_notice", "Choose a local review draft before discarding it.");
+        set_notice("Choose a local review draft before discarding it.", "warning");
         render();
         return;
     }
     let draft = drafts[index];
     if red::string(draft.state, "local") != "local" {
-        red::state_set("replay_notice", "A published GitHub review cannot be discarded locally.");
+        set_notice("A published GitHub review cannot be discarded locally.", "warning");
         render();
         return;
     }
@@ -1727,7 +1762,7 @@ fn discard_draft_cancelled(event: PickerCancelled) {
 
 fn review_draft_removed(result: Json) {
     if !red::bool(result.ok, false) {
-        red::state_set("replay_notice", source_error(result, "Could not discard the local review draft"));
+        set_notice(source_error(result, "Could not discard the local review draft"), "error");
         render();
         return;
     }
@@ -1744,7 +1779,7 @@ fn review_draft_removed(result: Json) {
     }
     red::state_set("replay_drafts", drafts);
     red::state_set("replay_pending_draft_id", "");
-    red::state_set("replay_notice", "Local draft discarded · the PR remains unchanged.");
+    set_notice("Local draft discarded · the PR remains unchanged.", "success");
     red::state_set("replay_view", "outbox");
     render();
 }
@@ -1754,7 +1789,7 @@ fn publish_review() {
         return;
     }
     if red::state_bool("replay_submission_pending") {
-        red::state_set("replay_notice", "A confirmed GitHub review is already being submitted.");
+        set_notice("A confirmed GitHub review is already being submitted.", "warning");
         render();
         return;
     }
@@ -1770,9 +1805,9 @@ fn publish_review() {
         );
         return;
     }
-    if red::string(red::state("replay_source_kind"), "demo") != "git_hub_pull_request"
-        && red::string(red::state("replay_source_kind"), "demo") != "github_pull_request" {
-        red::state_set("replay_notice", "Only a verified GitHub pull request can receive a published review.");
+    if normalize_source_kind(red::string(red::state("replay_source_kind"), "demo"))
+        != "github_pull_request" {
+        set_notice("Only a verified GitHub pull request can receive a published review.", "error");
         red::state_set("replay_view", "outbox");
         render();
         return;
@@ -1786,9 +1821,9 @@ fn publish_review() {
         }
     }
     if !publishable {
-        red::state_set(
-            "replay_notice",
-            "Add a local inline comment or PR summary first. Proposed code fixes remain private."
+        set_notice(
+            "Add a local inline comment or PR summary first. Proposed code fixes remain private.",
+            "warning"
         );
         red::state_set("replay_view", "outbox");
         render();
@@ -1838,9 +1873,9 @@ fn review_outcome_selected(item: PickerItem) {
 
 fn review_submission_retry_selected(item: PickerItem) {
     if item.id != "accept" {
-        red::state_set(
-            "replay_notice",
-            "Previous review may already be on GitHub · inspect the PR before retrying."
+        set_notice(
+            "Previous review may already be on GitHub · inspect the PR before retrying.",
+            "warning"
         );
         red::state_set("replay_view", "outbox");
         render();
@@ -1851,9 +1886,9 @@ fn review_submission_retry_selected(item: PickerItem) {
 }
 
 fn review_submission_retry_cancelled(event: PickerCancelled) {
-    red::state_set(
-        "replay_notice",
-        "Previous review may already be on GitHub · inspect the PR before retrying."
+    set_notice(
+        "Previous review may already be on GitHub · inspect the PR before retrying.",
+        "warning"
     );
     red::state_set("replay_view", "outbox");
     render();
@@ -1872,9 +1907,9 @@ fn review_outcome_label(outcome: String) -> String {
 fn review_submission_previewed(result: Json) {
     if !red::bool(result.ok, false) {
         clear_pending_review_submission();
-        red::state_set(
-            "replay_notice",
-            source_error(result, "The original GitHub review could not be safely previewed")
+        set_notice(
+            source_error(result, "The original GitHub review could not be safely previewed"),
+            "error"
         );
         red::state_set("replay_view", "outbox");
         render();
@@ -1945,13 +1980,13 @@ fn review_submission_confirmed(item: PickerItem) {
     let digest = red::string(red::state("replay_pending_submission_digest"), "");
     if outcome == "" || digest == "" {
         clear_pending_review_submission();
-        red::state_set("replay_notice", "That review preview has expired. Preview the exact review again.");
+        set_notice("That review preview has expired. Preview the exact review again.", "error");
         render();
         return;
     }
     red::state_set("replay_submission_pending", true);
     red::state_set("replay_view", "outbox");
-    red::state_set("replay_notice", "Posting your confirmed review to GitHub…");
+    set_notice("Posting your confirmed review to GitHub…", "info");
     render();
     red::request(
         "ReplaySubmitReview",
@@ -1971,7 +2006,7 @@ fn clear_pending_review_submission() {
 
 fn review_submission_cancelled(event: PickerCancelled) {
     clear_pending_review_submission();
-    red::state_set("replay_notice", "Review not posted · every draft remains local.");
+    set_notice("Review not posted · every draft remains local.", "info");
     red::state_set("replay_view", "outbox");
     render();
 }
@@ -1985,10 +2020,7 @@ fn review_submission_finished(result: Json) {
         if uncertain {
             fallback = "This review may already be on GitHub. Check the pull request before retrying.";
         }
-        red::state_set(
-            "replay_notice",
-            source_error(result, fallback)
-        );
+        set_notice(source_error(result, fallback), "error");
         red::state_set("replay_view", "outbox");
         render();
         return;
@@ -1997,11 +2029,11 @@ fn review_submission_finished(result: Json) {
     red::state_set("replay_submission_uncertain", false);
     red::state_set("replay_drafts", result.drafts);
     red::state_set("replay_receipts", result.receipts);
-    red::state_set(
-        "replay_notice",
+    set_notice(
         "Posted " + review_outcome_label(red::string(result.receipt.outcome, ""))
             + " · verified GitHub receipt"
-            + " · use S to save your private review and receipt."
+            + " · use S to save your private review and receipt.",
+        "success"
     );
     red::state_set("replay_view", "outbox");
     render();
@@ -2012,9 +2044,9 @@ fn portable_review_ready() -> bool {
         return false;
     }
     if red::string(red::state("replay_source_kind"), "demo") == "demo" {
-        red::state_set(
-            "replay_notice",
-            "Open a real PR or local branch before saving or loading a private review."
+        set_notice(
+            "Open a real PR or local branch before saving or loading a private review.",
+            "warning"
         );
         render();
         return false;
@@ -2043,9 +2075,9 @@ fn save_review() {
     if red::len(red::state("replay_drafts")) == 0
         && red::len(red::state("replay_notes")) == 0
         && red::len(red::state("replay_receipts")) == 0 {
-        red::state_set(
-            "replay_notice",
-            "Nothing to save yet. Add a local comment, summary, fix, or observation first."
+        set_notice(
+            "Nothing to save yet. Add a local comment, summary, fix, or observation first.",
+            "warning"
         );
         red::state_set("replay_view", "outbox");
         render();
@@ -2053,9 +2085,9 @@ fn save_review() {
     }
     let path = suggested_review_path();
     if path == "" {
-        red::state_set(
-            "replay_notice",
-            "The private review location could not be verified. Reopen the original review before saving."
+        set_notice(
+            "The private review location could not be verified. Reopen the original review before saving.",
+            "error"
         );
         red::state_set("replay_view", "outbox");
         render();
@@ -2075,7 +2107,7 @@ fn save_review() {
 fn save_review_path_submitted(value: String) {
     let path = red::trim(value);
     if path == "" {
-        red::state_set("replay_notice", "Choose a filename to save this private review.");
+        set_notice("Choose a filename to save this private review.", "warning");
         render();
         return;
     }
@@ -2104,10 +2136,7 @@ fn review_saved(result: Json) {
             return;
         }
         red::state_set("replay_pending_bundle_path", "");
-        red::state_set(
-            "replay_notice",
-            source_error(result, "Could not save the private local review")
-        );
+        set_notice(source_error(result, "Could not save the private local review"), "error");
         render();
         return;
     }
@@ -2118,13 +2147,13 @@ fn review_saved(result: Json) {
         receipt_copy = " and "
             + review_outcome_count(red::int(result.receipt_count, 0), "GitHub receipt", "GitHub receipts");
     }
-    red::state_set(
-        "replay_notice",
+    set_notice(
         "Saved " + review_outcome_count(red::int(result.draft_count, 0), "draft", "drafts")
             + " and "
             + review_outcome_count(red::int(result.note_count, 0), "observation", "observations")
             + receipt_copy
-            + " locally · nothing sent to GitHub."
+            + " locally · nothing sent to GitHub.",
+        "success"
     );
     red::state_set("replay_view", "outbox");
     render();
@@ -2166,7 +2195,7 @@ fn load_review() {
 fn load_review_path_submitted(value: String) {
     let path = red::trim(value);
     if path == "" {
-        red::state_set("replay_notice", "Choose the private review file you want to load.");
+        set_notice("Choose the private review file you want to load.", "warning");
         render();
         return;
     }
@@ -2183,9 +2212,9 @@ fn review_file_previewed(result: Json) {
     if !red::bool(result.ok, false) {
         red::state_set("replay_pending_bundle_path", "");
         red::state_set("replay_pending_bundle_digest", "");
-        red::state_set(
-            "replay_notice",
-            source_error(result, "This private review file does not match the original PR")
+        set_notice(
+            source_error(result, "This private review file does not match the original PR"),
+            "error"
         );
         render();
         return;
@@ -2199,11 +2228,11 @@ fn review_file_previewed(result: Json) {
     if new_drafts == 0 && new_notes == 0 && new_receipts == 0 {
         red::state_set("replay_pending_bundle_path", "");
         red::state_set("replay_pending_bundle_digest", "");
-        red::state_set(
-            "replay_notice",
+        set_notice(
             "All " + review_outcome_count(existing_drafts, "draft", "drafts") + " and "
                 + review_outcome_count(existing_notes, "observation", "observations")
-                + " are already here · nothing sent to GitHub."
+                + " are already here · nothing sent to GitHub.",
+            "info"
         );
         red::state_set("replay_view", "outbox");
         render();
@@ -2250,10 +2279,7 @@ fn review_file_loaded(result: Json) {
     red::state_set("replay_pending_bundle_path", "");
     red::state_set("replay_pending_bundle_digest", "");
     if !red::bool(result.ok, false) {
-        red::state_set(
-            "replay_notice",
-            source_error(result, "Could not safely load the private review file")
-        );
+        set_notice(source_error(result, "Could not safely load the private review file"), "error");
         render();
         return;
     }
@@ -2269,13 +2295,13 @@ fn review_file_loaded(result: Json) {
     } else if index >= red::len(result.drafts) && index > 0 {
         red::state_set("replay_outbox_index", red::len(result.drafts) - 1);
     }
-    red::state_set(
-        "replay_notice",
+    set_notice(
         "Loaded "
             + review_outcome_count(red::int(result.preview.drafts_to_add, 0), "draft", "drafts")
             + " and "
             + review_outcome_count(red::int(result.preview.notes_to_add, 0), "observation", "observations")
-            + " · existing drafts kept · nothing sent to GitHub."
+            + " · existing drafts kept · nothing sent to GitHub.",
+        "success"
     );
     red::state_set("replay_view", "outbox");
     render();
@@ -2363,6 +2389,7 @@ fn guide_content() -> String {
         author: red::string(red::state("replay_author"), "original-author"),
         branch: red::string(red::state("replay_branch"), ""),
         review_role: red::state("replay_review_role"),
+        viewer_verified: red::state("replay_viewer_verified"),
         head_commit: red::string(red::state("replay_head_commit"), ""),
         author_workspace_available: author_workspace_available(),
         author_workspace_root: red::string(red::state("replay_author_workspace_root"), ""),
@@ -2379,6 +2406,7 @@ fn guide_content() -> String {
         rationale_expanded: red::state_bool("replay_rationale_expanded"),
         help_visible: red::state_bool("replay_help_visible"),
         notice: red::string(red::state("replay_notice"), ""),
+        notice_severity: red::string(red::state("replay_notice_severity"), "info"),
         notes: red::state("replay_notes"),
         completions: red::state("replay_completions"),
         steps: red::state("replay_steps"),
@@ -2402,10 +2430,33 @@ fn findings_content() -> String {
         content = content + "No observations yet. Use `Space R o` to add one.\n\n";
     }
     for note in notes {
-        let index = red::int(note.index, 0);
-        let step = steps[index];
-        content = content + "### Step " + (index + 1) + " · " + step.title + "\n";
-        content = content + "`" + step.path + "`\n\n";
+        let index = -1;
+        let step_id = red::string(note.step_id, "");
+        if step_id != "" {
+            let candidate_index = 0;
+            for candidate in steps {
+                if red::string(candidate.id, "") == step_id {
+                    index = candidate_index;
+                }
+                candidate_index = candidate_index + 1;
+            }
+        }
+        if index < 0 {
+            index = red::int(note.index, -1);
+        }
+        if index >= 0 && index < red::len(steps) {
+            let step = steps[index];
+            content = content + "### Step " + (index + 1) + " · " + step.title + "\n";
+            content = content + "`" + step.path + "`\n\n";
+        } else {
+            content = content + "### Pull-request observation\n";
+            let note_path = red::string(note.path, "");
+            if note_path != "" {
+                content = content + "`" + note_path + "`\n\n";
+            } else {
+                content = content + "\n";
+            }
+        }
         content = content + red::string(note.text, "") + "\n\n";
     }
 

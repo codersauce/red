@@ -1761,6 +1761,7 @@ mod tests {
             capabilities: super::super::ReplayGitHubCapabilities {
                 viewer: viewer.map(str::to_string),
                 head_permission: super::super::ReplayRepositoryPermission::Write,
+                warning: None,
             },
             captured_at_ms: 0,
         });

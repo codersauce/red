@@ -126,6 +126,21 @@ impl ReplayCompletionSummary {
 pub(crate) struct ReplayPanelNote {
     pub(crate) index: usize,
     pub(crate) text: String,
+    #[serde(default)]
+    pub(crate) step_id: Option<String>,
+    #[serde(default)]
+    pub(crate) path: Option<String>,
+}
+
+/// Explicit presentation severity supplied by the owning Replay workflow.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReplayNoticeSeverity {
+    #[default]
+    Info,
+    Success,
+    Warning,
+    Error,
 }
 
 /// Validated, source-backed state for the dedicated PR Replay presentation.
@@ -137,6 +152,8 @@ pub(crate) struct ReplayPanelModel {
     pub(crate) branch: String,
     #[serde(default)]
     pub(crate) review_role: Option<ReplayReviewRole>,
+    #[serde(default)]
+    pub(crate) viewer_verified: Option<bool>,
     #[serde(default)]
     pub(crate) head_commit: String,
     #[serde(default)]
@@ -170,6 +187,8 @@ pub(crate) struct ReplayPanelModel {
     #[serde(default)]
     pub(crate) notice: String,
     #[serde(default)]
+    pub(crate) notice_severity: ReplayNoticeSeverity,
+    #[serde(default)]
     pub(crate) notes: Vec<ReplayPanelNote>,
     #[serde(default)]
     pub(crate) completions: Vec<ReplayPanelCompletion>,
@@ -179,6 +198,11 @@ pub(crate) struct ReplayPanelModel {
 impl ReplayPanelModel {
     pub(crate) fn current_step(&self) -> Option<&ReplayDemoStep> {
         self.steps.get(self.index)
+    }
+
+    fn verified_review_role(&self) -> Option<ReplayReviewRole> {
+        self.review_role
+            .filter(|_| self.pull_request > 0 && self.viewer_verified != Some(false))
     }
 
     fn completion(&self, index: usize) -> Option<&ReplayPanelCompletion> {
@@ -222,12 +246,15 @@ impl ReplayPanelModel {
             return ReplayChangeState::ManuallyChecked;
         }
 
-        let noted = self.notes.iter().any(|note| note.index == index)
-            || self.steps.get(index).is_some_and(|step| {
-                self.drafts
-                    .iter()
-                    .any(|draft| draft.step_id.as_deref() == Some(step.id.as_str()))
-            });
+        let noted = self.notes.iter().any(|note| {
+            note.step_id.as_deref().map_or(note.index == index, |id| {
+                self.steps.get(index).is_some_and(|step| step.id == id)
+            })
+        }) || self.steps.get(index).is_some_and(|step| {
+            self.drafts
+                .iter()
+                .any(|draft| draft.step_id.as_deref() == Some(step.id.as_str()))
+        });
         if noted {
             ReplayChangeState::Noted
         } else {
@@ -933,7 +960,7 @@ fn replay_header_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
         };
         metadata.push_str(&format!(" · {} {suffix}", model.draft_count));
     }
-    let verified_role = model.review_role.filter(|_| model.pull_request > 0);
+    let verified_role = model.verified_review_role();
     let mut branch = model.branch.clone();
     if !model.head_commit.is_empty() {
         let short = model.head_commit.chars().take(7).collect::<String>();
@@ -1134,13 +1161,17 @@ fn replay_pinned_header_lines(state: &ReplayPanelState, width: usize) -> Vec<Ren
     } else {
         identity
     };
-    let role = match model.review_role.filter(|_| model.pull_request > 0) {
-        Some(ReplayReviewRole::Author) if !model.author_workspace_root.is_empty() => {
+    let role = match (
+        model.review_role.filter(|_| model.pull_request > 0),
+        model.viewer_verified,
+    ) {
+        (Some(_), Some(false)) => "VIEWER UNVERIFIED",
+        (Some(ReplayReviewRole::Author), _) if !model.author_workspace_root.is_empty() => {
             "YOUR PR · PR HEAD"
         }
-        Some(ReplayReviewRole::Author) => "YOUR PR",
-        Some(ReplayReviewRole::Reviewer) => "REVIEW",
-        None => "",
+        (Some(ReplayReviewRole::Author), _) => "YOUR PR",
+        (Some(ReplayReviewRole::Reviewer), _) => "REVIEW",
+        (None, _) => "",
     };
     let complete = model.is_complete();
     let progress = replay_review_progress(model, width);
@@ -1467,7 +1498,7 @@ fn replay_outbox_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
     ));
 
     if model.drafts.is_empty() {
-        let message = if model.review_role == Some(ReplayReviewRole::Author) {
+        let message = if model.verified_review_role() == Some(ReplayReviewRole::Author) {
             "No review drafts yet. Use c for a comment, s for a summary, or F for a proposed fix."
         } else {
             "No review drafts yet. Use c for a comment or s for a review summary."
@@ -1608,7 +1639,7 @@ fn replay_outbox_actions(model: &ReplayPanelModel) -> Vec<UiAction> {
         .get(model.outbox_index)
         .is_some_and(|draft| draft.state == ReplayDraftState::Local);
     let can_publish = model.pull_request > 0
-        && model.review_role.is_some()
+        && model.verified_review_role().is_some()
         && !model.head_commit.is_empty()
         && model.drafts.iter().any(|draft| {
             draft.state == ReplayDraftState::Local && draft.kind != ReplayReviewDraftKind::CodeFix
@@ -1675,14 +1706,14 @@ fn replay_outbox_actions(model: &ReplayPanelModel) -> Vec<UiAction> {
             })
             .with_compact_label("Load"),
     );
-    if model.author_workspace_available {
+    if model.author_workspace_available && model.verified_review_role().is_some() {
         actions.push(
             UiAction::new("original_workspace", "W", "PR Head")
                 .with_priority(ActionPriority::Primary)
                 .with_compact_label("Head"),
         );
     }
-    if model.review_role == Some(ReplayReviewRole::Author) {
+    if model.verified_review_role() == Some(ReplayReviewRole::Author) {
         actions.push(
             UiAction::new("fix", "F", "Fix")
                 .with_priority(ActionPriority::Secondary)
@@ -2125,50 +2156,14 @@ fn render_replay_footer_status(
         return;
     };
 
-    let normalized = message.to_ascii_lowercase();
-    let (marker, semantic_colors): (&str, &[&str]) = if [
-        "failed",
-        "could not",
-        "cannot",
-        "unable",
-        "expired",
-        "does not match",
-        "not posted",
-        "conflict",
-    ]
-    .iter()
-    .any(|pattern| normalized.contains(pattern))
-    {
-        ("✕ ", &["errorForeground", "editorError.foreground"])
-    } else if [
-        "already",
-        "choose",
-        "first changed",
-        "last changed",
-        "still",
-    ]
-    .iter()
-    .any(|pattern| normalized.contains(pattern))
-    {
-        (
+    let (marker, semantic_colors): (&str, &[&str]) = match model.notice_severity {
+        ReplayNoticeSeverity::Error => ("✕ ", &["errorForeground", "editorError.foreground"]),
+        ReplayNoticeSeverity::Warning => (
             "! ",
             &["editorWarning.foreground", "list.warningForeground"],
-        )
-    } else if [
-        "saved",
-        "restored",
-        "applied",
-        "reconstructed",
-        "undid",
-        "published",
-        "posted",
-    ]
-    .iter()
-    .any(|pattern| normalized.contains(pattern))
-    {
-        ("✓ ", &["gitDecoration.addedResourceForeground"])
-    } else {
-        ("· ", &["editorInfo.foreground"])
+        ),
+        ReplayNoticeSeverity::Success => ("✓ ", &["gitDecoration.addedResourceForeground"]),
+        ReplayNoticeSeverity::Info => ("· ", &["editorInfo.foreground"]),
     };
     let foreground = semantic_colors
         .iter()
@@ -2434,7 +2429,7 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
         .with_compact_label("Check"),
     ]);
 
-    if model.pull_request > 0 && model.review_role.is_some() {
+    if model.verified_review_role().is_some() {
         actions.push(
             UiAction::new("comment", "c", "Note")
                 .with_priority(if review_complete {
@@ -2468,7 +2463,7 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
         }
     }
 
-    if model.author_workspace_available {
+    if model.author_workspace_available && model.verified_review_role().is_some() {
         actions.push(
             UiAction::new("original_workspace", "W", "Worktree")
                 .with_priority(if width >= 72 {
@@ -2571,6 +2566,7 @@ mod tests {
             author: plan.author,
             branch: plan.branch,
             review_role: None,
+            viewer_verified: None,
             head_commit: String::new(),
             author_workspace_available: false,
             author_workspace_root: String::new(),
@@ -2588,6 +2584,7 @@ mod tests {
             horizontal_offset: 0,
             help_visible: false,
             notice: String::new(),
+            notice_severity: ReplayNoticeSeverity::Info,
             notes: Vec::new(),
             completions: Vec::new(),
             steps: plan.steps,
@@ -3315,6 +3312,7 @@ mod tests {
         let mut changed = original.clone();
         changed.hint_visible = true;
         changed.notice = "Could not validate the exact original hunk.".to_string();
+        changed.notice_severity = ReplayNoticeSeverity::Error;
 
         let original = ReplayPanelState::parse(&serde_json::to_string(&original).unwrap()).unwrap();
         let changed = ReplayPanelState::parse(&serde_json::to_string(&changed).unwrap()).unwrap();
@@ -3529,6 +3527,8 @@ mod tests {
         replay.notes.push(ReplayPanelNote {
             index: 0,
             text: "Preserve this original-source observation.".to_string(),
+            step_id: None,
+            path: None,
         });
 
         for width in [46, 62, 86] {
@@ -3993,6 +3993,8 @@ mod tests {
         replay.notes.push(ReplayPanelNote {
             index: 0,
             text: "Preserve this private original-source observation.".to_string(),
+            step_id: None,
+            path: None,
         });
         let actions = replay_outbox_actions(&replay);
         let layout = ActionBar::new(&actions).layout(/*width*/ 46);
@@ -4175,6 +4177,8 @@ mod tests {
         replay.notes.push(ReplayPanelNote {
             index: 1,
             text: "Verify the changed original argument.".to_string(),
+            step_id: None,
+            path: None,
         });
         let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
         let theme = parse_vscode_theme("themes/red.json").unwrap();
@@ -4378,6 +4382,23 @@ mod tests {
             .map(|span| span.text.as_str())
             .collect::<String>();
         assert!(role.ends_with("YOUR PR · PR HEAD"));
+    }
+
+    #[test]
+    fn pinned_header_identifies_an_unverified_github_viewer_without_claiming_reviewer_access() {
+        let mut replay = model();
+        replay.review_role = Some(ReplayReviewRole::Reviewer);
+        replay.viewer_verified = Some(false);
+        let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+
+        let role = replay_pinned_header_lines(&state, /*width*/ 72)[0]
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+
+        assert!(role.ends_with("VIEWER UNVERIFIED"));
+        assert!(!role.ends_with("REVIEW"));
     }
 
     #[test]
@@ -4873,6 +4894,7 @@ mod tests {
         assert!(rendered_rows(&buffer)[0].trim().is_empty());
 
         replay.notice = "Could not validate the original source.".to_string();
+        replay.notice_severity = ReplayNoticeSeverity::Error;
         render_replay_footer_status(
             &mut buffer,
             &replay,
@@ -4884,6 +4906,26 @@ mod tests {
         let notice = &rendered_rows(&buffer)[0];
         assert!(notice.starts_with('✕'));
         assert!(notice.contains("Could not validate"));
+    }
+
+    #[test]
+    fn replay_notice_marker_follows_structured_severity_instead_of_english_wording() {
+        let mut replay = model();
+        replay.notice = "Everything failed successfully.".to_string();
+        replay.notice_severity = ReplayNoticeSeverity::Success;
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let mut buffer = RenderBuffer::new(/*width*/ 45, /*height*/ 1, &theme.style);
+
+        render_replay_footer_status(
+            &mut buffer,
+            &replay,
+            /*x*/ 0,
+            /*y*/ 0,
+            /*width*/ 45,
+            &theme,
+        );
+
+        assert!(rendered_rows(&buffer)[0].starts_with('✓'));
     }
 
     #[test]

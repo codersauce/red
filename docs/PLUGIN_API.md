@@ -54,15 +54,19 @@ only the actual source hunk scrolls.
 `ReplayDemoFocusSource(workspace_id)` restores the original scratch-source
 window. Hiding the coach preserves both the panel and replay session.
 
-`ReplayDemoValidateStep(callback, workspace_id, step_id)` checks the actual
+`ReplayValidateStep(callback, workspace_id, step_id)` checks the actual
 in-memory scratch source against the Rust-owned original hunk.
-`ReplayDemoApplyStep(callback, workspace_id, step_id, revision)` rejects a stale
+`ReplayApplyStep(callback, workspace_id, step_id, revision)` rejects a stale
 workspace, changed source, nested user transaction, or nonmatching pre-image.
 Its `revision` is a nonnegative, full-width `i64`; it is never narrowed to a
 32-bit integer before reaching the editor's checked buffer revision.
 Successful application becomes exactly one attributed, undoable editor
 transaction. These preview calls never create files or branches, fetch GitHub,
 stage changes, save buffers, or submit reviews.
+
+The original `ReplayDemoValidateStep` and `ReplayDemoApplyStep` names remain
+supported as backwards-compatible aliases. The production names apply equally
+to the safe in-memory demo and real source-backed Replay workspaces.
 
 Plugins declaring a host API requirement for these calls should use
 `"red_api_version": "^0.5.0"`.

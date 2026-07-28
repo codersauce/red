@@ -1497,6 +1497,19 @@ impl RedHost {
             },
             "ReplayDemoPlan" => PluginRequest::ReplayDemoPlan { request_id },
             "ReplayDemoOpenWorkspace" => PluginRequest::ReplayDemoOpenWorkspace { request_id },
+            "ReplayValidateStep" => PluginRequest::ReplayValidateStep {
+                request_id,
+                workspace_id: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayValidateStep requires a workspace id"))?
+                    .to_string(),
+                step_id: args
+                    .get(/*index*/ 1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayValidateStep requires a step id"))?
+                    .to_string(),
+            },
             "ReplayDemoValidateStep" => PluginRequest::ReplayDemoValidateStep {
                 request_id,
                 workspace_id: args
@@ -1511,6 +1524,23 @@ impl RedHost {
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("ReplayDemoValidateStep requires a step id"))?
                     .to_string(),
+            },
+            "ReplayApplyStep" => PluginRequest::ReplayApplyStep {
+                request_id,
+                workspace_id: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayApplyStep requires a workspace id"))?
+                    .to_string(),
+                step_id: args
+                    .get(/*index*/ 1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayApplyStep requires a step id"))?
+                    .to_string(),
+                revision: args
+                    .get(/*index*/ 2)
+                    .and_then(value_to_u64)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayApplyStep requires a revision"))?,
             },
             "ReplayDemoApplyStep" => PluginRequest::ReplayDemoApplyStep {
                 request_id,
@@ -4101,6 +4131,11 @@ mod tests {
                     "source_kind": source_kind,
                     "pull_request": 482,
                     "author": "original-author",
+                    "viewer": if review_role == "author" {
+                        "original-author"
+                    } else {
+                        "reviewer"
+                    },
                     "head_permission": "write",
                     "title": "Bound original visible diagnostics",
                     "branch": "feature/viewport-diagnostics",
@@ -4153,6 +4188,11 @@ mod tests {
                     "workspace_root": "/workspace/repository.replay-pr-482-bbbbbbb",
                     "workspace_branch": "replay/pr-482-bbbbbbb",
                     "review_role": review_role,
+                    "viewer": if review_role == "author" {
+                        "original-author"
+                    } else {
+                        "reviewer"
+                    },
                     "head_permission": "write",
                     "head_commit": "b".repeat(40),
                     "review_bundle_path":
@@ -5468,7 +5508,7 @@ mod tests {
 
         runtime.execute_command("ReplayValidate").await.unwrap();
         let request = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::ReplayDemoValidateStep {
+            PluginRequest::ReplayValidateStep {
                 request_id,
                 workspace_id,
                 step_id,
@@ -5517,9 +5557,9 @@ mod tests {
                 serde_json::json!({
                     "buffer_id": 1,
                     "buffer_name":
-                        "/workspace/repository.replay-revision-1234567/src/editor/rendering.rs",
+                        "\\workspace\\repository.replay-revision-1234567\\src\\editor\\rendering.rs",
                     "file_path":
-                        "/workspace/repository.replay-revision-1234567/src/editor/rendering.rs",
+                        "\\workspace\\repository.replay-revision-1234567\\src\\editor\\rendering.rs",
                     "revision": 3,
                 }),
             )
@@ -5541,7 +5581,7 @@ mod tests {
 
         runtime.execute_command("ReplayValidate").await.unwrap();
         let request = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::ReplayDemoValidateStep { request_id, .. } => request_id,
+            PluginRequest::ReplayValidateStep { request_id, .. } => request_id,
             _ => panic!("expected validation of the first source-backed original hunk"),
         };
         runtime
@@ -5688,7 +5728,7 @@ mod tests {
 
         runtime.execute_command("ReplayValidate").await.unwrap();
         let request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::ReplayDemoValidateStep {
+            PluginRequest::ReplayValidateStep {
                 request_id,
                 workspace_id,
                 step_id,
@@ -5891,7 +5931,7 @@ mod tests {
 
         runtime.execute_command("ReplayValidate").await.unwrap();
         let request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::ReplayDemoValidateStep {
+            PluginRequest::ReplayValidateStep {
                 request_id,
                 workspace_id,
                 step_id,
@@ -5978,7 +6018,7 @@ mod tests {
 
         runtime.execute_command("ReplayValidate").await.unwrap();
         let first_request = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::ReplayDemoValidateStep {
+            PluginRequest::ReplayValidateStep {
                 request_id,
                 workspace_id,
                 step_id,
@@ -6024,7 +6064,7 @@ mod tests {
 
         runtime.execute_command("ReplayValidate").await.unwrap();
         let second_request = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::ReplayDemoValidateStep {
+            PluginRequest::ReplayValidateStep {
                 request_id,
                 workspace_id,
                 step_id,
@@ -6085,7 +6125,7 @@ mod tests {
 
         runtime.execute_command("ReplayValidate").await.unwrap();
         let request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::ReplayDemoValidateStep {
+            PluginRequest::ReplayValidateStep {
                 request_id,
                 workspace_id,
                 step_id,
@@ -8150,6 +8190,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_backed_findings_resolve_the_actual_original_step_identity() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_source_backed_replay(&mut runtime).await;
+
+        runtime.execute_command("ReplayNext").await.unwrap();
+        let guide = recv_replay_guide();
+        assert_eq!(guide.index, 1);
+        recv_replay_source_focus("real-workspace-1", &plan.steps[1].id);
+
+        runtime.execute_command("ReplayNote").await.unwrap();
+        let handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackInput { handle, .. } => handle,
+            _ => panic!("expected a private original-source observation input"),
+        };
+        assert!(runtime
+            .notify_composer(
+                handle,
+                ComposerCallback::Submitted("Inspect the actual second change.".to_string()),
+            )
+            .unwrap());
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayAddNote {
+                request_id,
+                workspace_id,
+                step_id,
+                ..
+            } => {
+                assert_eq!(workspace_id, "real-workspace-1");
+                assert_eq!(step_id, plan.steps[1].id);
+                request_id
+            }
+            _ => panic!("expected an editor-owned original-step observation"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "real-workspace-1",
+                    "note": {
+                        "index": 0,
+                        "step_id": plan.steps[1].id,
+                        "path": plan.steps[1].path,
+                        "text": "Inspect the actual second change.",
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+        let guide = recv_replay_guide();
+        assert_eq!(guide.notes.len(), 1);
+
+        runtime.execute_command("ReplayFindings").await.unwrap();
+        let findings = recv_replay_findings();
+        assert!(findings.contains("### Step 2"));
+        assert!(findings.contains(&plan.steps[1].title));
+        assert!(findings.contains(&plan.steps[1].path));
+        assert!(findings.contains("Inspect the actual second change."));
+    }
+
+    #[tokio::test]
     async fn bundled_replay_demo_immediately_applies_one_revision_checked_hunk() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -8158,7 +8261,7 @@ mod tests {
 
         runtime.execute_command("ReplayApply").await.unwrap();
         let validation_request = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::ReplayDemoValidateStep {
+            PluginRequest::ReplayValidateStep {
                 request_id,
                 workspace_id,
                 step_id,
@@ -8183,7 +8286,7 @@ mod tests {
             .await
             .unwrap();
         let apply_request = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::ReplayDemoApplyStep {
+            PluginRequest::ReplayApplyStep {
                 request_id,
                 workspace_id,
                 step_id,
@@ -8227,7 +8330,7 @@ mod tests {
 
         runtime.execute_command("ReplayApply").await.unwrap();
         let validation = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::ReplayDemoValidateStep { request_id, .. } => request_id,
+            PluginRequest::ReplayValidateStep { request_id, .. } => request_id,
             _ => panic!("expected validation of the original full-width source revision"),
         };
         runtime
@@ -8246,7 +8349,7 @@ mod tests {
 
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::ReplayDemoApplyStep {
+            PluginRequest::ReplayApplyStep {
                 workspace_id,
                 step_id,
                 revision: applied_revision,
@@ -8267,7 +8370,7 @@ mod tests {
 
         runtime.execute_command("ReplayApply").await.unwrap();
         let request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::ReplayDemoValidateStep {
+            PluginRequest::ReplayValidateStep {
                 request_id,
                 workspace_id,
                 step_id,
@@ -8308,7 +8411,7 @@ mod tests {
 
         runtime.execute_command("ReplayApply").await.unwrap();
         let request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::ReplayDemoValidateStep {
+            PluginRequest::ReplayValidateStep {
                 request_id,
                 workspace_id,
                 step_id,

@@ -268,6 +268,9 @@ pub struct ReplayGitHubCapabilities {
     pub viewer: Option<String>,
     /// Viewer permission on the exact original head repository, not the base.
     pub head_permission: ReplayRepositoryPermission,
+    /// Read-only capability lookup failure; privileged actions remain blocked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// Immutable identity of the author's original pull request.
@@ -341,6 +344,7 @@ pub struct ReplayResolvedPullRequest {
 #[serde(rename_all = "snake_case")]
 pub enum ReplaySourceKind {
     /// Original GitHub pull request resolved through the trusted editor.
+    #[serde(rename = "github_pull_request", alias = "git_hub_pull_request")]
     GitHubPullRequest,
     /// Immutable locally selected commit or reference.
     LocalRevision,
@@ -579,7 +583,11 @@ pub fn resolve_pull_request(
     let mut resolved = parse_pull_request_metadata(repository, input, metadata, limits)?;
     match resolve_pull_request_capabilities(&resolved.pull_request, &resolved.repository, limits) {
         Ok(capabilities) => resolved.pull_request.capabilities = capabilities,
-        Err(ReplayError::CommandFailed { .. }) => {}
+        Err(error @ ReplayError::CommandFailed { .. }) => {
+            resolved.pull_request.capabilities.warning = Some(format!(
+                "GitHub viewer could not be verified: {error}. Review publication and PR-head editing remain unavailable."
+            ));
+        }
         Err(error) => return Err(error),
     }
     Ok(resolved)
@@ -676,6 +684,7 @@ fn parse_pull_request_capabilities(
     Ok(ReplayGitHubCapabilities {
         viewer: Some(data.viewer.login),
         head_permission,
+        warning: None,
     })
 }
 
@@ -1756,6 +1765,19 @@ mod tests {
         assert_eq!(recovered.capabilities, ReplayGitHubCapabilities::default());
     }
 
+    #[test]
+    fn github_source_kind_serializes_canonically_and_accepts_the_legacy_spelling() {
+        assert_eq!(
+            serde_json::to_value(ReplaySourceKind::GitHubPullRequest).unwrap(),
+            serde_json::json!("github_pull_request"),
+        );
+        assert_eq!(
+            serde_json::from_value::<ReplaySourceKind>(serde_json::json!("git_hub_pull_request"))
+                .unwrap(),
+            ReplaySourceKind::GitHubPullRequest,
+        );
+    }
+
     fn fixture_git(root: &Path, arguments: &[&str]) -> String {
         let output = Command::new("git")
             .current_dir(root)
@@ -1877,6 +1899,7 @@ mod tests {
             capabilities: ReplayGitHubCapabilities {
                 viewer: Some("original-author".to_string()),
                 head_permission: ReplayRepositoryPermission::Write,
+                warning: None,
             },
             captured_at_ms: 0,
         });

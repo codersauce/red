@@ -772,10 +772,21 @@ pub enum PluginRequest {
     ReplayDemoFocusSource {
         workspace_id: String,
     },
+    ReplayValidateStep {
+        request_id: RequestId,
+        workspace_id: String,
+        step_id: String,
+    },
     ReplayDemoValidateStep {
         request_id: RequestId,
         workspace_id: String,
         step_id: String,
+    },
+    ReplayApplyStep {
+        request_id: RequestId,
+        workspace_id: String,
+        step_id: String,
+        revision: u64,
     },
     ReplayDemoApplyStep {
         request_id: RequestId,
@@ -1228,7 +1239,9 @@ impl PluginRequest {
             Self::ReplayDemoPlan { .. } => "ReplayDemoPlan",
             Self::ReplayDemoOpenWorkspace { .. } => "ReplayDemoOpenWorkspace",
             Self::ReplayDemoFocusSource { .. } => "ReplayDemoFocusSource",
+            Self::ReplayValidateStep { .. } => "ReplayValidateStep",
             Self::ReplayDemoValidateStep { .. } => "ReplayDemoValidateStep",
+            Self::ReplayApplyStep { .. } => "ReplayApplyStep",
             Self::ReplayDemoApplyStep { .. } => "ReplayDemoApplyStep",
             Self::ReplayResolvePullRequest { .. } => "ReplayResolvePullRequest",
             Self::ReplayResolveLocalBranch { .. } => "ReplayResolveLocalBranch",
@@ -4316,6 +4329,8 @@ impl Editor {
                     .position(|step| step.id == step_id)?;
                 Some(json!({
                     "index": index,
+                    "step_id": note.step_id,
+                    "path": note.path,
                     "text": note.text,
                 }))
             })
@@ -4352,6 +4367,8 @@ impl Editor {
             "mode": session.mode,
             "review_role": session.review.role,
             "viewer": pull_request.and_then(|request| request.capabilities.viewer.as_deref()),
+            "capability_warning": pull_request
+                .and_then(|request| request.capabilities.warning.as_deref()),
             "head_ref": pull_request.map(|request| request.head_ref.as_str()),
             "head_commit": session.source.target_commit.as_str(),
             "review_bundle_path": crate::replay::suggested_review_bundle_path(&session.source),
@@ -4565,6 +4582,8 @@ impl Editor {
             "branch": display.head_ref,
             "review_role": crate::replay::ReplayReviewRole::from_pull_request(pull_request),
             "viewer": pull_request.and_then(|request| request.capabilities.viewer.as_deref()),
+            "capability_warning": pull_request
+                .and_then(|request| request.capabilities.warning.as_deref()),
             "head_commit": source.target_commit.as_str(),
             "head_permission": pull_request.map(|request| request.capabilities.head_permission),
             "base_ref": display.base_ref,
@@ -4647,6 +4666,7 @@ impl Editor {
                 &resolved.pull_request
             )),
             "viewer": resolved.pull_request.capabilities.viewer,
+            "capability_warning": resolved.pull_request.capabilities.warning,
             "head_commit": resolved.pull_request.head_commit.as_str(),
             "head_permission": resolved.pull_request.capabilities.head_permission,
             "base_ref": resolved.pull_request.base_ref,
@@ -4801,6 +4821,8 @@ impl Editor {
             "workspace_branch": workspace.branch,
             "review_role": recovered.review.role,
             "viewer": pull_request.and_then(|request| request.capabilities.viewer.as_deref()),
+            "capability_warning": pull_request
+                .and_then(|request| request.capabilities.warning.as_deref()),
             "head_commit": recovered.source.target_commit.as_str(),
             "review_bundle_path": crate::replay::suggested_review_bundle_path(&recovered.source),
             "head_permission": pull_request.map(|request| request.capabilities.head_permission),
@@ -8676,7 +8698,12 @@ impl Editor {
                         needs_render = true;
                     }
                 }
-                PluginRequest::ReplayDemoValidateStep {
+                PluginRequest::ReplayValidateStep {
+                    request_id,
+                    workspace_id,
+                    step_id,
+                }
+                | PluginRequest::ReplayDemoValidateStep {
                     request_id,
                     workspace_id,
                     step_id,
@@ -8686,7 +8713,13 @@ impl Editor {
                         .resolve_request(runtime, request_id, payload)
                         .await?;
                 }
-                PluginRequest::ReplayDemoApplyStep {
+                PluginRequest::ReplayApplyStep {
+                    request_id,
+                    workspace_id,
+                    step_id,
+                    revision,
+                }
+                | PluginRequest::ReplayDemoApplyStep {
                     request_id,
                     workspace_id,
                     step_id,
@@ -9141,6 +9174,8 @@ impl Editor {
                                 "workspace_id": workspace_id,
                                 "note": {
                                     "index": index,
+                                    "step_id": note.step_id,
+                                    "path": note.path,
                                     "text": note.text,
                                 },
                             })
@@ -9508,6 +9543,8 @@ impl Editor {
                                                 .position(|step| step.id == step_id)?;
                                             Some(json!({
                                                 "index": index,
+                                                "step_id": note.step_id,
+                                                "path": note.path,
                                                 "text": note.text,
                                             }))
                                         })
@@ -24736,6 +24773,7 @@ mod test {
             capabilities: crate::replay::ReplayGitHubCapabilities {
                 viewer: Some("original-author".to_string()),
                 head_permission: crate::replay::ReplayRepositoryPermission::Write,
+                warning: None,
             },
             captured_at_ms: 0,
         });
