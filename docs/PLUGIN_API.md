@@ -68,6 +68,13 @@ The original `ReplayDemoValidateStep` and `ReplayDemoApplyStep` names remain
 supported as backwards-compatible aliases. The production names apply equally
 to the safe in-memory demo and real source-backed Replay workspaces.
 
+`ReplayReconcileReview(callback, workspace_id)` performs a bounded, read-only
+lookup for one previously approved uncertain review or imported unverified
+receipt. The editor compares the original PR, reviewer, commit, outcome, body,
+and inline diff coordinates before returning a verified receipt. It never
+submits a review, starts an agent, mutates a Git ref, or grants a plugin shell
+or GitHub credentials.
+
 Plugins declaring a host API requirement for these calls should use
 `"red_api_version": "^0.5.0"`.
 

@@ -32,8 +32,12 @@ pub use plan::{
     replay_plan_from_session, replay_presentation_plan, ReplayPresentationPlan,
     ReplayPresentationStep,
 };
-pub(crate) use review::submit_prepared_review;
-pub use review::{ReplayReviewOutcome, ReplayReviewReceipt, ReplayReviewSubmissionPreview};
+pub(crate) use review::{reconcile_prepared_review, submit_prepared_review};
+pub use review::{
+    ReplayPendingReviewSubmission, ReplayReceiptVerification, ReplayReviewOutcome,
+    ReplayReviewReceipt, ReplayReviewReconciliation, ReplayReviewSubmissionPreview,
+    ReplayReviewSubmissionState,
+};
 pub(crate) use session::anchored_hunk_offset;
 pub use session::{
     ReplayCompletion, ReplayController, ReplayDiffSide, ReplayDraftOrigin, ReplayDraftState,

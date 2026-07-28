@@ -2653,6 +2653,7 @@ mod tests {
             draft_count: 0,
             drafts: Vec::new(),
             receipts: Vec::new(),
+            submission_state: None,
             outbox_index: 0,
             view: ReplayPanelView::Guide,
             title: plan.title,

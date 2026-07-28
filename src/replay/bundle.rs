@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     digest, now_ms, GitObjectId, ReplayController, ReplayDraftState, ReplayError, ReplayLimits,
-    ReplayNote, ReplayReviewDraft, ReplayReviewDraftKind, ReplayReviewReceipt, ReplayReviewRole,
-    ReplaySession, ReplaySource, ReplaySourceKind,
+    ReplayNote, ReplayReceiptVerification, ReplayReviewDraft, ReplayReviewDraftKind,
+    ReplayReviewReceipt, ReplayReviewRole, ReplaySession, ReplaySource, ReplaySourceKind,
 };
 
 /// Current, deliberately versioned portable review-bundle format.
@@ -85,7 +85,7 @@ pub struct ReplayReviewBundle {
     pub notes: Vec<ReplayNote>,
     /// Original-hunk-anchored private comments, summaries, and fix proposals.
     pub drafts: Vec<ReplayReviewDraft>,
-    /// Provider-confirmed receipts for explicitly submitted original PR reviews.
+    /// Review receipt claims; imported claims remain unverified until GitHub confirms them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub receipts: Vec<ReplayReviewReceipt>,
     /// Unix-millisecond time at which the user explicitly saved the file.
@@ -101,7 +101,7 @@ pub struct ReplayReviewBundleSaved {
     pub note_count: usize,
     /// Number of original-source-anchored local drafts in the resulting file.
     pub draft_count: usize,
-    /// Number of verified submitted-review receipts in the resulting file.
+    /// Number of submitted-review receipt claims retained in the resulting file.
     pub receipt_count: usize,
 }
 
@@ -120,7 +120,7 @@ pub struct ReplayReviewBundlePreview {
     pub drafts_to_add: usize,
     /// Identical original-source drafts already present in the review.
     pub drafts_already_present: usize,
-    /// Verified submitted-review receipts that would be added to this session.
+    /// Imported review receipt claims that would require local provider verification.
     pub receipts_to_add: usize,
     /// Identical provider-confirmed receipts already retained by this session.
     pub receipts_already_present: usize,
@@ -204,12 +204,26 @@ impl ReplayController {
         }
 
         let session = self.session_mut(session_id)?;
+        if session.review.pending_submission.is_some() {
+            return Err(ReplayError::ReviewSubmissionUncertain(
+                "reconcile the confirmed GitHub review before importing private outcomes"
+                    .to_string(),
+            ));
+        }
         for note in bundle.notes {
             if !session.notes.iter().any(|existing| existing.id == note.id) {
                 session.notes.push(note);
             }
         }
-        for draft in bundle.drafts {
+        for mut draft in bundle.drafts {
+            if draft.state == ReplayDraftState::Submitted
+                && !session.review.receipts.iter().any(|receipt| {
+                    receipt.verification == ReplayReceiptVerification::Verified
+                        && receipt.draft_ids.iter().any(|id| id == &draft.id)
+                })
+            {
+                draft.state = ReplayDraftState::Local;
+            }
             if !session
                 .review
                 .drafts
@@ -219,13 +233,14 @@ impl ReplayController {
                 session.review.drafts.push(draft);
             }
         }
-        for receipt in bundle.receipts {
+        for mut receipt in bundle.receipts {
             if !session
                 .review
                 .receipts
                 .iter()
                 .any(|existing| existing.id == receipt.id)
             {
+                receipt.verification = ReplayReceiptVerification::Unverified;
                 session.review.receipts.push(receipt);
             }
         }
@@ -436,10 +451,14 @@ impl ReplayReviewBundle {
             }
         }
         let mut receipt_ids = HashSet::with_capacity(self.receipts.len());
+        let mut receipt_draft_ids = HashSet::new();
         let mut submitted_draft_ids = HashSet::new();
         for receipt in &self.receipts {
             if receipt.id == 0
                 || !receipt_ids.insert(receipt.id)
+                || !session.source.pull_request.as_ref().is_some_and(|request| {
+                    super::review::review_receipt_matches_original_pull_request(request, receipt)
+                })
                 || receipt.target_commit != session.source.target_commit
                 || receipt.viewer.trim().is_empty()
                 || receipt.submitted_at.trim().is_empty()
@@ -457,12 +476,15 @@ impl ReplayReviewBundle {
             }
             for draft_id in &receipt.draft_ids {
                 if !draft_ids.contains(draft_id.as_str())
-                    || !submitted_draft_ids.insert(draft_id.as_str())
+                    || !receipt_draft_ids.insert(draft_id.as_str())
                 {
                     return Err(ReplayError::InvalidReviewBundle(
                         "a submitted-review receipt does not identify unique original review drafts"
                             .to_string(),
                     ));
+                }
+                if receipt.verification == ReplayReceiptVerification::Verified {
+                    submitted_draft_ids.insert(draft_id.as_str());
                 }
             }
         }
@@ -516,7 +538,9 @@ impl ReplayReviewBundle {
                 .iter()
                 .find(|existing| existing.id == draft.id)
             {
-                Some(existing) if existing == draft => preview.drafts_already_present += 1,
+                Some(existing) if equivalent_imported_draft(session, existing, draft) => {
+                    preview.drafts_already_present += 1;
+                }
                 Some(_) => {
                     return Err(ReplayError::ReviewBundleConflict(
                         "an imported review draft has the same ID as a differently edited existing local draft"
@@ -533,7 +557,9 @@ impl ReplayReviewBundle {
                 .iter()
                 .find(|existing| existing.id == receipt.id)
             {
-                Some(existing) if existing == receipt => preview.receipts_already_present += 1,
+                Some(existing) if equivalent_review_receipt(existing, receipt) => {
+                    preview.receipts_already_present += 1;
+                }
                 Some(_) => {
                     return Err(ReplayError::ReviewBundleConflict(
                         "an imported review receipt conflicts with a different submitted review"
@@ -576,6 +602,37 @@ impl ReplayReviewBundle {
         }
         Ok(preview)
     }
+}
+
+fn equivalent_imported_draft(
+    session: &ReplaySession,
+    existing: &ReplayReviewDraft,
+    imported: &ReplayReviewDraft,
+) -> bool {
+    if existing == imported {
+        return true;
+    }
+    if imported.state != ReplayDraftState::Submitted
+        || existing.state != ReplayDraftState::Local
+        || session.review.receipts.iter().any(|receipt| {
+            receipt.verification == ReplayReceiptVerification::Verified
+                && receipt.draft_ids.iter().any(|id| id == &existing.id)
+        })
+    {
+        return false;
+    }
+    let mut local = imported.clone();
+    local.state = ReplayDraftState::Local;
+    existing == &local
+}
+
+fn equivalent_review_receipt(
+    existing: &ReplayReviewReceipt,
+    imported: &ReplayReviewReceipt,
+) -> bool {
+    let mut claimed = imported.clone();
+    claimed.verification = existing.verification;
+    existing == &claimed
 }
 
 fn canonical_review_path(path: &Path) -> Result<PathBuf, ReplayError> {

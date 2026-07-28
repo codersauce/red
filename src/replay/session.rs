@@ -325,6 +325,9 @@ pub struct ReplayReviewState {
     /// Verified receipts for reviews explicitly submitted to the original PR.
     #[serde(default)]
     pub receipts: Vec<super::ReplayReviewReceipt>,
+    /// Exact durably approved request whose provider result remains unresolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_submission: Option<super::ReplayPendingReviewSubmission>,
 }
 
 /// Complete reviewer session and original author source context.
@@ -925,6 +928,12 @@ impl ReplayController {
         }
         let limits = self.limits;
         let session = self.session_mut(session_id)?;
+        if session.review.pending_submission.is_some() {
+            return Err(ReplayError::ReviewSubmissionUncertain(
+                "reconcile the confirmed GitHub review before changing its approved drafts"
+                    .to_string(),
+            ));
+        }
         if session.review.drafts.len() >= limits.max_steps {
             return Err(ReplayError::LimitExceeded {
                 kind: "local review drafts",
@@ -996,6 +1005,12 @@ impl ReplayController {
             ));
         }
         let session = self.session_mut(session_id)?;
+        if session.review.pending_submission.is_some() {
+            return Err(ReplayError::ReviewSubmissionUncertain(
+                "reconcile the confirmed GitHub review before changing its approved drafts"
+                    .to_string(),
+            ));
+        }
         let draft = session
             .review
             .drafts
@@ -1022,6 +1037,12 @@ impl ReplayController {
         draft_id: &str,
     ) -> Result<ReplayReviewDraft, ReplayError> {
         let session = self.session_mut(session_id)?;
+        if session.review.pending_submission.is_some() {
+            return Err(ReplayError::ReviewSubmissionUncertain(
+                "reconcile the confirmed GitHub review before changing its approved drafts"
+                    .to_string(),
+            ));
+        }
         let index = session
             .review
             .drafts
@@ -1092,19 +1113,29 @@ impl ReplayController {
         self.sessions.clear();
         self.sources.clear();
         self.workspaces.clear();
+        let mut recovered_in_flight = false;
         for session in &snapshot.sessions {
             self.sources
                 .insert(session.source.id.clone(), session.source.clone());
             self.workspaces
                 .insert(session.source.id.clone(), session.workspace.clone());
-            self.sessions.insert(session.id.clone(), session.clone());
+            let mut restored = session.clone();
+            if let Some(pending) = restored.review.pending_submission.as_mut() {
+                if pending.state == super::ReplayReviewSubmissionState::InFlight {
+                    pending.state = super::ReplayReviewSubmissionState::Uncertain;
+                    recovered_in_flight = true;
+                }
+            }
+            self.sessions.insert(restored.id.clone(), restored);
         }
         self.active_session = snapshot
             .active_session
             .as_ref()
             .filter(|id| self.sessions.contains_key(id.as_str()))
             .cloned();
-        self.generation = snapshot.generation;
+        self.generation = snapshot
+            .generation
+            .saturating_add(u64::from(recovered_in_flight));
         Ok(())
     }
 
@@ -1277,10 +1308,14 @@ fn validate_recovered_session(
     }
 
     let mut receipt_ids = HashSet::with_capacity(session.review.receipts.len());
+    let mut receipt_draft_ids = HashSet::new();
     let mut submitted_draft_ids = HashSet::new();
     for receipt in &session.review.receipts {
         if receipt.id == 0
             || !receipt_ids.insert(receipt.id)
+            || !session.source.pull_request.as_ref().is_some_and(|request| {
+                super::review::review_receipt_matches_original_pull_request(request, receipt)
+            })
             || receipt.target_commit != session.source.target_commit
             || receipt.viewer.trim().is_empty()
             || receipt.submitted_at.trim().is_empty()
@@ -1298,12 +1333,15 @@ fn validate_recovered_session(
         }
         for draft_id in &receipt.draft_ids {
             if !draft_ids.contains(draft_id.as_str())
-                || !submitted_draft_ids.insert(draft_id.as_str())
+                || !receipt_draft_ids.insert(draft_id.as_str())
             {
                 return Err(ReplayError::InvalidReviewDraft(
                     "a recovered submitted review contains an unrelated or duplicate draft"
                         .to_string(),
                 ));
+            }
+            if receipt.verification == super::ReplayReceiptVerification::Verified {
+                submitted_draft_ids.insert(draft_id.as_str());
             }
         }
     }
@@ -1317,6 +1355,10 @@ fn validate_recovered_session(
             "a published review draft does not have a matching submitted GitHub review receipt"
                 .to_string(),
         ));
+    }
+
+    if let Some(pending) = session.review.pending_submission.as_ref() {
+        super::review::validate_recovered_pending_submission(session, pending, limits)?;
     }
 
     Ok(())
@@ -1404,6 +1446,7 @@ impl ReplaySession {
                 role,
                 drafts: Vec::new(),
                 receipts: Vec::new(),
+                pending_submission: None,
             },
             generation: 0,
         })
@@ -1806,6 +1849,7 @@ mod tests {
                 .collect(),
             payload_digest: digest(b"explicitly approved original PR review"),
             submitted_at: "2026-07-27T20:00:00Z".to_string(),
+            verification: super::super::ReplayReceiptVerification::Verified,
         }
     }
 
@@ -2584,7 +2628,7 @@ mod tests {
     }
 
     #[test]
-    fn portable_reviews_preserve_verified_github_submission_receipts() {
+    fn portable_reviews_keep_imported_github_receipts_unverified_until_provider_confirmation() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("submitted-pr-482.red-review.json");
         let (mut original, original_id, original_step) =
@@ -2630,15 +2674,69 @@ mod tests {
             )
             .unwrap();
         let recovered = destination.session(&destination_id).unwrap();
-        assert_eq!(recovered.review.receipts, vec![receipt]);
+        let mut imported = receipt;
+        imported.verification = super::super::ReplayReceiptVerification::Unverified;
+        assert_eq!(recovered.review.receipts, vec![imported]);
+        assert_eq!(recovered.review.drafts[0].state, ReplayDraftState::Local);
+        assert!(destination
+            .preview_review_submission(&destination_id, ReplayReviewOutcome::Comment)
+            .is_ok());
+    }
+
+    #[test]
+    fn forged_portable_review_receipt_cannot_mark_a_local_draft_as_provider_verified() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("forged-pr-482.red-review.json");
+        let (mut original, original_id, original_step) =
+            controller_with_pull_request("alice", Some("reviewer"));
+        original
+            .add_review_draft(
+                &original_id,
+                Some(&original_step),
+                ReplayReviewDraftKind::InlineComment,
+                "A copied local JSON receipt is not GitHub evidence.",
+            )
+            .unwrap();
+        let preview = original
+            .preview_review_submission(&original_id, ReplayReviewOutcome::Comment)
+            .unwrap();
+        original
+            .record_review_submission(&original_id, &preview, submitted_review_receipt(&preview))
+            .unwrap();
+        original
+            .save_review_bundle(&original_id, &path, /*overwrite*/ false)
+            .unwrap();
+        let mut forged = read_portable_review(&path);
+        forged.receipts[0].id = 991;
+        forged.receipts[0].url =
+            "https://github.com/owner/repository/pull/482#pullrequestreview-991".to_string();
+        forged.receipts[0].payload_digest = "f".repeat(64);
+        forged.receipts[0].verification = super::super::ReplayReceiptVerification::Verified;
+        replace_portable_review(&path, &forged);
+
+        let (mut destination, destination_id, _) =
+            controller_with_pull_request("alice", Some("reviewer"));
+        let preview = destination
+            .preview_review_bundle(&destination_id, &path)
+            .unwrap();
+        destination
+            .import_review_bundle(
+                &destination_id,
+                &path,
+                &preview.bundle_digest,
+                /*confirmed*/ true,
+            )
+            .unwrap();
+        let recovered = destination.session(&destination_id).unwrap();
+
         assert_eq!(
-            recovered.review.drafts[0].state,
-            ReplayDraftState::Submitted
+            recovered.review.receipts[0].verification,
+            super::super::ReplayReceiptVerification::Unverified,
         );
-        assert!(matches!(
-            destination.preview_review_submission(&destination_id, ReplayReviewOutcome::Comment),
-            Err(ReplayError::InvalidReviewDraft(_)),
-        ));
+        assert_eq!(recovered.review.drafts[0].state, ReplayDraftState::Local);
+        assert!(destination
+            .preview_review_submission(&destination_id, ReplayReviewOutcome::Comment)
+            .is_ok());
     }
 
     #[test]

@@ -219,6 +219,7 @@ pub fn activate() {
     red::state_set("replay_pending_submission_digest", "");
     red::state_set("replay_submission_pending", false);
     red::state_set("replay_submission_uncertain", false);
+    red::state_set("replay_submission_state", red::null());
     red::state_set("replay_completions", []);
     red::state_set("replay_notice", "");
     red::state_set("replay_notice_severity", "info");
@@ -631,6 +632,7 @@ fn load_plan(plan: Json) -> bool {
     red::state_set("replay_pending_submission_digest", "");
     red::state_set("replay_submission_pending", false);
     red::state_set("replay_submission_uncertain", false);
+    red::state_set("replay_submission_state", red::null());
     red::state_set("replay_completions", []);
     set_notice("", "info");
     red::state_set("replay_view", "guide");
@@ -673,6 +675,18 @@ fn workspace_opened(event: Json) {
     }
     if event.receipts != red::null() {
         red::state_set("replay_receipts", event.receipts);
+    }
+    let submission_state = red::string(event.submission_state, "");
+    if submission_state == "" {
+        red::state_set("replay_submission_state", red::null());
+        red::state_set("replay_submission_uncertain", false);
+    } else {
+        red::state_set("replay_submission_state", submission_state);
+        red::state_set("replay_submission_uncertain", true);
+        set_notice(
+            "A previously confirmed review may already be on GitHub · press P to verify it.",
+            "warning"
+        );
     }
     let capability_warning = red::string(event.capability_warning, "");
     if capability_warning != "" {
@@ -1793,11 +1807,11 @@ fn publish_review() {
         render();
         return;
     }
-    if red::state_bool("replay_submission_uncertain") {
+    if red::state_bool("replay_submission_uncertain") || has_unverified_review_receipt() {
         red::execute(
             "OpenConfirm",
-            "Check GitHub before retrying",
-            "The previous review may already have been posted. Inspect the original pull request first. Accept only if you verified that the review was not submitted and want to preview a new request.",
+            "Verify the original review on GitHub?",
+            "Check the original pull request, reviewer, pinned commit, outcome, review body, and inline comments. This lookup is read-only and never posts another review. A new submission becomes available only if GitHub confirms the original review does not exist.",
             PickerHandlers {
                 selected: review_submission_retry_selected,
                 cancelled: review_submission_retry_cancelled,
@@ -1808,6 +1822,15 @@ fn publish_review() {
     if normalize_source_kind(red::string(red::state("replay_source_kind"), "demo"))
         != "github_pull_request" {
         set_notice("Only a verified GitHub pull request can receive a published review.", "error");
+        red::state_set("replay_view", "outbox");
+        render();
+        return;
+    }
+    if !red::state_bool("replay_viewer_verified") {
+        set_notice(
+            "GitHub viewer could not be verified · review publication remains unavailable.",
+            "warning"
+        );
         red::state_set("replay_view", "outbox");
         render();
         return;
@@ -1855,6 +1878,15 @@ fn publish_review() {
     });
 }
 
+fn has_unverified_review_receipt() -> bool {
+    for receipt in red::state("replay_receipts") {
+        if red::string(receipt.verification, "verified") == "unverified" {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn review_outcome_selected(item: PickerItem) {
     let outcome = red::string(item.id, "");
     if outcome != "comment" && outcome != "approve" && outcome != "request_changes" {
@@ -1881,8 +1913,52 @@ fn review_submission_retry_selected(item: PickerItem) {
         render();
         return;
     }
+    red::state_set("replay_submission_pending", true);
+    red::state_set("replay_view", "outbox");
+    set_notice("Checking the exact original review on GitHub…", "info");
+    render();
+    red::request(
+        "ReplayReconcileReview",
+        review_reconciled,
+        red::string(red::state("replay_workspace_id"), "")
+    );
+}
+
+fn review_reconciled(result: Json) {
+    red::state_set("replay_submission_pending", false);
+    if !red::bool(result.ok, false) {
+        red::state_set("replay_submission_uncertain", true);
+        set_notice(
+            source_error(result, "GitHub could not safely verify the original review"),
+            "error"
+        );
+        red::state_set("replay_view", "outbox");
+        render();
+        return;
+    }
+    if result.drafts != red::null() {
+        red::state_set("replay_drafts", result.drafts);
+    }
+    if result.receipts != red::null() {
+        red::state_set("replay_receipts", result.receipts);
+    }
+    red::state_set("replay_submission_state", red::null());
     red::state_set("replay_submission_uncertain", false);
-    publish_review();
+    if red::string(result.status, "") == "verified" {
+        set_notice(
+            "Original GitHub review verified · its receipt was recovered without reposting.",
+            "success"
+        );
+        red::state_set("replay_view", "outbox");
+        render();
+        return;
+    }
+    set_notice(
+        "GitHub has no matching submitted review · you can safely preview a fresh request.",
+        "success"
+    );
+    red::state_set("replay_view", "outbox");
+    render();
 }
 
 fn review_submission_retry_cancelled(event: PickerCancelled) {
@@ -1985,6 +2061,7 @@ fn review_submission_confirmed(item: PickerItem) {
         return;
     }
     red::state_set("replay_submission_pending", true);
+    red::state_set("replay_submission_state", "in_flight");
     red::state_set("replay_view", "outbox");
     set_notice("Posting your confirmed review to GitHub…", "info");
     render();
@@ -2016,6 +2093,11 @@ fn review_submission_finished(result: Json) {
     if !red::bool(result.ok, false) {
         let uncertain = red::string(result.code, "") == "review_submission_uncertain";
         red::state_set("replay_submission_uncertain", uncertain);
+        if uncertain {
+            red::state_set("replay_submission_state", "uncertain");
+        } else {
+            red::state_set("replay_submission_state", red::null());
+        }
         let fallback = "GitHub could not confirm this review; all local drafts are preserved";
         if uncertain {
             fallback = "This review may already be on GitHub. Check the pull request before retrying.";
@@ -2027,6 +2109,7 @@ fn review_submission_finished(result: Json) {
     }
 
     red::state_set("replay_submission_uncertain", false);
+    red::state_set("replay_submission_state", red::null());
     red::state_set("replay_drafts", result.drafts);
     red::state_set("replay_receipts", result.receipts);
     set_notice(
@@ -2289,20 +2372,24 @@ fn review_file_loaded(result: Json) {
     }
     red::state_set("replay_notes", result.notes);
     red::state_set("replay_review_path", red::string(result.preview.path, ""));
+    let imported_receipts = has_unverified_review_receipt();
     let index = red::int(red::state("replay_outbox_index"), 0);
     if red::len(result.drafts) == 0 {
         red::state_set("replay_outbox_index", 0);
     } else if index >= red::len(result.drafts) && index > 0 {
         red::state_set("replay_outbox_index", red::len(result.drafts) - 1);
     }
-    set_notice(
+    let import_notice =
         "Loaded "
             + review_outcome_count(red::int(result.preview.drafts_to_add, 0), "draft", "drafts")
             + " and "
             + review_outcome_count(red::int(result.preview.notes_to_add, 0), "observation", "observations")
-            + " · existing drafts kept · nothing sent to GitHub.",
-        "success"
-    );
+            + " · existing drafts kept · nothing sent to GitHub.";
+    if imported_receipts {
+        set_notice(import_notice + " Imported receipts require GitHub verification.", "warning");
+    } else {
+        set_notice(import_notice, "success");
+    }
     red::state_set("replay_view", "outbox");
     render();
 }
@@ -2397,6 +2484,7 @@ fn guide_content() -> String {
         draft_count: red::len(red::state("replay_drafts")),
         drafts: red::state("replay_drafts"),
         receipts: red::state("replay_receipts"),
+        submission_state: red::state("replay_submission_state"),
         outbox_index: red::int(red::state("replay_outbox_index"), 0),
         view: red::string(red::state("replay_view"), "guide"),
         title: red::string(red::state("replay_title"), ""),

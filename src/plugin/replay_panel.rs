@@ -20,7 +20,8 @@ use crate::{
     editor::{render_buffer::RenderBuffer, Point},
     replay::{
         parse_patch, GitObjectId, ReplayDemoStep, ReplayDraftState, ReplayLimits,
-        ReplayReviewDraft, ReplayReviewDraftKind, ReplayReviewReceipt, ReplayReviewRole,
+        ReplayReceiptVerification, ReplayReviewDraft, ReplayReviewDraftKind, ReplayReviewReceipt,
+        ReplayReviewRole, ReplayReviewSubmissionState,
     },
     theme::{SelectionForegroundPriority, Style, Theme},
     ui::{ActionBar, ActionBarRole, ActionPriority, UiAction},
@@ -168,6 +169,8 @@ pub(crate) struct ReplayPanelModel {
     pub(crate) drafts: Vec<ReplayReviewDraft>,
     #[serde(default)]
     pub(crate) receipts: Vec<ReplayReviewReceipt>,
+    #[serde(default)]
+    pub(crate) submission_state: Option<ReplayReviewSubmissionState>,
     #[serde(default)]
     pub(crate) outbox_index: usize,
     #[serde(default)]
@@ -1463,16 +1466,28 @@ fn replay_outbox_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
         String::new(),
         TextPanelSpanStyle::Text,
     ));
+    let verified_receipts = model
+        .receipts
+        .iter()
+        .filter(|receipt| receipt.verification == ReplayReceiptVerification::Verified)
+        .count();
+    let unverified_receipts = model.receipts.len().saturating_sub(verified_receipts);
     let count = if model.receipts.is_empty() && model.drafts.len() == 1 {
         "1 draft".to_string()
     } else if model.receipts.is_empty() {
         format!("{} drafts", model.drafts.len())
-    } else {
+    } else if unverified_receipts > 0 && verified_receipts == 0 {
         format!(
-            "{} drafts · {} posted",
-            model.drafts.len(),
-            model.receipts.len()
+            "{} drafts · {unverified_receipts} unverified",
+            model.drafts.len()
         )
+    } else if unverified_receipts > 0 {
+        format!(
+            "{} drafts · {verified_receipts} posted · {unverified_receipts} unverified",
+            model.drafts.len(),
+        )
+    } else {
+        format!("{} drafts · {verified_receipts} posted", model.drafts.len())
     };
     lines.push(aligned_line(
         "LOCAL OUTBOX",
@@ -1482,7 +1497,9 @@ fn replay_outbox_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
         None,
         width,
     ));
-    let privacy = if model.receipts.is_empty() {
+    let privacy = if unverified_receipts > 0 {
+        "Imported receipts are unverified · press P to check GitHub"
+    } else if model.receipts.is_empty() {
         "Local only · nothing sent to GitHub"
     } else {
         "Local drafts stay private · posted comments have verified receipts"
@@ -1691,10 +1708,23 @@ fn replay_outbox_actions(model: &ReplayPanelModel) -> Vec<UiAction> {
         );
     }
     if can_publish {
+        let verification_needed = model.submission_state.is_some()
+            || model
+                .receipts
+                .iter()
+                .any(|receipt| receipt.verification == ReplayReceiptVerification::Unverified);
         actions.push(
-            UiAction::new("publish_review", "P", "Publish")
-                .with_priority(ActionPriority::Essential)
-                .with_compact_label("Post"),
+            UiAction::new(
+                "publish_review",
+                "P",
+                if verification_needed {
+                    "Verify"
+                } else {
+                    "Publish"
+                },
+            )
+            .with_priority(ActionPriority::Essential)
+            .with_compact_label(if verification_needed { "Check" } else { "Post" }),
         );
     }
     actions.push(
@@ -2574,6 +2604,7 @@ mod tests {
             draft_count: 0,
             drafts: Vec::new(),
             receipts: Vec::new(),
+            submission_state: None,
             outbox_index: 0,
             view: ReplayPanelView::Guide,
             title: plan.title,
@@ -3917,6 +3948,7 @@ mod tests {
             draft_ids: vec![draft.id.clone()],
             payload_digest: "a".repeat(64),
             submitted_at: "2026-07-27T20:00:00Z".to_string(),
+            verification: crate::replay::ReplayReceiptVerification::Verified,
         }];
         replay.drafts = vec![draft];
         replay.draft_count = replay.drafts.len();
@@ -3941,6 +3973,52 @@ mod tests {
         for action in ["edit_draft", "discard_draft", "publish_review"] {
             assert!(!actions.iter().any(|candidate| candidate.id == action));
         }
+    }
+
+    #[test]
+    fn imported_review_receipts_are_labeled_unverified_and_offer_provider_verification() {
+        let mut replay = model();
+        replay.review_role = Some(ReplayReviewRole::Reviewer);
+        replay.viewer_verified = Some(true);
+        replay.head_commit = "b".repeat(40);
+        replay.view = ReplayPanelView::Outbox;
+        let draft = outbox_draft(
+            ReplayReviewDraftKind::InlineComment,
+            "Verify this imported original-source review before trusting it.",
+        );
+        replay.receipts = vec![ReplayReviewReceipt {
+            id: 71,
+            url: "https://github.com/example/replay/pull/482#pullrequestreview-71".to_string(),
+            outcome: crate::replay::ReplayReviewOutcome::Comment,
+            target_commit: draft.target_commit.clone(),
+            viewer: "reviewer".to_string(),
+            draft_ids: vec![draft.id.clone()],
+            payload_digest: "a".repeat(64),
+            submitted_at: "2026-07-27T20:00:00Z".to_string(),
+            verification: crate::replay::ReplayReceiptVerification::Unverified,
+        }];
+        replay.drafts = vec![draft];
+        replay.draft_count = 1;
+        let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+        let lines = replay_outbox_lines(&state, /*width*/ 72)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let actions = replay_outbox_actions(&replay);
+
+        assert!(lines.iter().any(|line| line.contains("1 unverified")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("Imported receipts are unverified")));
+        assert!(actions
+            .iter()
+            .any(|action| { action.id == "publish_review" && action.label == "Verify" }));
+        assert!(!lines.iter().any(|line| line.contains("1 posted")));
     }
 
     #[test]

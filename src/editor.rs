@@ -867,6 +867,10 @@ pub enum PluginRequest {
         preview_digest: String,
         confirmed: bool,
     },
+    ReplayReconcileReview {
+        request_id: RequestId,
+        workspace_id: String,
+    },
     ReplaySaveReview {
         request_id: RequestId,
         workspace_id: String,
@@ -1158,6 +1162,13 @@ pub enum ReplayBackgroundResult {
         /// Provider-verified, non-pending review receipt.
         receipt: Box<crate::replay::ReplayReviewReceipt>,
     },
+    /// Exact result of a bounded, read-only lookup for an uncertain review.
+    ReconciledReview {
+        /// Stable editor-owned review that requested provider verification.
+        workspace_id: String,
+        /// Either the sole matching provider receipt or proven bounded absence.
+        result: Box<crate::replay::ReplayReviewReconciliation>,
+    },
     /// An immutable editor-owned review snapshot saved to a user-selected file.
     SavedReviewBundle {
         /// Stable editor-owned review whose contents were explicitly saved.
@@ -1257,6 +1268,7 @@ impl PluginRequest {
             Self::ReplayRemoveDraft { .. } => "ReplayRemoveDraft",
             Self::ReplayPreviewSubmission { .. } => "ReplayPreviewSubmission",
             Self::ReplaySubmitReview { .. } => "ReplaySubmitReview",
+            Self::ReplayReconcileReview { .. } => "ReplayReconcileReview",
             Self::ReplaySaveReview { .. } => "ReplaySaveReview",
             Self::ReplayPreviewReview { .. } => "ReplayPreviewReview",
             Self::ReplayLoadReview { .. } => "ReplayLoadReview",
@@ -2080,6 +2092,9 @@ pub struct Editor {
 
     /// Bounded one-shot source requests currently running outside the UI loop.
     pending_replay_requests: HashSet<RequestId>,
+
+    /// Provider publication workers tied to their exact durable Replay session.
+    pending_replay_review_requests: HashMap<RequestId, String>,
 
     /// LSP client for code intelligence features
     lsp: Box<dyn LspClient>,
@@ -3289,6 +3304,7 @@ impl Editor {
             replay_source_displays: HashMap::new(),
             replay_reviews: HashMap::new(),
             pending_replay_requests: HashSet::new(),
+            pending_replay_review_requests: HashMap::new(),
             lsp,
             config,
             config_diagnostics: Vec::new(),
@@ -4375,6 +4391,11 @@ impl Editor {
             "head_permission": pull_request.map(|request| request.capabilities.head_permission),
             "drafts": drafts,
             "receipts": session.review.receipts,
+            "submission_state": session
+                .review
+                .pending_submission
+                .as_ref()
+                .map(|pending| pending.state),
             "outbox": {
                 "draft_count": drafts.len(),
                 "inline_count": drafts
@@ -4636,6 +4657,23 @@ impl Editor {
         Ok(())
     }
 
+    fn persist_replay_publication_snapshot(&mut self) -> Result<(), crate::replay::ReplayError> {
+        if self.session_manager.store().is_none() {
+            return Err(crate::replay::ReplayError::Filesystem(
+                "GitHub review publication requires an active durable editor recovery session"
+                    .to_string(),
+            ));
+        }
+        self.persist_session_snapshot(/*force*/ true);
+        if self.session_manager.warning().is_some() {
+            return Err(crate::replay::ReplayError::Filesystem(
+                "the confirmed review could not be durably saved; no unverified retry is allowed"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn finish_replay_pull_request(
         &mut self,
         resolved: crate::replay::ReplayResolvedPullRequest,
@@ -4828,6 +4866,11 @@ impl Editor {
             "head_permission": pull_request.map(|request| request.capabilities.head_permission),
             "drafts": recovered.review.drafts,
             "receipts": recovered.review.receipts,
+            "submission_state": recovered
+                .review
+                .pending_submission
+                .as_ref()
+                .map(|pending| pending.state),
             "plan": presentation,
         }))
     }
@@ -9289,24 +9332,75 @@ impl Editor {
                     confirmed,
                 } => {
                     let limits = self.replay_controller.limits();
-                    let started = self
-                        .replay_controller
-                        .prepare_review_submission(
+                    let started = (|| -> Result<(), crate::replay::ReplayError> {
+                        if self.session_manager.store().is_none() {
+                            return Err(crate::replay::ReplayError::Filesystem(
+                                "GitHub review publication requires durable editor recovery"
+                                    .to_string(),
+                            ));
+                        }
+                        let submission = self.replay_controller.begin_review_submission(
                             &workspace_id,
                             outcome,
                             &preview_digest,
                             confirmed,
-                        )
-                        .and_then(|submission| {
+                        )?;
+                        if let Err(error) = self.persist_replay_publication_snapshot() {
+                            let _ = self
+                                .replay_controller
+                                .clear_review_submission(&workspace_id);
+                            return Err(error);
+                        }
+
+                        let worker_workspace = workspace_id.clone();
+                        let spawned =
                             self.spawn_replay_background(request_id, "review-submit", move || {
                                 let (preview, receipt) =
                                     crate::replay::submit_prepared_review(submission, limits)?;
                                 Ok(ReplayBackgroundResult::SubmittedReview {
-                                    workspace_id,
+                                    workspace_id: worker_workspace,
                                     preview: Box::new(preview),
                                     receipt: Box::new(receipt),
                                 })
-                            })
+                            });
+                        if let Err(error) = spawned {
+                            self.replay_controller
+                                .clear_review_submission(&workspace_id)?;
+                            self.persist_replay_publication_snapshot()?;
+                            return Err(error);
+                        }
+                        self.pending_replay_review_requests
+                            .insert(request_id, workspace_id.clone());
+                        Ok(())
+                    })();
+                    if let Err(error) = started {
+                        self.plugin_registry
+                            .resolve_request(runtime, request_id, error.payload())
+                            .await?;
+                    }
+                }
+                PluginRequest::ReplayReconcileReview {
+                    request_id,
+                    workspace_id,
+                } => {
+                    let limits = self.replay_controller.limits();
+                    let started = self
+                        .replay_controller
+                        .prepare_review_reconciliation(&workspace_id)
+                        .and_then(|prepared| {
+                            let worker_workspace = workspace_id.clone();
+                            self.spawn_replay_background(
+                                request_id,
+                                "review-reconcile",
+                                move || {
+                                    let result =
+                                        crate::replay::reconcile_prepared_review(prepared, limits)?;
+                                    Ok(ReplayBackgroundResult::ReconciledReview {
+                                        workspace_id: worker_workspace,
+                                        result: Box::new(result),
+                                    })
+                                },
+                            )
                         });
                     if let Err(error) = started {
                         self.plugin_registry
@@ -9442,6 +9536,8 @@ impl Editor {
                     if !self.pending_replay_requests.remove(&request_id) {
                         continue;
                     }
+                    let publication_workspace =
+                        self.pending_replay_review_requests.remove(&request_id);
                     let payload = match result {
                         Ok(ReplayBackgroundResult::PullRequest { resolved, source }) => self
                             .finish_replay_pull_request(*resolved, source.map(|source| *source))
@@ -9482,20 +9578,109 @@ impl Editor {
                             &preview,
                             *receipt,
                         ) {
-                            Ok(receipt) => match self.replay_controller.session(&workspace_id) {
-                                Ok(session) => {
-                                    needs_render = true;
-                                    json!({
-                                        "ok": true,
-                                        "workspace_id": workspace_id,
-                                        "receipt": receipt,
-                                        "drafts": session.review.drafts,
-                                        "receipts": session.review.receipts,
-                                    })
+                            Ok(receipt) => {
+                                if let Err(error) = self.persist_replay_publication_snapshot() {
+                                    crate::replay::ReplayError::ReviewSubmissionUncertain(
+                                        format!(
+                                            "GitHub confirmed this review, but its local receipt could not be durably saved: {error}"
+                                        ),
+                                    )
+                                    .payload()
+                                } else {
+                                    match self.replay_controller.session(&workspace_id) {
+                                        Ok(session) => {
+                                            needs_render = true;
+                                            json!({
+                                                "ok": true,
+                                                "workspace_id": workspace_id,
+                                                "receipt": receipt,
+                                                "drafts": session.review.drafts,
+                                                "receipts": session.review.receipts,
+                                                "submission_state": null,
+                                            })
+                                        }
+                                        Err(error) => error.payload(),
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                let _ = self
+                                    .replay_controller
+                                    .mark_review_submission_uncertain(&workspace_id);
+                                let _ = self.persist_replay_publication_snapshot();
+                                error.payload()
+                            }
+                        },
+                        Ok(ReplayBackgroundResult::ReconciledReview {
+                            workspace_id,
+                            result,
+                        }) => match *result {
+                            crate::replay::ReplayReviewReconciliation::Verified {
+                                preview,
+                                receipt,
+                            } => match self.replay_controller.record_review_submission(
+                                &workspace_id,
+                                &preview,
+                                *receipt,
+                            ) {
+                                Ok(receipt) => {
+                                    if let Err(error) = self.persist_replay_publication_snapshot() {
+                                        crate::replay::ReplayError::ReviewSubmissionUncertain(
+                                            format!(
+                                                "GitHub verified the original review, but its local receipt could not be durably saved: {error}"
+                                            ),
+                                        )
+                                        .payload()
+                                    } else {
+                                        match self.replay_controller.session(&workspace_id) {
+                                            Ok(session) => {
+                                                needs_render = true;
+                                                json!({
+                                                    "ok": true,
+                                                    "workspace_id": workspace_id,
+                                                    "status": "verified",
+                                                    "receipt": receipt,
+                                                    "drafts": session.review.drafts,
+                                                    "receipts": session.review.receipts,
+                                                    "submission_state": null,
+                                                })
+                                            }
+                                            Err(error) => error.payload(),
+                                        }
+                                    }
                                 }
                                 Err(error) => error.payload(),
                             },
-                            Err(error) => error.payload(),
+                            crate::replay::ReplayReviewReconciliation::NotFound {
+                                imported_receipt_id,
+                            } => {
+                                let cleared = if let Some(receipt_id) = imported_receipt_id {
+                                    self.replay_controller
+                                        .clear_unverified_review_receipt(&workspace_id, receipt_id)
+                                } else {
+                                    self.replay_controller
+                                        .clear_review_submission(&workspace_id)
+                                };
+                                match cleared
+                                    .and_then(|()| self.persist_replay_publication_snapshot())
+                                {
+                                    Ok(()) => match self.replay_controller.session(&workspace_id) {
+                                        Ok(session) => {
+                                            needs_render = true;
+                                            json!({
+                                                "ok": true,
+                                                "workspace_id": workspace_id,
+                                                "status": "not_found",
+                                                "drafts": session.review.drafts,
+                                                "receipts": session.review.receipts,
+                                                "submission_state": session.review.pending_submission,
+                                            })
+                                        }
+                                        Err(error) => error.payload(),
+                                    },
+                                    Err(error) => error.payload(),
+                                }
+                            }
                         },
                         Ok(ReplayBackgroundResult::SavedReviewBundle {
                             workspace_id,
@@ -9663,7 +9848,31 @@ impl Editor {
                                 Err(error) => error.payload(),
                             }
                         }
-                        Err(error) => error.payload(),
+                        Err(error) => {
+                            if let Some(workspace_id) = publication_workspace.as_deref() {
+                                let changed = if matches!(
+                                    error,
+                                    crate::replay::ReplayError::ReviewSubmissionUncertain(_)
+                                ) {
+                                    self.replay_controller
+                                        .mark_review_submission_uncertain(workspace_id)
+                                } else {
+                                    self.replay_controller.clear_review_submission(workspace_id)
+                                };
+                                if let Err(safety_error) = changed
+                                    .and_then(|()| self.persist_replay_publication_snapshot())
+                                {
+                                    crate::replay::ReplayError::ReviewSubmissionUncertain(
+                                        safety_error.to_string(),
+                                    )
+                                    .payload()
+                                } else {
+                                    error.payload()
+                                }
+                            } else {
+                                error.payload()
+                            }
+                        }
                     };
                     self.plugin_registry
                         .resolve_request(runtime, request_id, payload)
@@ -25093,6 +25302,96 @@ mod test {
                 .len(),
             1,
         );
+    }
+
+    #[tokio::test]
+    async fn confirmed_github_review_is_durable_before_a_provider_worker_can_start() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let (directory, session, workspace, _author) = real_author_replay_session_fixture();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let store = SessionStore::new(directory.path().join("durable-review-session"));
+        editor.set_session_store(store.clone());
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        let opened = editor
+            .install_replay_source_session(
+                session,
+                "feature/original-pr",
+                workspace,
+                &mut render_buffer,
+            )
+            .await
+            .expect("install the verified original GitHub PR review");
+        let workspace_id = opened["workspace_id"].as_str().unwrap().to_string();
+        let step_id = opened["plan"]["steps"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        editor
+            .replay_controller
+            .add_review_draft(
+                &workspace_id,
+                Some(&step_id),
+                crate::replay::ReplayReviewDraftKind::InlineComment,
+                "Preserve this provider request across an unexpected editor exit.",
+            )
+            .unwrap();
+        let preview = editor
+            .replay_controller
+            .preview_review_submission(&workspace_id, crate::replay::ReplayReviewOutcome::Comment)
+            .unwrap();
+        let _prepared = editor
+            .replay_controller
+            .begin_review_submission(
+                &workspace_id,
+                crate::replay::ReplayReviewOutcome::Comment,
+                &preview.preview_digest,
+                /*confirmed*/ true,
+            )
+            .unwrap();
+
+        editor
+            .persist_replay_publication_snapshot()
+            .expect("sync the exact approved review before starting the network worker");
+        let snapshot = store
+            .load()
+            .expect("read the atomically synced session file");
+        let replay = snapshot
+            .replay
+            .as_ref()
+            .expect("include the exact original review in the durable editor session");
+        let pending = replay.controller.sessions[0]
+            .review
+            .pending_submission
+            .as_ref()
+            .expect("persist the confirmed provider request before it runs");
+        assert_eq!(pending.preview, preview);
+        assert_eq!(
+            pending.state,
+            crate::replay::ReplayReviewSubmissionState::InFlight,
+        );
+
+        let mut recovered = crate::replay::ReplayController::default();
+        recovered.restore(&replay.controller).unwrap();
+        assert_eq!(
+            recovered
+                .session(&workspace_id)
+                .unwrap()
+                .review
+                .pending_submission
+                .as_ref()
+                .unwrap()
+                .state,
+            crate::replay::ReplayReviewSubmissionState::Uncertain,
+        );
+        assert!(matches!(
+            recovered.preview_review_submission(
+                &workspace_id,
+                crate::replay::ReplayReviewOutcome::Comment,
+            ),
+            Err(crate::replay::ReplayError::ReviewSubmissionUncertain(_)),
+        ));
     }
 
     #[tokio::test]

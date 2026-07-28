@@ -266,7 +266,12 @@ first checks the exact original host, repository, PR, base, head commit, and
 complete diff. It previews the new drafts, observations, and receipts, requires
 confirmation before merging, and refuses conflicting text or a file that changes
 after the preview. Existing version-one private review files remain readable.
-Neither saving nor loading sends anything to GitHub.
+Neither saving nor loading sends anything to GitHub. Imported submission receipts
+are deliberately marked **unverified** on the new computer: a local JSON file
+cannot prove that GitHub actually accepted a review. Their associated comments
+remain editable local drafts until you explicitly press `P` to verify the
+original review against GitHub. A forged or stale imported receipt never labels
+a draft `POSTED` or silently prevents a legitimate new review.
 
 ### Publish an explicitly approved GitHub review
 
@@ -291,6 +296,12 @@ also identifies any original-PR fix proposals that will stay local. Cancel
 preserves all drafts. Only explicitly accepting this confirmation starts the
 background GitHub request.
 
+Before that worker can start, Red synchronously writes the exact approved PR,
+viewer, commit, outcome, drafts, and request digest into its crash-safe editor
+session. If durable session recovery is unavailable or that write fails, no
+review is posted. Git and GitHub operations have bounded execution deadlines,
+bounded output, noninteractive credentials, and redacted diagnostics.
+
 Immediately before publication, Red verifies the original PR head and viewer
 again. It sends all selected comments and the chosen outcome in one atomic,
 event-bearing GitHub review request; it never creates a remote `PENDING`
@@ -300,11 +311,15 @@ the exact submitted drafts `POSTED` and retains their portable GitHub review
 receipt. Private notes, the scratch worktree, and the original PR branch are
 never modified by review publication.
 
-If a network or provider failure happens after the review request may have
-reached GitHub, Red explicitly reports that the review might already be posted.
-It never claims that nothing happened or silently retries. A second confirmation
-requires you to inspect the original PR before choosing whether to preview
-another submission.
+If a crash, network failure, or lost response happens after the review request
+may have reached GitHub, Red restores the exact request as **uncertain** instead
+of allowing a blind retry. Press `P` and confirm a read-only provider lookup.
+Red verifies the original repository, pull request, authenticated reviewer,
+pinned commit, chosen outcome, review body, and every inline comment and source
+coordinate. Exactly one matching review becomes a verified local receipt without
+posting again. Only after GitHub confirms that no matching review exists does a
+fresh submission become available. Ambiguous or failed lookups remain blocked
+and explain why.
 
 ## Key bindings
 

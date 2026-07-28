@@ -110,6 +110,7 @@
     { "name": "ReplayRemoveDraft", "kind": "request", "signature": "(callback: fn(Json), workspace_id: String, draft_id: String)", "introduced": "0.5.1" },
     { "name": "ReplayPreviewSubmission", "kind": "request", "signature": "(callback: fn(Json), workspace_id: String, outcome: String)", "introduced": "0.5.1" },
     { "name": "ReplaySubmitReview", "kind": "request", "signature": "(callback: fn(Json), workspace_id: String, outcome: String, preview_digest: String, confirmed: bool)", "introduced": "0.5.1" },
+    { "name": "ReplayReconcileReview", "kind": "request", "signature": "(callback: fn(Json), workspace_id: String)", "introduced": "0.5.1" },
     { "name": "ReplaySaveReview", "kind": "request", "signature": "(callback: fn(Json), workspace_id: String, path: String, overwrite: bool)", "introduced": "0.5.1" },
     { "name": "ReplayPreviewReview", "kind": "request", "signature": "(callback: fn(Json), workspace_id: String, path: String)", "introduced": "0.5.1" },
     { "name": "ReplayLoadReview", "kind": "request", "signature": "(callback: fn(Json), workspace_id: String, path: String, bundle_digest: String, confirmed: bool)", "introduced": "0.5.1" },

@@ -1786,6 +1786,16 @@ impl RedHost {
                         anyhow::anyhow!("ReplaySubmitReview requires explicit human confirmation")
                     })?,
             },
+            "ReplayReconcileReview" => PluginRequest::ReplayReconcileReview {
+                request_id,
+                workspace_id: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ReplayReconcileReview requires a workspace id")
+                    })?
+                    .to_string(),
+            },
             "ReplaySaveReview" => PluginRequest::ReplaySaveReview {
                 request_id,
                 workspace_id: args
@@ -4099,6 +4109,28 @@ mod tests {
         review_role: &str,
         source_kind: &str,
     ) -> crate::replay::ReplayPresentationPlan {
+        let viewer = if review_role == "author" {
+            "original-author"
+        } else {
+            "reviewer"
+        };
+        open_github_replay_with_identity(
+            runtime,
+            review_role,
+            source_kind,
+            Some(viewer),
+            /*capability_warning*/ None,
+        )
+        .await
+    }
+
+    async fn open_github_replay_with_identity(
+        runtime: &mut Runtime,
+        review_role: &str,
+        source_kind: &str,
+        viewer: Option<&str>,
+        capability_warning: Option<&str>,
+    ) -> crate::replay::ReplayPresentationPlan {
         prepare_replay_runtime(runtime);
         runtime
             .load_plugin("replay", include_str!("../../plugins/replay.hk"))
@@ -4131,11 +4163,8 @@ mod tests {
                     "source_kind": source_kind,
                     "pull_request": 482,
                     "author": "original-author",
-                    "viewer": if review_role == "author" {
-                        "original-author"
-                    } else {
-                        "reviewer"
-                    },
+                    "viewer": viewer,
+                    "capability_warning": capability_warning,
                     "head_permission": "write",
                     "title": "Bound original visible diagnostics",
                     "branch": "feature/viewport-diagnostics",
@@ -4188,11 +4217,8 @@ mod tests {
                     "workspace_root": "/workspace/repository.replay-pr-482-bbbbbbb",
                     "workspace_branch": "replay/pr-482-bbbbbbb",
                     "review_role": review_role,
-                    "viewer": if review_role == "author" {
-                        "original-author"
-                    } else {
-                        "reviewer"
-                    },
+                    "viewer": viewer,
+                    "capability_warning": capability_warning,
                     "head_permission": "write",
                     "head_commit": "b".repeat(40),
                     "review_bundle_path":
@@ -6299,6 +6325,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovered_uncertain_github_review_requires_verification_before_another_post() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        prepare_replay_runtime(&mut runtime);
+        runtime
+            .load_plugin("replay", include_str!("../../plugins/replay.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify("editor:ready", serde_json::json!({}))
+            .await
+            .unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayActiveSession { request_id } => request_id,
+            _ => panic!("expected an editor-owned recovered review request"),
+        };
+        let demo = crate::replay::replay_demo_plan().unwrap();
+        let plan =
+            crate::replay::replay_presentation_plan(&demo, crate::replay::ReplayLimits::default())
+                .unwrap();
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "active": true,
+                    "workspace_id": "recovered-github-review-482",
+                    "workspace_root": "/workspace/repository.replay-pr-482-bbbbbbb",
+                    "source_kind": "github_pull_request",
+                    "source_buffer_index": 1,
+                    "review_role": "reviewer",
+                    "viewer": "reviewer",
+                    "head_permission": "write",
+                    "head_commit": "b".repeat(40),
+                    "drafts": [source_backed_review_draft(
+                        &plan,
+                        "recovered-approved-draft",
+                        "inline_comment",
+                        "Never publish this recovered draft twice.",
+                    )],
+                    "receipts": [],
+                    "submission_state": "uncertain",
+                    "notes": [],
+                    "completions": [],
+                    "plan": serde_json::to_value(&plan).unwrap(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::CreateTextPanel { id, .. } if id == "replay-coach"
+        ));
+        let recovered = recv_replay_guide();
+        assert_eq!(
+            recovered.submission_state,
+            Some(crate::replay::ReplayReviewSubmissionState::Uncertain),
+        );
+        assert!(recovered.notice.contains("previously confirmed review"));
+        recv_replay_source_focus("recovered-github-review-482", &plan.steps[0].id);
+
+        runtime.execute_command("ReplayPublish").await.unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackConfirmation { title, .. } => {
+                assert_eq!(title, "Verify the original review on GitHub?");
+            }
+            _ => panic!("a recovered uncertain review must offer read-only verification"),
+        }
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
     async fn bundled_replay_does_not_open_a_panel_when_no_recovered_review_exists() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -6898,6 +6997,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unverified_github_viewer_is_explained_and_cannot_start_review_publication() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_github_replay_with_identity(
+            &mut runtime,
+            "reviewer",
+            "github_pull_request",
+            /*viewer*/ None,
+            Some("GitHub viewer could not be verified: authentication expired."),
+        )
+        .await;
+        add_replay_review_summary(
+            &mut runtime,
+            &plan,
+            "github-workspace-482",
+            "unverified-viewer-summary",
+            "Keep this private until GitHub authentication is restored.",
+        )
+        .await;
+
+        runtime.execute_command("ReplayPublish").await.unwrap();
+        let outbox = recv_replay_outbox();
+
+        assert_eq!(outbox.viewer_verified, Some(false));
+        assert!(outbox.notice.contains("viewer could not be verified"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
     async fn failed_github_review_preview_keeps_every_draft_private() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -6951,7 +7080,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uncertain_github_submission_requires_a_second_explicit_retry_confirmation() {
+    async fn uncertain_github_submission_requires_explicit_read_only_provider_verification() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
@@ -7034,9 +7163,9 @@ mod tests {
                 message,
                 ..
             } => {
-                assert_eq!(title, "Check GitHub before retrying");
-                assert!(message.contains("may already have been posted"));
-                assert!(message.contains("Inspect the original pull request"));
+                assert_eq!(title, "Verify the original review on GitHub?");
+                assert!(message.contains("read-only"));
+                assert!(message.contains("never posts another review"));
                 handle
             }
             _ => panic!("expected a separate, cancel-by-default uncertain-retry confirmation"),
@@ -7050,6 +7179,131 @@ mod tests {
             .unwrap());
         let cancelled = recv_replay_outbox();
         assert!(cancelled.notice.contains("may already be on GitHub"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn accepting_uncertain_review_verification_dispatches_only_a_read_only_lookup() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_github_replay_for_submission(&mut runtime, "reviewer").await;
+        let draft_id = "recoverable-github-review-summary";
+        let body = "Recover this provider-confirmed review without posting twice.";
+        add_replay_review_summary(&mut runtime, &plan, "github-workspace-482", draft_id, body)
+            .await;
+        runtime.execute_command("ReplayPublish").await.unwrap();
+        let outcome = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, .. } => handle,
+            _ => panic!("expected original review outcome selection"),
+        };
+        let comment = serde_json::from_value(serde_json::json!({
+            "id": "comment",
+            "label": "Comment only",
+        }))
+        .unwrap();
+        assert!(runtime
+            .notify_picker(outcome, PickerCallback::Selected(comment))
+            .unwrap());
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayPreviewSubmission { request_id, .. } => request_id,
+            _ => panic!("expected read-only original review preview"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "github-workspace-482",
+                    "preview": github_submission_preview(&plan, draft_id, body, "comment"),
+                }),
+            )
+            .await
+            .unwrap();
+        let confirmation = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackConfirmation { handle, .. } => handle,
+            _ => panic!("expected explicit review-post confirmation"),
+        };
+        let accept: PickerItem = serde_json::from_value(serde_json::json!({
+            "id": "accept",
+            "label": "Accept",
+        }))
+        .unwrap();
+        assert!(runtime
+            .notify_picker(confirmation, PickerCallback::Selected(accept.clone()))
+            .unwrap());
+        let pending = recv_replay_outbox();
+        assert_eq!(
+            pending.submission_state,
+            Some(crate::replay::ReplayReviewSubmissionState::InFlight),
+        );
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplaySubmitReview { request_id, .. } => request_id,
+            _ => panic!("expected exactly one human-approved review POST"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": false,
+                    "code": "review_submission_uncertain",
+                    "message": "the approved GitHub review may already have been submitted",
+                }),
+            )
+            .await
+            .unwrap();
+        let uncertain = recv_replay_outbox();
+        assert_eq!(
+            uncertain.submission_state,
+            Some(crate::replay::ReplayReviewSubmissionState::Uncertain),
+        );
+
+        runtime.execute_command("ReplayPublish").await.unwrap();
+        let verify = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackConfirmation { handle, title, .. } => {
+                assert_eq!(title, "Verify the original review on GitHub?");
+                handle
+            }
+            _ => panic!("expected explicit read-only provider verification"),
+        };
+        assert!(runtime
+            .notify_picker(verify, PickerCallback::Selected(accept))
+            .unwrap());
+        let checking = recv_replay_outbox();
+        assert!(checking
+            .notice
+            .contains("Checking the exact original review"));
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayReconcileReview {
+                request_id,
+                workspace_id,
+            } => {
+                assert_eq!(workspace_id, "github-workspace-482");
+                request_id
+            }
+            _ => panic!("expected a read-only provider lookup, never another review POST"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "github-workspace-482",
+                    "status": "not_found",
+                    "drafts": checking.drafts,
+                    "receipts": [],
+                    "submission_state": null,
+                }),
+            )
+            .await
+            .unwrap();
+        let released = recv_replay_outbox();
+        assert!(released.notice.contains("no matching submitted review"));
+        assert_eq!(released.submission_state, None);
+        assert_eq!(
+            released.drafts[0].state,
+            crate::replay::ReplayDraftState::Local
+        );
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
