@@ -1205,12 +1205,12 @@ fn original_workspace_previewed(preview: Json) {
     if red::bool(preview.existing, false) {
         verb = "Reopen";
     }
-    let message = verb + " a separate worktree containing the ORIGINAL PR CODE, not your learning scratch.\n\n"
-        + "Repository:\n" + red::string(preview.head_repository, "") + "\n"
-        + "PR branch:\n" + red::string(preview.head_ref, "") + "\n"
-        + "Exact head:\n" + red::string(preview.head_commit, "") + "\n"
+    let message = "ORIGINAL PR CODE · not your learning scratch.\n\n"
+        + "Repository: " + red::string(preview.head_repository, "") + "\n"
+        + "PR branch: " + red::string(preview.head_ref, "") + "\n"
+        + "Original head:\n" + red::string(preview.head_commit, "") + "\n"
         + "Local branch:\n" + red::string(preview.workspace_branch, "") + "\n"
-        + "Selected source:\n" + red::string(preview.source_path, "") + "\n"
+        + "Selected file: " + red::string(preview.source_path, "") + "\n"
         + "Worktree:\n" + red::string(preview.workspace_root, "") + "\n\n"
         + "Current branch and learning scratch: unchanged.\n"
         + "Nothing is saved, committed, or pushed.\n"
