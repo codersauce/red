@@ -1005,6 +1005,7 @@ fn read_open_file(file: std::fs::File, path: &Path) -> anyhow::Result<String> {
 pub struct ProposalToolHost {
     workspace: Arc<Mutex<ProposalWorkspace>>,
     editor_tools: Option<mpsc::Sender<PendingEditorTool>>,
+    read_only_sessions: Arc<Mutex<HashSet<String>>>,
 }
 
 impl ProposalToolHost {
@@ -1014,6 +1015,7 @@ impl ProposalToolHost {
         Self {
             workspace,
             editor_tools: None,
+            read_only_sessions: Arc::default(),
         }
     }
 
@@ -1028,6 +1030,25 @@ impl ProposalToolHost {
     pub fn with_editor_tools(mut self, editor_tools: mpsc::Sender<PendingEditorTool>) -> Self {
         self.editor_tools = Some(editor_tools);
         self
+    }
+
+    #[must_use]
+    /// Enforces read-only access for reviewer-owned Replay Codex sessions.
+    pub fn with_read_only_sessions(mut self, sessions: Arc<Mutex<HashSet<String>>>) -> Self {
+        self.read_only_sessions = sessions;
+        self
+    }
+
+    fn ensure_session_can_mutate(&self, session_id: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self
+                .read_only_sessions
+                .lock()
+                .map_err(|_| anyhow::anyhow!("agent session policy lock is poisoned"))?
+                .contains(session_id),
+            "Replay review sessions cannot stage source edits or change editor state"
+        );
+        Ok(())
     }
 }
 
@@ -1052,6 +1073,7 @@ impl CodexToolHost for ProposalToolHost {
         path: &str,
         content: String,
     ) -> anyhow::Result<serde_json::Value> {
+        self.ensure_session_can_mutate(session_id)?;
         self.workspace
             .lock()
             .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?
@@ -1063,6 +1085,7 @@ impl CodexToolHost for ProposalToolHost {
         &mut self,
         request: EditorToolRequest,
     ) -> anyhow::Result<serde_json::Value> {
+        self.ensure_session_can_mutate(&request.session_id)?;
         let sender = self
             .editor_tools
             .as_ref()
@@ -1315,6 +1338,63 @@ mod tests {
             .send(Ok(serde_json::json!({"ok": true, "file": "main.rs"})))
             .unwrap();
         assert_eq!(task.await.unwrap().unwrap()["file"], "main.rs");
+    }
+
+    #[tokio::test]
+    async fn replay_reviewer_sessions_cannot_stage_source_or_move_the_editor() {
+        let (_temp, workspace, path) = workspace();
+        let sessions = Arc::new(Mutex::new(HashSet::from(["review-session".to_string()])));
+        let (sender, mut requests) = editor_tool_channel(/*capacity*/ 2);
+        let mut host = ProposalToolHost::new(Arc::new(Mutex::new(workspace)))
+            .with_editor_tools(sender)
+            .with_read_only_sessions(sessions);
+
+        let write = host
+            .write_file(
+                "review-session",
+                &path.to_string_lossy(),
+                "malicious replacement\n".to_string(),
+            )
+            .await
+            .expect_err("reviewer sessions must never stage text edits");
+        assert!(write.to_string().contains("cannot stage source edits"));
+
+        let editor = host
+            .editor_tool(EditorToolRequest {
+                session_id: "review-session".to_string(),
+                call: EditorToolCall::GetEditorState {},
+            })
+            .await
+            .expect_err("reviewer sessions must never invoke editor-changing tools");
+        assert!(editor.to_string().contains("cannot stage source edits"));
+        assert!(requests.try_recv().is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "one\ntwo\nthree\n");
+    }
+
+    #[tokio::test]
+    async fn original_author_sessions_can_stage_reviewable_changes_without_writing_disk() {
+        let (_temp, workspace, path) = workspace();
+        let sessions = Arc::new(Mutex::new(HashSet::from(["review-session".to_string()])));
+        let shared = Arc::new(Mutex::new(workspace));
+        let mut host = ProposalToolHost::new(Arc::clone(&shared)).with_read_only_sessions(sessions);
+
+        host.write_file(
+            "author-session",
+            &path.to_string_lossy(),
+            "one\nauthor proposal\nthree\n".to_string(),
+        )
+        .await
+        .expect("verified author sessions may stage normal reviewable proposals");
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\nthree\n");
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap()
+                .read("author-session", &path, None, None)
+                .unwrap(),
+            "one\nauthor proposal\nthree\n",
+        );
     }
 
     #[test]

@@ -40,11 +40,11 @@ pub use review::{
 };
 pub(crate) use session::anchored_hunk_offset;
 pub use session::{
-    ReplayCompletion, ReplayController, ReplayDiffSide, ReplayDraftOrigin, ReplayDraftState,
-    ReplayMode, ReplayNote, ReplayNoteCategory, ReplayRecoverySnapshot, ReplayReviewAnchor,
-    ReplayReviewDraft, ReplayReviewDraftKind, ReplayReviewRole, ReplayReviewState, ReplaySession,
-    ReplaySessionState, ReplayStage, ReplayStep, ReplayStepKind, ReplayStepStatus,
-    ReplayValidation, ReplayWorkspace, ReplayWorkspacePreview,
+    ReplayAgentScope, ReplayCompletion, ReplayController, ReplayDiffSide, ReplayDraftOrigin,
+    ReplayDraftState, ReplayMode, ReplayNote, ReplayNoteCategory, ReplayRecoverySnapshot,
+    ReplayReviewAnchor, ReplayReviewDraft, ReplayReviewDraftKind, ReplayReviewRole,
+    ReplayReviewState, ReplaySession, ReplaySessionState, ReplayStage, ReplayStep, ReplayStepKind,
+    ReplayStepStatus, ReplayValidation, ReplayWorkspace, ReplayWorkspacePreview,
 };
 pub use source::{
     fetch_pull_request_objects, finalize_pull_request, prepare_author_workspace, prepare_workspace,

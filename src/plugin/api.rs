@@ -515,11 +515,14 @@ mod tests {
             ("request", "ReplayResumeReview"),
             ("request", "ReplayAddNote"),
             ("request", "ReplayAddDraft"),
+            ("request", "ReplayAcceptAgentDraft"),
             ("request", "ReplayUpdateDraft"),
             ("request", "ReplayRemoveDraft"),
             ("request", "ReplaySetMode"),
             ("execute", "ReplayFocusStepSource"),
             ("execute", "ReplayToggleZoom"),
+            ("execute", "ReplayAgentStart"),
+            ("execute", "ReplayAgentOpenProposals"),
         ] {
             let call = HOST_API
                 .calls

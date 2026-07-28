@@ -234,6 +234,26 @@ pub enum ReplayReviewDraftKind {
     ReviewSummary,
 }
 
+/// Exact authority and original-source scope granted to one Replay Codex turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayAgentScope {
+    /// Inspect the selected original change without staging source edits.
+    CurrentChange,
+    /// Inspect the complete pinned pull request without staging source edits.
+    PullRequest,
+    /// Propose reviewable edits against the verified original author's worktree.
+    AuthorFix,
+}
+
+impl ReplayAgentScope {
+    /// Whether this turn may stage original-author source proposals.
+    #[must_use]
+    pub const fn permits_source_proposals(self) -> bool {
+        matches!(self, Self::AuthorFix)
+    }
+}
+
 /// Whether a local draft was composed by the reviewer or an approved agent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -920,6 +940,36 @@ impl ReplayController {
         kind: ReplayReviewDraftKind,
         text: &str,
     ) -> Result<ReplayReviewDraft, ReplayError> {
+        self.add_review_draft_with_origin(session_id, step_id, kind, text, ReplayDraftOrigin::Human)
+    }
+
+    /// Records an explicitly accepted agent suggestion as a local-only draft.
+    ///
+    /// Calling this method is the human approval boundary: generated Codex text
+    /// never enters the persisted outbox before the reviewer accepts it.
+    pub fn add_agent_review_draft(
+        &mut self,
+        session_id: &str,
+        step_id: Option<&str>,
+        kind: ReplayReviewDraftKind,
+        text: &str,
+    ) -> Result<ReplayReviewDraft, ReplayError> {
+        if kind == ReplayReviewDraftKind::CodeFix {
+            return Err(ReplayError::InvalidReviewDraft(
+                "agent source fixes must remain reviewable editor proposals".to_string(),
+            ));
+        }
+        self.add_review_draft_with_origin(session_id, step_id, kind, text, ReplayDraftOrigin::Agent)
+    }
+
+    fn add_review_draft_with_origin(
+        &mut self,
+        session_id: &str,
+        step_id: Option<&str>,
+        kind: ReplayReviewDraftKind,
+        text: &str,
+        origin: ReplayDraftOrigin,
+    ) -> Result<ReplayReviewDraft, ReplayError> {
         let text = text.trim();
         if text.is_empty() || text.len() > self.limits.max_note_bytes {
             return Err(ReplayError::InvalidReviewDraft(
@@ -978,7 +1028,7 @@ impl ReplayController {
             step_id: step_id.map(str::to_string),
             path: anchor.as_ref().map(|anchor| anchor.path.clone()),
             kind,
-            origin: ReplayDraftOrigin::Human,
+            origin,
             state: ReplayDraftState::Local,
             anchor,
             text: text.to_string(),
@@ -2250,6 +2300,57 @@ mod tests {
             anchor.hunk_digest,
             controller.session(&session_id).unwrap().steps[0].hunk_digest,
         );
+    }
+
+    #[test]
+    fn accepted_agent_review_drafts_keep_original_provenance_and_human_gate() {
+        let (mut controller, session_id, step_id) = controller_with_session();
+        assert!(controller
+            .session(&session_id)
+            .unwrap()
+            .review
+            .drafts
+            .is_empty());
+
+        let draft = controller
+            .add_agent_review_draft(
+                &session_id,
+                Some(&step_id),
+                ReplayReviewDraftKind::InlineComment,
+                "Could this replacement include a bounded regression test?",
+            )
+            .expect("accept a Codex suggestion only after explicit human approval");
+
+        assert_eq!(draft.origin, ReplayDraftOrigin::Agent);
+        assert_eq!(draft.state, ReplayDraftState::Local);
+        assert_eq!(draft.step_id.as_deref(), Some(step_id.as_str()));
+        assert_eq!(
+            controller.session(&session_id).unwrap().review.drafts.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn agent_drafts_cannot_disguise_source_fixes_as_local_review_outcomes() {
+        let (mut controller, session_id, step_id) =
+            controller_with_pull_request("original-author", Some("original-author"));
+
+        assert!(matches!(
+            controller.add_agent_review_draft(
+                &session_id,
+                Some(&step_id),
+                ReplayReviewDraftKind::CodeFix,
+                "Change the original author worktree.",
+            ),
+            Err(ReplayError::InvalidReviewDraft(message))
+                if message.contains("reviewable editor proposals"),
+        ));
+        assert!(controller
+            .session(&session_id)
+            .unwrap()
+            .review
+            .drafts
+            .is_empty());
     }
 
     #[test]

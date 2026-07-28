@@ -113,6 +113,23 @@ pub fn activate() {
         category: "PR Replay",
         description: "Record a local fix proposal without modifying the original PR branch",
     });
+    red::add_command("ReplayAsk", ask_codex, Json {
+        title: "Ask Codex about the current original change",
+        category: "PR Replay",
+        description: "Generate one reviewable local suggestion without posting or changing source",
+        aliases: ["ask codex about replay", "replay codex"],
+    });
+    red::add_command("ReplayAskScope", ask_codex_scope, Json {
+        title: "Choose the scope of a Replay Codex request",
+        category: "PR Replay",
+        description: "Ask about the selected change, the whole PR, or your verified original PR source",
+        aliases: ["replay codex scope", "ask codex about pull request"],
+    });
+    red::add_command("ReplayCancelCodex", cancel_codex, Json {
+        title: "Cancel the active Replay Codex request",
+        category: "PR Replay",
+        description: "Stop review analysis without changing the source or local outbox",
+    });
     red::add_command("ReplayOriginalWorkspace", open_original_workspace, Json {
         title: "Open the original PR author worktree",
         category: "PR Replay",
@@ -178,6 +195,12 @@ pub fn activate() {
     red::on("panel:event:replay-coach", panel_event);
     red::on("buffer:changed", source_changed);
     red::on("replay:undone", replay_undone);
+    red::on("replay:agent_started", codex_started);
+    red::on("replay:agent_update", codex_updated);
+    red::on("replay:agent_completed", codex_completed);
+    red::on("replay:agent_cancelled", codex_cancelled);
+    red::on("replay:agent_error", codex_failed);
+    red::on("replay:agent_proposals_changed", codex_proposals_changed);
     red::state_set("replay_panel_created", false);
     red::state_set("replay_panel_open", false);
     red::state_set("replay_review_picker", red::null());
@@ -201,6 +224,11 @@ pub fn activate() {
     red::state_set("replay_author_workspace_branch", "");
     red::state_set("replay_pending_author_step_id", "");
     red::state_set("replay_pending_author_preview_digest", "");
+    red::state_set("replay_agent_session_id", "");
+    red::state_set("replay_agent_scope", "");
+    red::state_set("replay_agent_step_id", "");
+    red::state_set("replay_agent_response", "");
+    red::state_set("replay_agent_proposal_kind", "");
     red::state_set("replay_review_path", "");
     red::state_set("replay_title", "");
     red::state_set("replay_index", 0);
@@ -677,6 +705,11 @@ fn load_plan(plan: Json) -> bool {
     red::state_set("replay_author_workspace_branch", "");
     red::state_set("replay_pending_author_step_id", "");
     red::state_set("replay_pending_author_preview_digest", "");
+    red::state_set("replay_agent_session_id", "");
+    red::state_set("replay_agent_scope", "");
+    red::state_set("replay_agent_step_id", "");
+    red::state_set("replay_agent_response", "");
+    red::state_set("replay_agent_proposal_kind", "");
     red::state_set("replay_review_path", "");
     red::state_set("replay_notes", []);
     red::state_set("replay_drafts", []);
@@ -852,6 +885,10 @@ fn panel_event(event: Json) {
         findings();
     } else if action == "c" || action == "comment" {
         open_comment();
+    } else if action == "x" || action == "codex" {
+        ask_codex();
+    } else if action == "X" || action == "codex_scope" {
+        ask_codex_scope();
     } else if action == "F" || action == "fix" {
         open_fix();
     } else if action == "W" || action == "original_workspace" {
@@ -1128,6 +1165,11 @@ fn toggle_help() {
         PickerItem {
             id: "comment",
             label: "NOTES c / r           note / review outbox",
+            data: Json {},
+        },
+        PickerItem {
+            id: "codex",
+            label: "CODEX x / X           ask about change / choose scope",
             data: Json {},
         },
         PickerItem {
@@ -1429,6 +1471,297 @@ fn findings() {
     }
     red::state_set("replay_view", "findings");
     render();
+}
+
+fn ask_codex() {
+    open_codex_prompt("current_change");
+}
+
+fn ask_codex_scope() {
+    if !ensure_workspace() {
+        return;
+    }
+    let items = [
+        PickerItem {
+            id: "current_change",
+            label: "Current change · suggest an original-source review comment",
+            data: Json {},
+        },
+        PickerItem {
+            id: "pull_request",
+            label: "Whole pull request · suggest a private review summary",
+            data: Json {},
+        },
+    ];
+    if author_workspace_available() {
+        items = red::push(items, PickerItem {
+            id: "author_fix",
+            label: "Your original PR · propose reviewable repository-wide fixes",
+            data: Json {},
+        });
+    }
+    red::execute("OpenPicker", "Ask Codex", items, PickerOptions {
+        presentation: "compact",
+        status: "Review comments stay local · source fixes require separate approval",
+    }, PickerHandlers {
+        selected: codex_scope_selected,
+        cancelled: codex_scope_cancelled,
+    });
+}
+
+fn codex_scope_selected(item: PickerItem) {
+    open_codex_prompt(red::string(item.id, "current_change"));
+}
+
+fn codex_scope_cancelled(event: PickerCancelled) {}
+
+fn open_codex_prompt(scope: String) {
+    if !ensure_workspace() {
+        return;
+    }
+    if red::string(red::state("replay_source_kind"), "demo") == "demo" {
+        set_notice("Open an original PR or local review before asking Codex.", "warning");
+        render();
+        return;
+    }
+    if scope == "author_fix" {
+        if !author_workspace_available() {
+            set_notice("Only the verified original PR author can request source fixes.", "warning");
+            render();
+            return;
+        }
+        if red::string(red::state("replay_author_workspace_root"), "") == "" {
+            set_notice("Press W to preview and open your verified original PR worktree first.", "warning");
+            render();
+            return;
+        }
+    }
+
+    let steps = red::state("replay_steps");
+    let index = red::int(red::state("replay_index"), 0);
+    if index < 0 || index >= red::len(steps) {
+        set_notice("Select an original PR change before asking Codex.", "warning");
+        render();
+        return;
+    }
+    red::state_set("replay_agent_scope", scope);
+    red::state_set("replay_agent_step_id", red::string(steps[index].id, ""));
+    let title = "Codex · current change · local suggestion only";
+    if scope == "pull_request" {
+        title = "Codex · whole PR · local review summary only";
+    } else if scope == "author_fix" {
+        title = "Codex · your original PR · preview source changes before applying";
+    }
+    red::execute("OpenComposer", title, "", [], ComposerHandlers {
+        submitted: codex_prompt_submitted,
+        cancelled: codex_prompt_cancelled,
+    });
+}
+
+fn codex_prompt_submitted(value: String) {
+    let prompt = red::trim(value);
+    if prompt == "" {
+        set_notice("Ask a question or describe the original PR fix you want.", "warning");
+        render();
+        return;
+    }
+    let scope = red::string(red::state("replay_agent_scope"), "current_change");
+    red::state_set("replay_agent_session_id", "");
+    red::state_set("replay_agent_response", "");
+    red::state_set("replay_agent_proposal_kind", "");
+    let label = "Codex is reviewing the selected original change…";
+    if scope == "pull_request" {
+        label = "Codex is reviewing the entire original pull request…";
+    } else if scope == "author_fix" {
+        label = "Codex is preparing reviewable original-PR source proposals…";
+    }
+    red::execute("SetTextPanelStatus", "replay-coach", TextPanelStatus {
+        busy: true,
+        label: label,
+        stream: false,
+    });
+    red::execute(
+        "ReplayAgentStart",
+        red::string(red::state("replay_workspace_id"), ""),
+        red::string(red::state("replay_agent_step_id"), ""),
+        scope,
+        prompt
+    );
+}
+
+fn codex_prompt_cancelled(event: ComposerCancelled) {}
+
+fn current_codex_event(event: Json) -> bool {
+    if red::string(event.workspace_id, "")
+        != red::string(red::state("replay_workspace_id"), "") {
+        return false;
+    }
+    let current_session = red::string(red::state("replay_agent_session_id"), "");
+    let event_session = red::string(event.session_id, "");
+    return current_session == "" || event_session == "" || current_session == event_session;
+}
+
+fn codex_started(event: Json) {
+    if !current_codex_event(event) {
+        return;
+    }
+    red::state_set("replay_agent_session_id", red::string(event.session_id, ""));
+    red::state_set("replay_agent_response", "");
+}
+
+fn codex_updated(event: Json) {
+    if !current_codex_event(event) {
+        return;
+    }
+    let response = red::string(red::state("replay_agent_response"), "")
+        + red::string(event.text, "");
+    if red::len(response) > 64000 {
+        response = red::slice(response, 0, 64000);
+    }
+    red::state_set("replay_agent_response", response);
+}
+
+fn codex_completed(event: Json) {
+    if !current_codex_event(event) {
+        return;
+    }
+    red::execute("SetTextPanelStatus", "replay-coach");
+    let scope = red::string(red::state("replay_agent_scope"), "current_change");
+    if scope == "author_fix" {
+        red::request("AgentProposals", codex_source_proposals_ready,
+            red::string(red::state("replay_agent_session_id"), ""));
+        return;
+    }
+
+    let response = red::trim(red::string(red::state("replay_agent_response"), ""));
+    if response == "" {
+        set_notice("Codex completed without suggesting a review comment.", "warning");
+        render();
+        return;
+    }
+    let proposal = red::parse_json(response);
+    let text = red::trim(red::string(proposal.text, response));
+    let kind = red::string(proposal.kind, "");
+    if kind != "inline_comment" && kind != "review_summary" {
+        kind = "inline_comment";
+        if scope == "pull_request" {
+            kind = "review_summary";
+        }
+    }
+    if text == "" {
+        set_notice("Codex returned an empty review suggestion.", "warning");
+        render();
+        return;
+    }
+    red::state_set("replay_agent_proposal_kind", kind);
+    let title = "Codex inline suggestion · submit to keep locally · cancel to discard";
+    if kind == "review_summary" {
+        title = "Codex PR summary · submit to keep locally · cancel to discard";
+    }
+    set_notice("Codex suggestion ready · inspect and explicitly accept before it enters your outbox.", "info");
+    render();
+    red::execute("OpenComposer", title, text, [], ComposerHandlers {
+        submitted: codex_proposal_accepted,
+        cancelled: codex_proposal_discarded,
+    });
+}
+
+fn codex_proposal_accepted(value: String) {
+    let text = red::trim(value);
+    if text == "" {
+        set_notice("An approved Codex review suggestion cannot be empty.", "warning");
+        render();
+        return;
+    }
+    let kind = red::string(red::state("replay_agent_proposal_kind"), "inline_comment");
+    let step_id = red::string(red::state("replay_agent_step_id"), "");
+    if kind == "review_summary" {
+        step_id = "";
+    }
+    red::request(
+        "ReplayAcceptAgentDraft",
+        codex_draft_recorded,
+        red::string(red::state("replay_workspace_id"), ""),
+        step_id,
+        kind,
+        text
+    );
+}
+
+fn codex_draft_recorded(result: Json) {
+    review_draft_recorded(result);
+    if red::bool(result.ok, false) {
+        red::state_set("replay_agent_proposal_kind", "");
+        red::state_set("replay_agent_response", "");
+        set_notice("Codex suggestion approved locally · nothing posted to GitHub.", "success");
+        render();
+    }
+}
+
+fn codex_proposal_discarded(event: ComposerCancelled) {
+    red::state_set("replay_agent_proposal_kind", "");
+    red::state_set("replay_agent_response", "");
+    set_notice("Codex suggestion discarded · your local outbox was unchanged.", "info");
+    render();
+}
+
+fn codex_source_proposals_ready(result: Json) {
+    if result.error != red::null() {
+        set_notice(red::string(result.error, "Codex source proposals could not be inspected."), "error");
+        render();
+        return;
+    }
+    let files = red::len(result.files);
+    if files == 0 {
+        set_notice("Codex finished without proposing any original-PR source changes.", "warning");
+        render();
+        return;
+    }
+    set_notice("Codex proposed " + files + " original PR files · inspect each hunk before applying.", "success");
+    render();
+    red::execute(
+        "ReplayAgentOpenProposals",
+        red::string(red::state("replay_workspace_id"), ""),
+        red::string(red::state("replay_agent_session_id"), "")
+    );
+}
+
+fn codex_proposals_changed(event: Json) {
+    if !current_codex_event(event) {
+        return;
+    }
+    let message = "Codex is staging original PR changes · nothing has been applied.";
+    if red::string(red::state("replay_agent_scope"), "") == "author_fix"
+        && red::string(red::state("replay_notice"), "") != message {
+        set_notice(message, "info");
+        render();
+    }
+}
+
+fn codex_failed(event: Json) {
+    if !current_codex_event(event) {
+        return;
+    }
+    red::execute("SetTextPanelStatus", "replay-coach");
+    set_notice(red::string(event.message, "Codex could not complete this review request."), "error");
+    render();
+}
+
+fn codex_cancelled(event: Json) {
+    if !current_codex_event(event) {
+        return;
+    }
+    red::execute("SetTextPanelStatus", "replay-coach");
+    red::state_set("replay_agent_response", "");
+    set_notice("Codex request cancelled · source and local drafts unchanged.", "info");
+    render();
+}
+
+fn cancel_codex() {
+    let session_id = red::string(red::state("replay_agent_session_id"), "");
+    if session_id != "" {
+        red::execute("AgentCancel", session_id);
+    }
 }
 
 fn open_comment() {

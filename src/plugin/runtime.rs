@@ -632,6 +632,55 @@ impl RedHost {
                     .map_or_else(|| PathBuf::from("."), PathBuf::from);
                 self.send_request(PluginRequest::AgentNewSession { cwd });
             }
+            "ReplayAgentStart" => {
+                let workspace_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayAgentStart requires a workspace id"))?
+                    .to_string();
+                let step_id = args
+                    .get(/*index*/ 1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayAgentStart requires a step id"))?
+                    .to_string();
+                let scope = args
+                    .get(/*index*/ 2)
+                    .map(value_to_json)
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .ok_or_else(|| anyhow::anyhow!("ReplayAgentStart requires a scope"))?;
+                let prompt = args
+                    .get(/*index*/ 3)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayAgentStart requires a prompt"))?
+                    .to_string();
+                self.send_request(PluginRequest::ReplayAgentStart {
+                    workspace_id,
+                    step_id,
+                    scope,
+                    prompt,
+                });
+            }
+            "ReplayAgentOpenProposals" => {
+                let workspace_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ReplayAgentOpenProposals requires a workspace id")
+                    })?
+                    .to_string();
+                let session_id = args
+                    .get(/*index*/ 1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ReplayAgentOpenProposals requires a session id")
+                    })?
+                    .to_string();
+                self.send_request(PluginRequest::ReplayAgentOpenProposals {
+                    workspace_id,
+                    session_id,
+                });
+            }
             "AgentPrompt" => {
                 let session_id = args
                     .first()
@@ -1708,6 +1757,34 @@ impl RedHost {
                     .get(/*index*/ 3)
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("ReplayAddDraft requires draft text"))?
+                    .to_string(),
+            },
+            "ReplayAcceptAgentDraft" => PluginRequest::ReplayAcceptAgentDraft {
+                request_id,
+                workspace_id: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ReplayAcceptAgentDraft requires a workspace id")
+                    })?
+                    .to_string(),
+                step_id: args
+                    .get(/*index*/ 1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayAcceptAgentDraft requires a step id"))?
+                    .to_string(),
+                kind: args
+                    .get(/*index*/ 2)
+                    .map(value_to_json)
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ReplayAcceptAgentDraft requires a draft kind")
+                    })?,
+                text: args
+                    .get(/*index*/ 3)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayAcceptAgentDraft requires draft text"))?
                     .to_string(),
             },
             "ReplayUpdateDraft" => PluginRequest::ReplayUpdateDraft {
@@ -6828,6 +6905,585 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_codex_comments_remain_transient_until_the_human_accepts_them() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_source_backed_replay(&mut runtime).await;
+
+        runtime.execute_command("ReplayAsk").await.unwrap();
+        let prompt = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer { handle, title, .. } => {
+                assert!(title.unwrap().contains("local suggestion only"));
+                handle
+            }
+            _ => panic!("expected a focused Codex review-question composer"),
+        };
+        assert!(runtime
+            .notify_composer(
+                prompt,
+                ComposerCallback::Submitted("Check the viewport bounds.".to_string()),
+            )
+            .unwrap());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: Some(status), .. }
+                if status.busy && status.label.contains("selected original change")
+        ));
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayAgentStart {
+                workspace_id,
+                step_id,
+                scope,
+                prompt,
+            } => {
+                assert_eq!(workspace_id, "real-workspace-1");
+                assert_eq!(step_id, plan.steps[0].id);
+                assert_eq!(scope, crate::replay::ReplayAgentScope::CurrentChange);
+                assert_eq!(prompt, "Check the viewport bounds.");
+            }
+            _ => panic!("expected one isolated read-only Replay Codex request"),
+        }
+
+        let event = serde_json::json!({
+            "workspace_id": "real-workspace-1",
+            "session_id": "codex-review-1",
+            "step_id": plan.steps[0].id,
+            "scope": "current_change",
+        });
+        runtime
+            .notify("replay:agent_started", event.clone())
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "replay:agent_update",
+                serde_json::json!({
+                    "workspace_id": "real-workspace-1",
+                    "session_id": "codex-review-1",
+                    "text": "{\"kind\":\"inline_comment\",\"text\":\"Could the viewport bounds be inclusive?\"}",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime
+            .notify("replay:agent_completed", event)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: None, .. }
+        ));
+        let guide = recv_replay_guide();
+        assert!(guide.drafts.is_empty());
+        assert!(guide.notice.contains("explicitly accept"));
+        let approval = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer {
+                handle,
+                title,
+                query,
+                ..
+            } => {
+                assert!(title.unwrap().contains("Codex inline suggestion"));
+                assert_eq!(query, "Could the viewport bounds be inclusive?");
+                handle
+            }
+            _ => panic!("expected human inspection before an agent draft can exist"),
+        };
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        assert!(runtime
+            .notify_composer(
+                approval,
+                ComposerCallback::Submitted("Please test inclusive viewport bounds.".to_string()),
+            )
+            .unwrap());
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayAcceptAgentDraft {
+                request_id,
+                workspace_id,
+                step_id,
+                kind,
+                text,
+            } => {
+                assert_eq!(workspace_id, "real-workspace-1");
+                assert_eq!(step_id, plan.steps[0].id);
+                assert_eq!(kind, crate::replay::ReplayReviewDraftKind::InlineComment);
+                assert_eq!(text, "Please test inclusive viewport bounds.");
+                request_id
+            }
+            _ => panic!("expected only an explicitly approved, editor-owned local agent draft"),
+        };
+        let mut draft = source_backed_review_draft(
+            &plan,
+            "codex-draft-1",
+            "inline_comment",
+            "Please test inclusive viewport bounds.",
+        );
+        draft["origin"] = serde_json::json!("agent");
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "real-workspace-1",
+                    "draft": draft,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let outbox = recv_replay_outbox();
+        assert_eq!(outbox.drafts.len(), 1);
+        assert_eq!(
+            outbox.drafts[0].origin,
+            crate::replay::ReplayDraftOrigin::Agent
+        );
+        let refreshed = recv_replay_outbox();
+        assert!(refreshed.notice.contains("approved locally"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn discarded_codex_review_suggestions_never_enter_the_outbox() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_source_backed_replay(&mut runtime).await;
+
+        runtime.execute_command("ReplayAsk").await.unwrap();
+        let prompt = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer { handle, .. } => handle,
+            _ => panic!("expected a Codex review question"),
+        };
+        assert!(runtime
+            .notify_composer(
+                prompt,
+                ComposerCallback::Submitted("Review this change.".into())
+            )
+            .unwrap());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { .. }
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ReplayAgentStart { .. }
+        ));
+
+        let identity = serde_json::json!({
+            "workspace_id": "real-workspace-1",
+            "session_id": "codex-review-2",
+            "step_id": plan.steps[0].id,
+            "scope": "current_change",
+        });
+        runtime
+            .notify("replay:agent_started", identity.clone())
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "replay:agent_update",
+                serde_json::json!({
+                    "workspace_id": "real-workspace-1",
+                    "session_id": "codex-review-2",
+                    "text": "{\"kind\":\"inline_comment\",\"text\":\"Possible edge case\"}",
+                }),
+            )
+            .await
+            .unwrap();
+        runtime
+            .notify("replay:agent_completed", identity)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: None, .. }
+        ));
+        assert!(recv_replay_guide().drafts.is_empty());
+        let approval = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer { handle, .. } => handle,
+            _ => panic!("expected the unapproved Codex suggestion"),
+        };
+        assert!(runtime
+            .notify_composer(approval, ComposerCallback::Cancelled)
+            .unwrap());
+
+        let guide = recv_replay_guide();
+        assert!(guide.drafts.is_empty());
+        assert!(guide.notice.contains("discarded"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_codex_scope_hides_author_fixes_from_ordinary_reviewers() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        open_github_replay_for_submission(&mut runtime, "reviewer").await;
+
+        runtime.execute_command("ReplayAskScope").await.unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { title, items, .. } => {
+                assert_eq!(title.as_deref(), Some("Ask Codex"));
+                assert!(items.iter().any(|item| item.id == "current_change"));
+                assert!(items.iter().any(|item| item.id == "pull_request"));
+                assert!(!items.iter().any(|item| item.id == "author_fix"));
+            }
+            _ => panic!("expected scoped read-only Codex choices for a reviewer"),
+        }
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_codex_pr_scope_approves_only_a_pr_level_local_summary() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_github_replay_for_submission(&mut runtime, "reviewer").await;
+
+        runtime.execute_command("ReplayAskScope").await.unwrap();
+        let (picker, pull_request) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, items, .. } => (
+                handle,
+                items
+                    .into_iter()
+                    .find(|item| item.id == "pull_request")
+                    .expect("offer read-only whole-PR analysis"),
+            ),
+            _ => panic!("expected bounded Replay Codex scopes"),
+        };
+        assert!(runtime
+            .notify_picker(picker, PickerCallback::Selected(pull_request))
+            .unwrap());
+        let prompt = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer { handle, title, .. } => {
+                assert!(title.unwrap().contains("whole PR"));
+                handle
+            }
+            _ => panic!("expected a PR-level review question"),
+        };
+        assert!(runtime
+            .notify_composer(
+                prompt,
+                ComposerCallback::Submitted("Summarize correctness and missing tests.".into()),
+            )
+            .unwrap());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus {
+                status: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ReplayAgentStart {
+                scope: crate::replay::ReplayAgentScope::PullRequest,
+                ..
+            }
+        ));
+
+        let event = serde_json::json!({
+            "workspace_id": "github-workspace-482",
+            "session_id": "codex-review-pr",
+            "step_id": plan.steps[0].id,
+            "scope": "pull_request",
+        });
+        runtime
+            .notify("replay:agent_started", event.clone())
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "replay:agent_update",
+                serde_json::json!({
+                    "workspace_id": "github-workspace-482",
+                    "session_id": "codex-review-pr",
+                    "text": "{\"kind\":\"review_summary\",\"text\":\"Please add cross-file regression coverage.\"}",
+                }),
+            )
+            .await
+            .unwrap();
+        runtime
+            .notify("replay:agent_completed", event)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: None, .. }
+        ));
+        assert!(recv_replay_guide().drafts.is_empty());
+        let approval = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer { handle, title, .. } => {
+                assert!(title.unwrap().contains("PR summary"));
+                handle
+            }
+            _ => panic!("expected explicit review of a PR-level Codex suggestion"),
+        };
+        assert!(runtime
+            .notify_composer(
+                approval,
+                ComposerCallback::Submitted("Please add cross-file regression coverage.".into()),
+            )
+            .unwrap());
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayAcceptAgentDraft {
+                workspace_id,
+                step_id,
+                kind,
+                text,
+                ..
+            } => {
+                assert_eq!(workspace_id, "github-workspace-482");
+                assert!(step_id.is_empty());
+                assert_eq!(kind, crate::replay::ReplayReviewDraftKind::ReviewSummary);
+                assert!(text.contains("cross-file regression"));
+            }
+            _ => panic!("expected an explicitly approved PR-level local summary"),
+        }
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_codex_author_fixes_require_the_explicit_verified_original_worktree() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        open_github_replay_for_submission(&mut runtime, "author").await;
+
+        runtime.execute_command("ReplayAskScope").await.unwrap();
+        let (picker, item) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, items, .. } => (
+                handle,
+                items
+                    .into_iter()
+                    .find(|item| item.id == "author_fix")
+                    .expect("the verified author may request an original-PR fix"),
+            ),
+            _ => panic!("expected an author-aware Codex scope picker"),
+        };
+        assert!(runtime
+            .notify_picker(picker, PickerCallback::Selected(item))
+            .unwrap());
+
+        let guide = recv_replay_guide();
+        assert!(guide.notice.contains("Press W"));
+        assert!(guide.author_workspace_root.is_empty());
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_codex_author_fixes_open_reviewable_proposals_without_a_chat_pane() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_github_replay_for_submission(&mut runtime, "author").await;
+
+        runtime
+            .execute_command("ReplayOriginalWorkspace")
+            .await
+            .unwrap();
+        let preview_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayPrepareAuthorWorkspace {
+                request_id,
+                confirmed: false,
+                ..
+            } => request_id,
+            _ => panic!("expected a non-mutating original-author worktree preview"),
+        };
+        runtime
+            .resolve_request(
+                preview_request,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "github-workspace-482",
+                    "step_id": plan.steps[0].id,
+                    "source_path": plan.steps[0].path,
+                    "workspace_root": "/workspace/repository.replay-author-pr-482-bbbbbbb",
+                    "workspace_branch": "replay/author/pr-482-bbbbbbb",
+                    "head_repository": "github.com/original-author/forked-replay",
+                    "head_ref": "feature/viewport-diagnostics",
+                    "head_commit": "b".repeat(40),
+                    "viewer": "original-author",
+                    "existing": false,
+                    "preview_digest": "a".repeat(64),
+                }),
+            )
+            .await
+            .unwrap();
+        let confirmation = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackConfirmation { handle, .. } => handle,
+            _ => panic!("expected separate human authorization for the original PR worktree"),
+        };
+        assert!(runtime
+            .notify_picker(
+                confirmation,
+                PickerCallback::Selected(
+                    serde_json::from_value(serde_json::json!({
+                        "id": "accept",
+                        "label": "Accept",
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .unwrap());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus {
+                status: Some(_),
+                ..
+            }
+        ));
+        let creation_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayPrepareAuthorWorkspace {
+                request_id,
+                confirmed: true,
+                ..
+            } => request_id,
+            _ => panic!("expected only the digest-confirmed original author worktree"),
+        };
+        runtime
+            .resolve_request(
+                creation_request,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "github-workspace-482",
+                    "workspace_root": "/workspace/repository.replay-author-pr-482-bbbbbbb",
+                    "workspace_branch": "replay/author/pr-482-bbbbbbb",
+                    "head_repository": "github.com/original-author/forked-replay",
+                    "head_ref": "feature/viewport-diagnostics",
+                    "head_commit": "b".repeat(40),
+                    "requested_source_path": "src/editor/rendering.rs",
+                    "source_path": "/workspace/repository.replay-author-pr-482-bbbbbbb/src/editor/rendering.rs",
+                    "used_fallback": false,
+                    "created": true,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: None, .. }
+        ));
+        assert!(!recv_replay_guide().author_workspace_root.is_empty());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusEditor
+        ));
+
+        runtime.execute_command("ReplayAskScope").await.unwrap();
+        let (picker, author_fix) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { handle, items, .. } => (
+                handle,
+                items
+                    .into_iter()
+                    .find(|item| item.id == "author_fix")
+                    .expect("offer source proposals only to the verified original author"),
+            ),
+            _ => panic!("expected a scope picker without a second chat pane"),
+        };
+        assert!(runtime
+            .notify_picker(picker, PickerCallback::Selected(author_fix))
+            .unwrap());
+        let prompt = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackComposer { handle, title, .. } => {
+                assert!(title.unwrap().contains("your original PR"));
+                handle
+            }
+            _ => panic!("expected a verified original-source Codex fix request"),
+        };
+        assert!(runtime
+            .notify_composer(
+                prompt,
+                ComposerCallback::Submitted("Fix this across every affected module.".into()),
+            )
+            .unwrap());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: Some(status), .. }
+                if status.busy && status.label.contains("original-PR source proposals")
+        ));
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayAgentStart {
+                workspace_id,
+                step_id,
+                scope,
+                prompt,
+            } => {
+                assert_eq!(workspace_id, "github-workspace-482");
+                assert_eq!(step_id, plan.steps[0].id);
+                assert_eq!(scope, crate::replay::ReplayAgentScope::AuthorFix);
+                assert!(prompt.contains("every affected module"));
+            }
+            _ => panic!("expected only the verified original-author Codex worker"),
+        }
+
+        let event = serde_json::json!({
+            "workspace_id": "github-workspace-482",
+            "session_id": "codex-author-1",
+            "scope": "author_fix",
+        });
+        runtime
+            .notify("replay:agent_started", event.clone())
+            .await
+            .unwrap();
+        runtime
+            .notify("replay:agent_completed", event)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: None, .. }
+        ));
+        let proposal_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AgentProposals {
+                request_id,
+                session_id,
+            } => {
+                assert_eq!(session_id, "codex-author-1");
+                request_id
+            }
+            _ => panic!("expected staged original-PR source proposals before any edit"),
+        };
+        runtime
+            .resolve_request(
+                proposal_request,
+                serde_json::json!({
+                    "files": [{
+                        "session_id": "codex-author-1",
+                        "path": "/workspace/repository.replay-author-pr-482-bbbbbbb/src/editor/rendering.rs",
+                        "conflict": false,
+                        "hunks": [{
+                            "id": "safe-hunk-1",
+                            "old_start": 8,
+                            "old_end": 10,
+                            "old_text": "old()",
+                            "new_text": "bounded()",
+                        }],
+                    }],
+                }),
+            )
+            .await
+            .unwrap();
+        let guide = recv_replay_guide();
+        assert!(guide.notice.contains("inspect each hunk"));
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayAgentOpenProposals {
+                workspace_id,
+                session_id,
+            } => {
+                assert_eq!(workspace_id, "github-workspace-482");
+                assert_eq!(session_id, "codex-author-1");
+            }
+            _ => panic!("expected an isolated source-proposal review, never a chat pane or write"),
+        }
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
     async fn github_review_publishing_previews_the_exact_outcome_before_any_remote_action() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -10981,6 +11637,42 @@ mod tests {
             } if session_id == "archived-session" && path == Path::new("/workspace/recovered.rs")
         ));
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_author_proposal_review_reuses_the_approval_surface_without_opening_chat() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        runtime
+            .notify(
+                "agent:replay_review_requested",
+                serde_json::json!({
+                    "workspace_id": "github-workspace-482",
+                    "session_id": "codex-author-1",
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::OpenWorkspace { id, .. } if id == "agent-review"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::AgentProposals { session_id, .. }
+                if session_id == "codex-author-1"
+        ));
+        assert!(
+            ACTION_DISPATCHER.try_recv_request().is_none(),
+            "a dedicated author-fix preview must not create the generic conversation pane",
+        );
     }
 
     #[tokio::test]

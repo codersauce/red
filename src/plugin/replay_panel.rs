@@ -19,9 +19,9 @@ use super::{
 use crate::{
     editor::{render_buffer::RenderBuffer, Point},
     replay::{
-        parse_patch, GitObjectId, ReplayDemoStep, ReplayDraftState, ReplayLimits,
-        ReplayReceiptVerification, ReplayReviewDraft, ReplayReviewDraftKind, ReplayReviewReceipt,
-        ReplayReviewRole, ReplayReviewSubmissionState,
+        parse_patch, GitObjectId, ReplayDemoStep, ReplayDraftOrigin, ReplayDraftState,
+        ReplayLimits, ReplayReceiptVerification, ReplayReviewDraft, ReplayReviewDraftKind,
+        ReplayReviewReceipt, ReplayReviewRole, ReplayReviewSubmissionState,
     },
     theme::{SelectionForegroundPriority, Style, Theme},
     ui::{ActionBar, ActionBarRole, ActionPriority, UiAction},
@@ -1516,9 +1516,9 @@ fn replay_outbox_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
 
     if model.drafts.is_empty() {
         let message = if model.verified_review_role() == Some(ReplayReviewRole::Author) {
-            "No review drafts yet. Use c for a comment, s for a summary, or F for a proposed fix."
+            "No review drafts yet. Use c for a comment, x for Codex, or F for a proposed fix."
         } else {
-            "No review drafts yet. Use c for a comment or s for a review summary."
+            "No review drafts yet. Use c for a comment, x for Codex, or s for a summary."
         };
         lines.extend(wrap_plain_text(
             message,
@@ -1539,7 +1539,12 @@ fn replay_outbox_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
             ReplayReviewDraftKind::CodeFix => "PROPOSED PR FIX",
             ReplayReviewDraftKind::ReviewSummary => "REVIEW SUMMARY",
         };
-        let label = format!("{marker} {kind}");
+        let origin = if draft.origin == ReplayDraftOrigin::Agent {
+            "◆ "
+        } else {
+            ""
+        };
+        let label = format!("{marker} {origin}{kind}");
         let publication = if draft.state == ReplayDraftState::Submitted {
             "POSTED"
         } else {
@@ -2113,8 +2118,8 @@ fn replay_action_group(actions: &[UiAction], key: &str) -> Option<ReplayActionGr
             ReplayActionGroup::Navigation
         }
         "edit" | "undo" | "apply" | "edit_draft" | "discard_draft" => ReplayActionGroup::Editing,
-        "validate" | "comment" | "outbox" | "summary" | "save_review" | "publish_review"
-        | "load_review" | "fix" => ReplayActionGroup::Review,
+        "validate" | "codex" | "comment" | "outbox" | "summary" | "save_review"
+        | "publish_review" | "load_review" | "fix" => ReplayActionGroup::Review,
         _ => ReplayActionGroup::Utility,
     })
 }
@@ -2436,7 +2441,7 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
         UiAction::new(
             "apply",
             "a",
-            if width >= 90 { "Apply hunk" } else { "Apply" },
+            if width >= 120 { "Apply hunk" } else { "Apply" },
         )
         .with_priority(if review_complete {
             ActionPriority::Primary
@@ -2447,7 +2452,7 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
         UiAction::new(
             "validate",
             "v",
-            if width >= 90 { "Validate" } else { "Check" },
+            if width >= 120 { "Validate" } else { "Check" },
         )
         .with_priority(if review_complete {
             ActionPriority::Secondary
@@ -2460,6 +2465,15 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
     ]);
 
     if model.verified_review_role().is_some() {
+        actions.push(
+            UiAction::new("codex", "x", "AI")
+                .with_priority(if width >= 90 {
+                    ActionPriority::Essential
+                } else {
+                    ActionPriority::Primary
+                })
+                .with_compact_label("AI"),
+        );
         actions.push(
             UiAction::new("comment", "c", "Note")
                 .with_priority(if review_complete {
@@ -2495,13 +2509,17 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
 
     if model.author_workspace_available && model.verified_review_role().is_some() {
         actions.push(
-            UiAction::new("original_workspace", "W", "Worktree")
-                .with_priority(if width >= 72 {
-                    ActionPriority::Essential
-                } else {
-                    ActionPriority::Secondary
-                })
-                .with_compact_label("Worktree"),
+            UiAction::new(
+                "original_workspace",
+                "W",
+                if width >= 120 { "Worktree" } else { "Head" },
+            )
+            .with_priority(if width >= 72 {
+                ActionPriority::Essential
+            } else {
+                ActionPriority::Secondary
+            })
+            .with_compact_label("Worktree"),
         );
     }
 
@@ -2531,6 +2549,7 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
                 [
                     "next_unreviewed",
                     "original_workspace",
+                    "codex",
                     "comment",
                     "navigate_file",
                     "navigate",
@@ -3645,7 +3664,7 @@ mod tests {
 
         assert_eq!(
             keys,
-            ["j/k", "h/l", "i", "u", "a", "v", "c", "r", "W", "z", "?"],
+            ["j/k", "h/l", "i", "u", "a", "v", "x", "c", "r", "W", "z", "?",],
             "navigation, editing, review, and utility actions must stay grouped: {}",
             layout.text(),
         );
@@ -4651,6 +4670,34 @@ mod tests {
             .any(|row| row.contains("Review draft 7")));
         assert_eq!(top_rows[height - 1], scrolled_rows[height - 1]);
         assert!(scrolled_rows[height - 1].contains("r "));
+    }
+
+    #[test]
+    fn native_outbox_distinguishes_human_approved_codex_review_drafts() {
+        let mut replay = model();
+        replay.review_role = Some(ReplayReviewRole::Reviewer);
+        replay.head_commit = "b".repeat(40);
+        replay.view = ReplayPanelView::Outbox;
+        let mut agent = outbox_draft(
+            ReplayReviewDraftKind::InlineComment,
+            "Please add a regression test for the bounded viewport.",
+        );
+        agent.origin = ReplayDraftOrigin::Agent;
+        replay.drafts = vec![agent];
+        replay.draft_count = 1;
+        let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+        let rows = replay_outbox_lines(&state, /*width*/ 58)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.text)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(rows.iter().any(|row| row.contains("▶ ◆ INLINE COMMENT")));
+        assert!(rows.iter().any(|row| row.contains("LOCAL")));
     }
 
     #[test]

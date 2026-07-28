@@ -148,6 +148,26 @@ the specified local draft. All draft mutations advance recoverable editor
 state, enforce bounded reviewer text, and reject foreign or stale original
 hunks.
 
+`ReplayAgentStart(workspace_id, step_id, scope, prompt)` starts an isolated
+Codex turn owned by the exact Replay session. The `current_change` and
+`pull_request` scopes are enforced as read-only: their dynamic-tool host
+rejects source proposals and editor mutations, and generated text remains a
+transient suggestion. Only the reviewer's explicit acceptance may call
+`ReplayAcceptAgentDraft(callback, workspace_id, step_id, kind, text)`, which
+creates an original-source-anchored local draft marked with `agent` provenance.
+PR-level summaries pass an empty step identity. Agent-generated source fixes
+cannot enter the comment outbox.
+
+The `author_fix` scope is available only to the verified original GitHub PR
+author after the exact, separately confirmed original-head worktree has been
+opened. Codex may inspect the whole repository and stage normal reviewable
+source proposals in that worktree, but it cannot write source files directly.
+`ReplayAgentOpenProposals(workspace_id, session_id)` verifies the same original
+head and opens Red's existing per-hunk agent approval surface without creating
+a conversation pane. Accepting a hunk creates an ordinary undoable editor
+transaction; saving, committing, pushing, and GitHub review submission never
+happen automatically.
+
 `ReplaySetMode(callback, workspace_id, mode)` records the selected Challenge or
 Snippet mode in the same editor-owned session. These additive calls belong to
 the unreleased source-backed `0.5.1` contract.
@@ -159,9 +179,10 @@ editor sends `replay:undone` with the original workspace and step identities,
 allowing the coach to distinguish restored source from a new manual edit. No
 Replay host call automatically
 saves, commits, pushes, posts a comment, creates a GitHub pending review, or
-submits a GitHub review. Explicit cross-computer draft saving, GitHub review
-publication, approved author-branch fixes, and agent-generated proposals are
-separate future operations, not implicit effects of the local outbox.
+submits a GitHub review. Cross-computer draft saving, GitHub review publication,
+and agent-generated suggestions each have their own explicit human approval
+boundary; committing or pushing an original author worktree is never an
+implicit effect of the local outbox or proposal acceptance.
 
 Plugins requiring these additive source-backed calls should declare
 `"red_api_version": "^0.5.1"`.

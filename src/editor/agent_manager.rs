@@ -7,8 +7,21 @@ use std::{
 };
 
 use crate::{
-    agent_tools::PendingEditorTool, agent_workspace::ProposalWorkspace, codex::CodexBridge,
+    agent_tools::PendingEditorTool,
+    agent_workspace::ProposalWorkspace,
+    codex::CodexBridge,
+    replay::{GitObjectId, ReplayAgentScope},
 };
+
+/// Editor-verified provenance and authority for a dedicated Replay Codex turn.
+#[derive(Debug, Clone)]
+pub struct ReplayAgentSession {
+    pub workspace_id: String,
+    pub step_id: String,
+    pub scope: ReplayAgentScope,
+    pub prompt: String,
+    pub target_commit: GitObjectId,
+}
 
 /// Encapsulates background AI agent task state, active turn metrics, and tool channels.
 #[derive(Default)]
@@ -19,6 +32,10 @@ pub struct AgentManager {
     tool_requests: Option<tokio::sync::mpsc::Receiver<PendingEditorTool>>,
     active_sessions: HashSet<String>,
     turn_started_at: HashMap<String, Instant>,
+    pending_replay_session: Option<ReplayAgentSession>,
+    replay_sessions: HashMap<String, ReplayAgentSession>,
+    general_sessions: HashSet<String>,
+    read_only_sessions: Arc<Mutex<HashSet<String>>>,
 }
 
 impl AgentManager {
@@ -106,6 +123,89 @@ impl AgentManager {
         self.active_sessions.clear();
     }
 
+    /// Marks the next created Codex session as owned exclusively by Replay.
+    pub fn begin_replay_session(&mut self, session: ReplayAgentSession) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.pending_replay_session.is_none(),
+            "another Replay Codex request is already starting"
+        );
+        self.pending_replay_session = Some(session);
+        Ok(())
+    }
+
+    /// Takes a pending Replay request when the app-server creates its session.
+    pub fn take_pending_replay_session(&mut self) -> Option<ReplayAgentSession> {
+        self.pending_replay_session.take()
+    }
+
+    /// Returns whether an app-server setup failure belongs to Replay.
+    pub fn has_pending_replay_session(&self) -> bool {
+        self.pending_replay_session.is_some()
+    }
+
+    /// Registers an isolated Replay session and its enforced source-write policy.
+    pub fn register_replay_session(
+        &mut self,
+        session_id: String,
+        session: ReplayAgentSession,
+    ) -> anyhow::Result<()> {
+        if !session.scope.permits_source_proposals() {
+            self.read_only_sessions
+                .lock()
+                .map_err(|_| anyhow::anyhow!("agent session policy lock is poisoned"))?
+                .insert(session_id.clone());
+        }
+        self.replay_sessions.insert(session_id, session);
+        Ok(())
+    }
+
+    /// Registers an ordinary conversation without granting Replay ownership.
+    pub fn register_general_session(&mut self, session_id: String) {
+        self.general_sessions.insert(session_id);
+    }
+
+    /// Returns the verified Replay identity associated with a Codex session.
+    pub fn replay_session(&self, session_id: &str) -> Option<&ReplayAgentSession> {
+        self.replay_sessions.get(session_id)
+    }
+
+    /// Returns isolated Replay sessions that must hear about worker shutdown.
+    pub fn replay_sessions(&self) -> Vec<(String, ReplayAgentSession)> {
+        self.replay_sessions
+            .iter()
+            .map(|(session_id, session)| (session_id.clone(), session.clone()))
+            .collect()
+    }
+
+    /// Returns whether changing proposal roots would displace an ordinary agent.
+    pub fn has_general_sessions(&self) -> bool {
+        !self.general_sessions.is_empty()
+    }
+
+    /// Shares the enforced reviewer-session policy with the Codex tool host.
+    pub fn read_only_sessions(&self) -> Arc<Mutex<HashSet<String>>> {
+        Arc::clone(&self.read_only_sessions)
+    }
+
+    /// Drops ownership and access policy after the underlying worker stops.
+    pub fn clear_session_ownership(&mut self) {
+        self.pending_replay_session = None;
+        self.replay_sessions.clear();
+        self.general_sessions.clear();
+        if let Ok(mut sessions) = self.read_only_sessions.lock() {
+            sessions.clear();
+        }
+    }
+
+    /// Stops tracking one explicitly closed Codex session.
+    pub fn forget_session(&mut self, session_id: &str) {
+        self.replay_sessions.remove(session_id);
+        self.general_sessions.remove(session_id);
+        if let Ok(mut sessions) = self.read_only_sessions.lock() {
+            sessions.remove(session_id);
+        }
+    }
+
     /// Records turn start timestamp for turn duration metrics.
     pub fn record_turn_start(&mut self, turn_id: impl Into<String>) {
         self.turn_started_at.insert(turn_id.into(), Instant::now());
@@ -129,7 +229,8 @@ impl AgentManager {
 
 #[cfg(test)]
 mod tests {
-    use super::AgentManager;
+    use super::{AgentManager, ReplayAgentSession};
+    use crate::replay::{GitObjectId, ReplayAgentScope};
 
     #[test]
     fn owns_session_and_turn_lifecycle() {
@@ -142,5 +243,67 @@ mod tests {
 
         manager.mark_session_inactive("session-1");
         assert!(!manager.is_session_active("session-1"));
+    }
+
+    #[test]
+    fn replay_reviewer_ownership_enforces_read_only_session_policy() {
+        let mut manager = AgentManager::new();
+        let session = ReplayAgentSession {
+            workspace_id: "review-1".to_string(),
+            step_id: "step-1".to_string(),
+            scope: ReplayAgentScope::CurrentChange,
+            prompt: "Check the boundary.".to_string(),
+            target_commit: GitObjectId::parse(&"a".repeat(40)).unwrap(),
+        };
+        manager.begin_replay_session(session.clone()).unwrap();
+        assert!(manager.has_pending_replay_session());
+        assert!(manager.begin_replay_session(session).is_err());
+
+        let session = manager.take_pending_replay_session().unwrap();
+        manager
+            .register_replay_session("codex-review-1".to_string(), session)
+            .unwrap();
+        assert_eq!(
+            manager
+                .replay_session("codex-review-1")
+                .unwrap()
+                .workspace_id,
+            "review-1",
+        );
+        assert!(manager
+            .read_only_sessions()
+            .lock()
+            .unwrap()
+            .contains("codex-review-1"));
+
+        manager.forget_session("codex-review-1");
+        assert!(!manager
+            .read_only_sessions()
+            .lock()
+            .unwrap()
+            .contains("codex-review-1"));
+    }
+
+    #[test]
+    fn original_author_sessions_can_stage_source_proposals() {
+        let mut manager = AgentManager::new();
+        manager
+            .register_replay_session(
+                "codex-author-1".to_string(),
+                ReplayAgentSession {
+                    workspace_id: "review-1".to_string(),
+                    step_id: "step-1".to_string(),
+                    scope: ReplayAgentScope::AuthorFix,
+                    prompt: "Fix this across the repository.".to_string(),
+                    target_commit: GitObjectId::parse(&"a".repeat(40)).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert!(!manager
+            .read_only_sessions()
+            .lock()
+            .unwrap()
+            .contains("codex-author-1"));
     }
 }
