@@ -4,7 +4,12 @@ use std::{
     ffi::OsStr,
     io::Write as _,
     path::{Component, Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Command, ExitStatus, Output, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -18,6 +23,8 @@ use super::{
 const GITHUB_METADATA_FIELDS: &str = "number,url,title,body,author,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,commits,changedFiles";
 const GITHUB_CAPABILITIES_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { viewer { login } repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { number author { login } headRefName headRefOid headRepository { nameWithOwner viewerPermission } } } }";
 const MAX_COMMAND_DIAGNOSTIC_BYTES: usize = 4 * 1024;
+const MAX_COMMAND_DURATION: Duration = Duration::from_secs(45);
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Validated, immutable SHA-1 or SHA-256 Git object identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1163,11 +1170,11 @@ pub fn prepare_author_workspace(
     }
 
     let branch_reference = format!("refs/heads/{}", preview.branch);
-    let branch_exists = replay_git_command(&source.repository.root)
+    let mut branch_command = replay_git_command(&source.repository.root);
+    branch_command
         .args(["show-ref", "--verify", "--quiet"])
-        .arg(&branch_reference)
-        .stdin(Stdio::null())
-        .status()
+        .arg(&branch_reference);
+    let branch_exists = run_command_status(&mut branch_command)
         .map_err(|error| ReplayError::Filesystem(error.to_string()))?
         .success();
     if branch_exists
@@ -1269,16 +1276,9 @@ fn author_head_is_ancestor(
     head: &GitObjectId,
     descendant: &str,
 ) -> Result<bool, ReplayError> {
-    let status = replay_git_command(root)
-        .args(["merge-base", "--is-ancestor", head.as_str(), descendant])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|error| ReplayError::CommandFailed {
-            program: "git".to_string(),
-            message: error.to_string(),
-        })?;
+    let mut command = replay_git_command(root);
+    command.args(["merge-base", "--is-ancestor", head.as_str(), descendant]);
+    let status = run_command_status(&mut command)?;
     match status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
@@ -1322,11 +1322,11 @@ pub fn prepare_workspace(
         let workspace = existing_workspace(source, &root, &branch)?;
         return Ok((preview, Some(workspace)));
     }
-    let branch_exists = replay_git_command(&source.repository.root)
+    let mut branch_command = replay_git_command(&source.repository.root);
+    branch_command
         .args(["show-ref", "--verify", "--quiet"])
-        .arg(format!("refs/heads/{branch}"))
-        .stdin(Stdio::null())
-        .status()
+        .arg(format!("refs/heads/{branch}"));
+    let branch_exists = run_command_status(&mut branch_command)
         .map_err(|error| ReplayError::Filesystem(error.to_string()))?
         .success();
     if branch_exists
@@ -1530,18 +1530,11 @@ fn git_object(root: &Path, reference: &str) -> Result<GitObjectId, ReplayError> 
 }
 
 fn has_git_commit(root: &Path, object: &GitObjectId) -> Result<bool, ReplayError> {
-    replay_git_command(root)
+    let mut command = replay_git_command(root);
+    command
         .args(["cat-file", "-e"])
-        .arg(format!("{}^{{commit}}", object.as_str()))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .map_err(|error| ReplayError::CommandFailed {
-            program: "git".to_string(),
-            message: error.to_string(),
-        })
+        .arg(format!("{}^{{commit}}", object.as_str()));
+    run_command_status(&mut command).map(|status| status.success())
 }
 
 /// Build an isolated Git command without depending on a repository fsmonitor daemon.
@@ -1567,17 +1560,47 @@ fn git_text(root: &Path, args: &[&str], limit: usize) -> Result<String, ReplayEr
     })
 }
 
-fn run_command(command: &mut Command, limit: usize) -> Result<Vec<u8>, ReplayError> {
+pub(super) fn run_command(command: &mut Command, limit: usize) -> Result<Vec<u8>, ReplayError> {
+    run_command_with_deadline(command, limit, MAX_COMMAND_DURATION)
+}
+
+fn run_command_with_deadline(
+    command: &mut Command,
+    limit: usize,
+    timeout: Duration,
+) -> Result<Vec<u8>, ReplayError> {
     let program = command.get_program().to_string_lossy().into_owned();
-    let output = command
-        .stdin(Stdio::null())
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .map_err(|error| ReplayError::CommandFailed {
-            program: program.clone(),
-            message: error.to_string(),
-        })?;
+    let output = run_bounded_command(command, None, limit, timeout)
+        .map_err(ReplayCommandFailure::into_error)?;
     bounded_command_output(program, output, limit)
+}
+
+fn run_command_status(command: &mut Command) -> Result<ExitStatus, ReplayError> {
+    run_bounded_command(
+        command,
+        None,
+        MAX_COMMAND_DIAGNOSTIC_BYTES,
+        MAX_COMMAND_DURATION,
+    )
+    .map(|output| output.status)
+    .map_err(ReplayCommandFailure::into_error)
+}
+
+/// Whether a provider command failed before or after its request could be sent.
+#[derive(Debug)]
+pub(super) enum ReplayCommandFailure {
+    /// The executable never received a complete request body.
+    NotStarted(ReplayError),
+    /// A complete request was provided and GitHub may have observed it.
+    PossiblyExecuted(ReplayError),
+}
+
+impl ReplayCommandFailure {
+    fn into_error(self) -> ReplayError {
+        match self {
+            Self::NotStarted(error) | Self::PossiblyExecuted(error) => error,
+        }
+    }
 }
 
 /// Runs one bounded command with an explicitly supplied, noninteractive body.
@@ -1585,48 +1608,242 @@ pub(super) fn run_command_with_input(
     command: &mut Command,
     input: &[u8],
     limit: usize,
-) -> Result<Vec<u8>, ReplayError> {
+) -> Result<Vec<u8>, ReplayCommandFailure> {
     if input.len() > limit {
-        return Err(ReplayError::LimitExceeded {
-            kind: "GitHub review submission",
-            limit,
-        });
+        return Err(ReplayCommandFailure::NotStarted(
+            ReplayError::LimitExceeded {
+                kind: "GitHub review submission",
+                limit,
+            },
+        ));
     }
 
     let program = command.get_program().to_string_lossy().into_owned();
+    let output = run_bounded_command(command, Some(input), limit, MAX_COMMAND_DURATION)?;
+    bounded_command_output(program, output, limit).map_err(ReplayCommandFailure::PossiblyExecuted)
+}
+
+fn run_bounded_command(
+    command: &mut Command,
+    input: Option<&[u8]>,
+    limit: usize,
+    timeout: Duration,
+) -> Result<Output, ReplayCommandFailure> {
+    let program = command.get_program().to_string_lossy().into_owned();
     let mut child = command
-        .stdin(Stdio::piped())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("GIT_TERMINAL_PROMPT", "0")
         .spawn()
-        .map_err(|error| ReplayError::CommandFailed {
-            program: program.clone(),
-            message: error.to_string(),
+        .map_err(|error| {
+            ReplayCommandFailure::NotStarted(ReplayError::CommandFailed {
+                program: program.clone(),
+                message: error.to_string(),
+            })
         })?;
-    let write_result = child
-        .stdin
-        .take()
-        .ok_or_else(|| ReplayError::CommandFailed {
-            program: program.clone(),
-            message: "could not open the GitHub review request body".to_string(),
-        })?
-        .write_all(input);
-    if let Err(error) = write_result {
+    let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(ReplayError::CommandFailed {
-            program,
-            message: format!("could not send the GitHub review request body: {error}"),
-        });
+        return Err(ReplayCommandFailure::NotStarted(
+            ReplayError::CommandFailed {
+                program,
+                message: "could not capture the bounded command output".to_string(),
+            },
+        ));
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(ReplayCommandFailure::NotStarted(
+            ReplayError::CommandFailed {
+                program,
+                message: "could not capture the bounded command diagnostic".to_string(),
+            },
+        ));
+    };
+
+    let overflowed = Arc::new(AtomicBool::new(false));
+    let stdout_overflowed = Arc::clone(&overflowed);
+    let stdout_reader =
+        std::thread::spawn(move || capture_command_output(stdout, limit, Some(stdout_overflowed)));
+    let stderr_reader = std::thread::spawn(move || {
+        capture_command_output(stderr, MAX_COMMAND_DIAGNOSTIC_BYTES, None)
+    });
+
+    let request_written = Arc::new(AtomicBool::new(input.is_none()));
+    let input_writer = if let Some(input) = input {
+        let Some(mut stdin) = child.stdin.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ReplayCommandFailure::NotStarted(
+                ReplayError::CommandFailed {
+                    program,
+                    message: "could not open the GitHub review request body".to_string(),
+                },
+            ));
+        };
+        let contents = input.to_vec();
+        let written = Arc::clone(&request_written);
+        Some(std::thread::spawn(move || {
+            let result = stdin.write_all(&contents);
+            if result.is_ok() {
+                written.store(true, Ordering::Release);
+            }
+            result
+        }))
+    } else {
+        None
+    };
+
+    let started_at = Instant::now();
+    let status = loop {
+        if overflowed.load(Ordering::Acquire) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ReplayCommandFailure::PossiblyExecuted(
+                ReplayError::LimitExceeded {
+                    kind: "source command output",
+                    limit,
+                },
+            ));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started_at.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let error = ReplayError::CommandFailed {
+                    program,
+                    message: format!(
+                        "command timed out after {} ms and was cancelled",
+                        timeout.as_millis()
+                    ),
+                };
+                return Err(if request_written.load(Ordering::Acquire) {
+                    ReplayCommandFailure::PossiblyExecuted(error)
+                } else {
+                    ReplayCommandFailure::NotStarted(error)
+                });
+            }
+            Ok(None) => std::thread::sleep(COMMAND_POLL_INTERVAL),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ReplayCommandFailure::PossiblyExecuted(
+                    ReplayError::CommandFailed {
+                        program,
+                        message: error.to_string(),
+                    },
+                ));
+            }
+        }
+    };
+
+    if let Some(writer) = input_writer {
+        match writer.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(ReplayCommandFailure::NotStarted(
+                    ReplayError::CommandFailed {
+                        program,
+                        message: format!("could not send the GitHub review request body: {error}"),
+                    },
+                ));
+            }
+            Err(_) => {
+                return Err(ReplayCommandFailure::NotStarted(
+                    ReplayError::CommandFailed {
+                        program,
+                        message: "the GitHub review request writer stopped unexpectedly"
+                            .to_string(),
+                    },
+                ));
+            }
+        }
     }
-    let output = child
-        .wait_with_output()
-        .map_err(|error| ReplayError::CommandFailed {
-            program: program.clone(),
-            message: error.to_string(),
-        })?;
-    bounded_command_output(program, output, limit)
+
+    let stdout = match stdout_reader.join() {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            return Err(ReplayCommandFailure::PossiblyExecuted(
+                ReplayError::CommandFailed {
+                    program,
+                    message: format!("could not read the bounded command output: {error}"),
+                },
+            ));
+        }
+        Err(_) => {
+            return Err(ReplayCommandFailure::PossiblyExecuted(
+                ReplayError::CommandFailed {
+                    program,
+                    message: "the bounded command output reader stopped unexpectedly".to_string(),
+                },
+            ));
+        }
+    };
+    let stderr = match stderr_reader.join() {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            return Err(ReplayCommandFailure::PossiblyExecuted(
+                ReplayError::CommandFailed {
+                    program,
+                    message: format!("could not read the bounded command diagnostic: {error}"),
+                },
+            ));
+        }
+        Err(_) => {
+            return Err(ReplayCommandFailure::PossiblyExecuted(
+                ReplayError::CommandFailed {
+                    program,
+                    message: "the bounded command diagnostic reader stopped unexpectedly"
+                        .to_string(),
+                },
+            ));
+        }
+    };
+
+    if overflowed.load(Ordering::Acquire) {
+        return Err(ReplayCommandFailure::PossiblyExecuted(
+            ReplayError::LimitExceeded {
+                kind: "source command output",
+                limit,
+            },
+        ));
+    }
+
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn capture_command_output(
+    mut reader: impl std::io::Read,
+    limit: usize,
+    overflowed: Option<Arc<AtomicBool>>,
+) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let count = reader.read(&mut chunk)?;
+        if count == 0 {
+            return Ok(output);
+        }
+        let retained = count.min(limit.saturating_sub(output.len()));
+        output.extend_from_slice(&chunk[..retained]);
+        if retained < count {
+            if let Some(overflowed) = overflowed.as_ref() {
+                overflowed.store(true, Ordering::Release);
+                return Ok(output);
+            }
+        }
+    }
 }
 
 fn bounded_command_output(
@@ -1645,15 +1862,111 @@ fn bounded_command_output(
         let diagnostic = String::from_utf8_lossy(&output.stderr[..diagnostic_length]);
         return Err(ReplayError::CommandFailed {
             program,
-            message: diagnostic.trim().to_string(),
+            message: redact_command_diagnostic(diagnostic.trim()),
         });
     }
     Ok(output.stdout)
 }
 
+fn redact_command_diagnostic(diagnostic: &str) -> String {
+    let mut redact_next = false;
+    diagnostic
+        .split_whitespace()
+        .map(|word| {
+            if std::mem::take(&mut redact_next) {
+                return "[REDACTED]".to_string();
+            }
+            if word.eq_ignore_ascii_case("bearer") {
+                redact_next = true;
+                return word.to_string();
+            }
+            if ["ghp_", "github_pat_", "gho_", "ghu_", "ghs_", "ghr_"]
+                .iter()
+                .any(|prefix| word.starts_with(prefix))
+            {
+                return "[REDACTED]".to_string();
+            }
+            if let Some((scheme, rest)) = word.split_once("://") {
+                if matches!(scheme, "http" | "https") {
+                    if let Some((credentials, host)) = rest.split_once('@') {
+                        if !credentials.contains('/') {
+                            return format!("{scheme}://[REDACTED]@{host}");
+                        }
+                    }
+                }
+            }
+            word.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn hung_source_command_is_cancelled_at_its_bounded_deadline() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 5"]);
+        let started = Instant::now();
+
+        let error =
+            run_command_with_deadline(&mut command, /*limit*/ 1024, Duration::from_millis(30))
+                .expect_err("a hung source command must be cancelled");
+
+        assert!(matches!(
+            error,
+            ReplayError::CommandFailed { message, .. }
+                if message.contains("timed out") && message.contains("cancelled")
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_command_output_is_stopped_before_exceeding_its_memory_limit() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 123456789"]);
+
+        let error =
+            run_command_with_deadline(&mut command, /*limit*/ 4, Duration::from_secs(1))
+                .expect_err("source output larger than its configured bound must be rejected");
+
+        assert!(matches!(
+            error,
+            ReplayError::LimitExceeded {
+                kind: "source command output",
+                limit: 4,
+            }
+        ));
+    }
+
+    #[test]
+    fn missing_provider_executable_is_reported_before_any_request_can_be_sent() {
+        let mut command = Command::new("red-replay-provider-command-does-not-exist");
+
+        let error = run_command_with_input(&mut command, br#"{"event":"COMMENT"}"#, 1024)
+            .expect_err("an unavailable executable cannot send a GitHub request");
+
+        assert!(matches!(
+            error,
+            ReplayCommandFailure::NotStarted(ReplayError::CommandFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn command_diagnostics_redact_github_tokens_bearer_headers_and_url_credentials() {
+        let diagnostic = redact_command_diagnostic(
+            "fatal ghp_sensitive Bearer another-secret https://token@example.com/private",
+        );
+
+        assert!(!diagnostic.contains("ghp_sensitive"));
+        assert!(!diagnostic.contains("another-secret"));
+        assert!(!diagnostic.contains("token@example.com"));
+        assert!(diagnostic.contains("https://[REDACTED]@example.com/private"));
+    }
 
     fn sample_capability_request() -> ReplayPullRequest {
         ReplayPullRequest {

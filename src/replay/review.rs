@@ -11,7 +11,7 @@ use url::Url;
 
 use super::{
     digest, refresh_pull_request_capabilities,
-    source::{run_command_with_input, validate_relative_path},
+    source::{run_command_with_input, validate_relative_path, ReplayCommandFailure},
     GitObjectId, ReplayController, ReplayDiffSide, ReplayDraftOrigin, ReplayDraftState,
     ReplayError, ReplayLimits, ReplayPullRequest, ReplayReviewDraft, ReplayReviewDraftKind,
     ReplayReviewRole, ReplaySession, ReplaySource, ReplaySourceKind,
@@ -510,7 +510,12 @@ pub(crate) fn submit_prepared_review(
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1");
     let output = run_command_with_input(&mut command, &encoded, limits.max_metadata_bytes)
-        .map_err(|error| ReplayError::ReviewSubmissionUncertain(error.to_string()))?;
+        .map_err(|error| match error {
+            ReplayCommandFailure::NotStarted(error) => error,
+            ReplayCommandFailure::PossiblyExecuted(error) => {
+                ReplayError::ReviewSubmissionUncertain(error.to_string())
+            }
+        })?;
     let receipt =
         validated_review_receipt(request, &submission.preview, &digest(&encoded), &output)
             .map_err(|error| ReplayError::ReviewSubmissionUncertain(error.to_string()))?;
