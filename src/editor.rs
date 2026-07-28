@@ -3945,10 +3945,12 @@ impl Editor {
             _ => ("BEFORE APPLY", "editorWarning.foreground"),
         };
         let basename = step.path.rsplit('/').next().unwrap_or(&step.path);
+        let minimum_path_width =
+            display_width(basename).saturating_add(usize::from(step.path != basename));
         let role = if display_width(" SCRATCH SOURCE ")
             .saturating_add(display_width(source_status))
-            .saturating_add(display_width(basename))
-            .saturating_add(/*separator widths*/ 6)
+            .saturating_add(minimum_path_width)
+            .saturating_add(/*separator widths*/ 5)
             <= width
         {
             " SCRATCH SOURCE "
@@ -3957,7 +3959,7 @@ impl Editor {
         };
         let reserved = display_width(role)
             .saturating_add(display_width(source_status))
-            .saturating_add(/*separator widths*/ 6);
+            .saturating_add(/*separator widths*/ 5);
         let path = truncate_display_width_with_marker(
             &step.path,
             width.saturating_sub(reserved),
@@ -25785,7 +25787,7 @@ mod test {
             "replay-coach",
             plugin::PanelConfig {
                 side: plugin::PanelSide::Left,
-                width: 39,
+                width: 41,
                 title: Some("PR REPLAY".to_string()),
                 ..plugin::PanelConfig::default()
             },
@@ -25800,6 +25802,7 @@ mod test {
             .window(source_window)
             .expect("the source window remains open")
             .inner_width();
+        assert_eq!(width, 38);
         let narrow_bar = editor
             .window_bar_manager
             .render(source_window, width)
