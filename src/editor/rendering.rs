@@ -482,6 +482,7 @@ impl Editor {
 
         self.render_gutter_rows_in_window(buffer, &window, window_id, &local_rows);
         self.render_main_content_rows_in_window(buffer, &window, &local_rows)?;
+        self.render_replay_source_hunk_highlight(buffer, &window, Some(&local_rows));
         self.render_line_highlight_rows_in_window(buffer, &window, &local_rows);
         self.render_matching_brackets_in_window(buffer, &window, Some(terminal_rows));
 
@@ -741,12 +742,71 @@ impl Editor {
 
             // Render the window content with proper boundaries
             self.render_main_content_in_window(buffer, &window)?;
+            self.render_replay_source_hunk_highlight(buffer, &window, None);
 
             // Render overlays within window bounds
             self.render_overlays_in_window(buffer, &window)?;
         }
 
         Ok(())
+    }
+
+    /// Tints verified original hunk lines without replacing editor text or syntax.
+    fn render_replay_source_hunk_highlight(
+        &self,
+        buffer: &mut RenderBuffer,
+        window: &crate::window::Window,
+        local_rows: Option<&[usize]>,
+    ) {
+        let Some(workspace) = self
+            .replay_demo_workspace
+            .as_ref()
+            .filter(|workspace| workspace.source_window == window.id)
+        else {
+            return;
+        };
+        let Some(hunk) = workspace.source_hunk.as_ref().filter(|hunk| {
+            self.buffer_manager
+                .get(window.buffer_index)
+                .is_some_and(|source| source.id() == hunk.source_buffer)
+        }) else {
+            return;
+        };
+        let Some(background) = crate::plugin::workspace::diff_line_style("added", &self.theme).bg
+        else {
+            return;
+        };
+
+        let content_start = window
+            .position
+            .x
+            .saturating_add(self.gutter_width_for_window(window))
+            .saturating_add(1);
+        let content_end = window
+            .position
+            .x
+            .saturating_add(window.inner_width())
+            .saturating_sub(1);
+        if content_start > content_end {
+            return;
+        }
+
+        let end_line = hunk.start_line.saturating_add(hunk.line_count);
+        let layout = self.layout_for_window(window);
+        for segment in &layout.rows {
+            if !(hunk.start_line..end_line).contains(&segment.line)
+                || local_rows.is_some_and(|rows| !rows.contains(&segment.row))
+            {
+                continue;
+            }
+            let y = self.window_to_terminal_y(window, segment.row);
+            buffer.set_bg_for_range(
+                Point::new(content_start, y),
+                Point::new(content_end, y),
+                &background,
+                &self.theme,
+            );
+        }
     }
 
     fn render_window_bar(&self, buffer: &mut RenderBuffer, window: &crate::window::Window) {
@@ -1772,6 +1832,7 @@ impl Editor {
         }
 
         let outbox_position = self.panel_manager.focused_replay_outbox_position();
+        let complete_review = self.panel_manager.focused_replay_is_complete();
         let restored_review = self
             .panel_manager
             .focused_replay_notice()
@@ -1783,7 +1844,9 @@ impl Editor {
                 } else {
                     format!(" PR #{pull_request}")
                 };
-                if restored_review {
+                if complete_review {
+                    file.push_str(" · ✓ complete");
+                } else if restored_review {
                     file.push_str(" · ✓ restored");
                 }
                 let position = match outbox_position {

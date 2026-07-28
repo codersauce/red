@@ -1316,7 +1316,7 @@ pub(super) fn render_syntax_overlays(
     }
 }
 
-pub(super) fn diff_line_style(kind: &str, theme: &Theme) -> Style {
+pub(crate) fn diff_line_style(kind: &str, theme: &Theme) -> Style {
     let mut style = theme.style.clone();
     style.bg = match kind {
         "added" => diff_background(

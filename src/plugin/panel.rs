@@ -1060,6 +1060,15 @@ impl PanelManager {
         ))
     }
 
+    /// Reports completion only while a genuine, fully reviewed Replay owns focus.
+    pub(crate) fn focused_replay_is_complete(&self) -> bool {
+        self.focused
+            .as_deref()
+            .and_then(|id| self.text_panels.get(id))
+            .and_then(|panel| panel.replay.as_ref())
+            .is_some_and(|replay| replay.model.is_complete())
+    }
+
     /// Return the active review notice only while the Replay pane owns focus.
     pub(crate) fn focused_replay_notice(&self) -> Option<&str> {
         let id = self.focused.as_deref()?;
@@ -2373,6 +2382,17 @@ fn text_panel_span_style(style: TextPanelSpanStyle, theme: &Theme) -> Style {
         TextPanelSpanStyle::User => theme.ui_style.picker_prompt.clone(),
         TextPanelSpanStyle::Agent | TextPanelSpanStyle::Text => theme.style.clone(),
         TextPanelSpanStyle::Error => theme.ui_style.deprecated.clone(),
+        TextPanelSpanStyle::Success => Style {
+            fg: theme
+                .colors
+                .get("gitDecoration.addedResourceForeground")
+                .copied()
+                .or_else(|| theme.colors.get("terminal.ansiGreen").copied())
+                .or(theme.style.fg),
+            bg: theme.style.bg,
+            bold: true,
+            italic: false,
+        },
         TextPanelSpanStyle::Heading => {
             let mut style = scoped("heading.1.markdown");
             style.bold = true;
@@ -3222,7 +3242,7 @@ mod tests {
         assert!(!rows[change_row].contains("01/05"));
         assert!(rows
             .iter()
-            .any(|line| line.contains("ORIGINAL CHANGE") && line.contains("01 / 05")));
+            .any(|line| line.contains("ORIGINAL CHANGE") && line.contains("PENDING")));
         assert!(rows.iter().any(|line| line.starts_with("WHY")));
         assert!(rows.iter().any(|line| line.contains("visible_start")));
         assert!(rows.iter().all(|line| !line.contains("diff --git")));
@@ -3422,6 +3442,7 @@ mod tests {
         assert!(row_text(&buffer, 0).starts_with("PR REPLAY"));
         assert_eq!(buffer.cells[46].text, "│");
         assert_eq!(manager.focused_replay_status(), None);
+        assert!(!manager.focused_replay_is_complete());
         assert!(!manager.focused_replay_is_guide());
         assert_eq!(manager.focused_replay_outbox_position(), None);
 
@@ -3437,6 +3458,7 @@ mod tests {
             manager.focused_replay_status(),
             Some((482, "feat/viewport-diagnostics", 0, 5)),
         );
+        assert!(!manager.focused_replay_is_complete());
         assert!(manager.focused_replay_is_guide());
         assert_eq!(manager.focused_replay_outbox_position(), None);
         let (x, y) = manager
@@ -3451,6 +3473,7 @@ mod tests {
         assert!(row_text(&buffer, 0).starts_with("PR REPLAY"));
         assert_eq!(buffer.cells[46].text, "│");
         assert_eq!(manager.focused_replay_status(), None);
+        assert!(!manager.focused_replay_is_complete());
         assert!(!manager.focused_replay_is_guide());
         assert_eq!(manager.focused_replay_outbox_position(), None);
         assert_eq!(
@@ -3459,6 +3482,52 @@ mod tests {
             ),
             None,
         );
+    }
+
+    #[test]
+    fn completed_replay_is_reported_only_while_its_genuine_panel_has_focus() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "replay-coach".to_string(),
+            PanelConfig {
+                side: PanelSide::Left,
+                width: 46,
+                title: Some("PR REPLAY".to_string()),
+                ..PanelConfig::default()
+            },
+        );
+        let mut block = structured_replay_block(ReplayPanelMode::Challenge);
+        let mut model: ReplayPanelModel = serde_json::from_str(&block.text).unwrap();
+        model.completions = model
+            .steps
+            .iter()
+            .enumerate()
+            .map(
+                |(index, _)| crate::plugin::replay_panel::ReplayPanelCompletion {
+                    index,
+                    completion: "automatically applied".to_string(),
+                },
+            )
+            .collect();
+        block.text = serde_json::to_string(&model).unwrap();
+        manager.update_text_panel(
+            "replay-coach",
+            vec![block],
+            /*panel_height*/ 26,
+            /*terminal_width*/ 100,
+        );
+
+        assert!(!manager.focused_replay_is_complete());
+        assert!(manager.focus_panel("replay-coach"));
+        assert!(manager.focused_replay_is_complete());
+
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let mut buffer = RenderBuffer::new(/*width*/ 100, /*height*/ 28, &theme.style);
+        manager.render(&mut buffer, &theme);
+        assert!((0..28).any(|row| row_text(&buffer, row).contains("✓ 5/5 complete")));
+
+        manager.focus_editor();
+        assert!(!manager.focused_replay_is_complete());
     }
 
     #[test]

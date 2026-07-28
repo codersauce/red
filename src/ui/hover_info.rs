@@ -553,6 +553,17 @@ fn hover_span_style(span: &RenderedTextSpan, theme: &Theme) -> Style {
                 base.clone()
             }
             TextPanelSpanStyle::Error => theme.ui_style.deprecated.clone(),
+            TextPanelSpanStyle::Success => Style {
+                fg: theme
+                    .colors
+                    .get("gitDecoration.addedResourceForeground")
+                    .copied()
+                    .or_else(|| theme.colors.get("terminal.ansiGreen").copied())
+                    .or(base.fg),
+                bg: base.bg,
+                bold: true,
+                italic: false,
+            },
             TextPanelSpanStyle::Heading => {
                 let mut style = scoped("heading.1.markdown");
                 style.bold = true;

@@ -26,7 +26,7 @@ use crate::{
     ui::{ActionBar, ActionBarRole, ActionPriority, UiAction},
     unicode_utils::{
         display_width, fit_display_width, truncate_display_width,
-        truncate_display_width_with_marker, TruncationSide,
+        truncate_display_width_with_marker, truncate_path_display_width, TruncationSide,
     },
 };
 
@@ -67,6 +67,43 @@ pub(crate) enum ReplayPanelView {
 pub(crate) struct ReplayPanelCompletion {
     pub(crate) index: usize,
     pub(crate) completion: String,
+}
+
+/// Truthful presentation of the persisted work for one original change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayChangeState {
+    Pending,
+    Noted,
+    ManuallyChecked,
+    AutomaticallyApplied,
+}
+
+impl ReplayChangeState {
+    const fn marker(self) -> &'static str {
+        match self {
+            Self::Pending => "○",
+            Self::Noted => "✎",
+            Self::ManuallyChecked => "✓",
+            Self::AutomaticallyApplied => "+",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "PENDING",
+            Self::Noted => "NOTE ADDED",
+            Self::ManuallyChecked => "CHECKED BY HAND",
+            Self::AutomaticallyApplied => "HUNK APPLIED",
+        }
+    }
+
+    const fn span_style(self) -> TextPanelSpanStyle {
+        match self {
+            Self::Pending => TextPanelSpanStyle::Muted,
+            Self::Noted => TextPanelSpanStyle::Heading,
+            Self::ManuallyChecked | Self::AutomaticallyApplied => TextPanelSpanStyle::Success,
+        }
+    }
 }
 
 /// A private reviewer observation retained only in the preview session.
@@ -147,6 +184,31 @@ impl ReplayPanelModel {
             .map(|completion| completion.index)
             .collect::<HashSet<_>>()
             .len()
+    }
+
+    pub(super) fn is_complete(&self) -> bool {
+        !self.steps.is_empty() && self.reviewed_count() == self.steps.len()
+    }
+
+    fn change_state(&self, index: usize) -> ReplayChangeState {
+        if let Some(completion) = self.completion(index) {
+            if completion.completion == "automatically applied" {
+                return ReplayChangeState::AutomaticallyApplied;
+            }
+            return ReplayChangeState::ManuallyChecked;
+        }
+
+        let noted = self.notes.iter().any(|note| note.index == index)
+            || self.steps.get(index).is_some_and(|step| {
+                self.drafts
+                    .iter()
+                    .any(|draft| draft.step_id.as_deref() == Some(step.id.as_str()))
+            });
+        if noted {
+            ReplayChangeState::Noted
+        } else {
+            ReplayChangeState::Pending
+        }
     }
 
     fn current_file_position(&self) -> Option<(usize, usize)> {
@@ -632,44 +694,11 @@ pub(super) fn render_replay_panel(
             .saturating_sub(viewport.scroll.saturating_add(layout.diff_rows));
         let source = if let Some(step) = state.model.current_step() {
             let mut details = Vec::new();
-            if let Some((index, count)) = state
-                .model
-                .current_file_position()
-                .filter(|(_, count)| *count > 1)
-            {
-                details.push(if width >= 56 {
-                    format!("file {index} of {count}")
-                } else {
-                    format!("{index}/{count}")
-                });
-            }
             if hidden_above > 0 {
-                details.push(if width >= 64 {
-                    format!("{hidden_above} above")
-                } else {
-                    format!("↑{hidden_above}")
-                });
+                details.push(format!("↑{hidden_above}"));
             }
             if hidden_below > 0 {
-                details.push(if width >= 64 {
-                    format!("{hidden_below} below")
-                } else {
-                    format!("↓{hidden_below}")
-                });
-            }
-            if width >= 36 && (hidden_above > 0 || hidden_below > 0) {
-                details.push("^D/^U".to_string());
-            }
-            let gutter_width = if width >= 72 { 13 } else { 7 };
-            let code_width = width.saturating_sub(gutter_width);
-            if width >= 56
-                && state
-                    .document
-                    .lines
-                    .iter()
-                    .any(|line| line.kind != "hunk" && display_width(&line.text) > code_width)
-            {
-                details.push("H/L pan".to_string());
+                details.push(format!("↓{hidden_below}"));
             }
             let prefix = if width >= 38 {
                 "ORIGINAL HUNK · "
@@ -695,12 +724,7 @@ pub(super) fn render_replay_panel(
                 .saturating_sub(display_width(prefix))
                 .saturating_sub(display_width(&details))
                 .saturating_sub(1);
-            let path = truncate_display_width_with_marker(
-                &step.path,
-                path_width,
-                "…",
-                TruncationSide::Left,
-            );
+            let path = truncate_path_display_width(&step.path, path_width);
             aligned_line(
                 &format!("{prefix}{path}"),
                 TextPanelSpanStyle::Link,
@@ -1032,7 +1056,16 @@ fn replay_pinned_header_lines(state: &ReplayPanelState, width: usize) -> Vec<Ren
         source.push_str(" · ");
         source.extend(model.head_commit.chars().take(7));
     }
-    let mut progress = format!("{}/{} reviewed", model.reviewed_count(), model.steps.len());
+    let complete = model.is_complete();
+    let mut progress = if complete {
+        format!(
+            "✓ {}/{} complete",
+            model.reviewed_count(),
+            model.steps.len()
+        )
+    } else {
+        format!("{}/{} reviewed", model.reviewed_count(), model.steps.len())
+    };
     if !model.notes.is_empty() {
         let suffix = if model.notes.len() == 1 {
             "note"
@@ -1063,11 +1096,72 @@ fn replay_pinned_header_lines(state: &ReplayPanelState, width: usize) -> Vec<Ren
             &source,
             TextPanelSpanStyle::Muted,
             &progress,
-            TextPanelSpanStyle::Muted,
+            if complete {
+                TextPanelSpanStyle::Success
+            } else {
+                TextPanelSpanStyle::Muted
+            },
             None,
             width,
         ),
     ]
+}
+
+/// Wraps source symbols at their actual boundaries without changing the original title.
+fn wrap_replay_change_title(title: &str, width: usize) -> Vec<RenderedTextLine> {
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for word in title.split_whitespace() {
+        let combined_width = display_width(&current)
+            .saturating_add(usize::from(!current.is_empty()))
+            .saturating_add(display_width(word));
+        if combined_width <= width {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+            continue;
+        }
+
+        if !current.is_empty() {
+            lines.push(RenderedTextLine::plain(
+                std::mem::take(&mut current),
+                TextPanelSpanStyle::Strong,
+            ));
+        }
+
+        let mut remaining = word;
+        while display_width(remaining) > width {
+            let visible = truncate_display_width(remaining, width);
+            if visible.is_empty() {
+                current.push_str(remaining);
+                remaining = "";
+                break;
+            }
+            let split = visible
+                .rfind('_')
+                .filter(|offset| *offset > 0)
+                .unwrap_or(visible.len());
+            let (line, rest) = remaining.split_at(split);
+            lines.push(RenderedTextLine::plain(
+                line.to_string(),
+                TextPanelSpanStyle::Strong,
+            ));
+            remaining = rest;
+        }
+        current.push_str(remaining);
+    }
+
+    if !current.is_empty() {
+        lines.push(RenderedTextLine::plain(current, TextPanelSpanStyle::Strong));
+    }
+
+    lines
 }
 
 /// Keeps the complete selected original change readable outside the compact step list.
@@ -1079,20 +1173,16 @@ fn replay_current_change_lines(state: &ReplayPanelState, width: usize) -> Vec<Re
         return Vec::new();
     }
 
-    let position = format!(
-        "{:02} / {:02}",
-        state.model.index.saturating_add(1),
-        state.model.steps.len(),
-    );
+    let change_state = state.model.change_state(state.model.index);
     let mut lines = vec![aligned_line(
         "ORIGINAL CHANGE",
         TextPanelSpanStyle::Heading,
-        &position,
-        TextPanelSpanStyle::Muted,
+        change_state.label(),
+        change_state.span_style(),
         None,
         width,
     )];
-    let title = wrap_plain_text(&step.title, width, TextPanelSpanStyle::Strong);
+    let title = wrap_replay_change_title(&step.title, width);
     let truncated = title.len() > 3;
     lines.extend(title.into_iter().take(3));
     if let Some(last) = lines.last_mut().filter(|_| truncated) {
@@ -1125,7 +1215,7 @@ fn replay_rationale_lines(state: &ReplayPanelState, width: usize) -> Vec<Rendere
     let (label, rationale, body_style) = if state.model.hint_visible && !step.hint.is_empty() {
         ("HINT  ", step.hint.as_str(), TextPanelSpanStyle::Quote)
     } else {
-        ("WHY   ", step.why.as_str(), TextPanelSpanStyle::Muted)
+        ("WHY   ", step.why.as_str(), TextPanelSpanStyle::Text)
     };
     let label_width = display_width(label).min(width);
     let text_width = width.saturating_sub(label_width).max(1);
@@ -1342,12 +1432,7 @@ fn replay_outbox_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
             };
             let source_width = width.saturating_sub(display_width(side)).saturating_sub(1);
             let path_width = source_width.saturating_sub(display_width(&line_suffix));
-            let path = truncate_display_width_with_marker(
-                &anchor.path.to_string_lossy(),
-                path_width,
-                "…",
-                TruncationSide::Left,
-            );
+            let path = truncate_path_display_width(&anchor.path.to_string_lossy(), path_width);
             let source = format!("{path}{line_suffix}");
             lines.push(aligned_line(
                 &source,
@@ -1788,29 +1873,105 @@ fn render_replay_action_bar(
     actions: &[UiAction],
     theme: &Theme,
 ) {
-    let layout = ActionBar::new(actions).render(buffer, x, y, width, theme, &theme.style);
+    let layout = replay_grouped_action_layout(actions, width);
+    if width == 0 || y >= buffer.height {
+        return;
+    }
+    buffer.set_text(x, y, &" ".repeat(width), &theme.style);
     let mut column = x;
 
-    for span in layout.spans {
-        if span.role == ActionBarRole::Key {
-            let foreground = theme.ui_style.picker_prompt.fg.or(theme.style.fg);
-            let key_style = Style {
-                fg: foreground,
+    for (index, span) in layout.spans.iter().enumerate() {
+        let group_boundary = width >= 56
+            && span.role == ActionBarRole::Separator
+            && span.text == "  "
+            && replay_action_group_boundary(&layout, actions, index);
+        let text = if group_boundary { " │ " } else { &span.text };
+        let style = match span.role {
+            ActionBarRole::Key => Style {
+                fg: theme.ui_style.picker_prompt.fg.or(theme.style.fg),
                 bg: theme.style.bg,
                 bold: true,
                 italic: false,
-            };
-            buffer.set_text(column, y, &span.text, &key_style);
-        } else if span.role == ActionBarRole::Overflow {
-            buffer.set_text(
-                column,
-                y,
-                &span.text,
-                &theme.ui_style.muted.clone().with_bg(theme.style.bg),
-            );
-        }
-        column = column.saturating_add(display_width(&span.text));
+            },
+            ActionBarRole::Separator | ActionBarRole::Overflow | ActionBarRole::Status => {
+                theme.ui_style.muted.clone().with_bg(theme.style.bg)
+            }
+            ActionBarRole::Mode | ActionBarRole::Label => theme.style.clone(),
+        };
+        buffer.set_text(column, y, text, &style);
+        column = column.saturating_add(display_width(text));
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayActionGroup {
+    Navigation,
+    Editing,
+    Review,
+    Utility,
+}
+
+fn replay_action_group(actions: &[UiAction], key: &str) -> Option<ReplayActionGroup> {
+    let action = actions.iter().find(|action| {
+        action.key == key
+            || action
+                .compact_key
+                .as_deref()
+                .is_some_and(|compact| compact == key)
+    })?;
+    Some(match action.id.as_str() {
+        "navigate" | "navigate_file" | "navigate_draft" | "next_unreviewed" => {
+            ReplayActionGroup::Navigation
+        }
+        "edit" | "undo" | "edit_draft" | "discard_draft" => ReplayActionGroup::Editing,
+        "validate" | "apply" | "comment" | "outbox" | "summary" | "save_review"
+        | "publish_review" | "load_review" | "fix" => ReplayActionGroup::Review,
+        _ => ReplayActionGroup::Utility,
+    })
+}
+
+fn replay_action_group_boundary(
+    layout: &crate::ui::ActionBarLayout,
+    actions: &[UiAction],
+    index: usize,
+) -> bool {
+    let previous = layout.spans[..index]
+        .iter()
+        .rev()
+        .find(|span| span.role == ActionBarRole::Key)
+        .and_then(|span| replay_action_group(actions, &span.text));
+    let next = layout.spans[index.saturating_add(1)..]
+        .iter()
+        .find(|span| span.role == ActionBarRole::Key)
+        .and_then(|span| replay_action_group(actions, &span.text));
+    matches!((previous, next), (Some(previous), Some(next)) if previous != next)
+}
+
+fn replay_grouped_action_layout(actions: &[UiAction], width: usize) -> crate::ui::ActionBarLayout {
+    if width < 56 || !actions.iter().any(|action| action.id == "navigate") {
+        return ActionBar::new(actions).layout(width);
+    }
+
+    let mut reserved = 0;
+    let mut layout = ActionBar::new(actions).layout(width);
+    for _ in 0..4 {
+        let required = layout
+            .spans
+            .iter()
+            .enumerate()
+            .filter(|(index, span)| {
+                span.role == ActionBarRole::Separator
+                    && span.text == "  "
+                    && replay_action_group_boundary(&layout, actions, *index)
+            })
+            .count();
+        if required == reserved {
+            break;
+        }
+        reserved = required;
+        layout = ActionBar::new(actions).layout(width.saturating_sub(reserved));
+    }
+    layout
 }
 
 fn render_replay_footer_status(
@@ -1936,18 +2097,10 @@ fn render_change_heading(
         }
     }
     if hidden_above > 0 {
-        progress.push(if width >= 56 {
-            format!("{hidden_above} above")
-        } else {
-            format!("↑{hidden_above}")
-        });
+        progress.push(format!("↑{hidden_above}"));
     }
     if hidden_below > 0 {
-        progress.push(if width >= 56 {
-            format!("{hidden_below} below")
-        } else {
-            format!("↓{hidden_below}")
-        });
+        progress.push(format!("↓{hidden_below}"));
     }
     let details = if progress.is_empty() {
         "─".to_string()
@@ -1987,7 +2140,6 @@ fn render_change_row(
         return;
     }
     let active = index == state.model.index;
-    let completion = state.model.completion(index);
     let mut selection = theme.list_selection_style();
     if !focused {
         selection.bg = theme
@@ -2014,24 +2166,11 @@ fn render_change_row(
     };
     buffer.set_text(x, y, &fit_display_width("", width), &row_style);
 
-    let noted = state.model.notes.iter().any(|note| note.index == index)
-        || state
-            .model
-            .drafts
-            .iter()
-            .any(|draft| draft.step_id.as_deref() == Some(step.id.as_str()));
-    let marker = if completion.is_some_and(|entry| entry.completion == "automatically applied") {
-        "⊕"
-    } else if completion.is_some() {
-        "✓"
-    } else if noted {
-        "✎"
-    } else {
-        "○"
-    };
-    let marker_style = if marker == "✓" {
+    let change_state = state.model.change_state(index);
+    let marker = change_state.marker();
+    let marker_style = if matches!(marker, "✓" | "+") {
         change_kind_style("add", theme)
-    } else if matches!(marker, "⊕" | "✎") {
+    } else if marker == "✎" {
         theme.ui_style.picker_prompt.clone()
     } else {
         theme.ui_style.muted.clone()
@@ -2104,21 +2243,37 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
     let has_multiple_files = model
         .current_file_position()
         .is_some_and(|(_, count)| count > 1);
-    let mut actions = vec![
-        UiAction::new("navigate", "j/k", "Change")
-            .with_priority(if width >= 39 {
-                ActionPriority::Essential
-            } else {
-                ActionPriority::Primary
-            })
-            .with_compact_label("Chg"),
+    let mut actions = vec![UiAction::new("navigate", "j/k", "Change")
+        .with_priority(if width >= 39 {
+            ActionPriority::Essential
+        } else {
+            ActionPriority::Primary
+        })
+        .with_compact_label("Chg")];
+
+    if has_multiple_files {
+        actions.push(
+            UiAction::new("navigate_file", "h/l", "File")
+                .with_priority(if width >= 56 {
+                    ActionPriority::Essential
+                } else {
+                    ActionPriority::Primary
+                })
+                .with_compact_label("File"),
+        );
+    }
+
+    actions.extend([
         UiAction::new("edit", "i", "Edit")
             .with_priority(ActionPriority::Essential)
             .with_compact_label("Edit"),
+        UiAction::new("undo", "u", "Undo")
+            .with_priority(ActionPriority::Essential)
+            .with_compact_label(if width >= 72 { "Undo" } else { "↶" }),
         UiAction::new(
             "validate",
             "v",
-            if width >= 82 { "Check edit" } else { "Check" },
+            if width >= 90 { "Validate" } else { "Check" },
         )
         .with_priority(if width >= 46 {
             ActionPriority::Essential
@@ -2129,28 +2284,14 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
         UiAction::new(
             "apply",
             "a",
-            if width >= 82 { "Apply hunk" } else { "Apply" },
+            if width >= 90 { "Apply hunk" } else { "Apply" },
         )
         .with_priority(ActionPriority::Essential)
         .with_compact_label("Apply"),
-        UiAction::new("undo", "u", "Undo")
-            .with_priority(ActionPriority::Essential)
-            .with_compact_label(if width >= 72 { "Undo" } else { "↶" }),
-        UiAction::new("zoom", "z", "Zoom")
-            .with_priority(if width >= 75 {
-                ActionPriority::Essential
-            } else {
-                ActionPriority::Primary
-            })
-            .with_compact_label("Zoom"),
-        UiAction::new("help", "?", "Help")
-            .with_priority(ActionPriority::Essential)
-            .with_compact_label("Help"),
-    ];
+    ]);
 
     if model.pull_request > 0 && model.review_role.is_some() {
-        actions.insert(
-            actions.len().saturating_sub(1),
+        actions.push(
             UiAction::new("comment", "c", "Note")
                 .with_priority(if width >= 60 {
                     ActionPriority::Essential
@@ -2159,8 +2300,7 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
                 })
                 .with_compact_label("Note"),
         );
-        actions.insert(
-            actions.len().saturating_sub(1),
+        actions.push(
             UiAction::new("outbox", "r", "Outbox")
                 .with_priority(if width >= 58 {
                     ActionPriority::Primary
@@ -2172,8 +2312,7 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
     }
 
     if model.author_workspace_available {
-        actions.insert(
-            actions.len().saturating_sub(1),
+        actions.push(
             UiAction::new("original_workspace", "W", "Worktree")
                 .with_priority(if width >= 72 {
                     ActionPriority::Essential
@@ -2184,22 +2323,8 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
         );
     }
 
-    if has_multiple_files {
-        actions.insert(
-            5,
-            UiAction::new("navigate_file", "h/l", "File")
-                .with_priority(if width >= 56 {
-                    ActionPriority::Essential
-                } else {
-                    ActionPriority::Primary
-                })
-                .with_compact_label("File"),
-        );
-    }
-
     if model.steps.len() > model.reviewed_count().saturating_add(1) {
-        actions.insert(
-            actions.len().saturating_sub(1),
+        actions.push(
             UiAction::new("next_unreviewed", "n", "Next")
                 .with_priority(if width >= 86 {
                     ActionPriority::Essential
@@ -2210,7 +2335,22 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
         );
     }
 
-    while ActionBar::new(&actions).layout(width).hidden_count() > 0 {
+    actions.push(
+        UiAction::new("zoom", "z", "Zoom")
+            .with_priority(if width >= 75 {
+                ActionPriority::Essential
+            } else {
+                ActionPriority::Primary
+            })
+            .with_compact_label("Zoom"),
+    );
+    actions.push(
+        UiAction::new("help", "?", "Help")
+            .with_priority(ActionPriority::Essential)
+            .with_compact_label("Help"),
+    );
+
+    while replay_grouped_action_layout(&actions, width).hidden_count() > 0 {
         let removable = actions
             .iter()
             .enumerate()
@@ -2588,6 +2728,32 @@ mod tests {
         assert!(
             rows.iter().any(|row| row.contains("initial_page")),
             "the complete original symbol must remain visible: {rows:?}",
+        );
+    }
+
+    #[test]
+    fn narrow_change_title_wraps_long_rust_symbols_at_underscore_boundaries() {
+        let title = concat!(
+            "Add metadata_resume_id to ",
+            "thread_resume_rejoins_running_paginated_thread_with_initial_page",
+        );
+        let lines = wrap_replay_change_title(title, /*width*/ 49)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.text)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            lines,
+            [
+                "Add metadata_resume_id to",
+                "thread_resume_rejoins_running_paginated_thread",
+                "_with_initial_page",
+            ],
         );
     }
 
@@ -2983,14 +3149,14 @@ mod tests {
         let model = model();
         let width = 62;
         let actions = replay_actions(&model, width);
-        let expected = ActionBar::new(&actions).layout(width);
+        let expected = replay_grouped_action_layout(&actions, width);
         let theme = parse_vscode_theme("themes/red.json").unwrap();
         let mut buffer = RenderBuffer::new(width, /*height*/ 1, &theme.style);
 
         render_replay_action_bar(&mut buffer, 0, 0, width, &actions, &theme);
 
         let mut column = 0;
-        for span in &expected.spans {
+        for (index, span) in expected.spans.iter().enumerate() {
             if span.role == ActionBarRole::Key {
                 assert_eq!(
                     buffer.cells[column].style.fg,
@@ -2998,8 +3164,13 @@ mod tests {
                 );
                 assert!(buffer.cells[column].style.bold);
             }
-            column += display_width(&span.text);
+            let grouped = width >= 56
+                && span.role == ActionBarRole::Separator
+                && span.text == "  "
+                && replay_action_group_boundary(&expected, &actions, index);
+            column += display_width(if grouped { " │ " } else { &span.text });
         }
+        assert!(rendered_rows(&buffer)[0].contains(" │ "));
         assert_labeled_actions(&expected);
         assert!(!expected.text().contains("[i]"));
     }
@@ -3168,9 +3339,12 @@ mod tests {
         );
         assert!(
             rows.iter().any(|row| {
-                row.contains("rendering.rs") && row.contains('↓') && row.contains("^D/^U")
+                row.contains("rendering.rs")
+                    && row.contains('↓')
+                    && !row.contains("^D/^U")
+                    && !row.contains("H/L pan")
             }),
-            "the exact source must expose remaining changed lines and the scroll keys",
+            "the exact source must retain its filename and disclose hidden lines without inline shortcuts",
         );
     }
 
@@ -3543,7 +3717,7 @@ mod tests {
 
         let rows = rendered_rows(&buffer);
         assert!(rows.iter().any(|row| row.trim_start().starts_with("✓ 01 ")));
-        assert!(rows.iter().any(|row| row.trim_start().starts_with("⊕ 02 ")));
+        assert!(rows.iter().any(|row| row.trim_start().starts_with("+ 02 ")));
         assert!(rows.iter().any(|row| row.starts_with("▶ ○ 03 ")));
         assert!(!rows.iter().any(|row| row.starts_with("▶ ●")));
         assert!(!rows.iter().any(|row| row.contains(" ADD ")));
@@ -4187,6 +4361,80 @@ mod tests {
         ];
 
         assert_eq!(replay.reviewed_count(), 1);
+    }
+
+    #[test]
+    fn completed_header_distinguishes_review_progress_from_selected_change() {
+        let mut replay = model();
+        replay.index = 2;
+        replay.completions = replay
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(index, _)| ReplayPanelCompletion {
+                index,
+                completion: "automatically applied".to_string(),
+            })
+            .collect();
+        let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+        let header = replay_pinned_header_lines(&state, /*width*/ 62);
+        let progress = header[1]
+            .spans
+            .iter()
+            .find(|span| span.text.contains("complete"))
+            .expect("a complete review is explicitly and semantically marked");
+        let change = replay_current_change_lines(&state, /*width*/ 62);
+
+        assert!(state.model.is_complete());
+        assert_eq!(progress.text, "✓ 5/5 complete");
+        assert_eq!(progress.style, TextPanelSpanStyle::Success);
+        assert!(change[0]
+            .spans
+            .iter()
+            .any(|span| span.text == "HUNK APPLIED"));
+        assert!(!change[0]
+            .spans
+            .iter()
+            .any(|span| span.text.contains("03 / 05")));
+    }
+
+    #[test]
+    fn current_change_status_distinguishes_automatic_and_manual_reconstruction() {
+        let mut replay = model();
+
+        for (completion, expected_label, expected_marker) in [
+            ("automatically applied", "HUNK APPLIED", "+"),
+            ("manually reconstructed", "CHECKED BY HAND", "✓"),
+        ] {
+            replay.completions = vec![ReplayPanelCompletion {
+                index: 0,
+                completion: completion.to_string(),
+            }];
+            let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+            let heading = replay_current_change_lines(&state, /*width*/ 52);
+
+            assert_eq!(state.model.change_state(0).marker(), expected_marker);
+            assert!(heading[0].spans.iter().any(
+                |span| span.text == expected_label && span.style == TextPanelSpanStyle::Success
+            ));
+        }
+    }
+
+    #[test]
+    fn rationale_uses_readable_source_text_without_brightening_metadata() {
+        let state = state();
+        let rationale = replay_rationale_lines(&state, /*width*/ 52);
+
+        assert!(rationale[0]
+            .spans
+            .iter()
+            .any(|span| span.text.starts_with("WHY") && span.style == TextPanelSpanStyle::Heading));
+        assert!(rationale[0]
+            .spans
+            .iter()
+            .any(|span| !span.text.trim().is_empty()
+                && !span.text.starts_with("WHY")
+                && span.style == TextPanelSpanStyle::Text));
     }
 
     #[test]

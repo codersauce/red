@@ -41,7 +41,7 @@ use crate::unicode_utils::{
     char_prefix, char_slice, char_suffix, char_to_grapheme, column_to_grapheme_with_tabs,
     display_width, display_width_with_tabs, grapheme_char_range, grapheme_len, grapheme_to_byte,
     grapheme_to_char, grapheme_to_column_with_tabs, trim_line_ending, truncate_chars,
-    truncate_display_width_with_marker, TruncationSide,
+    truncate_path_display_width,
 };
 
 use crossterm::{
@@ -1999,6 +1999,14 @@ struct ReplayAppliedStep {
     step_id: String,
 }
 
+/// Exact, verified original-hunk lines visible in the genuine scratch buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplaySourceHunkHighlight {
+    source_buffer: BufferId,
+    start_line: usize,
+    line_count: usize,
+}
+
 #[derive(Debug, Clone)]
 struct ReplayDemoWorkspaceState {
     id: String,
@@ -2007,6 +2015,7 @@ struct ReplayDemoWorkspaceState {
     source_buffers: HashMap<String, BufferId>,
     source_window: WindowId,
     applied_steps: Vec<ReplayAppliedStep>,
+    source_hunk: Option<ReplaySourceHunkHighlight>,
 }
 
 /// Original dock geometry retained while either Replay surface is temporarily zoomed.
@@ -3918,35 +3927,54 @@ impl Editor {
                     .iter()
                     .find(|candidate| candidate.id == step_id)
             });
-        let (source_status, status_role) = match session_step.map(|step| step.status) {
+        let (full_status, compact_status, status_role) = match session_step.map(|step| step.status)
+        {
             Some(crate::replay::ReplayStepStatus::Done) => {
-                let status = if session_step.is_some_and(|step| {
+                let statuses = if session_step.is_some_and(|step| {
                     step.completion == Some(crate::replay::ReplayCompletion::Automatic)
                 }) {
-                    "APPLIED"
+                    ("HUNK APPLIED", "HUNK +")
                 } else {
-                    "MATCHES ORIGINAL"
+                    ("HUNK CHECKED", "CHECKED")
                 };
-                (status, "gitDecoration.addedResourceForeground")
+                (
+                    statuses.0,
+                    statuses.1,
+                    "gitDecoration.addedResourceForeground",
+                )
             }
             Some(crate::replay::ReplayStepStatus::Skipped) => {
-                ("SKIPPED", "editorWarning.foreground")
+                ("HUNK SKIPPED", "SKIPPED", "editorWarning.foreground")
             }
             Some(crate::replay::ReplayStepStatus::Blocked) => {
-                ("BLOCKED", "editorWarning.foreground")
+                ("HUNK BLOCKED", "BLOCKED", "editorWarning.foreground")
             }
             Some(crate::replay::ReplayStepStatus::Conflict) => {
-                ("CONFLICT", "editorError.foreground")
+                ("HUNK CONFLICT", "CONFLICT", "editorError.foreground")
             }
-            _ if applied_in_demo => ("APPLIED", "gitDecoration.addedResourceForeground"),
+            _ if applied_in_demo => (
+                "HUNK APPLIED",
+                "HUNK +",
+                "gitDecoration.addedResourceForeground",
+            ),
             _ if matches!(step.kind.as_str(), "add" | "add_file") => {
-                ("INSERT HERE", "editorWarning.foreground")
+                ("INSERT HERE", "INSERT", "editorWarning.foreground")
             }
-            _ => ("BEFORE APPLY", "editorWarning.foreground"),
+            _ => ("BEFORE APPLY", "READY", "editorWarning.foreground"),
         };
         let basename = step.path.rsplit('/').next().unwrap_or(&step.path);
         let minimum_path_width =
             display_width(basename).saturating_add(usize::from(step.path != basename));
+        let source_status = if display_width(" SCRATCH ")
+            .saturating_add(display_width(full_status))
+            .saturating_add(minimum_path_width)
+            .saturating_add(/*separator widths*/ 5)
+            <= width
+        {
+            full_status
+        } else {
+            compact_status
+        };
         let role = if display_width(" SCRATCH SOURCE ")
             .saturating_add(display_width(source_status))
             .saturating_add(minimum_path_width)
@@ -3960,12 +3988,30 @@ impl Editor {
         let reserved = display_width(role)
             .saturating_add(display_width(source_status))
             .saturating_add(/*separator widths*/ 5);
-        let path = truncate_display_width_with_marker(
-            &step.path,
-            width.saturating_sub(reserved),
-            "…",
-            TruncationSide::Left,
-        );
+        let path = truncate_path_display_width(&step.path, width.saturating_sub(reserved));
+        let source_hunk = if matches!(
+            session_step.map(|step| step.status),
+            Some(crate::replay::ReplayStepStatus::Done)
+        ) || applied_in_demo
+        {
+            crate::replay::parse_patch(&step.diff, self.replay_controller.limits())
+                .ok()
+                .and_then(|patch| patch.files.into_iter().next())
+                .and_then(|file| file.hunks.into_iter().next())
+                .and_then(|hunk| {
+                    let range = hunk.added_range?;
+                    let source_line =
+                        self.replay_step_source_line(workspace_id, step_id, window.buffer_index)?;
+                    Some(ReplaySourceHunkHighlight {
+                        source_buffer: self.buffer_manager[window.buffer_index].id(),
+                        start_line: source_line
+                            .saturating_add(range.start.saturating_sub(hunk.new_range.start)),
+                        line_count: range.count.max(1),
+                    })
+                })
+        } else {
+            None
+        };
         let muted_style = plugin::WindowBarStyle {
             semantic: None,
             style: Some(
@@ -4024,8 +4070,18 @@ impl Editor {
             segments.push(segment(" · ".to_string(), muted_style));
         }
         segments.push(segment(source_status.to_string(), status_style));
-        self.window_bar_manager
-            .update(REPLAY_SOURCE_WINDOW_BAR, workspace.source_window, segments)
+        let source_window = workspace.source_window;
+        let updated =
+            self.window_bar_manager
+                .update(REPLAY_SOURCE_WINDOW_BAR, source_window, segments);
+        if let Some(workspace) = self
+            .replay_demo_workspace
+            .as_mut()
+            .filter(|workspace| workspace.id == workspace_id)
+        {
+            workspace.source_hunk = source_hunk;
+        }
+        updated
     }
 
     /// Refits source chrome after docking or resizing and never labels an unrelated buffer.
@@ -4728,6 +4784,7 @@ impl Editor {
             source_buffers,
             source_window,
             applied_steps: Vec::new(),
+            source_hunk: None,
         });
         anyhow::ensure!(
             self.focus_replay_step_source(&id, &initial_step),
@@ -4796,6 +4853,7 @@ impl Editor {
             source_buffers,
             source_window,
             applied_steps: Vec::new(),
+            source_hunk: None,
         });
         if let Some(step_id) = self
             .replay_demo_workspace
@@ -21641,6 +21699,7 @@ impl Editor {
             source_buffers,
             source_window,
             applied_steps,
+            source_hunk: None,
         });
         Ok(())
     }
@@ -25471,7 +25530,69 @@ mod test {
             .collect::<String>();
         assert!(source_title.contains("SCRATCH SOURCE"));
         assert!(source_title.contains("src/first.rs"));
-        assert!(source_title.contains("APPLIED"));
+        assert!(source_title.contains("HUNK APPLIED"));
+        let highlighted_hunk = editor
+            .replay_demo_workspace
+            .as_ref()
+            .and_then(|workspace| workspace.source_hunk)
+            .expect("the real source identifies the exact applied original lines");
+        assert_eq!(highlighted_hunk.start_line, 1);
+        assert_eq!(highlighted_hunk.line_count, 1);
+    }
+
+    #[tokio::test]
+    async fn real_replay_highlights_only_the_verified_applied_source_lines() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let (_directory, session, workspace) = real_replay_session_fixture();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        editor.theme = parse_vscode_theme("themes/red.json").unwrap();
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &editor.theme.style);
+        let mut runtime = Runtime::new();
+        let response = editor
+            .install_replay_source_session(session, "feature/replay", workspace, &mut render_buffer)
+            .await
+            .expect("open the real source-backed review");
+        let workspace_id = response["workspace_id"].as_str().unwrap();
+        let step_id = response["plan"]["steps"][0]["id"].as_str().unwrap();
+        let revision = editor.replay_demo_step_validation(workspace_id, step_id)["revision"]
+            .as_u64()
+            .unwrap();
+
+        editor
+            .apply_replay_demo_step(workspace_id, step_id, revision, &mut runtime)
+            .await
+            .expect("apply the exact original source hunk");
+        editor.vtop = 0;
+        editor.cy = 0;
+        editor.cx = 0;
+        editor.sync_to_window();
+        editor
+            .render(&mut render_buffer)
+            .expect("paint the real editor with the exact applied-hunk highlight");
+
+        let workspace = editor
+            .replay_demo_workspace
+            .as_ref()
+            .expect("retain the source-owned review");
+        let hunk = workspace
+            .source_hunk
+            .expect("retain only the verified applied source range");
+        let window = editor
+            .window_manager
+            .window(workspace.source_window)
+            .expect("retain the ordinary scratch editor window");
+        let content_x = window.position.x + editor.gutter_width_for_window(window) + 1;
+        let changed_y = editor.window_to_terminal_y(window, hunk.start_line);
+        let context_y =
+            editor.window_to_terminal_y(window, hunk.start_line.saturating_add(hunk.line_count));
+        let changed = &render_buffer.cells[changed_y * render_buffer.width + content_x];
+        let context = &render_buffer.cells[context_y * render_buffer.width + content_x];
+
+        assert_ne!(changed.style.bg, editor.theme.style.bg);
+        assert_eq!(context.style.bg, editor.theme.style.bg);
+        assert!(editor.current_buffer().contents().contains("after_first()"));
     }
 
     #[tokio::test]
@@ -26114,6 +26235,74 @@ mod test {
         assert!(status.contains("NORMAL"));
         assert!(!status.contains("PR #482"));
         assert!(editor.test_render_cursor_position().is_some());
+    }
+
+    #[tokio::test]
+    async fn completed_replay_status_distinguishes_review_from_selected_change() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        editor
+            .open_replay_demo_workspace(&mut render_buffer)
+            .await
+            .expect("open the real editable Replay source window");
+        let plan = editor
+            .replay_demo_workspace
+            .as_ref()
+            .expect("preserve the source-backed review workspace")
+            .plan
+            .clone();
+        let completions = plan
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                json!({
+                    "index": index,
+                    "completion": "automatically applied",
+                })
+            })
+            .collect::<Vec<_>>();
+        editor.test_create_text_panel(
+            "replay-coach",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Left,
+                width: 46,
+                title: Some("PR REPLAY".to_string()),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        editor.panel_manager.update_text_panel(
+            "replay-coach",
+            vec![plugin::TextPanelBlock {
+                id: "replay-current-change".to_string(),
+                kind: plugin::TextPanelBlockKind::Text,
+                format: plugin::TextPanelBlockFormat::Replay,
+                text: json!({
+                    "pull_request": plan.pull_request,
+                    "author": plan.author,
+                    "branch": plan.branch,
+                    "title": plan.title,
+                    "index": 2,
+                    "notice": "Review restored · progress, findings, and drafts recovered.",
+                    "completions": completions,
+                    "steps": plan.steps,
+                })
+                .to_string(),
+            }],
+            /*panel_height*/ 26,
+            /*terminal_width*/ 100,
+        );
+
+        assert!(editor.test_focus_panel("replay-coach"));
+        let status = editor.test_statusline_row();
+        assert!(status.contains("REPLAY"));
+        assert!(status.contains("PR #482"));
+        assert!(status.contains("✓ complete"));
+        assert!(status.contains("CHANGE 03/05"));
+        assert!(!status.contains("restored"));
     }
 
     #[tokio::test]

@@ -249,6 +249,32 @@ pub fn truncate_display_width_with_marker(
     }
 }
 
+/// Truncate a path at complete directory boundaries while preserving its filename.
+pub fn truncate_path_display_width(path: &str, max_width: usize) -> String {
+    if display_width(path) <= max_width {
+        return path.to_owned();
+    }
+
+    for (offset, separator) in path.char_indices() {
+        if !matches!(separator, '/' | '\\') {
+            continue;
+        }
+        let suffix = &path[offset.saturating_add(separator.len_utf8())..];
+        let candidate = format!("…{separator}{suffix}");
+        if display_width(&candidate) <= max_width {
+            return candidate;
+        }
+    }
+
+    if let Some(basename) = path.rsplit(['/', '\\']).next() {
+        if display_width(basename) <= max_width {
+            return basename.to_owned();
+        }
+    }
+
+    truncate_display_width_with_marker(path, max_width, "…", TruncationSide::Left)
+}
+
 /// Pad or truncate a string so it occupies exactly `width` display columns.
 pub fn fit_display_width(s: &str, width: usize) -> String {
     let mut result = truncate_display_width(s, width);
@@ -449,6 +475,40 @@ mod tests {
         assert_eq!(
             truncate_display_width_with_marker("hidden", 0, "…", TruncationSide::Left),
             ""
+        );
+    }
+
+    #[test]
+    fn path_truncation_preserves_complete_directory_names_and_filename() {
+        let path = "codex-rs/app-server/tests/suite/v2/thread_resume.rs";
+
+        assert_eq!(
+            truncate_path_display_width(path, /*max_width*/ 45),
+            "…/app-server/tests/suite/v2/thread_resume.rs",
+        );
+        assert_eq!(
+            truncate_path_display_width(path, /*max_width*/ 29),
+            "…/suite/v2/thread_resume.rs",
+        );
+        assert_eq!(
+            truncate_path_display_width(path, /*max_width*/ 16),
+            "thread_resume.rs",
+        );
+        assert_eq!(truncate_path_display_width(path, /*max_width*/ 0), "");
+    }
+
+    #[test]
+    fn path_truncation_preserves_windows_separators_and_unicode_graphemes() {
+        assert_eq!(
+            truncate_path_display_width(
+                "codex-rs\\app-server\\tests\\thread_resume.rs",
+                /*max_width*/ 24,
+            ),
+            "…\\tests\\thread_resume.rs",
+        );
+        assert_eq!(
+            truncate_path_display_width("src/👨‍👩‍👧‍👦/function.rs", /*max_width*/ 13),
+            "…/function.rs",
         );
     }
 

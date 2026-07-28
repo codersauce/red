@@ -1023,7 +1023,7 @@ fn toggle_help() {
         },
         PickerItem {
             id: "states",
-            label: "STATE ○ pending · ✓ reviewed · ⊕ applied · ✎ note",
+            label: "STATE ○ pending · ✓ checked · + applied · ✎ note",
             data: Json {},
         },
         PickerItem {
