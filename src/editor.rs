@@ -13349,6 +13349,7 @@ impl Editor {
 
                 // Move cursor by one character position (not display width)
                 self.cx += grapheme_len(&c.to_string());
+                self.refresh_cursor_goal();
                 if started_transaction {
                     self.commit_transaction(self.cursor_snapshot());
                 }
@@ -28342,6 +28343,68 @@ while True:
             editor.render_cursor_position(),
             Some((start.0 + 1, start.1))
         );
+    }
+
+    #[tokio::test]
+    async fn inserted_character_renders_cursor_at_its_new_display_column() {
+        let cases = [
+            ("", 0, 'a', 1),
+            ("hello", 0, 'x', 1),
+            ("hello", 2, 'x', 3),
+            ("\t👋x", 1, 'x', 5),
+            ("\t👋x", 2, 'x', 7),
+            ("ab", 1, '\t', 4),
+            ("ab", 1, '👋', 3),
+        ];
+
+        for (contents, initial_x, inserted, expected_display_col) in cases {
+            let config = Config::default();
+            let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+            let buffer = Buffer::new(None, contents.to_string());
+            let mut editor =
+                Editor::with_size(lsp, 20, 5, config, Theme::default(), vec![buffer]).unwrap();
+            editor.mode = Mode::Insert;
+            editor.cx = initial_x;
+            editor.refresh_cursor_goal();
+            editor.sync_to_window();
+            let (initial_screen_x, expected_screen_y) = editor.render_cursor_position().unwrap();
+            let initial_display_col =
+                grapheme_to_column_with_tabs(contents, initial_x, editor.active_tab_width());
+            let content_screen_x = initial_screen_x - initial_display_col;
+            let expected_position = (content_screen_x + expected_display_col, expected_screen_y);
+            let mut render_buffer = RenderBuffer::new(20, 5, &Style::default());
+            let mut runtime = Runtime::new();
+
+            editor
+                .process_editor_event(
+                    Event::Key(KeyEvent::new(KeyCode::Char(inserted), KeyModifiers::NONE)),
+                    &mut render_buffer,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                editor.cx,
+                initial_x + 1,
+                "insert {inserted:?} in {contents:?}"
+            );
+            assert_eq!(
+                editor.render_cursor_position(),
+                Some(expected_position),
+                "logical cursor after inserting {inserted:?} in {contents:?}"
+            );
+            assert_eq!(
+                editor.last_rendered_cursor_position,
+                Some(expected_position),
+                "painted cursor after inserting {inserted:?} in {contents:?}"
+            );
+            assert!(
+                editor.stdout.buffer().is_empty(),
+                "insert {inserted:?} in {contents:?} left the terminal cursor movement queued"
+            );
+        }
     }
 
     #[tokio::test]
