@@ -1135,7 +1135,8 @@ fn open_fix() {
 }
 
 fn author_workspace_available() -> bool {
-    if red::string(red::state("replay_source_kind"), "demo") != "github_pull_request" {
+    let source_kind = red::string(red::state("replay_source_kind"), "demo");
+    if source_kind != "github_pull_request" && source_kind != "git_hub_pull_request" {
         return false;
     }
     if red::string(red::state("replay_review_role"), "") != "author" {
@@ -1211,8 +1212,9 @@ fn original_workspace_previewed(preview: Json) {
         + "Local branch:\n" + red::string(preview.workspace_branch, "") + "\n"
         + "Selected source:\n" + red::string(preview.source_path, "") + "\n"
         + "Worktree:\n" + red::string(preview.workspace_root, "") + "\n\n"
-        + "Your current branch and learning scratch are unchanged. "
-        + "Nothing is saved, committed, pushed, or sent to Codex.";
+        + "Current branch and learning scratch: unchanged.\n"
+        + "Nothing is saved, committed, or pushed.\n"
+        + "Codex is not started.";
     red::execute(
         "OpenConfirm",
         verb + " original PR worktree?",

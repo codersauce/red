@@ -4033,6 +4033,14 @@ mod tests {
         runtime: &mut Runtime,
         review_role: &str,
     ) -> crate::replay::ReplayPresentationPlan {
+        open_github_replay_with_source_kind(runtime, review_role, "github_pull_request").await
+    }
+
+    async fn open_github_replay_with_source_kind(
+        runtime: &mut Runtime,
+        review_role: &str,
+        source_kind: &str,
+    ) -> crate::replay::ReplayPresentationPlan {
         runtime
             .load_plugin("replay", include_str!("../../plugins/replay.hk"))
             .await
@@ -4061,7 +4069,7 @@ mod tests {
                 serde_json::json!({
                     "ok": true,
                     "source_id": "original-github-pr-482",
-                    "source_kind": "github_pull_request",
+                    "source_kind": source_kind,
                     "pull_request": 482,
                     "author": "original-author",
                     "head_permission": "write",
@@ -7405,6 +7413,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovered_github_replay_retains_the_original_author_worktree_action() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan =
+            open_github_replay_with_source_kind(&mut runtime, "author", "git_hub_pull_request")
+                .await;
+
+        runtime
+            .execute_command("ReplayOriginalWorkspace")
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayPrepareAuthorWorkspace {
+                workspace_id,
+                step_id,
+                preview_digest,
+                confirmed,
+                ..
+            } => {
+                assert_eq!(workspace_id, "github-workspace-482");
+                assert_eq!(step_id, plan.steps[0].id);
+                assert!(preview_digest.is_empty());
+                assert!(!confirmed);
+            }
+            _ => panic!("a recovered original author must retain the read-only W preview"),
+        }
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
     async fn original_author_worktree_is_only_previewed_until_its_exact_confirmation() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -7472,7 +7512,9 @@ mod tests {
                 assert!(message.contains("replay/author/pr-482-bbbbbbb"));
                 assert!(message.contains("repository.replay-author-pr-482-bbbbbbb"));
                 assert!(message.contains("src/editor/rendering.rs"));
-                assert!(message.contains("Nothing is saved, committed, pushed, or sent to Codex"));
+                assert!(message.contains("Current branch and learning scratch: unchanged."));
+                assert!(message.contains("Nothing is saved, committed, or pushed."));
+                assert!(message.contains("Codex is not started."));
                 handle
             }
             _ => panic!("expected an exact, independently confirmed original-PR worktree preview"),
