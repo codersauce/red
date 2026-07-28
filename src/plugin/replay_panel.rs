@@ -204,6 +204,8 @@ pub(super) struct ReplayPanelLayout {
     pub(super) header_rows: usize,
     pub(super) change_rows: usize,
     pub(super) change_gap_rows: usize,
+    pub(super) current_change_rows: usize,
+    pub(super) current_change_gap_rows: usize,
     pub(super) rationale_rows: usize,
     pub(super) status_rows: usize,
     pub(super) source_rows: usize,
@@ -229,6 +231,8 @@ impl ReplayPanelLayout {
                 header_rows: 0,
                 change_rows: 0,
                 change_gap_rows: 0,
+                current_change_rows: 0,
+                current_change_gap_rows: 0,
                 rationale_rows: 0,
                 status_rows: 0,
                 source_rows: 0,
@@ -246,8 +250,28 @@ impl ReplayPanelLayout {
         let minimum_header = preferred_header.min(if content_height >= 8 { 3 } else { 1 });
         let source_rows =
             usize::from(!state.document.lines.is_empty() && content_height > minimum_header);
+        let current_change_rows = if content_height >= 14 {
+            replay_current_change_lines(state, width)
+                .len()
+                .min(if content_height >= 22 {
+                    4
+                } else if content_height >= 18 {
+                    3
+                } else {
+                    2
+                })
+        } else {
+            0
+        };
+        let current_change_gap_rows =
+            usize::from(current_change_rows > 0 && available_height >= 33);
         let status_rows = usize::from(
-            content_height >= minimum_header.saturating_add(source_rows).saturating_add(3),
+            content_height
+                >= minimum_header
+                    .saturating_add(source_rows)
+                    .saturating_add(current_change_rows)
+                    .saturating_add(current_change_gap_rows)
+                    .saturating_add(3),
         );
         let preferred_rationale_rows = if content_height >= 14 {
             2
@@ -260,6 +284,8 @@ impl ReplayPanelLayout {
             content_height
                 .saturating_sub(minimum_header)
                 .saturating_sub(source_rows)
+                .saturating_sub(current_change_rows)
+                .saturating_sub(current_change_gap_rows)
                 .saturating_sub(status_rows),
         );
         let minimum_diff = state
@@ -271,6 +297,8 @@ impl ReplayPanelLayout {
                 content_height
                     .saturating_sub(minimum_header)
                     .saturating_sub(source_rows)
+                    .saturating_sub(current_change_rows)
+                    .saturating_sub(current_change_gap_rows)
                     .saturating_sub(rationale_rows)
                     .saturating_sub(status_rows),
             );
@@ -278,6 +306,8 @@ impl ReplayPanelLayout {
             .saturating_sub(minimum_header)
             .saturating_sub(minimum_diff)
             .saturating_sub(source_rows)
+            .saturating_sub(current_change_rows)
+            .saturating_sub(current_change_gap_rows)
             .saturating_sub(rationale_rows)
             .saturating_sub(status_rows)
             .saturating_sub(section_spacing);
@@ -302,6 +332,8 @@ impl ReplayPanelLayout {
         let changes_height = usize::from(change_rows > 0)
             .saturating_add(change_rows)
             .saturating_add(change_gap_rows)
+            .saturating_add(current_change_rows)
+            .saturating_add(current_change_gap_rows)
             .saturating_add(rationale_rows)
             .saturating_add(status_rows)
             .saturating_add(source_rows);
@@ -320,6 +352,8 @@ impl ReplayPanelLayout {
                 .saturating_add(usize::from(change_rows > 0))
                 .saturating_add(change_rows)
                 .saturating_add(change_gap_rows)
+                .saturating_add(current_change_rows)
+                .saturating_add(current_change_gap_rows)
                 .saturating_add(rationale_rows)
                 .saturating_add(status_rows)
                 .saturating_add(source_rows)
@@ -340,6 +374,8 @@ impl ReplayPanelLayout {
             header_rows,
             change_rows,
             change_gap_rows,
+            current_change_rows,
+            current_change_gap_rows,
             rationale_rows,
             status_rows,
             source_rows,
@@ -522,10 +558,49 @@ pub(super) fn render_replay_panel(
         }
     }
 
-    let rationale_top = changes_top
+    let current_change_top = changes_top
         .saturating_add(usize::from(layout.change_rows > 0))
         .saturating_add(layout.change_rows)
         .saturating_add(layout.change_gap_rows);
+    let mut current_change = replay_current_change_lines(state, width);
+    if layout.current_change_rows > 0 && current_change.len() > layout.current_change_rows {
+        current_change.truncate(layout.current_change_rows);
+        if let Some(last) = current_change.last_mut() {
+            let text = last
+                .spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>();
+            *last = RenderedTextLine::plain(
+                truncate_display_width_with_marker(
+                    &format!("{text}…"),
+                    width,
+                    "…",
+                    TruncationSide::Right,
+                ),
+                TextPanelSpanStyle::Strong,
+            );
+        }
+    }
+    for (offset, line) in current_change
+        .iter()
+        .take(layout.current_change_rows)
+        .enumerate()
+    {
+        render_text_spans_on_surface(
+            buffer,
+            position.x,
+            current_change_top.saturating_add(offset),
+            width,
+            line,
+            theme,
+            &theme.style,
+        );
+    }
+
+    let rationale_top = current_change_top
+        .saturating_add(layout.current_change_rows)
+        .saturating_add(layout.current_change_gap_rows);
     for (offset, line) in replay_rationale_lines(state, width)
         .iter()
         .take(layout.rationale_rows)
@@ -562,35 +637,74 @@ pub(super) fn render_replay_panel(
                 .current_file_position()
                 .filter(|(_, count)| *count > 1)
             {
-                if width >= 56 {
-                    details.push("h/l File".to_string());
+                details.push(if width >= 56 {
+                    format!("file {index} of {count}")
                 } else {
-                    details.push(format!("{index}/{count} · h/l"));
-                }
+                    format!("{index}/{count}")
+                });
             }
             if hidden_above > 0 {
-                details.push(format!("↑{hidden_above}"));
+                details.push(if width >= 64 {
+                    format!("{hidden_above} above")
+                } else {
+                    format!("↑{hidden_above}")
+                });
             }
             if hidden_below > 0 {
-                details.push(format!("↓{hidden_below}"));
+                details.push(if width >= 64 {
+                    format!("{hidden_below} below")
+                } else {
+                    format!("↓{hidden_below}")
+                });
             }
-            if hidden_above > 0 || hidden_below > 0 {
+            if width >= 36 && (hidden_above > 0 || hidden_below > 0) {
                 details.push("^D/^U".to_string());
             }
             let gutter_width = if width >= 72 { 13 } else { 7 };
             let code_width = width.saturating_sub(gutter_width);
-            if state
-                .document
-                .lines
-                .iter()
-                .any(|line| line.kind != "hunk" && display_width(&line.text) > code_width)
+            if width >= 56
+                && state
+                    .document
+                    .lines
+                    .iter()
+                    .any(|line| line.kind != "hunk" && display_width(&line.text) > code_width)
             {
                 details.push("H/L pan".to_string());
             }
-            aligned_line(
+            let prefix = if width >= 38 {
+                "ORIGINAL HUNK · "
+            } else {
+                "ORIGINAL · "
+            };
+            let basename = step.path.rsplit('/').next().unwrap_or(&step.path);
+            let minimum_path_width =
+                display_width(basename).min(width.saturating_sub(display_width(prefix)));
+            while !details.is_empty() {
+                let candidate = details.join(" · ");
+                let available = width
+                    .saturating_sub(display_width(prefix))
+                    .saturating_sub(display_width(&candidate))
+                    .saturating_sub(1);
+                if available >= minimum_path_width {
+                    break;
+                }
+                details.pop();
+            }
+            let details = details.join(" · ");
+            let path_width = width
+                .saturating_sub(display_width(prefix))
+                .saturating_sub(display_width(&details))
+                .saturating_sub(1);
+            let path = truncate_display_width_with_marker(
                 &step.path,
+                path_width,
+                "…",
+                TruncationSide::Left,
+            );
+            aligned_line(
+                &format!("{prefix}{path}"),
                 TextPanelSpanStyle::Link,
-                &details.join(" · "),
+                &details,
                 TextPanelSpanStyle::Muted,
                 None,
                 width,
@@ -954,6 +1068,50 @@ fn replay_pinned_header_lines(state: &ReplayPanelState, width: usize) -> Vec<Ren
             width,
         ),
     ]
+}
+
+/// Keeps the complete selected original change readable outside the compact step list.
+fn replay_current_change_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTextLine> {
+    let Some(step) = state.model.current_step() else {
+        return Vec::new();
+    };
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let position = format!(
+        "{:02} / {:02}",
+        state.model.index.saturating_add(1),
+        state.model.steps.len(),
+    );
+    let mut lines = vec![aligned_line(
+        "ORIGINAL CHANGE",
+        TextPanelSpanStyle::Heading,
+        &position,
+        TextPanelSpanStyle::Muted,
+        None,
+        width,
+    )];
+    let title = wrap_plain_text(&step.title, width, TextPanelSpanStyle::Strong);
+    let truncated = title.len() > 3;
+    lines.extend(title.into_iter().take(3));
+    if let Some(last) = lines.last_mut().filter(|_| truncated) {
+        let text = last
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        *last = RenderedTextLine::plain(
+            truncate_display_width_with_marker(
+                &format!("{text}…"),
+                width,
+                "…",
+                TruncationSide::Right,
+            ),
+            TextPanelSpanStyle::Strong,
+        );
+    }
+    lines
 }
 
 fn replay_rationale_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTextLine> {
@@ -1767,27 +1925,35 @@ fn render_change_heading(
         .steps
         .len()
         .saturating_sub(first.saturating_add(visible_rows));
-    let mut progress = vec![format!(
-        "{:02}/{:02}",
-        state.model.index.saturating_add(1),
-        state.model.steps.len(),
-    )];
-    if hidden_above > 0 {
-        progress.push(format!("↑{hidden_above}"));
-    }
-    if hidden_below > 0 {
-        progress.push(format!("↓{hidden_below}"));
-    }
+    let mut progress = Vec::new();
     if width >= 56 {
         if let Some((index, count)) = state
             .model
             .current_file_position()
             .filter(|(_, count)| *count > 1)
         {
-            progress.insert(1, format!("file {index}/{count}"));
+            progress.push(format!("file {index} of {count}"));
         }
     }
-    let details = format!("{} ─", progress.join(" · "));
+    if hidden_above > 0 {
+        progress.push(if width >= 56 {
+            format!("{hidden_above} above")
+        } else {
+            format!("↑{hidden_above}")
+        });
+    }
+    if hidden_below > 0 {
+        progress.push(if width >= 56 {
+            format!("{hidden_below} below")
+        } else {
+            format!("↓{hidden_below}")
+        });
+    }
+    let details = if progress.is_empty() {
+        "─".to_string()
+    } else {
+        format!("{} ─", progress.join(" · "))
+    };
     let prefix = "─ CHANGES ";
     let fill_width = width
         .saturating_sub(display_width(prefix))
@@ -1871,21 +2037,29 @@ fn render_change_row(
         theme.ui_style.muted.clone()
     }
     .with_bg(row_style.bg);
+    let marker_style = if active {
+        theme.ensure_text_contrast(&marker_style)
+    } else {
+        marker_style
+    };
     let number = format!(" {:02} ", index.saturating_add(1));
 
     let mut column = x;
     let caret = if focused && active { "▶ " } else { "  " };
     let caret_style = theme.ui_style.picker_prompt.clone().with_bg(row_style.bg);
+    let caret_style = if active {
+        theme.ensure_text_contrast(&caret_style)
+    } else {
+        caret_style
+    };
+    let number_style = if active {
+        theme.ensure_text_contrast(&row_style)
+    } else {
+        theme.ui_style.muted.clone().with_bg(row_style.bg)
+    };
     column = render_change_segment(buffer, column, y, x + width, caret, &caret_style);
     column = render_change_segment(buffer, column, y, x + width, marker, &marker_style);
-    column = render_change_segment(
-        buffer,
-        column,
-        y,
-        x + width,
-        &number,
-        &theme.ui_style.muted.with_bg(row_style.bg),
-    );
+    column = render_change_segment(buffer, column, y, x + width, &number, &number_style);
     column = render_change_segment(buffer, column, y, x + width, " ", &row_style);
     let title = truncate_display_width_with_marker(
         &step.title,
@@ -1938,22 +2112,37 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
                 ActionPriority::Primary
             })
             .with_compact_label("Chg"),
-        UiAction::new("edit", "i", "Source")
+        UiAction::new("edit", "i", "Edit")
             .with_priority(ActionPriority::Essential)
-            .with_compact_label("Src"),
-        UiAction::new("validate", "v", "Check")
-            .with_priority(if width >= 46 {
+            .with_compact_label("Edit"),
+        UiAction::new(
+            "validate",
+            "v",
+            if width >= 82 { "Check edit" } else { "Check" },
+        )
+        .with_priority(if width >= 46 {
+            ActionPriority::Essential
+        } else {
+            ActionPriority::Primary
+        })
+        .with_compact_label("Check"),
+        UiAction::new(
+            "apply",
+            "a",
+            if width >= 82 { "Apply hunk" } else { "Apply" },
+        )
+        .with_priority(ActionPriority::Essential)
+        .with_compact_label("Apply"),
+        UiAction::new("undo", "u", "Undo")
+            .with_priority(ActionPriority::Essential)
+            .with_compact_label(if width >= 72 { "Undo" } else { "↶" }),
+        UiAction::new("zoom", "z", "Zoom")
+            .with_priority(if width >= 75 {
                 ActionPriority::Essential
             } else {
                 ActionPriority::Primary
             })
-            .with_compact_label("Check"),
-        UiAction::new("apply", "a", "Apply")
-            .with_priority(ActionPriority::Essential)
-            .with_compact_label("Apply"),
-        UiAction::new("undo", "u", "Undo")
-            .with_priority(ActionPriority::Essential)
-            .with_compact_label("↶"),
+            .with_compact_label("Zoom"),
         UiAction::new("help", "?", "Help")
             .with_priority(ActionPriority::Essential)
             .with_compact_label("Help"),
@@ -1999,7 +2188,7 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
         actions.insert(
             5,
             UiAction::new("navigate_file", "h/l", "File")
-                .with_priority(if width >= 65 {
+                .with_priority(if width >= 56 {
                     ActionPriority::Essential
                 } else {
                     ActionPriority::Primary
@@ -2036,6 +2225,7 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
                     "navigate_file",
                     "navigate",
                     "validate",
+                    "zoom",
                 ]
                 .into_iter()
                 .find_map(|id| actions.iter().position(|action| action.id == id))
@@ -2282,6 +2472,126 @@ mod tests {
     }
 
     #[test]
+    fn selected_original_change_retains_its_complete_wrapped_title() {
+        let mut replay = model();
+        replay.steps[0].title = "Pass app_server to handle_backtrack_overlay_event".to_string();
+        let expected_title = replay.steps[0].title.clone();
+        let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+        let width = 32;
+        let height = 30;
+        let layout = ReplayPanelLayout::calculate(&state, width, height);
+        let lines = replay_current_change_lines(&state, width);
+
+        assert_eq!(layout.current_change_rows, 3);
+        assert!(lines[0]
+            .spans
+            .iter()
+            .any(|span| span.text.contains("ORIGINAL CHANGE")));
+        let rendered_title = lines[1..]
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(rendered_title, expected_title);
+
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let mut buffer = RenderBuffer::new(width, height, &theme.style);
+        render_replay_panel(
+            &mut buffer,
+            &state,
+            Point::new(0, 0),
+            width,
+            height,
+            ReplayPanelViewport {
+                scroll: 0,
+                focused: true,
+            },
+            &theme,
+        );
+        let rows = rendered_rows(&buffer);
+        assert!(rows.iter().any(|row| row.contains("ORIGINAL CHANGE")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("handle_backtrack_overlay_event")));
+    }
+
+    #[test]
+    fn narrow_original_hunk_never_truncates_the_actual_filename() {
+        let state = state();
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+
+        for width in [30, 38, 46, 62] {
+            let height = 30;
+            let mut buffer = RenderBuffer::new(width, height, &theme.style);
+            render_replay_panel(
+                &mut buffer,
+                &state,
+                Point::new(0, 0),
+                width,
+                height,
+                ReplayPanelViewport {
+                    scroll: 0,
+                    focused: true,
+                },
+                &theme,
+            );
+            let rows = rendered_rows(&buffer);
+            assert!(
+                rows.iter()
+                    .any(|row| { row.starts_with("ORIGINAL") && row.contains("rendering.rs") }),
+                "the exact original filename must remain visible at {width} columns: {rows:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn real_length_change_title_uses_three_readable_lines_at_half_width() {
+        let mut replay = model();
+        replay.steps[0].title = concat!(
+            "Add metadata_resume_id to ",
+            "thread_resume_rejoins_running_paginated_thread_with_initial_page",
+        )
+        .to_string();
+        let expected_title = replay.steps[0].title.clone();
+        let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+        let width = 49;
+        let height = 26;
+        let layout = ReplayPanelLayout::calculate(&state, width, height);
+        let lines = replay_current_change_lines(&state, width);
+
+        assert_eq!(layout.current_change_rows, 4);
+        let title = lines[1..]
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.text.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            title.split_whitespace().collect::<String>(),
+            expected_title.split_whitespace().collect::<String>(),
+        );
+
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let mut buffer = RenderBuffer::new(width, height, &theme.style);
+        render_replay_panel(
+            &mut buffer,
+            &state,
+            Point::new(0, 0),
+            width,
+            height,
+            ReplayPanelViewport {
+                scroll: 0,
+                focused: true,
+            },
+            &theme,
+        );
+        let rows = rendered_rows(&buffer);
+        assert!(
+            rows.iter().any(|row| row.contains("initial_page")),
+            "the complete original symbol must remain visible: {rows:?}",
+        );
+    }
+
+    #[test]
     fn replay_diff_uses_language_syntax_without_losing_added_line_background() {
         let state = state();
         let theme = parse_vscode_theme("themes/red.json").unwrap();
@@ -2511,6 +2821,8 @@ mod tests {
                 + usize::from(layout.change_rows > 0)
                 + layout.change_rows
                 + layout.change_gap_rows
+                + layout.current_change_rows
+                + layout.current_change_gap_rows
                 + layout.rationale_rows
                 + layout.status_rows
                 + layout.source_rows
@@ -2595,7 +2907,9 @@ mod tests {
         let rationale_row = changes_row
             + usize::from(original_layout.change_rows > 0)
             + original_layout.change_rows
-            + original_layout.change_gap_rows;
+            + original_layout.change_gap_rows
+            + original_layout.current_change_rows
+            + original_layout.current_change_gap_rows;
         let status_row = rationale_row + original_layout.rationale_rows;
         let source_row = status_row + original_layout.status_rows;
 
@@ -2722,6 +3036,24 @@ mod tests {
         assert!(!visible.contains('['));
         assert!(visible.contains("v Check"));
         assert!(!visible.contains("Chk"));
+        assert_eq!(layout.hidden_count(), 0);
+    }
+
+    #[test]
+    fn wide_replay_footer_offers_reversible_zoom_without_hiding_core_actions() {
+        let replay = multi_file_model();
+        let width = 86;
+        let actions = replay_actions(&replay, width);
+        let layout = ActionBar::new(&actions).layout(width);
+
+        for key in ["j/k", "i", "v", "a", "u", "h/l", "z", "?"] {
+            assert!(
+                has_visible_key(&layout, key),
+                "missing focused-surface shortcut {key}: {}",
+                layout.text(),
+            );
+        }
+        assert_labeled_actions(&layout);
         assert_eq!(layout.hidden_count(), 0);
     }
 
@@ -3123,6 +3455,8 @@ mod tests {
             + usize::from(layout.change_rows > 0)
             + layout.change_rows
             + layout.change_gap_rows
+            + layout.current_change_rows
+            + layout.current_change_gap_rows
             + layout.rationale_rows
             + layout.status_rows;
         assert_eq!(layout.diff_rows, state.document.lines.len());
@@ -3332,7 +3666,7 @@ mod tests {
 
         let heading = &rendered_rows(&buffer)[layout.header_rows];
         assert!(heading.starts_with("─ CHANGES"));
-        assert!(heading.contains("file 2/3"));
+        assert!(heading.contains("file 2 of 3"));
     }
 
     #[test]

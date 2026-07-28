@@ -2939,6 +2939,7 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
             ("i", "ReplayEdit"),
             ("v", "ReplayValidate"),
             ("a", "ReplayApply"),
+            ("z", "ReplayZoom"),
             ("o", "ReplayNote"),
             ("f", "ReplayFindings"),
             ("c", "ReplayComment"),

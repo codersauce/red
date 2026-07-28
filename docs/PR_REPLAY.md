@@ -7,6 +7,14 @@ merge base, or a safe in-memory demonstration. Every step has its own complete
 original unified diff. The coach is a dedicated read-only panel, and
 reconstruction happens only in editable scratch-source buffers.
 
+The two code surfaces have intentionally different roles. `ORIGINAL CHANGE`
+shows the author's exact, pinned pull-request hunk. `SCRATCH SOURCE` is your
+real editable reconstruction, initially checked out at the merge base. It is
+expected not to contain an unapplied author change. Its own native window bar
+identifies the filename and reports `INSERT HERE`, `BEFORE APPLY`, `APPLIED`,
+or `MATCHES ORIGINAL` from actual review state. The accented source marker and
+cursor identify the precise insertion or replacement location.
+
 ## Start Replay
 
 Start Red from a checkout of the repository you want to review:
@@ -90,9 +98,11 @@ to the author.
 For a multi-file review, `j` and `k` or the down and up arrows select the next
 and previous original hunk, while `[` and `]` jump directly to the first hunk
 in the previous or next changed file. The left and right arrows or `h` and `l`
-also move between changed files. Both motions switch the existing editor window to the actual
-scratch file. The changes heading keeps the current file and total file count
-visible without introducing a second tree or another pane.
+also move between changed files. Both motions switch the existing editor window
+to the actual scratch file. The compact pinned list shows real completion:
+`○` is pending, `✓` was reconstructed by hand, `⊕` was automatically applied,
+and `✎` has a private note. The selected original-change title is displayed
+separately in full; long source paths preserve their actual filename.
 The source cursor and viewport jump directly to the original hunk, even when
 the change occurs thousands of lines into a large file.
 Changes from different files stay in their own buffers; no unrelated file tree,
@@ -141,6 +151,13 @@ binding with a count, such as `5 Ctrl-w >`, for a larger adjustment.
 `Ctrl-w =` restores the pane's original size. You can also drag its dividing
 line with the mouse; the captured divider brightens immediately and returns to
 its normal focus appearance when released.
+
+Press `z` while the guide is focused to enlarge the original change temporarily.
+From either the guide or the editable scratch source, `Space R z` enlarges the
+currently focused surface. Repeat the same shortcut to restore the exact
+previous split, including a divider width you chose yourself. Zoom never
+changes the default 50/50 layout, creates an editor split, alters scratch code,
+or modifies the pull request.
 
 Real review progress is included in Red's crash-safe editor session. Restart
 Red with `--resume` to reopen the verified scratch buffers, original source

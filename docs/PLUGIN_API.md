@@ -98,6 +98,10 @@ Full scratch-file images remain in editor-owned buffers; a large file is never
 copied into every plugin-visible step. `ReplayFocusStepSource(workspace_id,
 step_id)` switches the existing source window to the exact scratch file for a
 multi-file step without turning the dedicated guide into an editor buffer.
+`ReplayToggleZoom(workspace_id)` temporarily enlarges the focused Replay guide
+or its verified scratch-source window, then restores the exact original pane
+geometry when called again. It does not change source buffers, create a split,
+or write to a review workspace.
 
 `ReplayActiveSession(callback)` returns the authoritative recovered source,
 bounded original presentation, selected hunk, learning mode, completed

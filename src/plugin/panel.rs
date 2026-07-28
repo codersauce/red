@@ -3219,7 +3219,10 @@ mod tests {
         let footer_row = placement.y + placement.height - 1;
         assert!(rows[0].contains("PR REPLAY"));
         assert!(!rows[0].contains("01 / 05"));
-        assert!(rows[change_row].contains("01/05"));
+        assert!(!rows[change_row].contains("01/05"));
+        assert!(rows
+            .iter()
+            .any(|line| line.contains("ORIGINAL CHANGE") && line.contains("01 / 05")));
         assert!(rows.iter().any(|line| line.starts_with("WHY")));
         assert!(rows.iter().any(|line| line.contains("visible_start")));
         assert!(rows.iter().all(|line| !line.contains("diff --git")));
@@ -3239,7 +3242,7 @@ mod tests {
 
         let source_row = rows
             .iter()
-            .position(|line| line.contains("src/editor/rendering.rs"))
+            .position(|line| line.contains("ORIGINAL HUNK") && line.contains("rendering.rs"))
             .expect("pinned original source path");
         assert!(change_row < source_row);
         let visible_hunk = rows[source_row + 1..rows.len() - 1].join("\n");

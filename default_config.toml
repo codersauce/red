@@ -319,6 +319,7 @@ Esc = { EnterMode = "Normal" }
 "i" = { PluginCommand = "ReplayEdit" }
 "v" = { PluginCommand = "ReplayValidate" }
 "a" = { PluginCommand = "ReplayApply" }
+"z" = { PluginCommand = "ReplayZoom" }
 "u" = "ReplayUndo"
 "o" = { PluginCommand = "ReplayNote" }
 "f" = { PluginCommand = "ReplayFindings" }

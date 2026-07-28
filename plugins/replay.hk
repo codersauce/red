@@ -162,6 +162,12 @@ pub fn activate() {
         category: "PR Replay",
         description: "Focus the dedicated, movable Replay Coach panel",
     });
+    red::add_command("ReplayZoom", toggle_zoom, Json {
+        title: "Toggle PR Replay pane zoom",
+        category: "PR Replay",
+        description: "Enlarge the focused original-change guide or scratch source and restore the exact split",
+        aliases: ["zoom replay pane", "zoom replay source"],
+    });
     red::add_command("ReplayClose", close, Json {
         title: "Hide PR Replay Coach",
         category: "PR Replay",
@@ -723,6 +729,8 @@ fn panel_event(event: Json) {
         next_unreviewed();
     } else if action == "previous_unreviewed" && !in_outbox {
         previous_unreviewed();
+    } else if action == "zoom" && !in_outbox {
+        toggle_zoom();
     } else if action == "activate" && !in_outbox {
         toggle_rationale();
     } else if action == "next_file" || action == "]" {
@@ -995,17 +1003,27 @@ fn toggle_help() {
         },
         PickerItem {
             id: "source",
-            label: "EDIT  i               edit scratch source",
+            label: "EDIT  i               edit the scratch source",
             data: Json {},
         },
         PickerItem {
             id: "validate",
-            label: "EDIT  v               check reconstruction",
+            label: "EDIT  v               check your scratch edit",
             data: Json {},
         },
         PickerItem {
             id: "apply",
-            label: "EDIT  a / u           apply / undo hunk",
+            label: "EDIT  a / u           apply / undo original hunk",
+            data: Json {},
+        },
+        PickerItem {
+            id: "zoom",
+            label: "PANE  z · Space R z   zoom / restore focused pane",
+            data: Json {},
+        },
+        PickerItem {
+            id: "states",
+            label: "STATE ○ pending · ✓ reviewed · ⊕ applied · ✎ note",
             data: Json {},
         },
         PickerItem {
@@ -2282,6 +2300,16 @@ fn focus() {
     ensure_panel();
     render();
     red::execute("FocusPanel", "replay-coach");
+}
+
+fn toggle_zoom() {
+    if !ensure_workspace() {
+        return;
+    }
+    red::execute(
+        "ReplayToggleZoom",
+        red::string(red::state("replay_workspace_id"), "")
+    );
 }
 
 fn edit_manually() {

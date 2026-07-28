@@ -511,6 +511,7 @@ mod tests {
             ("request", "ReplayRemoveDraft"),
             ("request", "ReplaySetMode"),
             ("execute", "ReplayFocusStepSource"),
+            ("execute", "ReplayToggleZoom"),
         ] {
             let call = HOST_API
                 .calls

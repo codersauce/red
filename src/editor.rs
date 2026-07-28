@@ -41,6 +41,7 @@ use crate::unicode_utils::{
     char_prefix, char_slice, char_suffix, char_to_grapheme, column_to_grapheme_with_tabs,
     display_width, display_width_with_tabs, grapheme_char_range, grapheme_len, grapheme_to_byte,
     grapheme_to_char, grapheme_to_column_with_tabs, trim_line_ending, truncate_chars,
+    truncate_display_width_with_marker, TruncationSide,
 };
 
 use crossterm::{
@@ -142,6 +143,8 @@ const MIN_EDITOR_WINDOW_WIDTH: usize = 10;
 const MIN_EDITOR_WINDOW_HEIGHT: usize = 7;
 const MIN_DOCKED_PANEL_WIDTH: usize = 12;
 const MIN_DOCKED_PANEL_HEIGHT: usize = 4;
+const MAX_REPLAY_ZOOM_COMPANION_WIDTH: usize = 38;
+const REPLAY_SOURCE_WINDOW_BAR: &str = "pr-replay-scratch-source";
 const SESSION_SNAPSHOT_WARNING: &str =
     "Crash recovery is not being saved; check free space and permissions or reduce open-buffer size";
 
@@ -885,6 +888,9 @@ pub enum PluginRequest {
         workspace_id: String,
         step_id: String,
     },
+    ReplayToggleZoom {
+        workspace_id: String,
+    },
     CloseScratchBuffer {
         buffer_index: usize,
     },
@@ -1244,6 +1250,7 @@ impl PluginRequest {
             Self::ReplaySetMode { .. } => "ReplaySetMode",
             Self::ReplayBackgroundCompleted { .. } => "ReplayBackgroundCompleted",
             Self::ReplayFocusStepSource { .. } => "ReplayFocusStepSource",
+            Self::ReplayToggleZoom { .. } => "ReplayToggleZoom",
             Self::CloseScratchBuffer { .. } => "CloseScratchBuffer",
             Self::GetViewportLayout { .. } => "GetViewportLayout",
             Self::GetWindows { .. } => "GetWindows",
@@ -2002,6 +2009,14 @@ struct ReplayDemoWorkspaceState {
     applied_steps: Vec<ReplayAppliedStep>,
 }
 
+/// Original dock geometry retained while either Replay surface is temporarily zoomed.
+#[derive(Debug, Clone)]
+struct ReplayPaneZoom {
+    workspace_id: String,
+    side: plugin::PanelSide,
+    size: usize,
+}
+
 #[derive(Debug, Clone)]
 struct ReplaySourceDisplay {
     head_ref: String,
@@ -2028,6 +2043,9 @@ pub struct Editor {
 
     /// Editor-owned original hunks and a stable, fileless scratch-source identity.
     replay_demo_workspace: Option<ReplayDemoWorkspaceState>,
+
+    /// Reversible Replay-pane geometry; scratch contents and other windows are untouched.
+    replay_pane_zoom: Option<ReplayPaneZoom>,
 
     /// Pinned pull-request sources, confirmed scratch worktrees, and review sessions.
     replay_controller: crate::replay::ReplayController,
@@ -3244,6 +3262,7 @@ impl Editor {
             lsp_coordinator,
             agent_manager,
             replay_demo_workspace: None,
+            replay_pane_zoom: None,
             replay_controller: crate::replay::ReplayController::default(),
             replay_source_displays: HashMap::new(),
             replay_reviews: HashMap::new(),
@@ -3868,6 +3887,247 @@ impl Editor {
         true
     }
 
+    /// Labels only the actual editable Replay source window, without changing its buffer.
+    fn update_replay_source_window_bar(&mut self, workspace_id: &str, step_id: &str) -> bool {
+        let Some(workspace) = self
+            .replay_demo_workspace
+            .as_ref()
+            .filter(|workspace| workspace.id == workspace_id)
+        else {
+            return false;
+        };
+        let Some(step) = workspace.plan.steps.iter().find(|step| step.id == step_id) else {
+            return false;
+        };
+        let Some(window) = self.window_manager.window(workspace.source_window) else {
+            return false;
+        };
+
+        let width = window.inner_width();
+        let role = if width < 34 {
+            " SCRATCH "
+        } else {
+            " SCRATCH SOURCE "
+        };
+        let applied_in_demo = workspace
+            .applied_steps
+            .iter()
+            .any(|applied| applied.step_id == step_id);
+        let session_step = self
+            .replay_controller
+            .session(workspace_id)
+            .ok()
+            .and_then(|session| {
+                session
+                    .steps
+                    .iter()
+                    .find(|candidate| candidate.id == step_id)
+            });
+        let (source_status, status_role) = match session_step.map(|step| step.status) {
+            Some(crate::replay::ReplayStepStatus::Done) => {
+                let status = if session_step.is_some_and(|step| {
+                    step.completion == Some(crate::replay::ReplayCompletion::Automatic)
+                }) {
+                    "APPLIED"
+                } else {
+                    "MATCHES ORIGINAL"
+                };
+                (status, "gitDecoration.addedResourceForeground")
+            }
+            Some(crate::replay::ReplayStepStatus::Skipped) => {
+                ("SKIPPED", "editorWarning.foreground")
+            }
+            Some(crate::replay::ReplayStepStatus::Blocked) => {
+                ("BLOCKED", "editorWarning.foreground")
+            }
+            Some(crate::replay::ReplayStepStatus::Conflict) => {
+                ("CONFLICT", "editorError.foreground")
+            }
+            _ if applied_in_demo => ("APPLIED", "gitDecoration.addedResourceForeground"),
+            _ if matches!(step.kind.as_str(), "add" | "add_file") => {
+                ("INSERT HERE", "editorWarning.foreground")
+            }
+            _ => ("BEFORE APPLY", "editorWarning.foreground"),
+        };
+        let reserved = display_width(role)
+            .saturating_add(display_width(source_status))
+            .saturating_add(/*separator widths*/ 6);
+        let path = truncate_display_width_with_marker(
+            &step.path,
+            width.saturating_sub(reserved),
+            "…",
+            TruncationSide::Left,
+        );
+        let muted_style = plugin::WindowBarStyle {
+            semantic: None,
+            style: Some(
+                self.theme
+                    .ui_style
+                    .muted
+                    .clone()
+                    .with_bg(self.theme.style.bg),
+            ),
+        };
+        let role_style = plugin::WindowBarStyle {
+            semantic: None,
+            style: Some(Style {
+                bold: true,
+                ..self
+                    .theme
+                    .ui_style
+                    .picker_prompt
+                    .clone()
+                    .with_bg(self.theme.style.bg)
+            }),
+        };
+        let status_style = plugin::WindowBarStyle {
+            semantic: Some(plugin::WindowBarSemanticStyle::Key(status_role.to_string())),
+            style: Some(Style {
+                bg: self.theme.style.bg,
+                bold: true,
+                ..Style::default()
+            }),
+        };
+        let segment = |text: String, style: plugin::WindowBarStyle| plugin::WindowBarSegment {
+            id: None,
+            text,
+            style,
+            tooltip: None,
+            action: None,
+        };
+
+        self.window_bar_manager.create(
+            REPLAY_SOURCE_WINDOW_BAR.to_string(),
+            plugin::WindowBarConfig {
+                priority: 120,
+                overflow: plugin::WindowBarOverflow::TruncateRight,
+                style: plugin::WindowBarStyle {
+                    semantic: None,
+                    style: Some(self.theme.style.clone()),
+                },
+                ..plugin::WindowBarConfig::default()
+            },
+        );
+
+        let mut segments = vec![segment(role.to_string(), role_style)];
+        if !path.is_empty() {
+            segments.push(segment("· ".to_string(), muted_style.clone()));
+            segments.push(segment(path, muted_style.clone()));
+            segments.push(segment(" · ".to_string(), muted_style));
+        }
+        segments.push(segment(source_status.to_string(), status_style));
+        self.window_bar_manager
+            .update(REPLAY_SOURCE_WINDOW_BAR, workspace.source_window, segments)
+    }
+
+    /// Refits source chrome after docking or resizing and never labels an unrelated buffer.
+    fn refresh_replay_source_window_bar(&mut self) -> bool {
+        let Some(workspace) = self.replay_demo_workspace.as_ref() else {
+            return false;
+        };
+        let Some(window) = self.window_manager.window(workspace.source_window) else {
+            return false;
+        };
+        let source_window = workspace.source_window;
+        let is_scratch_source =
+            self.buffer_manager
+                .get(window.buffer_index)
+                .is_some_and(|buffer| {
+                    workspace
+                        .source_buffers
+                        .values()
+                        .any(|source| *source == buffer.id())
+                });
+        if !is_scratch_source {
+            return self
+                .window_bar_manager
+                .clear_window(REPLAY_SOURCE_WINDOW_BAR, source_window);
+        }
+        let workspace_id = workspace.id.clone();
+        let step_id = self
+            .replay_controller
+            .session(&workspace_id)
+            .ok()
+            .and_then(|session| session.active_step.clone())
+            .or_else(|| workspace.plan.steps.first().map(|step| step.id.clone()));
+        step_id.is_some_and(|step_id| self.update_replay_source_window_bar(&workspace_id, &step_id))
+    }
+
+    /// Enlarges the focused Replay surface and restores the exact preceding split.
+    fn toggle_replay_pane_zoom(&mut self, workspace_id: &str) -> bool {
+        let Some(workspace) = self
+            .replay_demo_workspace
+            .as_ref()
+            .filter(|workspace| workspace.id == workspace_id)
+        else {
+            return false;
+        };
+        let source_window = workspace.source_window;
+        let Some((side, current_size)) = self.panel_manager.panel_layout("replay-coach") else {
+            return false;
+        };
+        let minimum_companion_width = usize::from(self.size.0)
+            .saturating_div(4)
+            .clamp(MIN_DOCKED_PANEL_WIDTH, MAX_REPLAY_ZOOM_COMPANION_WIDTH);
+
+        if self
+            .replay_pane_zoom
+            .as_ref()
+            .is_some_and(|zoom| zoom.workspace_id == workspace_id)
+        {
+            let Some(zoom) = self.replay_pane_zoom.take() else {
+                return false;
+            };
+            return self.set_panel_size("replay-coach", zoom.side, zoom.size);
+        }
+
+        let requested_size = if self.panel_manager.focused_panel_id() == Some("replay-coach") {
+            if matches!(side, plugin::PanelSide::Left | plugin::PanelSide::Right) {
+                usize::from(self.size.0)
+                    .saturating_sub(minimum_companion_width)
+                    .saturating_sub(1)
+            } else {
+                usize::from(self.size.1)
+                    .saturating_sub(MIN_EDITOR_WINDOW_HEIGHT)
+                    .saturating_sub(1)
+            }
+        } else if self.window_manager.active_stable_window_id() == Some(source_window) {
+            if matches!(side, plugin::PanelSide::Left | plugin::PanelSide::Right) {
+                minimum_companion_width
+            } else {
+                MIN_DOCKED_PANEL_HEIGHT
+            }
+        } else {
+            return false;
+        };
+        if requested_size == current_size
+            || !self.set_panel_size("replay-coach", side, requested_size)
+        {
+            return false;
+        }
+        self.replay_pane_zoom = Some(ReplayPaneZoom {
+            workspace_id: workspace_id.to_string(),
+            side,
+            size: current_size,
+        });
+        true
+    }
+
+    /// Restores an active Replay zoom before its dedicated panel is hidden or closed.
+    fn restore_replay_pane_zoom(&mut self, panel_id: &str) -> bool {
+        if panel_id != "replay-coach" {
+            return false;
+        }
+        let Some(workspace_id) = self
+            .replay_pane_zoom
+            .as_ref()
+            .map(|zoom| zoom.workspace_id.clone())
+        else {
+            return false;
+        };
+        self.toggle_replay_pane_zoom(&workspace_id)
+    }
+
     fn focus_replay_step_source(&mut self, workspace_id: &str, step_id: &str) -> bool {
         let Some(source_index) = self.replay_step_source_index(workspace_id, step_id) else {
             return false;
@@ -3909,7 +4169,8 @@ impl Editor {
                 .unwrap_or_default();
             line.saturating_add(offset)
         });
-        let (source_vtop, source_cx, source_cy) = source_line.map_or_else(
+        let focus_line = changed_line.or(source_line);
+        let (source_vtop, source_cx, source_cy) = focus_line.map_or_else(
             || {
                 let source = &self.buffer_manager[source_index];
                 (source.vtop, source.pos.0, source.pos.1)
@@ -3949,6 +4210,7 @@ impl Editor {
         if let Some(workspace) = self.replay_demo_workspace.as_mut() {
             workspace.source_buffer = source_buffer;
         }
+        self.update_replay_source_window_bar(workspace_id, step_id);
         true
     }
 
@@ -4527,6 +4789,14 @@ impl Editor {
             source_window,
             applied_steps: Vec::new(),
         });
+        if let Some(step_id) = self
+            .replay_demo_workspace
+            .as_ref()
+            .and_then(|workspace| workspace.plan.steps.first())
+            .map(|step| step.id.clone())
+        {
+            self.update_replay_source_window_bar(&id, &step_id);
+        }
         Ok(json!({
             "ok": true,
             "workspace_id": id,
@@ -4608,6 +4878,7 @@ impl Editor {
         } else {
             "conflict"
         };
+        self.update_replay_source_window_bar(workspace_id, step_id);
         json!({
             "ok": true,
             "workspace_id": workspace_id,
@@ -4725,6 +4996,7 @@ impl Editor {
                 step_id: step_id.to_string(),
             });
         }
+        self.update_replay_source_window_bar(workspace_id, step_id);
         if let Err(error) = self.notify_change(runtime).await {
             log!("Replay hunk was applied but change notification failed: {error}");
         }
@@ -4823,6 +5095,7 @@ impl Editor {
         if let Some(workspace) = self.replay_demo_workspace.as_mut() {
             workspace.applied_steps.pop();
         }
+        self.update_replay_source_window_bar(&workspace_id, &applied.step_id);
         if let Some(panel_id) = focused_panel {
             self.panel_manager.focus_panel(&panel_id);
             self.render(render_buffer)?;
@@ -4858,6 +5131,7 @@ impl Editor {
             ),
         );
         self.sync_with_window();
+        self.refresh_replay_source_window_bar();
     }
 
     fn resize_terminal_surface(&mut self, width: u16, height: u16, buffer: &mut RenderBuffer) {
@@ -4920,6 +5194,7 @@ impl Editor {
                     .saturating_sub(reserved_bottom),
             ),
         );
+        self.refresh_replay_source_window_bar();
     }
 
     fn reserved_panel_widths(&self, terminal_width: usize) -> (usize, usize) {
@@ -9245,6 +9520,7 @@ impl Editor {
                                         .await
                                     {
                                         Ok(_) if self.current_buffer().name() == source_name => {
+                                            self.refresh_replay_source_window_bar();
                                             let used_fallback = source_path
                                                 .strip_prefix(&workspace.root)
                                                 .map(|path| path != requested_source_path.as_path())
@@ -9295,6 +9571,11 @@ impl Editor {
                     step_id,
                 } => {
                     if self.focus_replay_step_source(&workspace_id, &step_id) {
+                        needs_render = true;
+                    }
+                }
+                PluginRequest::ReplayToggleZoom { workspace_id } => {
+                    if self.toggle_replay_pane_zoom(&workspace_id) {
                         needs_render = true;
                     }
                 }
@@ -9892,12 +10173,16 @@ impl Editor {
                     needs_render = true;
                 }
                 PluginRequest::SetPanelVisible { id, visible } => {
+                    if !visible {
+                        self.restore_replay_pane_zoom(&id);
+                    }
                     if self.panel_manager.set_panel_visible(&id, visible) {
                         self.apply_panel_layout();
                         needs_render = true;
                     }
                 }
                 PluginRequest::ClosePanel { id } => {
+                    self.restore_replay_pane_zoom(&id);
                     self.panel_manager.close_panel(&id);
                     self.apply_panel_layout();
                     needs_render = true;
@@ -12104,6 +12389,7 @@ impl Editor {
                     KeyCode::Char('N') if self.panel_manager.focused_replay_is_guide() => {
                         "previous_unreviewed"
                     }
+                    KeyCode::Char('z') if self.panel_manager.focused_replay_is_guide() => "zoom",
                     KeyCode::Up | KeyCode::Char('k') => "up",
                     KeyCode::Down | KeyCode::Char('j') => "down",
                     KeyCode::PageUp => "page_up",
@@ -24464,6 +24750,18 @@ mod test {
             .expect("preserve the editor-owned learning scratch buffer")
             .contents()
             .to_string();
+        let source_window = editor
+            .replay_demo_workspace
+            .as_ref()
+            .expect("retain the verified scratch source window")
+            .source_window;
+        assert_eq!(
+            editor
+                .window_bar_manager
+                .render(source_window, /*width*/ 100)
+                .map(|bar| bar.bar_id),
+            Some(REPLAY_SOURCE_WINDOW_BAR.to_string()),
+        );
 
         let request_id = RequestId::from_raw(/*value*/ 27148);
         assert!(editor.pending_replay_requests.insert(request_id));
@@ -24487,6 +24785,10 @@ mod test {
         );
         assert_eq!(editor.current_buffer().contents(), original_source);
         assert_ne!(editor.current_buffer().id(), scratch_buffer);
+        assert!(editor
+            .window_bar_manager
+            .render(source_window, /*width*/ 100)
+            .is_none());
         assert_eq!(
             editor
                 .buffer_manager
@@ -25145,6 +25447,23 @@ mod test {
             step.completion,
             Some(crate::replay::ReplayCompletion::Automatic),
         );
+        let source_window = editor
+            .replay_demo_workspace
+            .as_ref()
+            .expect("the applied scratch review remains active")
+            .source_window;
+        let source_bar = editor
+            .window_bar_manager
+            .render(source_window, /*width*/ 100)
+            .expect("the scratch source retains its native title bar");
+        let source_title = source_bar
+            .segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert!(source_title.contains("SCRATCH SOURCE"));
+        assert!(source_title.contains("src/first.rs"));
+        assert!(source_title.contains("APPLIED"));
     }
 
     #[tokio::test]
@@ -25191,12 +25510,29 @@ mod test {
             .to_string();
 
         assert!(Path::new(editor.current_buffer().name()).ends_with("src/first.rs"));
-        assert_eq!(editor.vtop + editor.cy, 120);
-        assert_eq!(editor.vtop, 117);
+        assert_eq!(editor.vtop + editor.cy, 121);
+        assert_eq!(editor.vtop, 118);
+        let source_window = editor
+            .replay_demo_workspace
+            .as_ref()
+            .expect("active original-source review")
+            .source_window;
+        let source_bar = editor
+            .window_bar_manager
+            .render(source_window, /*width*/ 100)
+            .expect("the real scratch window has its own native title bar");
+        let source_title = source_bar
+            .segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert!(source_title.contains("SCRATCH SOURCE"));
+        assert!(source_title.contains("src/first.rs"));
+        assert!(source_title.contains("BEFORE APPLY"));
 
         assert!(editor.focus_replay_step_source(&workspace_id, &second));
         assert!(Path::new(editor.current_buffer().name()).ends_with("src/second.rs"));
-        assert_eq!(editor.vtop + editor.cy, 0);
+        assert_eq!(editor.vtop + editor.cy, 1);
         let second_index = editor
             .replay_step_source_index(&workspace_id, &second)
             .expect("second original source buffer");
@@ -25210,8 +25546,8 @@ mod test {
 
         assert!(editor.focus_replay_step_source(&workspace_id, &first));
         assert!(Path::new(editor.current_buffer().name()).ends_with("src/first.rs"));
-        assert_eq!(editor.vtop + editor.cy, 120);
-        assert_eq!(editor.vtop, 117);
+        assert_eq!(editor.vtop + editor.cy, 121);
+        assert_eq!(editor.vtop, 118);
         let first_index = editor
             .replay_step_source_index(&workspace_id, &first)
             .expect("first original source buffer");
@@ -25428,6 +25764,121 @@ mod test {
         assert_eq!(editor.buffer_manager[0].contents(), "hello");
     }
 
+    #[tokio::test]
+    async fn replay_zoom_restores_the_exact_custom_guide_and_source_split() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        let response = editor
+            .open_replay_demo_workspace(&mut render_buffer)
+            .await
+            .expect("open an editor-owned Replay scratch source");
+        let workspace_id = response["workspace_id"]
+            .as_str()
+            .expect("stable Replay workspace")
+            .to_string();
+        let original_source = editor.current_buffer().contents();
+        editor.test_create_text_panel(
+            "replay-coach",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Left,
+                width: 46,
+                title: Some("PR REPLAY".to_string()),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        assert!(editor.set_panel_size("replay-coach", plugin::PanelSide::Left, 53));
+        assert!(editor.panel_manager.focus_panel("replay-coach"));
+
+        assert!(editor.toggle_replay_pane_zoom(&workspace_id));
+        assert_eq!(
+            editor.panel_manager.panel_layout("replay-coach"),
+            Some((plugin::PanelSide::Left, 74)),
+        );
+        assert_eq!(
+            editor.panel_manager.focused_panel_id(),
+            Some("replay-coach")
+        );
+        let source_window = editor
+            .replay_demo_workspace
+            .as_ref()
+            .expect("preserve the real scratch source window")
+            .source_window;
+        assert!(
+            editor
+                .window_manager
+                .window(source_window)
+                .expect("zoom never closes the source window")
+                .inner_width()
+                >= 25,
+            "zoom must retain a readable companion pane",
+        );
+        assert_eq!(editor.window_manager.window_count(), 1);
+        assert_eq!(editor.current_buffer().contents(), original_source);
+
+        assert!(editor.toggle_replay_pane_zoom(&workspace_id));
+        assert_eq!(
+            editor.panel_manager.panel_layout("replay-coach"),
+            Some((plugin::PanelSide::Left, 53)),
+        );
+        assert!(editor.replay_pane_zoom.is_none());
+
+        assert!(editor.focus_replay_demo_source(&workspace_id));
+        assert!(editor.toggle_replay_pane_zoom(&workspace_id));
+        assert_eq!(
+            editor.panel_manager.panel_layout("replay-coach"),
+            Some((plugin::PanelSide::Left, 25)),
+        );
+        assert!(editor.toggle_replay_pane_zoom(&workspace_id));
+        assert_eq!(
+            editor.panel_manager.panel_layout("replay-coach"),
+            Some((plugin::PanelSide::Left, 53)),
+        );
+        assert_eq!(editor.current_buffer().contents(), original_source);
+        assert_eq!(editor.window_manager.window_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn replay_zoom_restores_a_horizontally_docked_guide() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        let response = editor
+            .open_replay_demo_workspace(&mut render_buffer)
+            .await
+            .expect("open a replay before moving its panel");
+        let workspace_id = response["workspace_id"]
+            .as_str()
+            .expect("stable Replay workspace")
+            .to_string();
+        editor.test_create_text_panel(
+            "replay-coach",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Bottom,
+                width: 8,
+                title: Some("PR REPLAY".to_string()),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        assert!(editor.panel_manager.focus_panel("replay-coach"));
+
+        assert!(editor.toggle_replay_pane_zoom(&workspace_id));
+        assert_eq!(
+            editor.panel_manager.panel_layout("replay-coach"),
+            Some((plugin::PanelSide::Bottom, 20)),
+        );
+        assert!(editor.toggle_replay_pane_zoom(&workspace_id));
+        assert_eq!(
+            editor.panel_manager.panel_layout("replay-coach"),
+            Some((plugin::PanelSide::Bottom, 8)),
+        );
+        assert!(editor.replay_pane_zoom.is_none());
+    }
+
     #[test]
     fn replay_panel_follows_terminal_resizes_until_the_reviewer_chooses_a_width() {
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
@@ -25521,6 +25972,7 @@ mod test {
             (KeyCode::Left, KeyModifiers::SHIFT, "horizontal_left"),
             (KeyCode::Right, KeyModifiers::SHIFT, "horizontal_right"),
             (KeyCode::Char('n'), KeyModifiers::NONE, "next_unreviewed"),
+            (KeyCode::Char('z'), KeyModifiers::NONE, "zoom"),
             (
                 KeyCode::Char('N'),
                 KeyModifiers::SHIFT,

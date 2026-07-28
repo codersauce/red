@@ -1334,6 +1334,14 @@ impl RedHost {
                     step_id,
                 });
             }
+            "ReplayToggleZoom" => {
+                let workspace_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayToggleZoom requires a workspace id"))?
+                    .to_string();
+                self.send_request(PluginRequest::ReplayToggleZoom { workspace_id });
+            }
             "SetPanelVisible" => {
                 let id = args
                     .first()
@@ -8328,6 +8336,35 @@ mod tests {
         let guide = recv_replay_guide();
         assert!(guide.completions.is_empty());
         assert!(guide.notice.contains("pre-image"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn bundled_replay_zoom_targets_only_the_active_scratch_workspace() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        open_replay_demo(&mut runtime).await;
+
+        runtime.execute_command("ReplayZoom").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ReplayToggleZoom { workspace_id }
+                if workspace_id == "replay-workspace-1"
+        ));
+
+        runtime
+            .notify(
+                "panel:event:replay-coach",
+                serde_json::json!({ "action": "zoom" }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ReplayToggleZoom { workspace_id }
+                if workspace_id == "replay-workspace-1"
+        ));
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
