@@ -1419,6 +1419,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("isolated local replay Git fixture");
         let root = directory.path();
         fixture_git(root, &["init", "--initial-branch=master"]);
+        fixture_git(root, &["config", "core.autocrlf", "false"]);
         fixture_git(root, &["config", "user.name", "Replay Fixture"]);
         fixture_git(root, &["config", "user.email", "replay@example.test"]);
         fixture_git(
@@ -1463,6 +1464,7 @@ mod tests {
         let root = directory.path().join("replay-fixture");
         std::fs::create_dir(&root).expect("isolated repository directory");
         fixture_git(&root, &["init", "--initial-branch=master"]);
+        fixture_git(&root, &["config", "core.autocrlf", "false"]);
         fixture_git(&root, &["config", "user.name", "Replay Fixture"]);
         fixture_git(&root, &["config", "user.email", "replay@example.test"]);
         fixture_git(

@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashSet,
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{Read as _, Write as _},
     path::{Path, PathBuf},
 };
@@ -608,7 +608,7 @@ fn write_review_bundle(
     }
     #[cfg(unix)]
     {
-        File::open(parent)
+        fs::File::open(parent)
             .and_then(|directory| directory.sync_all())
             .map_err(|error| {
                 ReplayError::Filesystem(format!(

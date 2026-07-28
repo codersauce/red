@@ -24043,7 +24043,7 @@ mod test {
             .undo_replay_step(&mut render_buffer, &mut runtime)
             .await
             .expect("recovered Replay undo follows the exact original source transaction");
-        assert!(recovered.current_buffer().name().ends_with("/src/first.rs"));
+        assert!(Path::new(recovered.current_buffer().name()).ends_with("src/first.rs"));
         assert!(recovered
             .current_buffer()
             .contents()
@@ -24421,7 +24421,7 @@ mod test {
             "fn first() {\n    after_first();\n}\n",
         );
         assert_eq!(editor.buffer_manager.len(), 3);
-        assert!(editor.current_buffer().name().ends_with("/src/first.rs"));
+        assert!(Path::new(editor.current_buffer().name()).ends_with("src/first.rs"));
         assert!(editor
             .current_buffer()
             .contents()
@@ -24451,7 +24451,7 @@ mod test {
                 .contains("before_first()")
         );
         assert!(editor.focus_replay_step_source(workspace_id, &second));
-        assert!(editor.current_buffer().name().ends_with("/src/second.rs"));
+        assert!(Path::new(editor.current_buffer().name()).ends_with("src/second.rs"));
         assert!(editor
             .current_buffer()
             .contents()
@@ -24566,16 +24566,16 @@ mod test {
             .unwrap()
             .to_string();
 
-        assert!(editor.current_buffer().name().ends_with("/src/first.rs"));
+        assert!(Path::new(editor.current_buffer().name()).ends_with("src/first.rs"));
         assert_eq!(editor.vtop + editor.cy, 120);
         assert_eq!(editor.vtop, 117);
 
         assert!(editor.focus_replay_step_source(&workspace_id, &second));
-        assert!(editor.current_buffer().name().ends_with("/src/second.rs"));
+        assert!(Path::new(editor.current_buffer().name()).ends_with("src/second.rs"));
         assert_eq!(editor.vtop + editor.cy, 0);
 
         assert!(editor.focus_replay_step_source(&workspace_id, &first));
-        assert!(editor.current_buffer().name().ends_with("/src/first.rs"));
+        assert!(Path::new(editor.current_buffer().name()).ends_with("src/first.rs"));
         assert_eq!(editor.vtop + editor.cy, 120);
         assert_eq!(editor.vtop, 117);
     }
@@ -24610,7 +24610,7 @@ mod test {
             .await
             .expect("apply the first file's exact original hunk");
         assert!(editor.focus_replay_step_source(&workspace_id, &second));
-        assert!(editor.current_buffer().name().ends_with("/src/second.rs"));
+        assert!(Path::new(editor.current_buffer().name()).ends_with("src/second.rs"));
         editor.test_create_text_panel(
             "replay-coach",
             plugin::PanelConfig {
@@ -24628,7 +24628,7 @@ mod test {
             .expect("undo the latest actual applied source hunk from another file");
 
         assert_eq!(editor.test_focused_panel_id(), Some("replay-coach"));
-        assert!(editor.current_buffer().name().ends_with("/src/first.rs"));
+        assert!(Path::new(editor.current_buffer().name()).ends_with("src/first.rs"));
         assert!(editor
             .current_buffer()
             .contents()
@@ -24706,7 +24706,7 @@ mod test {
             editor.buffer_manager[first_index].contents(),
             manually_edited
         );
-        assert!(editor.current_buffer().name().ends_with("/src/second.rs"));
+        assert!(Path::new(editor.current_buffer().name()).ends_with("src/second.rs"));
         assert!(editor
             .last_error
             .as_deref()

@@ -2649,6 +2649,7 @@ mod tests {
         let root = directory.path().join(name);
         fs::create_dir(&root).expect("create the original fixture repository");
         replay_fixture_git(&root, &["init", "--quiet", "--initial-branch=master"]);
+        replay_fixture_git(&root, &["config", "core.autocrlf", "false"]);
         replay_fixture_git(&root, &["config", "user.name", "Replay Recovery Fixture"]);
         replay_fixture_git(
             &root,
@@ -2819,7 +2820,10 @@ mod tests {
             .parent()
             .unwrap()
             .join("recovery-fixture.replay-pr-2733-1234abc");
-        let workspace_argument = workspace.to_string_lossy().into_owned();
+        let workspace_argument = Path::new("..")
+            .join("recovery-fixture.replay-pr-2733-1234abc")
+            .to_string_lossy()
+            .into_owned();
         replay_fixture_git(
             &repository,
             &[
