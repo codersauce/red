@@ -1,8 +1,8 @@
 //! Structured, editor-native presentation for source-backed PR Replay panels.
 //!
 //! Replay retains the original unified patch while projecting its old and new
-//! source independently for Tree-sitter highlighting. Short hunks retain their
-//! natural height, long hunks scroll, and only the compact footer stays pinned.
+//! source independently for Tree-sitter highlighting. The change list remains
+//! pinned above an independently scrollable hunk and a compact status footer.
 
 use std::collections::HashSet;
 
@@ -23,7 +23,7 @@ use crate::{
         ReplayReviewDraft, ReplayReviewDraftKind, ReplayReviewReceipt, ReplayReviewRole,
     },
     theme::{SelectionForegroundPriority, Style, Theme},
-    ui::{ActionBar, ActionPriority, UiAction},
+    ui::{ActionBar, ActionBarRole, ActionPriority, UiAction},
     unicode_utils::{
         display_width, fit_display_width, truncate_display_width,
         truncate_display_width_with_marker, TruncationSide,
@@ -110,6 +110,8 @@ pub(crate) struct ReplayPanelModel {
     pub(crate) mode: ReplayPanelMode,
     #[serde(default)]
     pub(crate) hint_visible: bool,
+    #[serde(default)]
+    pub(crate) rationale_expanded: bool,
     #[serde(default)]
     pub(crate) help_visible: bool,
     #[serde(default)]
@@ -198,9 +200,12 @@ impl ReplayPanelState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ReplayPanelLayout {
     pub(super) header_rows: usize,
-    pub(super) diff_rows: usize,
-    pub(super) change_gap_rows: usize,
     pub(super) change_rows: usize,
+    pub(super) change_gap_rows: usize,
+    pub(super) rationale_rows: usize,
+    pub(super) status_rows: usize,
+    pub(super) source_rows: usize,
+    pub(super) diff_rows: usize,
     pub(super) footer_rows: usize,
 }
 
@@ -220,53 +225,123 @@ impl ReplayPanelLayout {
         if width == 0 || available_height == 0 {
             return Self {
                 header_rows: 0,
-                diff_rows: 0,
-                change_gap_rows: 0,
                 change_rows: 0,
+                change_gap_rows: 0,
+                rationale_rows: 0,
+                status_rows: 0,
+                source_rows: 0,
+                diff_rows: 0,
                 footer_rows: 0,
             };
         }
 
-        let footer_rows = if available_height >= 4 { 2 } else { 1 };
+        let footer_rows = 1;
         let content_height = available_height.saturating_sub(footer_rows);
-        let preferred_header = replay_header_lines(state, width).len();
-        let minimum_header = preferred_header.min(if content_height >= 6 { 4 } else { 1 });
+        let section_spacing = usize::from(available_height >= 28);
+        let preferred_header = replay_pinned_header_lines(state, width)
+            .len()
+            .saturating_add(section_spacing);
+        let minimum_header = preferred_header.min(if content_height >= 8 { 3 } else { 1 });
+        let source_rows =
+            usize::from(!state.document.lines.is_empty() && content_height > minimum_header);
+        let status_rows = usize::from(
+            content_height >= minimum_header.saturating_add(source_rows).saturating_add(3),
+        );
+        let preferred_rationale_rows = if content_height >= 14 {
+            2
+        } else if content_height >= 8 {
+            1
+        } else {
+            0
+        };
+        let mut rationale_rows = preferred_rationale_rows.min(
+            content_height
+                .saturating_sub(minimum_header)
+                .saturating_sub(source_rows)
+                .saturating_sub(status_rows),
+        );
         let minimum_diff = state
             .document
             .lines
             .len()
-            .min(5)
-            .min(content_height.saturating_sub(minimum_header));
+            .min(if content_height >= 14 { 6 } else { 1 })
+            .min(
+                content_height
+                    .saturating_sub(minimum_header)
+                    .saturating_sub(source_rows)
+                    .saturating_sub(rationale_rows)
+                    .saturating_sub(status_rows),
+            );
         let change_capacity = content_height
             .saturating_sub(minimum_header)
-            .saturating_sub(minimum_diff);
-        let preferred_change_gap = usize::from(change_capacity >= 3);
+            .saturating_sub(minimum_diff)
+            .saturating_sub(source_rows)
+            .saturating_sub(rationale_rows)
+            .saturating_sub(status_rows)
+            .saturating_sub(section_spacing);
+        let preferred_change_rows = if available_height >= 33 {
+            5
+        } else if available_height >= 23 {
+            4
+        } else {
+            3
+        };
         let change_rows = if change_capacity >= 2 {
-            state.model.steps.len().min(7).min(
-                change_capacity
-                    .saturating_sub(1)
-                    .saturating_sub(preferred_change_gap),
-            )
+            state
+                .model
+                .steps
+                .len()
+                .min(preferred_change_rows)
+                .min(change_capacity.saturating_sub(1))
         } else {
             0
         };
-        let change_gap_rows = preferred_change_gap * usize::from(change_rows > 0);
-        let changes_height = change_gap_rows
+        let change_gap_rows = if change_rows > 0 { section_spacing } else { 0 };
+        let changes_height = usize::from(change_rows > 0)
             .saturating_add(change_rows)
-            .saturating_add(usize::from(change_rows > 0));
+            .saturating_add(change_gap_rows)
+            .saturating_add(rationale_rows)
+            .saturating_add(status_rows)
+            .saturating_add(source_rows);
         let remaining = content_height.saturating_sub(changes_height);
         let header_rows = preferred_header.min(remaining.saturating_sub(minimum_diff));
-        let diff_rows = state
+        let mut diff_rows = state
             .document
             .lines
             .len()
             .min(remaining.saturating_sub(header_rows));
 
+        if state.model.rationale_expanded {
+            let requested_rows = replay_rationale_lines(state, width).len();
+            let additional_rows = requested_rows.saturating_sub(rationale_rows);
+            let used_rows = header_rows
+                .saturating_add(usize::from(change_rows > 0))
+                .saturating_add(change_rows)
+                .saturating_add(change_gap_rows)
+                .saturating_add(rationale_rows)
+                .saturating_add(status_rows)
+                .saturating_add(source_rows)
+                .saturating_add(diff_rows)
+                .saturating_add(footer_rows);
+            let unallocated_rows = available_height.saturating_sub(used_rows);
+            let from_unallocated = additional_rows.min(unallocated_rows);
+            let from_diff = additional_rows
+                .saturating_sub(from_unallocated)
+                .min(diff_rows.saturating_sub(1));
+            rationale_rows = rationale_rows
+                .saturating_add(from_unallocated)
+                .saturating_add(from_diff);
+            diff_rows = diff_rows.saturating_sub(from_diff);
+        }
+
         Self {
             header_rows,
-            diff_rows,
-            change_gap_rows,
             change_rows,
+            change_gap_rows,
+            rationale_rows,
+            status_rows,
+            source_rows,
+            diff_rows,
             footer_rows,
         }
     }
@@ -286,6 +361,11 @@ pub(super) fn render_replay_panel_title(
         format!("▌ {title}")
     } else {
         title.to_string()
+    };
+    let title = if state.model.view == ReplayPanelView::Guide {
+        format!("{title} · {}", state.model.mode.label())
+    } else {
+        title
     };
     let position_label = if state.model.view == ReplayPanelView::Outbox {
         if state.model.drafts.is_empty() {
@@ -373,10 +453,9 @@ pub(super) fn render_replay_panel(
     }
     let layout = ReplayPanelLayout::calculate(state, width, height);
 
-    let mut header = replay_header_lines(state, width);
+    let mut header = replay_pinned_header_lines(state, width);
     if layout.header_rows < header.len() && layout.header_rows > 0 {
-        let path = header.pop();
-        header.truncate(layout.header_rows.saturating_sub(1));
+        header.truncate(layout.header_rows);
         if let Some(line) = header.iter_mut().rev().find(|line| !line.is_empty()) {
             let text = line
                 .spans
@@ -397,41 +476,6 @@ pub(super) fn render_replay_panel(
                 style,
             );
         }
-        if let Some(path) = path {
-            header.push(path);
-        }
-    }
-    let hidden_above = viewport.scroll.min(state.document.lines.len());
-    let hidden_below = state
-        .document
-        .lines
-        .len()
-        .saturating_sub(viewport.scroll.saturating_add(layout.diff_rows));
-    if hidden_above > 0 || hidden_below > 0 {
-        if let (Some(step), Some(path)) = (state.model.current_step(), header.last_mut()) {
-            let mut progress = state
-                .model
-                .current_file_position()
-                .filter(|(_, count)| *count > 1)
-                .map_or_else(String::new, |(index, count)| {
-                    format!("{index}/{count} files · ")
-                });
-            if hidden_above > 0 {
-                progress.push_str(&format!("↑{hidden_above} "));
-            }
-            if hidden_below > 0 {
-                progress.push_str(&format!("↓{hidden_below} "));
-            }
-            progress.push_str("j/k");
-            *path = aligned_line(
-                &step.path,
-                TextPanelSpanStyle::Link,
-                progress.trim(),
-                TextPanelSpanStyle::Muted,
-                None,
-                width,
-            );
-        }
     }
     for (offset, line) in header.iter().take(layout.header_rows).enumerate() {
         render_text_spans_on_surface(
@@ -445,38 +489,18 @@ pub(super) fn render_replay_panel(
         );
     }
 
-    let diff_top = position.y.saturating_add(layout.header_rows);
-    let highlights = highlight_document(Some(&state.document), theme);
-    for (offset, (line, spans)) in state
-        .document
-        .lines
-        .iter()
-        .zip(highlights.iter())
-        .skip(viewport.scroll)
-        .take(layout.diff_rows)
-        .enumerate()
-    {
-        render_replay_diff_line(
+    let changes_top = position.y.saturating_add(layout.header_rows);
+    if layout.change_rows > 0 {
+        render_change_heading(
             buffer,
+            state,
             position.x,
-            diff_top.saturating_add(offset),
+            changes_top,
             width,
-            line,
-            spans,
+            layout.change_rows,
             theme,
         );
-    }
-
-    let changes_top = diff_top
-        .saturating_add(layout.diff_rows)
-        .saturating_add(layout.change_gap_rows);
-    if layout.change_rows > 0 {
-        render_change_heading(buffer, state, position.x, changes_top, width, theme);
-        let first = state
-            .model
-            .index
-            .saturating_sub(layout.change_rows / 2)
-            .min(state.model.steps.len().saturating_sub(layout.change_rows));
+        let first = replay_change_window_start(state, layout.change_rows);
         for (row, (index, step)) in state
             .model
             .steps
@@ -500,25 +524,109 @@ pub(super) fn render_replay_panel(
         }
     }
 
-    let footer_top = position
-        .y
-        .saturating_add(height.saturating_sub(layout.footer_rows));
-    if layout.footer_rows > 1 {
-        buffer.set_text(
+    let rationale_top = changes_top
+        .saturating_add(usize::from(layout.change_rows > 0))
+        .saturating_add(layout.change_rows)
+        .saturating_add(layout.change_gap_rows);
+    for (offset, line) in replay_rationale_lines(state, width)
+        .iter()
+        .take(layout.rationale_rows)
+        .enumerate()
+    {
+        render_text_spans_on_surface(
+            buffer,
             position.x,
-            footer_top,
-            &"─".repeat(width),
-            &theme.ui_style.muted.with_bg(theme.style.bg),
+            rationale_top.saturating_add(offset),
+            width,
+            line,
+            theme,
+            &theme.style,
         );
     }
+
+    let status_top = rationale_top.saturating_add(layout.rationale_rows);
+    if layout.status_rows > 0 {
+        render_replay_footer_status(buffer, &state.model, position.x, status_top, width, theme);
+    }
+
+    let source_top = status_top.saturating_add(layout.status_rows);
+    if layout.source_rows > 0 {
+        let hidden_above = viewport.scroll.min(state.document.lines.len());
+        let hidden_below = state
+            .document
+            .lines
+            .len()
+            .saturating_sub(viewport.scroll.saturating_add(layout.diff_rows));
+        let source = if let Some(step) = state.model.current_step() {
+            let mut details = Vec::new();
+            if let Some((index, count)) = state
+                .model
+                .current_file_position()
+                .filter(|(_, count)| *count > 1)
+            {
+                details.push(format!("{index}/{count} files"));
+            }
+            if hidden_above > 0 {
+                details.push(format!("↑{hidden_above}"));
+            }
+            if hidden_below > 0 {
+                details.push(format!("↓{hidden_below}"));
+            }
+            if hidden_above > 0 || hidden_below > 0 {
+                details.push("^D/^U".to_string());
+            }
+            aligned_line(
+                &step.path,
+                TextPanelSpanStyle::Link,
+                &details.join(" · "),
+                TextPanelSpanStyle::Muted,
+                None,
+                width,
+            )
+        } else {
+            RenderedTextLine::plain(String::new(), TextPanelSpanStyle::Text)
+        };
+        render_text_spans_on_surface(
+            buffer,
+            position.x,
+            source_top,
+            width,
+            &source,
+            theme,
+            &theme.style,
+        );
+    }
+
+    let diff_top = source_top.saturating_add(layout.source_rows);
+    let highlights = highlight_document(Some(&state.document), theme);
+    for (offset, (line, spans)) in state
+        .document
+        .lines
+        .iter()
+        .zip(highlights.iter())
+        .skip(viewport.scroll)
+        .take(layout.diff_rows)
+        .enumerate()
+    {
+        render_replay_diff_line(
+            buffer,
+            position.x,
+            diff_top.saturating_add(offset),
+            width,
+            line,
+            spans,
+            theme,
+        );
+    }
+
     let actions = replay_actions(&state.model, width);
-    ActionBar::new(&actions).render(
+    render_replay_action_bar(
         buffer,
         position.x,
         position.y.saturating_add(height.saturating_sub(1)),
         width,
+        &actions,
         theme,
-        &theme.style,
     );
 }
 
@@ -742,39 +850,6 @@ fn replay_header_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
             .take(2),
     );
 
-    if state.model.hint_visible {
-        let hint = format!("HINT  {}", step.hint);
-        lines.extend(
-            wrap_plain_text(&hint, width.max(1), TextPanelSpanStyle::Quote)
-                .into_iter()
-                .take(2),
-        );
-    }
-    if state.model.help_visible {
-        lines.extend(
-            wrap_plain_text(
-                "j/k scroll · h/l step · [/] file · a apply · u undo · c comment · r outbox · S save · L load · Ctrl-w H/J/K/L dock · Space R h hint",
-                width.max(1),
-                TextPanelSpanStyle::Muted,
-            )
-            .into_iter()
-            .take(2),
-        );
-    }
-    if !model.notice.is_empty() {
-        lines.extend(
-            wrap_plain_text(&model.notice, width.max(1), TextPanelSpanStyle::Quote)
-                .into_iter()
-                .take(2),
-        );
-    } else if let Some(completion) = model.current_completion() {
-        let status = format!("✓ {}", completion.completion);
-        lines.push(RenderedTextLine::plain(
-            truncate_display_width_with_marker(&status, width, "…", TruncationSide::Right),
-            TextPanelSpanStyle::Muted,
-        ));
-    }
-
     lines.push(RenderedTextLine::plain(
         String::new(),
         TextPanelSpanStyle::Text,
@@ -794,6 +869,147 @@ fn replay_header_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
         width,
     ));
     lines
+}
+
+fn replay_pinned_header_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTextLine> {
+    let model = &state.model;
+    let identity = if model.pull_request == 0 {
+        "LOCAL BRANCH".to_string()
+    } else {
+        format!("#{}", model.pull_request)
+    };
+    let title = model.title.trim();
+    let show_title = !title.is_empty()
+        && title != model.branch
+        && title.strip_prefix("Replay ") != Some(model.branch.as_str());
+    let headline = if show_title {
+        format!("{identity} · {title}")
+    } else {
+        identity
+    };
+    let role = match model.review_role.filter(|_| model.pull_request > 0) {
+        Some(ReplayReviewRole::Author) if !model.author_workspace_root.is_empty() => {
+            "AUTHOR · PR HEAD"
+        }
+        Some(ReplayReviewRole::Author) => "AUTHOR",
+        Some(ReplayReviewRole::Reviewer) => "REVIEW",
+        None => "",
+    };
+    let mut source = if model.pull_request == 0 {
+        model.branch.clone()
+    } else {
+        format!("@{} · {}", model.author, model.branch)
+    };
+    if !model.head_commit.is_empty() {
+        source.push_str(" · ");
+        source.extend(model.head_commit.chars().take(7));
+    }
+    let mut progress = format!("{}/{} reviewed", model.reviewed_count(), model.steps.len());
+    if !model.notes.is_empty() {
+        let suffix = if model.notes.len() == 1 {
+            "note"
+        } else {
+            "notes"
+        };
+        progress.push_str(&format!(" · {} {suffix}", model.notes.len()));
+    }
+    if model.draft_count > 0 {
+        let suffix = if model.draft_count == 1 {
+            "draft"
+        } else {
+            "drafts"
+        };
+        progress.push_str(&format!(" · {} {suffix}", model.draft_count));
+    }
+
+    vec![
+        aligned_line(
+            &headline,
+            TextPanelSpanStyle::Strong,
+            role,
+            TextPanelSpanStyle::Heading,
+            None,
+            width,
+        ),
+        aligned_line(
+            &source,
+            TextPanelSpanStyle::Muted,
+            &progress,
+            TextPanelSpanStyle::Muted,
+            None,
+            width,
+        ),
+    ]
+}
+
+fn replay_rationale_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTextLine> {
+    let Some(step) = state.model.current_step() else {
+        return Vec::new();
+    };
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let (label, rationale, body_style) = if state.model.hint_visible && !step.hint.is_empty() {
+        ("HINT  ", step.hint.as_str(), TextPanelSpanStyle::Quote)
+    } else {
+        ("WHY   ", step.why.as_str(), TextPanelSpanStyle::Muted)
+    };
+    let label_width = display_width(label).min(width);
+    let text_width = width.saturating_sub(label_width).max(1);
+    let body = wrap_plain_text(rationale, text_width, body_style);
+    let visible_rows = if state.model.rationale_expanded {
+        body.len()
+    } else {
+        2
+    };
+    let overflow = body.len() > visible_rows;
+
+    body.into_iter()
+        .take(visible_rows)
+        .enumerate()
+        .map(|(index, line)| {
+            let prefix = if index == 0 {
+                truncate_display_width(label, width)
+            } else {
+                " ".repeat(label_width)
+            };
+            let mut spans = vec![RenderedTextSpan {
+                text: prefix,
+                style: if index == 0 {
+                    TextPanelSpanStyle::Heading
+                } else {
+                    TextPanelSpanStyle::Text
+                },
+                syntax_style: None,
+                link: None,
+            }];
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>();
+            let text = if index.saturating_add(1) == visible_rows && overflow {
+                truncate_display_width_with_marker(
+                    &format!("{text}…"),
+                    text_width,
+                    "…",
+                    TruncationSide::Right,
+                )
+            } else {
+                truncate_display_width(&text, text_width)
+            };
+            if width > label_width {
+                spans.push(RenderedTextSpan {
+                    text,
+                    style: body_style,
+                    syntax_style: None,
+                    link: None,
+                });
+            }
+            RenderedTextLine { spans }
+        })
+        .collect()
 }
 
 /// Returns the complete scrollable row count of the selected Replay surface.
@@ -816,6 +1032,20 @@ pub(super) fn replay_visible_rows(state: &ReplayPanelState, width: usize, height
             .diff_rows
             .max(1)
     }
+}
+
+/// Keep visible changes stable until the selected step crosses a list edge.
+pub(super) fn replay_change_window_start(state: &ReplayPanelState, visible_rows: usize) -> usize {
+    if visible_rows == 0 {
+        return 0;
+    }
+
+    state
+        .model
+        .index
+        .saturating_div(visible_rows)
+        .saturating_mul(visible_rows)
+        .min(state.model.steps.len().saturating_sub(visible_rows))
 }
 
 /// Locates the actual native outbox selection marker for terminal cursor focus.
@@ -881,18 +1111,6 @@ fn replay_outbox_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
         String::new(),
         TextPanelSpanStyle::Text,
     ));
-
-    if !model.notice.is_empty() {
-        lines.extend(
-            wrap_plain_text(&model.notice, width.max(1), TextPanelSpanStyle::Quote)
-                .into_iter()
-                .take(2),
-        );
-        lines.push(RenderedTextLine::plain(
-            String::new(),
-            TextPanelSpanStyle::Text,
-        ));
-    }
 
     if model.drafts.is_empty() {
         let message = if model.review_role == Some(ReplayReviewRole::Author) {
@@ -1010,24 +1228,26 @@ fn render_replay_outbox(
     }
 
     if footer_rows > 1 {
-        buffer.set_text(
+        render_replay_footer_status(
+            buffer,
+            &state.model,
             position.x,
             position
                 .y
                 .saturating_add(height.saturating_sub(footer_rows)),
-            &"─".repeat(width),
-            &theme.ui_style.muted.with_bg(theme.style.bg),
+            width,
+            theme,
         );
     }
     if footer_rows > 0 {
         let actions = replay_outbox_actions(&state.model);
-        ActionBar::new(&actions).render(
+        render_replay_action_bar(
             buffer,
             position.x,
             position.y.saturating_add(height.saturating_sub(1)),
             width,
+            &actions,
             theme,
-            &theme.style,
         );
     }
 }
@@ -1047,30 +1267,35 @@ fn replay_outbox_actions(model: &ReplayPanelModel) -> Vec<UiAction> {
     let mut actions = Vec::new();
     if has_drafts {
         actions.push(
-            UiAction::new("navigate_draft", "[h/l]", "Select")
+            UiAction::new("navigate_draft", "j/k", "Select")
                 .with_priority(ActionPriority::Essential)
-                .with_compact_label("↔"),
+                .with_compact_label("Item"),
         );
     }
     actions.push(
-        UiAction::new("comment", "[c]", "Comment")
+        UiAction::new("outbox", "r", "Return")
             .with_priority(ActionPriority::Essential)
-            .with_compact_label("+"),
+            .with_compact_label("Back"),
+    );
+    actions.push(
+        UiAction::new("comment", "c", "Comment")
+            .with_priority(ActionPriority::Essential)
+            .with_compact_label("Note"),
     );
     if selected_is_local {
         actions.push(
-            UiAction::new("edit_draft", "[e]", "Edit")
-                .with_priority(ActionPriority::Essential)
-                .with_compact_label(""),
+            UiAction::new("edit_draft", "e", "Edit")
+                .with_priority(ActionPriority::Primary)
+                .with_compact_label("Edit"),
         );
         actions.push(
-            UiAction::new("discard_draft", "[d]", "Discard")
-                .with_priority(ActionPriority::Essential)
-                .with_compact_label(""),
+            UiAction::new("discard_draft", "d", "Discard")
+                .with_priority(ActionPriority::Primary)
+                .with_compact_label("Del"),
         );
     }
     actions.push(
-        UiAction::new("summary", "[s]", "Summary")
+        UiAction::new("summary", "s", "Summary")
             .with_priority(if has_drafts {
                 ActionPriority::Secondary
             } else {
@@ -1080,20 +1305,20 @@ fn replay_outbox_actions(model: &ReplayPanelModel) -> Vec<UiAction> {
     );
     if has_drafts || !model.notes.is_empty() {
         actions.push(
-            UiAction::new("save_review", "[S]", "Save")
+            UiAction::new("save_review", "S", "Save")
                 .with_priority(ActionPriority::Essential)
-                .with_compact_label(""),
+                .with_compact_label("Save"),
         );
     }
     if can_publish {
         actions.push(
-            UiAction::new("publish_review", "[P]", "Publish")
+            UiAction::new("publish_review", "P", "Publish")
                 .with_priority(ActionPriority::Essential)
-                .with_compact_label("↗"),
+                .with_compact_label("Post"),
         );
     }
     actions.push(
-        UiAction::new("load_review", "[L]", "Load")
+        UiAction::new("load_review", "L", "Load")
             .with_priority(if has_drafts {
                 ActionPriority::Secondary
             } else {
@@ -1101,27 +1326,16 @@ fn replay_outbox_actions(model: &ReplayPanelModel) -> Vec<UiAction> {
             })
             .with_compact_label("Load"),
     );
-    actions.push(
-        UiAction::new("outbox", "[r]", "Return")
-            .with_priority(ActionPriority::Essential)
-            .with_compact_label(if model.author_workspace_available {
-                ""
-            } else {
-                "↩"
-            }),
-    );
     if model.author_workspace_available {
-        actions.insert(
-            actions.len().saturating_sub(1),
-            UiAction::new("original_workspace", "[W]", "PR Head")
-                .with_priority(ActionPriority::Essential)
-                .with_compact_label(""),
+        actions.push(
+            UiAction::new("original_workspace", "W", "PR Head")
+                .with_priority(ActionPriority::Primary)
+                .with_compact_label("Head"),
         );
     }
     if model.review_role == Some(ReplayReviewRole::Author) {
-        actions.insert(
-            actions.len().saturating_sub(1),
-            UiAction::new("fix", "[F]", "Fix")
+        actions.push(
+            UiAction::new("fix", "F", "Fix")
                 .with_priority(ActionPriority::Secondary)
                 .with_compact_label("Fix"),
         );
@@ -1196,7 +1410,7 @@ fn render_replay_diff_line(
         return;
     }
 
-    let wide_gutter = width >= 52;
+    let wide_gutter = width >= 72;
     let gutter_width = if wide_gutter {
         13.min(width)
     } else {
@@ -1221,14 +1435,24 @@ fn render_replay_diff_line(
                 .map_or(String::new(), |line| line.to_string()),
         )
     };
-    let mut gutter_style = theme.ui_style.muted.with_bg(line_style.bg);
-    gutter_style.fg = diff_foreground(&line.kind, theme).or(gutter_style.fg);
+    let gutter_style = theme.ui_style.muted.with_bg(line_style.bg);
     buffer.set_text(
         x,
         y,
         &truncate_display_width(&gutter, gutter_width),
         &gutter_style,
     );
+    if marker != " " {
+        let marker_column = if wide_gutter { 10 } else { 5 };
+        if marker_column < width {
+            buffer.set_text(
+                x.saturating_add(marker_column),
+                y,
+                marker,
+                &change_kind_style(&line.kind, theme).with_bg(line_style.bg),
+            );
+        }
+    }
 
     let code_width = width.saturating_sub(gutter_width);
     if code_width == 0 {
@@ -1261,25 +1485,180 @@ fn render_replay_diff_line(
     );
 }
 
+fn render_replay_action_bar(
+    buffer: &mut RenderBuffer,
+    x: usize,
+    y: usize,
+    width: usize,
+    actions: &[UiAction],
+    theme: &Theme,
+) {
+    let layout = ActionBar::new(actions).render(buffer, x, y, width, theme, &theme.style);
+    let mut column = x;
+
+    for span in layout.spans {
+        if span.role == ActionBarRole::Key {
+            let foreground = theme.ui_style.picker_prompt.fg.or(theme.style.fg);
+            let key_style = Style {
+                fg: foreground,
+                bg: theme.style.bg,
+                bold: true,
+                italic: false,
+            };
+            buffer.set_text(column, y, &span.text, &key_style);
+        } else if span.role == ActionBarRole::Overflow {
+            buffer.set_text(
+                column,
+                y,
+                &span.text,
+                &theme.ui_style.muted.clone().with_bg(theme.style.bg),
+            );
+        }
+        column = column.saturating_add(display_width(&span.text));
+    }
+}
+
+fn render_replay_footer_status(
+    buffer: &mut RenderBuffer,
+    model: &ReplayPanelModel,
+    x: usize,
+    y: usize,
+    width: usize,
+    theme: &Theme,
+) {
+    if width == 0 || y >= buffer.height {
+        return;
+    }
+
+    let message = if model.notice.trim().is_empty() {
+        model
+            .current_completion()
+            .map(|completion| completion.completion.as_str())
+    } else {
+        Some(model.notice.trim())
+    };
+    let Some(message) = message else {
+        buffer.set_text(x, y, &" ".repeat(width), &theme.style);
+        return;
+    };
+
+    let normalized = message.to_ascii_lowercase();
+    let (marker, semantic_colors): (&str, &[&str]) = if [
+        "failed",
+        "could not",
+        "cannot",
+        "unable",
+        "expired",
+        "does not match",
+        "not posted",
+        "conflict",
+    ]
+    .iter()
+    .any(|pattern| normalized.contains(pattern))
+    {
+        ("✕ ", &["errorForeground", "editorError.foreground"])
+    } else if [
+        "already",
+        "choose",
+        "first changed",
+        "last changed",
+        "still",
+    ]
+    .iter()
+    .any(|pattern| normalized.contains(pattern))
+    {
+        (
+            "! ",
+            &["editorWarning.foreground", "list.warningForeground"],
+        )
+    } else if [
+        "saved",
+        "restored",
+        "applied",
+        "reconstructed",
+        "undid",
+        "published",
+        "posted",
+    ]
+    .iter()
+    .any(|pattern| normalized.contains(pattern))
+    {
+        ("✓ ", &["gitDecoration.addedResourceForeground"])
+    } else {
+        ("· ", &["editorInfo.foreground"])
+    };
+    let foreground = semantic_colors
+        .iter()
+        .find_map(|role| theme.colors.get(*role).copied())
+        .or(theme.ui_style.picker_prompt.fg);
+    let marker_style = Style {
+        fg: foreground,
+        bg: theme.style.bg,
+        bold: true,
+        italic: false,
+    };
+    let text_style = theme.ui_style.muted.clone().with_bg(theme.style.bg);
+    buffer.set_text(x, y, &" ".repeat(width), &text_style);
+
+    let end = x.saturating_add(width);
+    let column = render_change_segment(buffer, x, y, end, marker, &marker_style);
+    let single_line = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let visible = truncate_display_width_with_marker(
+        &single_line,
+        end.saturating_sub(column),
+        "…",
+        TruncationSide::Right,
+    );
+    render_change_segment(buffer, column, y, end, &visible, &text_style);
+}
+
 fn render_change_heading(
     buffer: &mut RenderBuffer,
     state: &ReplayPanelState,
     x: usize,
     y: usize,
     width: usize,
+    visible_rows: usize,
     theme: &Theme,
 ) {
-    let file_progress = state
+    let first = replay_change_window_start(state, visible_rows);
+    let hidden_above = first;
+    let hidden_below = state
         .model
-        .current_file_position()
-        .filter(|(_, count)| *count > 1)
-        .map_or_else(String::new, |(index, count)| {
-            format!("{index}/{count} files")
-        });
+        .steps
+        .len()
+        .saturating_sub(first.saturating_add(visible_rows));
+    let mut progress = vec![format!(
+        "{:02}/{:02}",
+        state.model.index.saturating_add(1),
+        state.model.steps.len(),
+    )];
+    if hidden_above > 0 {
+        progress.push(format!("↑{hidden_above}"));
+    }
+    if hidden_below > 0 {
+        progress.push(format!("↓{hidden_below}"));
+    }
+    if width >= 56 {
+        if let Some((index, count)) = state
+            .model
+            .current_file_position()
+            .filter(|(_, count)| *count > 1)
+        {
+            progress.insert(1, format!("file {index}/{count}"));
+        }
+    }
+    let details = format!("{} ─", progress.join(" · "));
+    let prefix = "─ CHANGES ";
+    let fill_width = width
+        .saturating_sub(display_width(prefix))
+        .saturating_sub(display_width(&details))
+        .saturating_sub(1);
+    let heading = format!("{prefix}{}", "─".repeat(fill_width));
     let line = aligned_line(
-        "CHANGES",
+        &heading,
         TextPanelSpanStyle::Heading,
-        &file_progress,
+        &details,
         TextPanelSpanStyle::Muted,
         None,
         width,
@@ -1334,14 +1713,12 @@ fn render_change_row(
         "⊕"
     } else if completion.is_some() {
         "✓"
-    } else if active {
-        "●"
     } else {
         "○"
     };
     let marker_style = if marker == "✓" {
         change_kind_style("add", theme)
-    } else if active || marker == "⊕" {
+    } else if marker == "⊕" {
         theme.ui_style.picker_prompt.clone()
     } else {
         theme.ui_style.muted.clone()
@@ -1406,53 +1783,68 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
     let has_multiple_files = model
         .current_file_position()
         .is_some_and(|(_, count)| count > 1);
-    let named_compact = width >= 44 && !has_multiple_files && !model.author_workspace_available;
     let mut actions = vec![
-        UiAction::new("edit", "[i]", "Source")
+        UiAction::new("navigate", "j/k", "Change")
+            .with_priority(if width >= 46 {
+                ActionPriority::Essential
+            } else {
+                ActionPriority::Primary
+            })
+            .with_compact_label("Chg"),
+        UiAction::new("edit", "i", "Source")
             .with_priority(ActionPriority::Essential)
-            .with_compact_label(if named_compact { "Src" } else { "" }),
-        UiAction::new("validate", "[v]", "Check")
+            .with_compact_label("Src"),
+        UiAction::new("validate", "v", "Check")
+            .with_priority(if width >= 46 {
+                ActionPriority::Essential
+            } else {
+                ActionPriority::Primary
+            })
+            .with_compact_label("Chk"),
+        UiAction::new("apply", "a", "Apply")
             .with_priority(ActionPriority::Essential)
-            .with_compact_label(if named_compact { "✓" } else { "" }),
-        UiAction::new("apply", "[a]", "Apply")
+            .with_compact_label("Apply"),
+        UiAction::new("undo", "u", "Undo")
             .with_priority(ActionPriority::Essential)
-            .with_compact_label(if named_compact { "+" } else { "" }),
-        UiAction::new("undo", "[u]", "Undo")
+            .with_compact_label("Undo"),
+        UiAction::new("help", "?", "Help")
             .with_priority(ActionPriority::Essential)
-            .with_compact_label(if named_compact { "↶" } else { "" }),
-        UiAction::new("navigate", "[h/l]", "Step")
-            .with_priority(ActionPriority::Essential)
-            .with_compact_label(if named_compact { "↔" } else { "" }),
-        UiAction::new("help", "[?]", "Help")
-            .with_priority(ActionPriority::Essential)
-            .with_compact_label(if named_compact { "?" } else { "" }),
+            .with_compact_label("Help"),
     ];
 
     if model.pull_request > 0 && model.review_role.is_some() {
         actions.insert(
             actions.len().saturating_sub(1),
-            UiAction::new("comment", "[c]", "Comment")
-                .with_priority(ActionPriority::Secondary)
-                .with_compact_label(""),
+            UiAction::new("comment", "c", "Note")
+                .with_priority(if width >= 60 {
+                    ActionPriority::Essential
+                } else {
+                    ActionPriority::Secondary
+                })
+                .with_compact_label("Note"),
         );
         actions.insert(
             actions.len().saturating_sub(1),
-            UiAction::new("outbox", "[r]", "Outbox")
-                .with_priority(ActionPriority::Secondary)
-                .with_compact_label(""),
+            UiAction::new("outbox", "r", "Outbox")
+                .with_priority(if width >= 58 {
+                    ActionPriority::Primary
+                } else {
+                    ActionPriority::Secondary
+                })
+                .with_compact_label("Outbox"),
         );
     }
 
     if model.author_workspace_available {
         actions.insert(
             actions.len().saturating_sub(1),
-            UiAction::new("original_workspace", "[W]", "PR Head")
-                .with_priority(if width >= 35 {
+            UiAction::new("original_workspace", "W", "Worktree")
+                .with_priority(if width >= 72 {
                     ActionPriority::Essential
                 } else {
                     ActionPriority::Secondary
                 })
-                .with_compact_label(""),
+                .with_compact_label("Worktree"),
         );
     }
 
@@ -1461,7 +1853,7 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
             5,
             UiAction::new("navigate_file", "[/]", "File")
                 .with_priority(ActionPriority::Essential)
-                .with_compact_label(""),
+                .with_compact_label("File"),
         );
         if ActionBar::new(&actions).layout(width).hidden_count() > 0 {
             actions.remove(5);
@@ -1474,8 +1866,36 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{replay::replay_demo_plan, theme::parse_vscode_theme};
+    use crate::{replay::replay_demo_plan, theme::parse_vscode_theme, ui::ActionBarLayout};
     use similar::TextDiff;
+
+    fn has_visible_key(layout: &ActionBarLayout, key: &str) -> bool {
+        layout
+            .spans
+            .iter()
+            .any(|span| span.role == ActionBarRole::Key && span.text == key)
+    }
+
+    fn assert_labeled_actions(layout: &ActionBarLayout) {
+        for (index, span) in layout.spans.iter().enumerate() {
+            if span.role != ActionBarRole::Key {
+                continue;
+            }
+            assert!(
+                layout.spans[index + 1..]
+                    .iter()
+                    .take_while(|candidate| {
+                        !matches!(candidate.role, ActionBarRole::Key | ActionBarRole::Overflow)
+                    })
+                    .any(|candidate| {
+                        candidate.role == ActionBarRole::Label && !candidate.text.trim().is_empty()
+                    }),
+                "Replay action {} must never be displayed without its label: {}",
+                span.text,
+                layout.text(),
+            );
+        }
+    }
 
     fn model() -> ReplayPanelModel {
         let plan = replay_demo_plan().expect("source-backed demo plan");
@@ -1497,6 +1917,7 @@ mod tests {
             index: 0,
             mode: ReplayPanelMode::Challenge,
             hint_visible: false,
+            rationale_expanded: false,
             help_visible: false,
             notice: String::new(),
             notes: Vec::new(),
@@ -1813,16 +2234,22 @@ mod tests {
     fn compact_layout_keeps_hunk_steps_and_footer_visible() {
         let state = state();
         let layout = ReplayPanelLayout::calculate(&state, /*width*/ 46, /*height*/ 23);
-        assert!(layout.header_rows >= 4);
-        assert!(layout.diff_rows >= 5);
-        assert_eq!(layout.change_rows, 5);
-        assert_eq!(layout.footer_rows, 2);
+        assert!(layout.header_rows >= 2);
+        assert!(layout.diff_rows >= 6);
+        assert_eq!(layout.change_rows, 4);
+        assert_eq!(layout.rationale_rows, 2);
+        assert_eq!(layout.status_rows, 1);
+        assert_eq!(layout.source_rows, 1);
+        assert_eq!(layout.footer_rows, 1);
         assert!(
             layout.header_rows
-                + layout.diff_rows
-                + layout.change_gap_rows
                 + usize::from(layout.change_rows > 0)
                 + layout.change_rows
+                + layout.change_gap_rows
+                + layout.rationale_rows
+                + layout.status_rows
+                + layout.source_rows
+                + layout.diff_rows
                 + layout.footer_rows
                 <= 23,
         );
@@ -1830,32 +2257,204 @@ mod tests {
     }
 
     #[test]
+    fn responsive_changes_use_three_four_or_five_pinned_rows() {
+        let state = state();
+
+        for (width, height, expected_changes) in [(39, 22, 3), (49, 26, 4), (69, 38, 5)] {
+            let layout = ReplayPanelLayout::calculate(&state, width, height);
+            assert_eq!(
+                layout.change_rows, expected_changes,
+                "unexpected visible change count at {width}×{height}",
+            );
+            assert_eq!(layout.rationale_rows, 2);
+            assert_eq!(layout.status_rows, 1);
+            assert_eq!(layout.source_rows, 1);
+            assert_eq!(layout.footer_rows, 1);
+            assert!(layout.diff_rows >= 6);
+        }
+    }
+
+    #[test]
+    fn normal_height_adds_section_breathing_room_without_cramping_short_terminals() {
+        let state = state();
+
+        let compact = ReplayPanelLayout::calculate(&state, /*width*/ 49, /*height*/ 26);
+        assert_eq!(compact.header_rows, 2);
+        assert_eq!(compact.change_gap_rows, 0);
+        assert_eq!(compact.change_rows, 4);
+
+        let spacious = ReplayPanelLayout::calculate(&state, /*width*/ 69, /*height*/ 38);
+        assert_eq!(spacious.header_rows, 3);
+        assert_eq!(spacious.change_gap_rows, 1);
+        assert_eq!(spacious.change_rows, 5);
+        assert_eq!(spacious.rationale_rows, 2);
+        assert!(spacious.diff_rows >= 6);
+    }
+
+    #[test]
+    fn hints_and_errors_never_move_the_changes_or_original_hunk() {
+        let original = model();
+        let mut changed = original.clone();
+        changed.hint_visible = true;
+        changed.notice = "Could not validate the exact original hunk.".to_string();
+
+        let original = ReplayPanelState::parse(&serde_json::to_string(&original).unwrap()).unwrap();
+        let changed = ReplayPanelState::parse(&serde_json::to_string(&changed).unwrap()).unwrap();
+        let width = 50;
+        let height = 22;
+        let original_layout = ReplayPanelLayout::calculate(&original, width, height);
+        let changed_layout = ReplayPanelLayout::calculate(&changed, width, height);
+        assert_eq!(original_layout, changed_layout);
+
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let mut before = RenderBuffer::new(width, height, &theme.style);
+        let mut after = RenderBuffer::new(width, height, &theme.style);
+        for (state, buffer) in [(&original, &mut before), (&changed, &mut after)] {
+            render_replay_panel(
+                buffer,
+                state,
+                Point::new(0, 0),
+                width,
+                height,
+                ReplayPanelViewport {
+                    scroll: 0,
+                    focused: true,
+                },
+                &theme,
+            );
+        }
+
+        let before = rendered_rows(&before);
+        let after = rendered_rows(&after);
+        let changes_row = original_layout.header_rows;
+        let rationale_row = changes_row
+            + usize::from(original_layout.change_rows > 0)
+            + original_layout.change_rows
+            + original_layout.change_gap_rows;
+        let status_row = rationale_row + original_layout.rationale_rows;
+        let source_row = status_row + original_layout.status_rows;
+
+        assert_eq!(before[changes_row], after[changes_row]);
+        assert_eq!(before[changes_row + 1], after[changes_row + 1]);
+        assert!(before[rationale_row].starts_with("WHY"));
+        assert!(after[rationale_row].starts_with("HINT"));
+        assert!(before[status_row].trim().is_empty());
+        assert!(after[status_row].starts_with('✕'));
+        assert!(after[status_row].contains("Could not validate"));
+        assert_eq!(before[source_row], after[source_row]);
+        assert_eq!(before[height - 1], after[height - 1]);
+    }
+
+    #[test]
+    fn expanding_the_rationale_keeps_navigation_pinned_and_reveals_its_complete_text() {
+        let mut replay = model();
+        replay.steps[0].why = "Preserve the complete original author rationale so a reviewer can read every sentence, understand the design tradeoff, and reconstruct the change without guessing what the ellipsis omitted.".to_string();
+        let collapsed = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+        replay.rationale_expanded = true;
+        let expanded = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+        let width = 50;
+        let height = 26;
+        let collapsed_layout = ReplayPanelLayout::calculate(&collapsed, width, height);
+        let expanded_layout = ReplayPanelLayout::calculate(&expanded, width, height);
+
+        assert_eq!(collapsed_layout.header_rows, expanded_layout.header_rows);
+        assert_eq!(collapsed_layout.change_rows, expanded_layout.change_rows);
+        assert_eq!(collapsed_layout.status_rows, expanded_layout.status_rows);
+        assert_eq!(collapsed_layout.footer_rows, expanded_layout.footer_rows);
+        assert_eq!(collapsed_layout.rationale_rows, 2);
+        assert!(expanded_layout.rationale_rows > collapsed_layout.rationale_rows);
+        assert!(expanded_layout.diff_rows >= 1);
+
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let mut buffer = RenderBuffer::new(width, height, &theme.style);
+        render_replay_panel(
+            &mut buffer,
+            &expanded,
+            Point::new(0, 0),
+            width,
+            height,
+            ReplayPanelViewport {
+                scroll: 0,
+                focused: true,
+            },
+            &theme,
+        );
+        assert!(rendered_rows(&buffer)
+            .iter()
+            .any(|row| row.contains("ellipsis omitted.")));
+    }
+
+    #[test]
+    fn visible_changes_do_not_recenter_until_selection_crosses_an_edge() {
+        let mut replay = model();
+
+        for (index, expected_first) in [(0, 0), (1, 0), (2, 0), (3, 2), (4, 2)] {
+            replay.index = index;
+            let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+            assert_eq!(
+                replay_change_window_start(&state, /*visible_rows*/ 3),
+                expected_first,
+                "the pinned list moved before change {index} crossed its edge",
+            );
+        }
+    }
+
+    #[test]
+    fn replay_footer_keys_use_themes_without_modifying_shared_action_bars() {
+        let model = model();
+        let width = 62;
+        let actions = replay_actions(&model, width);
+        let expected = ActionBar::new(&actions).layout(width);
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let mut buffer = RenderBuffer::new(width, /*height*/ 1, &theme.style);
+
+        render_replay_action_bar(&mut buffer, 0, 0, width, &actions, &theme);
+
+        let mut column = 0;
+        for span in &expected.spans {
+            if span.role == ActionBarRole::Key {
+                assert_eq!(
+                    buffer.cells[column].style.fg,
+                    theme.ui_style.picker_prompt.fg.or(theme.style.fg),
+                );
+                assert!(buffer.cells[column].style.bold);
+            }
+            column += display_width(&span.text);
+        }
+        assert_labeled_actions(&expected);
+        assert!(!expected.text().contains("[i]"));
+    }
+
+    #[test]
     fn replay_action_bar_keeps_complete_shortcuts_at_narrow_widths() {
         let actions = replay_actions(&model(), /*width*/ 30);
         let layout = ActionBar::new(&actions).layout(/*width*/ 30);
         let visible = layout.text();
-        assert!(visible.contains("[i]"));
-        assert!(visible.contains("[v]"));
-        assert!(visible.contains("[a]"));
-        assert!(visible.contains("[u]"));
-        assert!(visible.contains("[h/l]"));
-        assert!(visible.contains("[?]"));
+        for key in ["i", "a", "u", "?"] {
+            assert!(
+                has_visible_key(&layout, key),
+                "missing essential narrow Replay action {key}: {visible}",
+            );
+        }
+        assert_labeled_actions(&layout);
+        assert!(!visible.contains('['));
         assert!(display_width(&visible) <= 30);
-        assert_eq!(layout.hidden_count(), 0);
     }
 
     #[test]
     fn normal_width_replay_actions_keep_meaningful_compact_labels() {
-        let actions = replay_actions(&model(), /*width*/ 46);
-        let layout = ActionBar::new(&actions).layout(/*width*/ 46);
+        let actions = replay_actions(&model(), /*width*/ 62);
+        let layout = ActionBar::new(&actions).layout(/*width*/ 62);
         let visible = layout.text();
 
-        assert!(visible.contains("[i] Src") || visible.contains("[i] Source"));
-        assert!(visible.contains("[v] ✓") || visible.contains("[v] Check"));
-        assert!(visible.contains("[a] +") || visible.contains("[a] Apply"));
-        assert!(visible.contains("[u] ↶") || visible.contains("[u] Undo"));
-        assert!(visible.contains("[h/l] ↔") || visible.contains("[h/l] Step"));
-        assert!(visible.contains("[?] ?") || visible.contains("[?] Help"));
+        for key in ["j/k", "i", "v", "a", "u", "?"] {
+            assert!(
+                has_visible_key(&layout, key),
+                "missing meaningful Replay action {key}: {visible}",
+            );
+        }
+        assert_labeled_actions(&layout);
+        assert!(!visible.contains('['));
         assert_eq!(layout.hidden_count(), 0);
     }
 
@@ -1870,23 +2469,33 @@ mod tests {
         let layout = ActionBar::new(&actions).layout(/*width*/ 46);
         let visible = layout.text();
 
-        for key in ["[i]", "[v]", "[a]", "[u]", "[h/l]", "[W]", "[?]"] {
+        for key in ["i", "v", "a", "u", "?"] {
             assert!(
-                visible.contains(key),
+                has_visible_key(&layout, key),
                 "missing verified-author guide shortcut {key} at 46 columns: {visible}",
             );
         }
+        assert_labeled_actions(&layout);
         assert!(display_width(&visible) <= 46);
+
+        let author_actions = replay_actions(&replay, /*width*/ 87);
+        let author_layout = ActionBar::new(&author_actions).layout(/*width*/ 87);
+        assert!(
+            has_visible_key(&author_layout, "W"),
+            "the original PR worktree must be visible at a full author-pane width: {}",
+            author_layout.text(),
+        );
 
         let narrow_actions = replay_actions(&replay, /*width*/ 30);
         let narrow_layout = ActionBar::new(&narrow_actions).layout(/*width*/ 30);
         let narrow = narrow_layout.text();
-        for key in ["[i]", "[v]", "[a]", "[u]", "[h/l]", "[?]"] {
+        for key in ["i", "a", "u", "?"] {
             assert!(
-                narrow.contains(key),
+                has_visible_key(&narrow_layout, key),
                 "an author shortcut must not hide essential narrow-guide action {key}: {narrow}",
             );
         }
+        assert_labeled_actions(&narrow_layout);
         assert!(display_width(&narrow) <= 30);
     }
 
@@ -1909,7 +2518,10 @@ mod tests {
 
     #[test]
     fn compact_replay_header_marks_omitted_reason_and_visible_diff_overflow() {
-        let state = state();
+        let mut replay = model();
+        replay.mode = ReplayPanelMode::Snippet;
+        replay.steps[0].why = replay.steps[0].why.repeat(4);
+        let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
         let theme = parse_vscode_theme("themes/red.json").unwrap();
         let width = 46;
         let height = 24;
@@ -1930,13 +2542,13 @@ mod tests {
 
         let rows = rendered_rows(&buffer);
         assert!(
-            rows.iter()
-                .any(|row| row.contains("evaluated") && row.trim_end().ends_with('…')),
+            rows.iter().any(|row| row.starts_with("WHY"))
+                && rows.iter().any(|row| row.trim_end().ends_with('…')),
             "a truncated explanation must never appear falsely complete",
         );
         assert!(
             rows.iter().any(|row| {
-                row.contains("rendering.rs") && row.contains('↓') && row.contains("j/k")
+                row.contains("rendering.rs") && row.contains('↓') && row.contains("^D/^U")
             }),
             "the exact source must expose remaining changed lines and the scroll keys",
         );
@@ -1949,14 +2561,16 @@ mod tests {
         let layout = ActionBar::new(&actions).layout(/*width*/ 46);
         let visible = layout.text();
 
-        assert!(visible.contains("[c]"));
-        assert!(visible.contains("[s]"));
-        assert!(visible.contains("[L]"));
-        assert!(visible.contains("[r]"));
-        assert!(!visible.contains("[S]"));
-        assert!(!visible.contains("[h/l]"));
-        assert!(!visible.contains("[e]"));
-        assert!(!visible.contains("[d]"));
+        for key in ["c", "s", "L", "r"] {
+            assert!(
+                has_visible_key(&layout, key),
+                "missing usable empty-outbox action {key}: {visible}",
+            );
+        }
+        for key in ["S", "j/k", "e", "d"] {
+            assert!(!has_visible_key(&layout, key));
+        }
+        assert_labeled_actions(&layout);
         assert_eq!(layout.hidden_count(), 0);
     }
 
@@ -1974,12 +2588,13 @@ mod tests {
         let layout = ActionBar::new(&actions).layout(/*width*/ 46);
         let visible = layout.text();
 
-        for key in ["[h/l]", "[c]", "[e]", "[d]", "[S]", "[P]", "[r]"] {
+        for key in ["j/k", "c", "S", "P", "r"] {
             assert!(
-                visible.contains(key),
+                has_visible_key(&layout, key),
                 "missing essential original-PR outbox action {key}: {visible}"
             );
         }
+        assert_labeled_actions(&layout);
         assert!(display_width(&visible) <= 46);
     }
 
@@ -1999,10 +2614,20 @@ mod tests {
         let layout = ActionBar::new(&actions).layout(/*width*/ 46);
         let visible = layout.text();
 
-        for key in ["[h/l]", "[c]", "[e]", "[d]", "[S]", "[P]", "[W]", "[r]"] {
+        for key in ["j/k", "c", "S", "P", "r"] {
             assert!(
-                visible.contains(key),
+                has_visible_key(&layout, key),
                 "missing original-head author outbox action {key}: {visible}",
+            );
+        }
+        assert_labeled_actions(&layout);
+
+        let wide_layout = ActionBar::new(&actions).layout(/*width*/ 87);
+        for key in ["e", "d", "W"] {
+            assert!(
+                has_visible_key(&wide_layout, key),
+                "missing author action {key} at the default wide Replay size: {}",
+                wide_layout.text(),
             );
         }
         assert!(display_width(&visible) <= 46);
@@ -2091,12 +2716,13 @@ mod tests {
         let layout = ActionBar::new(&actions).layout(/*width*/ 46);
         let visible = layout.text();
 
-        for key in ["[h/l]", "[c]", "[e]", "[d]", "[S]", "[r]"] {
+        for key in ["j/k", "c", "S", "r"] {
             assert!(
-                visible.contains(key),
+                has_visible_key(&layout, key),
                 "missing essential outbox action {key}"
             );
         }
+        assert_labeled_actions(&layout);
         assert!(display_width(&visible) <= 46);
     }
 
@@ -2112,9 +2738,13 @@ mod tests {
         let layout = ActionBar::new(&actions).layout(/*width*/ 120);
         let visible = layout.text();
 
-        for key in ["[h/l]", "[c]", "[e]", "[d]", "[s]", "[S]", "[L]", "[r]"] {
-            assert!(visible.contains(key), "missing private review action {key}");
+        for key in ["j/k", "c", "e", "d", "s", "S", "L", "r"] {
+            assert!(
+                has_visible_key(&layout, key),
+                "missing private review action {key}: {visible}",
+            );
         }
+        assert_labeled_actions(&layout);
         assert_eq!(layout.hidden_count(), 0);
     }
 
@@ -2129,12 +2759,16 @@ mod tests {
         let layout = ActionBar::new(&actions).layout(/*width*/ 46);
         let visible = layout.text();
 
-        assert!(visible.contains("[S]"));
-        assert!(visible.contains("[L]"));
-        assert!(visible.contains("[r]"));
-        assert!(!visible.contains("[h/l]"));
-        assert!(!visible.contains("[e]"));
-        assert!(!visible.contains("[d]"));
+        for key in ["S", "L", "r"] {
+            assert!(
+                has_visible_key(&layout, key),
+                "missing private finding action {key}: {visible}",
+            );
+        }
+        for key in ["j/k", "e", "d"] {
+            assert!(!has_visible_key(&layout, key));
+        }
+        assert_labeled_actions(&layout);
         assert_eq!(layout.hidden_count(), 0);
     }
 
@@ -2145,26 +2779,30 @@ mod tests {
         let layout = ActionBar::new(&actions).layout(/*width*/ 46);
         let visible = layout.text();
 
-        for key in ["[i]", "[v]", "[a]", "[u]", "[h/l]", "[/]", "[?]"] {
-            assert!(visible.contains(key), "missing visible replay action {key}");
+        for key in ["j/k", "i", "v", "a", "u", "?"] {
+            assert!(
+                has_visible_key(&layout, key),
+                "missing visible Replay action {key}: {visible}",
+            );
         }
+        assert_labeled_actions(&layout);
         assert_eq!(layout.hidden_count(), 0);
 
         let compact_actions = replay_actions(&replay, /*width*/ 30);
         let compact_layout = ActionBar::new(&compact_actions).layout(/*width*/ 30);
         let compact_visible = compact_layout.text();
-        for key in ["[i]", "[v]", "[a]", "[u]", "[h/l]", "[?]"] {
+        for key in ["i", "a", "u", "?"] {
             assert!(
-                compact_visible.contains(key),
-                "missing essential narrow replay action {key}"
+                has_visible_key(&compact_layout, key),
+                "missing essential narrow Replay action {key}: {compact_visible}",
             );
         }
-        assert!(!compact_visible.contains("[/]"));
-        assert_eq!(compact_layout.hidden_count(), 0);
+        assert!(!has_visible_key(&compact_layout, "[/]"));
+        assert_labeled_actions(&compact_layout);
     }
 
     #[test]
-    fn short_hunk_separates_original_source_and_changes_by_one_blank_row() {
+    fn short_hunk_keeps_changes_pinned_above_complete_original_source() {
         let state = state();
         let theme = parse_vscode_theme("themes/red.json").unwrap();
         let width = 46;
@@ -2186,12 +2824,18 @@ mod tests {
         );
 
         let rows = rendered_rows(&buffer);
-        let changes_row = layout.header_rows + layout.diff_rows + layout.change_gap_rows;
+        let changes_row = layout.header_rows;
+        let source_row = changes_row
+            + usize::from(layout.change_rows > 0)
+            + layout.change_rows
+            + layout.change_gap_rows
+            + layout.rationale_rows
+            + layout.status_rows;
         assert_eq!(layout.diff_rows, state.document.lines.len());
-        assert_eq!(layout.change_gap_rows, 1);
-        assert!(rows[changes_row].starts_with("CHANGES"));
-        assert!(rows[changes_row - 1].trim().is_empty());
-        assert!(rows[changes_row - 2].contains(
+        assert!(rows[changes_row].starts_with("─ CHANGES"));
+        assert!(rows[source_row].contains("src/editor/rendering.rs"));
+        let last_source_row = source_row + layout.source_rows + layout.diff_rows - 1;
+        assert!(rows[last_source_row].contains(
             state
                 .document
                 .lines
@@ -2200,7 +2844,7 @@ mod tests {
                 .text
                 .trim(),
         ));
-        assert!(rows[height - 1].contains("[?]"));
+        assert!(rows[height - 1].contains("? Help"));
         assert!(!rows[height - 1].contains("LOCAL"));
     }
 
@@ -2231,7 +2875,7 @@ mod tests {
                 .iter()
                 .all(|cell| cell.style.bg == theme.style.bg));
         }
-        let changes_row = layout.header_rows + layout.diff_rows + layout.change_gap_rows;
+        let changes_row = layout.header_rows;
         assert!(buffer.cells[changes_row * width..(changes_row + 1) * width]
             .iter()
             .all(|cell| cell.style.bg == theme.style.bg));
@@ -2272,7 +2916,8 @@ mod tests {
         let rows = rendered_rows(&buffer);
         assert!(rows.iter().any(|row| row.trim_start().starts_with("✓ 01 ")));
         assert!(rows.iter().any(|row| row.trim_start().starts_with("⊕ 02 ")));
-        assert!(rows.iter().any(|row| row.starts_with("▶ ● 03 ")));
+        assert!(rows.iter().any(|row| row.starts_with("▶ ○ 03 ")));
+        assert!(!rows.iter().any(|row| row.starts_with("▶ ●")));
         assert!(!rows.iter().any(|row| row.contains(" ADD ")));
     }
 
@@ -2306,7 +2951,7 @@ mod tests {
                 SelectionForegroundPriority::Content,
             )
             .bg;
-        let row = layout.header_rows + layout.diff_rows + layout.change_gap_rows + 1;
+        let row = layout.header_rows + 1;
         assert!(buffer.cells[row * width..(row + 1) * width]
             .iter()
             .all(|cell| cell.style.bg == expected_background));
@@ -2342,7 +2987,7 @@ mod tests {
         let text = serde_json::to_string(&replay).unwrap();
         let state = ReplayPanelState::parse(&text).unwrap();
         let theme = parse_vscode_theme("themes/red.json").unwrap();
-        let width = 46;
+        let width = 62;
         let height = 35;
         let layout = ReplayPanelLayout::calculate(&state, width, height);
         let mut buffer = RenderBuffer::new(width, height, &theme.style);
@@ -2360,10 +3005,9 @@ mod tests {
             &theme,
         );
 
-        let heading =
-            &rendered_rows(&buffer)[layout.header_rows + layout.diff_rows + layout.change_gap_rows];
-        assert!(heading.starts_with("CHANGES"));
-        assert!(heading.contains("2/3 files"));
+        let heading = &rendered_rows(&buffer)[layout.header_rows];
+        assert!(heading.starts_with("─ CHANGES"));
+        assert!(heading.contains("file 2/3"));
     }
 
     #[test]
@@ -2525,9 +3169,9 @@ mod tests {
         assert!(rows
             .iter()
             .any(|row| row.contains("Please test the original viewport boundary.")));
-        assert!(rows[height - 1].contains("[h/l]"));
-        assert!(rows[height - 1].contains("[c]"));
-        assert!(rows[height - 1].contains("[r]"));
+        assert!(rows[height - 1].contains("j/k"));
+        assert!(rows[height - 1].contains("c "));
+        assert!(rows[height - 1].contains("r "));
         assert_eq!(
             replay_outbox_selected_row(&state, width),
             replay_outbox_lines(&state, width)
@@ -2598,7 +3242,7 @@ mod tests {
             .iter()
             .any(|row| row.contains("Review draft 7")));
         assert_eq!(top_rows[height - 1], scrolled_rows[height - 1]);
-        assert!(scrolled_rows[height - 1].contains("[r]"));
+        assert!(scrolled_rows[height - 1].contains("r "));
     }
 
     #[test]
@@ -2799,7 +3443,7 @@ mod tests {
         assert!(!unfocused_rows.iter().any(|row| row.starts_with('▶')));
 
         let layout = ReplayPanelLayout::calculate(&state, width, height);
-        let row = layout.header_rows + layout.diff_rows + layout.change_gap_rows + 1;
+        let row = layout.header_rows + 1;
         assert_ne!(
             focused.cells[row * width].style.bg,
             unfocused.cells[row * width].style.bg,
@@ -2877,18 +3521,16 @@ mod tests {
             );
 
             let rows = rendered_rows(&buffer);
-            let changes_row = layout.header_rows + layout.diff_rows + layout.change_gap_rows;
+            let changes_row = layout.header_rows;
             let footer = &rows[height - 1];
-            assert!(rows[changes_row].starts_with("CHANGES"));
-            assert_eq!(layout.change_gap_rows, 1);
-            assert!(rows[changes_row - 1].trim().is_empty());
-            for shortcut in ["[i]", "[v]", "[a]", "[u]", "[h/l]", "[?]"] {
+            assert!(rows[changes_row].starts_with("─ CHANGES"));
+            for shortcut in ["i ", "a ", "u ", "? "] {
                 assert!(
                     footer.contains(shortcut),
                     "missing {shortcut} at {width} columns"
                 );
             }
-            assert!(!footer.contains("… +"));
+            assert!(!footer.contains("[i]"));
         }
     }
 }

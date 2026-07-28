@@ -3513,6 +3513,10 @@ mod tests {
         while ACTION_DISPATCHER.try_recv_request().is_some() {}
     }
 
+    fn prepare_replay_runtime(runtime: &mut Runtime) {
+        runtime.set_snapshot("editor_info", serde_json::json!({ "size": [80, 24] }));
+    }
+
     fn recv_replay_guide() -> crate::plugin::replay_panel::ReplayPanelModel {
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdateTextPanel { id, blocks } => {
@@ -3747,6 +3751,7 @@ mod tests {
     }
 
     async fn accept_codex_pull_request_replay(runtime: &mut Runtime) -> RequestId {
+        prepare_replay_runtime(runtime);
         runtime
             .load_plugin("replay", include_str!("../../plugins/replay.hk"))
             .await
@@ -3853,6 +3858,20 @@ mod tests {
         crate::replay::ReplayDemoPlan,
         crate::plugin::replay_panel::ReplayPanelModel,
     ) {
+        open_replay_demo_at_width(runtime, /*terminal_width*/ 80).await
+    }
+
+    async fn open_replay_demo_at_width(
+        runtime: &mut Runtime,
+        terminal_width: usize,
+    ) -> (
+        crate::replay::ReplayDemoPlan,
+        crate::plugin::replay_panel::ReplayPanelModel,
+    ) {
+        runtime.set_snapshot(
+            "editor_info",
+            serde_json::json!({ "size": [terminal_width, 24] }),
+        );
         runtime
             .load_plugin("replay", include_str!("../../plugins/replay.hk"))
             .await
@@ -3890,7 +3909,10 @@ mod tests {
             PluginRequest::CreateTextPanel { id, config } => {
                 assert_eq!(id, "replay-coach");
                 assert_eq!(config.side, crate::plugin::PanelSide::Left);
-                assert_eq!(config.width, 46);
+                assert_eq!(
+                    config.width,
+                    (terminal_width.saturating_sub(1) / 2).min(100),
+                );
                 assert!(config.composer.is_none());
             }
             _ => panic!("expected a dedicated, read-only replay panel"),
@@ -3914,6 +3936,7 @@ mod tests {
         runtime: &mut Runtime,
         review_role: &str,
     ) -> crate::replay::ReplayPresentationPlan {
+        prepare_replay_runtime(runtime);
         runtime
             .load_plugin("replay", include_str!("../../plugins/replay.hk"))
             .await
@@ -4041,6 +4064,7 @@ mod tests {
         review_role: &str,
         source_kind: &str,
     ) -> crate::replay::ReplayPresentationPlan {
+        prepare_replay_runtime(runtime);
         runtime
             .load_plugin("replay", include_str!("../../plugins/replay.hk"))
             .await
@@ -4779,6 +4803,7 @@ mod tests {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
+        prepare_replay_runtime(&mut runtime);
         runtime
             .load_plugin("replay", include_str!("../../plugins/replay.hk"))
             .await
@@ -4826,6 +4851,7 @@ mod tests {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
+        prepare_replay_runtime(&mut runtime);
         runtime
             .load_plugin("replay", include_str!("../../plugins/replay.hk"))
             .await
@@ -4868,6 +4894,7 @@ mod tests {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
+        prepare_replay_runtime(&mut runtime);
         runtime
             .load_plugin("replay", include_str!("../../plugins/replay.hk"))
             .await
@@ -4957,6 +4984,7 @@ mod tests {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
+        prepare_replay_runtime(&mut runtime);
         runtime
             .load_plugin("replay", include_str!("../../plugins/replay.hk"))
             .await
@@ -5016,6 +5044,7 @@ mod tests {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
+        prepare_replay_runtime(&mut runtime);
         runtime
             .load_plugin("replay", include_str!("../../plugins/replay.hk"))
             .await
@@ -5118,6 +5147,7 @@ mod tests {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
+        prepare_replay_runtime(&mut runtime);
         runtime
             .load_plugin("replay", include_str!("../../plugins/replay.hk"))
             .await
@@ -5238,6 +5268,7 @@ mod tests {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
+        prepare_replay_runtime(&mut runtime);
         runtime
             .load_plugin("replay", include_str!("../../plugins/replay.hk"))
             .await
@@ -5313,6 +5344,7 @@ mod tests {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
+        prepare_replay_runtime(&mut runtime);
         runtime
             .load_plugin("replay", include_str!("../../plugins/replay.hk"))
             .await
@@ -5656,6 +5688,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_replay_pane_scales_to_real_terminal_width() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+
+        for terminal_width in [80, 100, 140, 160, 200, 240] {
+            drain_requests();
+            let mut runtime = Runtime::new();
+            let (_, guide) = open_replay_demo_at_width(&mut runtime, terminal_width).await;
+
+            assert_eq!(guide.index, 0);
+            assert_eq!(guide.steps.len(), 5);
+            assert!(
+                ACTION_DISPATCHER.try_recv_request().is_none(),
+                "responsive Replay initialization left a pending request at {terminal_width} columns",
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn bundled_replay_demo_opens_a_dedicated_panel_with_real_per_step_diffs() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -5697,6 +5747,26 @@ mod tests {
             .hint
             .contains("An inclusive Rust range"));
 
+        runtime
+            .notify(
+                "panel:event:replay-coach",
+                serde_json::json!({ "action": "activate" }),
+            )
+            .await
+            .unwrap();
+        let guide = recv_replay_guide();
+        assert!(guide.rationale_expanded);
+
+        runtime
+            .notify(
+                "panel:event:replay-coach",
+                serde_json::json!({ "action": "activate" }),
+            )
+            .await
+            .unwrap();
+        let guide = recv_replay_guide();
+        assert!(!guide.rationale_expanded);
+
         runtime.execute_command("ReplayToggleMode").await.unwrap();
         let guide = recv_replay_guide();
         assert_eq!(
@@ -5710,8 +5780,48 @@ mod tests {
             .contains("diagnostics_by_visible_line"));
 
         runtime.execute_command("ReplayHelp").await.unwrap();
-        let guide = recv_replay_guide();
-        assert!(guide.help_visible);
+        let help = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                owner,
+                handle,
+                title,
+                items,
+                options,
+                ..
+            } => {
+                assert_eq!(owner, "replay");
+                assert_eq!(title.as_deref(), Some("PR Replay shortcuts"));
+                for id in [
+                    "change",
+                    "scroll-lines",
+                    "scroll-half",
+                    "rationale",
+                    "apply",
+                ] {
+                    assert!(
+                        items.iter().any(|item| item.id == id),
+                        "Replay shortcut popup is missing {id}",
+                    );
+                }
+                assert!(items
+                    .iter()
+                    .any(|item| item.id == "apply" && item.label.contains("a / u")));
+                assert_eq!(options.presentation, crate::ui::PickerPresentation::Compact,);
+                assert!(options
+                    .status
+                    .as_deref()
+                    .is_some_and(|status| status.contains("Esc close")),);
+                handle
+            }
+            _ => panic!("expected an isolated, dismissible Replay keyboard-help popup"),
+        };
+        assert!(runtime
+            .notify_picker(help, PickerCallback::Cancelled)
+            .expect("close the Replay keyboard-help popup without changing the review"));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusPanel { id } if id == "replay-coach"
+        ));
 
         runtime.execute_command("ReplayValidate").await.unwrap();
         let request_id = match ACTION_DISPATCHER.recv_request() {
@@ -5747,13 +5857,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bundled_replay_vim_horizontal_keys_navigate_without_stealing_scroll_or_hints() {
+    async fn bundled_replay_vertical_steps_preserve_scroll_and_legacy_aliases() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         open_replay_demo(&mut runtime).await;
 
-        for (action, expected_index) in [("expand", 1), ("collapse", 0), ("n", 1), ("p", 0)] {
+        for (action, expected_index) in [
+            ("next", 1),
+            ("previous", 0),
+            ("expand", 1),
+            ("collapse", 0),
+            ("n", 1),
+            ("p", 0),
+        ] {
             runtime
                 .notify(
                     "panel:event:replay-coach",
@@ -5985,6 +6102,7 @@ mod tests {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
+        prepare_replay_runtime(&mut runtime);
         runtime
             .load_plugin("replay", include_str!("../../plugins/replay.hk"))
             .await
@@ -6082,6 +6200,7 @@ mod tests {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
+        prepare_replay_runtime(&mut runtime);
         runtime
             .load_plugin("replay", include_str!("../../plugins/replay.hk"))
             .await

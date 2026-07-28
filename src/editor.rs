@@ -4832,6 +4832,7 @@ impl Editor {
         self.divider_drag = None;
         let max_y = (height as usize).saturating_sub(2);
         self.cy = self.cy.min(max_y.saturating_sub(1));
+        self.resize_default_replay_panel(usize::from(width));
         self.resize_window_layout((width as usize, height as usize));
         self.invalidate_terminal_render_state(buffer);
 
@@ -4845,6 +4846,30 @@ impl Editor {
         if self.current_dialog.is_some() && !dialog_resized {
             self.current_dialog = None;
         }
+    }
+
+    fn resize_default_replay_panel(&mut self, terminal_width: usize) {
+        let Some((side, _)) = self.panel_manager.panel_layout("replay-coach") else {
+            return;
+        };
+        if !matches!(side, plugin::PanelSide::Left | plugin::PanelSide::Right) {
+            return;
+        }
+
+        let mut width = (terminal_width.saturating_sub(1) / 2).min(100);
+        let minimum_source_width = if terminal_width >= 77 {
+            38
+        } else {
+            MIN_EDITOR_WINDOW_WIDTH
+        };
+        let maximum_width = terminal_width
+            .saturating_sub(minimum_source_width)
+            .saturating_sub(1)
+            .max(1);
+        width = width.clamp(1, maximum_width);
+
+        self.panel_manager
+            .update_default_panel_layout("replay-coach", side, width);
     }
 
     fn apply_panel_layout(&mut self) {
@@ -9755,7 +9780,11 @@ impl Editor {
                     needs_render = true;
                 }
                 PluginRequest::CreateTextPanel { id, config } => {
+                    let is_replay_panel = id == "replay-coach";
                     self.panel_manager.create_text_panel(id, config);
+                    if is_replay_panel {
+                        self.resize_default_replay_panel(usize::from(self.size.0));
+                    }
                     self.apply_panel_layout();
                     needs_render = true;
                 }
@@ -11994,10 +12023,40 @@ impl Editor {
                         self.panel_manager.focus_editor();
                         return Some(KeyAction::Single(Action::Refresh));
                     }
+                    KeyCode::Up
+                        if event.modifiers.contains(KeyModifiers::SHIFT)
+                            && self.panel_manager.focused_replay_is_guide() =>
+                    {
+                        "up"
+                    }
+                    KeyCode::Down
+                        if event.modifiers.contains(KeyModifiers::SHIFT)
+                            && self.panel_manager.focused_replay_is_guide() =>
+                    {
+                        "down"
+                    }
+                    KeyCode::Up | KeyCode::Char('k')
+                        if self.panel_manager.focused_replay_status().is_some() =>
+                    {
+                        "previous"
+                    }
+                    KeyCode::Down | KeyCode::Char('j')
+                        if self.panel_manager.focused_replay_status().is_some() =>
+                    {
+                        "next"
+                    }
+                    KeyCode::Char('K') if self.panel_manager.focused_replay_is_guide() => "up",
+                    KeyCode::Char('J') if self.panel_manager.focused_replay_is_guide() => "down",
                     KeyCode::Up | KeyCode::Char('k') => "up",
                     KeyCode::Down | KeyCode::Char('j') => "down",
                     KeyCode::PageUp => "page_up",
                     KeyCode::PageDown => "page_down",
+                    KeyCode::Char('u') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                        "half_page_up"
+                    }
+                    KeyCode::Char('d') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                        "half_page_down"
+                    }
                     KeyCode::Char('b') if event.modifiers.contains(KeyModifiers::CONTROL) => {
                         "page_up"
                     }
@@ -12018,6 +12077,16 @@ impl Editor {
                         "previous_file"
                     }
                     KeyCode::Char(']') if self.panel_manager.focused_replay_is_guide() => {
+                        "next_file"
+                    }
+                    KeyCode::Left | KeyCode::Char('h')
+                        if self.panel_manager.focused_replay_is_guide() =>
+                    {
+                        "previous_file"
+                    }
+                    KeyCode::Right | KeyCode::Char('l')
+                        if self.panel_manager.focused_replay_is_guide() =>
+                    {
                         "next_file"
                     }
                     KeyCode::Char('a') if !self.panel_manager.focused_row_panel() => {
@@ -25278,6 +25347,41 @@ mod test {
         assert_eq!(editor.buffer_manager[0].contents(), "hello");
     }
 
+    #[test]
+    fn replay_panel_follows_terminal_resizes_until_the_reviewer_chooses_a_width() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+        editor.test_create_text_panel(
+            "replay-coach",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Left,
+                width: 39,
+                title: Some("PR REPLAY".to_string()),
+                ..plugin::PanelConfig::default()
+            },
+        );
+
+        editor.resize_terminal_surface(/*width*/ 160, /*height*/ 45, &mut render_buffer);
+        assert_eq!(
+            editor.panel_manager.panel_layout("replay-coach"),
+            Some((plugin::PanelSide::Left, 79)),
+        );
+        assert_eq!(
+            editor
+                .panel_manager
+                .panel_default_size("replay-coach", plugin::PanelSide::Left),
+            Some(79),
+        );
+
+        assert!(editor.set_panel_size("replay-coach", plugin::PanelSide::Left, 90));
+        editor.resize_terminal_surface(/*width*/ 200, /*height*/ 48, &mut render_buffer);
+        assert_eq!(
+            editor.panel_manager.panel_layout("replay-coach"),
+            Some((plugin::PanelSide::Left, 90)),
+        );
+    }
+
     #[tokio::test]
     async fn focused_replay_guide_owns_the_status_line_and_terminal_cursor() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
@@ -25324,12 +25428,43 @@ mod test {
         assert!(status.contains("REPLAY"));
         assert!(status.contains("PR #482"));
         assert!(status.contains("01/05"));
-        for (key, expected_action) in [('[', "previous_file"), (']', "next_file")] {
+        for (code, modifiers, expected_action) in [
+            (KeyCode::Char('j'), KeyModifiers::NONE, "next"),
+            (KeyCode::Down, KeyModifiers::NONE, "next"),
+            (KeyCode::Char('k'), KeyModifiers::NONE, "previous"),
+            (KeyCode::Up, KeyModifiers::NONE, "previous"),
+            (KeyCode::Char('J'), KeyModifiers::SHIFT, "down"),
+            (KeyCode::Char('K'), KeyModifiers::SHIFT, "up"),
+            (KeyCode::Char('d'), KeyModifiers::CONTROL, "half_page_down"),
+            (KeyCode::Char('u'), KeyModifiers::CONTROL, "half_page_up"),
+            (KeyCode::Enter, KeyModifiers::NONE, "activate"),
+        ] {
             let action = editor
-                .test_handle_event(Event::Key(KeyEvent::new(
-                    KeyCode::Char(key),
-                    KeyModifiers::NONE,
-                )))
+                .test_handle_event(Event::Key(KeyEvent::new(code, modifiers)))
+                .expect("dispatch independent Replay list or hunk motion");
+
+            assert!(matches!(
+                action,
+                Some(KeyAction::Multiple(actions)) if actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        Action::NotifyPlugins(event, payload)
+                            if event == "panel:event:replay-coach"
+                                && payload["action"] == expected_action
+                    )
+                })
+            ));
+        }
+        for (code, expected_action) in [
+            (KeyCode::Char('['), "previous_file"),
+            (KeyCode::Char(']'), "next_file"),
+            (KeyCode::Char('h'), "previous_file"),
+            (KeyCode::Char('l'), "next_file"),
+            (KeyCode::Left, "previous_file"),
+            (KeyCode::Right, "next_file"),
+        ] {
+            let action = editor
+                .test_handle_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
                 .expect("dispatch focused Replay changed-file motion");
 
             assert!(matches!(

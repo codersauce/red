@@ -18,9 +18,9 @@ use super::markdown::{
     render_markdown_lines, wrap_plain_text, RenderedTextLine, RenderedTextSpan, TextPanelSpanStyle,
 };
 use super::replay_panel::{
-    render_replay_panel, render_replay_panel_title, replay_content_line_count,
-    replay_outbox_selected_row, replay_visible_rows, ReplayPanelLayout, ReplayPanelState,
-    ReplayPanelView, ReplayPanelViewport,
+    render_replay_panel, render_replay_panel_title, replay_change_window_start,
+    replay_content_line_count, replay_outbox_selected_row, replay_visible_rows, ReplayPanelLayout,
+    ReplayPanelState, ReplayPanelView, ReplayPanelViewport,
 };
 use super::text_link::{TextPanelLink, TextPanelLinkTarget};
 use crate::{
@@ -408,6 +408,11 @@ impl TextPanel {
     fn page_scroll(&mut self, delta: isize, panel_height: usize, panel_width: usize) {
         let page = self.visible_rows(panel_height, panel_width).max(1) as isize;
         self.move_scroll(delta.saturating_mul(page), panel_height, panel_width);
+    }
+
+    fn half_page_scroll(&mut self, delta: isize, panel_height: usize, panel_width: usize) {
+        let half_page = (self.visible_rows(panel_height, panel_width) / 2).max(1) as isize;
+        self.move_scroll(delta.saturating_mul(half_page), panel_height, panel_width);
     }
 
     fn scroll_to_top(&mut self) {
@@ -903,6 +908,25 @@ impl PanelManager {
         changed
     }
 
+    /// Updates a responsive default without overriding a user-selected size.
+    pub fn update_default_panel_layout(&mut self, id: &str, side: PanelSide, width: usize) -> bool {
+        let Some((current_side, current_width)) = self.panel_layout(id) else {
+            return false;
+        };
+        if current_side != side
+            || self.panel_default_size(id, side) != Some(current_width)
+            || self.panel_preferred_size(id, side) != Some(current_width)
+            || !self.update_panel_layout(id, side, width)
+        {
+            return false;
+        }
+
+        if let Some(sizes) = self.preferred_sizes.get_mut(id) {
+            sizes.axis_mut(side).default = Some(width);
+        }
+        true
+    }
+
     /// Returns the docking edge and requested size of a stable panel.
     pub fn panel_layout(&self, id: &str) -> Option<(PanelSide, usize)> {
         self.panel_config(id)
@@ -1128,6 +1152,8 @@ impl PanelManager {
             match action {
                 "up" => panel.move_scroll(-1, panel_height, width),
                 "down" => panel.move_scroll(1, panel_height, width),
+                "half_page_up" => panel.half_page_scroll(-1, panel_height, width),
+                "half_page_down" => panel.half_page_scroll(1, panel_height, width),
                 "page_up" => {
                     panel.page_scroll(-1, panel_height, width);
                 }
@@ -1502,11 +1528,7 @@ impl PanelManager {
             if layout.change_rows == 0 {
                 return Some((placement.x, placement.y));
             }
-            let first = replay
-                .model
-                .index
-                .saturating_sub(layout.change_rows / 2)
-                .min(replay.model.steps.len().saturating_sub(layout.change_rows));
+            let first = replay_change_window_start(replay, layout.change_rows);
             let selected_row = replay
                 .model
                 .index
@@ -1518,8 +1540,6 @@ impl PanelManager {
                     .y
                     .saturating_add(title_rows)
                     .saturating_add(layout.header_rows)
-                    .saturating_add(layout.diff_rows)
-                    .saturating_add(layout.change_gap_rows)
                     .saturating_add(1)
                     .saturating_add(selected_row),
             ));
@@ -2580,6 +2600,7 @@ mod tests {
             index: 0,
             mode,
             hint_visible: false,
+            rationale_expanded: false,
             help_visible: false,
             notice: String::new(),
             notes: Vec::new(),
@@ -3014,6 +3035,40 @@ mod tests {
     }
 
     #[test]
+    fn responsive_panel_default_follows_terminal_without_losing_manual_resize() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "responsive-guide".to_string(),
+            PanelConfig {
+                side: PanelSide::Left,
+                width: 50,
+                ..PanelConfig::default()
+            },
+        );
+
+        assert!(manager.update_default_panel_layout("responsive-guide", PanelSide::Left, 99));
+        assert_eq!(
+            manager.panel_layout("responsive-guide"),
+            Some((PanelSide::Left, 99)),
+        );
+        assert_eq!(
+            manager.panel_default_size("responsive-guide", PanelSide::Left),
+            Some(99),
+        );
+        assert!(manager.update_default_panel_layout("responsive-guide", PanelSide::Left, 124));
+        assert!(manager.update_panel_layout("responsive-guide", PanelSide::Left, 90));
+        assert!(!manager.update_default_panel_layout("responsive-guide", PanelSide::Left, 155));
+        assert_eq!(
+            manager.panel_layout("responsive-guide"),
+            Some((PanelSide::Left, 90)),
+        );
+        assert_eq!(
+            manager.panel_default_size("responsive-guide", PanelSide::Left),
+            Some(124),
+        );
+    }
+
+    #[test]
     fn four_sided_panel_geometry_is_safe_in_tiny_terminals() {
         for side in [
             PanelSide::Left,
@@ -3125,7 +3180,7 @@ mod tests {
         let footer_row = placement.y + placement.height - 1;
         assert!(rows[0].contains("PR REPLAY"));
         assert!(rows[0].contains("01 / 05"));
-        assert!(rows.iter().any(|line| line.contains("CURRENT CHANGE")));
+        assert!(rows.iter().any(|line| line.starts_with("WHY")));
         assert!(rows.iter().any(|line| line.contains("visible_start")));
         assert!(rows.iter().all(|line| !line.contains("diff --git")));
         assert!(rows[change_row + 1].contains("Capture the visible viewport"));
@@ -3134,12 +3189,20 @@ mod tests {
         let marker = &buffer.cells[active_row * buffer.width + placement.x];
         let badge = &buffer.cells[active_row * buffer.width + placement.x + 5];
         assert_eq!(marker.style.bg, badge.style.bg);
-        assert!(row_text(&buffer, footer_row).contains("[i]"));
-        assert!(row_text(&buffer, footer_row).contains("[v]"));
-        assert!(row_text(&buffer, footer_row).contains("[a]"));
-        assert!(row_text(&buffer, footer_row).contains("[?]"));
+        let footer = row_text(&buffer, footer_row);
+        for key in ["j/k ", "i ", "v ", "a ", "? "] {
+            assert!(
+                footer.contains(key),
+                "missing Replay action {key}: {footer}"
+            );
+        }
 
-        let visible_hunk = rows[..change_row].join("\n");
+        let source_row = rows
+            .iter()
+            .position(|line| line.contains("src/editor/rendering.rs"))
+            .expect("pinned original source path");
+        assert!(change_row < source_row);
+        let visible_hunk = rows[source_row + 1..rows.len() - 1].join("\n");
         manager
             .handle_focused_key(
                 "bottom", /*panel_height*/ 24, /*terminal_width*/ 96,
@@ -3154,7 +3217,84 @@ mod tests {
         assert_eq!(scrolled_rows[change_row], rows[change_row]);
         assert_eq!(scrolled_rows[change_row + 1], rows[change_row + 1]);
         assert_eq!(row_text(&buffer, footer_row), rows[rows.len() - 1]);
-        assert_ne!(scrolled_rows[..change_row].join("\n"), visible_hunk);
+        assert_ne!(
+            scrolled_rows[source_row + 1..scrolled_rows.len() - 1].join("\n"),
+            visible_hunk,
+        );
+    }
+
+    #[test]
+    fn replay_half_pages_and_mouse_wheel_scroll_without_changing_the_step() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "replay-coach".to_string(),
+            PanelConfig {
+                side: PanelSide::Left,
+                width: 50,
+                title: Some("PR REPLAY".to_string()),
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_text_panel(
+            "replay-coach",
+            vec![structured_replay_block(ReplayPanelMode::Snippet)],
+            /*panel_height*/ 18,
+            /*terminal_width*/ 80,
+        );
+        assert!(manager.scroll_text_panel_to_top("replay-coach"));
+        assert!(manager.focus_panel("replay-coach"));
+
+        let event = manager
+            .handle_focused_key(
+                "half_page_down",
+                /*panel_height*/ 18,
+                /*terminal_width*/ 80,
+                /*scrolloff*/ 0,
+            )
+            .expect("scroll the original diff half a page");
+        assert_eq!(event.action, "half_page_down");
+        assert!(manager.text_panels["replay-coach"].scroll > 0);
+        assert_eq!(
+            manager.text_panels["replay-coach"]
+                .replay
+                .as_ref()
+                .unwrap()
+                .model
+                .index,
+            0,
+        );
+
+        let event = manager
+            .handle_focused_key(
+                "half_page_up",
+                /*panel_height*/ 18,
+                /*terminal_width*/ 80,
+                /*scrolloff*/ 0,
+            )
+            .expect("scroll the original diff back up");
+        assert_eq!(event.action, "half_page_up");
+        assert_eq!(manager.text_panels["replay-coach"].scroll, 0);
+
+        let event = manager
+            .handle_mouse_scroll(
+                "replay-coach",
+                /*delta*/ 1,
+                /*panel_height*/ 18,
+                /*terminal_width*/ 80,
+                /*scrolloff*/ 0,
+            )
+            .expect("scroll the original diff with the mouse wheel");
+        assert_eq!(event.action, "down");
+        assert!(manager.text_panels["replay-coach"].scroll > 0);
+        assert_eq!(
+            manager.text_panels["replay-coach"]
+                .replay
+                .as_ref()
+                .unwrap()
+                .model
+                .index,
+            0,
+        );
     }
 
     #[test]
@@ -3356,7 +3496,7 @@ mod tests {
             assert!(cursor_x >= placement.x && cursor_x < placement.x + placement.width);
             assert!(cursor_y >= placement.y && cursor_y < placement.y + placement.height);
             assert!(
-                row_text(&buffer, placement.y + placement.height - 1).contains("[i]"),
+                row_text(&buffer, placement.y + placement.height - 1).contains("i "),
                 "essential shortcuts remain visible after docking {side:?}",
             );
         }

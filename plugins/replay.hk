@@ -59,9 +59,9 @@ pub fn activate() {
         description: "Reveal or hide the current exercise hint",
     });
     red::add_command("ReplayHelp", toggle_help, Json {
-        title: "Toggle replay keyboard help",
+        title: "Show replay keyboard help",
         category: "PR Replay",
-        description: "Reveal or hide the dedicated Replay pane shortcuts",
+        description: "Open the dedicated Replay keyboard shortcuts without changing the guide",
     });
     red::add_command("ReplayToggleMode", toggle_mode, Json {
         title: "Toggle replay learning mode",
@@ -186,6 +186,7 @@ pub fn activate() {
     red::state_set("replay_index", 0);
     red::state_set("replay_mode", "challenge");
     red::state_set("replay_hint_visible", false);
+    red::state_set("replay_rationale_expanded", false);
     red::state_set("replay_help_visible", false);
     red::state_set("replay_view", "guide");
     red::state_set("replay_notes", []);
@@ -224,7 +225,7 @@ fn active_session_restored(result: Json) {
     red::state_set("replay_mode", red::string(result.mode, "challenge"));
     red::state_set("replay_notes", result.notes);
     red::state_set("replay_completions", result.completions);
-    red::state_set("replay_notice", "Review restored · progress, private findings, and local review drafts recovered.");
+    red::state_set("replay_notice", "Review restored · progress, findings, and drafts recovered.");
     workspace_opened(result);
 }
 
@@ -637,9 +638,28 @@ fn workspace_opened(event: Json) {
 
 fn ensure_panel() {
     if !red::state_bool("replay_panel_created") {
+        let terminal_width = red::int(red::editor_info().size[0], 80);
+        let panel_width = (terminal_width - 1) / 2;
+        if panel_width > 100 {
+            panel_width = 100;
+        }
+        let minimum_source_width = 10;
+        if terminal_width >= 77 {
+            minimum_source_width = 38;
+        }
+        let maximum_panel_width = terminal_width - minimum_source_width - 1;
+        if maximum_panel_width < 1 {
+            maximum_panel_width = 1;
+        }
+        if panel_width > maximum_panel_width {
+            panel_width = maximum_panel_width;
+        }
+        if panel_width < 1 {
+            panel_width = 1;
+        }
         red::execute("CreateTextPanel", "replay-coach", PanelConfig {
             side: "left",
-            width: 46,
+            width: panel_width,
             title: "PR REPLAY",
         });
         red::state_set("replay_panel_created", true);
@@ -685,6 +705,8 @@ fn panel_event(event: Json) {
         } else {
             previous();
         }
+    } else if action == "activate" && !in_outbox {
+        toggle_rationale();
     } else if action == "next_file" || action == "]" {
         next_file();
     } else if action == "previous_file" || action == "[" {
@@ -742,6 +764,7 @@ fn next() {
     if index + 1 < red::len(red::state("replay_steps")) {
         red::state_set("replay_index", index + 1);
         red::state_set("replay_hint_visible", false);
+        red::state_set("replay_rationale_expanded", false);
         red::state_set("replay_notice", "");
     }
     red::state_set("replay_view", "guide");
@@ -757,6 +780,7 @@ fn previous() {
     if index > 0 {
         red::state_set("replay_index", index - 1);
         red::state_set("replay_hint_visible", false);
+        red::state_set("replay_rationale_expanded", false);
         red::state_set("replay_notice", "");
     }
     red::state_set("replay_view", "guide");
@@ -817,6 +841,7 @@ fn previous_file() {
 fn select_file_step(index: int) {
     red::state_set("replay_index", index);
     red::state_set("replay_hint_visible", false);
+    red::state_set("replay_rationale_expanded", false);
     red::state_set("replay_notice", "");
     red::state_set("replay_view", "guide");
     render();
@@ -849,13 +874,111 @@ fn toggle_hint() {
     render();
 }
 
+fn toggle_rationale() {
+    if !ensure_workspace() {
+        return;
+    }
+    red::state_set(
+        "replay_rationale_expanded",
+        !red::state_bool("replay_rationale_expanded")
+    );
+    red::state_set("replay_view", "guide");
+    render();
+}
+
 fn toggle_help() {
     if !ensure_workspace() {
         return;
     }
-    red::state_set("replay_help_visible", !red::state_bool("replay_help_visible"));
-    red::state_set("replay_view", "guide");
-    render();
+    let items = [
+        PickerItem {
+            id: "change",
+            label: "NAV   j/k · ↓/↑       select a change",
+            data: Json {},
+        },
+        PickerItem {
+            id: "scroll-lines",
+            label: "NAV   J/K             scroll the diff",
+            data: Json {},
+        },
+        PickerItem {
+            id: "scroll-half",
+            label: "NAV   Ctrl-d / Ctrl-u scroll half a page",
+            data: Json {},
+        },
+        PickerItem {
+            id: "scroll-page",
+            label: "NAV   Ctrl-f / Ctrl-b scroll one page",
+            data: Json {},
+        },
+        PickerItem {
+            id: "rationale",
+            label: "NAV   Enter           expand / collapse WHY",
+            data: Json {},
+        },
+        PickerItem {
+            id: "file",
+            label: "NAV   ]/[ · l/h       next / previous file",
+            data: Json {},
+        },
+        PickerItem {
+            id: "source",
+            label: "EDIT  i               edit scratch source",
+            data: Json {},
+        },
+        PickerItem {
+            id: "validate",
+            label: "EDIT  v               check reconstruction",
+            data: Json {},
+        },
+        PickerItem {
+            id: "apply",
+            label: "EDIT  a / u           apply / undo hunk",
+            data: Json {},
+        },
+        PickerItem {
+            id: "comment",
+            label: "NOTES c / r           note / review outbox",
+            data: Json {},
+        },
+        PickerItem {
+            id: "save",
+            label: "NOTES S / L           save / load review",
+            data: Json {},
+        },
+        PickerItem {
+            id: "dock",
+            label: "PANE  Ctrl-w H/J/K/L move the Replay pane",
+            data: Json {},
+        },
+        PickerItem {
+            id: "resize",
+            label: "PANE  Ctrl-w > / <   resize the pane",
+            data: Json {},
+        },
+    ];
+    if author_workspace_available() {
+        items = red::push(items, PickerItem {
+            id: "original-workspace",
+            label: "NOTES W               open your PR worktree",
+            data: Json {},
+        });
+    }
+    red::execute("OpenPicker", "PR Replay shortcuts", items, PickerOptions {
+        presentation: "compact",
+        status: "Esc close · Enter return to review",
+    }, PickerHandlers {
+        selected: replay_help_selected,
+        cancelled: replay_help_cancelled,
+    });
+}
+
+fn replay_help_selected(item: PickerItem) {
+    red::execute("FocusPanel", "replay-coach");
+}
+
+fn replay_help_cancelled(event: PickerCancelled) {
+    red::execute("FocusPanel", "replay-coach");
 }
 
 fn toggle_mode() {
@@ -2153,6 +2276,7 @@ fn guide_content() -> String {
         index: red::int(red::state("replay_index"), 0),
         mode: red::string(red::state("replay_mode"), "challenge"),
         hint_visible: red::state_bool("replay_hint_visible"),
+        rationale_expanded: red::state_bool("replay_rationale_expanded"),
         help_visible: red::state_bool("replay_help_visible"),
         notice: red::string(red::state("replay_notice"), ""),
         notes: red::state("replay_notes"),

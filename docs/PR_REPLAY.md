@@ -87,9 +87,10 @@ presented as explanations. This guidance is derived from the pinned original
 source and review context; it does not invent or attribute undocumented intent
 to the author.
 
-For a multi-file review, `h` and `l` select the previous and next original hunk,
-while `[` and `]` jump directly to the first hunk in the previous or next
-changed file. Both motions switch the existing editor window to the actual
+For a multi-file review, `j` and `k` or the down and up arrows select the next
+and previous original hunk, while `[` and `]` jump directly to the first hunk
+in the previous or next changed file. The left and right arrows or `h` and `l`
+also move between changed files. Both motions switch the existing editor window to the actual
 scratch file. The changes heading keeps the current file and total file count
 visible without introducing a second tree or another pane.
 The source cursor and viewport jump directly to the original hunk, even when
@@ -97,10 +98,19 @@ the change occurs thousands of lines into a large file.
 Changes from different files stay in their own buffers; no unrelated file tree,
 editable guide, or extra pane is created.
 
-The coach is a structured editor surface, not a rendered Markdown document. PR
-context and the current reconstruction task stay at the top. The exact original
-hunk occupies only the space its source needs. One blank row separates it from
-the change list; longer hunks scroll without hiding the current change. A compact
+The coach is a structured editor surface, not a rendered Markdown document. By
+default the guide and editable source split the terminal approximately 50/50;
+the extra column goes to the source, and the guide stops growing at 100 columns.
+The default follows terminal resizing until the reviewer explicitly adjusts the
+divider and preserves enough space
+for the editable source. PR context and a compact, vertically navigable change
+list stay pinned above the current author's rationale. At normal terminal
+heights, a blank line separates the identity, changes, and rationale; the changes
+heading uses a quiet horizontal rule. Shorter terminals reclaim the spacing
+before sacrificing any pinned changes or source lines. The rationale and hint
+share one fixed-size region; press `Enter` to expand the full explanation or
+hint without moving the change list. Notices and errors have their own reserved
+status row. Only the exact original hunk grows or scrolls. A compact, theme-colored
 action bar stays pinned at the bottom. Source retains its original line numbers,
 language-aware Tree-sitter highlighting, and the active theme's addition,
 removal, and modification colors. Git transport headers are hidden from the
@@ -286,7 +296,7 @@ unchanged.
 
 | Keys | Action |
 | --- | --- |
-| `Space R ?` | Show or hide the compact Replay keyboard help. |
+| `Space R ?` | Open the Replay keyboard-help popup. |
 | `Space R g` | Reopen the current review or choose among existing reviews. |
 | `Space R [` | Jump to the first change in the previous file. |
 | `Space R ]` | Jump to the first change in the next file. |
@@ -312,17 +322,22 @@ unchanged.
 | `Space R L` | Preview and load a source-verified portable private review. |
 | `Space R q` | Hide the coach without touching the scratch source or progress. |
 
-While the dedicated coach is focused, `j` and `k` scroll the current source
-hunk, `h` and `l` select the previous and next reconstruction steps, and `[` and
-`]` jump between changed files. Outside the focused coach, `[` and `]` retain
-their existing editor and Git-hunk motions. The older `p` and `n` step bindings
-remain compatibility aliases. Use `Space R h`
-for a hint so horizontal navigation never unexpectedly changes the exercise
-instead. `i`, `a`, `u`, `m`, `v`, `o`, `f`, `c`, `F`, `W`, `r`, `s`, `e`, `d`,
-`P`, `S`, `L`, `q`, and `?` act directly on the Replay pane. The pinned action bar keeps
-scratch-source focus, manual
-validation, immediate application, safe undo, `h/l` step navigation, and help
-visible even when the panel is narrow. The title shows the selected step
+While the dedicated coach is focused, `j` and `k` or the down and up arrows
+select the next and previous reconstruction steps. `J` and `K` scroll the
+original hunk one line, `Ctrl-d` and `Ctrl-u` scroll it half a page, and
+`Ctrl-f`, `Ctrl-b`, Page Down, and Page Up scroll it a full page. The mouse wheel
+also scrolls the hunk without changing the selected step. `[` and `]` jump
+between changed files, as do the left and right arrows or `h` and `l`. Press
+`Enter` to expand or collapse the full rationale. Outside the focused coach,
+those keys retain their existing editor and Git-hunk motions. The older `p`/`n`
+step bindings remain compatibility aliases. Use `Space R h` for a hint; it replaces
+the rationale in place without moving the change list or the diff. `i`, `a`,
+`u`, `m`, `v`, `o`, `f`, `c`, `F`, `W`, `r`, `s`, `e`, `d`, `P`, `S`, `L`, `q`,
+and `?` act directly on the Replay pane. The `?` key opens an Esc-closeable
+shortcut popup and restores focus to the Replay pane on dismissal. The pinned
+action bar uses theme-colored, unbracketed keys and keeps source editing,
+validation, immediate application, safe undo, change navigation, and help
+discoverable without rearranging the review. The title shows the selected step
 separately from the number of genuinely reviewed changes. A `✓` identifies a
 manually reconstructed step; `⊕` identifies an automatic
 application.
