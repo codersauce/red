@@ -2051,9 +2051,9 @@ fn replay_action_group(actions: &[UiAction], key: &str) -> Option<ReplayActionGr
         "navigate" | "navigate_file" | "navigate_draft" | "next_unreviewed" => {
             ReplayActionGroup::Navigation
         }
-        "edit" | "undo" | "edit_draft" | "discard_draft" => ReplayActionGroup::Editing,
-        "validate" | "apply" | "comment" | "outbox" | "summary" | "save_review"
-        | "publish_review" | "load_review" | "fix" => ReplayActionGroup::Review,
+        "edit" | "undo" | "apply" | "edit_draft" | "discard_draft" => ReplayActionGroup::Editing,
+        "validate" | "comment" | "outbox" | "summary" | "save_review" | "publish_review"
+        | "load_review" | "fix" => ReplayActionGroup::Review,
         _ => ReplayActionGroup::Utility,
     })
 }
@@ -2389,17 +2389,36 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
         );
     }
 
+    if model.steps.len() > model.reviewed_count().saturating_add(1) {
+        actions.push(
+            UiAction::new("next_unreviewed", "n", "Next")
+                .with_priority(if width >= 86 {
+                    ActionPriority::Essential
+                } else {
+                    ActionPriority::Secondary
+                })
+                .with_compact_label("Next"),
+        );
+    }
+
     actions.extend([
         UiAction::new("edit", "i", "Edit")
-            .with_priority(if review_complete {
-                ActionPriority::Primary
-            } else {
-                ActionPriority::Essential
-            })
+            .with_priority(ActionPriority::Essential)
             .with_compact_label("Edit"),
         UiAction::new("undo", "u", "Undo")
             .with_priority(ActionPriority::Essential)
             .with_compact_label(if width >= 72 { "Undo" } else { "↶" }),
+        UiAction::new(
+            "apply",
+            "a",
+            if width >= 90 { "Apply hunk" } else { "Apply" },
+        )
+        .with_priority(if review_complete {
+            ActionPriority::Primary
+        } else {
+            ActionPriority::Essential
+        })
+        .with_compact_label("Apply"),
         UiAction::new(
             "validate",
             "v",
@@ -2413,23 +2432,14 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
             ActionPriority::Primary
         })
         .with_compact_label("Check"),
-        UiAction::new(
-            "apply",
-            "a",
-            if width >= 90 { "Apply hunk" } else { "Apply" },
-        )
-        .with_priority(if review_complete {
-            ActionPriority::Primary
-        } else {
-            ActionPriority::Essential
-        })
-        .with_compact_label("Apply"),
     ]);
 
     if model.pull_request > 0 && model.review_role.is_some() {
         actions.push(
             UiAction::new("comment", "c", "Note")
-                .with_priority(if width >= 60 {
+                .with_priority(if review_complete {
+                    ActionPriority::Primary
+                } else if width >= 60 {
                     ActionPriority::Essential
                 } else {
                     ActionPriority::Secondary
@@ -2470,23 +2480,9 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
         );
     }
 
-    if model.steps.len() > model.reviewed_count().saturating_add(1) {
-        actions.push(
-            UiAction::new("next_unreviewed", "n", "Next")
-                .with_priority(if width >= 86 {
-                    ActionPriority::Essential
-                } else {
-                    ActionPriority::Secondary
-                })
-                .with_compact_label("Next"),
-        );
-    }
-
     actions.push(
         UiAction::new("zoom", "z", "Zoom")
-            .with_priority(if review_complete {
-                ActionPriority::Secondary
-            } else if width >= 75 {
+            .with_priority(if width >= 75 {
                 ActionPriority::Essential
             } else {
                 ActionPriority::Primary
@@ -2523,6 +2519,12 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
             break;
         };
         actions.remove(index);
+    }
+
+    // Importance chooses which actions fit; presentation should then retain
+    // Replay's semantic group order and leave help at the end of the footer.
+    for action in &mut actions {
+        action.priority = ActionPriority::Essential;
     }
 
     actions
@@ -3546,7 +3548,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_author_review_keeps_source_edit_and_outbox_ahead_of_zoom() {
+    fn completed_author_review_keeps_edit_outbox_zoom_and_help_visible() {
         let mut replay = multi_file_model();
         replay.completions = replay
             .steps
@@ -3563,15 +3565,94 @@ mod tests {
         let actions = replay_actions(&replay, /*width*/ 79);
         let layout = ActionBar::new(&actions).layout(/*width*/ 79);
 
-        for key in ["j/k", "h/l", "i", "u", "r", "W", "?"] {
+        for key in ["j/k", "h/l", "i", "u", "r", "W", "z", "?"] {
             assert!(
                 has_visible_key(&layout, key),
                 "the completed author review must retain {key}: {}",
                 layout.text(),
             );
         }
+        assert_eq!(
+            layout
+                .spans
+                .iter()
+                .rev()
+                .find(|span| span.role == ActionBarRole::Key)
+                .map(|span| span.text.as_str()),
+            Some("?"),
+            "help must be the final completed-review footer action: {}",
+            layout.text(),
+        );
         assert_eq!(layout.hidden_count(), 0);
         assert_labeled_actions(&layout);
+    }
+
+    #[test]
+    fn wide_completed_author_footer_keeps_actions_in_semantic_groups() {
+        let mut replay = multi_file_model();
+        replay.completions = replay
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(index, _)| ReplayPanelCompletion {
+                index,
+                completion: "automatically applied".to_string(),
+            })
+            .collect();
+        replay.review_role = Some(ReplayReviewRole::Author);
+        replay.head_commit = "b".repeat(40);
+        replay.author_workspace_available = true;
+        let width = 110;
+        let actions = replay_actions(&replay, width);
+        let layout = replay_grouped_action_layout(&actions, width);
+        let keys = layout
+            .spans
+            .iter()
+            .filter(|span| span.role == ActionBarRole::Key)
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            keys,
+            ["j/k", "h/l", "i", "u", "a", "v", "c", "r", "W", "z", "?"],
+            "navigation, editing, review, and utility actions must stay grouped: {}",
+            layout.text(),
+        );
+        assert_eq!(layout.hidden_count(), 0);
+        assert_labeled_actions(&layout);
+    }
+
+    #[test]
+    fn completed_review_keeps_help_last_at_every_usable_footer_width() {
+        let mut replay = completed_model();
+        replay.review_role = Some(ReplayReviewRole::Reviewer);
+        replay.head_commit = "b".repeat(40);
+
+        for width in [30, 46, 62, 79, 99, 120] {
+            let actions = replay_actions(&replay, width);
+            let layout = replay_grouped_action_layout(&actions, width);
+
+            assert_eq!(
+                layout
+                    .spans
+                    .iter()
+                    .rev()
+                    .find(|span| span.role == ActionBarRole::Key)
+                    .map(|span| span.text.as_str()),
+                Some("?"),
+                "help must remain last at {width} columns: {}",
+                layout.text(),
+            );
+            if width >= 75 {
+                assert!(
+                    has_visible_key(&layout, "z"),
+                    "zoom must remain available after completion at {width} columns: {}",
+                    layout.text(),
+                );
+            }
+            assert_eq!(layout.hidden_count(), 0);
+            assert_labeled_actions(&layout);
+        }
     }
 
     #[test]
