@@ -166,8 +166,48 @@ and `Ctrl-Enter` saves the complete draft locally. The selected original diff
 determines each
 inline comment's path, head commit, exact changed-line range, and GitHub `LEFT`
 or `RIGHT` side. Scratch-buffer cursor positions and later edits never replace
-those coordinates. A proposed fix is only text in this first milestone: it does
-not edit either the original PR or its learning scratch source.
+those coordinates. An `F` proposed fix remains local text: recording it does not
+edit either the original PR or its learning scratch source. Opening the real
+original PR code is a distinct, explicitly confirmed author action.
+
+### Open your original pull request code
+
+When you are both the verified original GitHub PR author and have confirmed
+write access to the exact head repository, press `W` in the focused guide or
+outbox, or use `Space R W`. Red first produces a read-only preview of the
+complete original PR head, exact head repository and branch, authenticated
+author, separate local author branch, and durable sibling-worktree path.
+Reviewers cannot open an author's original worktree just because they have
+write access to a shared base repository.
+
+Explicitly accepting **Create original PR worktree?** creates a normal Git
+worktree at the original PR **head**, not the merge base used for learning.
+The local branch is named `replay/author/pr-<number>-<head>` and its durable
+sibling is named `<repository>.replay-author-pr-<number>-<head>`. This means
+the actual original PR branch can remain checked out elsewhere. For fork PRs,
+the preview preserves the exact author-owned fork and original remote branch;
+it never substitutes the base repository's `origin`.
+
+The selected original source file opens as a real, editable Red buffer. The
+Replay pane displays **AUTHOR · PR HEAD** so it cannot be mistaken for a
+merge-base learning source. The editor can open and edit any real file in the
+author worktree through its normal buffer lifecycle; the existing learning
+scratch, progress, private review, and original checkout remain untouched.
+
+Pressing `W` again previews and safely reopens the exact same worktree. Unlike
+the learning scratch, the author worktree may contain unsaved work, saved
+changes, untracked files, or new local commits descending from the pinned PR
+head; Replay preserves all of them. It refuses symlinked paths, a different
+repository, an unrelated local branch, or a head that does not descend from the
+exact original PR commit. Confirmation is bound to the full original head,
+fork, local branch, and path. Before creating or reopening a worktree, a
+background worker verifies the authenticated GitHub author and pinned PR head
+again.
+
+Opening original PR code does **not** save a buffer, stage files, commit,
+push, submit a review, or start Codex. Normal Git hooks remain active. Agent
+execution and committing or pushing back to the exact fork and PR branch will
+each require their own separate, explicit user approvals in a later milestone.
 
 Press `r` to open the review outbox. It shows the verified role, original
 branch and commit, source-linked comments, author fix proposals, PR summaries,
@@ -262,6 +302,7 @@ unchanged.
 | `Space R f` | Show local reviewer observations. |
 | `Space R c` | Draft an exact original-source inline review comment. |
 | `Space R F` | Draft a proposed fix for your verified original PR. |
+| `Space R W` | Preview and explicitly open your original PR-head author worktree. |
 | `Space R r` | Show the local review outbox or return to the guide. |
 | `Space R s` | Draft a pull-request-level review summary. |
 | `Space R e` | Edit the selected local review draft. |
@@ -277,8 +318,8 @@ hunk, `h` and `l` select the previous and next reconstruction steps, and `[` and
 their existing editor and Git-hunk motions. The older `p` and `n` step bindings
 remain compatibility aliases. Use `Space R h`
 for a hint so horizontal navigation never unexpectedly changes the exercise
-instead. `i`, `a`, `u`, `m`, `v`, `o`, `f`, `c`, `F`, `r`, `s`, `e`, `d`, `P`,
-`S`, `L`, `q`, and `?` act directly on the Replay pane. The pinned action bar keeps
+instead. `i`, `a`, `u`, `m`, `v`, `o`, `f`, `c`, `F`, `W`, `r`, `s`, `e`, `d`,
+`P`, `S`, `L`, `q`, and `?` act directly on the Replay pane. The pinned action bar keeps
 scratch-source focus, manual
 validation, immediate application, safe undo, `h/l` step navigation, and help
 visible even when the panel is narrow. The title shows the selected step
@@ -322,6 +363,8 @@ Real-source observations stay local, survive `--resume`, and are never posted
 as GitHub comments or reviews.
 The demo source has a display name but no associated file path or URI; opening
 or using the demo never fetches, creates a branch, writes a file, or contacts
-GitHub. Real Replay buffers refer only to files inside the explicitly confirmed
-scratch worktree. Applying a hunk modifies an in-memory editor buffer; it does
-not save the file, stage changes, commit, push, or submit a review.
+GitHub. Learning buffers refer only to files inside the explicitly confirmed
+merge-base scratch worktree. Separately confirmed original-author buffers refer
+only to regular files inside the exact original-head author worktree. Applying
+a learning hunk modifies its own in-memory scratch buffer; it does not save a
+file, stage changes, commit, push, or submit a review.

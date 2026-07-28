@@ -1576,6 +1576,38 @@ impl RedHost {
                         anyhow::anyhow!("ReplayCreateWorkspace requires explicit confirmation")
                     })?,
             },
+            "ReplayPrepareAuthorWorkspace" => PluginRequest::ReplayPrepareAuthorWorkspace {
+                request_id,
+                workspace_id: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ReplayPrepareAuthorWorkspace requires a workspace id")
+                    })?
+                    .to_string(),
+                step_id: args
+                    .get(/*index*/ 1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ReplayPrepareAuthorWorkspace requires an original step id")
+                    })?
+                    .to_string(),
+                preview_digest: args
+                    .get(/*index*/ 2)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ReplayPrepareAuthorWorkspace requires a preview digest")
+                    })?
+                    .to_string(),
+                confirmed: args
+                    .get(/*index*/ 3)
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "ReplayPrepareAuthorWorkspace requires explicit author confirmation"
+                        )
+                    })?,
+            },
             "ReplayActiveSession" => PluginRequest::ReplayActiveSession { request_id },
             "ReplayListReviews" => PluginRequest::ReplayListReviews { request_id },
             "ReplayResumeReview" => PluginRequest::ReplayResumeReview {
@@ -4032,6 +4064,7 @@ mod tests {
                     "source_kind": "github_pull_request",
                     "pull_request": 482,
                     "author": "original-author",
+                    "head_permission": "write",
                     "title": "Bound original visible diagnostics",
                     "branch": "feature/viewport-diagnostics",
                     "head_commit": "b".repeat(40),
@@ -4083,6 +4116,7 @@ mod tests {
                     "workspace_root": "/workspace/repository.replay-pr-482-bbbbbbb",
                     "workspace_branch": "replay/pr-482-bbbbbbb",
                     "review_role": review_role,
+                    "head_permission": "write",
                     "head_commit": "b".repeat(40),
                     "review_bundle_path":
                         "/workspace/repository/.git/red/replay-reviews/pr-482-bbbbbbb.red-review.json",
@@ -7367,6 +7401,357 @@ mod tests {
             "The change needs broader regression tests.",
         );
         assert!(outbox.drafts[0].anchor.is_none());
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn original_author_worktree_is_only_previewed_until_its_exact_confirmation() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_github_replay_for_submission(&mut runtime, "author").await;
+
+        runtime
+            .execute_command("ReplayOriginalWorkspace")
+            .await
+            .unwrap();
+
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayPrepareAuthorWorkspace {
+                request_id,
+                workspace_id,
+                step_id,
+                preview_digest,
+                confirmed,
+            } => {
+                assert_eq!(workspace_id, "github-workspace-482");
+                assert_eq!(step_id, plan.steps[0].id);
+                assert!(preview_digest.is_empty());
+                assert!(!confirmed);
+                request_id
+            }
+            _ => panic!("expected only a read-only preview of the original author PR head"),
+        };
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "github-workspace-482",
+                    "step_id": plan.steps[0].id,
+                    "source_path": plan.steps[0].path,
+                    "workspace_root": "/workspace/repository.replay-author-pr-482-bbbbbbb",
+                    "workspace_branch": "replay/author/pr-482-bbbbbbb",
+                    "head_repository": "github.com/original-author/forked-replay",
+                    "head_ref": "feature/viewport-diagnostics",
+                    "head_commit": "b".repeat(40),
+                    "viewer": "original-author",
+                    "existing": false,
+                    "preview_digest": "a".repeat(64),
+                }),
+            )
+            .await
+            .unwrap();
+
+        let confirmation = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackConfirmation {
+                owner,
+                handle,
+                title,
+                message,
+            } => {
+                assert_eq!(owner, "replay");
+                assert_eq!(title, "Create original PR worktree?");
+                assert!(message.contains("ORIGINAL PR CODE"));
+                assert!(message.contains("not your learning scratch"));
+                assert!(message.contains("github.com/original-author/forked-replay"));
+                assert!(message.contains("feature/viewport-diagnostics"));
+                assert!(message.contains(&"b".repeat(40)));
+                assert!(message.contains("replay/author/pr-482-bbbbbbb"));
+                assert!(message.contains("repository.replay-author-pr-482-bbbbbbb"));
+                assert!(message.contains("src/editor/rendering.rs"));
+                assert!(message.contains("Nothing is saved, committed, pushed, or sent to Codex"));
+                handle
+            }
+            _ => panic!("expected an exact, independently confirmed original-PR worktree preview"),
+        };
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        assert!(runtime
+            .notify_picker(confirmation, PickerCallback::Cancelled)
+            .unwrap());
+        assert!(
+            ACTION_DISPATCHER.try_recv_request().is_none(),
+            "cancelling must never create a worktree, open a source, or start an agent",
+        );
+    }
+
+    #[tokio::test]
+    async fn original_author_worktree_opens_only_after_its_exact_preview_is_accepted() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_github_replay_for_submission(&mut runtime, "author").await;
+        runtime
+            .execute_command("ReplayOriginalWorkspace")
+            .await
+            .unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayPrepareAuthorWorkspace {
+                request_id,
+                confirmed: false,
+                ..
+            } => request_id,
+            _ => panic!("expected the non-mutating original PR worktree preview"),
+        };
+        let expected_digest = "a".repeat(64);
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "github-workspace-482",
+                    "step_id": plan.steps[0].id,
+                    "source_path": plan.steps[0].path,
+                    "workspace_root": "/workspace/repository.replay-author-pr-482-bbbbbbb",
+                    "workspace_branch": "replay/author/pr-482-bbbbbbb",
+                    "head_repository": "github.com/original-author/forked-replay",
+                    "head_ref": "feature/viewport-diagnostics",
+                    "head_commit": "b".repeat(40),
+                    "viewer": "original-author",
+                    "existing": false,
+                    "preview_digest": expected_digest,
+                }),
+            )
+            .await
+            .unwrap();
+        let confirmation = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackConfirmation { handle, .. } => handle,
+            _ => panic!("expected an explicit original-head worktree confirmation"),
+        };
+        let accept = serde_json::from_value(serde_json::json!({
+            "id": "accept",
+            "label": "Accept",
+        }))
+        .unwrap();
+        assert!(runtime
+            .notify_picker(confirmation, PickerCallback::Selected(accept))
+            .unwrap());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: Some(_) }
+                if id == "replay-coach"
+        ));
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayPrepareAuthorWorkspace {
+                request_id,
+                workspace_id,
+                step_id,
+                preview_digest,
+                confirmed,
+            } => {
+                assert_eq!(workspace_id, "github-workspace-482");
+                assert_eq!(step_id, plan.steps[0].id);
+                assert_eq!(preview_digest, "a".repeat(64));
+                assert!(confirmed);
+                request_id
+            }
+            _ => panic!("expected only the human-confirmed, digest-bound original PR worktree"),
+        };
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "github-workspace-482",
+                    "workspace_root": "/workspace/repository.replay-author-pr-482-bbbbbbb",
+                    "workspace_branch": "replay/author/pr-482-bbbbbbb",
+                    "head_repository": "github.com/original-author/forked-replay",
+                    "head_ref": "feature/viewport-diagnostics",
+                    "head_commit": "b".repeat(40),
+                    "requested_source_path": "src/editor/rendering.rs",
+                    "source_path":
+                        "/workspace/repository.replay-author-pr-482-bbbbbbb/src/editor/rendering.rs",
+                    "used_fallback": false,
+                    "created": true,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: None }
+                if id == "replay-coach"
+        ));
+        let guide = recv_replay_guide();
+        assert!(guide.author_workspace_available);
+        assert_eq!(
+            guide.author_workspace_root,
+            "/workspace/repository.replay-author-pr-482-bbbbbbb",
+        );
+        assert_eq!(
+            guide.author_workspace_branch,
+            "replay/author/pr-482-bbbbbbb",
+        );
+        assert_eq!(
+            guide.review_role,
+            Some(crate::replay::ReplayReviewRole::Author)
+        );
+        assert_eq!(guide.head_commit, "b".repeat(40));
+        assert!(guide.notice.contains("real author source"));
+        assert!(guide.notice.contains("learning scratch unchanged"));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusEditor,
+        ));
+        assert!(
+            ACTION_DISPATCHER.try_recv_request().is_none(),
+            "opening original PR code must not commit, push, or start Codex",
+        );
+    }
+
+    #[tokio::test]
+    async fn original_author_is_told_when_a_deleted_selected_file_requires_a_fallback() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_github_replay_for_submission(&mut runtime, "author").await;
+        runtime
+            .execute_command("ReplayOriginalWorkspace")
+            .await
+            .unwrap();
+        let preview = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayPrepareAuthorWorkspace {
+                request_id,
+                confirmed: false,
+                ..
+            } => request_id,
+            _ => panic!("expected the source-linked original PR worktree preview"),
+        };
+        runtime
+            .resolve_request(
+                preview,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "github-workspace-482",
+                    "step_id": plan.steps[0].id,
+                    "source_path": plan.steps[0].path,
+                    "workspace_root": "/workspace/repository.replay-author-pr-482-bbbbbbb",
+                    "workspace_branch": "replay/author/pr-482-bbbbbbb",
+                    "head_repository": "github.com/original-author/forked-replay",
+                    "head_ref": "feature/viewport-diagnostics",
+                    "head_commit": "b".repeat(40),
+                    "viewer": "original-author",
+                    "existing": false,
+                    "preview_digest": "a".repeat(64),
+                }),
+            )
+            .await
+            .unwrap();
+        let confirmation = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackConfirmation { handle, .. } => handle,
+            _ => panic!("expected independent original-source confirmation"),
+        };
+        let accept = serde_json::from_value(serde_json::json!({
+            "id": "accept",
+            "label": "Accept",
+        }))
+        .unwrap();
+        assert!(runtime
+            .notify_picker(confirmation, PickerCallback::Selected(accept))
+            .unwrap());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus {
+                status: Some(_),
+                ..
+            }
+        ));
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayPrepareAuthorWorkspace {
+                request_id,
+                confirmed: true,
+                ..
+            } => request_id,
+            _ => panic!("expected the separately confirmed original author worktree"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "github-workspace-482",
+                    "workspace_root": "/workspace/repository.replay-author-pr-482-bbbbbbb",
+                    "workspace_branch": "replay/author/pr-482-bbbbbbb",
+                    "requested_source_path": "src/deleted.rs",
+                    "source_path":
+                        "/workspace/repository.replay-author-pr-482-bbbbbbb/src/remaining.rs",
+                    "used_fallback": true,
+                    "created": true,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { status: None, .. }
+        ));
+        let guide = recv_replay_guide();
+        assert!(guide
+            .notice
+            .contains("selected file is absent at the PR head"));
+        assert!(guide.notice.contains("another original source"));
+        assert!(guide.notice.contains("learning scratch unchanged"));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusEditor,
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn reviewer_cannot_open_original_author_worktree_with_shared_write_access() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        open_github_replay_for_submission(&mut runtime, "reviewer").await;
+
+        runtime
+            .execute_command("ReplayOriginalWorkspace")
+            .await
+            .unwrap();
+
+        let guide = recv_replay_guide();
+        assert_eq!(
+            guide.review_role,
+            Some(crate::replay::ReplayReviewRole::Reviewer),
+        );
+        assert!(!guide.author_workspace_available);
+        assert!(guide.author_workspace_root.is_empty());
+        assert!(guide.notice.contains("verified original PR author"));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn local_branch_author_role_never_implies_an_original_github_worktree() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        open_source_backed_replay_with_role(&mut runtime, "author").await;
+
+        runtime
+            .execute_command("ReplayOriginalWorkspace")
+            .await
+            .unwrap();
+
+        let guide = recv_replay_guide();
+        assert!(!guide.author_workspace_available);
+        assert!(guide.author_workspace_root.is_empty());
+        assert!(guide.notice.contains("verified original PR author"));
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 

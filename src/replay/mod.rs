@@ -43,9 +43,10 @@ pub use session::{
     ReplayValidation, ReplayWorkspace, ReplayWorkspacePreview,
 };
 pub use source::{
-    fetch_pull_request_objects, finalize_pull_request, prepare_workspace,
+    fetch_pull_request_objects, finalize_pull_request, prepare_author_workspace, prepare_workspace,
     refresh_pull_request_capabilities, reopen_existing_workspace, resolve_local_branch_source,
-    resolve_local_source, resolve_pull_request, GitObjectId, PullRequestInput, ReplayCommitSummary,
+    resolve_local_source, resolve_pull_request, GitObjectId, PullRequestInput,
+    ReplayAuthorWorkspace, ReplayAuthorWorkspacePreview, ReplayCommitSummary,
     ReplayGitHubCapabilities, ReplayPullRequest, ReplayRepository, ReplayRepositoryPermission,
     ReplayResolvedLocalBranch, ReplayResolvedPullRequest, ReplayReviewContext, ReplaySource,
     ReplaySourceKind,
@@ -151,6 +152,12 @@ pub enum ReplayError {
     /// A worktree cannot be created without the explicit confirmation flag.
     #[error("scratch worktree creation requires explicit confirmation")]
     WorkspaceConfirmationRequired,
+    /// Opening original PR code requires a separately confirmed author action.
+    #[error("original PR worktree creation requires explicit confirmation")]
+    AuthorWorkspaceConfirmationRequired,
+    /// Original PR code is available only to its verified, write-capable author.
+    #[error("original PR worktree is unavailable: {0}")]
+    AuthorWorkspaceUnavailable(String),
     /// A pre-existing scratch branch or worktree must never be overwritten.
     #[error("the replay workspace already exists: {0}")]
     WorkspaceExists(String),
@@ -209,6 +216,8 @@ impl ReplayError {
             Self::StalePreview => "preview_expired",
             Self::UnsupportedOperation(_) => "file_unsupported",
             Self::WorkspaceConfirmationRequired => "workspace_confirmation_required",
+            Self::AuthorWorkspaceConfirmationRequired => "author_workspace_confirmation_required",
+            Self::AuthorWorkspaceUnavailable(_) => "author_workspace_unavailable",
             Self::WorkspaceExists(_) => "workspace_exists",
             Self::DependencyBlocked => "dependency_blocked",
             Self::InvalidMetadata(_) => "pull_request_metadata_invalid",

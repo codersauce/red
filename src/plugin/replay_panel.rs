@@ -89,6 +89,12 @@ pub(crate) struct ReplayPanelModel {
     #[serde(default)]
     pub(crate) head_commit: String,
     #[serde(default)]
+    pub(crate) author_workspace_available: bool,
+    #[serde(default)]
+    pub(crate) author_workspace_root: String,
+    #[serde(default)]
+    pub(crate) author_workspace_branch: String,
+    #[serde(default)]
     pub(crate) draft_count: usize,
     #[serde(default)]
     pub(crate) drafts: Vec<ReplayReviewDraft>,
@@ -664,6 +670,9 @@ fn replay_header_lines(state: &ReplayPanelState, width: usize) -> Vec<RenderedTe
     let mut lines = if let Some(role) = verified_role {
         let label = match role {
             ReplayReviewRole::Reviewer => "REVIEW",
+            ReplayReviewRole::Author if !model.author_workspace_root.is_empty() => {
+                "AUTHOR · PR HEAD"
+            }
             ReplayReviewRole::Author => "AUTHOR",
         };
         vec![
@@ -1095,8 +1104,20 @@ fn replay_outbox_actions(model: &ReplayPanelModel) -> Vec<UiAction> {
     actions.push(
         UiAction::new("outbox", "[r]", "Return")
             .with_priority(ActionPriority::Essential)
-            .with_compact_label("↩"),
+            .with_compact_label(if model.author_workspace_available {
+                ""
+            } else {
+                "↩"
+            }),
     );
+    if model.author_workspace_available {
+        actions.insert(
+            actions.len().saturating_sub(1),
+            UiAction::new("original_workspace", "[W]", "PR Head")
+                .with_priority(ActionPriority::Essential)
+                .with_compact_label(""),
+        );
+    }
     if model.review_role == Some(ReplayReviewRole::Author) {
         actions.insert(
             actions.len().saturating_sub(1),
@@ -1385,7 +1406,7 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
     let has_multiple_files = model
         .current_file_position()
         .is_some_and(|(_, count)| count > 1);
-    let named_compact = width >= 44 && !has_multiple_files;
+    let named_compact = width >= 44 && !has_multiple_files && !model.author_workspace_available;
     let mut actions = vec![
         UiAction::new("edit", "[i]", "Source")
             .with_priority(ActionPriority::Essential)
@@ -1422,6 +1443,19 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
         );
     }
 
+    if model.author_workspace_available {
+        actions.insert(
+            actions.len().saturating_sub(1),
+            UiAction::new("original_workspace", "[W]", "PR Head")
+                .with_priority(if width >= 35 {
+                    ActionPriority::Essential
+                } else {
+                    ActionPriority::Secondary
+                })
+                .with_compact_label(""),
+        );
+    }
+
     if has_multiple_files {
         actions.insert(
             5,
@@ -1451,6 +1485,9 @@ mod tests {
             branch: plan.branch,
             review_role: None,
             head_commit: String::new(),
+            author_workspace_available: false,
+            author_workspace_root: String::new(),
+            author_workspace_branch: String::new(),
             draft_count: 0,
             drafts: Vec::new(),
             receipts: Vec::new(),
@@ -1823,6 +1860,54 @@ mod tests {
     }
 
     #[test]
+    fn verified_author_guide_keeps_original_head_shortcut_and_learning_keys_visible() {
+        let mut replay = model();
+        replay.review_role = Some(ReplayReviewRole::Author);
+        replay.head_commit = "b".repeat(40);
+        replay.author_workspace_available = true;
+
+        let actions = replay_actions(&replay, /*width*/ 46);
+        let layout = ActionBar::new(&actions).layout(/*width*/ 46);
+        let visible = layout.text();
+
+        for key in ["[i]", "[v]", "[a]", "[u]", "[h/l]", "[W]", "[?]"] {
+            assert!(
+                visible.contains(key),
+                "missing verified-author guide shortcut {key} at 46 columns: {visible}",
+            );
+        }
+        assert!(display_width(&visible) <= 46);
+
+        let narrow_actions = replay_actions(&replay, /*width*/ 30);
+        let narrow_layout = ActionBar::new(&narrow_actions).layout(/*width*/ 30);
+        let narrow = narrow_layout.text();
+        for key in ["[i]", "[v]", "[a]", "[u]", "[h/l]", "[?]"] {
+            assert!(
+                narrow.contains(key),
+                "an author shortcut must not hide essential narrow-guide action {key}: {narrow}",
+            );
+        }
+        assert!(display_width(&narrow) <= 30);
+    }
+
+    #[test]
+    fn original_head_shortcut_is_not_offered_to_reviewers_or_local_sources() {
+        let mut reviewer = model();
+        reviewer.review_role = Some(ReplayReviewRole::Reviewer);
+        reviewer.head_commit = "b".repeat(40);
+
+        assert!(!replay_actions(&reviewer, /*width*/ 46)
+            .iter()
+            .any(|action| action.id == "original_workspace"));
+        assert!(!replay_outbox_actions(&reviewer)
+            .iter()
+            .any(|action| action.id == "original_workspace"));
+        assert!(!replay_actions(&model(), /*width*/ 46)
+            .iter()
+            .any(|action| action.id == "original_workspace"));
+    }
+
+    #[test]
     fn compact_replay_header_marks_omitted_reason_and_visible_diff_overflow() {
         let state = state();
         let theme = parse_vscode_theme("themes/red.json").unwrap();
@@ -1893,6 +1978,31 @@ mod tests {
             assert!(
                 visible.contains(key),
                 "missing essential original-PR outbox action {key}: {visible}"
+            );
+        }
+        assert!(display_width(&visible) <= 46);
+    }
+
+    #[test]
+    fn author_outbox_keeps_original_head_and_private_review_actions_visible() {
+        let mut replay = model();
+        replay.review_role = Some(ReplayReviewRole::Author);
+        replay.head_commit = "b".repeat(40);
+        replay.author_workspace_available = true;
+        replay.drafts = vec![outbox_draft(
+            ReplayReviewDraftKind::InlineComment,
+            "Keep the author review linked to the original PR source.",
+        )];
+        replay.draft_count = replay.drafts.len();
+
+        let actions = replay_outbox_actions(&replay);
+        let layout = ActionBar::new(&actions).layout(/*width*/ 46);
+        let visible = layout.text();
+
+        for key in ["[h/l]", "[c]", "[e]", "[d]", "[S]", "[P]", "[W]", "[r]"] {
+            assert!(
+                visible.contains(key),
+                "missing original-head author outbox action {key}: {visible}",
             );
         }
         assert!(display_width(&visible) <= 46);
@@ -2333,6 +2443,27 @@ mod tests {
         assert!(branch.contains("15c4957"));
         assert!(branch.ends_with("0 / 5 reviewed"));
         assert!(branch.contains('…'));
+    }
+
+    #[test]
+    fn attached_original_author_workspace_is_unmistakable_in_the_replay_header() {
+        let mut replay = model();
+        replay.review_role = Some(ReplayReviewRole::Author);
+        replay.head_commit = "b".repeat(40);
+        replay.author_workspace_available = true;
+        replay.author_workspace_root =
+            "/workspace/repository.replay-author-pr-482-bbbbbbb".to_string();
+        replay.author_workspace_branch = "replay/author/pr-482-bbbbbbb".to_string();
+
+        let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+        let metadata = replay_header_lines(&state, /*width*/ 46)[0]
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+
+        assert!(metadata.contains("#482"));
+        assert!(metadata.ends_with("AUTHOR · PR HEAD"));
     }
 
     #[test]

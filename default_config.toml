@@ -324,6 +324,7 @@ Esc = { EnterMode = "Normal" }
 "f" = { PluginCommand = "ReplayFindings" }
 "c" = { PluginCommand = "ReplayComment" }
 "F" = { PluginCommand = "ReplayFix" }
+"W" = { PluginCommand = "ReplayOriginalWorkspace" }
 "r" = { PluginCommand = "ReplayOutbox" }
 "s" = { PluginCommand = "ReplaySummary" }
 "e" = { PluginCommand = "ReplayEditDraft" }

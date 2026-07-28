@@ -103,6 +103,12 @@ pub fn activate() {
         category: "PR Replay",
         description: "Record a local fix proposal without modifying the original PR branch",
     });
+    red::add_command("ReplayOriginalWorkspace", open_original_workspace, Json {
+        title: "Open the original PR author worktree",
+        category: "PR Replay",
+        description: "Preview and explicitly open the verified original PR head in a separate real worktree",
+        aliases: ["open original pull request", "open pr author worktree"],
+    });
     red::add_command("ReplaySummary", open_summary, Json {
         title: "Draft a PR-level review summary",
         category: "PR Replay",
@@ -170,6 +176,11 @@ pub fn activate() {
     red::state_set("replay_branch", "");
     red::state_set("replay_review_role", red::null());
     red::state_set("replay_head_commit", "");
+    red::state_set("replay_head_permission", "");
+    red::state_set("replay_author_workspace_root", "");
+    red::state_set("replay_author_workspace_branch", "");
+    red::state_set("replay_pending_author_step_id", "");
+    red::state_set("replay_pending_author_preview_digest", "");
     red::state_set("replay_review_path", "");
     red::state_set("replay_title", "");
     red::state_set("replay_index", 0);
@@ -425,6 +436,7 @@ fn source_resolved(result: Json) {
     red::state_set("replay_author", red::string(result.author, "local"));
     red::state_set("replay_branch", red::string(result.branch, ""));
     red::state_set("replay_head_commit", red::string(result.head_commit, ""));
+    red::state_set("replay_head_permission", red::string(result.head_permission, ""));
     let role = red::string(result.review_role, "");
     if role == "" {
         red::state_set("replay_review_role", red::null());
@@ -564,6 +576,11 @@ fn load_plan(plan: Json) -> bool {
     red::state_set("replay_index", 0);
     red::state_set("replay_review_role", red::null());
     red::state_set("replay_head_commit", "");
+    red::state_set("replay_head_permission", "");
+    red::state_set("replay_author_workspace_root", "");
+    red::state_set("replay_author_workspace_branch", "");
+    red::state_set("replay_pending_author_step_id", "");
+    red::state_set("replay_pending_author_preview_digest", "");
     red::state_set("replay_review_path", "");
     red::state_set("replay_notes", []);
     red::state_set("replay_drafts", []);
@@ -599,6 +616,7 @@ fn workspace_opened(event: Json) {
     red::state_set("replay_workspace_root", red::string(event.workspace_root, ""));
     red::state_set("replay_source_buffer_index", red::int(event.source_buffer_index, -1));
     red::state_set("replay_head_commit", red::string(event.head_commit, ""));
+    red::state_set("replay_head_permission", red::string(event.head_permission, ""));
     red::state_set("replay_review_path", red::string(event.review_bundle_path, ""));
     let role = red::string(event.review_role, "");
     if role == "" {
@@ -689,6 +707,8 @@ fn panel_event(event: Json) {
         open_comment();
     } else if action == "F" || action == "fix" {
         open_fix();
+    } else if action == "W" || action == "original_workspace" {
+        open_original_workspace();
     } else if action == "s" || action == "summary" {
         open_summary();
     } else if action == "r" || action == "outbox" {
@@ -1112,6 +1132,160 @@ fn open_fix() {
         return;
     }
     open_review_draft("code_fix", "Local original-PR fix proposal", "");
+}
+
+fn author_workspace_available() -> bool {
+    if red::string(red::state("replay_source_kind"), "demo") != "github_pull_request" {
+        return false;
+    }
+    if red::string(red::state("replay_review_role"), "") != "author" {
+        return false;
+    }
+    let permission = red::string(red::state("replay_head_permission"), "");
+    return permission == "write" || permission == "maintain" || permission == "admin";
+}
+
+fn open_original_workspace() {
+    if !ensure_workspace() {
+        return;
+    }
+    if !author_workspace_available() {
+        red::state_set(
+            "replay_notice",
+            "Only the verified original PR author with head-repository write access can open real PR code."
+        );
+        render();
+        return;
+    }
+    let index = red::int(red::state("replay_index"), 0);
+    let steps = red::state("replay_steps");
+    if index < 0 || index >= red::len(steps) {
+        red::state_set("replay_notice", "Select an original PR change before opening its real source.");
+        render();
+        return;
+    }
+    let step_id = red::string(steps[index].id, "");
+    if step_id == "" {
+        red::state_set("replay_notice", "The selected original PR change could not be verified.");
+        render();
+        return;
+    }
+    red::request(
+        "ReplayPrepareAuthorWorkspace",
+        original_workspace_previewed,
+        red::string(red::state("replay_workspace_id"), ""),
+        step_id,
+        "",
+        false
+    );
+}
+
+fn original_workspace_previewed(preview: Json) {
+    if !red::bool(preview.ok, false) {
+        red::state_set(
+            "replay_notice",
+            source_error(preview, "The original PR author workspace could not be verified.")
+        );
+        render();
+        return;
+    }
+    if red::string(preview.workspace_id, "")
+        != red::string(red::state("replay_workspace_id"), "") {
+        red::state_set("replay_notice", "This original PR workspace preview has expired.");
+        render();
+        return;
+    }
+    red::state_set("replay_pending_author_step_id", red::string(preview.step_id, ""));
+    red::state_set(
+        "replay_pending_author_preview_digest",
+        red::string(preview.preview_digest, "")
+    );
+    let verb = "Create";
+    if red::bool(preview.existing, false) {
+        verb = "Reopen";
+    }
+    let message = verb + " a separate worktree containing the ORIGINAL PR CODE, not your learning scratch.\n\n"
+        + "Repository:\n" + red::string(preview.head_repository, "") + "\n"
+        + "PR branch:\n" + red::string(preview.head_ref, "") + "\n"
+        + "Exact head:\n" + red::string(preview.head_commit, "") + "\n"
+        + "Local branch:\n" + red::string(preview.workspace_branch, "") + "\n"
+        + "Selected source:\n" + red::string(preview.source_path, "") + "\n"
+        + "Worktree:\n" + red::string(preview.workspace_root, "") + "\n\n"
+        + "Your current branch and learning scratch are unchanged. "
+        + "Nothing is saved, committed, pushed, or sent to Codex.";
+    red::execute(
+        "OpenConfirm",
+        verb + " original PR worktree?",
+        message,
+        PickerHandlers {
+            selected: original_workspace_creation_selected,
+            cancelled: original_workspace_creation_cancelled,
+        }
+    );
+}
+
+fn original_workspace_creation_selected(item: PickerItem) {
+    if item.id != "accept" {
+        red::state_set("replay_pending_author_step_id", "");
+        red::state_set("replay_pending_author_preview_digest", "");
+        return;
+    }
+    let step_id = red::string(red::state("replay_pending_author_step_id"), "");
+    let preview_digest = red::string(red::state("replay_pending_author_preview_digest"), "");
+    if step_id == "" || preview_digest == "" {
+        red::state_set("replay_notice", "The original PR worktree preview has expired.");
+        render();
+        return;
+    }
+    red::execute("SetTextPanelStatus", "replay-coach", TextPanelStatus {
+        busy: true,
+        label: "Preparing original PR code…",
+        stream: false,
+    });
+    red::request(
+        "ReplayPrepareAuthorWorkspace",
+        original_workspace_opened,
+        red::string(red::state("replay_workspace_id"), ""),
+        step_id,
+        preview_digest,
+        true
+    );
+}
+
+fn original_workspace_creation_cancelled(event: PickerCancelled) {
+    red::state_set("replay_pending_author_step_id", "");
+    red::state_set("replay_pending_author_preview_digest", "");
+}
+
+fn original_workspace_opened(result: Json) {
+    red::execute("SetTextPanelStatus", "replay-coach");
+    red::state_set("replay_pending_author_step_id", "");
+    red::state_set("replay_pending_author_preview_digest", "");
+    if !red::bool(result.ok, false) {
+        red::state_set(
+            "replay_notice",
+            source_error(result, "The original PR worktree could not be safely opened.")
+        );
+        render();
+        return;
+    }
+    red::state_set("replay_author_workspace_root", red::string(result.workspace_root, ""));
+    red::state_set(
+        "replay_author_workspace_branch",
+        red::string(result.workspace_branch, "")
+    );
+    let result_label = "Original PR worktree reopened";
+    if red::bool(result.created, false) {
+        result_label = "Original PR worktree created";
+    }
+    let notice = result_label + " · real author source · learning scratch unchanged.";
+    if red::bool(result.used_fallback, false) {
+        notice = result_label
+            + " · selected file is absent at the PR head; opened another original source · learning scratch unchanged.";
+    }
+    red::state_set("replay_notice", notice);
+    render();
+    red::execute("FocusEditor");
 }
 
 fn open_summary() {
@@ -1965,6 +2139,9 @@ fn guide_content() -> String {
         branch: red::string(red::state("replay_branch"), ""),
         review_role: red::state("replay_review_role"),
         head_commit: red::string(red::state("replay_head_commit"), ""),
+        author_workspace_available: author_workspace_available(),
+        author_workspace_root: red::string(red::state("replay_author_workspace_root"), ""),
+        author_workspace_branch: red::string(red::state("replay_author_workspace_branch"), ""),
         draft_count: red::len(red::state("replay_drafts")),
         drafts: red::state("replay_drafts"),
         receipts: red::state("replay_receipts"),

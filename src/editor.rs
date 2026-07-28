@@ -799,6 +799,13 @@ pub enum PluginRequest {
         source_id: String,
         confirmed: bool,
     },
+    ReplayPrepareAuthorWorkspace {
+        request_id: RequestId,
+        workspace_id: String,
+        step_id: String,
+        preview_digest: String,
+        confirmed: bool,
+    },
     ReplayActiveSession {
         request_id: RequestId,
     },
@@ -1105,6 +1112,17 @@ pub enum ReplayBackgroundResult {
         /// Newly created or safely resumed original scratch worktree.
         workspace: Box<crate::replay::ReplayWorkspace>,
     },
+    /// Separately confirmed real PR-head worktree and editor-owned source file.
+    AuthorWorkspace {
+        /// Existing merge-base Replay session that requested original PR code.
+        workspace_id: String,
+        /// Independently verified original PR head and fork-aware author branch.
+        workspace: Box<crate::replay::ReplayAuthorWorkspace>,
+        /// Repository-relative file originally selected in the learning guide.
+        requested_source_path: PathBuf,
+        /// Canonical regular source file inside the original PR worktree.
+        source_path: PathBuf,
+    },
     /// Bounded, source-linked review summaries from readable owner snapshots.
     Reviews(Vec<SessionReplayReview>),
     /// A verified persisted editor snapshot chosen in the reviews picker.
@@ -1210,6 +1228,7 @@ impl PluginRequest {
             Self::ReplayResolveLocalBranch { .. } => "ReplayResolveLocalBranch",
             Self::ReplayFetchPullRequestObjects { .. } => "ReplayFetchPullRequestObjects",
             Self::ReplayCreateWorkspace { .. } => "ReplayCreateWorkspace",
+            Self::ReplayPrepareAuthorWorkspace { .. } => "ReplayPrepareAuthorWorkspace",
             Self::ReplayActiveSession { .. } => "ReplayActiveSession",
             Self::ReplayListReviews { .. } => "ReplayListReviews",
             Self::ReplayResumeReview { .. } => "ReplayResumeReview",
@@ -8404,6 +8423,121 @@ impl Editor {
                             .await?;
                     }
                 }
+                PluginRequest::ReplayPrepareAuthorWorkspace {
+                    request_id,
+                    workspace_id,
+                    step_id,
+                    preview_digest,
+                    confirmed,
+                } => {
+                    let selected =
+                        self.replay_controller
+                            .session(&workspace_id)
+                            .and_then(|session| {
+                                let selected = session
+                                    .steps
+                                    .iter()
+                                    .find(|step| step.id == step_id)
+                                    .ok_or_else(|| crate::replay::ReplayError::NotFound {
+                                        kind: "replay step",
+                                        id: step_id.clone(),
+                                    })?;
+                                let mut paths = vec![selected.path.clone()];
+                                for step in &session.steps {
+                                    if !paths.contains(&step.path) {
+                                        paths.push(step.path.clone());
+                                    }
+                                }
+                                Ok((session.source.clone(), paths))
+                            });
+                    if confirmed {
+                        let limits = self.replay_controller.limits();
+                        let started = selected.and_then(|(mut source, paths)| {
+                            if preview_digest.is_empty() {
+                                return Err(
+                                    crate::replay::ReplayError::AuthorWorkspaceConfirmationRequired,
+                                );
+                            }
+                            let requested_source_path =
+                                paths.first().cloned().ok_or_else(|| {
+                                    crate::replay::ReplayError::NotFound {
+                                        kind: "original PR source file",
+                                        id: step_id.clone(),
+                                    }
+                                })?;
+                            self.spawn_replay_background(request_id, "author-worktree", move || {
+                                crate::replay::refresh_pull_request_capabilities(
+                                    &mut source,
+                                    limits,
+                                )?;
+                                let (preview, _) = crate::replay::prepare_author_workspace(
+                                    &source, /*confirmed*/ false,
+                                )?;
+                                if preview.digest() != preview_digest {
+                                    return Err(crate::replay::ReplayError::StalePreview);
+                                }
+                                let (_, workspace) = crate::replay::prepare_author_workspace(
+                                    &source, /*confirmed*/ true,
+                                )?;
+                                let workspace = workspace.ok_or(
+                                    crate::replay::ReplayError::AuthorWorkspaceConfirmationRequired,
+                                )?;
+                                let mut source_path = None;
+                                for relative in paths {
+                                    match workspace.source_path(&relative) {
+                                        Ok(path) => {
+                                            source_path = Some(path);
+                                            break;
+                                        }
+                                        Err(crate::replay::ReplayError::NotFound { .. }) => {}
+                                        Err(error) => return Err(error),
+                                    }
+                                }
+                                let source_path =
+                                    source_path.ok_or(crate::replay::ReplayError::NotFound {
+                                        kind: "original PR source file",
+                                        id: requested_source_path.display().to_string(),
+                                    })?;
+                                Ok(ReplayBackgroundResult::AuthorWorkspace {
+                                    workspace_id,
+                                    workspace: Box::new(workspace),
+                                    requested_source_path,
+                                    source_path,
+                                })
+                            })
+                        });
+                        if let Err(error) = started {
+                            self.plugin_registry
+                                .resolve_request(runtime, request_id, error.payload())
+                                .await?;
+                        }
+                    } else {
+                        let payload = selected
+                            .and_then(|(_, paths)| {
+                                let preview = self
+                                    .replay_controller
+                                    .preview_author_workspace(&workspace_id)?;
+                                Ok(json!({
+                                    "ok": true,
+                                    "workspace_id": workspace_id,
+                                    "step_id": step_id,
+                                    "source_path": paths.first(),
+                                    "workspace_root": preview.root,
+                                    "workspace_branch": preview.branch,
+                                    "head_repository": preview.head_repository,
+                                    "head_ref": preview.head_ref,
+                                    "head_commit": preview.head_commit.as_str(),
+                                    "viewer": preview.viewer,
+                                    "existing": preview.existing,
+                                    "preview_digest": preview.digest(),
+                                }))
+                            })
+                            .unwrap_or_else(|error| error.payload());
+                        self.plugin_registry
+                            .resolve_request(runtime, request_id, payload)
+                            .await?;
+                    }
+                }
                 PluginRequest::ReplayActiveSession { request_id } => {
                     let payload = self.active_replay_session_payload();
                     self.plugin_registry
@@ -9032,6 +9166,66 @@ impl Editor {
                             }
                             Err(error) => json!({ "ok": false, "error": error.to_string() }),
                         },
+                        Ok(ReplayBackgroundResult::AuthorWorkspace {
+                            workspace_id,
+                            workspace,
+                            requested_source_path,
+                            source_path,
+                        }) => {
+                            let workspace = *workspace;
+                            match self
+                                .replay_controller
+                                .adopt_author_workspace(&workspace_id, workspace.clone())
+                            {
+                                Ok(()) => match source_path.to_str().map(str::to_owned) {
+                                    Some(source_name) => match self
+                                        .execute(
+                                            &Action::OpenFile(source_name.clone()),
+                                            buffer,
+                                            runtime,
+                                        )
+                                        .await
+                                    {
+                                        Ok(_) if self.current_buffer().name() == source_name => {
+                                            let used_fallback = source_path
+                                                .strip_prefix(&workspace.root)
+                                                .map(|path| path != requested_source_path.as_path())
+                                                .unwrap_or(true);
+                                            needs_render = true;
+                                            json!({
+                                                "ok": true,
+                                                "workspace_id": workspace_id,
+                                                "workspace_root": workspace.root,
+                                                "workspace_branch": workspace.branch,
+                                                "head_repository": workspace.head_repository,
+                                                "head_ref": workspace.head_ref,
+                                                "head_commit": workspace.head_commit.as_str(),
+                                                "requested_source_path": requested_source_path,
+                                                "source_path": source_path,
+                                                "used_fallback": used_fallback,
+                                                "created": workspace.created_by_replay,
+                                            })
+                                        }
+                                        Ok(_) => json!({
+                                            "ok": false,
+                                            "error": self.last_error.clone().unwrap_or_else(|| {
+                                                "the original PR source could not be opened"
+                                                    .to_string()
+                                            }),
+                                        }),
+                                        Err(error) => {
+                                            json!({ "ok": false, "error": error.to_string() })
+                                        }
+                                    },
+                                    None => crate::replay::ReplayError::UnsafePath(
+                                        "the original PR source path is not valid UTF-8"
+                                            .to_string(),
+                                    )
+                                    .payload(),
+                                },
+                                Err(error) => error.payload(),
+                            }
+                        }
                         Err(error) => error.payload(),
                     };
                     self.plugin_registry
@@ -23971,6 +24165,117 @@ mod test {
         (directory, session, workspace)
     }
 
+    fn real_author_replay_session_fixture() -> (
+        tempfile::TempDir,
+        crate::replay::ReplaySession,
+        crate::replay::ReplayWorkspace,
+        crate::replay::ReplayAuthorWorkspace,
+    ) {
+        fn fixture_git(root: &Path, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .expect("Git is available for the isolated author-worktree fixture");
+            assert!(
+                output.status.success(),
+                "isolated author fixture Git command {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            String::from_utf8(output.stdout)
+                .expect("author fixture Git output is UTF-8")
+                .trim()
+                .to_string()
+        }
+
+        let directory = tempfile::tempdir().expect("isolated original-head author fixture");
+        let root = directory.path().join("author-replay-fixture");
+        std::fs::create_dir(&root).expect("create the isolated original repository");
+        fixture_git(&root, &["init", "--initial-branch=master"]);
+        fixture_git(&root, &["config", "core.autocrlf", "false"]);
+        fixture_git(&root, &["config", "user.name", "Replay Author Fixture"]);
+        fixture_git(&root, &["config", "user.email", "author@example.test"]);
+        fixture_git(
+            &root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/author-replay-fixture.git",
+            ],
+        );
+        std::fs::create_dir(root.join("src")).expect("create original fixture source files");
+        std::fs::write(
+            root.join("src/first.rs"),
+            "fn first() {\n    before_first();\n}\n",
+        )
+        .expect("write the genuine original merge-base source");
+        std::fs::write(
+            root.join("src/second.rs"),
+            "fn second() {\n    before_second();\n}\n",
+        )
+        .expect("write a second whole-repository source file");
+        fixture_git(&root, &["add", "src/first.rs", "src/second.rs"]);
+        fixture_git(&root, &["commit", "--quiet", "-m", "create learning base"]);
+        fixture_git(&root, &["checkout", "--quiet", "-b", "feature/original-pr"]);
+        std::fs::write(
+            root.join("src/first.rs"),
+            "fn first() {\n    original_author_head();\n}\n",
+        )
+        .expect("write the exact original PR head");
+        fixture_git(&root, &["add", "src/first.rs"]);
+        fixture_git(
+            &root,
+            &["commit", "--quiet", "-m", "create exact original PR head"],
+        );
+        fixture_git(&root, &["checkout", "--quiet", "master"]);
+
+        let mut source = crate::replay::resolve_local_branch_source(
+            &root,
+            "feature/original-pr",
+            Some("master"),
+            crate::replay::ReplayLimits::default(),
+        )
+        .expect("resolve the real original head and merge-base source")
+        .source;
+        source.kind = crate::replay::ReplaySourceKind::GitHubPullRequest;
+        source.pull_request = Some(crate::replay::ReplayPullRequest {
+            host: "github.com".to_string(),
+            repository_owner: "example".to_string(),
+            repository_name: "author-replay-fixture".to_string(),
+            number: 482,
+            url: "https://github.com/example/author-replay-fixture/pull/482".to_string(),
+            author: Some("original-author".to_string()),
+            base_ref: "master".to_string(),
+            base_ref_tip: source.base_commit.clone(),
+            head_repository_owner: "example".to_string(),
+            head_repository_name: "author-replay-fixture".to_string(),
+            head_ref: "feature/original-pr".to_string(),
+            head_commit: source.target_commit.clone(),
+            cross_repository: false,
+            capabilities: crate::replay::ReplayGitHubCapabilities {
+                viewer: Some("original-author".to_string()),
+                head_permission: crate::replay::ReplayRepositoryPermission::Write,
+            },
+            captured_at_ms: 0,
+        });
+        let (_, scratch) = crate::replay::prepare_workspace(&source, /*confirmed*/ true)
+            .expect("create only the independently confirmed learning worktree");
+        let scratch = scratch.expect("the isolated merge-base learning worktree exists");
+        let session = crate::replay::ReplaySession::from_source(
+            source.clone(),
+            scratch.clone(),
+            crate::replay::ReplayLimits::default(),
+        )
+        .expect("compile the genuine original-head author learning session");
+        let (_, author) = crate::replay::prepare_author_workspace(&source, /*confirmed*/ true)
+            .expect("create the independently verified original PR-head worktree");
+        let author = author.expect("the isolated original PR-head worktree exists");
+
+        (directory, session, scratch, author)
+    }
+
     #[tokio::test]
     async fn real_replay_workspace_requires_confirmation_before_touching_editor_state() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
@@ -23992,6 +24297,95 @@ mod test {
         assert_eq!(result["code"], "workspace_confirmation_required");
         assert_eq!(editor.buffer_manager.len(), 1);
         assert!(editor.replay_demo_workspace.is_none());
+    }
+
+    #[tokio::test]
+    async fn confirmed_original_author_head_opens_a_real_buffer_without_replacing_scratch() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let (_directory, session, scratch, author) = real_author_replay_session_fixture();
+        let workspace_id = session.id.clone();
+        let selected = session.steps[0].path.clone();
+        let original_path = author
+            .source_path(&selected)
+            .expect("select a genuine original PR-head source file");
+        let original_source = std::fs::read_to_string(&original_path)
+            .expect("read the separately confirmed original-head source");
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .install_replay_source_session(
+                session,
+                "feature/original-pr",
+                scratch.clone(),
+                &mut render_buffer,
+            )
+            .await
+            .expect("open the independently confirmed merge-base learning source");
+        let selected_name = selected.to_string_lossy();
+        let scratch_buffer = editor
+            .replay_demo_workspace
+            .as_ref()
+            .and_then(|state| state.source_buffers.get(selected_name.as_ref()).copied())
+            .expect("retain the original learning scratch buffer identity");
+        let scratch_source = editor
+            .buffer_manager
+            .iter()
+            .find(|buffer| buffer.id() == scratch_buffer)
+            .expect("preserve the editor-owned learning scratch buffer")
+            .contents()
+            .to_string();
+
+        let request_id = RequestId::from_raw(/*value*/ 27148);
+        assert!(editor.pending_replay_requests.insert(request_id));
+        ACTION_DISPATCHER.send_request(PluginRequest::ReplayBackgroundCompleted {
+            request_id,
+            result: Ok(ReplayBackgroundResult::AuthorWorkspace {
+                workspace_id: workspace_id.clone(),
+                workspace: Box::new(author.clone()),
+                requested_source_path: selected.clone(),
+                source_path: original_path.clone(),
+            }),
+        });
+        editor
+            .service_background(&mut render_buffer, &mut runtime)
+            .await
+            .expect("open original PR code through the ordinary editor buffer lifecycle");
+
+        assert_eq!(
+            editor.current_buffer().name(),
+            original_path.to_string_lossy(),
+        );
+        assert_eq!(editor.current_buffer().contents(), original_source);
+        assert_ne!(editor.current_buffer().id(), scratch_buffer);
+        assert_eq!(
+            editor
+                .buffer_manager
+                .iter()
+                .find(|buffer| buffer.id() == scratch_buffer)
+                .expect("the learning source remains open and independent")
+                .contents(),
+            scratch_source,
+        );
+        assert_eq!(
+            editor
+                .replay_controller
+                .session(&workspace_id)
+                .unwrap()
+                .workspace,
+            scratch,
+        );
+        assert_eq!(
+            editor
+                .replay_controller
+                .author_workspace(&workspace_id)
+                .unwrap(),
+            &author,
+        );
+        assert!(!editor.pending_replay_requests.contains(&request_id));
     }
 
     #[tokio::test]

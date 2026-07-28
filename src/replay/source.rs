@@ -10,7 +10,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use super::{digest, now_ms, ReplayError, ReplayLimits, ReplayWorkspace, ReplayWorkspacePreview};
+use super::{
+    digest, now_ms, ReplayError, ReplayLimits, ReplayReviewRole, ReplayWorkspace,
+    ReplayWorkspacePreview,
+};
 
 const GITHUB_METADATA_FIELDS: &str = "number,url,title,body,author,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,commits,changedFiles";
 const GITHUB_CAPABILITIES_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { viewer { login } repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { number author { login } headRefName headRefOid headRepository { nameWithOwner viewerPermission } } } }";
@@ -366,6 +369,94 @@ pub struct ReplaySource {
     pub pull_request: Option<ReplayPullRequest>,
     /// Original author and commit context.
     pub review_context: Option<ReplayReviewContext>,
+}
+
+/// Read-only identity of the original author head, never the learning scratch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayAuthorWorkspacePreview {
+    /// The original checkout remains unchanged when this worktree is opened.
+    pub repository_root: PathBuf,
+    /// Exact durable sibling reserved for this original pull-request head.
+    pub root: PathBuf,
+    /// Separate Replay-owned branch, not the actual pull-request branch.
+    pub branch: String,
+    /// Complete, immutable original author-head commit.
+    pub head_commit: GitObjectId,
+    /// Host-qualified original head repository, including a fork when present.
+    pub head_repository: String,
+    /// Original pull-request branch, retained for a later explicit push.
+    pub head_ref: String,
+    /// Authenticated original pull-request author.
+    pub viewer: String,
+    /// Whether a sibling already exists and must be independently verified.
+    pub existing: bool,
+}
+
+impl ReplayAuthorWorkspacePreview {
+    /// Binds confirmation to the exact original head, fork, branch, and path.
+    #[must_use]
+    pub fn digest(&self) -> String {
+        let identity = serde_json::json!({
+            "repository_root": self.repository_root,
+            "root": self.root,
+            "branch": self.branch,
+            "head_commit": self.head_commit,
+            "head_repository": self.head_repository,
+            "head_ref": self.head_ref,
+            "viewer": self.viewer,
+            "existing": self.existing,
+        });
+        digest(identity.to_string().as_bytes())
+    }
+}
+
+/// Independently verified real author worktree, separate from replay scratch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayAuthorWorkspace {
+    /// Canonical durable sibling containing the real original PR source.
+    pub root: PathBuf,
+    /// Separate Replay-owned local author branch.
+    pub branch: String,
+    /// Original PR head from which author edits must descend.
+    pub head_commit: GitObjectId,
+    /// Host-qualified exact original head repository, including forks.
+    pub head_repository: String,
+    /// Original remote PR branch, never implicitly checked out or pushed.
+    pub head_ref: String,
+    /// Whether this confirmation created, rather than reopened, the worktree.
+    pub created_by_replay: bool,
+}
+
+impl ReplayAuthorWorkspace {
+    /// Resolves a real, regular PR file without following out-of-root symlinks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing, non-regular, absolute, traversing, or
+    /// symbolic-link source paths.
+    pub fn source_path(&self, path: &Path) -> Result<PathBuf, ReplayError> {
+        validate_relative_path(path)?;
+        let joined = self.root.join(path);
+        let metadata = match std::fs::symlink_metadata(&joined) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ReplayError::NotFound {
+                    kind: "original PR source file",
+                    id: path.display().to_string(),
+                });
+            }
+            Err(error) => return Err(ReplayError::Filesystem(error.to_string())),
+        };
+        if !metadata.file_type().is_file() {
+            return Err(ReplayError::UnsafePath(path.display().to_string()));
+        }
+        let canonical = std::fs::canonicalize(&joined)
+            .map_err(|error| ReplayError::Filesystem(error.to_string()))?;
+        if !canonical.starts_with(&self.root) {
+            return Err(ReplayError::UnsafePath(path.display().to_string()));
+        }
+        Ok(canonical)
+    }
 }
 
 /// Pinned local feature branch and its explicitly selected or detected base.
@@ -979,6 +1070,216 @@ fn build_source(seed: ReplaySourceSeed, limits: ReplayLimits) -> Result<ReplaySo
     })
 }
 
+/// Previews or explicitly opens the verified author's real original PR source.
+///
+/// The proposed branch and sibling are distinct from both the original PR
+/// branch and the merge-base learning worktree. Previewing does not create a
+/// directory, branch, commit, or remote request. Existing author edits are
+/// deliberately preserved when the exact verified worktree is reopened.
+///
+/// # Errors
+///
+/// Returns an error for local sources, unverified or read-only authors, moved
+/// source identities, unrelated existing branches or worktrees, and bounded
+/// Git or filesystem failures.
+pub fn prepare_author_workspace(
+    source: &ReplaySource,
+    confirmed: bool,
+) -> Result<(ReplayAuthorWorkspacePreview, Option<ReplayAuthorWorkspace>), ReplayError> {
+    if source.kind != ReplaySourceKind::GitHubPullRequest {
+        return Err(ReplayError::AuthorWorkspaceUnavailable(
+            "only an original GitHub pull request has an author worktree".to_string(),
+        ));
+    }
+    let request = source.pull_request.as_ref().ok_or_else(|| {
+        ReplayError::AuthorWorkspaceUnavailable(
+            "the original GitHub pull request could not be verified".to_string(),
+        )
+    })?;
+    if source.target_commit != request.head_commit {
+        return Err(ReplayError::SourceRefMoved);
+    }
+    if ReplayReviewRole::from_pull_request(Some(request)) != ReplayReviewRole::Author {
+        return Err(ReplayError::AuthorWorkspaceUnavailable(
+            "only the verified original PR author can open its real source".to_string(),
+        ));
+    }
+    if !matches!(
+        request.capabilities.head_permission,
+        ReplayRepositoryPermission::Write
+            | ReplayRepositoryPermission::Maintain
+            | ReplayRepositoryPermission::Admin
+    ) {
+        return Err(ReplayError::AuthorWorkspaceUnavailable(
+            "the verified author does not have write access to the original head repository"
+                .to_string(),
+        ));
+    }
+    let viewer = request.capabilities.viewer.clone().ok_or_else(|| {
+        ReplayError::AuthorWorkspaceUnavailable(
+            "the original author's authenticated identity could not be confirmed".to_string(),
+        )
+    })?;
+
+    let parent =
+        source.repository.root.parent().ok_or_else(|| {
+            ReplayError::UnsafePath("repository has no durable parent".to_string())
+        })?;
+    let slug = format!("pr-{}-{}", request.number, request.head_commit.short());
+    let branch = format!("replay/author/{slug}");
+    let directory_name = format!("{}.replay-author-{slug}", source.repository.name);
+    let root = parent.join(&directory_name);
+    let preview = ReplayAuthorWorkspacePreview {
+        repository_root: source.repository.root.clone(),
+        existing: root.exists() || std::fs::symlink_metadata(&root).is_ok(),
+        root,
+        branch,
+        head_commit: request.head_commit.clone(),
+        head_repository: format!(
+            "{}/{}/{}",
+            request.host, request.head_repository_owner, request.head_repository_name
+        ),
+        head_ref: request.head_ref.clone(),
+        viewer,
+    };
+    if !confirmed {
+        return Ok((preview, None));
+    }
+    if !has_git_commit(&source.repository.root, &request.head_commit)? {
+        return Err(ReplayError::MissingObjects);
+    }
+    if preview.existing {
+        let workspace = existing_author_workspace(source, &preview)?;
+        return Ok((preview, Some(workspace)));
+    }
+
+    let branch_reference = format!("refs/heads/{}", preview.branch);
+    let branch_exists = replay_git_command(&source.repository.root)
+        .args(["show-ref", "--verify", "--quiet"])
+        .arg(&branch_reference)
+        .stdin(Stdio::null())
+        .status()
+        .map_err(|error| ReplayError::Filesystem(error.to_string()))?
+        .success();
+    if branch_exists
+        && !author_head_is_ancestor(
+            &source.repository.root,
+            &request.head_commit,
+            &branch_reference,
+        )?
+    {
+        return Err(ReplayError::WorkspaceExists(preview.branch.clone()));
+    }
+
+    let relative_root = Path::new("..").join(&directory_name);
+    let mut command = replay_git_command(&source.repository.root);
+    command.args(["worktree", "add"]);
+    if branch_exists {
+        command.arg(&relative_root).arg(&preview.branch);
+    } else {
+        command
+            .arg("-b")
+            .arg(&preview.branch)
+            .arg(&relative_root)
+            .arg(request.head_commit.as_str());
+    }
+    if let Err(error) = run_command(&mut command, MAX_COMMAND_DIAGNOSTIC_BYTES) {
+        if preview.root.exists() || std::fs::symlink_metadata(&preview.root).is_ok() {
+            if let Ok(workspace) = existing_author_workspace(source, &preview) {
+                return Ok((preview, Some(workspace)));
+            }
+        }
+        return Err(error);
+    }
+    let mut workspace = existing_author_workspace(source, &preview)?;
+    workspace.created_by_replay = true;
+    Ok((preview, Some(workspace)))
+}
+
+fn existing_author_workspace(
+    source: &ReplaySource,
+    preview: &ReplayAuthorWorkspacePreview,
+) -> Result<ReplayAuthorWorkspace, ReplayError> {
+    let conflict = || ReplayError::WorkspaceExists(preview.root.display().to_string());
+    let metadata = std::fs::symlink_metadata(&preview.root).map_err(|_| conflict())?;
+    if !metadata.file_type().is_dir() {
+        return Err(conflict());
+    }
+    let canonical_root = std::fs::canonicalize(&preview.root).map_err(|_| conflict())?;
+    if canonical_root != preview.root {
+        return Err(conflict());
+    }
+    let actual_root = git_text(&preview.root, &["rev-parse", "--show-toplevel"], 16 * 1024)
+        .map_err(|_| conflict())?;
+    let actual_root = std::fs::canonicalize(actual_root.trim()).map_err(|_| conflict())?;
+    if actual_root != canonical_root {
+        return Err(conflict());
+    }
+    let actual_branch = git_text(
+        &preview.root,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        1024,
+    )
+    .map_err(|_| conflict())?;
+    if actual_branch.trim() != preview.branch {
+        return Err(conflict());
+    }
+    let actual_head =
+        git_text(&preview.root, &["rev-parse", "HEAD"], 1024).map_err(|_| conflict())?;
+    let actual_head = GitObjectId::parse(actual_head.trim()).map_err(|_| conflict())?;
+    if !author_head_is_ancestor(&preview.root, &preview.head_commit, actual_head.as_str())
+        .map_err(|_| conflict())?
+    {
+        return Err(conflict());
+    }
+    let common = git_text(&preview.root, &["rev-parse", "--git-common-dir"], 16 * 1024)
+        .map_err(|_| conflict())?;
+    let common = PathBuf::from(common.trim());
+    let common = if common.is_absolute() {
+        common
+    } else {
+        preview.root.join(common)
+    };
+    let common = std::fs::canonicalize(common).map_err(|_| conflict())?;
+    if common != source.repository.common_directory {
+        return Err(conflict());
+    }
+
+    Ok(ReplayAuthorWorkspace {
+        root: canonical_root,
+        branch: preview.branch.clone(),
+        head_commit: preview.head_commit.clone(),
+        head_repository: preview.head_repository.clone(),
+        head_ref: preview.head_ref.clone(),
+        created_by_replay: false,
+    })
+}
+
+fn author_head_is_ancestor(
+    root: &Path,
+    head: &GitObjectId,
+    descendant: &str,
+) -> Result<bool, ReplayError> {
+    let status = replay_git_command(root)
+        .args(["merge-base", "--is-ancestor", head.as_str(), descendant])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| ReplayError::CommandFailed {
+            program: "git".to_string(),
+            message: error.to_string(),
+        })?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(ReplayError::CommandFailed {
+            program: "git".to_string(),
+            message: "could not verify the original PR head ancestry".to_string(),
+        }),
+    }
+}
+
 /// Produces the preview or creates the explicitly confirmed scratch worktree.
 pub fn prepare_workspace(
     source: &ReplaySource,
@@ -1554,6 +1855,355 @@ mod tests {
         )
         .expect("resolve the isolated original feature");
         (directory, source.source)
+    }
+
+    fn reusable_author_workspace_source() -> (tempfile::TempDir, ReplaySource) {
+        let (directory, mut source) = reusable_workspace_source();
+        source.kind = ReplaySourceKind::GitHubPullRequest;
+        source.pull_request = Some(ReplayPullRequest {
+            host: "github.com".to_string(),
+            repository_owner: "example".to_string(),
+            repository_name: "replay-fixture".to_string(),
+            number: 482,
+            url: "https://github.com/example/replay-fixture/pull/482".to_string(),
+            author: Some("original-author".to_string()),
+            base_ref: "master".to_string(),
+            base_ref_tip: source.base_commit.clone(),
+            head_repository_owner: "example".to_string(),
+            head_repository_name: "replay-fixture".to_string(),
+            head_ref: "feature/replay".to_string(),
+            head_commit: source.target_commit.clone(),
+            cross_repository: false,
+            capabilities: ReplayGitHubCapabilities {
+                viewer: Some("original-author".to_string()),
+                head_permission: ReplayRepositoryPermission::Write,
+            },
+            captured_at_ms: 0,
+        });
+        (directory, source)
+    }
+
+    #[test]
+    fn previews_original_author_head_without_creating_a_branch_or_worktree() {
+        let (_directory, source) = reusable_author_workspace_source();
+
+        let (preview, workspace) = prepare_author_workspace(&source, /*confirmed*/ false)
+            .expect("preview the separately verified original PR head");
+
+        assert!(workspace.is_none());
+        assert!(!preview.existing);
+        assert!(!preview.root.exists());
+        assert_eq!(preview.head_commit, source.target_commit);
+        assert_ne!(preview.head_commit, source.base_commit);
+        assert_eq!(preview.viewer, "original-author");
+        assert_eq!(preview.head_repository, "github.com/example/replay-fixture");
+        assert_eq!(preview.head_ref, "feature/replay");
+        assert!(preview.branch.starts_with("replay/author/pr-482-"));
+        assert!(fixture_git(
+            &source.repository.root,
+            &["branch", "--list", &preview.branch],
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn original_author_confirmation_digest_binds_head_fork_branch_and_path() {
+        let (_directory, source) = reusable_author_workspace_source();
+        let (preview, _) = prepare_author_workspace(&source, /*confirmed*/ false)
+            .expect("preview the exact original author worktree");
+        let expected = preview.digest();
+
+        let mut different_head = preview.clone();
+        different_head.head_commit = source.base_commit.clone();
+        assert_ne!(different_head.digest(), expected);
+
+        let mut different_fork = preview.clone();
+        different_fork.head_repository = "github.com/another-author/fork".to_string();
+        assert_ne!(different_fork.digest(), expected);
+
+        let mut different_branch = preview.clone();
+        different_branch.head_ref = "feature/different".to_string();
+        assert_ne!(different_branch.digest(), expected);
+
+        let mut different_path = preview;
+        different_path.root = different_path.repository_root.join("unexpected-worktree");
+        assert_ne!(different_path.digest(), expected);
+    }
+
+    #[test]
+    fn opens_original_author_head_without_changing_the_learning_scratch() {
+        let (_directory, source) = reusable_author_workspace_source();
+        let (_, scratch) = prepare_workspace(&source, /*confirmed*/ true)
+            .expect("create the independently confirmed merge-base learning scratch");
+        let scratch = scratch.expect("the confirmed learning worktree exists");
+
+        let (preview, workspace) = prepare_author_workspace(&source, /*confirmed*/ true)
+            .expect("open the independently confirmed original author head");
+        let workspace = workspace.expect("the real original-author worktree exists");
+
+        assert!(workspace.created_by_replay);
+        assert_eq!(workspace.root, preview.root);
+        assert_ne!(workspace.root, scratch.root);
+        assert_ne!(workspace.branch, scratch.branch);
+        assert_eq!(
+            fixture_git(&workspace.root, &["rev-parse", "HEAD"]),
+            source.target_commit.as_str(),
+        );
+        assert_eq!(
+            fixture_git(&scratch.root, &["rev-parse", "HEAD"]),
+            source.base_commit.as_str(),
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.root.join("src/token.rs"))
+                .expect("read the real original PR source"),
+            "pub fn token() -> usize { 2 }\n",
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.root.join("src/token.rs"))
+                .expect("read the unchanged merge-base learning source"),
+            "pub fn token() -> usize { 1 }\n",
+        );
+        assert_eq!(
+            fixture_git(&source.repository.root, &["branch", "--show-current"]),
+            "master",
+        );
+    }
+
+    #[test]
+    fn original_author_branch_can_already_be_checked_out_elsewhere() {
+        let (_directory, source) = reusable_author_workspace_source();
+        fixture_git(
+            &source.repository.root,
+            &["checkout", "--quiet", "feature/replay"],
+        );
+
+        let (_, workspace) = prepare_author_workspace(&source, /*confirmed*/ true)
+            .expect("create a separate author branch while the real PR branch stays checked out");
+        let workspace = workspace.expect("the separately named author worktree exists");
+
+        assert_eq!(
+            fixture_git(&source.repository.root, &["branch", "--show-current"]),
+            "feature/replay",
+        );
+        assert_eq!(
+            fixture_git(&workspace.root, &["branch", "--show-current"]),
+            workspace.branch,
+        );
+        assert_ne!(workspace.branch, "feature/replay");
+    }
+
+    #[test]
+    fn resolves_only_regular_original_author_files_inside_the_exact_worktree() {
+        let (_directory, source) = reusable_author_workspace_source();
+        let (_, workspace) = prepare_author_workspace(&source, /*confirmed*/ true)
+            .expect("create the exact original author worktree");
+        let workspace = workspace.expect("the confirmed author worktree exists");
+
+        let path = workspace
+            .source_path(Path::new("src/token.rs"))
+            .expect("resolve a genuine regular original PR source file");
+
+        assert_eq!(path, workspace.root.join("src/token.rs"));
+        assert!(matches!(
+            workspace.source_path(Path::new("../src/token.rs")),
+            Err(ReplayError::UnsafePath(_)),
+        ));
+        assert!(matches!(
+            workspace.source_path(Path::new("src/missing.rs")),
+            Err(ReplayError::NotFound {
+                kind: "original PR source file",
+                ..
+            }),
+        ));
+    }
+
+    #[test]
+    fn reopening_original_author_worktree_preserves_dirty_and_untracked_files() {
+        let (_directory, source) = reusable_author_workspace_source();
+        let (_, created) = prepare_author_workspace(&source, /*confirmed*/ true)
+            .expect("create the exact original author worktree");
+        let created = created.expect("the confirmed author worktree exists");
+        let changed = "pub fn token() -> usize { 3 }\n";
+        std::fs::write(created.root.join("src/token.rs"), changed)
+            .expect("preserve the author's real in-progress code");
+        std::fs::write(
+            created.root.join("private-follow-up.txt"),
+            "keep this author edit\n",
+        )
+        .expect("preserve the author's real untracked work");
+
+        let (preview, reopened) = prepare_author_workspace(&source, /*confirmed*/ true)
+            .expect("reopen the independently verified dirty author worktree");
+        let reopened = reopened.expect("reopen rather than replace the original author worktree");
+
+        assert!(preview.existing);
+        assert!(!reopened.created_by_replay);
+        assert_eq!(reopened.root, created.root);
+        assert_eq!(
+            std::fs::read_to_string(reopened.root.join("src/token.rs")).unwrap(),
+            changed,
+        );
+        assert_eq!(
+            std::fs::read_to_string(reopened.root.join("private-follow-up.txt")).unwrap(),
+            "keep this author edit\n",
+        );
+    }
+
+    #[test]
+    fn reopening_original_author_worktree_accepts_committed_head_descendants() {
+        let (_directory, source) = reusable_author_workspace_source();
+        let (_, created) = prepare_author_workspace(&source, /*confirmed*/ true)
+            .expect("create the exact original author worktree");
+        let created = created.expect("the confirmed author worktree exists");
+        std::fs::write(
+            created.root.join("src/token.rs"),
+            "pub fn token() -> usize { 3 }\n",
+        )
+        .expect("prepare an explicitly authored local follow-up");
+        fixture_git(&created.root, &["add", "src/token.rs"]);
+        fixture_git(
+            &created.root,
+            &["commit", "--quiet", "-m", "add original author follow-up"],
+        );
+        let descendant = fixture_git(&created.root, &["rev-parse", "HEAD"]);
+
+        let (_, reopened) = prepare_author_workspace(&source, /*confirmed*/ true)
+            .expect("preserve committed descendants of the original pinned PR head");
+        let reopened = reopened.expect("reopen the author's existing follow-up");
+
+        assert!(!reopened.created_by_replay);
+        assert_eq!(
+            fixture_git(&reopened.root, &["rev-parse", "HEAD"]),
+            descendant
+        );
+        assert_eq!(reopened.head_commit, source.target_commit);
+    }
+
+    #[test]
+    fn original_author_preview_retains_the_exact_fork_repository() {
+        let (_directory, mut source) = reusable_author_workspace_source();
+        let request = source.pull_request.as_mut().unwrap();
+        request.head_repository_owner = "original-author".to_string();
+        request.head_repository_name = "forked-replay".to_string();
+        request.cross_repository = true;
+
+        let (preview, _) = prepare_author_workspace(&source, /*confirmed*/ false)
+            .expect("retain the original fork rather than infer the base origin");
+
+        assert_eq!(
+            preview.head_repository,
+            "github.com/original-author/forked-replay",
+        );
+        assert_eq!(preview.head_ref, "feature/replay");
+    }
+
+    #[test]
+    fn refuses_original_author_worktree_for_unverified_or_read_only_viewers() {
+        let (_directory, source) = reusable_author_workspace_source();
+
+        for (viewer, permission) in [
+            (Some("another-reviewer"), ReplayRepositoryPermission::Write),
+            (None, ReplayRepositoryPermission::Admin),
+            (Some("original-author"), ReplayRepositoryPermission::Unknown),
+            (Some("original-author"), ReplayRepositoryPermission::None),
+            (Some("original-author"), ReplayRepositoryPermission::Read),
+            (Some("original-author"), ReplayRepositoryPermission::Triage),
+        ] {
+            let mut unverified = source.clone();
+            let capabilities = &mut unverified.pull_request.as_mut().unwrap().capabilities;
+            capabilities.viewer = viewer.map(str::to_string);
+            capabilities.head_permission = permission;
+
+            assert!(matches!(
+                prepare_author_workspace(&unverified, /*confirmed*/ false),
+                Err(ReplayError::AuthorWorkspaceUnavailable(_)),
+            ));
+        }
+    }
+
+    #[test]
+    fn refuses_original_author_worktree_for_a_local_or_moved_source() {
+        let (_directory, mut source) = reusable_author_workspace_source();
+        source.kind = ReplaySourceKind::LocalRevision;
+
+        assert!(matches!(
+            prepare_author_workspace(&source, /*confirmed*/ false),
+            Err(ReplayError::AuthorWorkspaceUnavailable(_)),
+        ));
+
+        source.kind = ReplaySourceKind::GitHubPullRequest;
+        source.pull_request.as_mut().unwrap().head_commit = source.base_commit.clone();
+
+        assert!(matches!(
+            prepare_author_workspace(&source, /*confirmed*/ false),
+            Err(ReplayError::SourceRefMoved),
+        ));
+    }
+
+    #[test]
+    fn refuses_unavailable_original_head_without_creating_an_author_branch() {
+        let (_directory, mut source) = reusable_author_workspace_source();
+        let missing = GitObjectId::parse(&"c".repeat(40)).unwrap();
+        source.target_commit = missing.clone();
+        source.pull_request.as_mut().unwrap().head_commit = missing;
+        let (preview, _) = prepare_author_workspace(&source, /*confirmed*/ false)
+            .expect("preview the exact unavailable head without changing Git");
+
+        assert!(matches!(
+            prepare_author_workspace(&source, /*confirmed*/ true),
+            Err(ReplayError::MissingObjects),
+        ));
+        assert!(!preview.root.exists());
+        assert!(fixture_git(
+            &source.repository.root,
+            &["branch", "--list", &preview.branch],
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn refuses_unrelated_existing_original_author_branch_without_resetting_it() {
+        let (_directory, source) = reusable_author_workspace_source();
+        let (preview, _) = prepare_author_workspace(&source, /*confirmed*/ false)
+            .expect("preview the exact original PR author branch");
+        fixture_git(
+            &source.repository.root,
+            &["branch", &preview.branch, source.base_commit.as_str()],
+        );
+
+        assert!(matches!(
+            prepare_author_workspace(&source, /*confirmed*/ true),
+            Err(ReplayError::WorkspaceExists(_)),
+        ));
+        assert!(!preview.root.exists());
+        assert_eq!(
+            fixture_git(
+                &source.repository.root,
+                &["rev-parse", &format!("refs/heads/{}", preview.branch)],
+            ),
+            source.base_commit.as_str(),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_symlinked_original_author_workspace_without_following_it() {
+        let (directory, source) = reusable_author_workspace_source();
+        let (preview, _) = prepare_author_workspace(&source, /*confirmed*/ false)
+            .expect("preview the independently confined original author workspace");
+        let unrelated = directory.path().join("unrelated-author-source");
+        std::fs::create_dir(&unrelated).unwrap();
+        std::fs::write(unrelated.join("keep.txt"), "leave this untouched\n").unwrap();
+        std::os::unix::fs::symlink(&unrelated, &preview.root).unwrap();
+
+        assert!(matches!(
+            prepare_author_workspace(&source, /*confirmed*/ true),
+            Err(ReplayError::WorkspaceExists(_)),
+        ));
+        assert_eq!(
+            std::fs::read_to_string(unrelated.join("keep.txt")).unwrap(),
+            "leave this untouched\n",
+        );
     }
 
     #[test]

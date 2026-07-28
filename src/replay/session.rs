@@ -11,7 +11,8 @@ use crate::undo::{TextPosition, TextRange};
 
 use super::{
     digest, fetch_pull_request_objects, finalize_pull_request, now_ms, parse_patch,
-    prepare_workspace, GitObjectId, ReplayChangeKind, ReplayError, ReplayLimits, ReplayPullRequest,
+    prepare_author_workspace, prepare_workspace, GitObjectId, ReplayAuthorWorkspace,
+    ReplayAuthorWorkspacePreview, ReplayChangeKind, ReplayError, ReplayLimits, ReplayPullRequest,
     ReplayResolvedPullRequest, ReplaySource,
 };
 
@@ -399,6 +400,7 @@ pub struct ReplayController {
     pending_pull_requests: HashMap<String, ReplayResolvedPullRequest>,
     sources: HashMap<String, ReplaySource>,
     workspaces: HashMap<String, ReplayWorkspace>,
+    author_workspaces: HashMap<String, ReplayAuthorWorkspace>,
     sessions: HashMap<String, ReplaySession>,
     staged: HashMap<String, ReplayStage>,
     active_session: Option<String>,
@@ -420,6 +422,7 @@ impl ReplayController {
             pending_pull_requests: HashMap::new(),
             sources: HashMap::new(),
             workspaces: HashMap::new(),
+            author_workspaces: HashMap::new(),
             sessions: HashMap::new(),
             staged: HashMap::new(),
             active_session: None,
@@ -526,6 +529,50 @@ impl ReplayController {
         self.workspaces.insert(source_id.to_string(), workspace);
         self.advance_generation();
         Ok(())
+    }
+
+    /// Previews the verified author's real PR head without changing Git state.
+    pub fn preview_author_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<ReplayAuthorWorkspacePreview, ReplayError> {
+        let session = self.session(workspace_id)?;
+        prepare_author_workspace(&session.source, /*confirmed*/ false).map(|(preview, _)| preview)
+    }
+
+    /// Adopts only the bounded worker's exact, independently verified author head.
+    pub(crate) fn adopt_author_workspace(
+        &mut self,
+        workspace_id: &str,
+        workspace: ReplayAuthorWorkspace,
+    ) -> Result<(), ReplayError> {
+        let session = self.session(workspace_id)?;
+        let source_id = session.source.id.clone();
+        let (preview, _) = prepare_author_workspace(&session.source, /*confirmed*/ false)?;
+        if workspace.root != preview.root
+            || workspace.branch != preview.branch
+            || workspace.head_commit != preview.head_commit
+            || workspace.head_repository != preview.head_repository
+            || workspace.head_ref != preview.head_ref
+        {
+            return Err(ReplayError::WorkspaceExists(
+                workspace.root.display().to_string(),
+            ));
+        }
+        self.author_workspaces.insert(source_id, workspace);
+        self.advance_generation();
+        Ok(())
+    }
+
+    /// Returns the independently confirmed original-head author worktree.
+    pub fn author_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<&ReplayAuthorWorkspace, ReplayError> {
+        let session = self.session(workspace_id)?;
+        self.author_workspaces
+            .get(&session.source.id)
+            .ok_or(ReplayError::AuthorWorkspaceConfirmationRequired)
     }
 
     /// Creates a deterministic reviewer session for a confirmed workspace.
@@ -1975,6 +2022,91 @@ mod tests {
             .create_session(&source_id)
             .expect("create a session from the editor-owned pinned source");
         assert_eq!(session.workspace, workspace);
+    }
+
+    #[test]
+    fn author_workspace_is_adopted_without_replacing_the_learning_scratch() {
+        let (mut controller, session_id, _) =
+            controller_with_pull_request("original-author", Some("original-author"));
+        let original_scratch = controller.session(&session_id).unwrap().workspace.clone();
+        let preview = controller
+            .preview_author_workspace(&session_id)
+            .expect("preview only the authenticated author's exact PR head");
+        let author = ReplayAuthorWorkspace {
+            root: preview.root,
+            branch: preview.branch,
+            head_commit: preview.head_commit,
+            head_repository: preview.head_repository,
+            head_ref: preview.head_ref,
+            created_by_replay: true,
+        };
+
+        assert!(matches!(
+            controller.author_workspace(&session_id),
+            Err(ReplayError::AuthorWorkspaceConfirmationRequired),
+        ));
+        controller
+            .adopt_author_workspace(&session_id, author.clone())
+            .expect("adopt only the bounded worker's exact original author worktree");
+
+        assert_eq!(controller.author_workspace(&session_id).unwrap(), &author);
+        assert_eq!(
+            controller.session(&session_id).unwrap().workspace,
+            original_scratch
+        );
+        assert_ne!(author.root, original_scratch.root);
+        assert_ne!(author.head_commit, original_scratch.base_commit);
+    }
+
+    #[test]
+    fn refuses_a_background_author_worktree_from_another_fork_or_original_head() {
+        let (mut controller, session_id, _) =
+            controller_with_pull_request("original-author", Some("original-author"));
+        let preview = controller
+            .preview_author_workspace(&session_id)
+            .expect("preview the independently pinned original author head");
+        let expected = ReplayAuthorWorkspace {
+            root: preview.root,
+            branch: preview.branch,
+            head_commit: preview.head_commit,
+            head_repository: preview.head_repository,
+            head_ref: preview.head_ref,
+            created_by_replay: true,
+        };
+        let mut foreign_fork = expected.clone();
+        foreign_fork.head_repository = "github.com/another-author/unrelated-fork".to_string();
+
+        assert!(matches!(
+            controller.adopt_author_workspace(&session_id, foreign_fork),
+            Err(ReplayError::WorkspaceExists(_)),
+        ));
+
+        let mut foreign_head = expected;
+        foreign_head.head_commit = controller
+            .session(&session_id)
+            .unwrap()
+            .source
+            .base_commit
+            .clone();
+        assert!(matches!(
+            controller.adopt_author_workspace(&session_id, foreign_head),
+            Err(ReplayError::WorkspaceExists(_)),
+        ));
+        assert!(matches!(
+            controller.author_workspace(&session_id),
+            Err(ReplayError::AuthorWorkspaceConfirmationRequired),
+        ));
+    }
+
+    #[test]
+    fn shared_repository_write_access_does_not_authorize_a_reviewers_pr_worktree() {
+        let (controller, session_id, _) =
+            controller_with_pull_request("original-author", Some("another-reviewer"));
+
+        assert!(matches!(
+            controller.preview_author_workspace(&session_id),
+            Err(ReplayError::AuthorWorkspaceUnavailable(_)),
+        ));
     }
 
     #[test]
