@@ -7,6 +7,12 @@ merge base, or a safe in-memory demonstration. Every step has its own complete
 original unified diff. The coach is a dedicated read-only panel, and
 reconstruction happens only in editable scratch-source buffers.
 
+This guide documents behavior currently available on the Replay branch. The
+[PR Replay product and architecture specification](pr-replay/README.md)
+separately describes the agreed future interaction model, first-class findings,
+optional persistent Codex pane, on-demand scratch, and dependency-aware
+reconstruction.
+
 The two code surfaces have intentionally different roles. `ORIGINAL CHANGE`
 shows the author's exact, pinned pull-request hunk. `SCRATCH SOURCE` is your
 real editable reconstruction, initially checked out at the merge base. It is
@@ -236,6 +242,37 @@ push, submit a review, or start Codex. Normal Git hooks remain active. Agent
 execution and committing or pushing back to the exact fork and PR branch will
 each require their own separate, explicit user approvals in a later milestone.
 
+### Ask Codex about an original change
+
+Press `x` in the focused Replay guide, use `Space R x`, or run `:ReplayAsk` to
+ask a direct question about the selected original change. After you submit the
+question, the dedicated Replay pane immediately shows your question, a busy
+indicator, and the answer as it streams. `j` and `k` scroll that answer without
+changing the selected original step. Press `Esc` to cancel an active turn or
+`d` to return to the original change.
+
+An answer is not automatically recorded as a finding, review comment, or
+source edit. While the answer is visible, press `c` to prepare an editable
+original-source inline comment or `s` to prepare a PR-level summary. Only
+explicitly submitting that composer adds the agent-originated draft to the
+local outbox; nothing is posted to GitHub.
+
+Press `X` or use `Space R X` to choose a broader or different request:
+
+- Ask about the current original change.
+- Ask about the complete pinned pull request.
+- Explicitly request an inline review-comment suggestion.
+- Explicitly request a PR-level review-summary suggestion.
+- If you are the verified original author and have opened your original PR
+  worktree, request inspectable repository-wide source proposals.
+
+Read-only questions and review suggestions cannot mutate source. Original-PR
+source proposals remain staged until you explicitly accept their hunks through
+Red's existing agent-review surface. The current in-pane answer view is an
+interim implementation; a persistent companion that keeps the Replay guide
+visible is described in the
+[Codex collaboration specification](pr-replay/codex-collaboration.md).
+
 Press `r` to open the review outbox. It shows the verified role, original
 branch and commit, source-linked comments, author fix proposals, PR summaries,
 and whether each outcome is `LOCAL` or already `POSTED`. Until you explicitly
@@ -343,6 +380,8 @@ unchanged.
 | `Space R o` | Add a private, recoverable source-linked observation. |
 | `Space R f` | Show local reviewer observations. |
 | `Space R c` | Draft an exact original-source inline review comment. |
+| `Space R x` | Ask Codex a direct question about the current original change. |
+| `Space R X` | Choose a Codex question, review-draft, or authorized source-fix scope. |
 | `Space R F` | Draft a proposed fix for your verified original PR. |
 | `Space R W` | Preview and explicitly open your original PR-head author worktree. |
 | `Space R r` | Show the local review outbox or return to the guide. |
@@ -367,8 +406,8 @@ full rationale. Outside the focused coach, those keys retain their existing
 editor and Git-hunk motions. The older `Space R n` and `Space R p` step bindings
 remain compatibility aliases. Use `Space R h` for a hint; it replaces
 the rationale in place without moving the change list or the diff. `i`, `a`,
-`u`, `m`, `v`, `o`, `f`, `c`, `F`, `W`, `r`, `s`, `e`, `d`, `P`, `S`, `L`, `q`,
-and `?` act directly on the Replay pane. The `?` key opens an Esc-closeable
+`u`, `m`, `v`, `o`, `f`, `c`, `x`, `X`, `F`, `W`, `r`, `s`, `e`, `d`, `P`, `S`,
+`L`, `q`, and `?` act directly on the Replay pane. The `?` key opens an Esc-closeable
 shortcut popup and restores focus to the Replay pane on dismissal. The pinned
 action bar uses theme-colored, unbracketed keys and keeps source editing,
 validation, immediate application, safe undo, change navigation, and help
