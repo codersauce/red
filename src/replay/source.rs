@@ -23,7 +23,8 @@ use super::{
 const GITHUB_METADATA_FIELDS: &str = "number,url,title,body,author,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,commits,changedFiles";
 const GITHUB_CAPABILITIES_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { viewer { login } repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { number author { login } headRefName headRefOid headRepository { nameWithOwner viewerPermission } } } }";
 const MAX_COMMAND_DIAGNOSTIC_BYTES: usize = 4 * 1024;
-const MAX_COMMAND_DURATION: Duration = Duration::from_secs(45);
+const MAX_PROVIDER_COMMAND_DURATION: Duration = Duration::from_secs(45);
+const MAX_GIT_COMMAND_DURATION: Duration = Duration::from_secs(10 * 60);
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Validated, immutable SHA-1 or SHA-256 Git object identity.
@@ -1560,8 +1561,16 @@ fn git_text(root: &Path, args: &[&str], limit: usize) -> Result<String, ReplayEr
     })
 }
 
+fn command_timeout(command: &Command) -> Duration {
+    if command.get_program() == OsStr::new("git") {
+        MAX_GIT_COMMAND_DURATION
+    } else {
+        MAX_PROVIDER_COMMAND_DURATION
+    }
+}
+
 pub(super) fn run_command(command: &mut Command, limit: usize) -> Result<Vec<u8>, ReplayError> {
-    run_command_with_deadline(command, limit, MAX_COMMAND_DURATION)
+    run_command_with_deadline(command, limit, command_timeout(command))
 }
 
 fn run_command_with_deadline(
@@ -1580,7 +1589,7 @@ fn run_command_status(command: &mut Command) -> Result<ExitStatus, ReplayError> 
         command,
         None,
         MAX_COMMAND_DIAGNOSTIC_BYTES,
-        MAX_COMMAND_DURATION,
+        MAX_GIT_COMMAND_DURATION,
     )
     .map(|output| output.status)
     .map_err(ReplayCommandFailure::into_error)
@@ -1619,7 +1628,7 @@ pub(super) fn run_command_with_input(
     }
 
     let program = command.get_program().to_string_lossy().into_owned();
-    let output = run_bounded_command(command, Some(input), limit, MAX_COMMAND_DURATION)?;
+    let output = run_bounded_command(command, Some(input), limit, MAX_PROVIDER_COMMAND_DURATION)?;
     bounded_command_output(program, output, limit).map_err(ReplayCommandFailure::PossiblyExecuted)
 }
 
@@ -1904,6 +1913,15 @@ fn redact_command_diagnostic(diagnostic: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_operations_receive_more_time_than_provider_requests() {
+        let git = Command::new("git");
+        let provider = Command::new("gh");
+
+        assert_eq!(command_timeout(&git), Duration::from_secs(600));
+        assert_eq!(command_timeout(&provider), Duration::from_secs(45));
+    }
 
     #[cfg(unix)]
     #[test]
