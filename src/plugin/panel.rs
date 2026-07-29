@@ -113,6 +113,9 @@ pub struct TextPanelComposerConfig {
     pub placeholder: String,
     #[serde(default = "default_composer_rows")]
     pub rows: usize,
+    /// Omits the composer's internal divider for shallow, full-width drawers.
+    #[serde(default)]
+    pub compact: bool,
 }
 
 /// One clickable action rendered in a text-panel header.
@@ -476,9 +479,13 @@ impl TextPanel {
     }
 
     fn composer_height(&self) -> usize {
-        self.composer
-            .as_ref()
-            .map_or(0, |composer| composer.config.rows.max(1).saturating_add(2))
+        self.composer.as_ref().map_or(0, |composer| {
+            composer
+                .config
+                .rows
+                .max(1)
+                .saturating_add(if composer.config.compact { 1 } else { 2 })
+        })
     }
 
     fn copy_all(&self) -> String {
@@ -1620,7 +1627,7 @@ impl PanelManager {
             placement
                 .y
                 .saturating_add(top)
-                .saturating_add(1)
+                .saturating_add(usize::from(!composer.config.compact))
                 .saturating_add(row.saturating_sub(first)),
         ))
     }
@@ -1670,7 +1677,9 @@ impl PanelManager {
                         .map_or(0, |position| position.0);
                     let rows = composer.config.rows.max(1);
                     let first = cursor_row.saturating_sub(rows.saturating_sub(1));
-                    let row = first.saturating_add(y.saturating_sub(composer_top + 1));
+                    let input_top =
+                        composer_top.saturating_add(usize::from(!composer.config.compact));
+                    let row = first.saturating_add(y.saturating_sub(input_top));
                     let column = x.saturating_sub(placement.x + 2);
                     if let Some((index, _)) = wrapped
                         .positions
@@ -1870,13 +1879,16 @@ impl PanelManager {
                     .text_panels
                     .get(&placement.id)
                     .is_some_and(|panel| panel.replay.is_some());
+            let focused_replay_codex =
+                self.focused.as_deref() == Some("replay-codex") && placement.id == "replay-codex";
+            let focused_review_surface = focused_replay || focused_replay_codex;
             let mut border_style = panel_style(theme, config.border.as_ref());
             if is_active {
                 border_style = theme.active_divider_style(
                     &border_style,
                     &panel_style(theme, config.surface.as_ref()),
                 );
-            } else if focused_replay {
+            } else if focused_review_surface {
                 border_style.fg = theme
                     .colors
                     .get("panelTitle.activeBorder")
@@ -1890,7 +1902,7 @@ impl PanelManager {
                 || config.border.is_some()
                 || self.text_panels.contains_key(&placement.id)
             {
-                match (config.side, use_ascii, focused_replay && !is_active) {
+                match (config.side, use_ascii, focused_review_surface && !is_active) {
                     (PanelSide::Left | PanelSide::Right, true, _) => "|",
                     (PanelSide::Top | PanelSide::Bottom, true, _) => "-",
                     (PanelSide::Left | PanelSide::Right, false, true) => "┃",
@@ -1927,7 +1939,7 @@ impl PanelManager {
                     position,
                     placement.width,
                     placement.height,
-                    focused_replay,
+                    focused_review_surface,
                     theme,
                 );
             }
@@ -2078,7 +2090,11 @@ fn render_text_panel(
         } else {
             let title_style = Style {
                 bold: true,
-                ..theme.style.clone()
+                ..if focused {
+                    theme.ui_style.picker_prompt.clone()
+                } else {
+                    theme.style.clone()
+                }
             };
             buffer.set_text(
                 position.x,
@@ -2174,15 +2190,18 @@ fn render_text_panel_composer(
         return;
     }
     let top = position.y.saturating_add(top);
-    let divider = "─".repeat(width);
-    buffer.set_text(
-        position.x,
-        top,
-        &fit_display_width(&divider, width),
-        &theme.ui_style.muted,
-    );
+    if !composer.config.compact {
+        let divider = "─".repeat(width);
+        buffer.set_text(
+            position.x,
+            top,
+            &fit_display_width(&divider, width),
+            &theme.ui_style.muted,
+        );
+    }
 
     let rows = composer.config.rows.max(1);
+    let input_top = top.saturating_add(usize::from(!composer.config.compact));
     let content_width = width.saturating_sub(2).max(1);
     let wrapped = wrap_text(&composer.prompt.text(), content_width);
     let cursor_row = wrapped
@@ -2191,7 +2210,7 @@ fn render_text_panel_composer(
         .map_or(0, |position| position.0);
     let first = cursor_row.saturating_sub(rows.saturating_sub(1));
     for row in 0..rows {
-        let y = top + 1 + row;
+        let y = input_top.saturating_add(row);
         let line = wrapped
             .rows
             .get(first + row)
@@ -2215,7 +2234,11 @@ fn render_text_panel_composer(
             style,
         );
     }
-    let hints = if composer.focused {
+    let hints = if composer.config.compact && composer.focused {
+        "INSERT  Enter Send  ^J Newline  Esc Normal"
+    } else if composer.config.compact {
+        "j/k Scroll  i Edit  f Finding  c Comment  s Summary  q Hide"
+    } else if composer.focused {
         "Esc nav · Enter send · ^J newline · ^P/^N history"
     } else {
         "a edit · x clear · N new · q close · ^C stop"
@@ -2224,7 +2247,7 @@ fn render_text_panel_composer(
     let status = status.map_or_else(|| hints.to_string(), |status| format!("{status} · {hints}"));
     buffer.set_text(
         position.x,
-        top + rows + 1,
+        input_top.saturating_add(rows),
         &fit_display_width(&status, width),
         &theme.ui_style.muted,
     );
@@ -3030,6 +3053,7 @@ mod tests {
                 composer: Some(TextPanelComposerConfig {
                     placeholder: "Ask".to_string(),
                     rows: 2,
+                    compact: false,
                 }),
                 ..PanelConfig::default()
             },
@@ -3947,6 +3971,7 @@ mod tests {
                 composer: Some(TextPanelComposerConfig {
                     placeholder: "Ask a follow-up…".to_string(),
                     rows: 3,
+                    compact: false,
                 }),
                 surface: None,
                 border: None,
@@ -3989,6 +4014,53 @@ mod tests {
     }
 
     #[test]
+    fn compact_replay_codex_drawer_preserves_three_transcript_rows_at_80_by_24() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "replay-codex".to_string(),
+            PanelConfig {
+                side: PanelSide::Bottom,
+                width: 6,
+                title: Some("CODEX · PR #482".to_string()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask about this change…".to_string(),
+                    rows: 1,
+                    compact: true,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_text_panel(
+            "replay-codex",
+            vec![TextPanelBlock {
+                id: "answer".to_string(),
+                kind: TextPanelBlockKind::Agent,
+                format: TextPanelBlockFormat::Plain,
+                text: "first answer line\nsecond answer line".to_string(),
+            }],
+            22,
+            80,
+        );
+        assert!(manager.focus_text_panel_composer("replay-codex"));
+
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(80, 24, &theme.style);
+        manager.render(&mut buffer, &theme);
+
+        assert!(row_text(&buffer, 15).contains('━'));
+        assert!(row_text(&buffer, 16).contains("CODEX · PR #482"));
+        assert!(row_text(&buffer, 17).contains("Agent"));
+        assert!(row_text(&buffer, 18).contains("first answer line"));
+        assert!(row_text(&buffer, 19).contains("second answer line"));
+        assert!(row_text(&buffer, 20).contains("Ask about this change"));
+        assert!(row_text(&buffer, 21).contains("Esc Normal"));
+        assert_eq!(
+            manager.focused_text_panel_cursor_position(80, 24),
+            Some((2, 20))
+        );
+    }
+
+    #[test]
     fn text_panel_composer_shrinks_on_narrow_terminals_and_keeps_tail_visible() {
         let mut manager = PanelManager::default();
         manager.create_text_panel(
@@ -4000,6 +4072,7 @@ mod tests {
                 composer: Some(TextPanelComposerConfig {
                     placeholder: "Ask".to_string(),
                     rows: 2,
+                    compact: false,
                 }),
                 surface: None,
                 border: None,
@@ -4041,6 +4114,7 @@ mod tests {
                 composer: Some(TextPanelComposerConfig {
                     placeholder: "Ask".to_string(),
                     rows: 2,
+                    compact: false,
                 }),
                 surface: None,
                 border: None,
@@ -4165,6 +4239,7 @@ mod tests {
                 composer: Some(TextPanelComposerConfig {
                     placeholder: "Ask".to_string(),
                     rows: 3,
+                    compact: false,
                 }),
                 surface: None,
                 border: None,
@@ -4194,6 +4269,7 @@ mod tests {
                 composer: Some(TextPanelComposerConfig {
                     placeholder: "Ask".to_string(),
                     rows: 2,
+                    compact: false,
                 }),
                 surface: None,
                 border: None,
@@ -4250,6 +4326,7 @@ mod tests {
                 composer: Some(TextPanelComposerConfig {
                     placeholder: "Ask".to_string(),
                     rows: 2,
+                    compact: false,
                 }),
                 surface: None,
                 border: None,
@@ -4283,6 +4360,7 @@ mod tests {
                 composer: Some(TextPanelComposerConfig {
                     placeholder: "Ask".to_string(),
                     rows: 2,
+                    compact: false,
                 }),
                 surface: None,
                 border: None,

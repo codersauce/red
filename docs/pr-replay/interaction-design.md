@@ -1,8 +1,8 @@
 # PR Replay interaction design
 
-Status: target interaction model. Some controls already exist; a persistent
-Codex companion, first-class findings, ordering profiles, grouped steps, and
-compile checkpoints remain proposed. Current commands are documented in the
+Status: evolving interaction model. A persistent Replay-scoped Codex companion
+and explicitly saved findings are available; ordering profiles, grouped steps,
+and compile checkpoints remain proposed. Current commands are documented in the
 [existing PR Replay guide](../PR_REPLAY.md).
 
 ## Surface ownership
@@ -13,15 +13,14 @@ Replay uses genuine Red editor and panel primitives:
   placement, and native rendering.
 - The source is a genuine editor buffer and editor window, never an editable
   guide pretending to be source.
-- A future persistent Codex companion uses an existing editor-owned text or
-  conversation panel rather than replacing the source editor.
+- A persistent Replay-scoped Codex companion uses an existing editor-owned
+  text panel rather than replacing the guide or source editor.
 - The editor event loop owns buffer mutations, selections, transactions, undo,
   and plugin-visible UI updates.
 - Git, GitHub, worktree, agent, and build tasks run in bounded background
   workers.
 
-The existing answer-only view inside the Replay pane is an interim behavior.
-The target keeps the change guide visible while a conversation is open.
+The Replay guide remains visible while a Codex conversation is open.
 
 ## Core surfaces
 
@@ -79,9 +78,9 @@ The panel contains:
 
 ## Responsive layouts
 
-### Wide terminal
+### Optional side docking
 
-At comfortable widths, a third panel can be shown without making code unreadable:
+A person may explicitly move Codex to a third side panel at comfortable widths:
 
 ```text
 ┌ PR REPLAY ─────────────┬ SOURCE ──────────────────────┬ CODEX ──────────────┐
@@ -97,13 +96,13 @@ At comfortable widths, a third panel can be shown without making code unreadable
 └────────────────────────┴──────────────────────────────┴─────────────────────┘
 ```
 
-The source should remain the visually dominant surface. A conversation panel
-may be docked or moved with existing editor pane commands.
+Side docking is always an explicit user choice; opening Codex never silently
+replaces the familiar equal Replay/source split with three narrow columns.
 
 ### Normal terminal
 
-The default is a roughly equal Replay/source split. Opening Codex uses a
-bottom drawer when three side-by-side columns would clip source excessively:
+The default is a roughly equal Replay/source split. Opening Codex always uses
+a compact full-width bottom drawer unless the person has moved it elsewhere:
 
 ```text
 ┌ PR REPLAY ───────────────────┬ SOURCE ──────────────────────┐
@@ -118,6 +117,8 @@ bottom drawer when three side-by-side columns would clip source excessively:
 ```
 
 Opening or closing the companion preserves the exact prior guide/source split.
+Its responsive default is six rows at 80×24, eight at 100×28, nine at 120×32,
+and twelve at 160×45. Manual divider resizing remains authoritative.
 
 ### Small or short terminal
 
@@ -125,7 +126,8 @@ When there is not enough space for three readable surfaces:
 
 - Keep source and current change usable.
 - Collapse secondary metadata before removing the selected change.
-- Offer a toggleable companion drawer or temporary zoomed panel.
+- Keep a shallow, scrollable companion drawer rather than automatically
+  hiding the review guide or source.
 - Preserve conversation, draft, scroll, and source state when a surface hides.
 - Never force an unreadable three-column layout.
 - Keep destructive or external actions clearly labeled even in a compact bar.

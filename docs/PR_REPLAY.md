@@ -245,17 +245,24 @@ each require their own separate, explicit user approvals in a later milestone.
 ### Ask Codex about an original change
 
 Press `x` in the focused Replay guide, use `Space R x`, or run `:ReplayAsk` to
-ask a direct question about the selected original change. After you submit the
-question, the dedicated Replay pane immediately shows your question, a busy
-indicator, and the answer as it streams. `j` and `k` scroll that answer without
-changing the selected original step. Press `Esc` to cancel an active turn or
-`d` to return to the original change.
+open a dedicated Codex companion below the original Replay guide and genuine
+source editor. Its inline composer is focused immediately; no question dialog
+replaces the source you are reviewing. Press `Enter` to submit, `Shift+Enter`
+or `Ctrl+j` for a newline, and `Ctrl+p` / `Ctrl+n` for prompt history.
+
+The selected original change and source remain visible while the answer
+streams. The first `Esc` changes the companion from its composer to transcript
+navigation, where `j` / `k` scroll only the conversation. A second `Esc`
+restores the exact Replay pane or source editor that opened Codex. Press `q`
+from the companion's navigation mode to hide it without losing the
+conversation, or `Ctrl-c` to cancel an active request.
 
 An answer is not automatically recorded as a finding, review comment, or
-source edit. While the answer is visible, press `c` to prepare an editable
-original-source inline comment or `s` to prepare a PR-level summary. Only
-explicitly submitting that composer adds the agent-originated draft to the
-local outbox; nothing is posted to GitHub.
+source edit. From companion navigation, press `f` to explicitly save the
+latest answer as a private finding, `c` to prepare an editable original-source
+inline comment, or `s` to prepare a PR-level summary. Only explicitly
+submitting a draft composer adds an agent-originated draft to the local outbox;
+nothing is posted to GitHub.
 
 Press `X` or use `Space R X` to choose a broader or different request:
 
@@ -268,10 +275,10 @@ Press `X` or use `Space R X` to choose a broader or different request:
 
 Read-only questions and review suggestions cannot mutate source. Original-PR
 source proposals remain staged until you explicitly accept their hunks through
-Red's existing agent-review surface. The current in-pane answer view is an
-interim implementation; a persistent companion that keeps the Replay guide
-visible is described in the
-[Codex collaboration specification](pr-replay/codex-collaboration.md).
+Red's existing agent-review surface. The companion uses a Replay-owned Codex
+session and never replaces or captures an unrelated general Agent conversation.
+See the [Codex collaboration specification](pr-replay/codex-collaboration.md)
+for the underlying authority and review boundaries.
 
 Press `r` to open the review outbox. It shows the verified role, original
 branch and commit, source-linked comments, author fix proposals, PR summaries,

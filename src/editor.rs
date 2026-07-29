@@ -2076,6 +2076,13 @@ struct ReplayPaneZoom {
     size: usize,
 }
 
+/// Surface that requested the persistent Replay Codex companion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReplayCodexReturnFocus {
+    Editor,
+    Panel(String),
+}
+
 #[derive(Debug, Clone)]
 struct ReplaySourceDisplay {
     head_ref: String,
@@ -2105,6 +2112,9 @@ pub struct Editor {
 
     /// Reversible Replay-pane geometry; scratch contents and other windows are untouched.
     replay_pane_zoom: Option<ReplayPaneZoom>,
+
+    /// Exact review surface to restore after leaving the Replay Codex transcript.
+    replay_codex_return_focus: Option<ReplayCodexReturnFocus>,
 
     /// Pinned pull-request sources, confirmed scratch worktrees, and review sessions.
     replay_controller: crate::replay::ReplayController,
@@ -3325,6 +3335,7 @@ impl Editor {
             agent_manager,
             replay_demo_workspace: None,
             replay_pane_zoom: None,
+            replay_codex_return_focus: None,
             replay_controller: crate::replay::ReplayController::default(),
             replay_source_displays: HashMap::new(),
             replay_reviews: HashMap::new(),
@@ -5296,6 +5307,7 @@ impl Editor {
         let max_y = (height as usize).saturating_sub(2);
         self.cy = self.cy.min(max_y.saturating_sub(1));
         self.resize_default_replay_panel(usize::from(width));
+        self.resize_default_replay_codex_panel(usize::from(height));
         self.resize_window_layout((width as usize, height as usize));
         self.invalidate_terminal_render_state(buffer);
 
@@ -5333,6 +5345,37 @@ impl Editor {
 
         self.panel_manager
             .update_default_panel_layout("replay-coach", side, width);
+    }
+
+    fn resize_default_replay_codex_panel(&mut self, terminal_height: usize) {
+        let Some((side, _)) = self.panel_manager.panel_layout("replay-codex") else {
+            return;
+        };
+        if side != plugin::PanelSide::Bottom {
+            return;
+        }
+
+        let height = if terminal_height <= 24 {
+            6
+        } else {
+            terminal_height
+                .saturating_sub(2)
+                .saturating_mul(3)
+                .saturating_add(5)
+                .saturating_div(10)
+                .clamp(6, 12)
+        };
+        self.panel_manager
+            .update_default_panel_layout("replay-codex", side, height);
+    }
+
+    fn restore_replay_codex_focus(&mut self) {
+        match self.replay_codex_return_focus.take() {
+            Some(ReplayCodexReturnFocus::Panel(id)) if self.panel_manager.focus_panel(&id) => {}
+            Some(ReplayCodexReturnFocus::Editor) => self.panel_manager.focus_editor(),
+            _ if self.panel_manager.focus_panel("replay-coach") => {}
+            _ => self.panel_manager.focus_editor(),
+        }
     }
 
     fn apply_panel_layout(&mut self) {
@@ -8430,6 +8473,75 @@ impl Editor {
                             continue;
                         }
                     }
+                    let reusable_session = self
+                        .agent_manager
+                        .replay_sessions()
+                        .into_iter()
+                        .find(|(session_id, existing)| {
+                            existing.workspace_id == session.workspace_id
+                                && existing.target_commit == session.target_commit
+                                && existing.scope.permits_source_proposals()
+                                    == session.scope.permits_source_proposals()
+                                && !self.agent_manager.is_session_active(session_id)
+                        })
+                        .map(|(session_id, _)| session_id);
+                    if let Some(session_id) = reusable_session {
+                        let prompt = match self.replay_agent_prompt(&session) {
+                            Ok(prompt) => prompt,
+                            Err(error) => {
+                                self.plugin_registry
+                                    .notify_plugin(
+                                        runtime,
+                                        "replay",
+                                        "replay:agent_error",
+                                        json!({
+                                            "session_id": session_id,
+                                            "workspace_id": workspace_id,
+                                            "message": error.to_string(),
+                                        }),
+                                    )
+                                    .await?;
+                                continue;
+                            }
+                        };
+                        if let Err(error) = self
+                            .agent_manager
+                            .update_replay_session(&session_id, session.clone())
+                        {
+                            self.plugin_registry
+                                .notify_plugin(
+                                    runtime,
+                                    "replay",
+                                    "replay:agent_error",
+                                    json!({
+                                        "session_id": session_id,
+                                        "workspace_id": workspace_id,
+                                        "message": error.to_string(),
+                                    }),
+                                )
+                                .await?;
+                            continue;
+                        }
+                        self.plugin_registry
+                            .notify_plugin(
+                                runtime,
+                                "replay",
+                                "replay:agent_started",
+                                json!({
+                                    "session_id": session_id,
+                                    "workspace_id": session.workspace_id,
+                                    "step_id": session.step_id,
+                                    "scope": session.scope,
+                                    "target_commit": session.target_commit,
+                                }),
+                            )
+                            .await?;
+                        self.dispatch_agent_prompt(
+                            runtime, session_id, prompt, /*context*/ None,
+                        )
+                        .await?;
+                        continue;
+                    }
                     if let Err(error) = self.agent_manager.begin_replay_session(session) {
                         self.plugin_registry
                             .notify_plugin(
@@ -10945,9 +11057,13 @@ impl Editor {
                 }
                 PluginRequest::CreateTextPanel { id, config } => {
                     let is_replay_panel = id == "replay-coach";
+                    let is_replay_codex_panel = id == "replay-codex";
                     self.panel_manager.create_text_panel(id, config);
                     if is_replay_panel {
                         self.resize_default_replay_panel(usize::from(self.size.0));
+                    }
+                    if is_replay_codex_panel {
+                        self.resize_default_replay_codex_panel(usize::from(self.size.1));
                     }
                     self.apply_panel_layout();
                     needs_render = true;
@@ -10979,6 +11095,17 @@ impl Editor {
                     needs_render = true;
                 }
                 PluginRequest::FocusTextPanelComposer { id } => {
+                    if id == "replay-codex"
+                        && self.panel_manager.focused_panel_id() != Some("replay-codex")
+                    {
+                        self.replay_codex_return_focus = Some(
+                            self.panel_manager
+                                .focused_panel_id()
+                                .map_or(ReplayCodexReturnFocus::Editor, |id| {
+                                    ReplayCodexReturnFocus::Panel(id.to_string())
+                                }),
+                        );
+                    }
                     if self.panel_manager.focus_text_panel_composer(&id) {
                         needs_render = true;
                     }
@@ -11023,10 +11150,16 @@ impl Editor {
                     needs_render = true;
                 }
                 PluginRequest::SetPanelVisible { id, visible } => {
+                    let restore_codex_focus = id == "replay-codex"
+                        && !visible
+                        && self.panel_manager.focused_panel_id() == Some("replay-codex");
                     if !visible {
                         self.restore_replay_pane_zoom(&id);
                     }
                     if self.panel_manager.set_panel_visible(&id, visible) {
+                        if restore_codex_focus {
+                            self.restore_replay_codex_focus();
+                        }
                         self.apply_panel_layout();
                         needs_render = true;
                     }
@@ -13189,7 +13322,11 @@ impl Editor {
                 let action = match event.code {
                     KeyCode::Esc if self.panel_manager.focused_replay_is_answer() => "dismiss",
                     KeyCode::Esc => {
-                        self.panel_manager.focus_editor();
+                        if self.panel_manager.focused_panel_id() == Some("replay-codex") {
+                            self.restore_replay_codex_focus();
+                        } else {
+                            self.panel_manager.focus_editor();
+                        }
                         return Some(KeyAction::Single(Action::Refresh));
                     }
                     KeyCode::Up
@@ -13301,6 +13438,11 @@ impl Editor {
                             || self.panel_manager.focused_replay_is_answer() =>
                     {
                         "codex"
+                    }
+                    KeyCode::Char('x')
+                        if self.panel_manager.focused_panel_id() == Some("replay-codex") =>
+                    {
+                        "composer_focus"
                     }
                     KeyCode::Char('X')
                         if self.panel_manager.focused_replay_is_guide()
@@ -27498,6 +27640,122 @@ mod test {
         assert!(status.contains("✓ complete"));
         assert!(status.contains("CHANGE 03/05"));
         assert!(!status.contains("restored"));
+    }
+
+    #[test]
+    fn replay_codex_escape_ladder_restores_the_exact_invoking_pane() {
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        editor.test_create_text_panel(
+            "replay-coach",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Left,
+                width: 49,
+                title: Some("PR REPLAY".to_string()),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        editor.test_create_text_panel(
+            "replay-codex",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Bottom,
+                width: 8,
+                title: Some("CODEX".to_string()),
+                composer: Some(plugin::TextPanelComposerConfig {
+                    placeholder: "Ask about this change…".to_string(),
+                    rows: 1,
+                    compact: true,
+                }),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        assert!(editor.test_focus_panel("replay-coach"));
+        editor.replay_codex_return_focus =
+            Some(ReplayCodexReturnFocus::Panel("replay-coach".to_string()));
+        assert!(editor.test_focus_text_panel_composer("replay-codex"));
+
+        let first = editor
+            .test_handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .expect("blur only the Replay Codex composer");
+        assert!(matches!(
+            first,
+            Some(KeyAction::Multiple(actions)) if actions.iter().any(|action| {
+                matches!(
+                    action,
+                    Action::NotifyPlugins(event, payload)
+                        if event == "panel:event:replay-codex"
+                            && payload["action"] == "composer_blur"
+                )
+            })
+        ));
+        assert_eq!(editor.test_focused_panel_id(), Some("replay-codex"));
+        assert!(!editor.panel_manager.focused_text_input_active());
+
+        let second = editor
+            .test_handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .expect("restore the exact surface that invoked Codex");
+        assert_eq!(second, Some(KeyAction::Single(Action::Refresh)));
+        assert_eq!(editor.test_focused_panel_id(), Some("replay-coach"));
+
+        editor.replay_codex_return_focus = Some(ReplayCodexReturnFocus::Editor);
+        assert!(editor.test_focus_text_panel_composer("replay-codex"));
+        editor
+            .test_handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        editor
+            .test_handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(editor.test_focused_panel_id(), None);
+    }
+
+    #[test]
+    fn replay_codex_drawer_resizes_responsively_without_overriding_manual_height() {
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.test_create_text_panel(
+            "replay-coach",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Left,
+                width: 39,
+                title: Some("PR REPLAY".to_string()),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        editor.test_create_text_panel(
+            "replay-codex",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Bottom,
+                width: 6,
+                title: Some("CODEX".to_string()),
+                composer: Some(plugin::TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 1,
+                    compact: true,
+                }),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+        assert_eq!(
+            editor.test_panel_layout("replay-codex"),
+            Some((plugin::PanelSide::Bottom, 6))
+        );
+
+        editor.resize_terminal_surface(/*width*/ 100, /*height*/ 28, &mut buffer);
+        assert_eq!(
+            editor.test_panel_layout("replay-codex"),
+            Some((plugin::PanelSide::Bottom, 8))
+        );
+        assert_eq!(
+            editor.test_panel_layout("replay-coach"),
+            Some((plugin::PanelSide::Left, 49))
+        );
+
+        assert!(editor.set_panel_size("replay-codex", plugin::PanelSide::Bottom, 10));
+        editor.resize_terminal_surface(/*width*/ 120, /*height*/ 32, &mut buffer);
+        assert_eq!(
+            editor.test_panel_layout("replay-codex"),
+            Some((plugin::PanelSide::Bottom, 10))
+        );
     }
 
     #[tokio::test]

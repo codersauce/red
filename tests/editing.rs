@@ -237,6 +237,7 @@ async fn agent_editor_navigation_preserves_a_focused_conversation_composer() {
             composer: Some(TextPanelComposerConfig {
                 placeholder: "Ask a follow-up".to_string(),
                 rows: 2,
+                compact: false,
             }),
             ..PanelConfig::default()
         },
@@ -5268,6 +5269,7 @@ fn focused_agent_panel_keeps_leader_available_until_the_composer_is_focused() {
             composer: Some(TextPanelComposerConfig {
                 placeholder: "Ask".to_string(),
                 rows: 2,
+                compact: false,
             }),
             surface: None,
             border: None,
@@ -6177,6 +6179,7 @@ async fn ctrl_w_w_focuses_agent_composer_and_makes_cursor_visible() {
             composer: Some(TextPanelComposerConfig {
                 placeholder: "Ask".to_string(),
                 rows: 2,
+                compact: false,
             }),
             surface: None,
             border: None,
@@ -6573,6 +6576,7 @@ async fn mouse_drag_preserves_a_focused_text_composer_and_its_draft() {
             composer: Some(TextPanelComposerConfig {
                 placeholder: "Ask".to_string(),
                 rows: 2,
+                compact: false,
             }),
             ..PanelConfig::default()
         },
@@ -6723,6 +6727,7 @@ fn passive_mouse_events_over_editor_do_not_clear_focused_agent_composer() {
             composer: Some(TextPanelComposerConfig {
                 placeholder: "Ask".to_string(),
                 rows: 2,
+                compact: false,
             }),
             surface: None,
             border: None,
@@ -6767,6 +6772,7 @@ async fn only_window_hides_auxiliary_panels_and_preserves_agent_draft() {
             composer: Some(TextPanelComposerConfig {
                 placeholder: "Ask".to_string(),
                 rows: 2,
+                compact: false,
             }),
             surface: None,
             border: None,

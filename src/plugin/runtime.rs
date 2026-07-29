@@ -3675,13 +3675,84 @@ mod tests {
         model
     }
 
-    fn recv_replay_answer() -> crate::plugin::replay_panel::ReplayPanelModel {
-        let model = recv_replay_guide();
-        assert_eq!(
-            model.view,
-            crate::plugin::replay_panel::ReplayPanelView::Answer
-        );
-        model
+    fn recv_replay_codex_panel() {
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::CreateTextPanel { id, config } => {
+                assert_eq!(id, "replay-codex");
+                assert_eq!(config.side, crate::plugin::PanelSide::Bottom);
+                assert_eq!(config.width, 6);
+                let composer = config.composer.expect("persistent inline composer");
+                assert_eq!(composer.rows, 1);
+                assert!(composer.compact);
+            }
+            _ => panic!("expected a dedicated bottom-docked Replay Codex companion"),
+        }
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdateTextPanel { id, blocks } => {
+                assert_eq!(id, "replay-codex");
+                assert_eq!(blocks.len(), 1);
+                assert!(blocks[0].text.contains("Answers stay private"));
+            }
+            _ => panic!("expected a private, initially empty Replay Codex transcript"),
+        }
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusTextPanelComposer { id } if id == "replay-codex"
+        ));
+    }
+
+    async fn submit_replay_codex_prompt(runtime: &mut Runtime, prompt: &str) {
+        runtime
+            .notify(
+                "panel:event:replay-codex",
+                serde_json::json!({ "action": "submit", "text": prompt }),
+            )
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdateTextPanel { id, blocks } => {
+                assert_eq!(id, "replay-codex");
+                assert_eq!(blocks.len(), 2);
+                assert!(blocks[0].text.contains(prompt));
+                assert_eq!(blocks[1].kind, crate::plugin::TextPanelBlockKind::Agent);
+            }
+            _ => panic!("expected the question and its streaming answer in the companion"),
+        }
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelComposerState { id, enabled: true, .. }
+                if id == "replay-codex"
+        ));
+    }
+
+    fn recv_replay_codex_delta(expected: &str) {
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::AppendTextPanel { id, delta, .. } => {
+                assert_eq!(id, "replay-codex");
+                assert!(delta.contains(expected));
+            }
+            _ => panic!("expected the answer to stream into the dedicated Codex companion"),
+        }
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: Some(status) }
+                if id == "replay-codex" && status.stream
+        ));
+    }
+
+    fn replay_plugin_state(runtime: &Runtime, key: &str) -> serde_json::Value {
+        let inner = runtime
+            .inner
+            .lock()
+            .expect("inspect the initialized Replay host state");
+        inner
+            .host
+            .policy()
+            .plugin_states
+            .get("replay")
+            .and_then(|state| state.get(key))
+            .map(value_to_json)
+            .expect("initialized Replay plugin state")
     }
 
     fn source_backed_review_draft(
@@ -6921,32 +6992,22 @@ mod tests {
         let plan = open_source_backed_replay(&mut runtime).await;
 
         runtime.execute_command("ReplayAsk").await.unwrap();
-        let prompt = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenCallbackComposer { handle, title, .. } => {
-                assert!(title.unwrap().contains("Ask Codex"));
-                handle
-            }
-            _ => panic!("expected a focused Codex review-question composer"),
-        };
-        assert!(runtime
-            .notify_composer(
-                prompt,
-                ComposerCallback::Submitted("Check the viewport bounds.".to_string()),
-            )
-            .unwrap());
-        let pending = recv_replay_answer();
-        assert_eq!(pending.agent_question, "Check the viewport bounds.");
-        assert_eq!(pending.agent_phase, "asking");
-        assert!(pending.agent_answer.is_empty());
-        assert!(pending.drafts.is_empty());
+        recv_replay_codex_panel();
+        submit_replay_codex_prompt(&mut runtime, "Check the viewport bounds.").await;
+        assert_eq!(
+            replay_plugin_state(&runtime, "replay_agent_question"),
+            "Check the viewport bounds."
+        );
+        assert_eq!(
+            replay_plugin_state(&runtime, "replay_agent_phase"),
+            "asking"
+        );
+        assert_eq!(replay_plugin_state(&runtime, "replay_view"), "guide");
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::FocusPanel { id } if id == "replay-coach"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelStatus { status: Some(status), .. }
-                if status.busy && status.label.contains("selected original change")
+            PluginRequest::SetTextPanelStatus { id, status: Some(status) }
+                if id == "replay-codex" && status.busy
+                    && status.label.contains("selected original change")
         ));
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::ReplayAgentStart {
@@ -6984,10 +7045,16 @@ mod tests {
             )
             .await
             .unwrap();
-        let streaming = recv_replay_answer();
-        assert_eq!(streaming.agent_phase, "streaming");
-        assert!(streaming.agent_answer.contains("last visible row"));
-        assert!(streaming.drafts.is_empty());
+        recv_replay_codex_delta("last visible row");
+        assert_eq!(
+            replay_plugin_state(&runtime, "replay_agent_phase"),
+            "streaming"
+        );
+        assert!(replay_plugin_state(&runtime, "replay_agent_response")
+            .as_str()
+            .unwrap()
+            .contains("last visible row"));
+        assert_eq!(replay_plugin_state(&runtime, "replay_view"), "guide");
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
 
         runtime
@@ -6996,17 +7063,27 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelStatus { status: None, .. }
+            PluginRequest::SetTextPanelStatus { id, status: None }
+                if id == "replay-codex"
         ));
-        let answer = recv_replay_answer();
-        assert_eq!(answer.agent_phase, "complete");
-        assert!(answer.drafts.is_empty());
-        assert!(answer.notice.contains("Answer ready"));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelComposerState { id, status: Some(status), .. }
+                if id == "replay-codex" && status.contains("Answer ready")
+        ));
+        assert_eq!(
+            replay_plugin_state(&runtime, "replay_agent_phase"),
+            "complete"
+        );
+        assert_eq!(
+            replay_plugin_state(&runtime, "replay_drafts"),
+            serde_json::json!([])
+        );
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
 
         runtime
             .notify(
-                "panel:event:replay-coach",
+                "panel:event:replay-codex",
                 serde_json::json!({ "action": "comment" }),
             )
             .await
@@ -7082,31 +7159,209 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_codex_dismissed_answers_never_enter_the_outbox() {
+    async fn replay_codex_follow_ups_reuse_the_existing_companion_transcript() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         let plan = open_source_backed_replay(&mut runtime).await;
 
         runtime.execute_command("ReplayAsk").await.unwrap();
-        let prompt = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenCallbackComposer { handle, .. } => handle,
-            _ => panic!("expected a Codex review question"),
-        };
-        assert!(runtime
-            .notify_composer(
-                prompt,
-                ComposerCallback::Submitted("Review this change.".into())
-            )
-            .unwrap());
-        assert_eq!(recv_replay_answer().agent_phase, "asking");
+        recv_replay_codex_panel();
+        submit_replay_codex_prompt(&mut runtime, "Why are viewport bounds inclusive?").await;
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::FocusPanel { .. }
+            PluginRequest::SetTextPanelStatus { id, status: Some(_) }
+                if id == "replay-codex"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelStatus { .. }
+            PluginRequest::ReplayAgentStart { .. }
+        ));
+
+        let identity = serde_json::json!({
+            "workspace_id": "real-workspace-1",
+            "session_id": "codex-review-shared",
+            "step_id": plan.steps[0].id,
+            "scope": "current_change",
+        });
+        runtime
+            .notify("replay:agent_started", identity.clone())
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "replay:agent_update",
+                serde_json::json!({
+                    "workspace_id": "real-workspace-1",
+                    "session_id": "codex-review-shared",
+                    "text": "The final visible row still contains diagnostics.",
+                }),
+            )
+            .await
+            .unwrap();
+        recv_replay_codex_delta("final visible row");
+        runtime
+            .notify("replay:agent_completed", identity)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: None }
+                if id == "replay-codex"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelComposerState { id, .. }
+                if id == "replay-codex"
+        ));
+
+        runtime.execute_command("ReplayAsk").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusTextPanelComposer { id } if id == "replay-codex"
+        ));
+        runtime
+            .notify(
+                "panel:event:replay-codex",
+                serde_json::json!({
+                    "action": "submit",
+                    "text": "Does that also cover wrapped lines?",
+                }),
+            )
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdateTextPanel { id, blocks } => {
+                assert_eq!(id, "replay-codex");
+                assert_eq!(blocks.len(), 4);
+                assert!(blocks[0].text.contains("viewport bounds"));
+                assert!(blocks[1].text.contains("final visible row"));
+                assert!(blocks[2].text.contains("wrapped lines"));
+                assert_eq!(blocks[3].kind, crate::plugin::TextPanelBlockKind::Agent);
+            }
+            _ => panic!("expected a follow-up in the existing PR-wide conversation"),
+        }
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelComposerState { id, .. }
+                if id == "replay-codex"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: Some(_) }
+                if id == "replay-codex"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ReplayAgentStart { prompt, .. }
+                if prompt == "Does that also cover wrapped lines?"
+        ));
+        assert_eq!(replay_plugin_state(&runtime, "replay_view"), "guide");
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_codex_findings_remain_private_and_anchor_to_the_original_change() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_source_backed_replay(&mut runtime).await;
+
+        runtime.execute_command("ReplayAsk").await.unwrap();
+        recv_replay_codex_panel();
+        submit_replay_codex_prompt(&mut runtime, "Find the boundary risk.").await;
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: Some(_) }
+                if id == "replay-codex"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ReplayAgentStart { .. }
+        ));
+        let identity = serde_json::json!({
+            "workspace_id": "real-workspace-1",
+            "session_id": "codex-private-finding",
+            "step_id": plan.steps[0].id,
+            "scope": "current_change",
+        });
+        runtime
+            .notify("replay:agent_started", identity.clone())
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "replay:agent_update",
+                serde_json::json!({
+                    "workspace_id": "real-workspace-1",
+                    "session_id": "codex-private-finding",
+                    "text": "The final visible row is excluded by the current range.",
+                }),
+            )
+            .await
+            .unwrap();
+        recv_replay_codex_delta("excluded");
+        runtime
+            .notify("replay:agent_completed", identity)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: None }
+                if id == "replay-codex"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelComposerState { id, .. }
+                if id == "replay-codex"
+        ));
+
+        runtime
+            .notify(
+                "panel:event:replay-codex",
+                serde_json::json!({ "action": "f" }),
+            )
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayAddNote {
+                workspace_id,
+                step_id,
+                category,
+                text,
+                ..
+            } => {
+                assert_eq!(workspace_id, "real-workspace-1");
+                assert_eq!(step_id, plan.steps[0].id);
+                assert_eq!(category, crate::replay::ReplayNoteCategory::Observation);
+                assert!(text.contains("final visible row"));
+            }
+            _ => panic!("expected an explicitly saved, original-hunk-anchored private finding"),
+        }
+        assert_eq!(
+            replay_plugin_state(&runtime, "replay_drafts"),
+            serde_json::json!([])
+        );
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_codex_hidden_answers_never_enter_the_outbox() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_source_backed_replay(&mut runtime).await;
+
+        runtime.execute_command("ReplayAsk").await.unwrap();
+        recv_replay_codex_panel();
+        submit_replay_codex_prompt(&mut runtime, "Review this change.").await;
+        assert_eq!(
+            replay_plugin_state(&runtime, "replay_agent_phase"),
+            "asking"
+        );
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, .. } if id == "replay-codex"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -7130,8 +7385,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let busy = recv_replay_answer();
+        let busy = recv_replay_guide();
         assert_eq!(busy.agent_phase, "asking");
+        assert_eq!(
+            busy.view,
+            crate::plugin::replay_panel::ReplayPanelView::Guide
+        );
         assert!(busy.notice.contains("already answering"));
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
         runtime
@@ -7145,19 +7404,32 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(recv_replay_answer().agent_answer.contains("edge case"));
+        recv_replay_codex_delta("edge case");
+        assert!(replay_plugin_state(&runtime, "replay_agent_response")
+            .as_str()
+            .unwrap()
+            .contains("edge case"));
         runtime
             .notify("replay:agent_completed", identity)
             .await
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelStatus { status: None, .. }
+            PluginRequest::SetTextPanelStatus { id, status: None }
+                if id == "replay-codex"
         ));
-        assert!(recv_replay_answer().drafts.is_empty());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelComposerState { id, .. }
+                if id == "replay-codex"
+        ));
+        assert_eq!(
+            replay_plugin_state(&runtime, "replay_drafts"),
+            serde_json::json!([])
+        );
         runtime
             .notify(
-                "panel:event:replay-coach",
+                "panel:event:replay-codex",
                 serde_json::json!({ "action": "comment" }),
             )
             .await
@@ -7172,26 +7444,31 @@ mod tests {
         assert!(runtime
             .notify_composer(promotion, ComposerCallback::Cancelled)
             .unwrap());
-        let retained = recv_replay_answer();
+        let retained = recv_replay_guide();
         assert!(retained.agent_answer.contains("potential edge case"));
         assert!(retained.drafts.is_empty());
         assert!(retained.notice.contains("still available"));
 
         runtime
             .notify(
-                "panel:event:replay-coach",
-                serde_json::json!({ "action": "dismiss" }),
+                "panel:event:replay-codex",
+                serde_json::json!({ "action": "close" }),
             )
             .await
             .unwrap();
-
-        let guide = recv_replay_guide();
-        assert!(guide.drafts.is_empty());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPanelVisible { id, visible: false }
+                if id == "replay-codex"
+        ));
         assert_eq!(
-            guide.view,
-            crate::plugin::replay_panel::ReplayPanelView::Guide
+            replay_plugin_state(&runtime, "replay_drafts"),
+            serde_json::json!([])
         );
-        assert!(guide.agent_answer.is_empty());
+        assert!(replay_plugin_state(&runtime, "replay_agent_response")
+            .as_str()
+            .unwrap()
+            .contains("potential edge case"));
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
@@ -7203,27 +7480,16 @@ mod tests {
         let plan = open_source_backed_replay(&mut runtime).await;
 
         runtime.execute_command("ReplayAsk").await.unwrap();
-        let prompt = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenCallbackComposer { handle, .. } => handle,
-            _ => panic!("expected the focused Codex question composer"),
-        };
-        assert!(runtime
-            .notify_composer(
-                prompt,
-                ComposerCallback::Submitted("Explain the cancellation boundary.".into()),
-            )
-            .unwrap());
-        assert_eq!(recv_replay_answer().agent_phase, "asking");
+        recv_replay_codex_panel();
+        submit_replay_codex_prompt(&mut runtime, "Explain the cancellation boundary.").await;
+        assert_eq!(
+            replay_plugin_state(&runtime, "replay_agent_phase"),
+            "asking"
+        );
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::FocusPanel { .. }
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelStatus {
-                status: Some(_),
-                ..
-            }
+            PluginRequest::SetTextPanelStatus { id, status: Some(_) }
+                if id == "replay-codex"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -7242,14 +7508,24 @@ mod tests {
             .unwrap();
         runtime
             .notify(
-                "panel:event:replay-coach",
-                serde_json::json!({ "action": "dismiss" }),
+                "panel:event:replay-codex",
+                serde_json::json!({ "action": "interrupt" }),
             )
             .await
             .unwrap();
-        let cancelling = recv_replay_answer();
-        assert_eq!(cancelling.agent_phase, "cancelled");
-        assert!(cancelling.drafts.is_empty());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelComposerState { id, status: Some(status), .. }
+                if id == "replay-codex" && status.contains("Cancelling")
+        ));
+        assert_eq!(
+            replay_plugin_state(&runtime, "replay_agent_phase"),
+            "cancelled"
+        );
+        assert_eq!(
+            replay_plugin_state(&runtime, "replay_drafts"),
+            serde_json::json!([])
+        );
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::AgentCancel { session_id } if session_id == "codex-cancel-1"
@@ -7273,25 +7549,23 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelStatus { status: None, .. }
+            PluginRequest::SetTextPanelStatus { id, status: None }
+                if id == "replay-codex"
         ));
-        let cancelled = recv_replay_answer();
-        assert_eq!(cancelled.agent_phase, "cancelled");
-        assert!(cancelled.drafts.is_empty());
-
-        runtime
-            .notify(
-                "panel:event:replay-coach",
-                serde_json::json!({ "action": "dismiss" }),
-            )
-            .await
-            .unwrap();
-        let guide = recv_replay_guide();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelComposerState { id, status: Some(status), .. }
+                if id == "replay-codex" && status.contains("cancelled")
+        ));
         assert_eq!(
-            guide.view,
-            crate::plugin::replay_panel::ReplayPanelView::Guide
+            replay_plugin_state(&runtime, "replay_agent_phase"),
+            "cancelled"
         );
-        assert!(guide.drafts.is_empty());
+        assert_eq!(
+            replay_plugin_state(&runtime, "replay_drafts"),
+            serde_json::json!([])
+        );
+        assert_eq!(replay_plugin_state(&runtime, "replay_view"), "guide");
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
@@ -7316,25 +7590,12 @@ mod tests {
         assert!(runtime
             .notify_picker(picker, PickerCallback::Selected(inline_comment))
             .unwrap());
-        let prompt = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenCallbackComposer { handle, title, .. } => {
-                assert!(title.unwrap().contains("draft an inline review comment"));
-                handle
-            }
-            _ => panic!("expected an explicitly selected comment-request composer"),
-        };
-        assert!(runtime
-            .notify_composer(
-                prompt,
-                ComposerCallback::Submitted("Suggest a boundary-regression comment.".into()),
-            )
-            .unwrap());
+        recv_replay_codex_panel();
+        submit_replay_codex_prompt(&mut runtime, "Suggest a boundary-regression comment.").await;
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelStatus {
-                status: Some(_),
-                ..
-            }
+            PluginRequest::SetTextPanelStatus { id, status: Some(_) }
+                if id == "replay-codex"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -7365,6 +7626,7 @@ mod tests {
             )
             .await
             .unwrap();
+        recv_replay_codex_delta("inclusive viewport boundary");
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
         runtime
             .notify("replay:agent_completed", identity)
@@ -7372,7 +7634,8 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelStatus { status: None, .. }
+            PluginRequest::SetTextPanelStatus { id, status: None }
+                if id == "replay-codex"
         ));
         assert!(recv_replay_guide().drafts.is_empty());
         let approval = match ACTION_DISPATCHER.recv_request() {
@@ -7434,31 +7697,17 @@ mod tests {
         assert!(runtime
             .notify_picker(picker, PickerCallback::Selected(pull_request))
             .unwrap());
-        let prompt = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenCallbackComposer { handle, title, .. } => {
-                assert!(title.unwrap().contains("whole pull request"));
-                handle
-            }
-            _ => panic!("expected a PR-level review question"),
-        };
-        assert!(runtime
-            .notify_composer(
-                prompt,
-                ComposerCallback::Submitted("Summarize correctness and missing tests.".into()),
-            )
-            .unwrap());
-        let pending = recv_replay_answer();
-        assert_eq!(pending.agent_phase, "asking");
+        recv_replay_codex_panel();
+        submit_replay_codex_prompt(&mut runtime, "Summarize correctness and missing tests.").await;
+        assert_eq!(
+            replay_plugin_state(&runtime, "replay_agent_phase"),
+            "asking"
+        );
+        assert_eq!(replay_plugin_state(&runtime, "replay_view"), "guide");
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::FocusPanel { .. }
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelStatus {
-                status: Some(_),
-                ..
-            }
+            PluginRequest::SetTextPanelStatus { id, status: Some(_) }
+                if id == "replay-codex"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -7489,8 +7738,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(recv_replay_answer()
-            .agent_answer
+        recv_replay_codex_delta("resume and fork");
+        assert!(replay_plugin_state(&runtime, "replay_agent_response")
+            .as_str()
+            .unwrap()
             .contains("resume and fork"));
         runtime
             .notify("replay:agent_completed", event)
@@ -7498,13 +7749,21 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelStatus { status: None, .. }
+            PluginRequest::SetTextPanelStatus { id, status: None }
+                if id == "replay-codex"
         ));
-        let answer = recv_replay_answer();
-        assert!(answer.drafts.is_empty());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelComposerState { id, .. }
+                if id == "replay-codex"
+        ));
+        assert_eq!(
+            replay_plugin_state(&runtime, "replay_drafts"),
+            serde_json::json!([])
+        );
         runtime
             .notify(
-                "panel:event:replay-coach",
+                "panel:event:replay-codex",
                 serde_json::json!({ "action": "summary" }),
             )
             .await
@@ -7569,7 +7828,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_codex_author_fixes_open_reviewable_proposals_without_a_chat_pane() {
+    async fn replay_codex_author_fixes_stage_reviewable_proposals_from_the_companion() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
@@ -7676,28 +7935,18 @@ mod tests {
                     .find(|item| item.id == "author_fix")
                     .expect("offer source proposals only to the verified original author"),
             ),
-            _ => panic!("expected a scope picker without a second chat pane"),
+            _ => panic!("expected the compact original-source Codex scope picker"),
         };
         assert!(runtime
             .notify_picker(picker, PickerCallback::Selected(author_fix))
             .unwrap());
-        let prompt = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::OpenCallbackComposer { handle, title, .. } => {
-                assert!(title.unwrap().contains("your original PR"));
-                handle
-            }
-            _ => panic!("expected a verified original-source Codex fix request"),
-        };
-        assert!(runtime
-            .notify_composer(
-                prompt,
-                ComposerCallback::Submitted("Fix this across every affected module.".into()),
-            )
-            .unwrap());
+        recv_replay_codex_panel();
+        submit_replay_codex_prompt(&mut runtime, "Fix this across every affected module.").await;
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelStatus { status: Some(status), .. }
-                if status.busy && status.label.contains("original-PR source proposals")
+            PluginRequest::SetTextPanelStatus { id, status: Some(status) }
+                if id == "replay-codex" && status.busy
+                    && status.label.contains("original-PR source proposals")
         ));
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::ReplayAgentStart {
@@ -7729,7 +7978,8 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelStatus { status: None, .. }
+            PluginRequest::SetTextPanelStatus { id, status: None }
+                if id == "replay-codex"
         ));
         let proposal_request = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::AgentProposals {

@@ -169,6 +169,29 @@ impl AgentManager {
         self.replay_sessions.get(session_id)
     }
 
+    /// Refreshes one live PR-wide conversation without changing its write authority.
+    pub fn update_replay_session(
+        &mut self,
+        session_id: &str,
+        session: ReplayAgentSession,
+    ) -> anyhow::Result<()> {
+        let existing = self
+            .replay_sessions
+            .get_mut(session_id)
+            .ok_or_else(|| anyhow::anyhow!("the Replay Codex session is no longer available"))?;
+        anyhow::ensure!(
+            existing.workspace_id == session.workspace_id
+                && existing.target_commit == session.target_commit,
+            "the Replay Codex session no longer matches the pinned review"
+        );
+        anyhow::ensure!(
+            existing.scope.permits_source_proposals() == session.scope.permits_source_proposals(),
+            "the Replay Codex session cannot change its source-write authority"
+        );
+        *existing = session;
+        Ok(())
+    }
+
     /// Returns isolated Replay sessions that must hear about worker shutdown.
     pub fn replay_sessions(&self) -> Vec<(String, ReplayAgentSession)> {
         self.replay_sessions
@@ -282,6 +305,62 @@ mod tests {
             .lock()
             .unwrap()
             .contains("codex-review-1"));
+    }
+
+    #[test]
+    fn replay_follow_ups_reuse_the_pinned_thread_without_escalating_authority() {
+        let mut manager = AgentManager::new();
+        let pinned_commit = GitObjectId::parse(&"a".repeat(40)).unwrap();
+        manager
+            .register_replay_session(
+                "codex-review-1".to_string(),
+                ReplayAgentSession {
+                    workspace_id: "review-1".to_string(),
+                    step_id: "step-1".to_string(),
+                    scope: ReplayAgentScope::CurrentChange,
+                    prompt: "Explain this change.".to_string(),
+                    target_commit: pinned_commit.clone(),
+                },
+            )
+            .unwrap();
+
+        manager
+            .update_replay_session(
+                "codex-review-1",
+                ReplayAgentSession {
+                    workspace_id: "review-1".to_string(),
+                    step_id: "step-2".to_string(),
+                    scope: ReplayAgentScope::PullRequest,
+                    prompt: "How does the next change depend on it?".to_string(),
+                    target_commit: pinned_commit.clone(),
+                },
+            )
+            .unwrap();
+
+        let reused = manager.replay_session("codex-review-1").unwrap();
+        assert_eq!(reused.step_id, "step-2");
+        assert_eq!(reused.scope, ReplayAgentScope::PullRequest);
+        assert!(manager
+            .read_only_sessions()
+            .lock()
+            .unwrap()
+            .contains("codex-review-1"));
+
+        let escalation = manager.update_replay_session(
+            "codex-review-1",
+            ReplayAgentSession {
+                workspace_id: "review-1".to_string(),
+                step_id: "step-2".to_string(),
+                scope: ReplayAgentScope::AuthorFix,
+                prompt: "Try to stage a fix.".to_string(),
+                target_commit: pinned_commit,
+            },
+        );
+        assert!(escalation.is_err());
+        assert_eq!(
+            manager.replay_session("codex-review-1").unwrap().scope,
+            ReplayAgentScope::PullRequest
+        );
     }
 
     #[test]

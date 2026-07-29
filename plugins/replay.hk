@@ -193,6 +193,7 @@ pub fn activate() {
 
     red::on("editor:ready", restore_active_session);
     red::on("panel:event:replay-coach", panel_event);
+    red::on("panel:event:replay-codex", codex_panel_event);
     red::on("buffer:changed", source_changed);
     red::on("replay:undone", replay_undone);
     red::on("replay:agent_started", codex_started);
@@ -203,6 +204,11 @@ pub fn activate() {
     red::on("replay:agent_proposals_changed", codex_proposals_changed);
     red::state_set("replay_panel_created", false);
     red::state_set("replay_panel_open", false);
+    red::state_set("replay_codex_panel_created", false);
+    red::state_set("replay_codex_panel_open", false);
+    red::state_set("replay_codex_blocks", []);
+    red::state_set("replay_codex_block_generation", 0);
+    red::state_set("replay_codex_answer_block_id", "");
     red::state_set("replay_review_picker", red::null());
     red::state_set("replay_review_request", -1);
     red::state_set("replay_resume_request", -1);
@@ -714,6 +720,13 @@ fn load_plan(plan: Json) -> bool {
     red::state_set("replay_agent_proposal_kind", "");
     red::state_set("replay_agent_question", "");
     red::state_set("replay_agent_phase", "idle");
+    red::state_set("replay_codex_blocks", []);
+    red::state_set("replay_codex_block_generation", 0);
+    red::state_set("replay_codex_answer_block_id", "");
+    if red::state_bool("replay_codex_panel_open") {
+        red::execute("SetPanelVisible", "replay-codex", false);
+        red::state_set("replay_codex_panel_open", false);
+    }
     red::state_set("replay_review_path", "");
     red::state_set("replay_notes", []);
     red::state_set("replay_drafts", []);
@@ -825,6 +838,94 @@ fn ensure_panel() {
     if !red::state_bool("replay_panel_open") {
         red::execute("SetPanelVisible", "replay-coach", true);
         red::state_set("replay_panel_open", true);
+    }
+}
+
+fn ensure_codex_panel() {
+    if !red::state_bool("replay_codex_panel_created") {
+        let terminal_height = red::int(red::editor_info().size[1], 24);
+        let drawer_height = 6;
+        if terminal_height > 24 {
+            drawer_height = ((terminal_height - 2) * 3 + 5) / 10;
+            if drawer_height < 6 {
+                drawer_height = 6;
+            }
+            if drawer_height > 12 {
+                drawer_height = 12;
+            }
+        }
+        let title = "CODEX · PR Replay";
+        let pull_request = red::int(red::state("replay_pull_request"), 0);
+        if pull_request > 0 {
+            title = "CODEX · PR #" + pull_request + " · local conversation";
+        }
+        red::execute("CreateTextPanel", "replay-codex", PanelConfig {
+            side: "bottom",
+            width: drawer_height,
+            title: title,
+            composer: Json {
+                placeholder: "Ask about the selected original change…",
+                rows: 1,
+                compact: true,
+            },
+        });
+        red::state_set("replay_codex_panel_created", true);
+        red::state_set("replay_codex_panel_open", true);
+        render_codex_conversation();
+        return;
+    }
+    if !red::state_bool("replay_codex_panel_open") {
+        red::execute("SetPanelVisible", "replay-codex", true);
+        red::state_set("replay_codex_panel_open", true);
+    }
+}
+
+fn render_codex_conversation() {
+    if !red::state_bool("replay_codex_panel_created") {
+        return;
+    }
+    let blocks = red::state("replay_codex_blocks");
+    if red::len(blocks) == 0 {
+        blocks = [TextPanelBlock {
+            id: "replay-codex-empty",
+            kind: "activity",
+            format: "plain",
+            text: "Ask about the current original change. Answers stay private until you explicitly save a finding or review draft.",
+        }];
+    }
+    red::execute("UpdateTextPanel", "replay-codex", blocks);
+}
+
+fn codex_panel_event(event: Json) {
+    let action = red::string(event.action, "");
+    if action == "submit" {
+        codex_prompt_submitted(red::string(event.text, ""));
+    } else if action == "composer_focus" || action == "i" || action == "x" {
+        red::execute("FocusTextPanelComposer", "replay-codex");
+    } else if action == "interrupt" {
+        red::state_set("replay_agent_phase", "cancelled");
+        red::execute("SetTextPanelComposerState", "replay-codex", true,
+            "Cancelling Codex · your review and drafts are unchanged");
+        cancel_codex();
+    } else if action == "close" {
+        hide_codex_panel();
+    } else if action == "f" {
+        save_codex_finding();
+    } else if action == "c" || action == "comment" {
+        promote_codex_answer("inline_comment");
+    } else if action == "s" || action == "summary" {
+        promote_codex_answer("review_summary");
+    } else if action == "F" || action == "fix" {
+        open_codex_prompt("author_fix");
+    } else if action == "X" || action == "codex_scope" {
+        ask_codex_scope();
+    }
+}
+
+fn hide_codex_panel() {
+    if red::state_bool("replay_codex_panel_open") {
+        red::execute("SetPanelVisible", "replay-codex", false);
+        red::state_set("replay_codex_panel_open", false);
     }
 }
 
@@ -1597,20 +1698,8 @@ fn open_codex_prompt(scope: String) {
     }
     red::state_set("replay_agent_scope", scope);
     red::state_set("replay_agent_step_id", red::string(steps[index].id, ""));
-    let title = "Ask Codex · current change";
-    if scope == "pull_request" {
-        title = "Ask Codex · whole pull request";
-    } else if scope == "inline_comment" {
-        title = "Codex · draft an inline review comment";
-    } else if scope == "review_summary" {
-        title = "Codex · draft a PR review summary";
-    } else if scope == "author_fix" {
-        title = "Codex · your original PR · preview source changes before applying";
-    }
-    red::execute("OpenComposer", title, "", [], ComposerHandlers {
-        submitted: codex_prompt_submitted,
-        cancelled: codex_prompt_cancelled,
-    });
+    ensure_codex_panel();
+    red::execute("FocusTextPanelComposer", "replay-codex");
 }
 
 fn codex_prompt_submitted(value: String) {
@@ -1618,6 +1707,12 @@ fn codex_prompt_submitted(value: String) {
     if prompt == "" {
         set_notice("Ask a question or describe the original PR fix you want.", "warning");
         render();
+        return;
+    }
+    let phase = red::string(red::state("replay_agent_phase"), "idle");
+    if phase == "asking" || phase == "streaming" {
+        red::execute("SetTextPanelComposerState", "replay-codex", true,
+            "Wait for the current answer or press Ctrl-c to cancel it");
         return;
     }
     let scope = red::string(red::state("replay_agent_scope"), "current_change");
@@ -1637,17 +1732,43 @@ fn codex_prompt_submitted(value: String) {
     } else if scope == "author_fix" {
         label = "Codex is preparing reviewable original-PR source proposals…";
     }
+    let generation = red::int(red::state("replay_codex_block_generation"), 0) + 1;
+    red::state_set("replay_codex_block_generation", generation);
+    let blocks = red::state("replay_codex_blocks");
+    let question = prompt;
     if answering {
-        red::state_set("replay_view", "answer");
-        set_notice("Asking Codex… · press Esc to cancel", "info");
-        render();
-        red::execute("FocusPanel", "replay-coach");
-    } else if red::string(red::state("replay_view"), "guide") == "answer" {
-        red::state_set("replay_view", "guide");
-        set_notice("Codex is preparing an explicitly requested suggestion.", "info");
-        render();
+        question = "Change " + (red::int(red::state("replay_index"), 0) + 1)
+            + " · " + prompt;
     }
-    red::execute("SetTextPanelStatus", "replay-coach", TextPanelStatus {
+    blocks = red::push(blocks, TextPanelBlock {
+        id: "replay-user:" + generation,
+        kind: "user",
+        format: "plain",
+        text: question,
+    });
+    let answer_id = "replay-answer:" + generation;
+    blocks = red::push(blocks, TextPanelBlock {
+        id: answer_id,
+        kind: "agent",
+        format: "markdown",
+        text: "",
+    });
+    if red::len(blocks) > 40 {
+        let retained = [];
+        let block_index = 0;
+        for block in blocks {
+            if block_index >= red::len(blocks) - 40 {
+                retained = red::push(retained, block);
+            }
+            block_index = block_index + 1;
+        }
+        blocks = retained;
+    }
+    red::state_set("replay_codex_blocks", blocks);
+    red::state_set("replay_codex_answer_block_id", answer_id);
+    render_codex_conversation();
+    red::execute("SetTextPanelComposerState", "replay-codex", true);
+    red::execute("SetTextPanelStatus", "replay-codex", TextPanelStatus {
         busy: true,
         label: label,
         stream: false,
@@ -1660,8 +1781,6 @@ fn codex_prompt_submitted(value: String) {
         prompt
     );
 }
-
-fn codex_prompt_cancelled(event: ComposerCancelled) {}
 
 fn current_codex_event(event: Json) -> bool {
     if red::string(event.workspace_id, "")
@@ -1700,19 +1819,33 @@ fn codex_updated(event: Json) {
     let scope = red::string(red::state("replay_agent_scope"), "");
     if scope == "current_change" || scope == "pull_request" {
         red::state_set("replay_agent_phase", "streaming");
-        set_notice("Codex is answering… · press Esc to cancel", "info");
-        render();
     }
+    let answer_id = red::string(red::state("replay_codex_answer_block_id"), "");
+    if answer_id != "" {
+        let blocks = [];
+        for block in red::state("replay_codex_blocks") {
+            if red::string(block.id, "") == answer_id {
+                block.text = response;
+            }
+            blocks = red::push(blocks, block);
+        }
+        red::state_set("replay_codex_blocks", blocks);
+        red::execute("AppendTextPanel", "replay-codex", answer_id,
+            red::string(event.text, ""));
+    }
+    red::execute("SetTextPanelStatus", "replay-codex", TextPanelStatus {
+        busy: true,
+        label: "Codex is answering…",
+        stream: true,
+    });
 }
 
 fn codex_completed(event: Json) {
     if !current_codex_event(event) {
         return;
     }
-    red::execute("SetTextPanelStatus", "replay-coach");
+    red::execute("SetTextPanelStatus", "replay-codex");
     if red::string(red::state("replay_agent_phase"), "idle") == "cancelled" {
-        set_notice("Codex request cancelled · source and local drafts unchanged.", "info");
-        render();
         return;
     }
     let scope = red::string(red::state("replay_agent_scope"), "current_change");
@@ -1727,12 +1860,13 @@ fn codex_completed(event: Json) {
     if scope == "current_change" || scope == "pull_request" {
         if response == "" {
             red::state_set("replay_agent_phase", "failed");
-            set_notice("Codex completed without answering your question.", "warning");
+            red::execute("SetTextPanelComposerState", "replay-codex", true,
+                "Codex completed without answering your question");
         } else {
             red::state_set("replay_agent_phase", "complete");
-            set_notice("Answer ready · c comment · s summary · d back", "success");
+            red::execute("SetTextPanelComposerState", "replay-codex", true,
+                "Answer ready · Esc for findings and review drafts");
         }
-        render();
         return;
     }
     if response == "" {
@@ -1786,6 +1920,29 @@ fn promote_codex_answer(kind: String) {
         submitted: codex_proposal_accepted,
         cancelled: codex_answer_promotion_cancelled,
     });
+}
+
+fn save_codex_finding() {
+    let answer = red::trim(red::string(red::state("replay_agent_response"), ""));
+    if answer == "" {
+        red::execute("SetTextPanelComposerState", "replay-codex", true,
+            "Wait for Codex to answer before saving a finding");
+        return;
+    }
+    let step_id = red::string(red::state("replay_agent_step_id"), "");
+    if step_id == "" {
+        red::execute("SetTextPanelComposerState", "replay-codex", true,
+            "The original review change could not be verified");
+        return;
+    }
+    red::request(
+        "ReplayAddNote",
+        note_recorded,
+        red::string(red::state("replay_workspace_id"), ""),
+        step_id,
+        "observation",
+        answer
+    );
 }
 
 fn codex_answer_promotion_cancelled(event: ComposerCancelled) {
@@ -1889,21 +2046,31 @@ fn codex_failed(event: Json) {
     if !current_codex_event(event) {
         return;
     }
-    red::execute("SetTextPanelStatus", "replay-coach");
+    red::execute("SetTextPanelStatus", "replay-codex");
     red::state_set("replay_agent_phase", "failed");
-    set_notice(red::string(event.message, "Codex could not complete this review request."), "error");
-    render();
+    let message = red::string(event.message, "Codex could not complete this review request.");
+    let generation = red::int(red::state("replay_codex_block_generation"), 0);
+    let blocks = red::push(red::state("replay_codex_blocks"), TextPanelBlock {
+        id: "replay-error:" + generation,
+        kind: "error",
+        format: "plain",
+        text: message,
+    });
+    red::state_set("replay_codex_blocks", blocks);
+    render_codex_conversation();
+    red::execute("SetTextPanelComposerState", "replay-codex", true,
+        "Request failed · your review, source, and drafts are unchanged");
 }
 
 fn codex_cancelled(event: Json) {
     if !current_codex_event(event) {
         return;
     }
-    red::execute("SetTextPanelStatus", "replay-coach");
+    red::execute("SetTextPanelStatus", "replay-codex");
     red::state_set("replay_agent_phase", "cancelled");
     red::state_set("replay_agent_response", "");
-    set_notice("Codex request cancelled · source and local drafts unchanged.", "info");
-    render();
+    red::execute("SetTextPanelComposerState", "replay-codex", true,
+        "Request cancelled · source and local drafts unchanged");
 }
 
 fn cancel_codex() {
@@ -2978,6 +3145,7 @@ fn edit_manually() {
 }
 
 fn close() {
+    hide_codex_panel();
     if red::state_bool("replay_panel_open") {
         red::execute("SetPanelVisible", "replay-coach", false);
         red::state_set("replay_panel_open", false);
