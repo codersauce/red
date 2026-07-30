@@ -30,7 +30,7 @@ pub fn status_args() -> [String] {
         "--branch",
         "--show-stash",
         "-z",
-        "--untracked-files=all",
+        "--untracked-files=normal",
     ]
 }
 
@@ -170,7 +170,7 @@ fn builds_explicit_apply_modes() {
 
 #[test]
 fn builds_bounded_noninteractive_status_and_diff_commands() {
-    assert(status_args().join(" ") == "status --porcelain=v2 --branch --show-stash -z --untracked-files=all");
+    assert(status_args().join(" ") == "status --porcelain=v2 --branch --show-stash -z --untracked-files=normal");
     assert(sign_diff_args(false, ["src/a.rs"]).join(" ") == "-c core.quotePath=false diff --no-ext-diff --no-prefix --unified=0 -- src/a.rs");
     assert(sign_diff_args(true, ["src/a.rs", "src/b.rs"]).join(" ") == "-c core.quotePath=false diff --cached --no-ext-diff --no-prefix --unified=0 -- src/a.rs src/b.rs");
     assert(detail_diff_args("staged", "src/a.rs").join(" ") == "diff --cached --no-ext-diff --color=never -- src/a.rs");

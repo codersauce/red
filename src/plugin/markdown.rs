@@ -15,6 +15,7 @@ pub(crate) enum TextPanelSpanStyle {
     User,
     Agent,
     Error,
+    Success,
     Text,
     Heading,
     Strong,

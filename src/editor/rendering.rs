@@ -40,6 +40,9 @@ use super::{
     Point, Rect, RenderBuffer, StyleCursor, GUTTER_SIGN_COLUMN_WIDTH, MAX_HIGHLIGHT_SLICE_BYTES,
 };
 
+/// Keep verified Replay lines recognizable without drowning out genuine source syntax.
+const REPLAY_SOURCE_HUNK_TINT_ALPHA: u8 = 18;
+
 fn diagnostic_row(diagnostics: &[&Diagnostic], available_width: usize) -> Option<String> {
     let diagnostic = diagnostics.first()?;
     if available_width == 0 {
@@ -482,6 +485,7 @@ impl Editor {
 
         self.render_gutter_rows_in_window(buffer, &window, window_id, &local_rows);
         self.render_main_content_rows_in_window(buffer, &window, &local_rows)?;
+        self.render_replay_source_hunk_highlight(buffer, &window, Some(&local_rows));
         self.render_line_highlight_rows_in_window(buffer, &window, &local_rows);
         self.render_matching_brackets_in_window(buffer, &window, Some(terminal_rows));
 
@@ -741,12 +745,125 @@ impl Editor {
 
             // Render the window content with proper boundaries
             self.render_main_content_in_window(buffer, &window)?;
+            self.render_replay_source_hunk_highlight(buffer, &window, None);
 
             // Render overlays within window bounds
             self.render_overlays_in_window(buffer, &window)?;
         }
 
         Ok(())
+    }
+
+    /// Marks verified hunk lines without obscuring source syntax or existing gutter signs.
+    fn render_replay_source_hunk_highlight(
+        &self,
+        buffer: &mut RenderBuffer,
+        window: &crate::window::Window,
+        local_rows: Option<&[usize]>,
+    ) {
+        let Some(workspace) = self
+            .replay_demo_workspace
+            .as_ref()
+            .filter(|workspace| workspace.source_window == window.id)
+        else {
+            return;
+        };
+        let Some(hunk) = workspace.source_hunk.as_ref().filter(|hunk| {
+            self.buffer_manager
+                .get(window.buffer_index)
+                .is_some_and(|source| source.id() == hunk.source_buffer)
+        }) else {
+            return;
+        };
+        let Some(inserted_background) =
+            crate::plugin::workspace::diff_line_style("added", &self.theme).bg
+        else {
+            return;
+        };
+        let background = match inserted_background {
+            Color::Rgb { r, g, b } => Color::Rgba {
+                r,
+                g,
+                b,
+                a: REPLAY_SOURCE_HUNK_TINT_ALPHA,
+            },
+            Color::Rgba { r, g, b, a } => Color::Rgba {
+                r,
+                g,
+                b,
+                a: a.min(REPLAY_SOURCE_HUNK_TINT_ALPHA),
+            },
+        };
+        let gutter_style = self.theme.gutter_style.fallback_bg(&self.theme.style);
+        let gutter_marker_style = self.theme.ensure_text_contrast(&Style {
+            fg: self
+                .theme
+                .colors
+                .get("editorGutter.addedBackground")
+                .copied()
+                .or_else(|| {
+                    self.theme
+                        .colors
+                        .get("editorGutter.addedForeground")
+                        .copied()
+                })
+                .or_else(|| {
+                    self.theme
+                        .colors
+                        .get("gitDecoration.addedResourceForeground")
+                        .copied()
+                })
+                .or(self.theme.ui_style.picker_prompt.fg)
+                .or(gutter_style.fg),
+            bg: gutter_style.bg,
+            bold: true,
+            italic: false,
+        });
+
+        let content_start = window
+            .position
+            .x
+            .saturating_add(self.gutter_width_for_window(window))
+            .saturating_add(1);
+        let content_end = window
+            .position
+            .x
+            .saturating_add(window.inner_width())
+            .saturating_sub(1);
+        if content_start > content_end {
+            return;
+        }
+
+        let end_line = hunk.start_line.saturating_add(hunk.line_count);
+        let layout = self.layout_for_window(window);
+        for segment in &layout.rows {
+            if !(hunk.start_line..end_line).contains(&segment.line)
+                || local_rows.is_some_and(|rows| !rows.contains(&segment.row))
+            {
+                continue;
+            }
+            let y = self.window_to_terminal_y(window, segment.row);
+            let marker_x = if segment.first_segment {
+                self.gutter_sign_manager
+                    .visible_sign(window.buffer_index, segment.line)
+                    .map_or(Some(window.position.x), |sign| {
+                        let sign_width = display_width(&sign.text);
+                        (sign_width < GUTTER_SIGN_COLUMN_WIDTH)
+                            .then_some(window.position.x.saturating_add(sign_width))
+                    })
+            } else {
+                Some(window.position.x)
+            };
+            if let Some(marker_x) = marker_x {
+                buffer.set_text(marker_x, y, "▎", &gutter_marker_style);
+            }
+            buffer.set_bg_for_range(
+                Point::new(content_start, y),
+                Point::new(content_end, y),
+                &background,
+                &self.theme,
+            );
+        }
     }
 
     fn render_window_bar(&self, buffer: &mut RenderBuffer, window: &crate::window::Window) {
@@ -1771,12 +1888,46 @@ impl Editor {
             return;
         }
 
-        let mode = format_mode_name(&self.mode);
+        let outbox_position = self.panel_manager.focused_replay_outbox_position();
+        let complete_review = self.panel_manager.focused_replay_is_complete();
+        let restored_review = self
+            .panel_manager
+            .focused_replay_notice()
+            .is_some_and(|notice| notice.starts_with("Review restored"));
+        let replay_status = self.panel_manager.focused_replay_status().map(
+            |(pull_request, branch, index, total)| {
+                let mut file = if pull_request == 0 {
+                    format!(" {branch}")
+                } else {
+                    format!(" PR #{pull_request}")
+                };
+                if complete_review {
+                    file.push_str(" · ✓ complete");
+                } else if restored_review {
+                    file.push_str(" · ✓ restored");
+                }
+                let position = match outbox_position {
+                    Some((_, 0)) => " OUTBOX ".to_string(),
+                    Some((selected, count)) => {
+                        format!(" OUTBOX {:02}/{:02} ", selected + 1, count)
+                    }
+                    None => format!(" CHANGE {:02}/{:02} ", index + 1, total),
+                };
+                (file, position)
+            },
+        );
+        let mode = if replay_status.is_some() {
+            "REPLAY".to_string()
+        } else {
+            format_mode_name(&self.mode)
+        };
         let mode = format!(" {mode} ");
 
         // Get information from the active window
         let active_window = self.window_manager.active_window();
-        let (file, pos, window_indicator) = if let Some(window) = active_window {
+        let (file, pos, window_indicator) = if let Some((file, pos)) = replay_status {
+            (file, pos, String::new())
+        } else if let Some(window) = active_window {
             let window_buffer = &self.buffer_manager[window.buffer_index];
             let dirty = if window_buffer.is_dirty() {
                 " [+] "

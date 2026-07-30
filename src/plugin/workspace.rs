@@ -922,7 +922,7 @@ impl WorkspaceManager {
     }
 }
 
-fn highlight_document(
+pub(super) fn highlight_document(
     document: Option<&WorkspaceDocument>,
     theme: &Theme,
 ) -> Vec<Vec<crate::editor::StyleInfo>> {
@@ -933,13 +933,22 @@ fn highlight_document(
         return (0..document.lines.len()).map(|_| Vec::new()).collect();
     };
 
+    highlight_document_with(document, &mut highlighter)
+}
+
+pub(super) fn highlight_document_with(
+    document: &WorkspaceDocument,
+    highlighter: &mut Highlighter,
+) -> Vec<Vec<crate::editor::StyleInfo>> {
+    let _span = crate::editor::perf::PerfSpan::start("workspace:highlight_document");
+
     // A unified diff interleaves two different programs. Feeding removed and
     // added lines to one parser makes replacements (especially multiline ones)
     // corrupt the syntax state for everything that follows. Parse an old-file
     // and new-file projection independently, then use the matching side for
     // each displayed line.
-    let old = highlight_document_projection(document, &mut highlighter, false);
-    let new = highlight_document_projection(document, &mut highlighter, true);
+    let old = highlight_document_projection(document, highlighter, false);
+    let new = highlight_document_projection(document, highlighter, true);
     document
         .lines
         .iter()
@@ -957,6 +966,7 @@ fn highlight_document_projection(
     highlighter: &mut Highlighter,
     new_side: bool,
 ) -> Vec<Vec<crate::editor::StyleInfo>> {
+    let _span = crate::editor::perf::PerfSpan::start("workspace:highlight_projection");
     let source_lines = document
         .lines
         .iter()
@@ -1231,8 +1241,8 @@ fn render_detail_pane(
 }
 
 #[derive(Debug)]
-struct DisplaySlice {
-    text: String,
+pub(super) struct DisplaySlice {
+    pub(super) text: String,
     byte_start: usize,
     byte_end: usize,
 }
@@ -1258,7 +1268,7 @@ fn wrapped_slices(text: &str, width: usize) -> Vec<DisplaySlice> {
     result
 }
 
-fn display_slice(text: &str, start_column: usize, width: usize) -> DisplaySlice {
+pub(super) fn display_slice(text: &str, start_column: usize, width: usize) -> DisplaySlice {
     let mut column = 0;
     let mut byte_start = text.len();
     let mut byte_end = text.len();
@@ -1291,7 +1301,7 @@ fn display_slice(text: &str, start_column: usize, width: usize) -> DisplaySlice 
     }
 }
 
-fn render_syntax_overlays(
+pub(super) fn render_syntax_overlays(
     buffer: &mut RenderBuffer,
     rect: (usize, usize, usize),
     text: &str,
@@ -1316,7 +1326,7 @@ fn render_syntax_overlays(
     }
 }
 
-fn diff_line_style(kind: &str, theme: &Theme) -> Style {
+pub(crate) fn diff_line_style(kind: &str, theme: &Theme) -> Style {
     let mut style = theme.style.clone();
     style.bg = match kind {
         "added" => diff_background(
@@ -1358,7 +1368,7 @@ fn diff_background(theme: &Theme, preferred: &str, fallback: &str) -> Option<Col
     })
 }
 
-fn diff_foreground(kind: &str, theme: &Theme) -> Option<Color> {
+pub(super) fn diff_foreground(kind: &str, theme: &Theme) -> Option<Color> {
     let key = match kind {
         "added" => "gitDecoration.addedResourceForeground",
         "removed" => "gitDecoration.deletedResourceForeground",

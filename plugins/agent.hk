@@ -75,6 +75,7 @@ pub fn activate() {
     red::on("agent:error", failed);
     red::on("agent:session_lost", session_lost);
     red::on("agent:proposals_changed", proposals_changed);
+    red::on("agent:replay_review_requested", replay_review_requested);
     red::on("agent:proposal_applied", proposals_changed);
     red::on("agent:proposal_conflict", proposal_conflict);
     red::on("agent:permission_requested", permission_requested);
@@ -1121,6 +1122,19 @@ fn review() {
         min_two_pane_width: 88,
     });
     refresh_proposals();
+}
+
+fn replay_review_requested(event: Json) {
+    let session_id = red::string(event.session_id, "");
+    if session_id == "" {
+        return;
+    }
+    red::state_set("agent_session_id", session_id);
+    red::state_set("agent_detail", [[PanelSegment {
+        text: "Select a proposed original-PR hunk to inspect it",
+        style: muted_style(),
+    }]]);
+    review();
 }
 
 fn refresh_proposals() {

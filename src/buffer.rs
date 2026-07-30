@@ -73,6 +73,9 @@ pub struct Buffer {
     /// Optional path to the file this buffer represents
     pub file: Option<String>,
 
+    /// Display-only label for an in-memory scratch buffer with no filesystem path.
+    scratch_name: Option<String>,
+
     /// The text content stored as a rope for efficient editing
     content: Rope,
 
@@ -107,6 +110,7 @@ impl Buffer {
         Self {
             id: BufferId::next(),
             file,
+            scratch_name: None,
             content: Rope::from_str(&contents),
             dirty: false,
             pos: (0, 0),
@@ -115,6 +119,14 @@ impl Buffer {
             revision: 0,
             syntax_selection: SyntaxSelection::Auto,
         }
+    }
+
+    /// Creates a visibly named in-memory buffer without assigning a file or URI.
+    #[must_use]
+    pub fn named_scratch(name: impl Into<String>, contents: String) -> Self {
+        let mut buffer = Self::new(None, contents);
+        buffer.scratch_name = Some(name.into());
+        buffer
     }
 
     /// Creates a new Buffer by reading contents from a file
@@ -446,7 +458,10 @@ impl Buffer {
 
     /// Returns the display name used by buffer and status UI.
     pub fn name(&self) -> &str {
-        self.file.as_deref().unwrap_or("[No Name]")
+        self.file
+            .as_deref()
+            .or(self.scratch_name.as_deref())
+            .unwrap_or("[No Name]")
     }
 
     /// True when the buffer has never been associated with a file.
@@ -1173,6 +1188,20 @@ mod test {
 
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn named_scratch_has_a_display_label_without_a_file_uri() {
+        let buffer = Buffer::named_scratch(
+            "[PR Replay] src/editor/rendering.rs",
+            "fn diagnostics_by_visible_line() {}\n".to_string(),
+        );
+
+        assert_eq!(buffer.name(), "[PR Replay] src/editor/rendering.rs");
+        assert!(buffer.file.is_none());
+        assert!(buffer.is_unnamed());
+        assert!(buffer.uri().unwrap().is_none());
+        assert!(!buffer.is_dirty());
+    }
 
     #[test]
     fn syntax_selection_is_buffer_local_and_does_not_change_revision() {

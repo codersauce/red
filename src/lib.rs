@@ -36,6 +36,7 @@ pub mod matchit;
 pub mod onboarding;
 pub mod plugin;
 pub mod preferences;
+pub mod replay;
 mod self_check;
 pub mod session;
 pub mod splash;

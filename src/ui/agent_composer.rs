@@ -22,6 +22,8 @@ const TAB_WIDTH: usize = 4;
 const MAX_PROMPT_BYTES: usize = PROMPT_MAX_BYTES;
 const EMPTY_STATUS: &str = "Prompt is empty";
 const OVERSIZED_STATUS: &str = "Prompt exceeds 128 KiB";
+const AGENT_PLACEHOLDER: &str = "What should the agent do?";
+const CALLBACK_PLACEHOLDER: &str = "Write your message…";
 
 #[derive(Debug)]
 pub(crate) struct WrappedText {
@@ -34,6 +36,7 @@ pub struct AgentComposer {
     target: ComposerTarget,
     dialog: Dialog,
     prompt: PromptBuffer,
+    placeholder: &'static str,
     validation_status: Option<&'static str>,
     viewport_width: usize,
     viewport_height: usize,
@@ -109,6 +112,15 @@ impl AgentComposer {
             .collect::<Vec<_>>();
         let prompt = PromptBuffer::with_history(&query, history);
         let history_too_large = prompt.history().len() != history_len;
+        let placeholder = if matches!(&target, ComposerTarget::Legacy { .. })
+            || title
+                .as_deref()
+                .is_some_and(|title| title.eq_ignore_ascii_case("Agent prompt"))
+        {
+            AGENT_PLACEHOLDER
+        } else {
+            CALLBACK_PLACEHOLDER
+        };
 
         Self {
             target,
@@ -124,6 +136,7 @@ impl AgentComposer {
             )
             .with_surface_theme(&theme, SurfaceRole::Popup),
             prompt,
+            placeholder,
             validation_status: (initial_too_large || history_too_large).then_some(OVERSIZED_STATUS),
             viewport_width,
             viewport_height,
@@ -222,8 +235,7 @@ impl Component for AgentComposer {
         }
 
         if self.prompt.text().is_empty() {
-            let placeholder =
-                truncate_display_width("What should the agent do?", self.dialog.width);
+            let placeholder = truncate_display_width(self.placeholder, self.dialog.width);
             buffer.set_text(content_x, content_y, &placeholder, &self.muted_style);
         } else {
             let wrapped = self.wrapped_text();
@@ -791,6 +803,49 @@ mod tests {
                 Action::CloseDialog,
             ]))
         );
+    }
+
+    #[test]
+    fn generic_callback_composers_do_not_present_review_text_as_an_agent_prompt() {
+        let editor = editor(80, 24);
+        let composer = AgentComposer::new_callback(
+            &editor,
+            Some("Local inline review comment".to_string()),
+            String::new(),
+            Vec::new(),
+            ComposerHandle::from_raw(42),
+        );
+        let mut buffer = RenderBuffer::new(80, editor.vheight(), &Style::default());
+
+        composer.draw(&mut buffer).unwrap();
+
+        let rendered = (0..buffer.height)
+            .map(|row| rendered_row(&buffer, row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains(CALLBACK_PLACEHOLDER));
+        assert!(!rendered.contains(AGENT_PLACEHOLDER));
+    }
+
+    #[test]
+    fn agent_callback_composers_preserve_the_original_agent_prompt() {
+        let editor = editor(80, 24);
+        let composer = AgentComposer::new_callback(
+            &editor,
+            Some("Agent prompt".to_string()),
+            String::new(),
+            Vec::new(),
+            ComposerHandle::from_raw(43),
+        );
+        let mut buffer = RenderBuffer::new(80, editor.vheight(), &Style::default());
+
+        composer.draw(&mut buffer).unwrap();
+
+        let rendered = (0..buffer.height)
+            .map(|row| rendered_row(&buffer, row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains(AGENT_PLACEHOLDER));
     }
 
     #[test]

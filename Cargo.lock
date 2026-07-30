@@ -2249,6 +2249,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha2",
  "similar",
  "tempfile",
  "textwrap",
@@ -2270,6 +2271,7 @@ dependencies = [
  "tree-sitter-yaml",
  "unicode-segmentation",
  "unicode-width 0.2.1",
+ "url",
  "uuid",
  "windows-sys 0.61.2",
 ]

@@ -435,7 +435,7 @@ fn literal_matches(expected: &str, actual: &str) -> bool {
     match expected {
         "String" => actual == "string",
         "bool" => actual == "boolean",
-        "i32" | "u32" | "usize" => actual == "number",
+        "i32" | "i64" | "u32" | "usize" => actual == "number",
         ty if ty.starts_with('[') => actual == "array",
         ty if ty.starts_with("fn(") => false,
         "Json" => true,
@@ -489,6 +489,14 @@ mod tests {
         assert_eq!(picker.introduced, "0.3.0");
         assert!(picker.signature.contains("PickerHandlers"));
 
+        let picker_busy = HOST_API
+            .calls
+            .iter()
+            .find(|call| call.kind == "execute" && call.name == "UpdatePickerBusy")
+            .expect("picker loading animation must be present in the host API schema");
+        assert_eq!(picker_busy.signature, "(id: i32, busy: bool)");
+        assert_eq!(picker_busy.introduced, "0.5.1");
+
         let archive = HOST_API
             .calls
             .iter()
@@ -496,6 +504,35 @@ mod tests {
             .expect("agent archive must be present in the host API schema");
         assert_eq!(archive.signature, "(session_id: String)");
         assert_eq!(archive.introduced, "0.2.0");
+
+        for (kind, name) in [
+            ("request", "ReplayResolvePullRequest"),
+            ("request", "ReplayResolveLocalBranch"),
+            ("request", "ReplayFetchPullRequestObjects"),
+            ("request", "ReplayCreateWorkspace"),
+            ("request", "ReplayActiveSession"),
+            ("request", "ReplayListReviews"),
+            ("request", "ReplayResumeReview"),
+            ("request", "ReplayRegenerateReview"),
+            ("request", "ReplayRestartReview"),
+            ("request", "ReplayAddNote"),
+            ("request", "ReplayAddDraft"),
+            ("request", "ReplayAcceptAgentDraft"),
+            ("request", "ReplayUpdateDraft"),
+            ("request", "ReplayRemoveDraft"),
+            ("request", "ReplaySetMode"),
+            ("execute", "ReplayFocusStepSource"),
+            ("execute", "ReplayToggleZoom"),
+            ("execute", "ReplayAgentStart"),
+            ("execute", "ReplayAgentOpenProposals"),
+        ] {
+            let call = HOST_API
+                .calls
+                .iter()
+                .find(|call| call.kind == kind && call.name == name)
+                .unwrap_or_else(|| panic!("source-backed Replay host call is missing: {name}"));
+            assert_eq!(call.introduced, "0.5.1");
+        }
     }
 
     #[test]
@@ -749,6 +786,14 @@ mod tests {
             (
                 "DisplayColumnToCharIndex",
                 "(callback: fn(Json), column: i32, y: i32)",
+            ),
+            (
+                "ReplayApplyStep",
+                "(callback: fn(Json), workspace_id: String, step_id: String, revision: i64)",
+            ),
+            (
+                "ReplayDemoApplyStep",
+                "(callback: fn(Json), workspace_id: String, step_id: String, revision: i64)",
             ),
         ];
         for (name, signature) in expected {

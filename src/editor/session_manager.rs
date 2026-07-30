@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 /// Default interval for background session snapshot flushes.
 pub const DEFAULT_SESSION_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5);
-pub type SessionSnapshotGeneration = (u64, Option<u64>);
+pub type SessionSnapshotGeneration = (u64, Option<u64>, Option<u64>);
 pub type SessionSnapshotWriter = std::thread::JoinHandle<anyhow::Result<SessionSnapshotGeneration>>;
 
 /// Manages session persistence, disk divergence detection, and crash recovery.
@@ -110,8 +110,8 @@ mod tests {
         let mut manager = SessionManager::new();
         assert!(!manager.should_snapshot());
 
-        manager.record_generation((7, Some(3)));
-        assert!(manager.generation_is_current((7, Some(3))));
+        manager.record_generation((7, Some(3), Some(5)));
+        assert!(manager.generation_is_current((7, Some(3), Some(5))));
 
         manager.set_warning(Some("snapshot failed"));
         assert_eq!(manager.warning(), Some("snapshot failed"));
