@@ -11355,6 +11355,14 @@ impl Editor {
         let was_recording_macro = self.macro_recording.is_some();
         let resolve_span = perf::PerfSpan::start("event:resolve_action");
         let action = self.handle_event_with_runtime(&ev, Some(runtime))?;
+        let defer_replay_navigation_render = matches!(
+            action.as_ref(),
+            Some(KeyAction::Multiple(actions))
+                if matches!(
+                    actions.as_slice(),
+                    [Action::NotifyPlugins(method, _)] if method == "panel:event:replay-coach"
+                )
+        );
         if !sensitive_input {
             if was_recording_macro && self.macro_recording.is_some() {
                 self.record_macro_event(&ev);
@@ -11388,7 +11396,9 @@ impl Editor {
         self.finish_semantic_change_event();
         drop(semantic_span);
 
-        if render_mode == EventRenderMode::Immediate && self.render_generation == render_generation
+        if render_mode == EventRenderMode::Immediate
+            && self.render_generation == render_generation
+            && !defer_replay_navigation_render
         {
             self.render(buffer)?;
         }
@@ -13622,10 +13632,24 @@ impl Editor {
 
     fn panel_event_key_action(event: plugin::panel::PanelEvent) -> Option<KeyAction> {
         serde_json::to_value(&event).ok().map(|payload| {
-            KeyAction::Multiple(vec![
-                Action::NotifyPlugins(format!("panel:event:{}", event.panel_id), payload),
-                Action::Refresh,
-            ])
+            let defer_replay_navigation_render = event.panel_id == "replay-coach"
+                && matches!(
+                    event.action.as_str(),
+                    "next"
+                        | "previous"
+                        | "next_file"
+                        | "previous_file"
+                        | "next_unreviewed"
+                        | "previous_unreviewed"
+                );
+            let mut actions = vec![Action::NotifyPlugins(
+                format!("panel:event:{}", event.panel_id),
+                payload,
+            )];
+            if !defer_replay_navigation_render {
+                actions.push(Action::Refresh);
+            }
+            KeyAction::Multiple(actions)
         })
     }
 
@@ -20817,6 +20841,7 @@ impl Editor {
         self.theme = theme;
         self.highlighter = highlighter;
         self.highlight_cache.clear();
+        self.panel_manager.invalidate_replay_highlights();
         self.workspace_manager.update_theme(&self.theme);
         self.force_full_redraw = true;
         if let Some(dialog) = &mut self.current_dialog {
@@ -27523,17 +27548,28 @@ mod test {
                 .test_handle_event(Event::Key(KeyEvent::new(code, modifiers)))
                 .expect("dispatch independent Replay list or hunk motion");
 
-            assert!(matches!(
-                action,
-                Some(KeyAction::Multiple(actions)) if actions.iter().any(|action| {
-                    matches!(
-                        action,
-                        Action::NotifyPlugins(event, payload)
-                            if event == "panel:event:replay-coach"
-                                && payload["action"] == expected_action
-                    )
-                })
-            ));
+            let Some(KeyAction::Multiple(actions)) = action else {
+                panic!("Replay action {expected_action} must notify its owning plugin");
+            };
+            assert!(actions.iter().any(|action| {
+                matches!(
+                    action,
+                    Action::NotifyPlugins(event, payload)
+                        if event == "panel:event:replay-coach"
+                            && payload["action"] == expected_action
+                )
+            }));
+            let deferred = matches!(
+                expected_action,
+                "next" | "previous" | "next_unreviewed" | "previous_unreviewed"
+            );
+            assert_eq!(
+                actions
+                    .iter()
+                    .any(|action| matches!(action, Action::Refresh)),
+                !deferred,
+                "only Replay navigation should defer its refresh until new content arrives",
+            );
         }
         for (code, expected_action) in [
             (KeyCode::Char('['), "previous_file"),
@@ -27547,17 +27583,20 @@ mod test {
                 .test_handle_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
                 .expect("dispatch focused Replay changed-file motion");
 
-            assert!(matches!(
-                action,
-                Some(KeyAction::Multiple(actions)) if actions.iter().any(|action| {
-                    matches!(
-                        action,
-                        Action::NotifyPlugins(event, payload)
-                            if event == "panel:event:replay-coach"
-                                && payload["action"] == expected_action
-                    )
-                })
-            ));
+            let Some(KeyAction::Multiple(actions)) = action else {
+                panic!("Replay file navigation must notify its owning plugin");
+            };
+            assert!(actions.iter().any(|action| {
+                matches!(
+                    action,
+                    Action::NotifyPlugins(event, payload)
+                        if event == "panel:event:replay-coach"
+                            && payload["action"] == expected_action
+                )
+            }));
+            assert!(actions
+                .iter()
+                .all(|action| !matches!(action, Action::Refresh)));
         }
         assert_eq!(
             editor

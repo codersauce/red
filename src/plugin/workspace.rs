@@ -926,7 +926,6 @@ pub(super) fn highlight_document(
     document: Option<&WorkspaceDocument>,
     theme: &Theme,
 ) -> Vec<Vec<crate::editor::StyleInfo>> {
-    let _span = crate::editor::perf::PerfSpan::start("workspace:highlight_document");
     let Some(document) = document else {
         return Vec::new();
     };
@@ -934,13 +933,22 @@ pub(super) fn highlight_document(
         return (0..document.lines.len()).map(|_| Vec::new()).collect();
     };
 
+    highlight_document_with(document, &mut highlighter)
+}
+
+pub(super) fn highlight_document_with(
+    document: &WorkspaceDocument,
+    highlighter: &mut Highlighter,
+) -> Vec<Vec<crate::editor::StyleInfo>> {
+    let _span = crate::editor::perf::PerfSpan::start("workspace:highlight_document");
+
     // A unified diff interleaves two different programs. Feeding removed and
     // added lines to one parser makes replacements (especially multiline ones)
     // corrupt the syntax state for everything that follows. Parse an old-file
     // and new-file projection independently, then use the matching side for
     // each displayed line.
-    let old = highlight_document_projection(document, &mut highlighter, false);
-    let new = highlight_document_projection(document, &mut highlighter, true);
+    let old = highlight_document_projection(document, highlighter, false);
+    let new = highlight_document_projection(document, highlighter, true);
     document
         .lines
         .iter()

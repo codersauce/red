@@ -56,7 +56,7 @@ def window_samples(log, begin, end):
             if "Char('j')" not in detail and "Char('k')" not in detail:
                 continue
             label = "replay:key_event"
-        elif label == "husk:notify":
+        elif label == "notify":
             if "panel:event:replay-coach" not in detail:
                 continue
             label = "replay:plugin_action"
@@ -191,11 +191,19 @@ def run(args):
             bytes_before = terminal["bytes"]
             started = time.monotonic()
             for index in range(args.burst):
+                last_key = time.monotonic()
                 os.write(master, NAVIGATION[index % len(NAVIGATION)])
                 if args.delay_ms:
                     time.sleep(args.delay_ms / 1000)
-            last_key = time.monotonic()
+            wait_until(
+                lambda: terminal["last_output"] >= last_key,
+                process,
+                args.navigation_timeout,
+                "final sustained Replay navigation repaint",
+            )
             while time.monotonic() - terminal["last_output"] < args.settle_ms / 1000:
+                if process.poll() is not None:
+                    raise RuntimeError("editor exited during sustained Replay navigation")
                 time.sleep(0.001)
             burst_elapsed = time.monotonic() - started
             burst_tail = max(0.0, terminal["last_output"] - last_key)
@@ -212,6 +220,12 @@ def run(args):
             interactive = window_samples(log, "interactive begin", "interactive end")
             interactive["replay:visible_settle"] = visible_latencies
             burst = window_samples(log, "burst begin", "burst end")
+            if len(interactive.get("replay:update_panel", [])) != args.cycles:
+                raise RuntimeError(
+                    "Replay benchmark did not exercise one actual step change per keypress"
+                )
+            if args.trace_output:
+                Path(args.trace_output).expanduser().write_bytes(log.read_bytes())
             print(
                 f"profile={args.profile} terminal={args.cols}x{args.rows} "
                 f"steps={args.cycles} output={interactive_bytes / 1024:.1f}KiB "
@@ -248,9 +262,10 @@ def main():
     parser.add_argument("--cycles", type=int, default=32)
     parser.add_argument("--burst", type=int, default=80)
     parser.add_argument("--delay-ms", type=float, default=2)
-    parser.add_argument("--settle-ms", type=float, default=12)
+    parser.add_argument("--settle-ms", type=float, default=20)
     parser.add_argument("--startup-timeout", type=float, default=20)
     parser.add_argument("--navigation-timeout", type=float, default=3)
+    parser.add_argument("--trace-output", help="retain the complete editor performance trace")
     parser.add_argument("--enable-lsp", action="store_true")
     parser.add_argument("--assert", dest="assert_budget", action="store_true")
     parser.add_argument("--p95-ms", type=float)

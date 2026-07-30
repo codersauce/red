@@ -4,7 +4,10 @@
 //! source independently for Tree-sitter highlighting. The change list remains
 //! pinned above an independently scrollable hunk and a compact status footer.
 
-use std::collections::HashSet;
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::{Arc, Mutex, MutexGuard},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -12,12 +15,13 @@ use super::{
     markdown::{wrap_plain_text, RenderedTextLine, RenderedTextSpan, TextPanelSpanStyle},
     panel::render_text_spans_on_surface,
     workspace::{
-        diff_foreground, diff_line_style, display_slice, highlight_document,
+        diff_foreground, diff_line_style, display_slice, highlight_document_with,
         render_syntax_overlays, WorkspaceDocument, WorkspaceDocumentLine,
     },
 };
 use crate::{
-    editor::{render_buffer::RenderBuffer, Point},
+    editor::{render_buffer::RenderBuffer, Point, StyleInfo},
+    highlighter::Highlighter,
     replay::{
         parse_patch, GitObjectId, ReplayDemoStep, ReplayDraftOrigin, ReplayDraftState,
         ReplayLimits, ReplayReceiptVerification, ReplayReviewDraft, ReplayReviewDraftKind,
@@ -293,6 +297,37 @@ impl ReplayPanelModel {
 pub(super) struct ReplayPanelState {
     pub(super) model: ReplayPanelModel,
     pub(super) document: WorkspaceDocument,
+    render_cache: Arc<Mutex<ReplayRenderCache>>,
+}
+
+const MAX_CACHED_REPLAY_DOCUMENTS: usize = 16;
+const MAX_CACHED_REPLAY_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Default)]
+struct ReplayRenderCache {
+    highlighter: Option<Highlighter>,
+    documents: VecDeque<ReplayHighlightedDocument>,
+    retained_bytes: usize,
+}
+
+impl std::fmt::Debug for ReplayRenderCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReplayRenderCache")
+            .field("has_highlighter", &self.highlighter.is_some())
+            .field("documents", &self.documents)
+            .field("retained_bytes", &self.retained_bytes)
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+struct ReplayHighlightedDocument {
+    step_id: String,
+    document: WorkspaceDocument,
+    syntax: Vec<Vec<StyleInfo>>,
+    intraline: Vec<Vec<StyleInfo>>,
+    retained_bytes: usize,
 }
 
 impl ReplayPanelState {
@@ -320,7 +355,99 @@ impl ReplayPanelState {
             return None;
         }
         let document = replay_document(&model)?;
-        Some(Self { model, document })
+        Some(Self {
+            model,
+            document,
+            render_cache: Arc::default(),
+        })
+    }
+
+    /// Keep parsed language queries and recent hunks when one review changes steps.
+    pub(super) fn inherit_render_cache(&mut self, previous: &Self) {
+        if self.model.pull_request == previous.model.pull_request
+            && self.model.branch == previous.model.branch
+            && self.model.head_commit == previous.model.head_commit
+        {
+            self.render_cache = Arc::clone(&previous.render_cache);
+        }
+    }
+
+    /// A theme replacement changes every cached token and intraline style.
+    pub(super) fn invalidate_render_cache(&self) {
+        *self
+            .render_cache
+            .lock()
+            .expect("Replay render cache lock poisoned") = ReplayRenderCache::default();
+    }
+
+    fn highlighted_document(&self, theme: &Theme) -> MutexGuard<'_, ReplayRenderCache> {
+        let step_id = self
+            .model
+            .current_step()
+            .map_or("", |step| step.id.as_str());
+        let mut cache = self
+            .render_cache
+            .lock()
+            .expect("Replay render cache lock poisoned");
+
+        if let Some(index) = cache
+            .documents
+            .iter()
+            .position(|entry| entry.step_id == step_id && entry.document == self.document)
+        {
+            crate::editor::perf::increment("replay:highlight_cache_hit", 1);
+            if index + 1 != cache.documents.len() {
+                let entry = cache.documents.remove(index).expect("cached document");
+                cache.documents.push_back(entry);
+            }
+            return cache;
+        }
+
+        crate::editor::perf::increment("replay:highlight_cache_miss", 1);
+        if cache.highlighter.is_none() {
+            cache.highlighter = Highlighter::new(theme).ok();
+        }
+        let syntax = {
+            let _span = crate::editor::perf::PerfSpan::start("replay:syntax_highlight");
+            cache.highlighter.as_mut().map_or_else(
+                || (0..self.document.lines.len()).map(|_| Vec::new()).collect(),
+                |highlighter| highlight_document_with(&self.document, highlighter),
+            )
+        };
+        let intraline = {
+            let _span = crate::editor::perf::PerfSpan::start("replay:intraline_highlight");
+            replay_intraline_highlights(&self.document, theme)
+        };
+        let retained_bytes = self
+            .document
+            .lines
+            .iter()
+            .map(|line| line.id.len().saturating_add(line.text.len()))
+            .sum::<usize>()
+            .saturating_add(
+                syntax
+                    .iter()
+                    .chain(&intraline)
+                    .map(|spans| spans.len().saturating_mul(std::mem::size_of::<StyleInfo>()))
+                    .sum::<usize>(),
+            );
+
+        cache.retained_bytes = cache.retained_bytes.saturating_add(retained_bytes);
+        cache.documents.push_back(ReplayHighlightedDocument {
+            step_id: step_id.to_string(),
+            document: self.document.clone(),
+            syntax,
+            intraline,
+            retained_bytes,
+        });
+        while cache.documents.len() > MAX_CACHED_REPLAY_DOCUMENTS
+            || (cache.documents.len() > 1 && cache.retained_bytes > MAX_CACHED_REPLAY_BYTES)
+        {
+            let removed = cache.documents.pop_front().expect("cached document");
+            cache.retained_bytes = cache.retained_bytes.saturating_sub(removed.retained_bytes);
+        }
+
+        cache
     }
 }
 
@@ -821,21 +948,18 @@ pub(super) fn render_replay_panel(
     }
 
     let diff_top = source_top.saturating_add(layout.source_rows);
-    let highlights = {
-        let _span = crate::editor::perf::PerfSpan::start("replay:syntax_highlight");
-        highlight_document(Some(&state.document), theme)
-    };
-    let intraline = {
-        let _span = crate::editor::perf::PerfSpan::start("replay:intraline_highlight");
-        replay_intraline_highlights(&state.document, theme)
-    };
+    let cache = state.highlighted_document(theme);
+    let highlights = cache
+        .documents
+        .back()
+        .expect("current highlighted document");
     let dual_gutter = replay_uses_dual_gutter(&state.document, width);
     for (offset, ((line, spans), changed_spans)) in state
         .document
         .lines
         .iter()
-        .zip(highlights.iter())
-        .zip(intraline.iter())
+        .zip(highlights.syntax.iter())
+        .zip(highlights.intraline.iter())
         .skip(viewport.scroll)
         .take(layout.diff_rows)
         .enumerate()
@@ -2738,7 +2862,10 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{replay::replay_demo_plan, theme::parse_vscode_theme, ui::ActionBarLayout};
+    use crate::{
+        plugin::workspace::highlight_document, replay::replay_demo_plan, theme::parse_vscode_theme,
+        ui::ActionBarLayout,
+    };
     use similar::TextDiff;
 
     fn has_visible_key(layout: &ActionBarLayout, key: &str) -> bool {
@@ -2985,6 +3112,117 @@ mod tests {
                 && !line.text.starts_with("--- a/")
                 && !line.text.starts_with("+++ b/")
         }));
+    }
+
+    #[test]
+    fn repeated_replay_frames_reuse_highlighter_and_current_hunk() {
+        let state = state();
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let initial = state.highlighted_document(&theme);
+        let highlighter = initial
+            .highlighter
+            .as_ref()
+            .map(|highlighter| highlighter as *const Highlighter)
+            .expect("initialized Replay highlighter");
+        let syntax = initial.documents.back().unwrap().syntax.as_ptr();
+        assert_eq!(initial.documents.len(), 1);
+        assert!(initial.retained_bytes > 0);
+        drop(initial);
+
+        let repeated = state.highlighted_document(&theme);
+        assert_eq!(repeated.documents.len(), 1);
+        assert_eq!(
+            repeated
+                .highlighter
+                .as_ref()
+                .map(|current| current as *const Highlighter),
+            Some(highlighter),
+        );
+        assert_eq!(repeated.documents.back().unwrap().syntax.as_ptr(), syntax);
+    }
+
+    #[test]
+    fn replay_step_changes_share_language_queries_and_reuse_previous_hunks() {
+        let original = state();
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let initial = original.highlighted_document(&theme);
+        let highlighter = initial
+            .highlighter
+            .as_ref()
+            .map(|current| current as *const Highlighter)
+            .unwrap();
+        let original_step = initial.documents.back().unwrap().step_id.clone();
+        drop(initial);
+
+        let mut next_model = model();
+        next_model.index = 1;
+        let mut next = ReplayPanelState::parse(&serde_json::to_string(&next_model).unwrap())
+            .expect("valid next Replay step");
+        next.inherit_render_cache(&original);
+        assert!(Arc::ptr_eq(&original.render_cache, &next.render_cache));
+
+        let changed = next.highlighted_document(&theme);
+        assert_eq!(changed.documents.len(), 2);
+        assert_eq!(
+            changed
+                .highlighter
+                .as_ref()
+                .map(|current| current as *const Highlighter),
+            Some(highlighter),
+        );
+        assert_ne!(changed.documents.back().unwrap().step_id, original_step);
+        drop(changed);
+
+        let revisited = original.highlighted_document(&theme);
+        assert_eq!(revisited.documents.len(), 2);
+        assert_eq!(revisited.documents.back().unwrap().step_id, original_step);
+    }
+
+    #[test]
+    fn replay_render_cache_does_not_cross_review_identity_or_theme_changes() {
+        let original = state();
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        drop(original.highlighted_document(&theme));
+
+        let mut unrelated_model = model();
+        unrelated_model.pull_request = unrelated_model.pull_request.saturating_add(1);
+        let mut unrelated =
+            ReplayPanelState::parse(&serde_json::to_string(&unrelated_model).unwrap()).unwrap();
+        unrelated.inherit_render_cache(&original);
+        assert!(!Arc::ptr_eq(
+            &original.render_cache,
+            &unrelated.render_cache
+        ));
+
+        original.invalidate_render_cache();
+        let invalidated = original.render_cache.lock().unwrap();
+        assert!(invalidated.highlighter.is_none());
+        assert!(invalidated.documents.is_empty());
+        assert_eq!(invalidated.retained_bytes, 0);
+    }
+
+    #[test]
+    fn replay_render_cache_retains_only_a_bounded_number_of_original_hunks() {
+        let theme = parse_vscode_theme("themes/red.json").unwrap();
+        let mut previous = state();
+        for index in 0..MAX_CACHED_REPLAY_DOCUMENTS.saturating_add(4) {
+            let mut replay = model();
+            replay.steps[0].id = format!("bounded-cache-step-{index}");
+            let mut current =
+                ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+            current.inherit_render_cache(&previous);
+            let cached = current.highlighted_document(&theme);
+            assert!(cached.documents.len() <= MAX_CACHED_REPLAY_DOCUMENTS);
+            drop(cached);
+            previous = current;
+        }
+
+        let cached = previous.render_cache.lock().unwrap();
+        assert_eq!(cached.documents.len(), MAX_CACHED_REPLAY_DOCUMENTS);
+        assert_eq!(
+            cached.documents.front().unwrap().step_id,
+            "bounded-cache-step-4",
+        );
     }
 
     #[test]

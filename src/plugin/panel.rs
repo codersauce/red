@@ -355,10 +355,14 @@ impl TextPanel {
             self.scroll = self.viewport.offset();
             self.follow_tail = self.viewport.is_following();
         }
-        self.replay = blocks
+        let mut replay = blocks
             .iter()
             .find(|block| block.format == TextPanelBlockFormat::Replay)
             .and_then(|block| ReplayPanelState::parse(&block.text));
+        if let (Some(current), Some(previous)) = (replay.as_mut(), self.replay.as_ref()) {
+            current.inherit_render_cache(previous);
+        }
+        self.replay = replay;
         self.blocks = blocks;
         if self.follow_tail {
             self.scroll_to_bottom(panel_height, panel_width);
@@ -377,7 +381,11 @@ impl TextPanel {
         if let Some(block) = self.blocks.iter_mut().find(|block| block.id == block_id) {
             block.text.push_str(delta);
             if block.format == TextPanelBlockFormat::Replay {
-                self.replay = ReplayPanelState::parse(&block.text);
+                let mut replay = ReplayPanelState::parse(&block.text);
+                if let (Some(current), Some(previous)) = (replay.as_mut(), self.replay.as_ref()) {
+                    current.inherit_render_cache(previous);
+                }
+                self.replay = replay;
             }
         } else {
             self.blocks.push(TextPanelBlock {
@@ -851,6 +859,17 @@ pub struct PanelManager {
 }
 
 impl PanelManager {
+    /// Drop theme-sensitive Replay syntax and intraline highlighting.
+    pub(crate) fn invalidate_replay_highlights(&self) {
+        for replay in self
+            .text_panels
+            .values()
+            .filter_map(|panel| panel.replay.as_ref())
+        {
+            replay.invalidate_render_cache();
+        }
+    }
+
     pub fn create_panel(&mut self, id: String, config: PanelConfig) {
         self.remember_panel_size(&id, config.side, config.width);
         self.text_panels.remove(&id);
