@@ -40,16 +40,17 @@ pub use review::{
 };
 pub(crate) use session::anchored_hunk_offset;
 pub use session::{
-    ReplayAgentScope, ReplayCompletion, ReplayController, ReplayDiffSide, ReplayDraftOrigin,
-    ReplayDraftState, ReplayMode, ReplayNote, ReplayNoteCategory, ReplayRecoverySnapshot,
-    ReplayReviewAnchor, ReplayReviewDraft, ReplayReviewDraftKind, ReplayReviewRole,
-    ReplayReviewState, ReplaySession, ReplaySessionState, ReplayStage, ReplayStep, ReplayStepKind,
-    ReplayStepStatus, ReplayValidation, ReplayWorkspace, ReplayWorkspacePreview,
+    ReplayAgentScope, ReplayCompletion, ReplayController, ReplayDiffSide, ReplayDiscardedSession,
+    ReplayDraftOrigin, ReplayDraftState, ReplayMode, ReplayNote, ReplayNoteCategory,
+    ReplayRecoverySnapshot, ReplayReviewAnchor, ReplayReviewDraft, ReplayReviewDraftKind,
+    ReplayReviewRole, ReplayReviewState, ReplaySession, ReplaySessionState, ReplayStage,
+    ReplayStep, ReplayStepKind, ReplayStepStatus, ReplayValidation, ReplayWorkspace,
+    ReplayWorkspacePreview,
 };
 pub use source::{
     fetch_pull_request_objects, finalize_pull_request, prepare_author_workspace, prepare_workspace,
     refresh_pull_request_capabilities, reopen_existing_workspace, resolve_local_branch_source,
-    resolve_local_source, resolve_pull_request, GitObjectId, PullRequestInput,
+    resolve_local_source, resolve_pull_request, restart_workspace, GitObjectId, PullRequestInput,
     ReplayAuthorWorkspace, ReplayAuthorWorkspacePreview, ReplayCommitSummary,
     ReplayGitHubCapabilities, ReplayPullRequest, ReplayRepository, ReplayRepositoryPermission,
     ReplayResolvedLocalBranch, ReplayResolvedPullRequest, ReplayReviewContext, ReplaySource,

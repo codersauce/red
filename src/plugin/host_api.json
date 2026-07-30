@@ -107,6 +107,8 @@
     { "name": "ReplayActiveSession", "kind": "request", "signature": "(callback: fn(Json))", "introduced": "0.5.1" },
     { "name": "ReplayListReviews", "kind": "request", "signature": "(callback: fn(Json))", "introduced": "0.5.1" },
     { "name": "ReplayResumeReview", "kind": "request", "signature": "(callback: fn(Json), review_id: String)", "introduced": "0.5.1" },
+    { "name": "ReplayRegenerateReview", "kind": "request", "signature": "(callback: fn(Json), workspace_id: String)", "introduced": "0.5.1" },
+    { "name": "ReplayRestartReview", "kind": "request", "signature": "(callback: fn(Json), workspace_id: String, preview_digest: String, confirmed: bool)", "introduced": "0.5.1" },
     { "name": "ReplayAddNote", "kind": "request", "signature": "(callback: fn(Json), workspace_id: String, step_id: String, category: String, text: String)", "introduced": "0.5.1" },
     { "name": "ReplayAddDraft", "kind": "request", "signature": "(callback: fn(Json), workspace_id: String, step_id: String, kind: String, text: String)", "introduced": "0.5.1" },
     { "name": "ReplayAcceptAgentDraft", "kind": "request", "signature": "(callback: fn(Json), workspace_id: String, step_id: String, kind: String, text: String)", "introduced": "0.5.1" },

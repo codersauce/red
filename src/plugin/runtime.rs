@@ -1711,6 +1711,37 @@ impl RedHost {
                     .ok_or_else(|| anyhow::anyhow!("ReplayResumeReview requires a review id"))?
                     .to_string(),
             },
+            "ReplayRegenerateReview" => PluginRequest::ReplayRegenerateReview {
+                request_id,
+                workspace_id: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ReplayRegenerateReview requires a workspace id")
+                    })?
+                    .to_string(),
+            },
+            "ReplayRestartReview" => PluginRequest::ReplayRestartReview {
+                request_id,
+                workspace_id: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("ReplayRestartReview requires a workspace id"))?
+                    .to_string(),
+                preview_digest: args
+                    .get(/*index*/ 1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ReplayRestartReview requires a preview digest")
+                    })?
+                    .to_string(),
+                confirmed: args
+                    .get(/*index*/ 2)
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ReplayRestartReview requires explicit confirmation")
+                    })?,
+            },
             "ReplayAddNote" => PluginRequest::ReplayAddNote {
                 request_id,
                 workspace_id: args
@@ -5514,6 +5545,200 @@ mod tests {
                 );
             }
             _ => panic!("expected the unchanged GitHub, local-branch, and demo source picker"),
+        }
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_regeneration_preserves_the_selected_change_and_private_review_state() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_source_backed_replay(&mut runtime).await;
+
+        runtime.execute_command("ReplayNext").await.unwrap();
+        assert_eq!(recv_replay_guide().index, 1);
+        recv_replay_source_focus("real-workspace-1", &plan.steps[1].id);
+
+        runtime.execute_command("ReplayRegenerate").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: Some(status) }
+                if id == "replay-coach" && status.busy
+                    && status.label == "Regenerating review…"
+        ));
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayRegenerateReview {
+                request_id,
+                workspace_id,
+            } => {
+                assert_eq!(workspace_id, "real-workspace-1");
+                request_id
+            }
+            _ => panic!("expected read-only regeneration of the existing review"),
+        };
+        let mut regenerated = plan.clone();
+        regenerated.steps[1].title = "Explain the refreshed original source".to_string();
+        let note = serde_json::json!({
+            "index": 1,
+            "step_id": plan.steps[1].id,
+            "text": "Preserve this private finding.",
+        });
+        let draft = source_backed_review_draft(
+            &plan,
+            "preserved-local-draft",
+            "inline_comment",
+            "Keep this original-source comment private.",
+        );
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "active": true,
+                    "workspace_id": "real-workspace-1",
+                    "notes": [note],
+                    "completions": [{ "index": 0, "completion": "automatically applied" }],
+                    "drafts": [draft],
+                    "receipts": [],
+                    "plan": regenerated,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: None }
+                if id == "replay-coach"
+        ));
+        let guide = recv_replay_guide();
+        assert_eq!(guide.index, 1);
+        assert_eq!(
+            guide.steps[1].title,
+            "Explain the refreshed original source"
+        );
+        assert_eq!(guide.notes.len(), 1);
+        assert_eq!(guide.completions.len(), 1);
+        assert_eq!(guide.drafts.len(), 1);
+        assert!(guide.notice.contains("progress, scratch edits"));
+        recv_replay_source_focus("real-workspace-1", &plan.steps[1].id);
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_restart_requires_a_content_pinned_explicit_confirmation() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let plan = open_source_backed_replay(&mut runtime).await;
+
+        runtime.execute_command("ReplayRestart").await.unwrap();
+        let preview_request = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ReplayRestartReview {
+                request_id,
+                workspace_id,
+                preview_digest,
+                confirmed,
+            } => {
+                assert_eq!(workspace_id, "real-workspace-1");
+                assert!(preview_digest.is_empty());
+                assert!(!confirmed);
+                request_id
+            }
+            _ => panic!("starting over must first request a read-only loss preview"),
+        };
+        runtime
+            .resolve_request(
+                preview_request,
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": "real-workspace-1",
+                    "pull_request": 482,
+                    "reviewed_steps": 2,
+                    "total_steps": plan.steps.len(),
+                    "note_count": 3,
+                    "draft_count": 2,
+                    "dirty_buffers": 1,
+                    "preview_digest": "e".repeat(64),
+                }),
+            )
+            .await
+            .unwrap();
+        let handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackConfirmation {
+                title,
+                message,
+                handle,
+                ..
+            } => {
+                assert_eq!(title, "Start PR #482 over?");
+                assert!(message.contains("Review progress: 2 /"));
+                assert!(message.contains("Private notes: 3"));
+                assert!(message.contains("Local review drafts: 2"));
+                assert!(message.contains("Unsaved scratch buffers: 1"));
+                assert!(message.contains("original PR branch"));
+                handle
+            }
+            _ => panic!("review restart must show an explicit destructive-action confirmation"),
+        };
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        let accept = serde_json::from_value(serde_json::json!({
+            "id": "accept",
+            "label": "Accept",
+        }))
+        .unwrap();
+        assert!(runtime
+            .notify_picker(handle, PickerCallback::Selected(accept))
+            .unwrap());
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: Some(status) }
+                if id == "replay-coach" && status.busy
+                    && status.label == "Restarting review…"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::ReplayRestartReview {
+                workspace_id,
+                preview_digest,
+                confirmed,
+                ..
+            } if workspace_id == "real-workspace-1"
+                && preview_digest == "e".repeat(64)
+                && confirmed
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_review_actions_expose_preserving_and_destructive_choices() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        open_source_backed_replay(&mut runtime).await;
+
+        runtime
+            .execute_command("ReplayReviewActions")
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                title,
+                items,
+                options,
+                ..
+            } => {
+                assert_eq!(title.as_deref(), Some("Review actions"));
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].id, "regenerate");
+                assert!(items[0].label.contains("preserve"));
+                assert_eq!(items[1].id, "restart");
+                assert!(items[1].label.contains("discard"));
+                assert_eq!(options.presentation, crate::ui::PickerPresentation::Compact);
+            }
+            _ => panic!("expected an explicit Replay review-actions menu"),
         }
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }

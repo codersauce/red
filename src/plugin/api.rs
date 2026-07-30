@@ -513,6 +513,8 @@ mod tests {
             ("request", "ReplayActiveSession"),
             ("request", "ReplayListReviews"),
             ("request", "ReplayResumeReview"),
+            ("request", "ReplayRegenerateReview"),
+            ("request", "ReplayRestartReview"),
             ("request", "ReplayAddNote"),
             ("request", "ReplayAddDraft"),
             ("request", "ReplayAcceptAgentDraft"),

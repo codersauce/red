@@ -1385,10 +1385,62 @@ pub fn reopen_existing_workspace(source: &ReplaySource) -> Result<ReplayWorkspac
     existing_workspace(source, &preview.root, &preview.branch)
 }
 
+/// Recreates only an explicitly confirmed, independently verified scratch tree.
+///
+/// The source repository, original PR branch, and separately confirmed author
+/// worktree are never selected as removal targets. Reviewer-authored scratch
+/// files may be discarded only after the caller obtains explicit confirmation.
+pub fn restart_workspace(
+    source: &ReplaySource,
+    confirmed: bool,
+) -> Result<ReplayWorkspace, ReplayError> {
+    if !confirmed {
+        return Err(ReplayError::WorkspaceConfirmationRequired);
+    }
+    let (preview, _) = prepare_workspace(source, /*confirmed*/ false)?;
+    let workspace = verified_existing_workspace(
+        source,
+        &preview.root,
+        &preview.branch,
+        /*require_clean*/ false,
+    )?;
+
+    let mut remove = replay_git_command(&source.repository.root);
+    remove
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "worktree",
+            "remove",
+            "--force",
+        ])
+        .arg(&workspace.root);
+    run_command(&mut remove, MAX_COMMAND_DIAGNOSTIC_BYTES)?;
+
+    let mut delete = replay_git_command(&source.repository.root);
+    delete.args(["branch", "-D", "--"]).arg(&workspace.branch);
+    if let Err(error) = run_command(&mut delete, MAX_COMMAND_DIAGNOSTIC_BYTES) {
+        let _ = prepare_workspace(source, /*confirmed*/ true);
+        return Err(error);
+    }
+
+    let (_, replacement) = prepare_workspace(source, /*confirmed*/ true)?;
+    replacement.ok_or(ReplayError::WorkspaceConfirmationRequired)
+}
+
 fn existing_workspace(
     source: &ReplaySource,
     root: &Path,
     branch: &str,
+) -> Result<ReplayWorkspace, ReplayError> {
+    verified_existing_workspace(source, root, branch, /*require_clean*/ true)
+}
+
+fn verified_existing_workspace(
+    source: &ReplaySource,
+    root: &Path,
+    branch: &str,
+    require_clean: bool,
 ) -> Result<ReplayWorkspace, ReplayError> {
     let conflict = || ReplayError::WorkspaceExists(root.display().to_string());
     let metadata = std::fs::symlink_metadata(root).map_err(|_| conflict())?;
@@ -1432,17 +1484,19 @@ fn existing_workspace(
         return Err(conflict());
     }
 
-    let status = git_text(
-        root,
-        &["status", "--porcelain=v1", "--untracked-files=all"],
-        16 * 1024,
-    )
-    .map_err(|_| conflict())?;
-    if !status.trim().is_empty() {
-        return Err(ReplayError::WorkspaceExists(format!(
-            "{} contains saved or untracked review changes",
-            root.display(),
-        )));
+    if require_clean {
+        let status = git_text(
+            root,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+            16 * 1024,
+        )
+        .map_err(|_| conflict())?;
+        if !status.trim().is_empty() {
+            return Err(ReplayError::WorkspaceExists(format!(
+                "{} contains saved or untracked review changes",
+                root.display(),
+            )));
+        }
     }
 
     Ok(ReplayWorkspace {
@@ -3015,6 +3069,76 @@ mod tests {
         assert_eq!(
             fixture_git(&workspace.root, &["branch", "--show-current"]),
             workspace.branch,
+        );
+    }
+
+    #[test]
+    fn restarting_scratch_requires_confirmation_and_preserves_the_original_source() {
+        let (_directory, source) = reusable_workspace_source();
+        let (_, workspace) = prepare_workspace(&source, /*confirmed*/ true)
+            .expect("create the explicitly confirmed original scratch worktree");
+        let workspace = workspace.expect("the original scratch worktree exists");
+        let original_branch = fixture_git(&source.repository.root, &["branch", "--show-current"]);
+        let reviewer_source = "pub fn token() -> usize { 42 }\n";
+        std::fs::write(workspace.root.join("src/token.rs"), reviewer_source)
+            .expect("retain the reviewer's saved reconstruction");
+
+        assert!(matches!(
+            restart_workspace(&source, /*confirmed*/ false),
+            Err(ReplayError::WorkspaceConfirmationRequired),
+        ));
+        assert_eq!(
+            std::fs::read_to_string(workspace.root.join("src/token.rs")).unwrap(),
+            reviewer_source,
+        );
+        assert_eq!(
+            fixture_git(&source.repository.root, &["branch", "--show-current"]),
+            original_branch,
+        );
+    }
+
+    #[test]
+    fn confirmed_restart_discards_only_verified_scratch_changes() {
+        let (_directory, source) = reusable_author_workspace_source();
+        let (_, workspace) = prepare_workspace(&source, /*confirmed*/ true)
+            .expect("create the confirmed original scratch worktree");
+        let workspace = workspace.expect("the learning scratch worktree exists");
+        let (_, author) = prepare_author_workspace(&source, /*confirmed*/ true)
+            .expect("create the separately authorized original author worktree");
+        let author = author.expect("the original author worktree exists");
+        let author_source = "pub fn token() -> usize { 99 }\n";
+        std::fs::write(author.root.join("src/token.rs"), author_source)
+            .expect("preserve an uncommitted original author edit");
+        std::fs::write(
+            workspace.root.join("src/token.rs"),
+            "pub fn token() -> usize { 42 }\n",
+        )
+        .expect("create a saved scratch reconstruction");
+        std::fs::write(workspace.root.join("private-scratch.txt"), "discard me\n")
+            .expect("create an untracked scratch-only review artifact");
+        let original_branch = fixture_git(&source.repository.root, &["branch", "--show-current"]);
+
+        let replacement = restart_workspace(&source, /*confirmed*/ true)
+            .expect("replace only the independently verified Replay-owned scratch worktree");
+
+        assert_eq!(replacement.root, workspace.root);
+        assert_eq!(replacement.branch, workspace.branch);
+        assert_eq!(
+            fixture_git(&replacement.root, &["rev-parse", "HEAD"]),
+            source.base_commit.as_str(),
+        );
+        assert_eq!(
+            std::fs::read_to_string(replacement.root.join("src/token.rs")).unwrap(),
+            "pub fn token() -> usize { 1 }\n",
+        );
+        assert!(!replacement.root.join("private-scratch.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(author.root.join("src/token.rs")).unwrap(),
+            author_source,
+        );
+        assert_eq!(
+            fixture_git(&source.repository.root, &["branch", "--show-current"]),
+            original_branch,
         );
     }
 

@@ -131,6 +131,15 @@ completion, note counts, and unsaved or active state without exposing source
 buffers. `ReplayResumeReview(callback, review_id)` rechecks the selected
 snapshot, immutable source, and exact original scratch worktree before opening
 its guide. Reopening never creates a branch or discards unrelated dirty buffers.
+`ReplayRegenerateReview(callback, workspace_id)` rebuilds the current review's
+derived source presentation in a bounded background worker without changing its
+pinned source, scratch buffers, completion, notes, drafts, or receipts.
+`ReplayRestartReview(callback, workspace_id, preview_digest, confirmed)` first
+returns a content-pinned preview when `confirmed` is false. Only an explicitly
+confirmed request with the identical preview digest recreates the independently
+verified Replay scratch worktree and discards its local review generation. The
+original repository branch, author worktree, and published provider reviews are
+never removal targets. Uncertain review submissions must be reconciled first.
 `ReplayAddNote(callback, workspace_id, step_id, category, text)` validates and
 stores a reviewer observation against the exact original author commit and
 source hunk.

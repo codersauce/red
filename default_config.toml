@@ -310,6 +310,9 @@ Esc = { EnterMode = "Normal" }
 [keys.normal." "."R"]
 "?" = { PluginCommand = "ReplayHelp" }
 "g" = { PluginCommand = "Replay" }
+"A" = { PluginCommand = "ReplayReviewActions" }
+"R" = { PluginCommand = "ReplayRegenerate" }
+"D" = { PluginCommand = "ReplayRestart" }
 "[" = { PluginCommand = "ReplayPreviousFile" }
 "]" = { PluginCommand = "ReplayNextFile" }
 "n" = { PluginCommand = "ReplayNext" }

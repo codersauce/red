@@ -15,6 +15,24 @@ pub fn activate() {
         description: "Choose a GitHub pull request, local branch, or safe Replay demo",
         aliases: ["pr replay", "replay coach"],
     });
+    red::add_command("ReplayReviewActions", open_review_actions, Json {
+        title: "Manage the current PR review",
+        category: "PR Replay",
+        description: "Regenerate the review presentation or explicitly start the review over",
+        aliases: ["replay review actions", "manage pull request review"],
+    });
+    red::add_command("ReplayRegenerate", regenerate_review, Json {
+        title: "Regenerate the current PR review",
+        category: "PR Replay",
+        description: "Rebuild change explanations while preserving the exact PR, scratch edits, progress, and drafts",
+        aliases: ["refresh replay review", "regenerate replay steps"],
+    });
+    red::add_command("ReplayRestart", restart_review, Json {
+        title: "Start the current PR review over",
+        category: "PR Replay",
+        description: "Explicitly discard the local review and recreate only its isolated scratch worktree",
+        aliases: ["restart replay review", "discard replay review"],
+    });
     red::add_command("ReplayPR", open_pull_request, Json {
         title: "Replay a GitHub pull request",
         category: "PR Replay",
@@ -212,6 +230,7 @@ pub fn activate() {
     red::state_set("replay_review_picker", red::null());
     red::state_set("replay_review_request", -1);
     red::state_set("replay_resume_request", -1);
+    red::state_set("replay_restart_preview_digest", "");
     red::state_set("replay_workspace_id", "");
     red::state_set("replay_workspace_root", "");
     red::state_set("replay_source_buffer_index", -1);
@@ -426,6 +445,195 @@ fn review_resumed(result: Json, request_id: i32) {
         return;
     }
     active_session_restored(result);
+}
+
+fn open_review_actions() {
+    if !ensure_workspace() {
+        return;
+    }
+    if red::string(red::state("replay_source_kind"), "demo") == "demo" {
+        set_notice("Review actions are available for real pull requests and local branches.", "warning");
+        render();
+        return;
+    }
+    red::execute("OpenPicker", "Review actions", [
+        PickerItem {
+            id: "regenerate",
+            label: "Regenerate review · preserve progress, notes, and drafts",
+            data: Json {},
+        },
+        PickerItem {
+            id: "restart",
+            label: "Start review over… · discard local progress and scratch edits",
+            data: Json {},
+        },
+    ], PickerOptions {
+        presentation: "compact",
+        status: "Regenerate preserves your work · restart requires confirmation",
+    }, PickerHandlers {
+        selected: review_action_selected,
+        cancelled: review_action_cancelled,
+    });
+}
+
+fn review_action_selected(item: PickerItem) {
+    if item.id == "regenerate" {
+        regenerate_review();
+    } else if item.id == "restart" {
+        restart_review();
+    }
+}
+
+fn review_action_cancelled(event: PickerCancelled) {
+    red::execute("FocusPanel", "replay-coach");
+}
+
+fn regenerate_review() {
+    if !ensure_workspace() {
+        return;
+    }
+    if red::string(red::state("replay_source_kind"), "demo") == "demo" {
+        set_notice("The in-memory demo does not need source regeneration.", "warning");
+        render();
+        return;
+    }
+    red::execute("SetTextPanelStatus", "replay-coach", TextPanelStatus {
+        busy: true,
+        label: "Regenerating review…",
+        stream: false,
+    });
+    red::request(
+        "ReplayRegenerateReview",
+        review_regenerated,
+        red::string(red::state("replay_workspace_id"), "")
+    );
+}
+
+fn review_regenerated(result: Json) {
+    red::execute("SetTextPanelStatus", "replay-coach");
+    if !red::bool(result.ok, false) {
+        set_notice(source_error(result, "The existing review could not be regenerated."), "error");
+        render();
+        return;
+    }
+    let previous_steps = red::state("replay_steps");
+    let previous_index = red::int(red::state("replay_index"), 0);
+    let selected_id = "";
+    if previous_index >= 0 && previous_index < red::len(previous_steps) {
+        selected_id = red::string(previous_steps[previous_index].id, "");
+    }
+    let plan = result.plan;
+    red::state_set("replay_title", red::string(plan.title, ""));
+    red::state_set("replay_steps", plan.steps);
+    let index = 0;
+    let candidate = 0;
+    for step in plan.steps {
+        if red::string(step.id, "") == selected_id {
+            index = candidate;
+        }
+        candidate = candidate + 1;
+    }
+    red::state_set("replay_index", index);
+    if result.notes != red::null() {
+        red::state_set("replay_notes", result.notes);
+    }
+    if result.completions != red::null() {
+        red::state_set("replay_completions", result.completions);
+    }
+    if result.drafts != red::null() {
+        red::state_set("replay_drafts", result.drafts);
+    }
+    if result.receipts != red::null() {
+        red::state_set("replay_receipts", result.receipts);
+    }
+    set_notice("Review regenerated · progress, scratch edits, notes, and drafts preserved.", "success");
+    red::state_set("replay_view", "guide");
+    render();
+    sync_selected_source();
+}
+
+fn restart_review() {
+    if !ensure_workspace() {
+        return;
+    }
+    if red::string(red::state("replay_source_kind"), "demo") == "demo" {
+        set_notice("The safe in-memory demo does not own a review worktree.", "warning");
+        render();
+        return;
+    }
+    red::request(
+        "ReplayRestartReview",
+        restart_previewed,
+        red::string(red::state("replay_workspace_id"), ""),
+        "",
+        false
+    );
+}
+
+fn restart_previewed(preview: Json) {
+    if !red::bool(preview.ok, false) {
+        set_notice(source_error(preview, "This review cannot be safely restarted."), "error");
+        render();
+        return;
+    }
+    red::state_set("replay_restart_preview_digest", red::string(preview.preview_digest, ""));
+    let title = "Start review over?";
+    if red::int(preview.pull_request, 0) > 0 {
+        title = "Start PR #" + red::int(preview.pull_request, 0) + " over?";
+    }
+    let message = "This will permanently discard:\n\n"
+        + "  • Review progress: " + red::int(preview.reviewed_steps, 0)
+        + " / " + red::int(preview.total_steps, 0) + " changes\n"
+        + "  • Private notes: " + red::int(preview.note_count, 0) + "\n"
+        + "  • Local review drafts: " + red::int(preview.draft_count, 0) + "\n"
+        + "  • Unsaved scratch buffers: " + red::int(preview.dirty_buffers, 0) + "\n\n"
+        + "The isolated scratch worktree will be recreated from the original merge base. "
+        + "Your original PR branch, author worktree, and published GitHub comments remain untouched.";
+    red::execute("OpenConfirm", title, message, PickerHandlers {
+        selected: restart_confirmed,
+        cancelled: restart_cancelled,
+    });
+}
+
+fn restart_confirmed(item: PickerItem) {
+    if item.id != "accept" {
+        red::state_set("replay_restart_preview_digest", "");
+        red::execute("FocusPanel", "replay-coach");
+        return;
+    }
+    red::execute("SetTextPanelStatus", "replay-coach", TextPanelStatus {
+        busy: true,
+        label: "Restarting review…",
+        stream: false,
+    });
+    red::request(
+        "ReplayRestartReview",
+        review_restarted,
+        red::string(red::state("replay_workspace_id"), ""),
+        red::string(red::state("replay_restart_preview_digest"), ""),
+        true
+    );
+}
+
+fn restart_cancelled(event: PickerCancelled) {
+    red::state_set("replay_restart_preview_digest", "");
+    red::execute("FocusPanel", "replay-coach");
+}
+
+fn review_restarted(result: Json) {
+    red::execute("SetTextPanelStatus", "replay-coach");
+    red::state_set("replay_restart_preview_digest", "");
+    if !red::bool(result.ok, false) {
+        set_notice(source_error(result, "The review could not be restarted safely."), "error");
+        render();
+        return;
+    }
+    if !load_plan(result.plan) {
+        return;
+    }
+    workspace_opened(result);
+    set_notice("Started the review over · previous progress and private drafts were discarded.", "success");
+    render();
 }
 
 fn review_picker_cancelled(event: PickerCancelled) {
@@ -991,6 +1199,12 @@ fn panel_event(event: Json) {
         validate();
     } else if action == "?" {
         toggle_help();
+    } else if action == "A" || action == "review_actions" {
+        open_review_actions();
+    } else if action == "R" || action == "refresh" || action == "regenerate" {
+        regenerate_review();
+    } else if action == "D" || action == "restart" {
+        restart_review();
     } else if action == "m" {
         toggle_mode();
     } else if action == "o" {
@@ -1303,6 +1517,11 @@ fn toggle_help() {
         PickerItem {
             id: "save",
             label: "NOTES S / L           save / load review",
+            data: Json {},
+        },
+        PickerItem {
+            id: "review-actions",
+            label: "REVIEW A · R / D      actions / regenerate / restart",
             data: Json {},
         },
         PickerItem {

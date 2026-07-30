@@ -422,8 +422,22 @@ pub struct ReplayRecoverySnapshot {
     pub active_session: Option<String>,
     /// All editor-owned source-linked reviewer sessions.
     pub sessions: Vec<ReplaySession>,
+    /// Previously discarded review generations that must never be recovered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discarded_sessions: Vec<ReplayDiscardedSession>,
     /// Monotonic replay state generation.
     pub generation: u64,
+}
+
+/// Durable proof that one explicitly discarded review may not be resurrected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayDiscardedSession {
+    /// Exact editor-owned review identity that the reviewer discarded.
+    pub id: String,
+    /// Exact original Replay-owned scratch worktree.
+    pub workspace_root: PathBuf,
+    /// Unix-millisecond time after which legacy recovery is obsolete.
+    pub discarded_at_ms: u64,
 }
 
 /// Single-editor owner of source handles, review sessions, and staged edits.
@@ -435,6 +449,7 @@ pub struct ReplayController {
     workspaces: HashMap<String, ReplayWorkspace>,
     author_workspaces: HashMap<String, ReplayAuthorWorkspace>,
     sessions: HashMap<String, ReplaySession>,
+    discarded_sessions: Vec<ReplayDiscardedSession>,
     staged: HashMap<String, ReplayStage>,
     active_session: Option<String>,
     generation: u64,
@@ -457,6 +472,7 @@ impl ReplayController {
             workspaces: HashMap::new(),
             author_workspaces: HashMap::new(),
             sessions: HashMap::new(),
+            discarded_sessions: Vec::new(),
             staged: HashMap::new(),
             active_session: None,
             generation: 0,
@@ -622,6 +638,50 @@ impl ReplayController {
         self.active_session = Some(id.clone());
         self.advance_generation();
         self.session(&id)
+    }
+
+    /// Permanently discards one explicitly confirmed review without touching Git.
+    ///
+    /// The pinned source and any separately authorized original-author worktree
+    /// remain available for a replacement session. A durable tombstone stops
+    /// older editor-owner snapshots from resurrecting the discarded generation.
+    pub fn discard_session(&mut self, session_id: &str) -> Result<ReplaySession, ReplayError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| missing("replay session", session_id))?;
+        if session.review.pending_submission.is_some() {
+            return Err(ReplayError::ReviewSubmissionUncertain(
+                "reconcile the confirmed GitHub review before discarding its local state"
+                    .to_string(),
+            ));
+        }
+        let session = self
+            .sessions
+            .remove(session_id)
+            .ok_or_else(|| missing("replay session", session_id))?;
+        self.sources
+            .entry(session.source.id.clone())
+            .or_insert_with(|| session.source.clone());
+        self.workspaces
+            .entry(session.source.id.clone())
+            .or_insert_with(|| session.workspace.clone());
+        self.staged
+            .retain(|_, stage| stage.session_id != session_id);
+        self.discarded_sessions.push(ReplayDiscardedSession {
+            id: session.id.clone(),
+            workspace_root: session.workspace.root.clone(),
+            discarded_at_ms: now_ms(),
+        });
+        if self.discarded_sessions.len() > self.limits.max_steps {
+            let excess = self.discarded_sessions.len() - self.limits.max_steps;
+            self.discarded_sessions.drain(..excess);
+        }
+        if self.active_session.as_deref() == Some(session_id) {
+            self.active_session = None;
+        }
+        self.advance_generation();
+        Ok(session)
     }
 
     /// Attaches an already verified, editor-owned source session.
@@ -1134,11 +1194,14 @@ impl ReplayController {
     /// Returns recoverable source and reviewer state, excluding one-shot tokens.
     #[must_use]
     pub fn recovery_snapshot(&self) -> Option<ReplayRecoverySnapshot> {
-        (!self.sessions.is_empty()).then(|| ReplayRecoverySnapshot {
-            version: 1,
-            active_session: self.active_session.clone(),
-            sessions: self.sessions().into_iter().cloned().collect(),
-            generation: self.generation,
+        (!self.sessions.is_empty() || !self.discarded_sessions.is_empty()).then(|| {
+            ReplayRecoverySnapshot {
+                version: 1,
+                active_session: self.active_session.clone(),
+                sessions: self.sessions().into_iter().cloned().collect(),
+                discarded_sessions: self.discarded_sessions.clone(),
+                generation: self.generation,
+            }
         })
     }
 
@@ -1159,6 +1222,23 @@ impl ReplayController {
             }
             validate_recovered_session(session, self.limits)?;
         }
+        if snapshot.discarded_sessions.len() > self.limits.max_steps {
+            return Err(ReplayError::InvalidMetadata(
+                "replay recovery contains too many discarded reviews".to_string(),
+            ));
+        }
+        let mut discarded_ids = HashSet::with_capacity(snapshot.discarded_sessions.len());
+        for discarded in &snapshot.discarded_sessions {
+            if discarded.id.is_empty()
+                || !discarded.workspace_root.is_absolute()
+                || !discarded_ids.insert(discarded.id.as_str())
+                || session_ids.contains(discarded.id.as_str())
+            {
+                return Err(ReplayError::InvalidMetadata(
+                    "replay recovery contains an invalid discarded review".to_string(),
+                ));
+            }
+        }
         if snapshot
             .active_session
             .as_deref()
@@ -1173,6 +1253,7 @@ impl ReplayController {
         self.sessions.clear();
         self.sources.clear();
         self.workspaces.clear();
+        self.discarded_sessions = snapshot.discarded_sessions.clone();
         let mut recovered_in_flight = false;
         for session in &snapshot.sessions {
             self.sources
@@ -2127,6 +2208,62 @@ mod tests {
             .create_session(&source_id)
             .expect("create a session from the editor-owned pinned source");
         assert_eq!(session.workspace, workspace);
+    }
+
+    #[test]
+    fn discarded_review_generations_remain_blocked_after_recovery() {
+        let (mut controller, session_id, step_id) = controller_with_session();
+        let source_id = controller
+            .session(&session_id)
+            .expect("retain the original review")
+            .source
+            .id
+            .clone();
+        controller
+            .add_note(
+                &session_id,
+                Some(&step_id),
+                ReplayNoteCategory::Observation,
+                "discard this private review note",
+            )
+            .expect("record private review progress before confirmation");
+
+        let discarded = controller
+            .discard_session(&session_id)
+            .expect("discard the explicitly confirmed original session");
+        assert_eq!(discarded.notes.len(), 1);
+        assert!(controller.session(&session_id).is_err());
+        assert!(controller.active_session().is_none());
+
+        let replacement = controller
+            .create_session(&source_id)
+            .expect("rebuild the exact same pinned original review")
+            .clone();
+        assert_ne!(replacement.id, session_id);
+        assert_eq!(replacement.steps[0].id, step_id);
+        assert!(replacement.notes.is_empty());
+        assert!(replacement.review.drafts.is_empty());
+
+        let snapshot = controller
+            .recovery_snapshot()
+            .expect("persist both the replacement and discarded generation");
+        assert_eq!(snapshot.discarded_sessions.len(), 1);
+        assert_eq!(snapshot.discarded_sessions[0].id, session_id);
+
+        let mut recovered = ReplayController::default();
+        recovered
+            .restore(&snapshot)
+            .expect("restore only the fresh review and the durable discard marker");
+        assert!(recovered.session(&session_id).is_err());
+        assert!(recovered.session(&replacement.id).is_ok());
+        assert_eq!(
+            recovered
+                .recovery_snapshot()
+                .expect("retain discarded-review protection")
+                .discarded_sessions[0]
+                .id,
+            session_id,
+        );
     }
 
     #[test]

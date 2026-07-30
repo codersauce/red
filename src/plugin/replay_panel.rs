@@ -2809,6 +2809,12 @@ fn replay_actions(model: &ReplayPanelModel, width: usize) -> Vec<UiAction> {
     }
 
     actions.push(
+        UiAction::new("review_actions", "A", "Review")
+            .with_priority(ActionPriority::Secondary)
+            .with_compact_label("Review"),
+    );
+
+    actions.push(
         UiAction::new("zoom", "z", "Zoom")
             .with_priority(if width >= 75 {
                 ActionPriority::Essential

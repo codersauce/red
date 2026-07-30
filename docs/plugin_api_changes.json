@@ -4,7 +4,7 @@
     {
       "version": "0.5.1",
       "kind": "introduced",
-      "symbols": ["ReplayValidateStep", "ReplayApplyStep", "ReplayResolvePullRequest", "ReplayResolveLocalBranch", "ReplayFetchPullRequestObjects", "ReplayCreateWorkspace", "ReplayFocusStepSource", "ReplayActiveSession", "ReplayListReviews", "ReplayResumeReview", "ReplayAddNote", "ReplayAddDraft", "ReplayUpdateDraft", "ReplayRemoveDraft", "ReplayPreviewSubmission", "ReplaySubmitReview", "ReplayReconcileReview", "ReplaySaveReview", "ReplayPreviewReview", "ReplayLoadReview", "ReplaySetMode"],
+      "symbols": ["ReplayValidateStep", "ReplayApplyStep", "ReplayResolvePullRequest", "ReplayResolveLocalBranch", "ReplayFetchPullRequestObjects", "ReplayCreateWorkspace", "ReplayFocusStepSource", "ReplayActiveSession", "ReplayListReviews", "ReplayResumeReview", "ReplayRegenerateReview", "ReplayRestartReview", "ReplayAddNote", "ReplayAddDraft", "ReplayUpdateDraft", "ReplayRemoveDraft", "ReplayPreviewSubmission", "ReplaySubmitReview", "ReplayReconcileReview", "ReplaySaveReview", "ReplayPreviewReview", "ReplayLoadReview", "ReplaySetMode"],
       "migration_note": "docs/PLUGIN_API.md#source-backed-pull-request-replay"
     },
     {

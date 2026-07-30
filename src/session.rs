@@ -1,7 +1,7 @@
 //! Crash-safe, core-owned editor session snapshots.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::{self, Read as _, Write as _},
     path::{Path, PathBuf},
@@ -481,10 +481,29 @@ impl SessionStore {
 
         let mut reviews = HashMap::new();
         let mut repositories = HashMap::new();
+        let mut discarded_sessions = HashSet::new();
+        let mut discarded_workspaces = HashMap::new();
         for store in stores {
             let Ok(snapshot) = store.load() else {
                 continue;
             };
+            if let Some(recovery) = &snapshot.replay {
+                for discarded in &recovery.controller.discarded_sessions {
+                    discarded_sessions.insert(discarded.id.clone());
+                    discarded_workspaces
+                        .entry(discarded.workspace_root.clone())
+                        .and_modify(|previous: &mut u64| {
+                            *previous = (*previous).max(discarded.discarded_at_ms);
+                        })
+                        .or_insert(discarded.discarded_at_ms);
+                    reviews.retain(|_, review: &mut SessionReplayReview| {
+                        review.session_id.as_deref() != Some(discarded.id.as_str())
+                            && !(review.legacy
+                                && review.workspace_root == discarded.workspace_root
+                                && review.last_activity_ms <= discarded.discarded_at_ms)
+                    });
+                }
+            }
             let owner = store
                 .namespace_root
                 .as_ref()
@@ -497,6 +516,8 @@ impl SessionStore {
                 active_workspace,
                 &mut reviews,
                 &mut repositories,
+                &discarded_sessions,
+                &discarded_workspaces,
             );
         }
 
@@ -2304,9 +2325,14 @@ fn collect_snapshot_replay_reviews(
     active_workspace: Option<&Path>,
     reviews: &mut HashMap<String, SessionReplayReview>,
     repositories: &mut HashMap<PathBuf, Option<crate::replay::ReplayRepository>>,
+    discarded_sessions: &HashSet<String>,
+    discarded_workspaces: &HashMap<PathBuf, u64>,
 ) {
     if let Some(recovery) = &snapshot.replay {
         let has_unseen_review = recovery.controller.sessions.iter().any(|session| {
+            if discarded_sessions.contains(&session.id) {
+                return false;
+            }
             let id = replay_workspace_review_id(&session.workspace.root);
             let active = active_workspace
                 .is_some_and(|workspace| workspace == session.workspace.root.as_path());
@@ -2320,6 +2346,9 @@ fn collect_snapshot_replay_reviews(
         let mut controller = crate::replay::ReplayController::default();
         if has_unseen_review && controller.restore(&recovery.controller).is_ok() {
             for session in controller.sessions() {
+                if discarded_sessions.contains(&session.id) {
+                    continue;
+                }
                 let id = replay_workspace_review_id(&session.workspace.root);
                 let active = active_workspace
                     .is_some_and(|workspace| workspace == session.workspace.root.as_path());
@@ -2409,6 +2438,12 @@ fn collect_snapshot_replay_reviews(
         else {
             continue;
         };
+        if discarded_workspaces
+            .get(&workspace_root)
+            .is_some_and(|discarded_at| snapshot.saved_at_ms <= *discarded_at)
+        {
+            continue;
+        }
         let id = replay_workspace_review_id(&workspace_root);
         let active = active_workspace.is_some_and(|workspace| workspace == workspace_root);
         if !replay_review_should_replace(
@@ -2856,6 +2891,70 @@ mod tests {
     }
 
     #[test]
+    fn discarded_replay_snapshots_never_resurrect_an_older_review_generation() {
+        let (directory, mut original, workspace) =
+            recoverable_replay_snapshot("discarded-repository");
+        let root = directory.path().join("sessions");
+        original.saved_at_ms = 10;
+        SessionStore::for_owner(&root, "editor-original")
+            .unwrap()
+            .write(&mut original)
+            .unwrap();
+
+        let recovery = original.replay.as_ref().unwrap();
+        let original_id = recovery.controller.sessions[0].id.clone();
+        let source_id = recovery.controller.sessions[0].source.id.clone();
+        let mut controller = crate::replay::ReplayController::default();
+        controller
+            .restore(&recovery.controller)
+            .expect("load the original source-backed review");
+        controller
+            .discard_session(&original_id)
+            .expect("persist the explicitly discarded review identity");
+
+        let mut discarded = original.clone();
+        discarded.saved_at_ms =
+            controller.recovery_snapshot().unwrap().discarded_sessions[0].discarded_at_ms;
+        discarded.replay.as_mut().unwrap().controller = controller
+            .recovery_snapshot()
+            .expect("retain the discard marker even without an active review");
+        SessionStore::for_owner(&root, "editor-discarded")
+            .unwrap()
+            .write(&mut discarded)
+            .unwrap();
+
+        assert!(
+            SessionStore::list_replay_reviews(&root, /*active_workspace*/ None)
+                .expect("older owner snapshots must not resurrect a discarded review")
+                .is_empty()
+        );
+
+        let replacement_id = controller
+            .create_session(&source_id)
+            .expect("open a fresh review against the same pinned scratch workspace")
+            .id
+            .clone();
+        let mut replacement = original.clone();
+        replacement.saved_at_ms = discarded.saved_at_ms.saturating_add(1);
+        replacement.replay.as_mut().unwrap().controller = controller
+            .recovery_snapshot()
+            .expect("save the replacement session beside its old-generation tombstone");
+        SessionStore::for_owner(&root, "editor-replacement")
+            .unwrap()
+            .write(&mut replacement)
+            .unwrap();
+
+        let reviews = SessionStore::list_replay_reviews(&root, Some(&workspace.root))
+            .expect("discover only the replacement session");
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(
+            reviews[0].session_id.as_deref(),
+            Some(replacement_id.as_str())
+        );
+        assert_ne!(reviews[0].session_id.as_deref(), Some(original_id.as_str()));
+    }
+
+    #[test]
     fn superseded_replay_snapshots_skip_controller_and_repository_discovery() {
         let (_directory, mut newest, workspace) =
             recoverable_replay_snapshot("superseded-repository");
@@ -2871,6 +2970,8 @@ mod tests {
             Some(&workspace.root),
             &mut reviews,
             &mut repositories,
+            &HashSet::new(),
+            &HashMap::new(),
         );
         assert_eq!(reviews.len(), 1);
         assert_eq!(repositories.len(), 1);
@@ -2882,6 +2983,8 @@ mod tests {
             Some(&workspace.root),
             &mut reviews,
             &mut repositories,
+            &HashSet::new(),
+            &HashMap::new(),
         );
 
         assert!(
@@ -2907,6 +3010,8 @@ mod tests {
             Some(&workspace.root),
             &mut reviews,
             &mut repositories,
+            &HashSet::new(),
+            &HashMap::new(),
         );
         collect_snapshot_replay_reviews(
             &newer,
@@ -2914,6 +3019,8 @@ mod tests {
             Some(&workspace.root),
             &mut reviews,
             &mut repositories,
+            &HashSet::new(),
+            &HashMap::new(),
         );
 
         assert_eq!(repositories.len(), 1);

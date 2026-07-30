@@ -85,6 +85,29 @@ can also restore its missing scratch worktree. It reuses the branch only when
 the branch still points to the exact verified merge base; an unrelated or
 modified branch is never reset or overwritten.
 
+### Regenerate or restart an existing review
+
+Press `A` in the focused Replay guide or `Space R A` to open **Review actions**.
+The two actions deliberately have different safety boundaries:
+
+- **Regenerate review**, also available as `R`, `Space R R`, or
+  `:ReplayRegenerate`, rebuilds the current change titles, explanations, and
+  source presentation from the exact pinned original PR. It preserves the
+  scratch worktree and edits, selected change, completion progress, private
+  notes, drafts, and submission receipts. No GitHub fetch or branch operation
+  occurs.
+- **Start review over…**, also available as `D`, `Space R D`, or
+  `:ReplayRestart`, first previews the exact local progress, notes, drafts, and
+  unsaved scratch buffers that will be discarded. Only after explicit
+  confirmation does Red remove and recreate the independently verified
+  Replay-owned scratch worktree at the original merge base and open a new review
+  session. The original PR branch, separately authorized author worktree, and
+  comments already published to GitHub remain untouched. Previously discarded
+  review generations cannot reappear through older editor snapshots.
+
+If a previously approved GitHub submission has an uncertain provider result,
+resolve that submission before restarting its local review.
+
 Replay initially places its dedicated coach panel on the left and the editable
 scratch source on the right, matching the pull-request replay mockup. The
 coach is rendered by Red's panel system; it is not a Markdown file, a scratch
@@ -374,6 +397,9 @@ unchanged.
 | --- | --- |
 | `Space R ?` | Open the Replay keyboard-help popup. |
 | `Space R g` | Reopen the current review or choose among existing reviews. |
+| `Space R A` | Open the current review's regeneration and restart actions. |
+| `Space R R` | Regenerate presentation without changing scratch work or progress. |
+| `Space R D` | Preview and explicitly confirm starting the review over. |
 | `Space R [` | Jump to the first change in the previous file. |
 | `Space R ]` | Jump to the first change in the next file. |
 | `Space R n` | Next reconstruction step. |

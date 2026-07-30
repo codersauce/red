@@ -844,6 +844,16 @@ pub enum PluginRequest {
         request_id: RequestId,
         review_id: String,
     },
+    ReplayRegenerateReview {
+        request_id: RequestId,
+        workspace_id: String,
+    },
+    ReplayRestartReview {
+        request_id: RequestId,
+        workspace_id: String,
+        preview_digest: String,
+        confirmed: bool,
+    },
     ReplayAddNote {
         request_id: RequestId,
         workspace_id: String,
@@ -1154,6 +1164,24 @@ pub enum ReplayBackgroundResult {
         /// Newly created or safely resumed original scratch worktree.
         workspace: Box<crate::replay::ReplayWorkspace>,
     },
+    /// Fresh presentation compiled from the unchanged pinned review source.
+    RegeneratedReview {
+        /// Exact review whose source-backed presentation was recomputed.
+        workspace_id: String,
+        /// Session generation observed before read-only compilation.
+        generation: u64,
+        /// Complete editor-owned presentation with unchanged hunk identities.
+        plan: Box<crate::replay::ReplayDemoPlan>,
+    },
+    /// Confirmed replacement of one verified, Replay-owned scratch worktree.
+    RestartedWorkspace {
+        /// Review generation that must be discarded before replacement.
+        workspace_id: String,
+        /// Original pinned source retained by the editor.
+        source_id: String,
+        /// Newly recreated scratch worktree at the exact original merge base.
+        workspace: Box<crate::replay::ReplayWorkspace>,
+    },
     /// Separately confirmed real PR-head worktree and editor-owned source file.
     AuthorWorkspace {
         /// Existing merge-base Replay session that requested original PR code.
@@ -1286,6 +1314,8 @@ impl PluginRequest {
             Self::ReplayActiveSession { .. } => "ReplayActiveSession",
             Self::ReplayListReviews { .. } => "ReplayListReviews",
             Self::ReplayResumeReview { .. } => "ReplayResumeReview",
+            Self::ReplayRegenerateReview { .. } => "ReplayRegenerateReview",
+            Self::ReplayRestartReview { .. } => "ReplayRestartReview",
             Self::ReplayAddNote { .. } => "ReplayAddNote",
             Self::ReplayAddDraft { .. } => "ReplayAddDraft",
             Self::ReplayAcceptAgentDraft { .. } => "ReplayAcceptAgentDraft",
@@ -4454,6 +4484,157 @@ impl Editor {
             "completions": completions,
             "plan": presentation,
         })
+    }
+
+    fn replay_restart_preview(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Value, crate::replay::ReplayError> {
+        let session = self.replay_controller.session(workspace_id)?;
+        if session.review.pending_submission.is_some() {
+            return Err(crate::replay::ReplayError::ReviewSubmissionUncertain(
+                "reconcile the confirmed GitHub review before starting this review over"
+                    .to_string(),
+            ));
+        }
+        let workspace = self
+            .replay_demo_workspace
+            .as_ref()
+            .filter(|workspace| workspace.id == workspace_id)
+            .ok_or_else(|| crate::replay::ReplayError::NotFound {
+                kind: "active replay scratch workspace",
+                id: workspace_id.to_string(),
+            })?;
+        let dirty_buffers =
+            self.buffer_manager
+                .iter()
+                .filter(|buffer| {
+                    buffer.dirty
+                        && buffer.file.as_deref().is_some_and(|path| {
+                            Path::new(path).starts_with(&session.workspace.root)
+                        })
+                })
+                .count();
+        let mut preview = json!({
+            "ok": true,
+            "workspace_id": workspace_id,
+            "workspace_root": session.workspace.root,
+            "workspace_branch": session.workspace.branch,
+            "pull_request": session
+                .source
+                .pull_request
+                .as_ref()
+                .map_or(0, |request| request.number),
+            "title": workspace.plan.title,
+            "reviewed_steps": session
+                .steps
+                .iter()
+                .filter(|step| step.completion.is_some())
+                .count(),
+            "total_steps": session.steps.len(),
+            "note_count": session.notes.len(),
+            "draft_count": session.review.drafts.len(),
+            "receipt_count": session.review.receipts.len(),
+            "dirty_buffers": dirty_buffers,
+            "generation": session.generation,
+        });
+        let encoded = serde_json::to_vec(&preview).map_err(|error| {
+            crate::replay::ReplayError::InvalidMetadata(format!(
+                "could not verify the Replay restart preview: {error}"
+            ))
+        })?;
+        preview["preview_digest"] = json!(crate::replay::digest(&encoded));
+        Ok(preview)
+    }
+
+    fn install_regenerated_replay_plan(
+        &mut self,
+        workspace_id: &str,
+        generation: u64,
+        plan: crate::replay::ReplayDemoPlan,
+    ) -> Result<Value, crate::replay::ReplayError> {
+        let session = self.replay_controller.session(workspace_id)?;
+        if session.generation != generation
+            || plan.steps.len() != session.steps.len()
+            || plan
+                .steps
+                .iter()
+                .zip(&session.steps)
+                .any(|(generated, original)| {
+                    generated.id != original.id || generated.path != original.path.to_string_lossy()
+                })
+        {
+            return Err(crate::replay::ReplayError::StalePreview);
+        }
+        let workspace = self
+            .replay_demo_workspace
+            .as_mut()
+            .filter(|workspace| workspace.id == workspace_id)
+            .ok_or_else(|| crate::replay::ReplayError::NotFound {
+                kind: "active replay scratch workspace",
+                id: workspace_id.to_string(),
+            })?;
+        workspace.plan = plan;
+        Ok(self.active_replay_session_payload())
+    }
+
+    async fn install_restarted_replay_workspace(
+        &mut self,
+        workspace_id: &str,
+        source_id: &str,
+        workspace: crate::replay::ReplayWorkspace,
+        render_buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<Value> {
+        let previous = self.replay_controller.session(workspace_id)?.clone();
+        anyhow::ensure!(
+            previous.source.id == source_id
+                && previous.workspace.root == workspace.root
+                && previous.workspace.branch == workspace.branch
+                && previous.workspace.base_commit == workspace.base_commit,
+            "the restarted scratch worktree no longer matches its original review"
+        );
+
+        let removed_buffers = self
+            .buffer_manager
+            .iter()
+            .filter(|buffer| {
+                buffer
+                    .file
+                    .as_deref()
+                    .is_some_and(|path| Path::new(path).starts_with(&previous.workspace.root))
+            })
+            .map(Buffer::id)
+            .collect::<Vec<_>>();
+        for id in removed_buffers {
+            let Some(index) = self
+                .buffer_manager
+                .iter()
+                .position(|buffer| buffer.id() == id)
+            else {
+                continue;
+            };
+            self.set_current_replay_source_buffer(render_buffer, index)
+                .await?;
+            self.delete_current_buffer(render_buffer, /*force*/ true)
+                .await?;
+        }
+
+        self.replay_controller.discard_session(workspace_id)?;
+        self.replay_reviews
+            .retain(|_, review| review.session_id.as_deref() != Some(workspace_id));
+        self.replay_demo_workspace = None;
+        let payload = self
+            .install_prepared_replay_source_workspace(source_id, workspace, render_buffer)
+            .await?;
+        if self.session_manager.store().is_some() {
+            self.persist_session_snapshot(/*force*/ true);
+            if self.session_manager.warning().is_some() {
+                anyhow::bail!(
+                    "the replacement review could not be durably saved; its discarded predecessor remains blocked in memory"
+                );
+            }
+        }
+        Ok(payload)
     }
 
     fn live_replay_reviews(&self) -> Vec<SessionReplayReview> {
@@ -9817,6 +9998,79 @@ impl Editor {
                             .await?;
                     }
                 }
+                PluginRequest::ReplayRegenerateReview {
+                    request_id,
+                    workspace_id,
+                } => {
+                    let session = self.replay_controller.session(&workspace_id).cloned();
+                    let started = session.and_then(|session| {
+                        let workspace = self
+                            .replay_demo_workspace
+                            .as_ref()
+                            .filter(|workspace| workspace.id == workspace_id)
+                            .ok_or_else(|| crate::replay::ReplayError::NotFound {
+                                kind: "active replay scratch workspace",
+                                id: workspace_id.clone(),
+                            })?;
+                        let branch = workspace.plan.branch.clone();
+                        let generation = session.generation;
+                        let limits = self.replay_controller.limits();
+                        self.spawn_replay_background(request_id, "regenerate", move || {
+                            let plan =
+                                crate::replay::replay_plan_from_session(&session, &branch, limits)?;
+                            Ok(ReplayBackgroundResult::RegeneratedReview {
+                                workspace_id,
+                                generation,
+                                plan: Box::new(plan),
+                            })
+                        })
+                    });
+                    if let Err(error) = started {
+                        self.plugin_registry
+                            .resolve_request(runtime, request_id, error.payload())
+                            .await?;
+                    }
+                }
+                PluginRequest::ReplayRestartReview {
+                    request_id,
+                    workspace_id,
+                    preview_digest,
+                    confirmed,
+                } => {
+                    let result = self.replay_restart_preview(&workspace_id);
+                    if !confirmed {
+                        let payload = result.unwrap_or_else(|error| error.payload());
+                        self.plugin_registry
+                            .resolve_request(runtime, request_id, payload)
+                            .await?;
+                        continue;
+                    }
+                    let started = result.and_then(|preview| {
+                        if preview["preview_digest"].as_str() != Some(preview_digest.as_str()) {
+                            return Err(crate::replay::ReplayError::StalePreview);
+                        }
+                        let source = self
+                            .replay_controller
+                            .session(&workspace_id)?
+                            .source
+                            .clone();
+                        let source_id = source.id.clone();
+                        self.spawn_replay_background(request_id, "restart", move || {
+                            let workspace =
+                                crate::replay::restart_workspace(&source, /*confirmed*/ true)?;
+                            Ok(ReplayBackgroundResult::RestartedWorkspace {
+                                workspace_id,
+                                source_id,
+                                workspace: Box::new(workspace),
+                            })
+                        })
+                    });
+                    if let Err(error) = started {
+                        self.plugin_registry
+                            .resolve_request(runtime, request_id, error.payload())
+                            .await?;
+                    }
+                }
                 PluginRequest::ReplayAddNote {
                     request_id,
                     workspace_id,
@@ -10435,6 +10689,40 @@ impl Editor {
                         }) => match self
                             .install_prepared_replay_source_workspace(
                                 &source_id, *workspace, buffer,
+                            )
+                            .await
+                        {
+                            Ok(payload) => {
+                                needs_render = true;
+                                payload
+                            }
+                            Err(error) => json!({ "ok": false, "error": error.to_string() }),
+                        },
+                        Ok(ReplayBackgroundResult::RegeneratedReview {
+                            workspace_id,
+                            generation,
+                            plan,
+                        }) => match self.install_regenerated_replay_plan(
+                            &workspace_id,
+                            generation,
+                            *plan,
+                        ) {
+                            Ok(payload) => {
+                                needs_render = true;
+                                payload
+                            }
+                            Err(error) => error.payload(),
+                        },
+                        Ok(ReplayBackgroundResult::RestartedWorkspace {
+                            workspace_id,
+                            source_id,
+                            workspace,
+                        }) => match self
+                            .install_restarted_replay_workspace(
+                                &workspace_id,
+                                &source_id,
+                                *workspace,
+                                buffer,
                             )
                             .await
                         {
@@ -26212,6 +26500,187 @@ mod test {
         assert!(!inactive.replay_review_is_active(&review));
         assert!(inactive.replay_controller.active_session().is_none());
         assert!(!inactive.replay_review_is_active(&legacy));
+    }
+
+    #[tokio::test]
+    async fn regenerating_replay_keeps_scratch_progress_findings_and_drafts() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let (_directory, session, workspace) = real_replay_session_fixture();
+        let workspace_id = session.id.clone();
+        let first_id = session.steps[0].id.clone();
+        let second_id = session.steps[1].id.clone();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        editor
+            .install_replay_source_session(session, "feature/replay", workspace, &mut render_buffer)
+            .await
+            .expect("open the pinned original source-backed review");
+        editor
+            .replay_controller
+            .complete_step(
+                &workspace_id,
+                &first_id,
+                crate::replay::ReplayCompletion::Automatic,
+            )
+            .expect("retain the existing review progress");
+        editor
+            .replay_controller
+            .add_note(
+                &workspace_id,
+                Some(&second_id),
+                crate::replay::ReplayNoteCategory::Observation,
+                "Keep the private original-source finding.",
+            )
+            .expect("retain an existing reviewer finding");
+        editor
+            .replay_controller
+            .add_review_draft(
+                &workspace_id,
+                Some(&second_id),
+                crate::replay::ReplayReviewDraftKind::InlineComment,
+                "Keep this unsubmitted original-source draft.",
+            )
+            .expect("retain the existing local review draft");
+        assert!(editor.focus_replay_step_source(&workspace_id, &second_id));
+        let scratch_buffer = editor.current_buffer().id();
+        let scratch_contents = editor.current_buffer().contents();
+        let session = editor
+            .replay_controller
+            .session(&workspace_id)
+            .unwrap()
+            .clone();
+        let generation = session.generation;
+        editor.replay_demo_workspace.as_mut().unwrap().plan.steps[1].title =
+            "Obsolete cached title".to_string();
+        let regenerated = crate::replay::replay_plan_from_session(
+            &session,
+            "feature/replay",
+            crate::replay::ReplayLimits::default(),
+        )
+        .expect("recompute the exact pinned original review presentation");
+
+        let refreshed = editor
+            .install_regenerated_replay_plan(&workspace_id, generation, regenerated)
+            .expect("replace only the derived cached review presentation");
+
+        assert_eq!(refreshed["workspace_id"], workspace_id);
+        assert_eq!(refreshed["index"], 1);
+        assert_eq!(refreshed["notes"].as_array().unwrap().len(), 1);
+        assert_eq!(refreshed["drafts"].as_array().unwrap().len(), 1);
+        assert_eq!(refreshed["completions"].as_array().unwrap().len(), 1);
+        assert_ne!(
+            refreshed["plan"]["steps"][1]["title"],
+            "Obsolete cached title"
+        );
+        assert_eq!(editor.current_buffer().id(), scratch_buffer);
+        assert_eq!(editor.current_buffer().contents(), scratch_contents);
+    }
+
+    #[tokio::test]
+    async fn restarting_replay_discards_only_learning_state_and_preserves_author_worktree() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let (_directory, session, scratch, author) = real_author_replay_session_fixture();
+        let original_id = session.id.clone();
+        let source_id = session.source.id.clone();
+        let step_id = session.steps[0].id.clone();
+        let source = session.source.clone();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        editor
+            .install_replay_source_session(
+                session,
+                "feature/original-pr",
+                scratch.clone(),
+                &mut render_buffer,
+            )
+            .await
+            .expect("open the original learning review");
+        editor
+            .replay_controller
+            .adopt_author_workspace(&original_id, author.clone())
+            .expect("retain the independently confirmed original-author worktree");
+        editor
+            .replay_controller
+            .add_note(
+                &original_id,
+                Some(&step_id),
+                crate::replay::ReplayNoteCategory::Observation,
+                "Discard this previous-generation reviewer finding.",
+            )
+            .expect("record a local finding before the confirmed restart");
+        editor
+            .replay_controller
+            .add_review_draft(
+                &original_id,
+                Some(&step_id),
+                crate::replay::ReplayReviewDraftKind::InlineComment,
+                "Discard this unpublished review comment.",
+            )
+            .expect("record a local review draft before the confirmed restart");
+        let old_scratch_buffers = editor
+            .replay_demo_workspace
+            .as_ref()
+            .unwrap()
+            .source_buffers
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        let author_path = author.root.join("src/first.rs");
+        let author_edit = "fn first() { preserve_original_author_work(); }\n";
+        std::fs::write(&author_path, author_edit)
+            .expect("retain separately authorized original-PR edits");
+        std::fs::write(
+            scratch.root.join("src/first.rs"),
+            "fn first() { discard_scratch_reconstruction(); }\n",
+        )
+        .expect("prepare explicitly disposable saved scratch changes");
+        let replacement = crate::replay::restart_workspace(&source, /*confirmed*/ true)
+            .expect("recreate only the verified scratch worktree");
+
+        let restarted = editor
+            .install_restarted_replay_workspace(
+                &original_id,
+                &source_id,
+                replacement,
+                &mut render_buffer,
+            )
+            .await
+            .expect("discard old review state and adopt the fresh scratch review");
+
+        let replacement_id = restarted["workspace_id"].as_str().unwrap();
+        assert_ne!(replacement_id, original_id);
+        assert!(editor.replay_controller.session(&original_id).is_err());
+        let review = editor.replay_controller.session(replacement_id).unwrap();
+        assert!(review.notes.is_empty());
+        assert!(review.review.drafts.is_empty());
+        assert!(review.steps.iter().all(|step| step.completion.is_none()));
+        assert_eq!(
+            editor
+                .replay_controller
+                .author_workspace(replacement_id)
+                .unwrap(),
+            &author,
+        );
+        assert_eq!(std::fs::read_to_string(&author_path).unwrap(), author_edit);
+        assert!(old_scratch_buffers.iter().all(|id| {
+            editor
+                .buffer_manager
+                .iter()
+                .all(|buffer| buffer.id() != *id)
+        }));
+        assert_eq!(
+            editor
+                .replay_controller
+                .recovery_snapshot()
+                .unwrap()
+                .discarded_sessions[0]
+                .id,
+            original_id,
+        );
     }
 
     #[tokio::test]
