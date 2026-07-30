@@ -800,6 +800,83 @@ impl ReplayController {
         ))
     }
 
+    /// Validates a complete semantic change without hiding original-hunk prerequisites.
+    ///
+    /// Each exact original hunk remains independently identified. A temporary
+    /// session image advances only for validation, so partially reconstructed
+    /// groups never mutate reviewer progress or editor source.
+    pub fn validate_step_group(
+        &self,
+        session_id: &str,
+        step_ids: &[String],
+        path: &Path,
+        text: &str,
+    ) -> Result<ReplayValidation, ReplayError> {
+        validate_semantic_group_ids(step_ids)?;
+        let mut simulated = self.session(session_id)?.clone();
+        for id in step_ids {
+            let index = simulated
+                .steps
+                .iter()
+                .position(|step| step.id == *id)
+                .ok_or_else(|| missing("replay step", id))?;
+            if !simulated.dependencies_complete(index) {
+                return Ok(ReplayValidation::Blocked);
+            }
+            let step = &simulated.steps[index];
+            if step.path != path {
+                return Ok(ReplayValidation::Conflict);
+            }
+            match validate_text(step, text, effective_old_start(&simulated, step)) {
+                ReplayValidation::Exact => simulated.steps[index].status = ReplayStepStatus::Done,
+                other => return Ok(other),
+            }
+        }
+        Ok(ReplayValidation::Exact)
+    }
+
+    /// Checks that every grouped hunk can be applied before any editor mutation.
+    pub fn preview_step_group(
+        &self,
+        session_id: &str,
+        step_ids: &[String],
+        path: &Path,
+        text: &str,
+    ) -> Result<(), ReplayError> {
+        validate_semantic_group_ids(step_ids)?;
+        let mut simulated = self.session(session_id)?.clone();
+        let mut image = text.to_string();
+        for id in step_ids {
+            let index = simulated
+                .steps
+                .iter()
+                .position(|step| step.id == *id)
+                .ok_or_else(|| missing("replay step", id))?;
+            if !simulated.dependencies_complete(index) {
+                return Err(ReplayError::DependencyBlocked);
+            }
+            let step = &simulated.steps[index];
+            if step.path != path {
+                return Err(ReplayError::AnchorConflict);
+            }
+            if step.before.is_empty() {
+                if !image.is_empty() && image != "\n" {
+                    return Err(ReplayError::AnchorConflict);
+                }
+                image.clone_from(&step.after);
+            } else {
+                let start = anchored_hunk_offset(
+                    &image,
+                    &step.before,
+                    effective_old_start(&simulated, step),
+                )?;
+                image.replace_range(start..start + step.before.len(), &step.after);
+            }
+            simulated.steps[index].status = ReplayStepStatus::Done;
+        }
+        Ok(())
+    }
+
     /// Issues one immutable, session-owned preview without changing an editor buffer.
     pub fn stage_step(
         &mut self,
@@ -1681,6 +1758,24 @@ impl ReplaySession {
     }
 }
 
+fn validate_semantic_group_ids(step_ids: &[String]) -> Result<(), ReplayError> {
+    if step_ids.is_empty() {
+        return Err(ReplayError::InvalidPatch(
+            "semantic change has no original source hunks".to_string(),
+        ));
+    }
+    let mut originals = HashSet::with_capacity(step_ids.len());
+    if step_ids
+        .iter()
+        .any(|step_id| !originals.insert(step_id.as_str()))
+    {
+        return Err(ReplayError::InvalidPatch(
+            "semantic change contains the same original source hunk more than once".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_text(step: &ReplayStep, text: &str, old_start: usize) -> ReplayValidation {
     if step.before.is_empty() {
         if text == step.after || (text.ends_with('\n') && text.trim_end_matches('\n') == step.after)
@@ -2020,6 +2115,70 @@ mod tests {
                 .unwrap(),
             ReplayValidation::Exact
         );
+    }
+
+    #[test]
+    fn semantic_group_preflight_never_mutates_original_progress() {
+        let (controller, session_id, step_id) = controller_with_session();
+        let original = "fn refresh() {\n    old();\n}\n";
+        let group = vec![step_id];
+        let before = controller.session(&session_id).unwrap().steps[0].clone();
+
+        controller
+            .preview_step_group(&session_id, &group, Path::new("src/token.rs"), original)
+            .expect("preflight the immutable original hunk without consuming progress");
+
+        let after = &controller.session(&session_id).unwrap().steps[0];
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.completion, before.completion);
+        assert_eq!(after.id, before.id);
+    }
+
+    #[test]
+    fn semantic_groups_reject_empty_duplicate_and_cross_file_original_hunks() {
+        let (mut controller, session_id, step_id) = controller_with_session();
+        let original = "fn refresh() {\n    old();\n}\n";
+        assert!(matches!(
+            controller.preview_step_group(&session_id, &[], Path::new("src/token.rs"), original,),
+            Err(ReplayError::InvalidPatch(_)),
+        ));
+        let duplicate = vec![step_id.clone(), step_id.clone()];
+        assert!(matches!(
+            controller.validate_step_group(
+                &session_id,
+                &duplicate,
+                Path::new("src/token.rs"),
+                original,
+            ),
+            Err(ReplayError::InvalidPatch(_)),
+        ));
+
+        let other_id = "other-original-hunk".to_string();
+        let session = controller.sessions.get_mut(&session_id).unwrap();
+        let mut other = session.steps[0].clone();
+        other.id = other_id.clone();
+        other.ordinal = 2;
+        other.path = PathBuf::from("src/other.rs");
+        other.dependencies = vec![step_id.clone()];
+        other.status = ReplayStepStatus::Pending;
+        other.completion = None;
+        session.steps.push(other);
+
+        assert!(matches!(
+            controller.preview_step_group(
+                &session_id,
+                &[step_id, other_id],
+                Path::new("src/token.rs"),
+                original,
+            ),
+            Err(ReplayError::AnchorConflict),
+        ));
+        assert!(controller
+            .session(&session_id)
+            .unwrap()
+            .steps
+            .iter()
+            .all(|step| step.status != ReplayStepStatus::Done));
     }
 
     #[test]

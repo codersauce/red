@@ -31,6 +31,15 @@ Each original hunk becomes one `ReplayStep`. Later hunks in the same file
 depend on earlier hunks through `prior_by_path`. No current dependency connects
 different files.
 
+A separate semantic presentation overlay can group consecutive same-file
+original hunks without changing their identities, relative order, source
+anchors, or exact patches. Formatting-only hunks attach to the next meaningful
+change when possible. Related compatibility changes, such as removing derived
+deserialization and adding an explicit backwards-compatible implementation,
+form one reviewable unit. Applying or undoing that unit remains one ordinary
+editor transaction while each original hunk retains independent completion and
+recovery metadata.
+
 For example, Git path order can produce:
 
 ```text
@@ -41,9 +50,11 @@ For example, Git path order can produce:
 The intermediate scratch repository cannot compile after step 1 because the
 referenced module does not yet exist.
 
-The presentation compiler currently traverses the raw parsed patch and expects
-`session.steps[steps.len()]` to refer to the same file and hunk. Therefore,
-changing the visible list order alone would violate existing plan assumptions.
+The presentation compiler still retains every raw parsed hunk and verifies that
+each semantic group references consecutive hunks in its original file. The
+current overlay groups changes but does not reorder them; changing the visible
+list order independently would still violate same-file prerequisites and
+source-image assumptions.
 
 ## Separate original identity from presentation order
 

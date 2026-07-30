@@ -31,6 +31,12 @@ pub struct ReplayDemoStep {
     pub task: String,
     /// Optional graduated hint.
     pub hint: String,
+    /// Exact original hunks represented by this reviewer-visible semantic change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub original_hunk_ids: Vec<String>,
+    /// Concise source-backed details describing all meaningful grouped changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<String>,
     /// Exact complete source buffer before this step.
     pub before: String,
     /// Exact complete source buffer after this step.
@@ -56,6 +62,9 @@ pub struct ReplayDemoPlan {
     pub initial_source: String,
     /// Ordered, contiguous original-author unified hunks.
     pub steps: Vec<ReplayDemoStep>,
+    /// Reviewer-facing groups over immutable original hunks; empty for legacy demos.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub semantic_changes: Vec<super::ReplaySemanticChange>,
 }
 
 struct DemoSpec {
@@ -160,6 +169,8 @@ pub fn replay_demo_plan() -> Result<ReplayDemoPlan, ReplayError> {
             why: spec.why.to_string(),
             task: spec.task.to_string(),
             hint: spec.hint.to_string(),
+            original_hunk_ids: Vec::new(),
+            details: Vec::new(),
             before: source,
             after: after.clone(),
             diff,
@@ -175,6 +186,7 @@ pub fn replay_demo_plan() -> Result<ReplayDemoPlan, ReplayError> {
         source_path: DEMO_SOURCE_PATH.to_string(),
         initial_source: DEMO_BASE.to_string(),
         steps,
+        semantic_changes: Vec::new(),
     })
 }
 

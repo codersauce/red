@@ -1477,6 +1477,17 @@ fn replay_current_change_lines(state: &ReplayPanelState, width: usize) -> Vec<Re
             TextPanelSpanStyle::Strong,
         );
     }
+    for detail in step.details.iter().take(2) {
+        lines.push(RenderedTextLine::plain(
+            truncate_display_width_with_marker(
+                &format!("  · {detail}"),
+                width,
+                "…",
+                TruncationSide::Right,
+            ),
+            TextPanelSpanStyle::Muted,
+        ));
+    }
     lines
 }
 
@@ -3011,6 +3022,8 @@ mod tests {
             why: "Keep the original source hunk attached to its learning step.".to_string(),
             task: "Reconstruct the original source change.".to_string(),
             hint: String::new(),
+            original_hunk_ids: Vec::new(),
+            details: Vec::new(),
             before: before.to_string(),
             after: after.to_string(),
             diff,
@@ -3273,6 +3286,32 @@ mod tests {
         assert!(rows
             .iter()
             .any(|row| row.contains("handle_backtrack_overlay_event")));
+    }
+
+    #[test]
+    fn semantic_change_details_remain_visible_without_unbounded_panel_growth() {
+        let mut replay = model();
+        replay.steps[0].title =
+            "Add is_blocking to RequestParams with backward-compatible deserialization".to_string();
+        replay.steps[0].details = vec![
+            "Add the `is_blocking` field to `RequestParams`.".to_string(),
+            "Default missing blocking information to `true` for legacy payloads.".to_string(),
+            "Never allow a third detail to crowd out the actual original source.".to_string(),
+        ];
+        let state = ReplayPanelState::parse(&serde_json::to_string(&replay).unwrap()).unwrap();
+        let width = 82;
+        let lines = replay_current_change_lines(&state, width);
+        let details = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| span.text.starts_with("  · "))
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(details.len(), 2);
+        assert!(details[0].contains("is_blocking"));
+        assert!(details[1].contains("legacy payloads"));
+        assert!(details.iter().all(|detail| display_width(detail) <= width));
     }
 
     #[test]

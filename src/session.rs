@@ -2330,7 +2330,9 @@ fn collect_snapshot_replay_reviews(
 ) {
     if let Some(recovery) = &snapshot.replay {
         let has_unseen_review = recovery.controller.sessions.iter().any(|session| {
-            if discarded_sessions.contains(&session.id) {
+            if discarded_sessions.contains(&session.id)
+                || !snapshot_has_replay_source_buffers(snapshot, session)
+            {
                 return false;
             }
             let id = replay_workspace_review_id(&session.workspace.root);
@@ -2346,7 +2348,9 @@ fn collect_snapshot_replay_reviews(
         let mut controller = crate::replay::ReplayController::default();
         if has_unseen_review && controller.restore(&recovery.controller).is_ok() {
             for session in controller.sessions() {
-                if discarded_sessions.contains(&session.id) {
+                if discarded_sessions.contains(&session.id)
+                    || !snapshot_has_replay_source_buffers(snapshot, session)
+                {
                     continue;
                 }
                 let id = replay_workspace_review_id(&session.workspace.root);
@@ -2536,6 +2540,23 @@ fn legacy_pull_request_workspace(path: &Path) -> Option<(PathBuf, u64, String)> 
         return Some((ancestor.to_path_buf(), number, short_head.to_string()));
     }
     None
+}
+
+fn snapshot_has_replay_source_buffers(
+    snapshot: &SessionSnapshot,
+    session: &crate::replay::ReplaySession,
+) -> bool {
+    let saved_paths = snapshot
+        .buffers
+        .iter()
+        .filter_map(|buffer| buffer.path.as_deref())
+        .map(Path::new)
+        .collect::<HashSet<_>>();
+
+    session.steps.iter().all(|step| {
+        let path = session.workspace.root.join(&step.path);
+        saved_paths.contains(path.as_path())
+    })
 }
 
 fn insert_snapshot_replay_review(
@@ -2952,6 +2973,56 @@ mod tests {
             Some(replacement_id.as_str())
         );
         assert_ne!(reviews[0].session_id.as_deref(), Some(original_id.as_str()));
+    }
+
+    #[test]
+    fn review_discovery_skips_newer_snapshots_missing_original_scratch_buffers() {
+        let (directory, mut complete, workspace) =
+            recoverable_replay_snapshot("incomplete-review-repository");
+        let root = directory.path().join("sessions");
+        complete.saved_at_ms = 10;
+        SessionStore::for_owner(&root, "editor-complete")
+            .unwrap()
+            .write(&mut complete)
+            .unwrap();
+
+        let mut incomplete = complete.clone();
+        incomplete.saved_at_ms = 20;
+        incomplete.buffers[0].path = None;
+        SessionStore::for_owner(&root, "editor-incomplete")
+            .unwrap()
+            .write(&mut incomplete)
+            .unwrap();
+
+        let reviews = SessionStore::list_replay_reviews(&root, /*active_workspace*/ None)
+            .expect("fall back to the newest snapshot that retains the actual scratch source");
+
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].owner, "editor-complete");
+        assert_eq!(reviews[0].workspace_root, workspace.root);
+        assert_eq!(reviews[0].last_activity_ms, 10);
+    }
+
+    #[test]
+    fn incomplete_replay_snapshots_do_not_trigger_repository_discovery() {
+        let (_directory, mut snapshot, workspace) =
+            recoverable_replay_snapshot("missing-buffer-repository");
+        snapshot.buffers[0].path = None;
+        let mut reviews = HashMap::new();
+        let mut repositories = HashMap::new();
+
+        collect_snapshot_replay_reviews(
+            &snapshot,
+            "editor-incomplete",
+            Some(&workspace.root),
+            &mut reviews,
+            &mut repositories,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+
+        assert!(reviews.is_empty());
+        assert!(repositories.is_empty());
     }
 
     #[test]

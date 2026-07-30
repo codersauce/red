@@ -18,6 +18,26 @@ use super::{
     ReplaySession, ReplayStep, ReplayStepKind,
 };
 
+/// One reviewer-facing concept backed by complete, immutable original Git hunks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplaySemanticChange {
+    /// Stable identity of the meaningful original hunk representing this concept.
+    pub id: String,
+    /// Every exact original hunk represented by the reviewer-facing concept.
+    pub original_hunk_ids: Vec<String>,
+    /// Source-grounded description of the complete semantic change.
+    pub title: String,
+    /// Relevant original-author explanation for the complete change.
+    pub why: String,
+    /// Concrete reviewer-facing reconstruction instruction.
+    pub task: String,
+    /// Optional source-grounded reconstruction hint.
+    pub hint: String,
+    /// Individually understandable behaviors included in this change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<String>,
+}
+
 /// Bounded reviewer-visible source context for one original-author hunk.
 ///
 /// The editor retains the complete scratch-file images for validation and
@@ -41,6 +61,12 @@ pub struct ReplayPresentationStep {
     pub task: String,
     /// Optional graduated reconstruction hint.
     pub hint: String,
+    /// Exact original hunks included in this atomic reviewer-facing change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub original_hunk_ids: Vec<String>,
+    /// Source-backed details describing all meaningful grouped behaviors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<String>,
     /// Exact old hunk and its original surrounding context.
     pub before: String,
     /// Exact new hunk and its original surrounding context.
@@ -91,38 +117,56 @@ pub fn replay_presentation_plan(
         });
     }
 
-    let steps = plan
-        .steps
-        .iter()
-        .map(|step| {
-            let patch = parse_patch(&step.diff, limits)?;
-            if patch.files.len() != 1 {
-                return Err(ReplayError::InvalidPatch(
-                    "presentation step is not one original source file".to_string(),
-                ));
-            }
-            let file = &patch.files[0];
-            if file.path() != Some(Path::new(&step.path)) || file.hunks.len() != 1 {
-                return Err(ReplayError::InvalidPatch(
-                    "presentation step is not one original source hunk".to_string(),
-                ));
-            }
-            let hunk = &file.hunks[0];
-            Ok(ReplayPresentationStep {
+    let semantic_changes = if plan.semantic_changes.is_empty() {
+        plan.steps
+            .iter()
+            .map(|step| ReplaySemanticChange {
                 id: step.id.clone(),
-                ordinal: step.ordinal,
-                path: step.path.clone(),
-                kind: step.kind.clone(),
-                title: refined_presentation_title(step, &hunk.before, &hunk.after),
+                original_hunk_ids: vec![step.id.clone()],
+                title: step.title.clone(),
                 why: step.why.clone(),
                 task: step.task.clone(),
                 hint: step.hint.clone(),
-                before: hunk.before.clone(),
-                after: hunk.after.clone(),
-                diff: step.diff.clone(),
+                details: step.details.clone(),
             })
-        })
-        .collect::<Result<Vec<_>, ReplayError>>()?;
+            .collect::<Vec<_>>()
+    } else {
+        plan.semantic_changes.clone()
+    };
+    let original_steps = plan
+        .steps
+        .iter()
+        .map(|step| (step.id.as_str(), step))
+        .collect::<HashMap<_, _>>();
+    let mut covered = HashSet::with_capacity(plan.steps.len());
+    let mut steps = Vec::with_capacity(semantic_changes.len());
+    for (index, change) in semantic_changes.iter().enumerate() {
+        let mut members = Vec::with_capacity(change.original_hunk_ids.len());
+        for id in &change.original_hunk_ids {
+            let step = original_steps.get(id.as_str()).ok_or_else(|| {
+                ReplayError::InvalidPatch(
+                    "semantic change does not reference an original source hunk".to_string(),
+                )
+            })?;
+            if !covered.insert(id.as_str()) {
+                return Err(ReplayError::InvalidPatch(
+                    "semantic changes repeat an original source hunk".to_string(),
+                ));
+            }
+            members.push(*step);
+        }
+        steps.push(present_semantic_change(
+            change,
+            &members,
+            index + 1,
+            limits,
+        )?);
+    }
+    if covered.len() != plan.steps.len() {
+        return Err(ReplayError::InvalidPatch(
+            "semantic changes do not cover every original source hunk".to_string(),
+        ));
+    }
 
     let presentation = ReplayPresentationPlan {
         pull_request: plan.pull_request,
@@ -142,6 +186,93 @@ pub fn replay_presentation_plan(
     }
 
     Ok(presentation)
+}
+
+fn present_semantic_change(
+    change: &ReplaySemanticChange,
+    members: &[&ReplayDemoStep],
+    ordinal: usize,
+    limits: ReplayLimits,
+) -> Result<ReplayPresentationStep, ReplayError> {
+    let first = members.first().ok_or_else(|| {
+        ReplayError::InvalidPatch("semantic change has no original source hunks".to_string())
+    })?;
+    if !members.iter().any(|step| step.id == change.id) {
+        return Err(ReplayError::InvalidPatch(
+            "semantic change identity does not match an original source hunk".to_string(),
+        ));
+    }
+
+    let mut diff = String::new();
+    let mut before = String::new();
+    let mut after = String::new();
+    let mut previous_ordinal = None;
+    for (index, step) in members.iter().enumerate() {
+        if step.path != first.path
+            || previous_ordinal.is_some_and(|previous: usize| step.ordinal != previous + 1)
+        {
+            return Err(ReplayError::InvalidPatch(
+                "semantic change crosses source files or reorders original hunks".to_string(),
+            ));
+        }
+        previous_ordinal = Some(step.ordinal);
+        let patch = parse_patch(&step.diff, limits)?;
+        if patch.files.len() != 1 {
+            return Err(ReplayError::InvalidPatch(
+                "presentation step is not one original source file".to_string(),
+            ));
+        }
+        let file = &patch.files[0];
+        if file.path() != Some(Path::new(&step.path)) || file.hunks.len() != 1 {
+            return Err(ReplayError::InvalidPatch(
+                "presentation step is not one original source hunk".to_string(),
+            ));
+        }
+        let hunk = &file.hunks[0];
+        if index == 0 {
+            diff.push_str(&step.diff);
+            before.clone_from(&hunk.before);
+        } else {
+            let header = step.diff.find("\n@@ ").ok_or_else(|| {
+                ReplayError::InvalidPatch("grouped original hunk has no unified header".to_string())
+            })?;
+            if !diff.ends_with('\n') {
+                diff.push('\n');
+            }
+            diff.push_str(&step.diff[header + 1..]);
+            if !after.is_empty() {
+                after.push_str("\n…\n");
+            }
+        }
+        after.push_str(&hunk.after);
+    }
+    let grouped = parse_patch(&diff, limits)?;
+    if grouped.files.len() != 1 || grouped.files[0].hunks.len() != members.len() {
+        return Err(ReplayError::InvalidPatch(
+            "semantic change did not retain every original source hunk".to_string(),
+        ));
+    }
+
+    let title = if change.title == first.title {
+        refined_presentation_title(first, &before, &after)
+    } else {
+        change.title.clone()
+    };
+    Ok(ReplayPresentationStep {
+        id: change.id.clone(),
+        ordinal,
+        path: first.path.clone(),
+        kind: first.kind.clone(),
+        title,
+        why: change.why.clone(),
+        task: change.task.clone(),
+        hint: change.hint.clone(),
+        original_hunk_ids: change.original_hunk_ids.clone(),
+        details: change.details.clone(),
+        before,
+        after,
+        diff,
+    })
 }
 
 fn refined_presentation_title(step: &ReplayDemoStep, before: &str, after: &str) -> String {
@@ -256,6 +387,8 @@ pub fn replay_plan_from_session(
                 why: replay_rationale(session, source_step, &display_path),
                 task: replay_task(source_step, &display_path),
                 hint: replay_hint(source_step, &display_path),
+                original_hunk_ids: vec![source_step.id.clone()],
+                details: Vec::new(),
                 before,
                 after,
                 diff,
@@ -273,6 +406,7 @@ pub fn replay_plan_from_session(
     })?;
     let context = session.source.review_context.as_ref();
     let pull_request = session.source.pull_request.as_ref();
+    let semantic_changes = build_semantic_changes(session, &steps);
 
     Ok(ReplayDemoPlan {
         pull_request: pull_request.map_or(0, |request| request.number),
@@ -288,6 +422,7 @@ pub fn replay_plan_from_session(
         source_path,
         initial_source,
         steps,
+        semantic_changes,
     })
 }
 
@@ -394,6 +529,402 @@ const fn replay_kind(kind: ReplayStepKind) -> &'static str {
 const MAX_REPLAY_RATIONALE_CHARS: usize = 240;
 const MAX_SEMANTIC_SOURCE_LINES: usize = 32;
 const MAX_SEMANTIC_SOURCE_CHARS: usize = 8 * 1024;
+
+#[derive(Debug, Clone, Default)]
+struct ReplaySemanticFacts {
+    public_fields: Vec<String>,
+    functions: Vec<String>,
+    deserialize_target: Option<String>,
+    removes_derived_deserialize: bool,
+    defaults_missing_to_true: bool,
+    deprecates_compatibility_field: bool,
+    adds_test: bool,
+    substantive_lines: usize,
+}
+
+impl ReplaySemanticFacts {
+    fn from_step(step: &ReplayStep) -> Self {
+        let changed = changed_source_lines(step);
+        let removed = source_lines_not_retained(&step.after, &step.before);
+        let mut facts = Self {
+            substantive_lines: changed
+                .iter()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+                + removed
+                    .iter()
+                    .filter(|line| !line.trim().is_empty())
+                    .count(),
+            removes_derived_deserialize: removed
+                .iter()
+                .any(|line| line.contains("#[derive(") && line.contains("Deserialize"))
+                && changed
+                    .iter()
+                    .any(|line| line.contains("#[derive(") && !line.contains("Deserialize")),
+            ..Self::default()
+        };
+
+        for line in changed {
+            let line = line.trim();
+            if let Some(declaration) = line.strip_prefix("pub ") {
+                if let Some((field, _)) = declaration.split_once(':') {
+                    let field = field.trim();
+                    if is_source_identifier(field) {
+                        facts.public_fields.push(field.to_string());
+                    }
+                }
+            }
+            if let Some((kind, name)) = source_symbol(line) {
+                if kind == "fn" && !facts.functions.iter().any(|existing| existing == name) {
+                    facts.functions.push(name.to_string());
+                }
+            }
+            if line.starts_with("impl") && line.contains("Deserialize") {
+                if let Some((_, target)) = line.split_once(" for ") {
+                    let target = target
+                        .split(|character: char| character.is_whitespace() || character == '{')
+                        .next()
+                        .unwrap_or_default();
+                    if is_source_identifier(target) {
+                        facts.deserialize_target = Some(target.to_string());
+                    }
+                }
+            }
+            facts.defaults_missing_to_true |=
+                line.contains(".unwrap_or(true)") || line.contains(".unwrap_or_else(|| true)");
+            facts.deprecates_compatibility_field |= line.contains("@deprecated");
+            facts.adds_test |= line.starts_with("#[test]") || line.starts_with("#[tokio::test]");
+        }
+
+        facts
+    }
+
+    fn merge(&mut self, other: Self) {
+        for field in other.public_fields {
+            if !self.public_fields.contains(&field) {
+                self.public_fields.push(field);
+            }
+        }
+        for function in other.functions {
+            if !self.functions.contains(&function) {
+                self.functions.push(function);
+            }
+        }
+        if self.deserialize_target.is_none() {
+            self.deserialize_target = other.deserialize_target;
+        }
+        self.removes_derived_deserialize |= other.removes_derived_deserialize;
+        self.defaults_missing_to_true |= other.defaults_missing_to_true;
+        self.deprecates_compatibility_field |= other.deprecates_compatibility_field;
+        self.adds_test |= other.adds_test;
+        self.substantive_lines = self
+            .substantive_lines
+            .saturating_add(other.substantive_lines);
+    }
+
+    const fn is_incidental(&self) -> bool {
+        self.substantive_lines == 0
+    }
+
+    fn is_backward_compatible_deserialization(&self) -> bool {
+        self.deserialize_target.is_some()
+            && (self.defaults_missing_to_true || self.removes_derived_deserialize)
+    }
+}
+
+#[derive(Debug)]
+struct ReplaySemanticGroup {
+    member_indices: Vec<usize>,
+    facts: ReplaySemanticFacts,
+}
+
+fn build_semantic_changes(
+    session: &ReplaySession,
+    steps: &[ReplayDemoStep],
+) -> Vec<ReplaySemanticChange> {
+    let originals = session
+        .steps
+        .iter()
+        .map(|step| (step.id.as_str(), step))
+        .collect::<HashMap<_, _>>();
+    let mut groups: Vec<ReplaySemanticGroup> = Vec::new();
+    let mut incidental: Vec<usize> = Vec::new();
+
+    for (index, step) in steps.iter().enumerate() {
+        let Some(original) = originals.get(step.id.as_str()) else {
+            continue;
+        };
+        let facts = ReplaySemanticFacts::from_step(original);
+        if facts.is_incidental() {
+            if incidental
+                .first()
+                .is_some_and(|first| steps[*first].path != step.path)
+            {
+                flush_incidental_semantic_group(&mut groups, &mut incidental, steps);
+            }
+            incidental.push(index);
+            continue;
+        }
+
+        if incidental
+            .first()
+            .is_some_and(|first| steps[*first].path != step.path)
+        {
+            flush_incidental_semantic_group(&mut groups, &mut incidental, steps);
+        }
+
+        let merge_with_previous = groups.last().is_some_and(|previous| {
+            previous
+                .member_indices
+                .last()
+                .is_some_and(|last| steps[*last].path == step.path)
+                && previous.facts.removes_derived_deserialize
+                && facts.deserialize_target.is_some()
+        });
+        if merge_with_previous {
+            if let Some(previous) = groups.last_mut() {
+                previous.member_indices.append(&mut incidental);
+                previous.member_indices.push(index);
+                previous.facts.merge(facts);
+            }
+        } else {
+            incidental.push(index);
+            groups.push(ReplaySemanticGroup {
+                member_indices: std::mem::take(&mut incidental),
+                facts,
+            });
+        }
+    }
+
+    flush_incidental_semantic_group(&mut groups, &mut incidental, steps);
+
+    groups
+        .into_iter()
+        .map(|group| semantic_change(session, steps, &originals, group))
+        .collect()
+}
+
+fn flush_incidental_semantic_group(
+    groups: &mut Vec<ReplaySemanticGroup>,
+    incidental: &mut Vec<usize>,
+    steps: &[ReplayDemoStep],
+) {
+    let Some(first) = incidental.first().copied() else {
+        return;
+    };
+    if let Some(previous) = groups.last_mut().filter(|group| {
+        group
+            .member_indices
+            .last()
+            .is_some_and(|last| steps[*last].path == steps[first].path)
+    }) {
+        previous.member_indices.append(incidental);
+    } else {
+        groups.push(ReplaySemanticGroup {
+            member_indices: std::mem::take(incidental),
+            facts: ReplaySemanticFacts::default(),
+        });
+    }
+}
+
+fn semantic_change(
+    session: &ReplaySession,
+    steps: &[ReplayDemoStep],
+    originals: &HashMap<&str, &ReplayStep>,
+    group: ReplaySemanticGroup,
+) -> ReplaySemanticChange {
+    let first = &steps[group.member_indices[0]];
+    let meaningful = group
+        .member_indices
+        .iter()
+        .filter_map(|index| {
+            let step = &steps[*index];
+            let original = originals.get(step.id.as_str())?;
+            (!ReplaySemanticFacts::from_step(original).is_incidental()).then_some((step, *original))
+        })
+        .collect::<Vec<_>>();
+    let primary = meaningful.last().map_or(first, |(step, _)| *step);
+    let mut details = Vec::new();
+
+    let title = if group.facts.is_backward_compatible_deserialization() {
+        let target = group
+            .facts
+            .deserialize_target
+            .as_deref()
+            .unwrap_or("request");
+        for field in &group.facts.public_fields {
+            details.push(format!("Add the `{field}` field to `{target}`."));
+        }
+        if group.facts.removes_derived_deserialize {
+            details.push(
+                "Replace derived deserialization with an explicit compatibility implementation."
+                    .to_string(),
+            );
+        }
+        if group.facts.defaults_missing_to_true {
+            details.push(
+                "Default missing blocking information to `true` for legacy payloads.".to_string(),
+            );
+        }
+        if group.facts.deprecates_compatibility_field {
+            details.push("Keep the existing timeout as deprecated compatibility data.".to_string());
+        }
+        if let Some(field) = group.facts.public_fields.first() {
+            format!("Add {field} to {target} with backward-compatible deserialization")
+        } else {
+            format!("Preserve backward-compatible {target} deserialization")
+        }
+    } else if group.facts.adds_test {
+        group.facts.functions.last().map_or_else(
+            || primary.title.clone(),
+            |function| semantic_test_title(function),
+        )
+    } else if let Some(function) = group.facts.functions.first().filter(|_| {
+        meaningful
+            .last()
+            .is_some_and(|(_, original)| original.kind == ReplayStepKind::Add)
+    }) {
+        match rust_function_owner(&primary.after, function) {
+            Some(Some(owner)) => format!("Add {function} to {owner}"),
+            Some(None) => format!("Add {function}"),
+            None => primary.title.clone(),
+        }
+    } else if group.facts.is_incidental() {
+        let filename = Path::new(&first.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&first.path);
+        format!("Preserve formatting in {filename}")
+    } else {
+        primary.title.clone()
+    };
+
+    let why = semantic_rationale(session, &meaningful, &group.facts)
+        .unwrap_or_else(|| primary.why.clone());
+    let task = if group.member_indices.len() > 1 {
+        format!(
+            "Reconstruct the complete original change in {}.",
+            first.path
+        )
+    } else {
+        primary.task.clone()
+    };
+
+    ReplaySemanticChange {
+        id: primary.id.clone(),
+        original_hunk_ids: group
+            .member_indices
+            .iter()
+            .map(|index| steps[*index].id.clone())
+            .collect(),
+        title,
+        why,
+        task,
+        hint: primary.hint.clone(),
+        details,
+    }
+}
+
+fn rust_function_owner(source: &str, function: &str) -> Option<Option<String>> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(source, None)?;
+    find_rust_function_owner(tree.root_node(), source.as_bytes(), function)
+}
+
+fn find_rust_function_owner(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    function: &str,
+) -> Option<Option<String>> {
+    if node.kind() == "function_item"
+        && node
+            .child_by_field_name("name")
+            .and_then(|name| name.utf8_text(source).ok())
+            == Some(function)
+    {
+        let mut parent = node.parent();
+        while let Some(ancestor) = parent {
+            if matches!(ancestor.kind(), "impl_item" | "trait_item") {
+                return Some(
+                    ancestor
+                        .child_by_field_name("type")
+                        .or_else(|| ancestor.child_by_field_name("name"))
+                        .and_then(|target| target.utf8_text(source).ok())
+                        .map(str::to_string),
+                );
+            }
+            parent = ancestor.parent();
+        }
+        return Some(None);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(owner) = find_rust_function_owner(child, source, function) {
+            return Some(owner);
+        }
+    }
+    None
+}
+
+fn semantic_test_title(function: &str) -> String {
+    if let Some(subject) = function.strip_prefix("test_") {
+        return format!("Test {}", subject.replace('_', " "));
+    }
+    if function.contains("legacy") && function.contains("blocking") {
+        return "Verify legacy requests default missing blocking information to true".to_string();
+    }
+    format!("Test {}", function.replace('_', " "))
+}
+
+fn semantic_rationale(
+    session: &ReplaySession,
+    meaningful: &[(&ReplayDemoStep, &ReplayStep)],
+    facts: &ReplaySemanticFacts,
+) -> Option<String> {
+    if meaningful.is_empty() {
+        return Some(
+            "Preserve the original source formatting without changing behavior.".to_string(),
+        );
+    }
+    let context = session.source.review_context.as_ref()?;
+    if facts.is_backward_compatible_deserialization() {
+        for line in context.body.lines() {
+            let Some(bullet) = markdown_bullet(line.trim()) else {
+                continue;
+            };
+            let normalized = bullet.to_ascii_lowercase();
+            if (normalized.contains("legacy") || normalized.contains("missing"))
+                && (normalized.contains("default") || normalized.contains("deserializ"))
+                && (normalized.contains("blocking") || normalized.contains("compatib"))
+            {
+                return Some(bounded_rationale(bullet));
+            }
+        }
+    }
+
+    if meaningful.len() == 1 {
+        let (presentation, original) = meaningful[0];
+        return Some(replay_rationale(session, original, &presentation.path));
+    }
+
+    let mut best: Option<(usize, String)> = None;
+    for (presentation, original) in meaningful {
+        if let Some(candidate) = review_body_rationale(&context.body, original, &presentation.path)
+        {
+            let score = semantic_tokens(&candidate)
+                .intersection(&changed_semantic_tokens(original))
+                .count();
+            if best.as_ref().is_none_or(|(previous, _)| score > *previous) {
+                best = Some((score, candidate));
+            }
+        }
+    }
+    best.map(|(_, rationale)| bounded_rationale(&rationale))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReviewSection {
@@ -582,7 +1113,9 @@ fn named_change_task(kind: ReplayStepKind, name: &str, noun: &str, container: &s
 }
 
 fn replay_rationale(session: &ReplaySession, step: &ReplayStep, path: &str) -> String {
-    if let Some(documentation) = added_documentation(step) {
+    if let Some(documentation) =
+        added_documentation(step).filter(|documentation| !documentation.starts_with("@deprecated"))
+    {
         return bounded_rationale(&documentation);
     }
 
@@ -617,6 +1150,10 @@ fn changed_source_lines(step: &ReplayStep) -> Vec<&str> {
     } else {
         (&step.before, &step.after)
     };
+    source_lines_not_retained(original, changed)
+}
+
+fn source_lines_not_retained<'source>(original: &str, changed: &'source str) -> Vec<&'source str> {
     let mut remaining = HashMap::<&str, usize>::new();
     for line in original.lines() {
         *remaining.entry(line).or_default() += 1;
@@ -884,6 +1421,7 @@ fn added_documentation(step: &ReplayStep) -> Option<String> {
 
 fn review_body_rationale(body: &str, step: &ReplayStep, path: &str) -> Option<String> {
     let keywords = replay_semantic_tokens(step, path);
+    let changed_keywords = changed_semantic_tokens(step);
     let mut section = ReviewSection::Other;
     let mut fenced = false;
     let mut motivation = String::new();
@@ -915,8 +1453,11 @@ fn review_body_rationale(body: &str, step: &ReplayStep, path: &str) -> Option<St
 
         if let Some(bullet) = markdown_bullet(trimmed) {
             if section == ReviewSection::Changes {
-                let score = semantic_tokens(bullet).intersection(&keywords).count();
+                let bullet_keywords = semantic_tokens(bullet);
+                let score = bullet_keywords.intersection(&keywords).count();
+                let changed_score = bullet_keywords.intersection(&changed_keywords).count();
                 if score >= 2
+                    && changed_score > 0
                     && best_change
                         .as_ref()
                         .is_none_or(|(best_score, _)| score > *best_score)
@@ -1002,6 +1543,16 @@ fn replay_semantic_tokens(step: &ReplayStep, path: &str) -> HashSet<String> {
     semantic_tokens(&source)
 }
 
+fn changed_semantic_tokens(step: &ReplayStep) -> HashSet<String> {
+    let source = changed_source_lines(step)
+        .into_iter()
+        .filter(|line| !line.trim().is_empty())
+        .take(MAX_SEMANTIC_SOURCE_LINES)
+        .collect::<Vec<_>>()
+        .join(" ");
+    semantic_tokens(&source)
+}
+
 fn semantic_tokens(text: &str) -> HashSet<String> {
     let mut tokens = HashSet::new();
     let mut current = String::new();
@@ -1058,6 +1609,7 @@ mod tests {
         digest, replay_demo_plan, GitObjectId, ReplayRepository, ReplayReviewContext, ReplaySource,
         ReplaySourceKind, ReplayWorkspace,
     };
+    use similar::TextDiff;
 
     const MULTI_FILE_PATCH: &str = concat!(
         "diff --git a/src/token.rs b/src/token.rs\n",
@@ -1161,6 +1713,242 @@ mod tests {
         let session = ReplaySession::from_source(source, workspace, ReplayLimits::default())
             .expect("source-linked replay session");
         (directory, session)
+    }
+
+    fn semantic_source_session(before: &str, after: &str) -> (tempfile::TempDir, ReplaySession) {
+        let path = "src/token.rs";
+        let patch = format!(
+            "diff --git a/{path} b/{path}\n{}",
+            TextDiff::from_lines(before, after)
+                .unified_diff()
+                .context_radius(3)
+                .header(&format!("a/{path}"), &format!("b/{path}")),
+        );
+        let (directory, session) = source_session(&patch);
+        std::fs::write(directory.path().join(path), before)
+            .expect("write the original semantic-change fixture");
+        (directory, session)
+    }
+
+    #[test]
+    fn groups_derived_deserialization_and_legacy_compatibility_into_one_honest_change() {
+        let before = concat!(
+            "#[derive(Serialize, Deserialize, Debug)]\n",
+            "#[serde(rename_all = \"camelCase\")]\n",
+            "/// Original request parameters.\n",
+            "pub struct RequestParams {\n",
+            "    pub thread_id: String,\n",
+            "    pub turn_id: String,\n",
+            "    pub item_id: String,\n",
+            "    pub questions: Vec<String>,\n",
+            "    #[serde(default)]\n",
+            "    pub timeout_ms: Option<u64>,\n",
+            "}\n",
+            "\n",
+            "pub struct NextItem;\n",
+        );
+        let after = concat!(
+            "#[derive(Serialize, Debug)]\n",
+            "#[serde(rename_all = \"camelCase\")]\n",
+            "/// Original request parameters.\n",
+            "pub struct RequestParams {\n",
+            "    pub thread_id: String,\n",
+            "    pub turn_id: String,\n",
+            "    pub item_id: String,\n",
+            "    pub questions: Vec<String>,\n",
+            "    pub is_blocking: bool,\n",
+            "    /// @deprecated Use `isBlocking` for request behavior.\n",
+            "    #[serde(default)]\n",
+            "    pub timeout_ms: Option<u64>,\n",
+            "}\n",
+            "\n",
+            "impl<'de> Deserialize<'de> for RequestParams {\n",
+            "    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>\n",
+            "    where\n",
+            "        D: serde::Deserializer<'de>,\n",
+            "    {\n",
+            "        let wire = WireRequestParams::deserialize(deserializer)?;\n",
+            "        Ok(Self {\n",
+            "            is_blocking: wire.is_blocking.unwrap_or(true),\n",
+            "            ..wire.into()\n",
+            "        })\n",
+            "    }\n",
+            "}\n",
+            "\n",
+            "pub struct NextItem;\n",
+        );
+        let (_directory, mut session) = semantic_source_session(before, after);
+        session.source.review_context = Some(codex_review_context(concat!(
+            "## Why\n\nKeep legacy requests compatible.\n\n",
+            "## What changed\n\n",
+            "- Add the new blocking field throughout generated request schemas.\n",
+            "- Default missing blocking information during deserialization so legacy payloads continue to load safely.\n",
+        )));
+
+        assert_eq!(session.steps.len(), 2);
+        let plan = replay_plan_from_session(&session, "feature/replay", ReplayLimits::default())
+            .expect("group the complete original compatibility change");
+        let presentation = replay_presentation_plan(&plan, ReplayLimits::default())
+            .expect("retain both exact original unified hunks");
+
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.semantic_changes.len(), 1);
+        assert_eq!(presentation.steps.len(), 1);
+        let change = &presentation.steps[0];
+        assert_eq!(
+            change.title,
+            "Add is_blocking to RequestParams with backward-compatible deserialization",
+        );
+        assert_eq!(
+            change.why,
+            "Default missing blocking information during deserialization so legacy payloads continue to load safely.",
+        );
+        assert_eq!(change.original_hunk_ids.len(), 2);
+        assert!(change
+            .details
+            .iter()
+            .any(|detail| detail.contains("derived deserialization")));
+        assert!(change
+            .details
+            .iter()
+            .any(|detail| detail.contains("legacy payloads")));
+        assert!(!change.why.contains("@deprecated"));
+        let patch = parse_patch(&change.diff, ReplayLimits::default())
+            .expect("parse every original grouped hunk independently");
+        assert_eq!(patch.files[0].hunks.len(), 2);
+    }
+
+    #[test]
+    fn attaches_a_whitespace_only_hunk_to_the_following_meaningful_test() {
+        let before = concat!(
+            "fn existing_request() {\n",
+            "    preserve_original_behavior();\n",
+            "}\n",
+            "#[test]\n",
+            "fn neighboring_test() {\n",
+            "    let one = 1;\n",
+            "    let two = 2;\n",
+            "    let three = 3;\n",
+            "    let four = 4;\n",
+            "    let five = 5;\n",
+            "    assert_eq!(one + two + three + four, 10);\n",
+            "    assert_eq!(five, 5);\n",
+            "}\n",
+        );
+        let after = concat!(
+            "fn existing_request() {\n",
+            "    preserve_original_behavior();\n",
+            "}\n",
+            "\n",
+            "#[test]\n",
+            "fn neighboring_test() {\n",
+            "    let one = 1;\n",
+            "    let two = 2;\n",
+            "    let three = 3;\n",
+            "    let four = 4;\n",
+            "    let five = 5;\n",
+            "    assert_eq!(one + two + three + four, 10);\n",
+            "    assert_eq!(five, 5);\n",
+            "}\n",
+            "\n",
+            "#[test]\n",
+            "fn legacy_requests_default_missing_blocking_to_true() {\n",
+            "    assert!(legacy_request().is_blocking);\n",
+            "}\n",
+        );
+        let (_directory, mut session) = semantic_source_session(before, after);
+        session.source.review_context = Some(codex_review_context(concat!(
+            "## Why\n\nPreserve existing request behavior.\n\n",
+            "## What changed\n\n",
+            "- Add generated request schemas and protocol event fields.\n",
+            "- Verify legacy requests default missing blocking information to true.\n",
+        )));
+
+        assert_eq!(session.steps.len(), 2);
+        let plan = replay_plan_from_session(&session, "feature/replay", ReplayLimits::default())
+            .expect("attach incidental formatting to the substantive test");
+        let presentation = replay_presentation_plan(&plan, ReplayLimits::default())
+            .expect("preserve the incidental original hunk");
+
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(presentation.steps.len(), 1);
+        let change = &presentation.steps[0];
+        assert_eq!(change.original_hunk_ids.len(), 2);
+        assert_eq!(
+            change.title,
+            "Verify legacy requests default missing blocking information to true",
+        );
+        assert!(!change.title.contains("existing_request"));
+        assert!(!change.why.contains("generated request schemas"));
+        let patch = parse_patch(&change.diff, ReplayLimits::default())
+            .expect("keep whitespace and test hunks in the exact original diff");
+        assert_eq!(patch.files[0].hunks.len(), 2);
+    }
+
+    #[test]
+    fn added_top_level_function_does_not_inherit_the_previous_hunk_heading() {
+        let before = concat!(
+            "fn existing_request() {\n",
+            "    preserve_original_behavior();\n",
+            "}\n",
+        );
+        let after = concat!(
+            "fn existing_request() {\n",
+            "    preserve_original_behavior();\n",
+            "}\n",
+            "\n",
+            "fn decode_request() {\n",
+            "    deserialize_new_request();\n",
+            "}\n",
+        );
+        let (_directory, session) = semantic_source_session(before, after);
+        let plan = replay_plan_from_session(&session, "feature/replay", ReplayLimits::default())
+            .expect("identify the added function from its actual syntax");
+        let presentation = replay_presentation_plan(&plan, ReplayLimits::default())
+            .expect("present the original top-level function change");
+
+        assert_eq!(presentation.steps.len(), 1);
+        assert_eq!(presentation.steps[0].title, "Add decode_request");
+        assert!(!presentation.steps[0].title.contains("existing_request"));
+    }
+
+    #[test]
+    fn incidental_hunks_never_cross_file_boundaries() {
+        let first_before = "fn existing_request() {\n    preserve_original_behavior();\n}\n";
+        let first_after = "fn existing_request() {\n    preserve_original_behavior();\n}\n\n";
+        let second_before = "assert_eq!(token(), 1);\n";
+        let second_after = "assert_eq!(token(), 2);\n";
+        let first = "src/token.rs";
+        let second = "tests/token.rs";
+        let patch = format!(
+            "diff --git a/{first} b/{first}\n{}diff --git a/{second} b/{second}\n{}",
+            TextDiff::from_lines(first_before, first_after)
+                .unified_diff()
+                .context_radius(3)
+                .header(&format!("a/{first}"), &format!("b/{first}")),
+            TextDiff::from_lines(second_before, second_after)
+                .unified_diff()
+                .context_radius(3)
+                .header(&format!("a/{second}"), &format!("b/{second}")),
+        );
+        let (directory, session) = source_session(&patch);
+        std::fs::write(directory.path().join(first), first_before)
+            .expect("original formatting-only source");
+        let plan = replay_plan_from_session(&session, "feature/replay", ReplayLimits::default())
+            .expect("retain formatting-only changes within their original source file");
+        let presentation = replay_presentation_plan(&plan, ReplayLimits::default())
+            .expect("never combine original hunks from unrelated files");
+
+        assert_eq!(presentation.steps.len(), 2);
+        assert_eq!(presentation.steps[0].path, first);
+        assert_eq!(presentation.steps[1].path, second);
+        assert!(presentation.steps[0]
+            .title
+            .starts_with("Preserve formatting"));
+        assert!(presentation
+            .steps
+            .iter()
+            .all(|change| change.original_hunk_ids.len() == 1));
     }
 
     #[test]
