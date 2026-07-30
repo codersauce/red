@@ -69,6 +69,34 @@ hunk digest, original before/after text, and same-file prerequisites.
 An ordering profile must reference original hunk IDs; it must never regenerate
 their identities from their new presentation positions.
 
+## Semantic review change
+
+A semantic review change is a source-backed presentation overlay, not a
+replacement for the immutable original hunks:
+
+```rust
+struct SemanticReviewChange {
+    id: HunkId,
+    original_hunk_ids: Vec<HunkId>,
+    title: String,
+    why: String,
+    details: Vec<String>,
+}
+```
+
+The current implementation groups consecutive hunks within the same file when
+they form one meaningful behavior. Incidental whitespace belongs to its nearest
+substantive change, and replacing derived deserialization plus adding its
+compatibility implementation is presented as one change. The visible identity
+uses the substantive original hunk so findings and inline comments retain a real
+source anchor.
+
+Every exact original hunk still appears once in the overlay and remains present
+in the displayed unified diff. Grouped application, validation, undo, progress,
+and recovery operate on the underlying hunks in their original order. The
+presentation title and rationale must describe actual changed source behavior;
+nearby hunk headings and unrelated PR-body prose are not sufficient evidence.
+
 ## Ordering and logical replay groups
 
 An ordering plan is a separate, versioned overlay:

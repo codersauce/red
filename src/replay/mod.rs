@@ -30,7 +30,7 @@ pub use patch::{
 };
 pub use plan::{
     replay_plan_from_session, replay_presentation_plan, ReplayPresentationPlan,
-    ReplayPresentationStep,
+    ReplayPresentationStep, ReplaySemanticChange,
 };
 pub(crate) use review::{reconcile_prepared_review, submit_prepared_review};
 pub use review::{

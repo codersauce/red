@@ -3978,6 +3978,27 @@ impl Editor {
             .position(|buffer| buffer.id() == *source_buffer)
     }
 
+    fn replay_semantic_hunk_ids(&self, workspace_id: &str, step_id: &str) -> Option<Vec<String>> {
+        let workspace = self.replay_demo_workspace.as_ref()?;
+        if workspace.id != workspace_id {
+            return None;
+        }
+        if let Some(change) = workspace
+            .plan
+            .semantic_changes
+            .iter()
+            .find(|change| change.id == step_id)
+        {
+            return Some(change.original_hunk_ids.clone());
+        }
+        workspace
+            .plan
+            .steps
+            .iter()
+            .any(|step| step.id == step_id)
+            .then(|| vec![step_id.to_string()])
+    }
+
     fn focus_replay_demo_source(&mut self, workspace_id: &str) -> bool {
         let Some(workspace) = self.replay_demo_workspace.as_ref() else {
             return false;
@@ -4400,18 +4421,24 @@ impl Editor {
         let index = session
             .active_step
             .as_deref()
-            .and_then(|id| workspace.plan.steps.iter().position(|step| step.id == id))
+            .and_then(|id| {
+                presentation.steps.iter().position(|step| {
+                    step.id == id || step.original_hunk_ids.iter().any(|original| original == id)
+                })
+            })
             .unwrap_or_default();
         let notes = session
             .notes
             .iter()
             .filter_map(|note| {
                 let step_id = note.step_id.as_deref()?;
-                let index = workspace
-                    .plan
-                    .steps
-                    .iter()
-                    .position(|step| step.id == step_id)?;
+                let index = presentation.steps.iter().position(|step| {
+                    step.id == step_id
+                        || step
+                            .original_hunk_ids
+                            .iter()
+                            .any(|original| original == step_id)
+                })?;
                 Some(json!({
                     "index": index,
                     "step_id": note.step_id,
@@ -4420,14 +4447,38 @@ impl Editor {
                 }))
             })
             .collect::<Vec<_>>();
-        let completions = session
+        let completions = presentation
             .steps
             .iter()
             .enumerate()
-            .filter_map(|(index, step)| {
-                let completion = match step.completion? {
-                    crate::replay::ReplayCompletion::Manual => "manually reconstructed",
-                    crate::replay::ReplayCompletion::Automatic => "automatically applied",
+            .filter_map(|(index, change)| {
+                let originals = if change.original_hunk_ids.is_empty() {
+                    vec![change.id.as_str()]
+                } else {
+                    change
+                        .original_hunk_ids
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                };
+                let completed = originals
+                    .iter()
+                    .filter_map(|id| session.steps.iter().find(|step| step.id == *id))
+                    .collect::<Vec<_>>();
+                if completed.len() != originals.len()
+                    || completed
+                        .iter()
+                        .any(|step| step.status != crate::replay::ReplayStepStatus::Done)
+                {
+                    return None;
+                }
+                let automatic = completed.iter().all(|step| {
+                    step.completion == Some(crate::replay::ReplayCompletion::Automatic)
+                });
+                let completion = if automatic {
+                    "automatically applied"
+                } else {
+                    "manually reconstructed"
                 };
                 Some(json!({ "index": index, "completion": completion }))
             })
@@ -5019,7 +5070,7 @@ impl Editor {
         )?;
         let presentation =
             crate::replay::replay_presentation_plan(&plan, self.replay_controller.limits())?;
-        let initial_step = plan
+        let initial_step = presentation
             .steps
             .first()
             .map(|step| step.id.clone())
@@ -5181,9 +5232,13 @@ impl Editor {
         let contents = source.contents();
         let revision = source.revision();
         let state = if self.replay_controller.session(workspace_id).is_ok() {
-            let validation = match self.replay_controller.validate_step(
+            let Some(original_hunk_ids) = self.replay_semantic_hunk_ids(workspace_id, step_id)
+            else {
+                return json!({ "ok": false, "error": "semantic change is no longer available" });
+            };
+            let validation = match self.replay_controller.validate_step_group(
                 workspace_id,
-                step_id,
+                &original_hunk_ids,
                 Path::new(&step.path),
                 &contents,
             ) {
@@ -5194,26 +5249,28 @@ impl Editor {
             };
             match validation {
                 crate::replay::ReplayValidation::Exact => {
-                    let completed = self
-                        .replay_controller
-                        .session(workspace_id)
-                        .ok()
-                        .and_then(|session| {
-                            session
-                                .steps
-                                .iter()
-                                .find(|candidate| candidate.id == step_id)
-                        })
-                        .is_some_and(|candidate| {
-                            candidate.status == crate::replay::ReplayStepStatus::Done
-                        });
-                    if !completed {
-                        if let Err(error) = self.replay_controller.complete_step(
-                            workspace_id,
-                            step_id,
-                            crate::replay::ReplayCompletion::Manual,
-                        ) {
-                            return json!({ "ok": false, "error": error.to_string() });
+                    for original in original_hunk_ids {
+                        let completed = self
+                            .replay_controller
+                            .session(workspace_id)
+                            .ok()
+                            .and_then(|session| {
+                                session
+                                    .steps
+                                    .iter()
+                                    .find(|candidate| candidate.id == original)
+                            })
+                            .is_some_and(|candidate| {
+                                candidate.status == crate::replay::ReplayStepStatus::Done
+                            });
+                        if !completed {
+                            if let Err(error) = self.replay_controller.complete_step(
+                                workspace_id,
+                                &original,
+                                crate::replay::ReplayCompletion::Manual,
+                            ) {
+                                return json!({ "ok": false, "error": error.to_string() });
+                            }
                         }
                     }
                     "exact"
@@ -5272,11 +5329,23 @@ impl Editor {
         let source_buffer = source.id();
         let contents = source.contents();
         let real_session = self.replay_controller.session(workspace_id).is_ok();
+        let original_hunk_ids = self
+            .replay_semantic_hunk_ids(workspace_id, step_id)
+            .ok_or_else(|| anyhow::anyhow!("semantic change is no longer available"))?;
+        let first_original = original_hunk_ids
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("semantic change has no original source hunks"))?;
         let (range, replacement) = if real_session {
             let path = Path::new(&step.path);
+            self.replay_controller.preview_step_group(
+                workspace_id,
+                &original_hunk_ids,
+                path,
+                &contents,
+            )?;
             let stage = self.replay_controller.stage_step(
                 workspace_id,
-                step_id,
+                first_original,
                 path,
                 &contents,
                 revision,
@@ -5335,14 +5404,38 @@ impl Editor {
             },
         );
         self.replace_range(range, &replacement);
-        self.commit_transaction(self.cursor_snapshot());
         if real_session {
             self.replay_controller.complete_step(
                 workspace_id,
-                step_id,
+                first_original,
                 crate::replay::ReplayCompletion::Automatic,
             )?;
+            for original in original_hunk_ids.iter().skip(1) {
+                let contents = self.current_buffer().contents();
+                let revision = self.current_buffer().revision();
+                let path = Path::new(&step.path);
+                let stage = self.replay_controller.stage_step(
+                    workspace_id,
+                    original,
+                    path,
+                    &contents,
+                    revision,
+                )?;
+                let stage = self.replay_controller.consume_stage(
+                    &stage.token,
+                    path,
+                    &contents,
+                    revision,
+                )?;
+                self.replace_range(stage.range, &stage.replacement);
+                self.replay_controller.complete_step(
+                    workspace_id,
+                    original,
+                    crate::replay::ReplayCompletion::Automatic,
+                )?;
+            }
         }
+        self.commit_transaction(self.cursor_snapshot());
         if let Some(workspace) = self.replay_demo_workspace.as_mut() {
             workspace.applied_steps.push(ReplayAppliedStep {
                 source_buffer,
@@ -5417,13 +5510,17 @@ impl Editor {
             }
         }
 
+        let original_hunk_ids = self
+            .replay_semantic_hunk_ids(&workspace_id, &applied.step_id)
+            .unwrap_or_else(|| vec![applied.step_id.clone()]);
         if let Ok(session) = self.replay_controller.session(&workspace_id) {
             if session.steps.iter().any(|candidate| {
                 candidate.status == crate::replay::ReplayStepStatus::Done
+                    && !original_hunk_ids.iter().any(|id| id == &candidate.id)
                     && candidate
                         .dependencies
                         .iter()
-                        .any(|dependency| dependency == &applied.step_id)
+                        .any(|dependency| original_hunk_ids.contains(dependency))
             }) {
                 self.last_error = Some(
                     "Undo the completed dependent replay hunk before its prerequisite".to_string(),
@@ -5442,8 +5539,10 @@ impl Editor {
         }
         self.undo_transaction(render_buffer, runtime).await?;
         if self.replay_controller.session(&workspace_id).is_ok() {
-            self.replay_controller
-                .reopen_step(&workspace_id, &applied.step_id)?;
+            for original in original_hunk_ids.iter().rev() {
+                self.replay_controller
+                    .reopen_step(&workspace_id, original)?;
+            }
         }
         if let Some(workspace) = self.replay_demo_workspace.as_mut() {
             workspace.applied_steps.pop();
@@ -25973,6 +26072,95 @@ mod test {
         (directory, session, workspace)
     }
 
+    fn semantic_replay_session_fixture() -> (
+        tempfile::TempDir,
+        crate::replay::ReplaySession,
+        crate::replay::ReplayWorkspace,
+        &'static str,
+        &'static str,
+    ) {
+        let before = concat!(
+            "fn existing_request() {\n",
+            "    preserve_original_behavior();\n",
+            "}\n",
+            "#[test]\n",
+            "fn neighboring_test() {\n",
+            "    let one = 1;\n",
+            "    let two = 2;\n",
+            "    let three = 3;\n",
+            "    let four = 4;\n",
+            "    let five = 5;\n",
+            "    assert_eq!(one + two + three + four, 10);\n",
+            "    assert_eq!(five, 5);\n",
+            "}\n",
+        );
+        let after = concat!(
+            "fn existing_request() {\n",
+            "    preserve_original_behavior();\n",
+            "}\n",
+            "\n",
+            "#[test]\n",
+            "fn neighboring_test() {\n",
+            "    let one = 1;\n",
+            "    let two = 2;\n",
+            "    let three = 3;\n",
+            "    let four = 4;\n",
+            "    let five = 5;\n",
+            "    assert_eq!(one + two + three + four, 10);\n",
+            "    assert_eq!(five, 5);\n",
+            "}\n",
+            "\n",
+            "#[test]\n",
+            "fn legacy_requests_default_missing_blocking_to_true() {\n",
+            "    assert!(legacy_request().is_blocking);\n",
+            "}\n",
+        );
+        let path = "src/token.rs";
+        let patch = format!(
+            "diff --git a/{path} b/{path}\n{}",
+            similar::TextDiff::from_lines(before, after)
+                .unified_diff()
+                .context_radius(3)
+                .header(&format!("a/{path}"), &format!("b/{path}")),
+        );
+        let directory = tempfile::tempdir().expect("isolated semantic replay source fixture");
+        let root = directory.path();
+        std::fs::create_dir(root.join("src")).expect("semantic fixture source directory");
+        std::fs::write(root.join(path), before).expect("original semantic fixture source");
+        let base = crate::replay::GitObjectId::parse(&"a".repeat(40)).unwrap();
+        let source = crate::replay::ReplaySource {
+            id: "semantic-replay-source".to_string(),
+            repository: crate::replay::ReplayRepository {
+                root: root.to_path_buf(),
+                common_directory: root.join(".git"),
+                host: "github.com".to_string(),
+                owner: "example".to_string(),
+                name: "repository".to_string(),
+            },
+            kind: crate::replay::ReplaySourceKind::LocalRange,
+            base_commit: base.clone(),
+            target_commit: crate::replay::GitObjectId::parse(&"b".repeat(40)).unwrap(),
+            patch_digest: crate::replay::digest(patch.as_bytes()),
+            patch,
+            pull_request: None,
+            review_context: None,
+        };
+        let workspace = crate::replay::ReplayWorkspace {
+            root: root.to_path_buf(),
+            branch: "replay/semantic-bbbbbbb".to_string(),
+            base_commit: base,
+            created_by_replay: true,
+        };
+        let session = crate::replay::ReplaySession::from_source(
+            source,
+            workspace.clone(),
+            crate::replay::ReplayLimits::default(),
+        )
+        .expect("source-backed semantic review session");
+        assert_eq!(session.steps.len(), 2);
+        (directory, session, workspace, before, after)
+    }
+
     fn real_author_replay_session_fixture() -> (
         tempfile::TempDir,
         crate::replay::ReplaySession,
@@ -27377,6 +27565,191 @@ mod test {
                 .unwrap()
                 .contains("before_second()")
         );
+    }
+
+    #[tokio::test]
+    async fn real_replay_groups_incidental_hunks_into_one_atomic_apply_and_undo() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let (_directory, session, workspace, before, after) = semantic_replay_session_fixture();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        let mut runtime = Runtime::new();
+        let response = editor
+            .install_replay_source_session(session, "feature/replay", workspace, &mut render_buffer)
+            .await
+            .expect("open one semantic change backed by two exact original hunks");
+        let workspace_id = response["workspace_id"].as_str().unwrap();
+        let changes = response["plan"]["steps"].as_array().unwrap();
+        assert_eq!(changes.len(), 1);
+        let change_id = changes[0]["id"].as_str().unwrap();
+        let originals = changes[0]["original_hunk_ids"].as_array().unwrap();
+        assert_eq!(originals.len(), 2);
+        assert_eq!(
+            change_id,
+            originals[1].as_str().unwrap(),
+            "inline findings must anchor to the meaningful source hunk",
+        );
+        let validation = editor.replay_demo_step_validation(workspace_id, change_id);
+        assert_eq!(validation["state"], "incomplete");
+        let revision = validation["revision"].as_u64().unwrap();
+
+        editor
+            .apply_replay_demo_step(workspace_id, change_id, revision, &mut runtime)
+            .await
+            .expect("apply both exact original hunks in one attributed source transaction");
+
+        assert_eq!(editor.current_buffer().contents(), after);
+        let transaction = editor
+            .current_buffer()
+            .undo_history
+            .latest_transaction()
+            .expect("one atomic semantic-change transaction");
+        assert_eq!(transaction.edits.len(), 2);
+        assert!(matches!(
+            &transaction.origin,
+            EditOrigin::Replay { session_id, step_id }
+                if session_id == workspace_id && step_id == change_id
+        ));
+        let applied = editor.replay_controller.session(workspace_id).unwrap();
+        assert!(applied.steps.iter().all(|step| {
+            step.status == crate::replay::ReplayStepStatus::Done
+                && step.completion == Some(crate::replay::ReplayCompletion::Automatic)
+        }));
+        assert_eq!(
+            editor
+                .replay_demo_workspace
+                .as_ref()
+                .unwrap()
+                .applied_steps
+                .len(),
+            1,
+        );
+
+        editor
+            .execute(&Action::ReplayUndo, &mut render_buffer, &mut runtime)
+            .await
+            .expect("undo the complete grouped semantic change atomically");
+
+        assert_eq!(editor.current_buffer().contents(), before);
+        let reopened = editor.replay_controller.session(workspace_id).unwrap();
+        assert!(reopened
+            .steps
+            .iter()
+            .all(|step| step.status != crate::replay::ReplayStepStatus::Done));
+    }
+
+    #[tokio::test]
+    async fn real_replay_validates_every_manually_reconstructed_semantic_hunk() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let (_directory, session, workspace, _before, after) = semantic_replay_session_fixture();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        let response = editor
+            .install_replay_source_session(session, "feature/replay", workspace, &mut render_buffer)
+            .await
+            .expect("open one manually reconstructible semantic change");
+        let workspace_id = response["workspace_id"].as_str().unwrap();
+        let change_id = response["plan"]["steps"][0]["id"].as_str().unwrap();
+        let source = editor.current_buffer();
+        let end = source.char_idx_to_position(source.contents().chars().count());
+        editor.begin_transaction("manually reconstruct semantic change");
+        editor.replace_range(
+            TextRange::new(TextPosition::new(/*line*/ 0, /*character*/ 0), end),
+            after,
+        );
+        editor.commit_transaction(editor.cursor_snapshot());
+
+        let validation = editor.replay_demo_step_validation(workspace_id, change_id);
+
+        assert_eq!(validation["state"], "exact");
+        let session = editor.replay_controller.session(workspace_id).unwrap();
+        assert!(session.steps.iter().all(|step| {
+            step.status == crate::replay::ReplayStepStatus::Done
+                && step.completion == Some(crate::replay::ReplayCompletion::Manual)
+        }));
+        assert_eq!(
+            editor.active_replay_session_payload()["completions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+        );
+    }
+
+    #[tokio::test]
+    async fn real_replay_recovers_grouped_original_hunks_and_their_atomic_undo() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let (_directory, session, workspace, before, after) = semantic_replay_session_fixture();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        let mut runtime = Runtime::new();
+        let response = editor
+            .install_replay_source_session(session, "feature/replay", workspace, &mut render_buffer)
+            .await
+            .expect("open the recoverable semantic replay session");
+        let workspace_id = response["workspace_id"].as_str().unwrap().to_string();
+        let change_id = response["plan"]["steps"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let revision = editor.replay_demo_step_validation(&workspace_id, &change_id)["revision"]
+            .as_u64()
+            .unwrap();
+        editor
+            .apply_replay_demo_step(&workspace_id, &change_id, revision, &mut runtime)
+            .await
+            .expect("apply both exact original hunks before recovery");
+        let snapshot = editor.test_session_snapshot();
+
+        let buffers = Editor::buffers_from_session_snapshot(&snapshot);
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut recovered = Editor::with_size(
+            lsp,
+            /*width*/ 100,
+            /*height*/ 28,
+            config,
+            Theme::default(),
+            buffers,
+        )
+        .expect("restore the semantic scratch buffer and its undo transaction");
+        recovered.test_disable_terminal_output();
+        recovered
+            .restore_session_snapshot(&snapshot)
+            .expect("recover every exact original hunk without modifying the worktree");
+
+        assert_eq!(recovered.current_buffer().contents(), after);
+        let restored = recovered.active_replay_session_payload();
+        assert_eq!(restored["plan"]["steps"].as_array().unwrap().len(), 1);
+        assert_eq!(restored["completions"].as_array().unwrap().len(), 1);
+        assert_eq!(restored["plan"]["steps"][0]["id"], change_id);
+        assert!(recovered
+            .replay_controller
+            .session(&workspace_id)
+            .unwrap()
+            .steps
+            .iter()
+            .all(|step| step.status == crate::replay::ReplayStepStatus::Done));
+
+        recovered
+            .undo_replay_step(&mut render_buffer, &mut runtime)
+            .await
+            .expect("undo the recovered semantic change as one editor transaction");
+
+        assert_eq!(recovered.current_buffer().contents(), before);
+        assert!(recovered
+            .replay_controller
+            .session(&workspace_id)
+            .unwrap()
+            .steps
+            .iter()
+            .all(|step| step.status != crate::replay::ReplayStepStatus::Done));
     }
 
     #[tokio::test]
