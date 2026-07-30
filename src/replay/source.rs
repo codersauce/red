@@ -849,10 +849,20 @@ pub fn fetch_pull_request_objects(
             return Err(ReplayError::SourceRefMoved);
         }
     }
-    let fetched_base = git_object(&resolved.repository.root, &format!("{namespace}/base"))?;
     let fetched_head = git_object(&resolved.repository.root, &format!("{namespace}/head"))?;
-    if fetched_base != request.base_ref_tip || fetched_head != request.head_commit {
+    if fetched_head != request.head_commit {
         return Err(ReplayError::SourceRefMoved);
+    }
+    let base_reference = format!("{namespace}/base");
+    let fetched_base = git_object(&resolved.repository.root, &base_reference)?;
+    if fetched_base != request.base_ref_tip {
+        let mut command = replay_git_command(&resolved.repository.root);
+        command
+            .args(["-c", "core.hooksPath=/dev/null", "update-ref"])
+            .arg(&base_reference)
+            .arg(request.base_ref_tip.as_str())
+            .arg(fetched_base.as_str());
+        run_command(&mut command, MAX_COMMAND_DIAGNOSTIC_BYTES)?;
     }
     resolved.missing_objects.clear();
     Ok(())
@@ -2125,6 +2135,223 @@ mod tests {
             .expect("fixture Git output is UTF-8")
             .trim()
             .to_string()
+    }
+
+    fn advanced_pull_request_repository() -> (tempfile::TempDir, ReplayResolvedPullRequest) {
+        let directory = tempfile::tempdir().expect("isolated original pull request fixture");
+        let remote = directory.path().join("origin.git");
+        let remote_path = remote.to_str().expect("UTF-8 original pull request remote");
+        fixture_git(
+            directory.path(),
+            &[
+                "init",
+                "--quiet",
+                "--bare",
+                "--initial-branch=main",
+                remote_path,
+            ],
+        );
+
+        let publisher = directory.path().join("publisher");
+        std::fs::create_dir(&publisher).expect("isolated pull request publisher");
+        fixture_git(&publisher, &["init", "--quiet", "--initial-branch=main"]);
+        fixture_git(&publisher, &["config", "user.name", "Replay Fixture"]);
+        fixture_git(&publisher, &["config", "user.email", "replay@example.test"]);
+        fixture_git(&publisher, &["remote", "add", "origin", remote_path]);
+        std::fs::write(publisher.join("original.txt"), "original base\n")
+            .expect("write the pinned original base");
+        fixture_git(&publisher, &["add", "original.txt"]);
+        fixture_git(
+            &publisher,
+            &["commit", "--quiet", "-m", "create pinned PR base"],
+        );
+        fixture_git(&publisher, &["push", "--quiet", "origin", "main"]);
+        let base_ref_tip = GitObjectId::parse(&fixture_git(&publisher, &["rev-parse", "HEAD"]))
+            .expect("pin the exact original pull request base");
+
+        fixture_git(&publisher, &["checkout", "--quiet", "-b", "feature/replay"]);
+        std::fs::write(publisher.join("feature.txt"), "original pull request\n")
+            .expect("write the pinned original pull request change");
+        fixture_git(&publisher, &["add", "feature.txt"]);
+        fixture_git(
+            &publisher,
+            &["commit", "--quiet", "-m", "create pinned PR head"],
+        );
+        let head_commit = GitObjectId::parse(&fixture_git(&publisher, &["rev-parse", "HEAD"]))
+            .expect("pin the exact original pull request head");
+        fixture_git(
+            &publisher,
+            &["push", "--quiet", "origin", "HEAD:refs/pull/2237/head"],
+        );
+
+        fixture_git(&publisher, &["checkout", "--quiet", "main"]);
+        std::fs::write(publisher.join("advanced.txt"), "target branch advanced\n")
+            .expect("advance only the pull request target branch");
+        fixture_git(&publisher, &["add", "advanced.txt"]);
+        fixture_git(
+            &publisher,
+            &["commit", "--quiet", "-m", "advance PR target"],
+        );
+        fixture_git(&publisher, &["push", "--quiet", "origin", "main"]);
+
+        let local = directory.path().join("local");
+        let local_path = local.to_str().expect("UTF-8 original pull request clone");
+        fixture_git(
+            directory.path(),
+            &[
+                "clone",
+                "--quiet",
+                "--no-local",
+                "--single-branch",
+                "--branch",
+                "main",
+                remote_path,
+                local_path,
+            ],
+        );
+
+        let mut pull_request = sample_capability_request();
+        pull_request.number = 2237;
+        pull_request.url = "https://github.com/example/replay-fixture/pull/2237".to_string();
+        pull_request.base_ref = "main".to_string();
+        pull_request.base_ref_tip = base_ref_tip;
+        pull_request.head_commit = head_commit.clone();
+
+        let resolved = ReplayResolvedPullRequest {
+            source_id: "original-pull-request-fixture".to_string(),
+            repository: ReplayRepository {
+                root: std::fs::canonicalize(&local).expect("canonical local replay repository"),
+                common_directory: std::fs::canonicalize(local.join(".git"))
+                    .expect("canonical local Git directory"),
+                host: "github.com".to_string(),
+                owner: "example".to_string(),
+                name: "replay-fixture".to_string(),
+            },
+            pull_request,
+            context: ReplayReviewContext {
+                title: "Original pull request".to_string(),
+                body: String::new(),
+                author: Some("original-author".to_string()),
+                commits: Vec::new(),
+                changed_files: 1,
+            },
+            missing_objects: vec![head_commit],
+        };
+
+        (directory, resolved)
+    }
+
+    #[test]
+    fn fetches_original_pull_request_after_its_target_branch_advances() {
+        let (_directory, mut resolved) = advanced_pull_request_repository();
+        let root = resolved.repository.root.clone();
+        let original_branch = fixture_git(&root, &["branch", "--show-current"]);
+
+        assert!(has_git_commit(&root, &resolved.pull_request.base_ref_tip).unwrap());
+        assert!(!has_git_commit(&root, &resolved.pull_request.head_commit).unwrap());
+
+        fetch_pull_request_objects(&mut resolved, /*confirmed*/ true)
+            .expect("an advanced target branch must not invalidate the pinned original PR");
+
+        let namespace = format!(
+            "refs/replay/pr-2237-{}",
+            resolved.pull_request.head_commit.short(),
+        );
+        assert!(resolved.missing_objects.is_empty());
+        assert_eq!(
+            fixture_git(&root, &["rev-parse", &format!("{namespace}/base")]),
+            resolved.pull_request.base_ref_tip.as_str(),
+        );
+        assert_eq!(
+            fixture_git(&root, &["rev-parse", &format!("{namespace}/head")]),
+            resolved.pull_request.head_commit.as_str(),
+        );
+        assert_eq!(
+            fixture_git(&root, &["branch", "--show-current"]),
+            original_branch
+        );
+
+        let source = finalize_pull_request(&resolved, ReplayLimits::default())
+            .expect("reconstruct the review from its original pinned endpoints");
+        assert_eq!(source.base_commit, resolved.pull_request.base_ref_tip);
+        assert_eq!(source.target_commit, resolved.pull_request.head_commit);
+    }
+
+    #[test]
+    fn fetches_missing_original_base_after_its_target_branch_advances() {
+        let (directory, mut resolved) = advanced_pull_request_repository();
+        let local = directory.path().join("unrelated");
+        std::fs::create_dir(&local).expect("isolated repository without original PR objects");
+        fixture_git(&local, &["init", "--quiet", "--initial-branch=main"]);
+        fixture_git(&local, &["config", "user.name", "Replay Fixture"]);
+        fixture_git(&local, &["config", "user.email", "replay@example.test"]);
+        std::fs::write(local.join("local.txt"), "unrelated current work\n")
+            .expect("write unrelated existing work");
+        fixture_git(&local, &["add", "local.txt"]);
+        fixture_git(&local, &["commit", "--quiet", "-m", "preserve local work"]);
+        let original_head = fixture_git(&local, &["rev-parse", "HEAD"]);
+        let remote = directory.path().join("origin.git");
+        fixture_git(
+            &local,
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("UTF-8 original pull request remote"),
+            ],
+        );
+
+        resolved.repository.root = std::fs::canonicalize(&local)
+            .expect("canonical unrelated repository without original PR objects");
+        resolved.repository.common_directory =
+            std::fs::canonicalize(local.join(".git")).expect("canonical unrelated Git directory");
+        resolved.missing_objects = vec![
+            resolved.pull_request.base_ref_tip.clone(),
+            resolved.pull_request.head_commit.clone(),
+        ];
+        assert!(!has_git_commit(&local, &resolved.pull_request.base_ref_tip).unwrap());
+        assert!(!has_git_commit(&local, &resolved.pull_request.head_commit).unwrap());
+
+        fetch_pull_request_objects(&mut resolved, /*confirmed*/ true)
+            .expect("fetch the original base through the advanced target branch");
+
+        assert!(resolved.missing_objects.is_empty());
+        assert_eq!(fixture_git(&local, &["rev-parse", "HEAD"]), original_head);
+        assert!(has_git_commit(&local, &resolved.pull_request.base_ref_tip).unwrap());
+        assert!(has_git_commit(&local, &resolved.pull_request.head_commit).unwrap());
+    }
+
+    #[test]
+    fn refuses_pull_request_fetch_after_its_original_head_moves() {
+        let (directory, mut resolved) = advanced_pull_request_repository();
+        let publisher = directory.path().join("publisher");
+        fixture_git(&publisher, &["checkout", "--quiet", "feature/replay"]);
+        std::fs::write(
+            publisher.join("feature.txt"),
+            "changed original pull request\n",
+        )
+        .expect("move the original pull request head");
+        fixture_git(&publisher, &["add", "feature.txt"]);
+        fixture_git(
+            &publisher,
+            &["commit", "--quiet", "-m", "move original PR head"],
+        );
+        fixture_git(
+            &publisher,
+            &["push", "--quiet", "origin", "HEAD:refs/pull/2237/head"],
+        );
+        let original_branch = fixture_git(&resolved.repository.root, &["branch", "--show-current"]);
+
+        assert!(matches!(
+            fetch_pull_request_objects(&mut resolved, /*confirmed*/ true),
+            Err(ReplayError::SourceRefMoved),
+        ));
+
+        assert!(!resolved.missing_objects.is_empty());
+        assert_eq!(
+            fixture_git(&resolved.repository.root, &["branch", "--show-current"]),
+            original_branch,
+        );
     }
 
     fn diverged_local_repository() -> (tempfile::TempDir, GitObjectId, GitObjectId) {
