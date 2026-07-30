@@ -4710,10 +4710,22 @@ impl Editor {
             .replay_controller
             .active_session()
             .map(|session| &session.id);
+        let open_paths = self
+            .buffer_manager
+            .iter()
+            .filter_map(|buffer| buffer.file.as_deref())
+            .map(Path::new)
+            .collect::<HashSet<_>>();
 
         self.replay_controller
             .sessions()
             .into_iter()
+            .filter(|session| {
+                session.steps.iter().all(|step| {
+                    let path = session.workspace.root.join(&step.path);
+                    open_paths.contains(path.as_path())
+                })
+            })
             .map(|session| {
                 let branch = self
                     .replay_source_displays
@@ -26868,6 +26880,40 @@ mod test {
                 .discarded_sessions[0]
                 .id,
             original_id,
+        );
+    }
+
+    #[tokio::test]
+    async fn live_review_without_its_original_buffers_cannot_hide_a_recoverable_snapshot() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let (directory, session, workspace) = real_replay_session_fixture();
+        let mut editor = test_editor(/*width*/ 100, /*height*/ 28);
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        editor
+            .install_replay_source_session(session, "feature/replay", workspace, &mut render_buffer)
+            .await
+            .expect("open every original scratch source buffer");
+        assert_eq!(editor.live_replay_reviews().len(), 1);
+
+        let missing = directory.path().join("src/second.rs");
+        let index = editor
+            .buffer_manager
+            .iter()
+            .position(|buffer| {
+                buffer
+                    .file
+                    .as_deref()
+                    .is_some_and(|path| Path::new(path) == missing.as_path())
+            })
+            .expect("the original second source buffer was opened");
+        editor.buffer_manager.remove_buffer(index);
+
+        assert!(editor.replay_controller.active_session().is_some());
+        assert!(
+            editor.live_replay_reviews().is_empty(),
+            "controller-only sessions must not replace older snapshots with complete source",
         );
     }
 
