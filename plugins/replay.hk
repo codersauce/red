@@ -304,7 +304,11 @@ fn open() {
     }
     red::state_set("replay_review_request", -1);
     red::state_set("replay_resume_request", -1);
-    let picker = red::execute("OpenPicker", "PR Replay Reviews", [], PickerOptions {
+    let picker = red::execute("OpenPicker", "PR Replay Reviews", [PickerItem {
+        id: "start-new",
+        label: "Start a new review",
+        data: Json {},
+    }], PickerOptions {
         placeholder: "Filter saved reviews",
         status: "Looking for saved reviews…",
         busy: true,
@@ -328,11 +332,6 @@ fn reviews_listed(result: Json, request_id: i32) {
     }
     if !red::bool(result.ok, false) {
         red::execute("UpdatePickerBusy", picker, false);
-        red::execute("UpdatePickerItems", picker, [PickerItem {
-            id: "start-new",
-            label: "Start a new review",
-            data: Json {},
-        }]);
         red::execute(
             "UpdatePickerStatus",
             picker,
@@ -341,18 +340,12 @@ fn reviews_listed(result: Json, request_id: i32) {
         return;
     }
     let reviews = result.reviews;
-    if red::len(reviews) == 0 {
-        red::state_set("replay_review_picker", red::null());
-        open_source_picker();
-        return;
-    }
-    if red::len(reviews) == 1 {
-        red::execute("UpdatePickerStatus", picker, "Reopening saved review…");
-        resume_review(reviews[0]);
-        return;
-    }
-
-    let items = [];
+    let review_count = red::len(reviews);
+    let items = [PickerItem {
+        id: "start-new",
+        label: "Start a new review",
+        data: Json {},
+    }];
     for review in reviews {
         let number = red::int(review.pull_request, 0);
         let label = red::string(review.title, "Local branch review");
@@ -383,13 +376,12 @@ fn reviews_listed(result: Json, request_id: i32) {
             data: review,
         });
     }
-    items = red::push(items, PickerItem {
-        id: "start-new",
-        label: "Start a new review",
-        data: Json {},
-    });
     red::execute("UpdatePickerBusy", picker, false);
     red::execute("UpdatePickerItems", picker, items);
+    if review_count == 0 {
+        red::execute("UpdatePickerStatus", picker, "No saved reviews. Start a new one.");
+        return;
+    }
     red::execute(
         "UpdatePickerStatus",
         picker,

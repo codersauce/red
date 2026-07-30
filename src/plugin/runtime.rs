@@ -3921,8 +3921,8 @@ mod tests {
         })
     }
 
-    fn recv_replay_review_discovery() -> (PickerHandle, RequestId) {
-        let handle = match ACTION_DISPATCHER.recv_request() {
+    fn recv_replay_review_discovery() -> (PickerHandle, RequestId, PickerItem) {
+        let (handle, start_new) = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::OpenCallbackPicker {
                 owner,
                 handle,
@@ -3932,21 +3932,23 @@ mod tests {
             } => {
                 assert_eq!(owner, "replay");
                 assert_eq!(title.as_deref(), Some("PR Replay Reviews"));
-                assert!(items.is_empty());
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].id, "start-new");
+                assert_eq!(items[0].label, "Start a new review");
                 assert_eq!(
                     options.status.as_deref(),
                     Some("Looking for saved reviews…")
                 );
                 assert!(options.busy);
-                handle
+                (handle, items[0].clone())
             }
-            _ => panic!("expected visible Replay loading feedback before review discovery"),
+            _ => panic!("expected an immediately usable Replay picker before review discovery"),
         };
         let request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::ReplayListReviews { request_id } => request_id,
             _ => panic!("expected read-only discovery of existing Replay reviews"),
         };
-        (handle, request_id)
+        (handle, request_id, start_new)
     }
 
     fn recv_replay_review_items(handle: PickerHandle) -> Vec<PickerItem> {
@@ -5081,6 +5083,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_launcher_starts_a_new_review_while_saved_reviews_are_loading() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        prepare_replay_runtime(&mut runtime);
+        runtime
+            .load_plugin("replay", include_str!("../../plugins/replay.hk"))
+            .await
+            .unwrap();
+
+        runtime.execute_command("Replay").await.unwrap();
+        let (loading_picker, request_id, start_new) = recv_replay_review_discovery();
+
+        assert!(runtime
+            .notify_picker(loading_picker, PickerCallback::Selected(start_new))
+            .unwrap());
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker { title, items, .. } => {
+                assert_eq!(title.as_deref(), Some("Start PR Replay"));
+                assert_eq!(
+                    items
+                        .iter()
+                        .map(|item| item.id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["github", "local", "demo"],
+                );
+            }
+            _ => panic!("expected new-review sources before saved-review discovery finished"),
+        }
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "reviews": [recovered_review(
+                        "review-original-pr",
+                        2733,
+                        "Paginate session history",
+                        3,
+                        49,
+                        false,
+                        true,
+                    )],
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            ACTION_DISPATCHER.try_recv_request().is_none(),
+            "late saved-review discovery must not replace an already chosen source picker",
+        );
+    }
+
+    #[tokio::test]
     async fn replay_launcher_offers_github_local_branch_and_safe_demo_sources() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -5092,11 +5151,33 @@ mod tests {
             .unwrap();
 
         runtime.execute_command("Replay").await.unwrap();
-        let (_loading_picker, request_id) = recv_replay_review_discovery();
+        let (loading_picker, request_id, start_new) = recv_replay_review_discovery();
         runtime
             .resolve_request(request_id, serde_json::json!({ "ok": true, "reviews": [] }))
             .await
             .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerBusy { id, busy }
+                if id == loading_picker.get() && !busy
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerItems { id, items }
+                if id == loading_picker.get()
+                    && items.len() == 1
+                    && items[0].id == "start-new"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerStatus { id, status }
+                if id == loading_picker.get()
+                    && status.as_deref() == Some("No saved reviews. Start a new one.")
+        ));
+        assert!(runtime
+            .notify_picker(loading_picker, PickerCallback::Selected(start_new))
+            .unwrap());
 
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::OpenCallbackPicker {
@@ -5126,7 +5207,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_launcher_reopens_its_only_verified_review_without_a_picker() {
+    async fn replay_launcher_keeps_its_only_saved_review_selectable_without_auto_reopening() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
@@ -5137,7 +5218,7 @@ mod tests {
             .unwrap();
 
         runtime.execute_command("Replay").await.unwrap();
-        let (loading_picker, request_id) = recv_replay_review_discovery();
+        let (loading_picker, request_id, _start_new) = recv_replay_review_discovery();
         runtime
             .resolve_request(
                 request_id,
@@ -5157,12 +5238,18 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdatePickerStatus { id, status }
-                if id == loading_picker.get()
-                    && status.as_deref() == Some("Reopening saved review…")
-        ));
+        let items = recv_replay_review_items(loading_picker);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["start-new", "review-original-pr"],
+        );
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        assert!(runtime
+            .notify_picker(loading_picker, PickerCallback::Selected(items[1].clone()))
+            .unwrap());
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::ReplayResumeReview { review_id, .. }
@@ -5183,14 +5270,16 @@ mod tests {
             .unwrap();
 
         runtime.execute_command("Replay").await.unwrap();
-        let (cancelled_picker, cancelled_request) = recv_replay_review_discovery();
+        let (cancelled_picker, cancelled_request, _cancelled_start_new) =
+            recv_replay_review_discovery();
         assert!(runtime
             .notify_picker(cancelled_picker, PickerCallback::Cancelled)
             .unwrap());
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
 
         runtime.execute_command("Replay").await.unwrap();
-        let (_replacement_picker, replacement_request) = recv_replay_review_discovery();
+        let (replacement_picker, replacement_request, _replacement_start_new) =
+            recv_replay_review_discovery();
         runtime
             .resolve_request(
                 cancelled_request,
@@ -5220,8 +5309,21 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenCallbackPicker { title, .. }
-                if title.as_deref() == Some("Start PR Replay")
+            PluginRequest::UpdatePickerBusy { id, busy }
+                if id == replacement_picker.get() && !busy
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerItems { id, items }
+                if id == replacement_picker.get()
+                    && items.len() == 1
+                    && items[0].id == "start-new"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePickerStatus { id, status }
+                if id == replacement_picker.get()
+                    && status.as_deref() == Some("No saved reviews. Start a new one.")
         ));
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
@@ -5238,7 +5340,7 @@ mod tests {
             .unwrap();
 
         runtime.execute_command("Replay").await.unwrap();
-        let (handle, request_id) = recv_replay_review_discovery();
+        let (handle, request_id, start_new) = recv_replay_review_discovery();
         runtime
             .resolve_request(
                 request_id,
@@ -5252,15 +5354,6 @@ mod tests {
             PluginRequest::UpdatePickerBusy { id, busy }
                 if id == handle.get() && !busy
         ));
-        let start_new = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::UpdatePickerItems { id, mut items } => {
-                assert_eq!(id, handle.get());
-                assert_eq!(items.len(), 1);
-                items.remove(0)
-            }
-            _ => panic!("expected a safe new-review action when saved discovery fails"),
-        };
-        assert_eq!(start_new.id, "start-new");
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdatePickerStatus { id, status }
@@ -5292,7 +5385,7 @@ mod tests {
             .unwrap();
 
         runtime.execute_command("Replay").await.unwrap();
-        let (handle, request_id) = recv_replay_review_discovery();
+        let (handle, request_id, _start_new) = recv_replay_review_discovery();
         runtime
             .resolve_request(
                 request_id,
@@ -5329,18 +5422,18 @@ mod tests {
                 .iter()
                 .map(|item| item.id.as_str())
                 .collect::<Vec<_>>(),
-            ["review-active-pr", "review-another-pr", "start-new"]
+            ["start-new", "review-active-pr", "review-another-pr"]
         );
-        assert!(items[0].label.contains("#2733"));
-        assert!(items[0].label.contains("3/49"));
-        assert!(items[0].label.contains("2 notes"));
-        assert!(items[0].label.contains("unsaved"));
-        assert!(items[0].label.contains("active"));
-        assert!(items[1].label.contains("#145"));
-        assert!(items[1].label.contains("7/11"));
+        assert!(items[1].label.contains("#2733"));
+        assert!(items[1].label.contains("3/49"));
+        assert!(items[1].label.contains("2 notes"));
+        assert!(items[1].label.contains("unsaved"));
+        assert!(items[1].label.contains("active"));
+        assert!(items[2].label.contains("#145"));
+        assert!(items[2].label.contains("7/11"));
 
         assert!(runtime
-            .notify_picker(handle, PickerCallback::Selected(items[1].clone()))
+            .notify_picker(handle, PickerCallback::Selected(items[2].clone()))
             .unwrap());
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -5362,7 +5455,7 @@ mod tests {
             .unwrap();
 
         runtime.execute_command("Replay").await.unwrap();
-        let (handle, request_id) = recv_replay_review_discovery();
+        let (handle, request_id, _start_new) = recv_replay_review_discovery();
         runtime
             .resolve_request(
                 request_id,
