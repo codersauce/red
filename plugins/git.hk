@@ -64,7 +64,6 @@ pub fn activate() {
         aliases: ["abort commit"],
     });
     red::on("workspace:event:git-dashboard", workspace_event);
-    red::on("buffer:changed", schedule_refresh);
     red::on("file:opened", schedule_refresh);
     red::on("file:saved", schedule_refresh);
     red::on("window:buffer_changed", schedule_refresh);
@@ -76,6 +75,7 @@ pub fn activate() {
     red::state_set("git_status_initialized", false);
     red::state_set("git_status_output", "");
     red::state_set("git_refresh_forced", true);
+    red::state_set("git_refresh_pending", false);
     red::state_set("git_idle_polls", 0);
     red::state_set("git_refresh_timer", "");
     red::state_set("git_poll_timer", "");
@@ -187,11 +187,15 @@ fn close_dashboard() {
 }
 
 fn schedule_poll() {
-    red::state_set("git_poll_timer", red::execute("SetTimeout", 5000));
+    let delay = 120000;
+    if red::state_bool("git_dashboard_open") {
+        delay = 5000;
+    }
+    red::state_set("git_poll_timer", red::execute("SetTimeout", delay));
 }
 
 fn git_directory_changed(event: Json) {
-    force_refresh();
+    schedule_refresh(event);
 }
 
 fn schedule_refresh(event: Json) {
@@ -218,7 +222,9 @@ fn timeout_callback(event: Json) {
     }
     if event.timer_id == red::state("git_poll_timer") {
         red::state_set("git_poll_timer", "");
-        refresh();
+        if red::string(red::state("git_process"), "") == "" {
+            refresh();
+        }
         schedule_poll();
     }
 }
@@ -231,7 +237,8 @@ fn force_refresh() {
 fn refresh() {
     let previous = red::string(red::state("git_process"), "");
     if previous != "" {
-        red::execute("KillProcess", previous);
+        red::state_set("git_refresh_pending", true);
+        return;
     }
     let process_id = red::execute("SpawnProcess", Process {
         command: "git",
@@ -239,6 +246,7 @@ fn refresh() {
         env: Json {
             GIT_PAGER: "cat",
             GIT_TERMINAL_PROMPT: "0",
+            GIT_OPTIONAL_LOCKS: "0",
             LC_ALL: "C",
         },
         raw_output: true,
@@ -353,6 +361,10 @@ fn status_event(event: Json) {
         red::state_set("git_process", "");
         if red::int(event.code, 0) != 0 {
             render_error("git status exited with " + red::int(event.code, 0));
+        }
+        if red::state_bool("git_refresh_pending") {
+            red::state_set("git_refresh_pending", false);
+            refresh();
         }
     }
 }
@@ -2415,6 +2427,7 @@ fn deactivate() {
     }
     red::state_set("git_refresh_timer", "");
     red::state_set("git_poll_timer", "");
+    red::state_set("git_refresh_pending", false);
     if red::string(red::state("git_watch_path"), "") != "" {
         red::execute("UnwatchDirectory", 1502);
     }

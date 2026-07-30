@@ -4832,6 +4832,22 @@ mod tests {
         runtime
     }
 
+    #[cfg(not(windows))]
+    fn git_plugin_state(runtime: &Runtime, key: &str) -> serde_json::Value {
+        let inner = runtime
+            .inner
+            .lock()
+            .expect("inspect the initialized Git plugin state");
+        inner
+            .host
+            .policy()
+            .plugin_states
+            .get("git")
+            .and_then(|state| state.get(key))
+            .map(value_to_json)
+            .expect("initialized Git plugin state")
+    }
+
     #[test]
     fn embedded_git_core_compiles_as_a_native_multi_file_package_and_normalizes_options() {
         let program = git_core_program().unwrap();
@@ -4852,6 +4868,14 @@ mod tests {
         assert_eq!(status["head"], "native");
         assert_eq!(status["untracked"][0]["path"], "src/new file.rs");
         assert!(status["untracked"][0]["original_path"].is_null());
+
+        let status_args = host.call_git_core("status_args", &[]).unwrap().to_json();
+        assert!(status_args.as_array().is_some_and(|args| args
+            .iter()
+            .any(|arg| arg.as_str() == Some("--untracked-files=normal"))));
+        assert!(!status_args.as_array().is_some_and(|args| args
+            .iter()
+            .any(|arg| arg.as_str() == Some("--untracked-files=all"))));
 
         let document = host
             .call_git_core(
@@ -14537,6 +14561,264 @@ mod tests {
             }
             _ => panic!("unexpected plugin request"),
         }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn git_status_does_not_rescan_the_repository_for_unsaved_buffer_edits() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("git", include_str!("../../plugins/git.hk"))
+            .await
+            .unwrap();
+        drain_requests();
+        let original_timeout_count = PENDING_TIMEOUTS.lock().unwrap().len();
+        let poll_timer = git_plugin_state(&runtime, "git_poll_timer")
+            .as_str()
+            .unwrap()
+            .to_string();
+        let poll_delay = PENDING_TIMEOUTS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|timeout| timeout.id == poll_timer)
+            .unwrap()
+            .expires_at
+            .saturating_duration_since(Instant::now());
+        assert!(
+            poll_delay > Duration::from_secs(110),
+            "background repository-wide polling must remain infrequent while Git is hidden",
+        );
+
+        for _ in 0..32 {
+            runtime
+                .notify("buffer:changed", serde_json::json!({ "buffer_index": 7 }))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            PENDING_TIMEOUTS.lock().unwrap().len(),
+            original_timeout_count,
+            "unsaved editor changes cannot change repository status on disk",
+        );
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime.deactivate_all().await.unwrap();
+        drain_requests();
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn git_directory_notifications_are_debounced_without_spawning_status_immediately() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new_with_permissions(HashMap::from([(
+            "git".to_string(),
+            PluginPermissions {
+                process: vec!["git".to_string()],
+            },
+        )]));
+        runtime
+            .load_plugin("git", include_str!("../../plugins/git.hk"))
+            .await
+            .unwrap();
+        drain_requests();
+        let original_timeout_count = PENDING_TIMEOUTS.lock().unwrap().len();
+
+        for _ in 0..32 {
+            runtime
+                .notify("filesystem:changed:1502", serde_json::json!({}))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            runtime
+                .inner
+                .lock()
+                .unwrap()
+                .host
+                .process_manager
+                .active_process_count("git"),
+            0,
+            "Git metadata updates should wait for one coalesced refresh",
+        );
+        assert_eq!(
+            PENDING_TIMEOUTS.lock().unwrap().len(),
+            original_timeout_count + 1,
+            "repeated Git metadata changes retain only one refresh timeout",
+        );
+
+        runtime.deactivate_all().await.unwrap();
+        drain_requests();
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn git_status_keeps_one_in_flight_scan_and_coalesces_follow_up_requests() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+
+        let mut runtime = Runtime::new_with_permissions(HashMap::from([(
+            "git".to_string(),
+            PluginPermissions {
+                process: vec!["git".to_string()],
+            },
+        )]));
+        runtime
+            .load_plugin("git", include_str!("../../plugins/git.hk"))
+            .await
+            .unwrap();
+        drain_requests();
+        {
+            let mut inner = runtime.inner.lock().unwrap();
+            inner
+                .host
+                .policy_mut()
+                .plugin_states
+                .get_mut("git")
+                .unwrap()
+                .insert(
+                    "git_root".to_string(),
+                    Value::String(root.display().to_string()),
+                );
+        }
+
+        runtime.execute_command("GitRefresh").await.unwrap();
+        let original_process = git_plugin_state(&runtime, "git_process")
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!original_process.is_empty());
+
+        for _ in 0..32 {
+            runtime.execute_command("GitRefresh").await.unwrap();
+        }
+
+        assert_eq!(
+            git_plugin_state(&runtime, "git_process").as_str(),
+            Some(original_process.as_str()),
+            "a running status must never be killed and restarted for newer events",
+        );
+        assert_eq!(
+            git_plugin_state(&runtime, "git_refresh_pending"),
+            serde_json::json!(true),
+        );
+        assert_eq!(
+            runtime
+                .inner
+                .lock()
+                .unwrap()
+                .host
+                .process_manager
+                .active_process_count("git"),
+            1,
+        );
+
+        runtime.deactivate_all().await.unwrap();
+        drain_requests();
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn git_status_groups_large_untracked_directories_into_one_reviewable_entry() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        let generated = root.join("generated");
+        fs::create_dir(&generated).unwrap();
+        for index in 0..256 {
+            fs::write(generated.join(format!("output_{index}.txt")), "pending\n").unwrap();
+        }
+
+        let mut runtime = load_git_runtime(root).await;
+        runtime.execute_command("GitRefresh").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            while ACTION_DISPATCHER.try_recv_request().is_some() {}
+            let state = git_plugin_state(&runtime, "git_state");
+            if let Some(untracked) = state["untracked"].as_array() {
+                if !untracked.is_empty() {
+                    assert_eq!(untracked.len(), 1);
+                    assert_eq!(untracked[0]["path"], "generated/");
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Git status did not report the grouped untracked directory",
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn git_status_does_not_rewrite_the_index_or_retrigger_its_directory_watch() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        let tracked = root.join("tracked.rs");
+        fs::write(&tracked, "fn tracked() {}\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "tracked.rs"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        let index = root.join(".git/index");
+        let original_index = fs::read(&index).unwrap();
+        fs::write(&tracked, "fn tracked() {}\n").unwrap();
+
+        let mut runtime = load_git_runtime(root).await;
+        runtime.execute_command("GitRefresh").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            while ACTION_DISPATCHER.try_recv_request().is_some() {}
+            if git_plugin_state(&runtime, "git_status_initialized") == serde_json::json!(true) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "read-only Git status did not complete",
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            fs::read(index).unwrap(),
+            original_index,
+            "background status must not rewrite the watched repository index",
+        );
     }
 
     #[cfg(not(windows))]
