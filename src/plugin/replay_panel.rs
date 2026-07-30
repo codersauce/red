@@ -298,6 +298,8 @@ pub(super) struct ReplayPanelState {
 impl ReplayPanelState {
     /// Parse once at the plugin boundary and reject invalid or unrelated hunks.
     pub(super) fn parse(text: &str) -> Option<Self> {
+        let _span = crate::editor::perf::PerfSpan::start("replay:parse_model");
+        crate::editor::perf::gauge_max("replay:model_bytes", text.len() as u64);
         let limits = ReplayLimits::default();
         if text.len() > limits.max_patch_bytes {
             return None;
@@ -605,6 +607,8 @@ pub(super) fn render_replay_panel(
     if width == 0 || height == 0 {
         return;
     }
+    let _span = crate::editor::perf::PerfSpan::start("replay:panel_render");
+    crate::editor::perf::gauge_max("replay:diff_lines", state.document.lines.len() as u64);
     match state.model.view {
         ReplayPanelView::Outbox => {
             render_replay_outbox(buffer, state, position, width, height, viewport, theme);
@@ -817,8 +821,14 @@ pub(super) fn render_replay_panel(
     }
 
     let diff_top = source_top.saturating_add(layout.source_rows);
-    let highlights = highlight_document(Some(&state.document), theme);
-    let intraline = replay_intraline_highlights(&state.document, theme);
+    let highlights = {
+        let _span = crate::editor::perf::PerfSpan::start("replay:syntax_highlight");
+        highlight_document(Some(&state.document), theme)
+    };
+    let intraline = {
+        let _span = crate::editor::perf::PerfSpan::start("replay:intraline_highlight");
+        replay_intraline_highlights(&state.document, theme)
+    };
     let dual_gutter = replay_uses_dual_gutter(&state.document, width);
     for (offset, ((line, spans), changed_spans)) in state
         .document
@@ -858,6 +868,7 @@ pub(super) fn render_replay_panel(
 }
 
 fn replay_document(model: &ReplayPanelModel) -> Option<WorkspaceDocument> {
+    let _span = crate::editor::perf::PerfSpan::start("replay:build_document");
     let step = model.current_step()?;
     let patch = parse_patch(&step.diff, ReplayLimits::default()).ok()?;
     if patch.files.len() != 1 {

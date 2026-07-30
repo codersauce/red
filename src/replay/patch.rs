@@ -150,6 +150,8 @@ enum HunkLineKind {
 
 /// Parses an entire canonical patch or fails without exposing partial hunks.
 pub fn parse_patch(text: &str, limits: ReplayLimits) -> Result<ReplayPatch, ReplayError> {
+    let _span = crate::editor::perf::PerfSpan::start("replay:parse_patch");
+    crate::editor::perf::gauge_max("replay:patch_bytes", text.len() as u64);
     if text.len() > limits.max_patch_bytes {
         return Err(ReplayError::LimitExceeded {
             kind: "canonical patch bytes",

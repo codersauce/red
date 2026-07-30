@@ -926,6 +926,7 @@ pub(super) fn highlight_document(
     document: Option<&WorkspaceDocument>,
     theme: &Theme,
 ) -> Vec<Vec<crate::editor::StyleInfo>> {
+    let _span = crate::editor::perf::PerfSpan::start("workspace:highlight_document");
     let Some(document) = document else {
         return Vec::new();
     };
@@ -957,6 +958,7 @@ fn highlight_document_projection(
     highlighter: &mut Highlighter,
     new_side: bool,
 ) -> Vec<Vec<crate::editor::StyleInfo>> {
+    let _span = crate::editor::perf::PerfSpan::start("workspace:highlight_projection");
     let source_lines = document
         .lines
         .iter()

@@ -4258,6 +4258,7 @@ impl Editor {
     }
 
     fn focus_replay_step_source(&mut self, workspace_id: &str, step_id: &str) -> bool {
+        let _span = perf::PerfSpan::start("replay:focus_source");
         let Some(source_index) = self.replay_step_source_index(workspace_id, step_id) else {
             return false;
         };
@@ -4553,6 +4554,7 @@ impl Editor {
         step_id: &str,
         source_index: usize,
     ) -> Option<usize> {
+        let _span = perf::PerfSpan::start("replay:locate_hunk");
         let workspace = self.replay_demo_workspace.as_ref()?;
         if workspace.id != workspace_id {
             return None;
@@ -11069,6 +11071,11 @@ impl Editor {
                     needs_render = true;
                 }
                 PluginRequest::UpdateTextPanel { id, blocks } => {
+                    let _span = if id == "replay-coach" {
+                        perf::PerfSpan::start("replay:update_panel")
+                    } else {
+                        None
+                    };
                     self.panel_manager.update_text_panel(
                         &id,
                         blocks,

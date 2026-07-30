@@ -45,6 +45,7 @@ python3 scripts/interaction_bench.py typing
 python3 scripts/interaction_bench.py search --query self
 python3 scripts/interaction_bench.py picker --query src/editor.rs
 python3 scripts/git_workspace_bench.py --files 80 --presses 120
+python3 scripts/replay_bench.py --assert
 ```
 
 The detach driver creates an isolated config and Unicode-heavy buffer, disables LSP,
@@ -60,6 +61,13 @@ The Git workspace driver creates an isolated repository with many modified Rust 
 moves through the file list, then repeats the same motion in the diff pane. It reports frame and
 plugin-callback percentiles and fails if selection churn starts more than two subprocesses, core
 diff navigation starts any subprocess, or the Git plugin exceeds its process budget.
+
+The Replay driver opens the safe in-memory review, measures both individual change selection and
+sustained `j`/`k` navigation, and reports visible terminal-settle latency alongside Replay model,
+patch, source-focus, highlighting, and full-frame spans. Its default release gate requires p95
+navigation below 16 ms. Use `python3 scripts/replay_bench.py --profile debug --assert` to verify
+the unoptimized `cargo run` experience against its separate 50 ms budget. The benchmark never
+fetches a PR, creates a worktree, modifies reviewed source, or submits a GitHub review.
 
 ```shell
 python3 scripts/interaction_bench.py picker \
