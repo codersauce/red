@@ -69,6 +69,12 @@ navigation below 16 ms. Use `python3 scripts/replay_bench.py --profile debug --a
 the unoptimized `cargo run` experience against its separate 50 ms budget. The benchmark never
 fetches a PR, creates a worktree, modifies reviewed source, or submits a GitHub review.
 
+For a representative existing review, pass `--session-snapshot /path/to/latest.json` and
+`--navigation forward`. The driver copies that snapshot into its isolated temporary Red config,
+restores its real saved review and source buffers, and never modifies the original snapshot or
+reviewed files. Add `--trace-output /private/tmp/replay-perf.log` when detailed frame evidence is
+needed.
+
 ```shell
 python3 scripts/interaction_bench.py picker \
   --root ../codex \

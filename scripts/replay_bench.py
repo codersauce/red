@@ -10,10 +10,12 @@ Use `--profile debug` to inspect the same unoptimized build used by `cargo run`.
 import argparse
 from collections import defaultdict
 import fcntl
+import json
 import os
 from pathlib import Path
 import pty
 import re
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -87,7 +89,12 @@ def wait_until(predicate, process, timeout, message):
         if predicate():
             return
         if process.poll() is not None:
-            raise RuntimeError(f"editor exited before {message}: {process.returncode}")
+            detail = ""
+            if process.stderr is not None:
+                stderr = process.stderr.read().decode("utf-8", errors="replace").strip()
+                if stderr:
+                    detail = f" ({stderr.splitlines()[0][:300]})"
+            raise RuntimeError(f"editor exited before {message}: {process.returncode}{detail}")
         time.sleep(0.002)
     raise RuntimeError(f"timed out waiting for {message}")
 
@@ -100,6 +107,22 @@ def run(args):
         raise SystemExit(f"build the {args.profile} binary first: {binary}")
     if not root.is_dir() or not source.is_file():
         raise SystemExit("benchmark root and source file must exist")
+    snapshot = Path(args.session_snapshot).expanduser().resolve() if args.session_snapshot else None
+    if snapshot is not None and not snapshot.is_file():
+        raise SystemExit(f"recoverable session snapshot does not exist: {snapshot}")
+    review_changes = 5
+    if snapshot is not None:
+        with snapshot.open(encoding="utf-8") as stream:
+            recovered = json.load(stream)
+        sessions = recovered.get("replay", {}).get("controller", {}).get("sessions", [])
+        if not sessions:
+            raise SystemExit("session snapshot contains no recoverable PR Replay review")
+        review_changes = max(len(session.get("steps", [])) for session in sessions)
+    navigation = {
+        "oscillate": NAVIGATION,
+        "forward": (b"j",),
+        "backward": (b"k",),
+    }[args.navigation]
 
     with tempfile.TemporaryDirectory(prefix="red-replay-perf-") as directory:
         config_home = Path(directory)
@@ -107,6 +130,10 @@ def run(args):
         config_dir.mkdir()
         log = config_home / "red.log"
         (config_dir / "config.toml").write_text(f'log_file = "{log}"\n', encoding="utf-8")
+        if snapshot is not None:
+            session_dir = config_dir / "sessions"
+            session_dir.mkdir()
+            shutil.copyfile(snapshot, session_dir / "latest.json")
 
         master, slave = pty.openpty()
         fcntl.ioctl(
@@ -114,15 +141,20 @@ def run(args):
             termios.TIOCSWINSZ,
             struct.pack("HHHH", args.rows, args.cols, 0, 0),
         )
-        command = [str(binary), "--root", str(root)]
+        command = [str(binary)]
+        if snapshot is None:
+            command.extend(["--root", str(root)])
         if not args.enable_lsp:
             command.extend(["--config-override", "lsp.enabled = false"])
-        command.append(str(source))
+        if snapshot is None:
+            command.append(str(source))
+        else:
+            command.append("--resume")
         process = subprocess.Popen(
             command,
             stdin=slave,
             stdout=slave,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             env=dict(os.environ, RED_PERF="trace", XDG_CONFIG_HOME=str(config_home)),
             close_fds=True,
         )
@@ -151,14 +183,15 @@ def run(args):
                 args.startup_timeout,
                 "first editor frame",
             )
-            os.write(master, b":ReplayDemo\r")
+            if snapshot is None:
+                os.write(master, b":ReplayDemo\r")
             wait_until(
                 lambda: "[PERF] replay:panel_render:" in log.read_text(
                     encoding="utf-8", errors="replace"
                 ),
                 process,
                 args.startup_timeout,
-                "Replay demo",
+                "restored Replay review" if snapshot is not None else "Replay demo",
             )
             time.sleep(0.1)
 
@@ -172,7 +205,7 @@ def run(args):
             for index in range(args.cycles):
                 started = time.monotonic()
                 previous_bytes = terminal["bytes"]
-                os.write(master, NAVIGATION[index % len(NAVIGATION)])
+                os.write(master, navigation[index % len(navigation)])
                 wait_until(
                     lambda: terminal["bytes"] != previous_bytes,
                     process,
@@ -192,7 +225,7 @@ def run(args):
             started = time.monotonic()
             for index in range(args.burst):
                 last_key = time.monotonic()
-                os.write(master, NAVIGATION[index % len(NAVIGATION)])
+                os.write(master, navigation[index % len(navigation)])
                 if args.delay_ms:
                     time.sleep(args.delay_ms / 1000)
             wait_until(
@@ -224,10 +257,16 @@ def run(args):
                 raise RuntimeError(
                     "Replay benchmark did not exercise one actual step change per keypress"
                 )
+            if len(interactive.get("render:full", [])) > args.cycles + 2:
+                raise RuntimeError("Replay navigation repainted the complete terminal repeatedly")
+            if len(burst.get("replay:key_event", [])) != args.burst:
+                raise RuntimeError("Replay benchmark did not drain all sustained navigation keys")
             if args.trace_output:
                 Path(args.trace_output).expanduser().write_bytes(log.read_bytes())
             print(
-                f"profile={args.profile} terminal={args.cols}x{args.rows} "
+                f"profile={args.profile} scenario={'restored' if snapshot else 'demo'} "
+                f"navigation={args.navigation} changes={review_changes} "
+                f"terminal={args.cols}x{args.rows} "
                 f"steps={args.cycles} output={interactive_bytes / 1024:.1f}KiB "
                 f"burst={args.burst} burst_wall={burst_elapsed * 1000:.1f}ms "
                 f"burst_tail={burst_tail * 1000:.1f}ms "
@@ -257,6 +296,10 @@ def main():
     parser.add_argument("--binary")
     parser.add_argument("--root", default=str(ROOT))
     parser.add_argument("--file", default=str(ROOT / "src" / "editor.rs"))
+    parser.add_argument("--session-snapshot", help="copy and resume a real saved review safely")
+    parser.add_argument(
+        "--navigation", choices=("oscillate", "forward", "backward"), default="oscillate"
+    )
     parser.add_argument("--rows", type=int, default=40)
     parser.add_argument("--cols", type=int, default=120)
     parser.add_argument("--cycles", type=int, default=32)
