@@ -467,7 +467,20 @@ impl SessionStore {
             Err(error) => return Err(error.into()),
         }
 
+        // Owner directories accumulate across editor sessions, but most of
+        // their Replay metadata describes the same handful of worktrees. Read
+        // the newest generations first so older duplicates can be rejected
+        // before restoring their controllers or spawning repository probes.
+        stores.sort_unstable_by_key(|store| {
+            std::cmp::Reverse(
+                fs::symlink_metadata(store.latest_path())
+                    .and_then(|metadata| metadata.modified())
+                    .ok(),
+            )
+        });
+
         let mut reviews = HashMap::new();
+        let mut repositories = HashMap::new();
         for store in stores {
             let Ok(snapshot) = store.load() else {
                 continue;
@@ -478,7 +491,13 @@ impl SessionStore {
                 .and_then(|_| store.directory.file_name())
                 .and_then(|name| name.to_str())
                 .unwrap_or_default();
-            collect_snapshot_replay_reviews(&snapshot, owner, active_workspace, &mut reviews);
+            collect_snapshot_replay_reviews(
+                &snapshot,
+                owner,
+                active_workspace,
+                &mut reviews,
+                &mut repositories,
+            );
         }
 
         let mut reviews = reviews.into_values().collect::<Vec<_>>();
@@ -2284,13 +2303,36 @@ fn collect_snapshot_replay_reviews(
     owner: &str,
     active_workspace: Option<&Path>,
     reviews: &mut HashMap<String, SessionReplayReview>,
+    repositories: &mut HashMap<PathBuf, Option<crate::replay::ReplayRepository>>,
 ) {
     if let Some(recovery) = &snapshot.replay {
+        let has_unseen_review = recovery.controller.sessions.iter().any(|session| {
+            let id = replay_workspace_review_id(&session.workspace.root);
+            let active = active_workspace
+                .is_some_and(|workspace| workspace == session.workspace.root.as_path());
+            replay_review_should_replace(
+                reviews.get(&id),
+                /*legacy*/ false,
+                active,
+                snapshot.saved_at_ms,
+            )
+        });
         let mut controller = crate::replay::ReplayController::default();
-        if controller.restore(&recovery.controller).is_ok() {
+        if has_unseen_review && controller.restore(&recovery.controller).is_ok() {
             for session in controller.sessions() {
-                let Ok(workspace_repository) =
-                    crate::replay::ReplayRepository::discover(&session.workspace.root)
+                let id = replay_workspace_review_id(&session.workspace.root);
+                let active = active_workspace
+                    .is_some_and(|workspace| workspace == session.workspace.root.as_path());
+                if !replay_review_should_replace(
+                    reviews.get(&id),
+                    /*legacy*/ false,
+                    active,
+                    snapshot.saved_at_ms,
+                ) {
+                    continue;
+                }
+                let Some(workspace_repository) =
+                    discover_replay_repository(repositories, &session.workspace.root)
                 else {
                     continue;
                 };
@@ -2319,7 +2361,7 @@ fn collect_snapshot_replay_reviews(
                     .map(|context| context.title.clone())
                     .unwrap_or_else(|| format!("Local branch {branch}"));
                 let review = SessionReplayReview {
-                    id: replay_workspace_review_id(&session.workspace.root),
+                    id,
                     owner: owner.to_string(),
                     session_id: Some(session.id.clone()),
                     repository_root: session.source.repository.root.clone(),
@@ -2350,8 +2392,7 @@ fn collect_snapshot_replay_reviews(
                             })
                     }),
                     last_activity_ms: snapshot.saved_at_ms,
-                    active: active_workspace
-                        .is_some_and(|workspace| workspace == session.workspace.root.as_path()),
+                    active,
                     legacy: false,
                 };
                 insert_snapshot_replay_review(reviews, review);
@@ -2359,7 +2400,6 @@ fn collect_snapshot_replay_reviews(
         }
     }
 
-    let mut originating_repository = None;
     for buffer in &snapshot.buffers {
         let Some(path) = buffer.path.as_deref() else {
             continue;
@@ -2370,21 +2410,21 @@ fn collect_snapshot_replay_reviews(
             continue;
         };
         let id = replay_workspace_review_id(&workspace_root);
-        if reviews.get(&id).is_some_and(|review| {
-            !review.legacy
-                || (review.owner == owner && review.last_activity_ms == snapshot.saved_at_ms)
-        }) {
+        let active = active_workspace.is_some_and(|workspace| workspace == workspace_root);
+        if !replay_review_should_replace(
+            reviews.get(&id),
+            /*legacy*/ true,
+            active,
+            snapshot.saved_at_ms,
+        ) {
             continue;
         }
-        let repository = originating_repository
-            .get_or_insert_with(|| {
-                crate::replay::ReplayRepository::discover(Path::new(&snapshot.cwd)).ok()
-            })
-            .as_ref();
-        let Some(repository) = repository else {
+        let Some(repository) =
+            discover_replay_repository(repositories, Path::new(&snapshot.cwd)).cloned()
+        else {
             continue;
         };
-        let Ok(workspace_repository) = crate::replay::ReplayRepository::discover(&workspace_root)
+        let Some(workspace_repository) = discover_replay_repository(repositories, &workspace_root)
         else {
             continue;
         };
@@ -2419,12 +2459,21 @@ fn collect_snapshot_replay_reviews(
                 note_count: 0,
                 dirty,
                 last_activity_ms: snapshot.saved_at_ms,
-                active: active_workspace
-                    .is_some_and(|workspace| workspace == workspace_root.as_path()),
+                active,
                 legacy: true,
             },
         );
     }
+}
+
+fn discover_replay_repository<'a>(
+    repositories: &'a mut HashMap<PathBuf, Option<crate::replay::ReplayRepository>>,
+    path: &Path,
+) -> Option<&'a crate::replay::ReplayRepository> {
+    repositories
+        .entry(path.to_path_buf())
+        .or_insert_with(|| crate::replay::ReplayRepository::discover(path).ok())
+        .as_ref()
 }
 
 fn replay_workspace_review_id(workspace: &Path) -> String {
@@ -2458,16 +2507,27 @@ fn insert_snapshot_replay_review(
     reviews: &mut HashMap<String, SessionReplayReview>,
     candidate: SessionReplayReview,
 ) {
-    let replace = reviews.get(&candidate.id).is_none_or(|current| {
-        (
-            !candidate.legacy,
-            candidate.active,
-            candidate.last_activity_ms,
-        ) > (!current.legacy, current.active, current.last_activity_ms)
-    });
+    let replace = replay_review_should_replace(
+        reviews.get(&candidate.id),
+        candidate.legacy,
+        candidate.active,
+        candidate.last_activity_ms,
+    );
     if replace {
         reviews.insert(candidate.id.clone(), candidate);
     }
+}
+
+fn replay_review_should_replace(
+    current: Option<&SessionReplayReview>,
+    legacy: bool,
+    active: bool,
+    last_activity_ms: u64,
+) -> bool {
+    current.is_none_or(|current| {
+        (!legacy, active, last_activity_ms)
+            > (!current.legacy, current.active, current.last_activity_ms)
+    })
 }
 
 fn validate_snapshot(mut snapshot: SessionSnapshot) -> anyhow::Result<SessionSnapshot> {
@@ -2793,6 +2853,72 @@ mod tests {
         assert!(reviews[0].active);
         assert!(reviews[0].dirty);
         assert_eq!(reviews[0].last_activity_ms, 20);
+    }
+
+    #[test]
+    fn superseded_replay_snapshots_skip_controller_and_repository_discovery() {
+        let (_directory, mut newest, workspace) =
+            recoverable_replay_snapshot("superseded-repository");
+        newest.saved_at_ms = 20;
+        let mut older = newest.clone();
+        older.saved_at_ms = 10;
+
+        let mut reviews = HashMap::new();
+        let mut repositories = HashMap::new();
+        collect_snapshot_replay_reviews(
+            &newest,
+            "editor-newest",
+            Some(&workspace.root),
+            &mut reviews,
+            &mut repositories,
+        );
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(repositories.len(), 1);
+
+        repositories.clear();
+        collect_snapshot_replay_reviews(
+            &older,
+            "editor-older",
+            Some(&workspace.root),
+            &mut reviews,
+            &mut repositories,
+        );
+
+        assert!(
+            repositories.is_empty(),
+            "an older duplicate must not spawn another repository-discovery command"
+        );
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews.values().next().unwrap().owner, "editor-newest");
+    }
+
+    #[test]
+    fn replay_discovery_reuses_repository_identity_across_owner_snapshots() {
+        let (_directory, mut older, workspace) = recoverable_replay_snapshot("cached-repository");
+        older.saved_at_ms = 10;
+        let mut newer = older.clone();
+        newer.saved_at_ms = 20;
+
+        let mut reviews = HashMap::new();
+        let mut repositories = HashMap::new();
+        collect_snapshot_replay_reviews(
+            &older,
+            "editor-older",
+            Some(&workspace.root),
+            &mut reviews,
+            &mut repositories,
+        );
+        collect_snapshot_replay_reviews(
+            &newer,
+            "editor-newer",
+            Some(&workspace.root),
+            &mut reviews,
+            &mut repositories,
+        );
+
+        assert_eq!(repositories.len(), 1);
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews.values().next().unwrap().owner, "editor-newer");
     }
 
     #[test]

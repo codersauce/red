@@ -2464,7 +2464,9 @@ impl DetachedEditorCore {
                 )
                 .await?;
         }
-        editor.ensure_current_buffer_lsp_opened().await?;
+        if !editor.replay_scratch_lsp_is_deferred() {
+            editor.ensure_current_buffer_lsp_opened().await?;
+        }
         let mut render_buffer = RenderBuffer::new(
             editor.size.0 as usize,
             editor.size.1 as usize,
@@ -4864,7 +4866,8 @@ impl Editor {
             .iter()
             .position(|buffer| buffer.id() == source_buffer)
             .ok_or_else(|| anyhow::anyhow!("Replay scratch source was not opened"))?;
-        self.set_current_buffer(render_buffer, source_index).await?;
+        self.set_current_replay_source_buffer(render_buffer, source_index)
+            .await?;
         let source_window = self
             .window_manager
             .active_stable_window_id()
@@ -7921,7 +7924,9 @@ impl Editor {
             self.size.1 as usize,
             &Style::default(),
         );
-        self.ensure_current_buffer_lsp_opened().await?;
+        if !self.replay_scratch_lsp_is_deferred() {
+            self.ensure_current_buffer_lsp_opened().await?;
+        }
         let (columns, rows) = terminal::size()?;
         self.resize_terminal_surface(columns, rows, &mut buffer);
         self.render(&mut buffer)?;
@@ -19117,6 +19122,7 @@ impl Editor {
             }
             Action::RefreshDiagnostics => {
                 add_to_history = false;
+                self.ensure_current_buffer_lsp_opened().await?;
                 self.request_diagnostics().await?;
                 self.render(buffer)?;
             }
@@ -20538,7 +20544,7 @@ impl Editor {
         let file = self.current_buffer().file.clone();
 
         // Notify LSP if enabled and the buffer has a file.
-        if self.config.lsp.enabled {
+        if self.config.lsp.enabled && (!self.replay_scratch_lsp_is_deferred() || self.is_insert()) {
             if let Some(file) = &file {
                 self.ensure_current_buffer_lsp_opened().await?;
                 self.lsp
@@ -20587,6 +20593,34 @@ impl Editor {
         render_buffer: &mut RenderBuffer,
         index: usize,
     ) -> anyhow::Result<()> {
+        self.set_current_buffer_with_diagnostics(
+            render_buffer,
+            index,
+            /*request_diagnostics*/ true,
+        )
+        .await
+    }
+
+    /// Shows a Replay source without eagerly indexing its entire scratch worktree.
+    async fn set_current_replay_source_buffer(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        index: usize,
+    ) -> anyhow::Result<()> {
+        self.set_current_buffer_with_diagnostics(
+            render_buffer,
+            index,
+            /*request_diagnostics*/ false,
+        )
+        .await
+    }
+
+    async fn set_current_buffer_with_diagnostics(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        index: usize,
+        request_diagnostics: bool,
+    ) -> anyhow::Result<()> {
         let vtop = self.vtop;
         let pos = (self.cx, self.cy);
 
@@ -20614,7 +20648,9 @@ impl Editor {
 
         self.prev_highlight_y = None;
 
-        self.request_diagnostics().await?;
+        if request_diagnostics {
+            self.request_diagnostics().await?;
+        }
         self.render(render_buffer)
     }
 
@@ -20720,11 +20756,34 @@ impl Editor {
     }
 
     async fn request_diagnostics(&mut self) -> anyhow::Result<()> {
+        if self.replay_scratch_lsp_is_deferred() {
+            return Ok(());
+        }
         if let Some(uri) = self.current_buffer().uri()? {
             self.ensure_current_buffer_lsp_opened().await?;
             self.lsp.request_diagnostics(&uri).await?;
         }
         Ok(())
+    }
+
+    /// Reviewing a scratch buffer is read-only until an edit or explicit LSP request.
+    fn replay_scratch_lsp_is_deferred(&self) -> bool {
+        let Some(workspace) = self.replay_demo_workspace.as_ref() else {
+            return false;
+        };
+        let buffer = self.current_buffer();
+        if !workspace
+            .source_buffers
+            .values()
+            .any(|source| *source == buffer.id())
+        {
+            return false;
+        }
+        buffer
+            .uri()
+            .ok()
+            .flatten()
+            .is_some_and(|uri| !self.lsp_coordinator.is_document_opened(&uri))
     }
 
     async fn ensure_current_buffer_lsp_opened(&mut self) -> anyhow::Result<()> {
@@ -22527,7 +22586,8 @@ impl Editor {
             })
             .map(|(index, _)| index)
             .ok_or_else(|| anyhow::anyhow!("the selected scratch source could not be reopened"))?;
-        self.set_current_buffer(render_buffer, source_index).await?;
+        self.set_current_replay_source_buffer(render_buffer, source_index)
+            .await?;
         self.restore_replay_session_snapshot(&recovery)?;
         Ok(self.active_replay_session_payload())
     }
@@ -26714,6 +26774,66 @@ mod test {
             .await
             .expect("resolve the recovered Replay request");
         assert!(editor.pending_replay_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replay_scratch_defers_language_server_until_the_reviewer_edits() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let (_directory, session, workspace) = real_replay_session_fixture();
+        let mut config = Config::default();
+        config.lsp.servers.clear();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = Editor::with_size(
+            lsp,
+            /*width*/ 100,
+            /*height*/ 28,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, "hello".to_string())],
+        )
+        .expect("create an editor without launching a real language server");
+        editor.test_disable_terminal_output();
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 100, /*height*/ 28, &Style::default());
+        let mut runtime = Runtime::new();
+
+        let response = editor
+            .install_replay_source_session(session, "feature/replay", workspace, &mut render_buffer)
+            .await
+            .expect("open the scratch review without indexing its entire repository");
+        let uri = editor
+            .current_buffer()
+            .uri()
+            .unwrap()
+            .expect("the real Replay scratch source remains file backed");
+        assert!(editor.replay_scratch_lsp_is_deferred());
+        assert!(!editor.lsp_coordinator.is_document_opened(&uri));
+
+        editor
+            .request_diagnostics()
+            .await
+            .expect("automatic diagnostics remain deferred while browsing");
+        assert!(!editor.lsp_coordinator.is_document_opened(&uri));
+
+        let workspace_id = response["workspace_id"].as_str().unwrap();
+        let step_id = response["plan"]["steps"][0]["id"].as_str().unwrap();
+        let revision = editor.replay_demo_step_validation(workspace_id, step_id)["revision"]
+            .as_u64()
+            .unwrap();
+        editor
+            .apply_replay_demo_step(workspace_id, step_id, revision, &mut runtime)
+            .await
+            .expect("automatic hunk application stays lightweight");
+        assert!(!editor.lsp_coordinator.is_document_opened(&uri));
+
+        editor.mode = Mode::Insert;
+        editor
+            .notify_change(&mut runtime)
+            .await
+            .expect("a deliberate manual edit activates language-server synchronization");
+        assert!(editor.lsp_coordinator.is_document_opened(&uri));
+        assert!(!editor.replay_scratch_lsp_is_deferred());
     }
 
     #[tokio::test]
