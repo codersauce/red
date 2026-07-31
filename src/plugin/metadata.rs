@@ -9,6 +9,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use super::package::PluginPackageManifest;
+
 /// Plugin metadata structure based on package.json format
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginMetadata {
@@ -114,6 +116,53 @@ impl PluginMetadata {
         let content = std::fs::read_to_string(path)?;
         let metadata: PluginMetadata = serde_json::from_str(&content)?;
         Ok(metadata)
+    }
+
+    /// Adapts the external package manifest to the legacy registry metadata view.
+    pub fn from_package(package: &PluginPackageManifest) -> Self {
+        Self {
+            name: package.plugin.id.to_string(),
+            version: package.plugin.version.to_string(),
+            description: package.plugin.description.clone(),
+            author: None,
+            license: package.plugin.license.clone(),
+            main: package
+                .plugin
+                .entry
+                .as_ref()
+                .or(package.plugin.husk_manifest.as_ref())
+                .map_or_else(default_main, |path| path.to_string_lossy().into_owned()),
+            homepage: None,
+            repository: package.plugin.repository.as_ref().map(|url| Repository {
+                repo_type: "git".to_string(),
+                url: url.clone(),
+            }),
+            keywords: vec![],
+            engines: None,
+            dependencies: HashMap::new(),
+            red_api_version: Some(package.plugin.red_api.to_string()),
+            config_schema: None,
+            activation_events: package
+                .activation
+                .events
+                .iter()
+                .cloned()
+                .chain(
+                    package
+                        .activation
+                        .commands
+                        .iter()
+                        .map(|command| format!("onCommand:{command}")),
+                )
+                .collect(),
+            capabilities: PluginCapabilities {
+                commands: !package.activation.commands.is_empty(),
+                events: !package.activation.events.is_empty(),
+                buffer_manipulation: false,
+                ui_components: true,
+                lsp_integration: false,
+            },
+        }
     }
 
     /// Create minimal metadata with just a name

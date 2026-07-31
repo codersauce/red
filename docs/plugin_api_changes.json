@@ -1,6 +1,12 @@
 {
-  "api_version": "0.4.0",
+  "api_version": "0.6.0",
   "changes": [
+    {
+      "version": "0.6.0",
+      "kind": "introduced",
+      "symbols": ["CompanionCall", "DocumentSnapshot", "DocumentApply", "DocumentUndo", "UpdatePickerBusy"],
+      "migration_note": "docs/PLUGIN_API.md#external-package-primitives"
+    },
     {
       "version": "0.4.0",
       "kind": "introduced",

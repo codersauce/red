@@ -63,7 +63,8 @@ impl BufferManager {
         self.buffers.len()
     }
 
-    /// Adds a buffer and makes it active.
+    /// Adds a buffer and makes it active in editor tests.
+    #[cfg(test)]
     pub fn add_buffer(&mut self, buffer: Buffer) -> usize {
         self.buffers.push(buffer);
         self.current_index = self.buffers.len() - 1;

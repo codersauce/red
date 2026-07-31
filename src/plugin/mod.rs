@@ -11,13 +11,16 @@
 //! schema, but must not independently redefine its version.
 
 mod api;
+pub mod companion;
 pub mod decoration;
+pub mod document;
 pub(crate) mod filesystem;
 pub mod gutter;
 pub mod location;
 pub(crate) mod markdown;
 mod metadata;
 pub mod overlay;
+pub mod package;
 pub mod panel;
 pub mod process;
 mod registry;
@@ -28,6 +31,7 @@ pub mod window_bar;
 pub mod workspace;
 
 pub use decoration::{Decoration, DecorationAnchor, DecorationManager};
+pub use document::{DocumentEdit, DocumentSnapshot};
 pub use gutter::{GutterSign, GutterSignManager};
 pub use location::{LocationColumnEncoding, OpenLocationTarget, PluginLocation};
 pub use metadata::PluginMetadata;

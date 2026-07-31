@@ -1,0 +1,25 @@
+pub fn activate() {
+    red::add_command("HelloPanel", open, Json {
+        title: "Open external hello panel",
+        category: "Examples",
+        description: "Proves that external UI packages do not depend on Replay",
+    });
+}
+
+fn open() {
+    red::execute("CreateTextPanel", "external-hello", PanelConfig {
+        side: "right",
+        width: 36,
+        title: "EXTERNAL PLUGIN",
+        header_actions: [
+            Json { id: "close", label: "Close", compact_label: "×" },
+        ],
+    });
+    red::execute("UpdateTextPanel", "external-hello", [TextPanelBlock {
+        id: "hello",
+        kind: "text",
+        format: "markdown",
+        text: "# Hello from a package\n\nLoaded lazily from a multi-file external plugin package.",
+    }]);
+    red::execute("FocusPanel", "external-hello");
+}

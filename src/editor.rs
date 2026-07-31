@@ -133,6 +133,42 @@ const MAX_HIGHLIGHT_SLICE_BYTES: usize = 512 * 1024;
 const MAX_PLUGIN_VIEWPORT_LINE_CHARS: usize = 64 * 1024;
 const MAX_DIRECTORY_LISTING_ENTRIES: usize = 160;
 const AGENT_BRIDGE_CAPACITY: usize = 64;
+const PLUGIN_MANAGER_PICKER_ID: i32 = 9_101;
+const PLUGIN_MANAGER_ACTION_PICKER_ID: i32 = 9_102;
+
+async fn apply_plugin_manager_operation(
+    manager: &plugin::package::PluginPackageManager,
+    operation: &str,
+) -> anyhow::Result<String> {
+    let (verb, raw_id) = operation
+        .split_once('\t')
+        .ok_or_else(|| anyhow::anyhow!("invalid plugin operation"))?;
+    let id = plugin::package::PluginId::parse(raw_id)?;
+    match verb {
+        "enable" => {
+            manager.set_enabled(&id, true)?;
+            Ok(format!("Enabled plugin {id}."))
+        }
+        "disable" => {
+            manager.set_enabled(&id, false)?;
+            Ok(format!("Disabled plugin {id}."))
+        }
+        "update" => {
+            let installed = manager.update(&id).await?;
+            Ok(format!(
+                "Updated {} to {}.",
+                installed.name, installed.version
+            ))
+        }
+        "remove" => {
+            manager.remove(&id, false)?;
+            Ok(format!(
+                "Removed plugin {id}; its private data was preserved."
+            ))
+        }
+        _ => anyhow::bail!("unknown plugin operation `{verb}`"),
+    }
+}
 const MACRO_MAX_REPLAY_DEPTH: usize = 20;
 const MACRO_MAX_REPLAY_EVENTS: usize = 10_000;
 const MIN_EDITOR_WINDOW_WIDTH: usize = 10;
@@ -704,6 +740,10 @@ pub enum PluginRequest {
         id: i32,
         status: Option<String>,
     },
+    UpdatePickerBusy {
+        id: i32,
+        busy: bool,
+    },
     UpdatePickerPreview {
         id: i32,
         preview: Option<PickerPreview>,
@@ -952,6 +992,31 @@ pub enum PluginRequest {
     UnwatchDirectory {
         watch_id: i32,
     },
+    CompanionCall {
+        owner: String,
+        method: String,
+        params: Value,
+        timeout_ms: Option<u64>,
+        request_id: RequestId,
+    },
+    DocumentSnapshot {
+        path: Option<String>,
+        request_id: RequestId,
+    },
+    DocumentApply {
+        owner: String,
+        path: Option<String>,
+        expected_revision: u64,
+        label: String,
+        edits: Vec<plugin::DocumentEdit>,
+        request_id: RequestId,
+    },
+    DocumentUndo {
+        owner: String,
+        path: Option<String>,
+        transaction_id: String,
+        request_id: RequestId,
+    },
 }
 
 impl PluginRequest {
@@ -983,6 +1048,7 @@ impl PluginRequest {
             Self::UpdatePickerItems { .. } => "UpdatePickerItems",
             Self::UpdatePickerQuery { .. } => "UpdatePickerQuery",
             Self::UpdatePickerStatus { .. } => "UpdatePickerStatus",
+            Self::UpdatePickerBusy { .. } => "UpdatePickerBusy",
             Self::UpdatePickerPreview { .. } => "UpdatePickerPreview",
             Self::ClosePicker { .. } => "ClosePicker",
             Self::BufferInsert { .. } => "BufferInsert",
@@ -1019,6 +1085,10 @@ impl PluginRequest {
             Self::DisplayColumnToCharIndex { .. } => "DisplayColumnToCharIndex",
             Self::IntervalCallback { .. } => "IntervalCallback",
             Self::TimeoutCallback { .. } => "TimeoutCallback",
+            Self::CompanionCall { .. } => "CompanionCall",
+            Self::DocumentSnapshot { .. } => "DocumentSnapshot",
+            Self::DocumentApply { .. } => "DocumentApply",
+            Self::DocumentUndo { .. } => "DocumentUndo",
             Self::CreateOverlay { .. } => "CreateOverlay",
             Self::UpdateOverlay { .. } => "UpdateOverlay",
             Self::RemoveOverlay { .. } => "RemoveOverlay",
@@ -1462,6 +1532,9 @@ pub enum Action {
     ResolvePluginRequest(i64, Value),
     ViewLogs,
     ListPlugins,
+    PluginManagerInstall(String),
+    PluginManagerAction(String),
+    PluginManagerFinished(String),
 
     // Window management actions
     SplitHorizontal,
@@ -1770,6 +1843,9 @@ pub struct Editor {
 
     /// Plugin system registry
     plugin_registry: PluginRegistry,
+
+    /// Lazily spawned native companions owned by installed plugins.
+    companion_manager: Arc<tokio::sync::Mutex<plugin::companion::CompanionManager>>,
 
     /// Syntax highlighting engine
     highlighter: Highlighter,
@@ -2483,6 +2559,14 @@ struct PendingLspEdit {
     uri: String,
 }
 
+struct PluginDocumentTransaction {
+    owner: String,
+    path: Option<String>,
+    expected_revision: u64,
+    label: String,
+    edits: Vec<plugin::DocumentEdit>,
+}
+
 #[derive(Debug, Clone)]
 struct PendingLspFormatSave {
     save_as: Option<String>,
@@ -2963,6 +3047,9 @@ impl Editor {
             config_diagnostics_acknowledged: true,
             theme,
             plugin_registry,
+            companion_manager: Arc::new(tokio::sync::Mutex::new(
+                plugin::companion::CompanionManager::new(Config::config_dir()),
+            )),
             highlighter,
             highlight_cache: HashMap::new(),
             bracket_match_cache: None,
@@ -6054,6 +6141,7 @@ impl Editor {
         if let Err(err) = self.plugin_registry.deactivate_all(runtime).await {
             log!("Plugin deactivate failed: {}", err);
         }
+        self.companion_manager.lock().await.shutdown().await;
     }
 
     fn abort_agent_bridge(&mut self) {
@@ -6821,6 +6909,12 @@ impl Editor {
                 PluginRequest::UpdatePickerStatus { id, status } => {
                     if let Some(dialog) = &mut self.current_dialog {
                         dialog.update_picker(id, PickerUpdate::Status(status));
+                    }
+                    needs_render = true;
+                }
+                PluginRequest::UpdatePickerBusy { id, busy } => {
+                    if let Some(dialog) = &mut self.current_dialog {
+                        dialog.update_picker(id, PickerUpdate::Busy(busy));
                     }
                     needs_render = true;
                 }
@@ -7645,6 +7739,118 @@ impl Editor {
                     self.reconcile_plugin_file_operation(&outcome).await?;
                     self.plugin_registry
                         .resolve_request(runtime, request_id, outcome.payload)
+                        .await?;
+                    needs_render = true;
+                }
+                PluginRequest::CompanionCall {
+                    owner,
+                    method,
+                    params,
+                    timeout_ms,
+                    request_id,
+                } => {
+                    let timeout = timeout_ms.map(Duration::from_millis);
+                    let companion_manager = Arc::clone(&self.companion_manager);
+                    let mut callback_runtime = runtime.clone();
+                    tokio::spawn(async move {
+                        let payload = match companion_manager
+                            .lock()
+                            .await
+                            .call(&owner, &method, params, timeout)
+                            .await
+                        {
+                            Ok(response) => json!({
+                                "ok": true,
+                                "result": response.result,
+                                "progress": response.progress,
+                            }),
+                            Err(error) => json!({
+                                "ok": false,
+                                "error": error.to_string(),
+                            }),
+                        };
+                        if let Err(error) =
+                            callback_runtime.resolve_request(request_id, payload).await
+                        {
+                            log!(
+                                "{}",
+                                json!({
+                                    "event": "plugin_companion_callback_failed",
+                                    "plugin": owner,
+                                    "request_id": request_id.get(),
+                                    "error": error.to_string(),
+                                })
+                            );
+                        }
+                    });
+                }
+                PluginRequest::DocumentSnapshot { path, request_id } => {
+                    let payload = self.plugin_document_snapshot(path.as_deref()).map_or_else(
+                        |error| json!({ "ok": false, "error": error.to_string() }),
+                        |snapshot| json!({ "ok": true, "document": snapshot }),
+                    );
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
+                }
+                PluginRequest::DocumentApply {
+                    owner,
+                    path,
+                    expected_revision,
+                    label,
+                    edits,
+                    request_id,
+                } => {
+                    let payload = match self
+                        .apply_plugin_document_transaction(
+                            buffer,
+                            runtime,
+                            PluginDocumentTransaction {
+                                owner,
+                                path,
+                                expected_revision,
+                                label,
+                                edits,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(transaction_id) => json!({
+                            "ok": true,
+                            "transaction_id": transaction_id,
+                            "revision": self.current_buffer().revision(),
+                        }),
+                        Err(error) => json!({ "ok": false, "error": error.to_string() }),
+                    };
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
+                        .await?;
+                    needs_render = true;
+                }
+                PluginRequest::DocumentUndo {
+                    owner,
+                    path,
+                    transaction_id,
+                    request_id,
+                } => {
+                    let payload = match self
+                        .undo_plugin_document_transaction(
+                            buffer,
+                            runtime,
+                            &owner,
+                            path.as_deref(),
+                            &transaction_id,
+                        )
+                        .await
+                    {
+                        Ok(()) => json!({
+                            "ok": true,
+                            "revision": self.current_buffer().revision(),
+                        }),
+                        Err(error) => json!({ "ok": false, "error": error.to_string() }),
+                    };
+                    self.plugin_registry
+                        .resolve_request(runtime, request_id, payload)
                         .await?;
                     needs_render = true;
                 }
@@ -14277,88 +14483,86 @@ impl Editor {
             }
             Action::ListPlugins => {
                 add_to_history = false;
-
-                // Create a buffer with plugin information
-                let mut content = String::from("# Loaded Plugins\n\n");
-
-                let metadata = self.plugin_registry.all_metadata();
-                if metadata.is_empty() {
-                    content.push_str("No plugins loaded.\n");
-                } else {
-                    for (plugin_name, meta) in metadata {
-                        content.push_str(&format!("## {}\n", meta.name));
-                        content.push_str(&format!("Version: {}\n", meta.version));
-                        if let Some(status) = self.plugin_registry.statuses().get(plugin_name) {
-                            content.push_str(&format!("Status: {status:?}\n"));
-                            if let plugin::PluginStatus::Quarantined {
-                                path, diagnostic, ..
-                            } = status
-                            {
-                                content.push_str(&format!("Source: {path}\n"));
-                                content.push_str(&format!("Diagnostic: {diagnostic}\n"));
-                                content.push_str(
-                                    "Actions: fix and save to retry, remove from config to disable, or open docs/PLUGIN_API.md\n",
-                                );
-                            }
-                        }
-
-                        if let Some(desc) = &meta.description {
-                            content.push_str(&format!("Description: {}\n", desc));
-                        }
-
-                        if let Some(author) = &meta.author {
-                            content.push_str(&format!("Author: {}\n", author));
-                        }
-
-                        if let Some(license) = &meta.license {
-                            content.push_str(&format!("License: {}\n", license));
-                        }
-
-                        if !meta.keywords.is_empty() {
-                            content.push_str(&format!("Keywords: {}\n", meta.keywords.join(", ")));
-                        }
-
-                        content.push_str(&format!("Main: {}\n", meta.main));
-
-                        // Show capabilities
-                        if meta.capabilities.commands
-                            || meta.capabilities.events
-                            || meta.capabilities.buffer_manipulation
-                            || meta.capabilities.ui_components
-                        {
-                            content.push_str("Capabilities: ");
-                            let mut caps = vec![];
-                            if meta.capabilities.commands {
-                                caps.push("commands");
-                            }
-                            if meta.capabilities.events {
-                                caps.push("events");
-                            }
-                            if meta.capabilities.buffer_manipulation {
-                                caps.push("buffer manipulation");
-                            }
-                            if meta.capabilities.ui_components {
-                                caps.push("UI components");
-                            }
-                            if meta.capabilities.lsp_integration {
-                                caps.push("LSP integration");
-                            }
-                            content.push_str(&caps.join(", "));
-                            content.push('\n');
-                        }
-
-                        content.push('\n');
+                let manager = plugin::package::PluginPackageManager::new(Config::config_dir());
+                let mut items = vec!["Install plugin…".to_string()];
+                match manager.list() {
+                    Ok(installed) => {
+                        items.extend(installed.into_iter().map(|plugin| {
+                            format!(
+                                "{}\t{}\t{}\t{}",
+                                plugin.id,
+                                plugin.name,
+                                plugin.version,
+                                if plugin.enabled {
+                                    "enabled"
+                                } else {
+                                    "disabled"
+                                }
+                            )
+                        }));
                     }
+                    Err(error) => self.last_error = Some(error.to_string()),
                 }
-
-                // Create a new buffer with the plugin list
-                let plugin_list_buffer = Buffer::new(Some("[Plugin List]".to_string()), content);
-                self.buffer_manager.add_buffer(plugin_list_buffer);
-                self.cx = 0;
-                self.cy = 0;
-                self.vtop = 0;
-                self.vleft = 0;
-                self.skipcol = 0;
+                self.current_dialog = Some(Box::new(Picker::new(
+                    Some("Plugin manager".to_string()),
+                    self,
+                    &items,
+                    Some(PLUGIN_MANAGER_PICKER_ID),
+                )));
+                self.render(buffer)?;
+            }
+            Action::PluginManagerInstall(source) => {
+                add_to_history = false;
+                let source = source.trim().to_string();
+                if source.is_empty() {
+                    self.last_error = Some("plugin source cannot be empty".to_string());
+                } else {
+                    self.last_error = Some(format!("Installing plugin from {source}…"));
+                    tokio::spawn(async move {
+                        let manager =
+                            plugin::package::PluginPackageManager::new(Config::config_dir());
+                        let result = if Path::new(&source).exists() {
+                            manager.install_path(Path::new(&source)).await
+                        } else {
+                            let (repository, version) = source
+                                .rsplit_once('@')
+                                .map_or((source.as_str(), None), |(repository, version)| {
+                                    (repository, Some(version))
+                                });
+                            manager.install_github(repository, version).await
+                        };
+                        let message = match result {
+                            Ok(plugin) => format!(
+                                "Installed {} {}. Restart Red to activate it.",
+                                plugin.name, plugin.version
+                            ),
+                            Err(error) => format!("Plugin install failed: {error}"),
+                        };
+                        ACTION_DISPATCHER.send_request(PluginRequest::Action(
+                            Action::PluginManagerFinished(message),
+                        ));
+                    });
+                }
+            }
+            Action::PluginManagerAction(operation) => {
+                add_to_history = false;
+                let operation = operation.clone();
+                self.last_error = Some("Updating plugin installation…".to_string());
+                tokio::spawn(async move {
+                    let manager = plugin::package::PluginPackageManager::new(Config::config_dir());
+                    let result = apply_plugin_manager_operation(&manager, &operation).await;
+                    let message = match result {
+                        Ok(message) => format!("{message} Restart Red to refresh plugins."),
+                        Err(error) => format!("Plugin operation failed: {error}"),
+                    };
+                    ACTION_DISPATCHER.send_request(PluginRequest::Action(
+                        Action::PluginManagerFinished(message),
+                    ));
+                });
+            }
+            Action::PluginManagerFinished(message) => {
+                add_to_history = false;
+                self.last_error = Some(message.clone());
             }
             Action::Command(cmd) => {
                 log!("Handling command: {cmd}");
@@ -15418,7 +15622,35 @@ impl Editor {
             }
             Action::Picked(item, id) => {
                 log!("picked: {item} - {id:?}");
-                if let Some(id) = id {
+                if *id == Some(PLUGIN_MANAGER_PICKER_ID) {
+                    if item == "Install plugin…" {
+                        self.current_dialog = Some(Box::new(InputPrompt::new(
+                            self,
+                            "GitHub owner/repo[@tag] or local path",
+                            "",
+                            Action::PluginManagerInstall,
+                        )));
+                    } else if let Some(plugin_id) = item.split('\t').next() {
+                        let enabled = item.ends_with("\tenabled");
+                        let toggle = if enabled { "disable" } else { "enable" };
+                        let actions = vec![
+                            format!("{toggle}\t{plugin_id}"),
+                            format!("update\t{plugin_id}"),
+                            format!("remove\t{plugin_id}"),
+                        ];
+                        self.current_dialog = Some(Box::new(Picker::new(
+                            Some(format!("Manage {plugin_id}")),
+                            self,
+                            &actions,
+                            Some(PLUGIN_MANAGER_ACTION_PICKER_ID),
+                        )));
+                    }
+                    self.render(buffer)?;
+                } else if *id == Some(PLUGIN_MANAGER_ACTION_PICKER_ID) {
+                    return self
+                        .execute(&Action::PluginManagerAction(item.clone()), buffer, runtime)
+                        .await;
+                } else if let Some(id) = id {
                     self.plugin_registry
                         .notify(
                             runtime,
@@ -17044,6 +17276,139 @@ impl Editor {
         self.ensure_buffer_lsp_opened(buffer_index).await
     }
 
+    fn plugin_document_index(&self, path: Option<&str>) -> anyhow::Result<usize> {
+        let Some(path) = path else {
+            return Ok(self.buffer_manager.active_index());
+        };
+        let requested = Path::new(path)
+            .absolutize()
+            .map(|path| path.into_owned())
+            .unwrap_or_else(|_| PathBuf::from(path));
+        self.buffer_manager
+            .iter()
+            .position(|buffer| {
+                buffer.file.as_deref().is_some_and(|candidate| {
+                    candidate == path
+                        || Path::new(candidate)
+                            .absolutize()
+                            .map(|candidate| candidate.as_ref() == requested)
+                            .unwrap_or(false)
+                })
+            })
+            .ok_or_else(|| anyhow::anyhow!("document is not open in Red: {path}"))
+    }
+
+    fn plugin_document_snapshot(
+        &self,
+        path: Option<&str>,
+    ) -> anyhow::Result<plugin::DocumentSnapshot> {
+        let buffer_index = self.plugin_document_index(path)?;
+        let buffer = self
+            .buffer_manager
+            .get(buffer_index)
+            .ok_or_else(|| anyhow::anyhow!("document buffer disappeared"))?;
+        Ok(plugin::DocumentSnapshot {
+            buffer_index,
+            path: buffer.file.clone(),
+            revision: buffer.revision(),
+            text: buffer.contents(),
+        })
+    }
+
+    async fn apply_plugin_document_transaction(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+        transaction: PluginDocumentTransaction,
+    ) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            !transaction.edits.is_empty(),
+            "document transaction contains no edits"
+        );
+        let buffer_index = self.plugin_document_index(transaction.path.as_deref())?;
+        if buffer_index != self.buffer_manager.active_index() {
+            self.set_current_buffer(render_buffer, buffer_index).await?;
+        }
+        anyhow::ensure!(
+            self.current_buffer().revision() == transaction.expected_revision,
+            "document revision changed: expected {}, found {}",
+            transaction.expected_revision,
+            self.current_buffer().revision()
+        );
+
+        let mut prepared = transaction
+            .edits
+            .into_iter()
+            .map(|edit| {
+                let start = self.current_buffer().position_to_char_idx(edit.range.start);
+                let end = self.current_buffer().position_to_char_idx(edit.range.end);
+                anyhow::ensure!(start <= end, "document edit range is reversed");
+                if let Some(expected_text) = &edit.expected_text {
+                    anyhow::ensure!(
+                        self.current_buffer().text_in_range(edit.range) == *expected_text,
+                        "document edit preimage no longer matches"
+                    );
+                }
+                Ok((start, end, edit))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        prepared.sort_by_key(|(start, end, _)| (*start, *end));
+        anyhow::ensure!(
+            prepared.windows(2).all(|pair| pair[0].1 <= pair[1].0),
+            "document transaction contains overlapping edits"
+        );
+
+        self.begin_transaction_with_origin(
+            &transaction.label,
+            EditOrigin::Plugin {
+                name: transaction.owner,
+            },
+        );
+        for (_, _, edit) in prepared.into_iter().rev() {
+            self.replace_range(edit.range, &edit.text);
+        }
+        anyhow::ensure!(
+            self.commit_transaction(self.cursor_snapshot()),
+            "document transaction made no changes"
+        );
+        let transaction_id = self
+            .current_buffer()
+            .undo_history
+            .latest_transaction()
+            .map(|transaction| transaction.id.clone())
+            .ok_or_else(|| anyhow::anyhow!("document transaction was not recorded"))?;
+        self.notify_change(runtime).await?;
+        Ok(transaction_id)
+    }
+
+    async fn undo_plugin_document_transaction(
+        &mut self,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+        owner: &str,
+        path: Option<&str>,
+        transaction_id: &str,
+    ) -> anyhow::Result<()> {
+        let buffer_index = self.plugin_document_index(path)?;
+        if buffer_index != self.buffer_manager.active_index() {
+            self.set_current_buffer(render_buffer, buffer_index).await?;
+        }
+        let latest = self
+            .current_buffer()
+            .undo_history
+            .latest_transaction()
+            .ok_or_else(|| anyhow::anyhow!("document has no transaction to undo"))?;
+        anyhow::ensure!(
+            latest.id == transaction_id,
+            "plugin transaction is no longer the document's latest change"
+        );
+        anyhow::ensure!(
+            matches!(&latest.origin, EditOrigin::Plugin { name } if name == owner),
+            "plugin cannot undo a transaction owned by another actor"
+        );
+        self.undo_transaction(render_buffer, runtime).await
+    }
+
     async fn reconcile_plugin_file_operation(
         &mut self,
         outcome: &plugin::filesystem::FileOperationOutcome,
@@ -18585,6 +18950,56 @@ impl Editor {
                 .clone()
                 .map(|workspace| Arc::new(Mutex::new(ProposalWorkspace::from_snapshot(workspace)))),
         );
+        if let Err(error) = self
+            .preferences
+            .merge_plugin_storage_snapshot(&snapshot.plugin_extensions)
+        {
+            log!(
+                "{}",
+                json!({
+                    "event": "recovery_plugin_extension_persistence_failed",
+                    "level": "warn",
+                    "service": "red",
+                    "error": error.to_string(),
+                })
+            );
+        }
+        let package_manager = plugin::package::PluginPackageManager::new(Config::config_dir());
+        match package_manager.legacy_session_imports(&snapshot.legacy_extensions) {
+            Ok(imports) => {
+                for (plugin_id, storage_key, value) in imports {
+                    if self
+                        .preferences
+                        .plugin_storage(plugin_id.as_str(), &storage_key)
+                        .is_none()
+                    {
+                        if let Err(error) = self.preferences.set_plugin_storage(
+                            plugin_id.as_str(),
+                            &storage_key,
+                            value,
+                        ) {
+                            log!(
+                                "{}",
+                                json!({
+                                    "event": "legacy_plugin_session_import_failed",
+                                    "level": "warn",
+                                    "plugin": plugin_id.as_str(),
+                                    "error": error.to_string(),
+                                })
+                            );
+                        }
+                    }
+                }
+            }
+            Err(error) => log!(
+                "{}",
+                json!({
+                    "event": "legacy_plugin_session_discovery_failed",
+                    "level": "warn",
+                    "error": error.to_string(),
+                })
+            ),
+        }
         if let Some(transcript) = &snapshot.agent_transcript {
             let transcript_persisted = if let Err(error) = self.preferences.set_plugin_storage(
                 "agent",
@@ -18787,6 +19202,8 @@ impl Editor {
                 agent_transcript,
                 agent_workspace,
                 agent_session_resumable: false,
+                plugin_extensions: self.preferences.plugin_storage_snapshot(),
+                legacy_extensions: std::collections::BTreeMap::new(),
             },
             disk_fingerprints,
         )

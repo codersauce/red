@@ -1,6 +1,6 @@
 # Husk plugin compatibility
 
-Red host API version `0.4.0` is defined by
+Red host API version `0.6.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -22,6 +22,31 @@ literal host call absent from the canonical schema. Literal host calls also chec
 required/optional arity (`HUSK-A0002`) and obvious literal argument types
 (`HUSK-A0003`) against the machine-readable signature. `--no-typecheck` is an unsupported
 development escape hatch; compatibility guarantees do not apply while it is enabled.
+
+Red `0.6.0` retains the complete `0.4.0` contract, so existing packages that
+declare `"red_api_version": "^0.4.0"` continue to load. New packages should
+target `"red_api_version": "^0.6.0"` to use the external-package primitives.
+
+## External package primitives
+
+`CompanionCall(callback, method, params, timeout_ms?)` lazily starts the calling
+package's declared native companion and exchanges bounded JSON-lines RPC
+messages. Red owns the process, matches responses to requests, enforces the
+timeout, and stops the process when the package or editor shuts down.
+
+`DocumentSnapshot(callback, path?)` returns the current text and revision for an
+open document. `DocumentApply(callback, options)` atomically applies non-overlapping
+edits after checking the expected revision and optional preimages. The result
+contains an attributed transaction ID. `DocumentUndo(callback, options)` reverts
+that exact transaction only while it is still the most recent transaction from
+the same plugin. Red remains responsible for buffer state, dirty tracking, LSP
+notifications, and undo history.
+
+Plugin-owned storage is captured as an opaque namespaced extension in Red session
+snapshots. Unknown extensions survive load/save cycles, allowing a package to
+restore its workflow without Red understanding the payload.
+
+These calls were introduced in host API `0.6.0`.
 
 ## Workspace file operations
 
@@ -95,8 +120,8 @@ picker. They do not use global `picker:*:<id>` subscriptions. Picker items and c
 payloads use the declared `PickerItem`, `PickerCancelled`, and `PickerActionEvent` records;
 the `PickerItem.data` field remains `Json` so a plugin can attach its own payload.
 
-`OpenPicker` was added in host API `0.3.0`. Plugins targeting this Red release should
-declare `"red_api_version": "^0.4.0"`. The numeric-ID `OpenDynamicPicker` API remains
+`OpenPicker` was added in host API `0.3.0`. New plugins targeting this Red release should
+declare `"red_api_version": "^0.6.0"`. The numeric-ID `OpenDynamicPicker` API remains
 available for compatibility, but new plugins should not use it.
 
 ## Agent composer

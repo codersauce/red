@@ -19,6 +19,7 @@ use crate::editor::EditorStateSnapshot;
 use semver::{Version, VersionReq};
 use serde::Serialize;
 
+use super::package::{PluginPackageManifest, PLUGIN_MANIFEST_FILE};
 use super::{PluginMetadata, RequestId, Runtime};
 
 /// Lifecycle authority for configured Husk plugins.
@@ -32,7 +33,8 @@ pub struct PluginRegistry {
 }
 
 /// Host API version used for plugin compatibility checks.
-pub const RED_HOST_API_VERSION: &str = "0.4.0";
+pub const RED_HOST_API_VERSION: &str = "0.6.0";
+const SUPPORTED_HOST_API_VERSIONS: &[&str] = &["0.4.0", RED_HOST_API_VERSION];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PluginModification {
@@ -167,24 +169,22 @@ impl PluginRegistry {
                     progressed = true;
                     continue;
                 }
-                match plugin_source(&plugin) {
-                    Ok(source) => match runtime
-                        .load_plugin_at(&name, plugin_display_path(&plugin), &source)
-                        .await
-                    {
-                        Ok(()) => {
-                            self.statuses.insert(name, PluginStatus::Active);
-                        }
-                        Err(error) => self.quarantine(
+                if is_lazy(&metadata) {
+                    progressed = true;
+                    continue;
+                }
+                match load_plugin(runtime, &name, &plugin).await {
+                    Ok(()) => {
+                        self.statuses.insert(name, PluginStatus::Active);
+                    }
+                    Err(error) => {
+                        self.quarantine(
                             runtime,
                             &name,
                             &plugin,
                             diagnostic_stage(&error),
                             error.to_string(),
-                        ),
-                    },
-                    Err(error) => {
-                        self.quarantine(runtime, &name, &plugin, "source", error.to_string())
+                        );
                     }
                 }
                 progressed = true;
@@ -290,6 +290,24 @@ impl PluginRegistry {
 
     /// Executes a plugin command and quarantines its owner on callback failure.
     pub async fn execute(&mut self, runtime: &mut Runtime, command: &str) -> anyhow::Result<()> {
+        if runtime.command_plugin(command).is_none() {
+            let candidate = self
+                .plugins
+                .iter()
+                .find(|(name, _)| {
+                    matches!(self.statuses.get(name), Some(PluginStatus::Pending))
+                        && self.metadata.get(name).is_some_and(|metadata| {
+                            metadata
+                                .activation_events
+                                .iter()
+                                .any(|event| event == &format!("onCommand:{command}"))
+                        })
+                })
+                .cloned();
+            if let Some((name, path)) = candidate {
+                self.activate_one(runtime, &name, &path).await;
+            }
+        }
         let owner = runtime.command_plugin(command);
         if let Err(error) = runtime.execute_command(command).await {
             crate::log!("Plugin command `{command}` failed: {error:?}");
@@ -314,6 +332,22 @@ impl PluginRegistry {
         args: serde_json::Value,
     ) -> anyhow::Result<()> {
         let _span = crate::editor::perf::PerfSpan::with_detail("notify", event);
+        let pending = self
+            .plugins
+            .iter()
+            .filter(|(name, _)| matches!(self.statuses.get(name), Some(PluginStatus::Pending)))
+            .filter(|(name, _)| {
+                self.metadata.get(name).is_some_and(|metadata| {
+                    metadata.activation_events.iter().any(|activation| {
+                        activation == event || activation == &format!("onEvent:{event}")
+                    })
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for (name, path) in pending {
+            self.activate_one(runtime, &name, &path).await;
+        }
         for (plugin, error) in runtime.notify_isolated(event, args) {
             let path = self
                 .plugins
@@ -335,6 +369,16 @@ impl PluginRegistry {
         args: serde_json::Value,
     ) -> anyhow::Result<()> {
         let _span = crate::editor::perf::PerfSpan::with_detail("notify_plugin", event);
+        if matches!(self.statuses.get(plugin), Some(PluginStatus::Pending)) {
+            if let Some((name, path)) = self
+                .plugins
+                .iter()
+                .find(|(name, _)| name == plugin)
+                .cloned()
+            {
+                self.activate_one(runtime, &name, &path).await;
+            }
+        }
         for (failed_plugin, error) in runtime.notify_plugin_isolated(plugin, event, args) {
             let path = self
                 .plugins
@@ -345,6 +389,30 @@ impl PluginRegistry {
             self.quarantine(runtime, &failed_plugin, &path, "runtime", error.to_string());
         }
         Ok(())
+    }
+
+    async fn activate_one(&mut self, runtime: &mut Runtime, name: &str, path: &str) {
+        let metadata = self
+            .metadata
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| PluginMetadata::minimal(name.to_string()));
+        if let Some((stage, diagnostic)) = self.activation_error(&metadata) {
+            self.quarantine(runtime, name, path, stage, diagnostic);
+            return;
+        }
+        match load_plugin(runtime, name, path).await {
+            Ok(()) => {
+                self.statuses.insert(name.to_string(), PluginStatus::Active);
+            }
+            Err(error) => self.quarantine(
+                runtime,
+                name,
+                path,
+                diagnostic_stage(&error),
+                error.to_string(),
+            ),
+        }
     }
 
     /// Delivers a callback-scoped picker event only to the plugin that opened it.
@@ -757,6 +825,13 @@ fn plugin_metadata_path(plugin: &str) -> Option<std::path::PathBuf> {
 }
 
 fn plugin_metadata(name: &str, plugin: &str) -> anyhow::Result<PluginMetadata> {
+    if is_husk_package(plugin) {
+        let root = Path::new(plugin)
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Husk package manifest has no parent"))?;
+        let package = PluginPackageManifest::load(root)?;
+        return Ok(PluginMetadata::from_package(&package));
+    }
     let Some(path) = plugin_metadata_path(plugin).filter(|path| path.exists()) else {
         return Ok(PluginMetadata::minimal(name.to_string()));
     };
@@ -764,6 +839,19 @@ fn plugin_metadata(name: &str, plugin: &str) -> anyhow::Result<PluginMetadata> {
 }
 
 fn plugin_modification(plugin: &str) -> PluginModification {
+    if is_husk_package(plugin) {
+        let root = Path::new(plugin).parent();
+        return PluginModification {
+            source: fs::metadata(plugin)
+                .and_then(|metadata| metadata.modified())
+                .ok(),
+            metadata: root.and_then(|root| {
+                fs::metadata(root.join(PLUGIN_MANIFEST_FILE))
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+            }),
+        };
+    }
     PluginModification {
         source: fs::metadata(plugin)
             .and_then(|metadata| metadata.modified())
@@ -782,10 +870,16 @@ fn check_api_compatibility(metadata: &PluginMetadata) -> anyhow::Result<()> {
     };
     let requirement = VersionReq::parse(requirement)
         .map_err(|error| anyhow::anyhow!("invalid red_api_version `{requirement}`: {error}"))?;
-    let current = Version::parse(RED_HOST_API_VERSION)?;
+    let compatible = SUPPORTED_HOST_API_VERSIONS
+        .iter()
+        .map(|version| Version::parse(version))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .any(|version| requirement.matches(&version));
     anyhow::ensure!(
-        requirement.matches(&current),
-        "plugin requires Red host API `{requirement}`, but this release provides `{current}`; see docs/PLUGIN_API.md"
+        compatible,
+        "plugin requires Red host API `{requirement}`, but this release supports {}; see docs/PLUGIN_API.md",
+        SUPPORTED_HOST_API_VERSIONS.join(", ")
     );
     Ok(())
 }
@@ -793,6 +887,8 @@ fn check_api_compatibility(metadata: &PluginMetadata) -> anyhow::Result<()> {
 fn diagnostic_stage(error: &anyhow::Error) -> &'static str {
     if error.downcast_ref::<husk_diagnostics::Report>().is_some() {
         "compile"
+    } else if error.downcast_ref::<std::io::Error>().is_some() {
+        "source"
     } else {
         "activation"
     }
@@ -806,6 +902,28 @@ fn plugin_source(plugin: &str) -> anyhow::Result<String> {
     }
 
     Ok(fs::read_to_string(plugin)?)
+}
+
+async fn load_plugin(runtime: &mut Runtime, name: &str, plugin: &str) -> anyhow::Result<()> {
+    if is_husk_package(plugin) {
+        return runtime.load_plugin_package(name, Path::new(plugin)).await;
+    }
+    let source = plugin_source(plugin)?;
+    runtime
+        .load_plugin_at(name, plugin_display_path(plugin), &source)
+        .await
+}
+
+fn is_husk_package(plugin: &str) -> bool {
+    !crate::assets::is_bundled_plugin_specifier(plugin)
+        && Path::new(plugin).file_name().and_then(|name| name.to_str()) == Some("Husk.toml")
+        && Path::new(plugin)
+            .parent()
+            .is_some_and(|root| root.join(PLUGIN_MANIFEST_FILE).is_file())
+}
+
+fn is_lazy(metadata: &PluginMetadata) -> bool {
+    !metadata.activation_events.is_empty()
 }
 
 fn plugin_display_path(plugin: &str) -> String {
@@ -1189,10 +1307,10 @@ mod tests {
         metadata.red_api_version = Some("^0.4.0".to_string());
         check_api_compatibility(&metadata).unwrap();
 
-        metadata.red_api_version = Some("^0.3.0".to_string());
+        metadata.red_api_version = Some("^0.5.0".to_string());
         let error = check_api_compatibility(&metadata).unwrap_err().to_string();
 
-        assert!(error.contains("^0.3.0"));
+        assert!(error.contains("^0.5.0"));
         assert!(error.contains(RED_HOST_API_VERSION));
         assert!(error.contains("docs/PLUGIN_API.md"));
     }
@@ -1270,12 +1388,16 @@ mod tests {
         registry.initialize(&mut runtime).await.unwrap();
         assert_eq!(
             registry.statuses().get("example-plugin"),
-            Some(&PluginStatus::Active)
+            Some(&PluginStatus::Pending)
         );
         registry
             .execute(&mut runtime, "ExampleCommand")
             .await
             .unwrap();
+        assert_eq!(
+            registry.statuses().get("example-plugin"),
+            Some(&PluginStatus::Active)
+        );
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::Action(Action::Print(message))
