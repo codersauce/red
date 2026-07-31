@@ -825,12 +825,13 @@ fn plugin_metadata_path(plugin: &str) -> Option<std::path::PathBuf> {
 }
 
 fn plugin_metadata(name: &str, plugin: &str) -> anyhow::Result<PluginMetadata> {
-    if is_husk_package(plugin) {
-        let root = Path::new(plugin)
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("Husk package manifest has no parent"))?;
-        let package = PluginPackageManifest::load(root)?;
+    if let Some((_, package)) = external_plugin_package(plugin)? {
         return Ok(PluginMetadata::from_package(&package));
+    }
+    if is_husk_package(plugin) {
+        // A standalone Husk package has no Red package metadata, so it loads
+        // eagerly with the same minimal metadata as a single-file plugin.
+        return Ok(PluginMetadata::minimal(name.to_string()));
     }
     let Some(path) = plugin_metadata_path(plugin).filter(|path| path.exists()) else {
         return Ok(PluginMetadata::minimal(name.to_string()));
@@ -838,18 +839,44 @@ fn plugin_metadata(name: &str, plugin: &str) -> anyhow::Result<PluginMetadata> {
     PluginMetadata::from_file(&path)
 }
 
+fn external_plugin_package(
+    plugin: &str,
+) -> anyhow::Result<Option<(std::path::PathBuf, PluginPackageManifest)>> {
+    if crate::assets::is_bundled_plugin_specifier(plugin) {
+        return Ok(None);
+    }
+    let plugin_path = Path::new(plugin);
+    let canonical_plugin = plugin_path.canonicalize().ok();
+    for root in plugin_path.ancestors().skip(1) {
+        if !root.join(PLUGIN_MANIFEST_FILE).is_file() {
+            continue;
+        }
+        let package = PluginPackageManifest::load(root)?;
+        let Some(entry) = package.husk_entry(root) else {
+            continue;
+        };
+        let canonical_entry = entry.canonicalize().ok();
+        let matches = entry == plugin_path
+            || canonical_plugin
+                .as_ref()
+                .zip(canonical_entry.as_ref())
+                .is_some_and(|(plugin, entry)| plugin == entry);
+        if matches {
+            return Ok(Some((root.to_path_buf(), package)));
+        }
+    }
+    Ok(None)
+}
+
 fn plugin_modification(plugin: &str) -> PluginModification {
-    if is_husk_package(plugin) {
-        let root = Path::new(plugin).parent();
+    if let Ok(Some((root, _))) = external_plugin_package(plugin) {
         return PluginModification {
             source: fs::metadata(plugin)
                 .and_then(|metadata| metadata.modified())
                 .ok(),
-            metadata: root.and_then(|root| {
-                fs::metadata(root.join(PLUGIN_MANIFEST_FILE))
-                    .and_then(|metadata| metadata.modified())
-                    .ok()
-            }),
+            metadata: fs::metadata(root.join(PLUGIN_MANIFEST_FILE))
+                .and_then(|metadata| metadata.modified())
+                .ok(),
         };
     }
     PluginModification {
@@ -917,9 +944,6 @@ async fn load_plugin(runtime: &mut Runtime, name: &str, plugin: &str) -> anyhow:
 fn is_husk_package(plugin: &str) -> bool {
     !crate::assets::is_bundled_plugin_specifier(plugin)
         && Path::new(plugin).file_name().and_then(|name| name.to_str()) == Some("Husk.toml")
-        && Path::new(plugin)
-            .parent()
-            .is_some_and(|root| root.join(PLUGIN_MANIFEST_FILE).is_file())
 }
 
 fn is_lazy(metadata: &PluginMetadata) -> bool {
@@ -993,6 +1017,86 @@ mod tests {
             }
             _ => panic!("unexpected plugin request"),
         }
+    }
+
+    #[tokio::test]
+    async fn lazily_activates_external_package_with_nested_husk_manifest() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let root = tempfile_dir("external-husk-package");
+        let husk_root = root.join("husk");
+        fs::create_dir_all(husk_root.join("src")).unwrap();
+        fs::write(
+            root.join(PLUGIN_MANIFEST_FILE),
+            r#"
+                schema_version = 1
+
+                [plugin]
+                id = "external-husk-package"
+                name = "External Husk Package"
+                version = "0.1.0"
+                red_api = "^0.6.0"
+                husk_manifest = "husk/Husk.toml"
+
+                [activation]
+                commands = ["ExternalHello"]
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            husk_root.join("Husk.toml"),
+            r#"
+                schema_version = 1
+
+                [package]
+                name = "external-husk-package"
+                version = "0.1.0"
+                entry = "src/main.hk"
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            husk_root.join("src/main.hk"),
+            r#"
+                pub fn activate() {
+                    red::add_command("ExternalHello", hello);
+                }
+
+                fn hello() {
+                    red::execute("Print", "hello from external package");
+                }
+            "#,
+        )
+        .unwrap();
+
+        let mut registry = PluginRegistry::new();
+        registry.add(
+            "external-husk-package",
+            husk_root.join("Husk.toml").to_str().unwrap(),
+        );
+        let mut runtime = Runtime::new();
+
+        registry.initialize(&mut runtime).await.unwrap();
+        assert_eq!(
+            registry.statuses().get("external-husk-package"),
+            Some(&PluginStatus::Pending)
+        );
+
+        registry
+            .execute(&mut runtime, "ExternalHello")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            registry.statuses().get("external-husk-package"),
+            Some(&PluginStatus::Active)
+        );
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message))
+                if message == "hello from external package"
+        ));
     }
 
     #[tokio::test]
