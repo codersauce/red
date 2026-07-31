@@ -257,6 +257,7 @@ impl PluginPackageManifest {
                 "legacy session migration keys cannot be empty"
             );
         }
+        validate_keymaps(&self.keymaps)?;
         Ok(())
     }
 
@@ -613,6 +614,50 @@ fn default_manifest_schema() -> u32 {
     PLUGIN_MANIFEST_SCHEMA
 }
 
+fn validate_keymaps(keymaps: &BTreeMap<String, BTreeMap<String, String>>) -> Result<()> {
+    const SUPPORTED_MODES: [&str; 6] = [
+        "normal",
+        "insert",
+        "command",
+        "visual",
+        "visual_line",
+        "visual_block",
+    ];
+
+    for (mode, bindings) in keymaps {
+        anyhow::ensure!(
+            SUPPORTED_MODES.contains(&mode.as_str()),
+            "plugin keymap uses unsupported mode `{mode}`"
+        );
+
+        let mut sequences: Vec<(&str, Vec<&str>)> = Vec::with_capacity(bindings.len());
+        for (sequence, command) in bindings {
+            anyhow::ensure!(
+                !command.trim().is_empty(),
+                "plugin keymap command for `{sequence}` in mode `{mode}` is empty"
+            );
+            let keys = sequence.split_whitespace().collect::<Vec<_>>();
+            anyhow::ensure!(
+                !keys.is_empty(),
+                "plugin keymap sequence in mode `{mode}` is empty"
+            );
+
+            for (existing_sequence, existing_keys) in &sequences {
+                anyhow::ensure!(
+                    keys != *existing_keys,
+                    "plugin keymap sequences `{existing_sequence}` and `{sequence}` normalize to the same keys in mode `{mode}`"
+                );
+                anyhow::ensure!(
+                    !keys.starts_with(existing_keys) && !existing_keys.starts_with(&keys),
+                    "plugin keymap prefix conflict in mode `{mode}`: `{existing_sequence}` and `{sequence}` cannot both be declared"
+                );
+            }
+            sequences.push((sequence, keys));
+        }
+    }
+    Ok(())
+}
+
 fn validate_relative_path(path: &Path) -> Result<()> {
     anyhow::ensure!(!path.as_os_str().is_empty(), "plugin path is empty");
     anyhow::ensure!(!path.is_absolute(), "plugin path must be package-relative");
@@ -837,6 +882,66 @@ entry = "src/main.hk"
             .unwrap_err()
             .to_string()
             .contains("unsafe component"));
+    }
+
+    #[test]
+    fn rejects_keymap_prefix_conflicts() {
+        let directory = tempfile::tempdir().unwrap();
+        write_package(directory.path(), "test", "1.0.0");
+        let manifest_path = directory.path().join(PLUGIN_MANIFEST_FILE);
+        let mut source = fs::read_to_string(&manifest_path).unwrap();
+        source.push_str(
+            r#"
+
+[keymaps.normal]
+"Space R" = "Test"
+"Space R g" = "Test"
+"#,
+        );
+        fs::write(manifest_path, source).unwrap();
+
+        let error = PluginPackageManifest::load(directory.path()).unwrap_err();
+        assert!(error.to_string().contains("keymap prefix conflict"));
+        assert!(error.to_string().contains("Space R"));
+        assert!(error.to_string().contains("Space R g"));
+    }
+
+    #[test]
+    fn accepts_keymap_siblings_under_a_shared_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        write_package(directory.path(), "test", "1.0.0");
+        let manifest_path = directory.path().join(PLUGIN_MANIFEST_FILE);
+        let mut source = fs::read_to_string(&manifest_path).unwrap();
+        source.push_str(
+            r#"
+
+[keymaps.normal]
+"Space R g" = "Test"
+"Space R n" = "Test"
+"#,
+        );
+        fs::write(manifest_path, source).unwrap();
+
+        PluginPackageManifest::load(directory.path()).unwrap();
+    }
+
+    #[test]
+    fn rejects_keymaps_for_unsupported_modes() {
+        let directory = tempfile::tempdir().unwrap();
+        write_package(directory.path(), "test", "1.0.0");
+        let manifest_path = directory.path().join(PLUGIN_MANIFEST_FILE);
+        let mut source = fs::read_to_string(&manifest_path).unwrap();
+        source.push_str(
+            r#"
+
+[keymaps.select]
+"Space R" = "Test"
+"#,
+        );
+        fs::write(manifest_path, source).unwrap();
+
+        let error = PluginPackageManifest::load(directory.path()).unwrap_err();
+        assert!(error.to_string().contains("unsupported mode `select`"));
     }
 
     #[tokio::test]

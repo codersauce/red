@@ -33,6 +33,11 @@ Path installs are linked through an installation record, so editing a package
 and restarting or reloading Red picks up the local source without copying it.
 User keymaps override defaults declared by a package.
 
+Plugin keymaps may share a leader, such as `Space R g` and `Space R n`, but a
+package cannot bind both a leader (`Space R`) and one of its descendants
+(`Space R g`). Install and update reject these ambiguous declarations instead
+of silently dropping one binding.
+
 ## Lifecycle
 
 Plugins may be enabled, disabled, updated, and removed:

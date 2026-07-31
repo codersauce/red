@@ -920,6 +920,39 @@ async fn load_startup_buffers(files: &[String]) -> anyhow::Result<Vec<Buffer>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn plugin_default_keymaps_install_shared_leader_siblings() {
+        let mut keys = Keys::default();
+        let keymaps = std::collections::BTreeMap::from([(
+            "normal".to_string(),
+            std::collections::BTreeMap::from([
+                ("Space R g".to_string(), "Replay".to_string()),
+                ("Space R n".to_string(), "ReplayNext".to_string()),
+            ]),
+        )]);
+
+        apply_plugin_default_keymaps(&mut keys, &keymaps);
+
+        let Some(KeyAction::Nested(space)) = keys.normal.get(" ") else {
+            panic!("expected Space to become a leader");
+        };
+        let Some(KeyAction::Nested(replay)) = space.get("R") else {
+            panic!("expected Space R to become the Replay leader");
+        };
+        assert_eq!(
+            replay.get("g"),
+            Some(&KeyAction::Single(Action::PluginCommand(
+                "Replay".to_string()
+            )))
+        );
+        assert_eq!(
+            replay.get("n"),
+            Some(&KeyAction::Single(Action::PluginCommand(
+                "ReplayNext".to_string()
+            )))
+        );
+    }
+
     #[tokio::test]
     async fn startup_opens_missing_file_without_creating_it_until_save() {
         let directory = tempfile::tempdir().unwrap();
