@@ -22,7 +22,9 @@ use crate::{
     theme::Theme,
 };
 
-use super::{Component, Picker, PickerItem, PickerPreview};
+use super::{picker::PickerFilterHighlights, Component, Picker, PickerItem, PickerPreview};
+
+const FILENAME_MATCH_BONUS: i64 = 1;
 
 pub struct FilePicker {
     picker: Picker,
@@ -75,11 +77,16 @@ impl FilePicker {
         sender: mpsc::Sender<FilePickerLoad>,
         receiver: Receiver<FilePickerLoad>,
     ) -> Self {
-        let matcher = SkimMatcherV2::default();
+        let score_matcher = SkimMatcherV2::default();
+        let highlight_matcher = SkimMatcherV2::default();
         let mut picker = Picker::builder()
             .title("Find Files")
             .items(vec![])
-            .filter_action(move |item, query| matcher.fuzzy_match(&item.id, query))
+            .filter_action(move |item, query| file_match_score(&score_matcher, item, query))
+            .filter_tie_breaker(|item| item.id.len())
+            .filter_highlight_action(move |item, query| {
+                file_match_highlights(&highlight_matcher, item, query)
+            })
             .history_key("find_files")
             .select_action(Action::OpenFile)
             .build(editor);
@@ -228,6 +235,128 @@ impl Component for FilePicker {
     }
 }
 
+fn file_match_score(matcher: &SkimMatcherV2, item: &PickerItem, query: &str) -> Option<i64> {
+    if !fuzzy_subsequence_matches(&item.label, query) {
+        return matcher.fuzzy_match(&item.id, query);
+    }
+
+    let filename_score = matcher
+        .fuzzy_match(&item.label, query)
+        .map(|score| score.saturating_add(FILENAME_MATCH_BONUS))?;
+    let query_matches_parent = item
+        .annotation
+        .as_deref()
+        .is_some_and(|parent| fuzzy_subsequence_matches(parent, query));
+
+    if query_matches_parent {
+        matcher
+            .fuzzy_match(&item.id, query)
+            .map(|path_score| path_score.max(filename_score))
+    } else {
+        Some(filename_score)
+    }
+}
+
+fn file_match_highlights(
+    matcher: &SkimMatcherV2,
+    item: &PickerItem,
+    query: &str,
+) -> PickerFilterHighlights {
+    let Some((filename_score, filename_indices)) = matcher.fuzzy_indices(&item.label, query) else {
+        return matcher
+            .fuzzy_indices(&item.id, query)
+            .map(|(_, indices)| path_match_highlights(item, indices))
+            .unwrap_or_default();
+    };
+    let filename_score = filename_score.saturating_add(FILENAME_MATCH_BONUS);
+    let query_matches_parent = item
+        .annotation
+        .as_deref()
+        .is_some_and(|parent| fuzzy_subsequence_matches(parent, query));
+
+    if query_matches_parent {
+        if let Some((path_score, path_indices)) = matcher.fuzzy_indices(&item.id, query) {
+            if path_score > filename_score {
+                return path_match_highlights(item, path_indices);
+            }
+        }
+    }
+
+    PickerFilterHighlights {
+        label: indices_to_ranges(filename_indices),
+        annotation: Vec::new(),
+    }
+}
+
+fn path_match_highlights(item: &PickerItem, indices: Vec<usize>) -> PickerFilterHighlights {
+    let label_start = item
+        .id
+        .chars()
+        .count()
+        .saturating_sub(item.label.chars().count());
+    let annotation_len = item
+        .annotation
+        .as_deref()
+        .map(|annotation| annotation.chars().count())
+        .unwrap_or_default();
+    let mut label_indices = Vec::new();
+    let mut annotation_indices = Vec::new();
+
+    for index in indices {
+        if index >= label_start {
+            label_indices.push(index - label_start);
+        } else if index < annotation_len {
+            annotation_indices.push(index);
+        }
+    }
+
+    PickerFilterHighlights {
+        label: indices_to_ranges(label_indices),
+        annotation: indices_to_ranges(annotation_indices),
+    }
+}
+
+fn indices_to_ranges(indices: Vec<usize>) -> Vec<[usize; 2]> {
+    let mut ranges: Vec<[usize; 2]> = Vec::new();
+    for index in indices {
+        if let Some(last) = ranges.last_mut() {
+            if last[1] == index {
+                last[1] += 1;
+                continue;
+            }
+        }
+        ranges.push([index, index + 1]);
+    }
+    ranges
+}
+
+fn fuzzy_subsequence_matches(candidate: &str, query: &str) -> bool {
+    let case_sensitive = query
+        .chars()
+        .any(|character| character.is_ascii_uppercase());
+    let mut query = query.chars();
+    let Some(mut expected) = query.next() else {
+        return true;
+    };
+
+    for character in candidate.chars() {
+        let matches = if case_sensitive {
+            character == expected
+        } else {
+            character.eq_ignore_ascii_case(&expected)
+        };
+        if !matches {
+            continue;
+        }
+        let Some(next) = query.next() else {
+            return true;
+        };
+        expected = next;
+    }
+
+    false
+}
+
 fn load_file_picker_items(
     root_path: &Path,
     visibility: FilePickerVisibility,
@@ -279,6 +408,7 @@ mod tests {
 
     use crate::{
         buffer::Buffer,
+        color::Color,
         config::{Config, KeyAction},
         editor::Editor,
         lsp::LspManager,
@@ -307,11 +437,15 @@ mod tests {
     }
 
     fn test_editor() -> Editor {
+        test_editor_with_theme(Theme::default())
+    }
+
+    fn test_editor_with_theme(theme: Theme) -> Editor {
         let config = Config::default();
         let lsp = Box::new(LspManager::new(config.lsp.clone()));
         let buffer = Buffer::new(None, String::new());
 
-        Editor::with_size(lsp, 80, 24, config, Theme::default(), vec![buffer]).unwrap()
+        Editor::with_size(lsp, 80, 24, config, theme, vec![buffer]).unwrap()
     }
 
     fn key(code: KeyCode) -> Event {
@@ -349,6 +483,49 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.c).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn selected_file(picker: &mut FilePicker) -> String {
+        let Some(KeyAction::Multiple(actions)) = picker.handle_event(&key(KeyCode::Enter)) else {
+            panic!("expected file picker selection actions");
+        };
+        actions
+            .into_iter()
+            .find_map(|action| match action {
+                Action::OpenFile(path) => Some(path),
+                _ => None,
+            })
+            .expect("file picker selection should open a file")
+    }
+
+    fn picker_item(path: &str) -> PickerItem {
+        let path = Path::new(path);
+        PickerItem {
+            id: path.to_string_lossy().into_owned(),
+            icon: None,
+            label: path.file_name().unwrap().to_string_lossy().into_owned(),
+            kind: Some("FilePath".to_string()),
+            annotation: path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(|parent| parent.to_string_lossy().into_owned()),
+            detail: None,
+            data: serde_json::Value::Null,
+            matches: Vec::new(),
+            detail_matches: Vec::new(),
+            preview: None,
+        }
+    }
+
+    fn rendered_text_start(buffer: &RenderBuffer, needle: &str) -> usize {
+        for (row_index, row) in buffer.cells.chunks(buffer.width).enumerate() {
+            let text = row.iter().map(|cell| cell.c).collect::<String>();
+            if let Some(byte_column) = text.find(needle) {
+                let column = text[..byte_column].chars().count();
+                return row_index * buffer.width + column;
+            }
+        }
+        panic!("{needle:?} was not rendered");
     }
 
     #[test]
@@ -419,6 +596,175 @@ mod tests {
                 Action::OpenFile("crates/husk-parser/src/lib.rs".to_string()),
             ]))
         );
+    }
+
+    #[test]
+    fn file_picker_prefers_shorter_paths_when_match_scores_are_equal() {
+        let editor = test_editor();
+        let mut picker = FilePicker::loading(&editor);
+        for character in "main".chars() {
+            picker.handle_event(&key(KeyCode::Char(character)));
+        }
+        send_load(
+            &picker,
+            picker.load_generation,
+            Ok(vec![
+                "crates/husk-cli/src/main.rs".to_string(),
+                "crates/husk-lsp/src/main.rs".to_string(),
+                "examples/external-hello-plugin/src/main.hk".to_string(),
+                "plugins/git_core/src/main.hk".to_string(),
+                "plugins/neotree_core/src/main.hk".to_string(),
+                "src/main.rs".to_string(),
+                "tools/husk-standalone/smoke/src/main.rs".to_string(),
+            ]),
+        );
+
+        assert!(picker.tick().unwrap());
+        for expected in [
+            "src/main.rs",
+            "crates/husk-cli/src/main.rs",
+            "crates/husk-lsp/src/main.rs",
+            "plugins/git_core/src/main.hk",
+            "plugins/neotree_core/src/main.hk",
+            "tools/husk-standalone/smoke/src/main.rs",
+            "examples/external-hello-plugin/src/main.hk",
+        ] {
+            assert_eq!(selected_file(&mut picker), expected);
+            picker.handle_event(&key(KeyCode::Down));
+        }
+    }
+
+    #[test]
+    fn file_picker_prefers_filename_matches_over_directory_matches() {
+        let editor = test_editor();
+        let mut picker = FilePicker::loading(&editor);
+        for character in "main".chars() {
+            picker.handle_event(&key(KeyCode::Char(character)));
+        }
+        send_load(
+            &picker,
+            picker.load_generation,
+            Ok(vec![
+                "main/lib.rs".to_string(),
+                "deep/src/main.rs".to_string(),
+                "src/domain/mainland.rs".to_string(),
+            ]),
+        );
+
+        assert!(picker.tick().unwrap());
+        assert_eq!(selected_file(&mut picker), "deep/src/main.rs");
+    }
+
+    #[test]
+    fn file_match_highlights_filename_characters() {
+        let highlights = file_match_highlights(
+            &SkimMatcherV2::default(),
+            &picker_item("src/main.rs"),
+            "main",
+        );
+
+        assert_eq!(highlights.label, vec![[0, 4]]);
+        assert!(highlights.annotation.is_empty());
+    }
+
+    #[test]
+    fn file_match_highlights_parent_and_filename_characters() {
+        let highlights = file_match_highlights(
+            &SkimMatcherV2::default(),
+            &picker_item("src/main.rs"),
+            "smn",
+        );
+
+        assert_eq!(highlights.label, vec![[0, 1], [3, 4]]);
+        assert_eq!(highlights.annotation, vec![[0, 1]]);
+    }
+
+    #[test]
+    fn file_match_highlights_use_character_indices_for_unicode() {
+        let highlights = file_match_highlights(
+            &SkimMatcherV2::default(),
+            &picker_item("src/mäin.rs"),
+            "min",
+        );
+
+        assert_eq!(highlights.label, vec![[0, 1], [2, 4]]);
+    }
+
+    #[test]
+    fn file_picker_renders_query_matches_with_the_list_highlight_color() {
+        let match_color = Color::Rgb {
+            r: 255,
+            g: 204,
+            b: 102,
+        };
+        let selected_background = Color::Rgb { r: 0, g: 0, b: 0 };
+        let mut theme = Theme::default();
+        theme
+            .colors
+            .insert("list.highlightForeground".to_string(), match_color);
+        theme.ui_style.picker_item = Style {
+            fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
+            bg: Some(Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            }),
+            ..Style::default()
+        };
+        theme.ui_style.picker_selected_item = Style {
+            fg: Some(Color::Rgb {
+                r: 80,
+                g: 250,
+                b: 123,
+            }),
+            bg: Some(selected_background),
+            ..Style::default()
+        };
+        let editor = test_editor_with_theme(theme);
+        let mut picker = FilePicker::loading(&editor);
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+        for character in "main".chars() {
+            picker.handle_event(&key(KeyCode::Char(character)));
+        }
+        send_load(
+            &picker,
+            picker.load_generation,
+            Ok(vec!["src/main.rs".to_string()]),
+        );
+
+        assert!(picker.tick().unwrap());
+        picker.draw(&mut buffer).unwrap();
+        let start = rendered_text_start(&buffer, "main.rs src");
+        let row_background = buffer.cells[start + 4].style.bg;
+
+        for cell in &buffer.cells[start..start + 4] {
+            assert_eq!(cell.style.fg, Some(match_color));
+            assert_eq!(cell.style.bg, row_background);
+        }
+        assert_ne!(buffer.cells[start + 4].style.fg, Some(match_color));
+    }
+
+    #[test]
+    fn file_picker_preserves_a_stronger_parent_path_match() {
+        let editor = test_editor();
+        let mut picker = FilePicker::loading(&editor);
+        for character in "src".chars() {
+            picker.handle_event(&key(KeyCode::Char(character)));
+        }
+        send_load(
+            &picker,
+            picker.load_generation,
+            Ok(vec![
+                "lib/source.rs".to_string(),
+                "src/source.rs".to_string(),
+                "src/main.rs".to_string(),
+            ]),
+        );
+
+        assert!(picker.tick().unwrap());
+        assert_eq!(selected_file(&mut picker), "src/main.rs");
+        picker.handle_event(&key(KeyCode::Down));
+        assert_eq!(selected_file(&mut picker), "src/source.rs");
     }
 
     #[test]

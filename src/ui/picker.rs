@@ -44,6 +44,8 @@ use super::{
 
 type SelectAction = Box<dyn Fn(String) -> Action + Send>;
 type FilterAction = Box<dyn Fn(&PickerItem, &str) -> Option<i64> + Send>;
+type FilterTieBreaker = Box<dyn Fn(&PickerItem) -> usize + Send>;
+type FilterHighlightAction = Box<dyn Fn(&PickerItem, &str) -> PickerFilterHighlights + Send>;
 const MIN_HORIZONTAL_PREVIEW_PANE_WIDTH: usize = 40;
 const MAX_PREVIEW_HIGHLIGHT_BYTES: usize = 64 * 1024;
 const MAX_UNFOCUSED_PREVIEW_BYTES: u64 = 256 * 1024;
@@ -283,6 +285,8 @@ pub struct Picker {
     matcher: SkimMatcherV2,
     select_action: Option<SelectAction>,
     filter_action: Option<FilterAction>,
+    filter_tie_breaker: Option<FilterTieBreaker>,
+    filter_highlight_action: Option<FilterHighlightAction>,
     search: String,
     empty_message: Option<String>,
     theme: Theme,
@@ -343,6 +347,12 @@ struct CommandColumns {
     title: usize,
     shortcut: usize,
     colon: usize,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct PickerFilterHighlights {
+    pub label: Vec<[usize; 2]>,
+    pub annotation: Vec<[usize; 2]>,
 }
 
 impl Picker {
@@ -431,6 +441,8 @@ impl Picker {
             matcher: SkimMatcherV2::default(),
             select_action: None,
             filter_action: None,
+            filter_tie_breaker: None,
+            filter_highlight_action: None,
             search: String::new(),
             empty_message: None,
             theme: editor.theme.clone(),
@@ -605,11 +617,20 @@ impl Picker {
                                 || self.matcher.fuzzy_match(&item.label, term),
                                 |filter| filter(item, term),
                             )
-                            .map(|score| (index, score))
+                            .map(|score| {
+                                let tie_breaker = self
+                                    .filter_tie_breaker
+                                    .as_ref()
+                                    .map_or(0, |tie_breaker| tie_breaker(item));
+                                (index, score, tie_breaker)
+                            })
                     })
                     .collect::<Vec<_>>();
-                matches.sort_unstable_by_key(|(index, score)| (Reverse(*score), *index));
-                self.visible_dynamic_items = matches.into_iter().map(|(index, _)| index).collect();
+                matches.sort_unstable_by_key(|(index, score, tie_breaker)| {
+                    (Reverse(*score), *tie_breaker, *index)
+                });
+                self.visible_dynamic_items =
+                    matches.into_iter().map(|(index, _, _)| index).collect();
             }
             self.list.set_item_count(self.visible_dynamic_items.len());
             self.command_column_widths.set(None);
@@ -1144,6 +1165,23 @@ impl Picker {
         }
     }
 
+    fn result_filter_match_style(&self, base: &Style) -> Style {
+        let foreground = self
+            .theme_color("list.highlightForeground")
+            .or(self.theme.ui_style.picker_prompt.fg)
+            .or(base.fg);
+        let mut style = self.theme.ensure_text_contrast(&Style {
+            fg: foreground,
+            bg: base.bg,
+            bold: base.bold,
+            italic: base.italic,
+        });
+        if style.fg == base.fg {
+            style.bold = true;
+        }
+        style
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn draw_text_with_matches(
         &self,
@@ -1447,6 +1485,16 @@ impl Picker {
             let item_index = top + offset;
             let is_selected = selected == Some(item_index);
             let row_style = self.result_row_style(is_selected);
+            let filter_highlights = self
+                .filter_highlight_action
+                .as_ref()
+                .filter(|_| !self.search.is_empty())
+                .map(|highlight| highlight(item, &self.search));
+            let derived_label_matches = filter_highlights
+                .as_ref()
+                .map(|highlights| highlights.label.as_slice())
+                .filter(|matches| !matches.is_empty());
+            let label_matches = derived_label_matches.unwrap_or(&item.matches);
             let y = rect.y + offset;
             buffer.set_text(rect.x, y, &" ".repeat(rect.width), &row_style);
 
@@ -1463,7 +1511,11 @@ impl Picker {
                 let category_gap = usize::from(command_columns.category > 0) * COMMAND_COLUMN_GAP;
                 let label_x = x + command_columns.category + category_gap;
                 let label_style = self.result_label_style(&row_style);
-                let match_style = self.result_match_style(&label_style);
+                let match_style = if derived_label_matches.is_some() {
+                    self.result_filter_match_style(&label_style)
+                } else {
+                    self.result_match_style(&label_style)
+                };
                 self.draw_text_with_matches(
                     buffer,
                     label_x,
@@ -1472,7 +1524,7 @@ impl Picker {
                     command_columns.title,
                     &label_style,
                     &match_style,
-                    &item.matches,
+                    label_matches,
                 );
 
                 let content_style = self.result_content_style(&row_style, is_selected);
@@ -1540,7 +1592,11 @@ impl Picker {
             let label_x = x;
             let label_width = display_width(&item.label).min(primary_width);
             let label_style = self.result_label_style(&row_style);
-            let match_style = self.result_match_style(&label_style);
+            let match_style = if derived_label_matches.is_some() {
+                self.result_filter_match_style(&label_style)
+            } else {
+                self.result_match_style(&label_style)
+            };
             let used = self.draw_text_with_matches(
                 buffer,
                 label_x,
@@ -1549,7 +1605,7 @@ impl Picker {
                 label_width,
                 &label_style,
                 &match_style,
-                &item.matches,
+                label_matches,
             );
             let annotation_remaining = primary_width.saturating_sub(used);
 
@@ -1559,9 +1615,21 @@ impl Picker {
                 {
                     let annotation_style = self.result_annotation_style(&row_style, is_selected);
                     let annotation_x = label_x + used + 1;
-                    let visible =
-                        truncate_display_width(annotation, annotation_remaining.saturating_sub(1));
-                    buffer.set_text(annotation_x, y, &visible, &annotation_style);
+                    let annotation_match_style = self.result_filter_match_style(&annotation_style);
+                    let annotation_matches = filter_highlights
+                        .as_ref()
+                        .map(|highlights| highlights.annotation.as_slice())
+                        .unwrap_or_default();
+                    self.draw_text_with_matches(
+                        buffer,
+                        annotation_x,
+                        y,
+                        annotation,
+                        annotation_remaining.saturating_sub(1),
+                        &annotation_style,
+                        &annotation_match_style,
+                        annotation_matches,
+                    );
                 }
             }
 
@@ -2999,6 +3067,8 @@ pub struct PickerBuilder {
     id: Option<i32>,
     select_action: Option<SelectAction>,
     filter_action: Option<FilterAction>,
+    filter_tie_breaker: Option<FilterTieBreaker>,
+    filter_highlight_action: Option<FilterHighlightAction>,
     placeholder: Option<String>,
     history_key: Option<String>,
 }
@@ -3018,6 +3088,8 @@ impl PickerBuilder {
             id: None,
             select_action: None,
             filter_action: None,
+            filter_tie_breaker: None,
+            filter_highlight_action: None,
             placeholder: None,
             history_key: None,
         }
@@ -3059,6 +3131,24 @@ impl PickerBuilder {
         self
     }
 
+    /// Sets an ascending secondary sort key for structured rows with equal filter scores.
+    pub fn filter_tie_breaker(
+        mut self,
+        tie_breaker: impl Fn(&PickerItem) -> usize + Send + 'static,
+    ) -> Self {
+        self.filter_tie_breaker = Some(Box::new(tie_breaker));
+        self
+    }
+
+    /// Sets a query highlighter evaluated only for rows that are being rendered.
+    pub(crate) fn filter_highlight_action(
+        mut self,
+        highlight: impl Fn(&PickerItem, &str) -> PickerFilterHighlights + Send + 'static,
+    ) -> Self {
+        self.filter_highlight_action = Some(Box::new(highlight));
+        self
+    }
+
     /// Sets the prompt hint shown while the picker query is empty.
     pub fn placeholder(mut self, placeholder: impl Into<String>) -> Self {
         self.placeholder = Some(placeholder.into());
@@ -3081,6 +3171,8 @@ impl PickerBuilder {
         let id = self.id;
         let select_action = self.select_action;
         let filter_action = self.filter_action;
+        let filter_tie_breaker = self.filter_tie_breaker;
+        let filter_highlight_action = self.filter_highlight_action;
         let placeholder = self.placeholder;
         let history_key = self.history_key;
 
@@ -3094,6 +3186,8 @@ impl PickerBuilder {
             picker.select_action = Some(select_action);
         }
         picker.filter_action = filter_action;
+        picker.filter_tie_breaker = filter_tie_breaker;
+        picker.filter_highlight_action = filter_highlight_action;
         picker.placeholder = placeholder;
         if let Some(history_key) = history_key {
             let history = editor.picker_history(&history_key).to_vec();
@@ -3106,12 +3200,15 @@ impl PickerBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use serde_json::json;
 
-    use super::{picker_file_icon, picker_file_icon_color};
+    use super::{picker_file_icon, picker_file_icon_color, PickerFilterHighlights};
     use crate::{
         buffer::Buffer,
         color::{contrast_ratio, Color},
@@ -5305,6 +5402,55 @@ mod tests {
         assert_eq!(selected.id, "b");
         assert_eq!(selected.label.as_ptr(), original_label);
         assert!(picker.list.items().is_empty());
+    }
+
+    #[test]
+    fn structured_picker_can_break_equal_score_ties_with_an_item_key() {
+        let editor = test_editor();
+        let items = vec![
+            dynamic_item("long/path/alpha", "alpha"),
+            dynamic_item("alpha", "alpha"),
+        ];
+        let mut picker = Picker::builder()
+            .structured_items(items)
+            .filter_action(|_, _| Some(1))
+            .filter_tie_breaker(|item| item.id.len())
+            .build(&editor);
+
+        picker.filter("a");
+
+        assert_eq!(
+            picker.selected_dynamic_item().map(|item| item.id.as_str()),
+            Some("alpha")
+        );
+    }
+
+    #[test]
+    fn structured_picker_only_derives_filter_highlights_for_visible_rows() {
+        let editor = test_editor();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let highlight_calls = Arc::clone(&calls);
+        let items = (0..100)
+            .map(|index| dynamic_item(&format!("item-{index}"), &format!("item {index}")))
+            .collect();
+        let mut picker = Picker::builder()
+            .structured_items(items)
+            .filter_action(|_, _| Some(1))
+            .filter_highlight_action(move |_, _| {
+                highlight_calls.fetch_add(1, Ordering::Relaxed);
+                PickerFilterHighlights::default()
+            })
+            .build(&editor);
+        picker.set_search("i".to_string());
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            picker.layout().results.height
+        );
+        assert!(calls.load(Ordering::Relaxed) < 100);
     }
 
     #[test]
