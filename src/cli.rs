@@ -5,11 +5,17 @@
 //! boundaries rather than supported interactive workflows, so callers should prefer the
 //! public modes documented by the CLI.
 
-use clap::Parser;
+use std::path::PathBuf;
+
+use clap::{Args as ClapArgs, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(version)]
 pub struct Args {
+    /// Non-interactive Red utilities.
+    #[command(subcommand)]
+    pub command: Option<RootCommand>,
+
     /// Root path
     #[clap(short, long)]
     pub root: Option<String>,
@@ -87,9 +93,73 @@ pub struct Args {
     pub files: Vec<String>,
 }
 
+#[derive(Debug, Subcommand)]
+pub enum RootCommand {
+    /// Install and manage external plugin packages.
+    Plugin(PluginArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct PluginArgs {
+    #[command(subcommand)]
+    pub command: PluginCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PluginCommand {
+    /// Install a plugin from GitHub or a local development checkout.
+    Install(PluginInstallArgs),
+    /// List installed external plugins.
+    List,
+    /// Update one plugin or every enabled plugin.
+    Update(PluginUpdateArgs),
+    /// Disable an installed plugin without deleting state.
+    Disable(PluginIdArgs),
+    /// Enable a disabled installed plugin.
+    Enable(PluginIdArgs),
+    /// Remove an installed plugin, preserving its data by default.
+    Remove(PluginRemoveArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct PluginInstallArgs {
+    /// GitHub repository in `owner/repository` form, optionally followed by `@tag`.
+    #[arg(required_unless_present = "path", conflicts_with = "path")]
+    pub source: Option<String>,
+    /// Install a local package checkout for development.
+    #[arg(long, value_name = "DIRECTORY")]
+    pub path: Option<PathBuf>,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct PluginUpdateArgs {
+    /// Installed plugin identifier.
+    #[arg(required_unless_present = "all", conflicts_with = "all")]
+    pub id: Option<String>,
+    /// Update every enabled external plugin.
+    #[arg(long)]
+    pub all: bool,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct PluginIdArgs {
+    /// Installed plugin identifier.
+    pub id: String,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct PluginRemoveArgs {
+    /// Installed plugin identifier.
+    pub id: String,
+    /// Also delete the plugin's namespaced saved data.
+    #[arg(long)]
+    pub purge: bool,
+}
+
 impl Args {
     pub fn utility_requested(&self) -> bool {
-        self.self_check
+        self.command.is_some()
+            || self.self_check
             || self.check_config
             || self.agent_check
             || self.runtime_files
@@ -186,6 +256,38 @@ mod tests {
         let args = Args::try_parse_from(["red", "--process-editor-replace", "todo"]).unwrap();
         assert!(args.process_editor_replace);
         assert!(args.validate_utility_args().is_ok());
+
+        let args =
+            Args::try_parse_from(["red", "plugin", "install", "codersauce/replay@v1.2.3"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(RootCommand::Plugin(PluginArgs {
+                command: PluginCommand::Install(PluginInstallArgs {
+                    source: Some(_),
+                    path: None,
+                }),
+            }))
+        ));
+
+        let args =
+            Args::try_parse_from(["red", "plugin", "install", "--path", "../replay"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(RootCommand::Plugin(PluginArgs {
+                command: PluginCommand::Install(PluginInstallArgs {
+                    source: None,
+                    path: Some(_),
+                }),
+            }))
+        ));
+
+        let args = Args::try_parse_from(["red", "plugin", "update", "--all"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(RootCommand::Plugin(PluginArgs {
+                command: PluginCommand::Update(PluginUpdateArgs { all: true, .. }),
+            }))
+        ));
     }
 
     #[test]

@@ -28,9 +28,11 @@ use crossterm::{style, QueueableCommand};
 
 use red::assets;
 use red::buffer::Buffer;
-use red::cli::Args;
-use red::config::{Config, ConfigDiagnosticSeverity, ConfigRecovery, LoadedConfig};
-use red::editor::Editor;
+use red::cli::{Args, PluginCommand, RootCommand};
+use red::config::{
+    Config, ConfigDiagnosticSeverity, ConfigRecovery, KeyAction, Keys, LoadedConfig,
+};
+use red::editor::{Action, Editor};
 #[cfg(any(unix, test))]
 use red::headless::{InputEvent as DetachedInput, KeyCode as DetachedKeyCode, KeyModifier};
 use red::logger::Logger;
@@ -80,6 +82,10 @@ fn forwarded_husk_arguments_from(
 async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
     args.validate_utility_args()?;
+
+    if let Some(RootCommand::Plugin(plugin)) = &args.command {
+        return run_plugin_command(&plugin.command).await;
+    }
 
     if let Some(session) = &args.attach {
         return attach_session(session).await;
@@ -282,6 +288,102 @@ async fn run() -> anyhow::Result<()> {
     cleanup_result?;
     result?;
 
+    Ok(())
+}
+
+async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
+    use red::plugin::package::{PluginId, PluginPackageManager};
+
+    let manager = PluginPackageManager::new(Config::config_dir());
+    match command {
+        PluginCommand::Install(arguments) => {
+            let installed = if let Some(path) = &arguments.path {
+                manager.install_path(path).await?
+            } else {
+                let source = arguments
+                    .source
+                    .as_deref()
+                    .expect("clap requires a source or --path");
+                let (repository, version) = source
+                    .rsplit_once('@')
+                    .map_or((source, None), |(repository, version)| {
+                        (repository, Some(version))
+                    });
+                manager.install_github(repository, version).await?
+            };
+            println!(
+                "Installed {} {} ({})",
+                installed.id,
+                installed.version,
+                installed.package_root.display()
+            );
+        }
+        PluginCommand::List => {
+            let plugins = manager.list()?;
+            if plugins.is_empty() {
+                println!("No external plugins installed.");
+            }
+            for plugin in plugins {
+                let state = if plugin.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
+                let compatibility = if plugin.compatible {
+                    "compatible"
+                } else {
+                    "incompatible"
+                };
+                let companion = if plugin.has_companion {
+                    "companion"
+                } else {
+                    "husk"
+                };
+                println!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    plugin.id, plugin.version, state, compatibility, companion
+                );
+            }
+        }
+        PluginCommand::Update(arguments) if arguments.all => {
+            let results = manager.update_all().await;
+            for (id, result) in results {
+                match result {
+                    Ok(plugin) => println!("Updated {} to {}", id, plugin.version),
+                    Err(error) => eprintln!("Failed to update {id}: {error:#}"),
+                }
+            }
+        }
+        PluginCommand::Update(arguments) => {
+            let id = PluginId::parse(
+                arguments
+                    .id
+                    .as_deref()
+                    .expect("clap requires an id or --all"),
+            )?;
+            let plugin = manager.update(&id).await?;
+            println!("Updated {} to {}", plugin.id, plugin.version);
+        }
+        PluginCommand::Disable(arguments) => {
+            let id = PluginId::parse(&arguments.id)?;
+            manager.set_enabled(&id, false)?;
+            println!("Disabled {id}");
+        }
+        PluginCommand::Enable(arguments) => {
+            let id = PluginId::parse(&arguments.id)?;
+            manager.set_enabled(&id, true)?;
+            println!("Enabled {id}");
+        }
+        PluginCommand::Remove(arguments) => {
+            let id = PluginId::parse(&arguments.id)?;
+            manager.remove(&id, arguments.purge)?;
+            if arguments.purge {
+                println!("Removed {id} and purged its saved data");
+            } else {
+                println!("Removed {id}; saved data was preserved");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -660,6 +762,23 @@ fn finalize_runtime_config(
     mut loaded: LoadedConfig,
 ) -> anyhow::Result<(LoadedConfig, Theme, Option<Logger>)> {
     let config_dir = Config::config_dir();
+    let package_manager = red::plugin::package::PluginPackageManager::new(&config_dir);
+    for installed in package_manager
+        .list()?
+        .into_iter()
+        .filter(|plugin| plugin.enabled && plugin.compatible)
+    {
+        let manifest = red::plugin::package::PluginPackageManifest::load(&installed.package_root)?;
+        apply_plugin_default_keymaps(&mut loaded.config.keys, &manifest.keymaps);
+        let Some(entrypoint) = manifest.husk_entry(&installed.package_root) else {
+            continue;
+        };
+        loaded
+            .config
+            .plugins
+            .entry(installed.id.to_string())
+            .or_insert_with(|| entrypoint.to_string_lossy().into_owned());
+    }
     for plugin in loaded.config.missing_plugins(&config_dir) {
         loaded.config.plugins.remove(&plugin);
         loaded.add_runtime_diagnostic(
@@ -728,6 +847,58 @@ fn finalize_runtime_config(
     Ok((loaded, theme, logger))
 }
 
+fn apply_plugin_default_keymaps(
+    keys: &mut Keys,
+    keymaps: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+) {
+    for (mode, bindings) in keymaps {
+        let target = match mode.as_str() {
+            "normal" => &mut keys.normal,
+            "insert" => &mut keys.insert,
+            "command" => &mut keys.command,
+            "visual" => &mut keys.visual,
+            "visual_line" => &mut keys.visual_line,
+            "visual_block" => &mut keys.visual_block,
+            _ => continue,
+        };
+        for (sequence, command) in bindings {
+            let sequence = sequence
+                .split_whitespace()
+                .map(|key| if key == "Space" { " " } else { key })
+                .collect::<Vec<_>>();
+            insert_plugin_default_binding(target, &sequence, command);
+        }
+    }
+}
+
+fn insert_plugin_default_binding(
+    bindings: &mut std::collections::HashMap<String, KeyAction>,
+    sequence: &[&str],
+    command: &str,
+) {
+    let Some((key, remainder)) = sequence.split_first() else {
+        return;
+    };
+    if remainder.is_empty() {
+        bindings
+            .entry((*key).to_string())
+            .or_insert_with(|| KeyAction::Single(Action::PluginCommand(command.to_string())));
+        return;
+    }
+    match bindings.entry((*key).to_string()) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let mut nested = std::collections::HashMap::new();
+            insert_plugin_default_binding(&mut nested, remainder, command);
+            entry.insert(KeyAction::Nested(nested));
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            if let KeyAction::Nested(nested) = entry.get_mut() {
+                insert_plugin_default_binding(nested, remainder, command);
+            }
+        }
+    }
+}
+
 fn resolve_log_path(config_dir: &Path, configured_path: &str) -> anyhow::Result<PathBuf> {
     let path = expand_user_path(configured_path)?;
     if path.is_absolute() {
@@ -748,6 +919,39 @@ async fn load_startup_buffers(files: &[String]) -> anyhow::Result<Vec<Buffer>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_default_keymaps_install_shared_leader_siblings() {
+        let mut keys = Keys::default();
+        let keymaps = std::collections::BTreeMap::from([(
+            "normal".to_string(),
+            std::collections::BTreeMap::from([
+                ("Space R g".to_string(), "Replay".to_string()),
+                ("Space R n".to_string(), "ReplayNext".to_string()),
+            ]),
+        )]);
+
+        apply_plugin_default_keymaps(&mut keys, &keymaps);
+
+        let Some(KeyAction::Nested(space)) = keys.normal.get(" ") else {
+            panic!("expected Space to become a leader");
+        };
+        let Some(KeyAction::Nested(replay)) = space.get("R") else {
+            panic!("expected Space R to become the Replay leader");
+        };
+        assert_eq!(
+            replay.get("g"),
+            Some(&KeyAction::Single(Action::PluginCommand(
+                "Replay".to_string()
+            )))
+        );
+        assert_eq!(
+            replay.get("n"),
+            Some(&KeyAction::Single(Action::PluginCommand(
+                "ReplayNext".to_string()
+            )))
+        );
+    }
 
     #[tokio::test]
     async fn startup_opens_missing_file_without_creating_it_until_save() {

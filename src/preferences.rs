@@ -167,6 +167,29 @@ impl PreferencesStore {
         self.save()
     }
 
+    /// Returns an opaque copy suitable for co-snapshotting with editor recovery.
+    ///
+    /// Keys and values are intentionally not interpreted here so data from an
+    /// unavailable or newer plugin survives Red upgrades and plugin reinstalls.
+    #[must_use]
+    pub fn plugin_storage_snapshot(&self) -> HashMap<String, serde_json::Value> {
+        self.preferences.plugin_storage.clone()
+    }
+
+    /// Restores opaque plugin values without deleting keys written after the snapshot.
+    pub fn merge_plugin_storage_snapshot(
+        &mut self,
+        snapshot: &HashMap<String, serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        for (key, value) in snapshot {
+            self.preferences
+                .plugin_storage
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+        self.save()
+    }
+
     /// Persists owner-only JSON for filesystem-backed stores.
     ///
     /// In-memory stores treat saving as a successful no-op.

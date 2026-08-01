@@ -999,6 +999,12 @@ impl RedHost {
                 let status = args.get(1).map(value_to_string);
                 self.send_request(PluginRequest::UpdatePickerStatus { id, status });
             }
+            "UpdatePickerBusy" => {
+                let id = args.first().and_then(value_to_i32).unwrap_or(1);
+                self.ensure_picker_owner(plugin, id, "UpdatePickerBusy")?;
+                let busy = args.get(1).and_then(Value::as_bool).unwrap_or(false);
+                self.send_request(PluginRequest::UpdatePickerBusy { id, busy });
+            }
             "ClosePicker" => {
                 let id = args.first().and_then(value_to_i32).unwrap_or(1);
                 self.ensure_picker_owner(plugin, id, "ClosePicker")?;
@@ -1561,6 +1567,74 @@ impl RedHost {
                     .unwrap_or(serde_json::Value::Null),
                 request_id,
             },
+            "CompanionCall" => PluginRequest::CompanionCall {
+                owner: plugin.to_string(),
+                method: args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("CompanionCall requires a method"))?
+                    .to_string(),
+                params: args
+                    .get(1)
+                    .map(value_to_json)
+                    .unwrap_or(serde_json::Value::Null),
+                timeout_ms: args.get(2).and_then(value_to_u64),
+                request_id,
+            },
+            "DocumentSnapshot" => PluginRequest::DocumentSnapshot {
+                path: args.first().and_then(Value::as_str).map(str::to_string),
+                request_id,
+            },
+            "DocumentApply" => {
+                let options = args
+                    .first()
+                    .map(value_to_json)
+                    .ok_or_else(|| anyhow::anyhow!("DocumentApply requires options"))?;
+                PluginRequest::DocumentApply {
+                    owner: plugin.to_string(),
+                    path: options
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    expected_revision: options
+                        .get("expected_revision")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("DocumentApply requires expected_revision")
+                        })?,
+                    label: options
+                        .get("label")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("plugin edit")
+                        .to_string(),
+                    edits: serde_json::from_value(
+                        options
+                            .get("edits")
+                            .cloned()
+                            .ok_or_else(|| anyhow::anyhow!("DocumentApply requires edits"))?,
+                    )?,
+                    request_id,
+                }
+            }
+            "DocumentUndo" => {
+                let options = args
+                    .first()
+                    .map(value_to_json)
+                    .ok_or_else(|| anyhow::anyhow!("DocumentUndo requires options"))?;
+                PluginRequest::DocumentUndo {
+                    owner: plugin.to_string(),
+                    path: options
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    transaction_id: options
+                        .get("transaction_id")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| anyhow::anyhow!("DocumentUndo requires transaction_id"))?
+                        .to_string(),
+                    request_id,
+                }
+            }
             other => anyhow::bail!("unsupported Red host request: {other}"),
         };
         self.send_request(request);
@@ -2708,6 +2782,41 @@ impl Runtime {
         result
     }
 
+    /// Resolves and transactionally loads a multi-file Husk package.
+    pub async fn load_plugin_package(
+        &mut self,
+        name: &str,
+        manifest_path: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let _span = crate::editor::perf::PerfSpan::with_detail("husk:load_package", name);
+        let package = ResolvedPackage::open(manifest_path, PackageLimits::default())?;
+        let mut inner = self.inner.lock().unwrap();
+        let program = if inner.typecheck_enabled {
+            compile_plugin_package(name, &package)?
+        } else {
+            CompiledProgram::compile_package(
+                &package,
+                &CompileOptions::legacy_runtime_compatibility(),
+            )?
+        };
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        host.begin_reload();
+        let was_loaded = plugins.contains_key(name);
+        let vm = plugins
+            .entry(name.to_string())
+            .or_insert_with(new_plugin_vm);
+        let result = vm.reload_compiled_plugin(name, program, host);
+        if result.is_ok() {
+            host.commit_reload();
+        } else {
+            host.rollback_reload();
+            if !was_loaded {
+                plugins.remove(name);
+            }
+        }
+        result
+    }
+
     pub fn unload_plugin(&mut self, name: &str) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
         let RuntimeInner { plugins, host, .. } = &mut *inner;
@@ -3118,6 +3227,37 @@ fn compile_plugin_source(name: &str, path: &str, source: &str) -> anyhow::Result
         .with_declaration(host.clone());
     let program = CompiledProgram::compile_at(name, path, source, &options)?;
     super::api::validate_parsed_source(name, path, source, program.syntax())?;
+    Ok(program)
+}
+
+fn compile_plugin_package(
+    name: &str,
+    package: &ResolvedPackage,
+) -> anyhow::Result<CompiledProgram> {
+    let host = RED_HOST_AST.get_or_init(|| {
+        let parsed = husk_parser::parse_str(RED_HOST_DECLARATIONS);
+        assert!(
+            parsed.errors.is_empty(),
+            "Red host declarations must parse: {:?}",
+            parsed.errors
+        );
+        parsed
+            .file
+            .expect("Red host declarations must produce an AST")
+    });
+    let options = CompileOptions::legacy_runtime_compatibility()
+        .with_typecheck(true)
+        .with_profile(SemanticProfile::LegacyJavaScript)
+        .with_declaration(host.clone());
+    let program = CompiledProgram::compile_package(package, &options)?;
+    for module in &package.modules {
+        super::api::validate_parsed_source(
+            name,
+            &module.display_path.to_string_lossy(),
+            &module.source,
+            &module.syntax,
+        )?;
+    }
     Ok(program)
 }
 

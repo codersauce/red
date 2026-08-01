@@ -1,0 +1,17 @@
+schema_version = 1
+
+[plugin]
+id = "hello-panel"
+name = "Hello Panel"
+version = "0.1.0"
+red_api = "^0.6.0"
+husk_manifest = "Husk.toml"
+description = "Minimal external package fixture with no native companion"
+license = "MIT"
+
+[activation]
+commands = ["HelloPanel"]
+
+[keymaps.normal]
+"Space H" = "HelloPanel"
+

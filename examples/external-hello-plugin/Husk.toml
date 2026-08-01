@@ -1,0 +1,7 @@
+schema_version = 1
+
+[package]
+name = "hello-panel"
+version = "0.1.0"
+entry = "src/main.hk"
+

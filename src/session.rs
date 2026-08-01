@@ -113,6 +113,15 @@ pub struct SessionSnapshot {
     /// invents Codex thread resume support that the adapter did not negotiate.
     #[serde(default)]
     pub agent_session_resumable: bool,
+    /// Opaque plugin-owned values co-snapshotted with buffers and undo history.
+    ///
+    /// Red preserves unknown keys so uninstalling or temporarily disabling a plugin
+    /// never destroys its recovery payload.
+    #[serde(default)]
+    pub plugin_extensions: HashMap<String, serde_json::Value>,
+    /// Unknown top-level fields retained for manifest-declared plugin migrations.
+    #[serde(default, flatten)]
+    pub legacy_extensions: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2257,7 +2266,31 @@ mod tests {
             agent_transcript: None,
             agent_workspace: None,
             agent_session_resumable: false,
+            plugin_extensions: HashMap::new(),
+            legacy_extensions: std::collections::BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn unknown_top_level_session_fields_survive_for_plugin_migration() {
+        let value = serde_json::to_value(snapshot("source")).unwrap();
+        let mut object = value.as_object().unwrap().clone();
+        object.insert(
+            "former_plugin".to_string(),
+            serde_json::json!({ "version": 1, "reviews": [1, 2] }),
+        );
+
+        let restored: SessionSnapshot =
+            serde_json::from_value(serde_json::Value::Object(object)).unwrap();
+        assert_eq!(
+            restored.legacy_extensions.get("former_plugin"),
+            Some(&serde_json::json!({ "version": 1, "reviews": [1, 2] }))
+        );
+        let encoded = serde_json::to_value(restored).unwrap();
+        assert_eq!(
+            encoded.get("former_plugin"),
+            Some(&serde_json::json!({ "version": 1, "reviews": [1, 2] }))
+        );
     }
 
     #[test]
