@@ -19,9 +19,9 @@ files stay yours.
 [Documentation](#documentation) ·
 [Community](https://discord.gg/5PWvAUNRHU)
 
-<!-- current-release: 0.2.4 -->
+<!-- current-release: 0.3.0 -->
 The current documented release is
-[v0.2.4](https://github.com/codersauce/red/releases/tag/v0.2.4).
+[v0.3.0](https://github.com/codersauce/red/releases/tag/v0.3.0).
 
 ![Red editing its Rust rendering pipeline with the project tree open](docs/images/editor-overview.jpg)
 
@@ -64,7 +64,7 @@ The PowerShell installer verifies the release checksum, installs to
 To pin a release or choose another directory:
 
 ```shell
-RED_VERSION=0.2.4 RED_INSTALL_DIR="$HOME/bin" \
+RED_VERSION=0.3.0 RED_INSTALL_DIR="$HOME/bin" \
   sh -c "$(curl --proto '=https' --tlsv1.2 -fsSL https://getred.dev/install.sh)"
 ```
 

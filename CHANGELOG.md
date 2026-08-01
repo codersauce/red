@@ -2,6 +2,41 @@
 
 All notable changes to Red are documented in this file.
 
+## [0.3.0](https://github.com/codersauce/red/compare/v0.2.4...v0.3.0)
+
+### Features
+
+- **picker:** Highlight file search matches ([96ffa91](https://github.com/codersauce/red/commit/96ffa91082b70ccbddc8c38e3866506fb35c5eec))
+- **picker:** Improve file result ranking ([c4856c1](https://github.com/codersauce/red/commit/c4856c15534bb6ced6194d5369cd16b7d16aff43))
+- **plugins:** Add external package platform ([cf32ae1](https://github.com/codersauce/red/commit/cf32ae18904a09205ba0f4c4d2a4a1463f1b13fd))
+- **window:** Add interactive pane and split resizing ([#161](https://github.com/codersauce/red/issues/161)) ([cf86175](https://github.com/codersauce/red/commit/cf8617503277963ae115b4553e3a5d2916f7b7d3))
+- **release:** Announce releases on Discord ([#154](https://github.com/codersauce/red/issues/154)) ([471e930](https://github.com/codersauce/red/commit/471e93005337c4b9d5efd2c054235532e41695cc))
+- **window:** Add vim-style directional window moves ([#155](https://github.com/codersauce/red/issues/155)) ([9e6fe19](https://github.com/codersauce/red/commit/9e6fe195b7e13c63b6a5995e057b15888cd7a33d))
+
+### Bug Fixes
+
+- **barbecue:** Retain breadcrumbs during symbol refresh ([fd32186](https://github.com/codersauce/red/commit/fd321864c98f2ee471e98bc35447d1e2c908cc40))
+- **editor:** Synchronize cursor transitions ([d5bb6ed](https://github.com/codersauce/red/commit/d5bb6ed277ec3381ece7cf1d7683d89bb4a75fb7))
+- **editor:** Sync shift-i cursor position ([95cde5d](https://github.com/codersauce/red/commit/95cde5dbf7ab15313b51724f6a21f79fe3a88327))
+- **ci:** Resolve clippy and wasmtime security failures ([9bf6de2](https://github.com/codersauce/red/commit/9bf6de2148de370c8b2a63ec6fbe855e1d85de5c))
+- **plugins:** Validate default keymap prefixes ([12ff80b](https://github.com/codersauce/red/commit/12ff80b940dc46f4c209509c08faf5ed381510e0))
+- **plugins:** Activate nested Husk packages ([904b293](https://github.com/codersauce/red/commit/904b2930c8a9fe9a917e1deffb1f28a90fe092d8))
+- **editor:** Keep insert cursor aligned while typing ([0c36732](https://github.com/codersauce/red/commit/0c36732173052d746b16eea2f24a56a1126d49df))
+- **cli:** Open nonexistent files on startup ([523ceda](https://github.com/codersauce/red/commit/523ceda35b0e083b6ab8f1762bbcaadae855e55e))
+- **ci:** Support CodeAlmanac link routes ([fd38d07](https://github.com/codersauce/red/commit/fd38d07295fea2a60843edf010eb84bd530ebff7))
+- **editor:** Match neovim motions and operators ([#157](https://github.com/codersauce/red/issues/157)) ([781da82](https://github.com/codersauce/red/commit/781da82347df6e12a41e20a96dcb20008963e9c5))
+- **release:** Remap generated source paths ([f6077da](https://github.com/codersauce/red/commit/f6077dac0e3670f5e6bc0c960192897eb4093692))
+
+### Refactoring
+
+- **ui:** Unify terminal rendering and component primitives ([#159](https://github.com/codersauce/red/issues/159)) ([b7de490](https://github.com/codersauce/red/commit/b7de490269299e1eb008614a3d48ec96ca93d81c))
+
+### Other
+
+- Document panel-focused key dispatch ([8932431](https://github.com/codersauce/red/commit/8932431423dc848a47b089df96d3e24a79f20b27))
+- Improve wiki graph navigation ([2c4b371](https://github.com/codersauce/red/commit/2c4b37108b774a392a368fcdd50b5751c147bf94))
+- Build first wiki ([0a7e5fb](https://github.com/codersauce/red/commit/0a7e5fb7890005c58bf0d68210e31073745eca8d))
+
 ## [0.2.4](https://github.com/codersauce/red/compare/v0.2.3...v0.2.4)
 
 ### Features
