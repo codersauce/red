@@ -195,10 +195,7 @@ impl CompanionManager {
         let diagnostic_sink = Arc::clone(&diagnostics);
         tokio::spawn(async move {
             let mut chunk = [0_u8; 1024];
-            loop {
-                let Ok(read) = stderr.read(&mut chunk).await else {
-                    break;
-                };
+            while let Ok(read) = stderr.read(&mut chunk).await {
                 if read == 0 {
                     break;
                 }
