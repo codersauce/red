@@ -8086,6 +8086,10 @@ mod tests {
             PluginRequest::GetConfig { request_id, .. } => request_id,
             _ => panic!("unexpected plugin request"),
         };
+        let windows_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetWindows { request_id } => request_id,
+            _ => panic!("expected Barbecue windows request"),
+        };
 
         runtime
             .resolve_request(
@@ -8097,6 +8101,32 @@ mod tests {
                             "barbecue": { "separator": "›" }
                         }
                     }
+                }),
+            )
+            .await
+            .unwrap();
+        runtime
+            .resolve_request(
+                windows_request_id,
+                serde_json::json!({
+                    "windows": [
+                        {
+                            "window_id": 7,
+                            "buffer_index": 2,
+                            "buffer_path": "/repo/plugins/example.rs",
+                            "revision": 4,
+                            "cursor": { "x": 1, "y": 6 },
+                            "lsp_position": { "line": 6, "character": 1 },
+                        },
+                        {
+                            "window_id": 8,
+                            "buffer_index": 2,
+                            "buffer_path": "/repo/plugins/example.rs",
+                            "revision": 4,
+                            "cursor": { "x": 1, "y": 6 },
+                            "lsp_position": { "line": 6, "character": 1 },
+                        }
+                    ]
                 }),
             )
             .await
@@ -8208,6 +8238,286 @@ mod tests {
             }
             _ => panic!("unexpected plugin request"),
         }
+    }
+
+    #[tokio::test]
+    async fn barbecue_debounced_refresh_uses_live_window_cursor() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let stale_windows = serde_json::json!({
+            "windows": [{
+                "window_id": 7,
+                "buffer_index": 2,
+                "buffer_path": "/repo/src/main.rs",
+                "revision": 4,
+                "cursor": { "x": 1, "y": 48 },
+                "lsp_position": { "line": 48, "character": 1 },
+            }]
+        });
+        let symbols = serde_json::json!([
+            {
+                "id": "detached-paste-bytes",
+                "parent_id": null,
+                "name": "DETACHED_PASTE_CHUNK_BYTES",
+                "kind_name": "Constant",
+                "file": "/repo/src/main.rs",
+                "depth": 0,
+                "range": {
+                    "start": { "line": 47, "character": 0 },
+                    "end": { "line": 49, "character": 0 }
+                },
+                "selection_range": {
+                    "start": { "line": 47, "character": 6 },
+                    "end": { "line": 47, "character": 32 }
+                }
+            },
+            {
+                "id": "run",
+                "parent_id": null,
+                "name": "run",
+                "kind_name": "Function",
+                "file": "/repo/src/main.rs",
+                "depth": 0,
+                "range": {
+                    "start": { "line": 81, "character": 0 },
+                    "end": { "line": 126, "character": 0 }
+                },
+                "selection_range": {
+                    "start": { "line": 81, "character": 9 },
+                    "end": { "line": 81, "character": 12 }
+                }
+            }
+        ]);
+
+        let mut runtime = Runtime::new();
+        runtime.set_snapshot("windows", stale_windows.clone());
+        runtime.set_snapshot(
+            "editor_info",
+            serde_json::json!({
+                "theme": {
+                    "style": {
+                        "fg": null,
+                        "bg": "#111111",
+                        "bold": false,
+                        "italic": false
+                    }
+                }
+            }),
+        );
+        runtime
+            .load_plugin("barbecue", include_str!("../../plugins/barbecue.hk"))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::CreateWindowBar { .. }
+        ));
+        let config_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, .. } => request_id,
+            _ => panic!("expected Barbecue config request"),
+        };
+        runtime
+            .resolve_request(
+                config_request_id,
+                serde_json::json!({
+                    "value": {
+                        "cwd": "/repo",
+                        "plugin_config": { "barbecue": {} }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        let initial_symbols_request_id = loop {
+            match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::DocumentSymbols { request_id, .. } => break request_id,
+                PluginRequest::GetWindows { request_id } => {
+                    runtime
+                        .resolve_request(request_id, stale_windows.clone())
+                        .await
+                        .unwrap();
+                }
+                PluginRequest::CreateWindowBar { .. } | PluginRequest::UpdateWindowBar { .. } => {}
+                _ => panic!("unexpected Barbecue startup request"),
+            }
+        };
+        runtime
+            .resolve_request(
+                initial_symbols_request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "file": "/repo/src/main.rs",
+                    "buffer_index": 2,
+                    "revision": 4,
+                    "symbols": symbols.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime
+            .notify(
+                "cursor:moved",
+                serde_json::json!({
+                    "window_id": 7,
+                    "x": 8,
+                    "y": 97,
+                    "lsp_character": 8,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateWindowBar { segments, .. }
+                if segments.iter().any(|segment| segment.text.contains("run"))
+                    && !segments.iter().any(|segment| segment.text.contains("DETACHED_PASTE_CHUNK_BYTES"))
+        ));
+
+        runtime
+            .notify(
+                "buffer:changed",
+                serde_json::json!({
+                    "buffer_id": 2,
+                    "revision": 5,
+                    "cursor": { "line": 97, "column": 8 },
+                }),
+            )
+            .await
+            .unwrap();
+        let timer_id = {
+            let inner = runtime.inner.lock().unwrap();
+            inner
+                .host
+                .policy()
+                .plugin_states
+                .get("barbecue")
+                .and_then(|state| state.get("barbecue_timer"))
+                .and_then(Value::as_str)
+                .expect("expected Barbecue refresh timer")
+                .to_string()
+        };
+        cancel_timeout(&timer_id);
+        runtime
+            .notify(
+                "timeout:callback",
+                serde_json::json!({ "timer_id": timer_id }),
+            )
+            .await
+            .unwrap();
+
+        let refresh_windows_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetWindows { request_id } => request_id,
+            _ => panic!("expected live Barbecue windows refresh"),
+        };
+        runtime
+            .resolve_request(
+                refresh_windows_request_id,
+                serde_json::json!({
+                    "windows": [{
+                        "window_id": 7,
+                        "buffer_index": 2,
+                        "buffer_path": "/repo/src/main.rs",
+                        "revision": 5,
+                        "cursor": { "x": 8, "y": 97 },
+                        "lsp_position": { "line": 97, "character": 8 },
+                    }]
+                }),
+            )
+            .await
+            .unwrap();
+
+        let refreshed_symbols_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::DocumentSymbols { request_id, .. } => request_id,
+            PluginRequest::UpdateWindowBar { .. } => {
+                panic!("Barbecue redrew before refreshed symbols were available");
+            }
+            _ => panic!("unexpected Barbecue refresh request"),
+        };
+        runtime
+            .notify(
+                "cursor:moved",
+                serde_json::json!({
+                    "window_id": 7,
+                    "x": 8,
+                    "y": 98,
+                    "lsp_character": 8,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        runtime
+            .resolve_request(
+                refreshed_symbols_request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "file": "/repo/src/main.rs",
+                    "buffer_index": 2,
+                    "revision": 5,
+                    "symbols": [],
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime
+            .notify(
+                "file:saved",
+                serde_json::json!({
+                    "file": "/repo/src/main.rs",
+                    "buffer_index": 2,
+                }),
+            )
+            .await
+            .unwrap();
+        let saved_windows_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetWindows { request_id } => request_id,
+            _ => panic!("expected Barbecue windows request after save"),
+        };
+        runtime
+            .resolve_request(
+                saved_windows_request_id,
+                serde_json::json!({
+                    "windows": [{
+                        "window_id": 7,
+                        "buffer_index": 2,
+                        "buffer_path": "/repo/src/main.rs",
+                        "revision": 5,
+                        "cursor": { "x": 8, "y": 98 },
+                        "lsp_position": { "line": 98, "character": 8 },
+                    }]
+                }),
+            )
+            .await
+            .unwrap();
+        let saved_symbols_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::DocumentSymbols { request_id, .. } => request_id,
+            _ => panic!("expected Barbecue symbols request after save"),
+        };
+        runtime
+            .resolve_request(
+                saved_symbols_request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "file": "/repo/src/main.rs",
+                    "buffer_index": 2,
+                    "revision": 5,
+                    "symbols": [],
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateWindowBar { segments, .. }
+                if !segments.iter().any(|segment| segment.text.contains("run"))
+        ));
     }
 
     #[cfg(not(windows))]

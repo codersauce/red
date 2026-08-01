@@ -15,13 +15,16 @@ pub fn activate() {
     red::on("window:closed", refresh);
     red::on("buffer:changed", schedule_refresh);
     red::on("file:opened", refresh);
+    red::on("file:saved", file_saved);
     red::on("theme:changed", refresh_theme);
     red::on("window_bar:action:barbecue", bar_action);
     red::on("timeout:callback", timeout_callback);
     red::state_set("barbecue_cwd", "");
     red::state_set("barbecue_windows", []);
     red::state_set("barbecue_symbols", []);
+    red::state_set("barbecue_fallback_symbols", []);
     red::state_set("barbecue_segments", Json {});
+    red::state_set("barbecue_rendered_windows", []);
     red::state_set("barbecue_info", red::null());
     red::state_set("barbecue_timer", "");
     red::state_set("barbecue_context_loaded", false);
@@ -56,7 +59,7 @@ fn refresh(event: Json) {
     if !red::state_bool("barbecue_context_loaded") {
         red::request("GetConfig", config_loaded);
     }
-    windows_loaded(red::windows());
+    red::request("GetWindows", windows_loaded);
     if !red::state_bool("barbecue_info_loaded") {
         info_loaded(red::editor_info());
     }
@@ -109,6 +112,7 @@ fn config_loaded(event: Json) {
 }
 
 fn windows_loaded(result: Json) {
+    retain_rendered_windows(result.windows);
     red::state_set("barbecue_windows", result.windows);
     render_windows();
     if !red::state_bool("barbecue_show_symbols") {
@@ -136,19 +140,49 @@ fn symbols_loaded(result: Json) {
         return;
     }
     let records = [];
+    let should_add = true;
     for record in red::state("barbecue_symbols") {
-        if record.file != result.file || red::int(record.revision, -1) != red::int(result.revision, -1) {
+        if record.file != result.file {
             records = red::push(records, record);
+        } else if red::int(record.revision, -1) > red::int(result.revision, -1) {
+            records = red::push(records, record);
+            should_add = false;
         }
     }
-    records = red::push(records, SymbolRecord {
+    if should_add {
+        records = red::push(records, symbol_record(result));
+    }
+    red::state_set("barbecue_symbols", records);
+    render_windows();
+}
+
+fn symbol_record(result: Json) -> Json {
+    return SymbolRecord {
         file: result.file,
         buffer_index: red::int(result.buffer_index, -1),
         revision: result.revision,
         symbols: result.symbols,
-    });
+    };
+}
+
+fn file_saved(event: Json) {
+    let records = [];
+    for record in red::state("barbecue_symbols") {
+        if record.file != event.file
+            && red::int(record.buffer_index, -1) != red::int(event.buffer_index, -2) {
+            records = red::push(records, record);
+        }
+    }
     red::state_set("barbecue_symbols", records);
-    render_windows();
+    let fallback_records = [];
+    for record in red::state("barbecue_fallback_symbols") {
+        if record.file != event.file
+            && red::int(record.buffer_index, -1) != red::int(event.buffer_index, -2) {
+            fallback_records = red::push(fallback_records, record);
+        }
+    }
+    red::state_set("barbecue_fallback_symbols", fallback_records);
+    refresh(red::null());
 }
 
 fn cursor_moved(event: Json) {
@@ -177,6 +211,9 @@ fn render_windows() {
 }
 
 fn render_window(window: Json) {
+    if should_defer_symbol_render(window) {
+        return;
+    }
     let segments = segments_for(window);
     let cache = red::state("barbecue_segments");
     let key = red::int(window.window_id, -1) + "";
@@ -185,7 +222,56 @@ fn render_window(window: Json) {
     }
     cache[key] = segments;
     red::state_set("barbecue_segments", cache);
+    remember_rendered_window(window);
     red::execute("UpdateWindowBar", "barbecue", window.window_id, segments);
+}
+
+fn should_defer_symbol_render(window: Json) -> bool {
+    if !red::state_bool("barbecue_show_symbols") || has_symbols_for(window) {
+        return false;
+    }
+    for rendered in red::state("barbecue_rendered_windows") {
+        if red::int(rendered.window_id, -1) == red::int(window.window_id, -2)
+            && rendered.buffer_path == window.buffer_path {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn has_symbols_for(window: Json) -> bool {
+    for record in red::state("barbecue_symbols") {
+        if record.file == window.buffer_path && red::int(record.revision, -1) == red::int(window.revision, -1) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn remember_rendered_window(window: Json) {
+    let rendered_windows = [];
+    for rendered in red::state("barbecue_rendered_windows") {
+        if red::int(rendered.window_id, -1) != red::int(window.window_id, -1) {
+            rendered_windows = red::push(rendered_windows, rendered);
+        }
+    }
+    rendered_windows = red::push(rendered_windows, RenderedWindow {
+        window_id: window.window_id,
+        buffer_path: window.buffer_path,
+    });
+    red::state_set("barbecue_rendered_windows", rendered_windows);
+}
+
+fn retain_rendered_windows(windows: Json) {
+    let rendered_windows = [];
+    for rendered in red::state("barbecue_rendered_windows") {
+        for window in windows {
+            if red::int(rendered.window_id, -1) == red::int(window.window_id, -2) {
+                rendered_windows = red::push(rendered_windows, rendered);
+            }
+        }
+    }
+    red::state_set("barbecue_rendered_windows", rendered_windows);
 }
 
 fn segments_for(window: Json) -> Json {
@@ -272,9 +358,46 @@ fn symbols_for(window: Json) -> Json {
 }
 
 fn symbol_chain(window: Json) -> Json {
-    // Breadcrumb rendering runs once per window, so keep each callback's scan bounded.
-    let symbols = symbols_for(window);
     let position = window_position(window);
+    let symbols = symbols_for(window);
+    let chain = symbol_chain_for(symbols, position);
+    if red::len(chain) > 0 {
+        remember_fallback_symbols(window, symbols);
+        return chain;
+    }
+
+    for record in red::state("barbecue_fallback_symbols") {
+        if record.file == window.buffer_path {
+            return symbol_chain_for(record.symbols, position);
+        }
+    }
+    return [];
+}
+
+fn remember_fallback_symbols(window: Json, symbols: Json) {
+    let records = [];
+    let should_add = true;
+    for record in red::state("barbecue_fallback_symbols") {
+        if record.file != window.buffer_path {
+            records = red::push(records, record);
+        } else if red::int(record.revision, -1) > red::int(window.revision, -1) {
+            records = red::push(records, record);
+            should_add = false;
+        }
+    }
+    if should_add {
+        records = red::push(records, SymbolRecord {
+            file: window.buffer_path,
+            buffer_index: red::int(window.buffer_index, -1),
+            revision: window.revision,
+            symbols: symbols,
+        });
+    }
+    red::state_set("barbecue_fallback_symbols", records);
+}
+
+fn symbol_chain_for(symbols: Json, position: Json) -> Json {
+    // Breadcrumb rendering runs once per window, so keep each callback's scan bounded.
     let leaf = red::null();
     let leaf_depth = -1;
     let containing = [];
