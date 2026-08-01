@@ -24,6 +24,8 @@ use crate::{
 
 use super::{Component, Picker, PickerItem, PickerPreview};
 
+const FILENAME_MATCH_BONUS: i64 = 1;
+
 pub struct FilePicker {
     picker: Picker,
     receiver: Receiver<FilePickerLoad>,
@@ -79,7 +81,8 @@ impl FilePicker {
         let mut picker = Picker::builder()
             .title("Find Files")
             .items(vec![])
-            .filter_action(move |item, query| matcher.fuzzy_match(&item.id, query))
+            .filter_action(move |item, query| file_match_score(&matcher, item, query))
+            .filter_tie_breaker(|item| item.id.len())
             .history_key("find_files")
             .select_action(Action::OpenFile)
             .build(editor);
@@ -228,6 +231,55 @@ impl Component for FilePicker {
     }
 }
 
+fn file_match_score(matcher: &SkimMatcherV2, item: &PickerItem, query: &str) -> Option<i64> {
+    if !fuzzy_subsequence_matches(&item.label, query) {
+        return matcher.fuzzy_match(&item.id, query);
+    }
+
+    let filename_score = matcher
+        .fuzzy_match(&item.label, query)
+        .map(|score| score.saturating_add(FILENAME_MATCH_BONUS))?;
+    let query_matches_parent = item
+        .annotation
+        .as_deref()
+        .is_some_and(|parent| fuzzy_subsequence_matches(parent, query));
+
+    if query_matches_parent {
+        matcher
+            .fuzzy_match(&item.id, query)
+            .map(|path_score| path_score.max(filename_score))
+    } else {
+        Some(filename_score)
+    }
+}
+
+fn fuzzy_subsequence_matches(candidate: &str, query: &str) -> bool {
+    let case_sensitive = query
+        .chars()
+        .any(|character| character.is_ascii_uppercase());
+    let mut query = query.chars();
+    let Some(mut expected) = query.next() else {
+        return true;
+    };
+
+    for character in candidate.chars() {
+        let matches = if case_sensitive {
+            character == expected
+        } else {
+            character.eq_ignore_ascii_case(&expected)
+        };
+        if !matches {
+            continue;
+        }
+        let Some(next) = query.next() else {
+            return true;
+        };
+        expected = next;
+    }
+
+    false
+}
+
 fn load_file_picker_items(
     root_path: &Path,
     visibility: FilePickerVisibility,
@@ -351,6 +403,19 @@ mod tests {
             .join("\n")
     }
 
+    fn selected_file(picker: &mut FilePicker) -> String {
+        let Some(KeyAction::Multiple(actions)) = picker.handle_event(&key(KeyCode::Enter)) else {
+            panic!("expected file picker selection actions");
+        };
+        actions
+            .into_iter()
+            .find_map(|action| match action {
+                Action::OpenFile(path) => Some(path),
+                _ => None,
+            })
+            .expect("file picker selection should open a file")
+    }
+
     #[test]
     fn file_picker_draws_loading_message_before_files_arrive() {
         let editor = test_editor();
@@ -419,6 +484,86 @@ mod tests {
                 Action::OpenFile("crates/husk-parser/src/lib.rs".to_string()),
             ]))
         );
+    }
+
+    #[test]
+    fn file_picker_prefers_shorter_paths_when_match_scores_are_equal() {
+        let editor = test_editor();
+        let mut picker = FilePicker::loading(&editor);
+        for character in "main".chars() {
+            picker.handle_event(&key(KeyCode::Char(character)));
+        }
+        send_load(
+            &picker,
+            picker.load_generation,
+            Ok(vec![
+                "crates/husk-cli/src/main.rs".to_string(),
+                "crates/husk-lsp/src/main.rs".to_string(),
+                "examples/external-hello-plugin/src/main.hk".to_string(),
+                "plugins/git_core/src/main.hk".to_string(),
+                "plugins/neotree_core/src/main.hk".to_string(),
+                "src/main.rs".to_string(),
+                "tools/husk-standalone/smoke/src/main.rs".to_string(),
+            ]),
+        );
+
+        assert!(picker.tick().unwrap());
+        for expected in [
+            "src/main.rs",
+            "crates/husk-cli/src/main.rs",
+            "crates/husk-lsp/src/main.rs",
+            "plugins/git_core/src/main.hk",
+            "plugins/neotree_core/src/main.hk",
+            "tools/husk-standalone/smoke/src/main.rs",
+            "examples/external-hello-plugin/src/main.hk",
+        ] {
+            assert_eq!(selected_file(&mut picker), expected);
+            picker.handle_event(&key(KeyCode::Down));
+        }
+    }
+
+    #[test]
+    fn file_picker_prefers_filename_matches_over_directory_matches() {
+        let editor = test_editor();
+        let mut picker = FilePicker::loading(&editor);
+        for character in "main".chars() {
+            picker.handle_event(&key(KeyCode::Char(character)));
+        }
+        send_load(
+            &picker,
+            picker.load_generation,
+            Ok(vec![
+                "main/lib.rs".to_string(),
+                "deep/src/main.rs".to_string(),
+                "src/domain/mainland.rs".to_string(),
+            ]),
+        );
+
+        assert!(picker.tick().unwrap());
+        assert_eq!(selected_file(&mut picker), "deep/src/main.rs");
+    }
+
+    #[test]
+    fn file_picker_preserves_a_stronger_parent_path_match() {
+        let editor = test_editor();
+        let mut picker = FilePicker::loading(&editor);
+        for character in "src".chars() {
+            picker.handle_event(&key(KeyCode::Char(character)));
+        }
+        send_load(
+            &picker,
+            picker.load_generation,
+            Ok(vec![
+                "lib/source.rs".to_string(),
+                "src/source.rs".to_string(),
+                "src/main.rs".to_string(),
+            ]),
+        );
+
+        assert!(picker.tick().unwrap());
+        assert_eq!(selected_file(&mut picker), "src/main.rs");
+        picker.handle_event(&key(KeyCode::Down));
+        assert_eq!(selected_file(&mut picker), "src/source.rs");
     }
 
     #[test]

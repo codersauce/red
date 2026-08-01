@@ -44,6 +44,7 @@ use super::{
 
 type SelectAction = Box<dyn Fn(String) -> Action + Send>;
 type FilterAction = Box<dyn Fn(&PickerItem, &str) -> Option<i64> + Send>;
+type FilterTieBreaker = Box<dyn Fn(&PickerItem) -> usize + Send>;
 const MIN_HORIZONTAL_PREVIEW_PANE_WIDTH: usize = 40;
 const MAX_PREVIEW_HIGHLIGHT_BYTES: usize = 64 * 1024;
 const MAX_UNFOCUSED_PREVIEW_BYTES: u64 = 256 * 1024;
@@ -283,6 +284,7 @@ pub struct Picker {
     matcher: SkimMatcherV2,
     select_action: Option<SelectAction>,
     filter_action: Option<FilterAction>,
+    filter_tie_breaker: Option<FilterTieBreaker>,
     search: String,
     empty_message: Option<String>,
     theme: Theme,
@@ -431,6 +433,7 @@ impl Picker {
             matcher: SkimMatcherV2::default(),
             select_action: None,
             filter_action: None,
+            filter_tie_breaker: None,
             search: String::new(),
             empty_message: None,
             theme: editor.theme.clone(),
@@ -605,11 +608,20 @@ impl Picker {
                                 || self.matcher.fuzzy_match(&item.label, term),
                                 |filter| filter(item, term),
                             )
-                            .map(|score| (index, score))
+                            .map(|score| {
+                                let tie_breaker = self
+                                    .filter_tie_breaker
+                                    .as_ref()
+                                    .map_or(0, |tie_breaker| tie_breaker(item));
+                                (index, score, tie_breaker)
+                            })
                     })
                     .collect::<Vec<_>>();
-                matches.sort_unstable_by_key(|(index, score)| (Reverse(*score), *index));
-                self.visible_dynamic_items = matches.into_iter().map(|(index, _)| index).collect();
+                matches.sort_unstable_by_key(|(index, score, tie_breaker)| {
+                    (Reverse(*score), *tie_breaker, *index)
+                });
+                self.visible_dynamic_items =
+                    matches.into_iter().map(|(index, _, _)| index).collect();
             }
             self.list.set_item_count(self.visible_dynamic_items.len());
             self.command_column_widths.set(None);
@@ -2999,6 +3011,7 @@ pub struct PickerBuilder {
     id: Option<i32>,
     select_action: Option<SelectAction>,
     filter_action: Option<FilterAction>,
+    filter_tie_breaker: Option<FilterTieBreaker>,
     placeholder: Option<String>,
     history_key: Option<String>,
 }
@@ -3018,6 +3031,7 @@ impl PickerBuilder {
             id: None,
             select_action: None,
             filter_action: None,
+            filter_tie_breaker: None,
             placeholder: None,
             history_key: None,
         }
@@ -3059,6 +3073,15 @@ impl PickerBuilder {
         self
     }
 
+    /// Sets an ascending secondary sort key for structured rows with equal filter scores.
+    pub fn filter_tie_breaker(
+        mut self,
+        tie_breaker: impl Fn(&PickerItem) -> usize + Send + 'static,
+    ) -> Self {
+        self.filter_tie_breaker = Some(Box::new(tie_breaker));
+        self
+    }
+
     /// Sets the prompt hint shown while the picker query is empty.
     pub fn placeholder(mut self, placeholder: impl Into<String>) -> Self {
         self.placeholder = Some(placeholder.into());
@@ -3081,6 +3104,7 @@ impl PickerBuilder {
         let id = self.id;
         let select_action = self.select_action;
         let filter_action = self.filter_action;
+        let filter_tie_breaker = self.filter_tie_breaker;
         let placeholder = self.placeholder;
         let history_key = self.history_key;
 
@@ -3094,6 +3118,7 @@ impl PickerBuilder {
             picker.select_action = Some(select_action);
         }
         picker.filter_action = filter_action;
+        picker.filter_tie_breaker = filter_tie_breaker;
         picker.placeholder = placeholder;
         if let Some(history_key) = history_key {
             let history = editor.picker_history(&history_key).to_vec();
@@ -5305,6 +5330,27 @@ mod tests {
         assert_eq!(selected.id, "b");
         assert_eq!(selected.label.as_ptr(), original_label);
         assert!(picker.list.items().is_empty());
+    }
+
+    #[test]
+    fn structured_picker_can_break_equal_score_ties_with_an_item_key() {
+        let editor = test_editor();
+        let items = vec![
+            dynamic_item("long/path/alpha", "alpha"),
+            dynamic_item("alpha", "alpha"),
+        ];
+        let mut picker = Picker::builder()
+            .structured_items(items)
+            .filter_action(|_, _| Some(1))
+            .filter_tie_breaker(|item| item.id.len())
+            .build(&editor);
+
+        picker.filter("a");
+
+        assert_eq!(
+            picker.selected_dynamic_item().map(|item| item.id.as_str()),
+            Some("alpha")
+        );
     }
 
     #[test]
