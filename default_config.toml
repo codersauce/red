@@ -175,8 +175,8 @@ Esc = { EnterMode = "Normal" }
 "e" = "MoveToNextWordEnd"
 "E" = "MoveToNextBigWordEnd"
 "B" = "MoveToPreviousBigWord"
-"o" = [ { EnterMode = "Insert" }, "InsertLineBelowCursor" ]
-"O" = [ { EnterMode = "Insert" }, "InsertLineAtCursor" ]
+"o" = "InsertLineBelowCursor"
+"O" = "InsertLineAtCursor"
 "G" = "MoveToBottom"
 "g" = { "g" = "MoveToTop", "%" = "MatchitBackward", "c" = { StartCommentOperator = 1 }, "d" = "GoToDefinition", "j" = "MoveScreenLineDown", "k" = "MoveScreenLineUp", "0" = "MoveToScreenLineStart", "^" = "MoveToScreenLineFirstNonBlank", "$" = "MoveToScreenLineEnd", "e" = "MoveToPreviousWordEnd", "E" = "MoveToPreviousBigWordEnd", "J" = { JoinLinesKeepSpaces = 2 }, "W" = "ToggleWrap", "u" = { StartLowercaseOperator = 1 }, "U" = { StartUppercaseOperator = 1 }, "~" = { StartToggleCaseOperator = 1 }, "-" = "SelectPreviousUndoBranch", "+" = "SelectNextUndoBranch" }
 "u" = "Undo"

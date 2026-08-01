@@ -29,7 +29,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::OsStr,
     fs,
-    io::{stdout, Write as _},
+    io::Write as _,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     process::Command,
@@ -135,6 +135,11 @@ const MAX_DIRECTORY_LISTING_ENTRIES: usize = 160;
 const AGENT_BRIDGE_CAPACITY: usize = 64;
 const PLUGIN_MANAGER_PICKER_ID: i32 = 9_101;
 const PLUGIN_MANAGER_ACTION_PICKER_ID: i32 = 9_102;
+
+#[cfg(not(test))]
+type TerminalOutput = std::io::Stdout;
+#[cfg(test)]
+type TerminalOutput = Box<dyn std::io::Write + Send>;
 
 async fn apply_plugin_manager_operation(
     manager: &plugin::package::PluginPackageManager,
@@ -1810,6 +1815,13 @@ impl ActionOnSelection {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalCursorState {
+    Hidden,
+    Visible((usize, usize)),
+}
+
 /// Single-task owner of Red's interactive application state.
 ///
 /// The editor coordinates buffers, windows, rendering, LSP, plugins,
@@ -1864,10 +1876,22 @@ pub struct Editor {
     window_manager: WindowManager,
 
     /// Terminal output handle
-    stdout: std::io::BufWriter<std::io::Stdout>,
+    stdout: std::io::BufWriter<TerminalOutput>,
 
     /// Whether render operations should write terminal escape sequences
     terminal_output_enabled: bool,
+
+    /// Final terminal cursor command queued since the last flush.
+    #[cfg(test)]
+    pending_terminal_cursor: Option<TerminalCursorState>,
+
+    /// Final terminal cursor state observed at the last flush boundary.
+    #[cfg(test)]
+    flushed_terminal_cursor: Option<TerminalCursorState>,
+
+    /// Number of terminal flushes observed by cursor synchronization tests.
+    #[cfg(test)]
+    terminal_flush_generation: u64,
 
     /// Whether the terminal window currently has focus.
     is_focused: bool,
@@ -2986,7 +3010,13 @@ impl Editor {
     ) -> anyhow::Result<Self> {
         // Buffer terminal output so a full-screen repaint is one write
         // syscall instead of one per ~1KB of escape sequences.
-        let mut stdout = std::io::BufWriter::with_capacity(1 << 20, stdout());
+        #[cfg(not(test))]
+        let stdout = std::io::BufWriter::with_capacity(1 << 20, std::io::stdout());
+        #[cfg(test)]
+        let stdout = std::io::BufWriter::with_capacity(
+            1 << 20,
+            Box::new(Vec::<u8>::new()) as TerminalOutput,
+        );
         let vx = buffers
             .first()
             .map(|b| b.len().to_string().len())
@@ -3057,6 +3087,12 @@ impl Editor {
             window_manager,
             stdout,
             terminal_output_enabled: true,
+            #[cfg(test)]
+            pending_terminal_cursor: None,
+            #[cfg(test)]
+            flushed_terminal_cursor: None,
+            #[cfg(test)]
+            terminal_flush_generation: 0,
             is_focused: true,
             suppress_reactivation_click: false,
             render_generation: 0,
@@ -3277,10 +3313,20 @@ impl Editor {
         } else {
             self.draw_cursor_preserving_cursor_goal()?;
             if self.terminal_output_enabled {
-                self.stdout.flush()?;
+                self.flush_terminal_output()?;
             }
             Ok(())
         }
+    }
+
+    fn flush_terminal_output(&mut self) -> std::io::Result<()> {
+        self.stdout.flush()?;
+        #[cfg(test)]
+        {
+            self.flushed_terminal_cursor = self.pending_terminal_cursor;
+            self.terminal_flush_generation = self.terminal_flush_generation.wrapping_add(1);
+        }
+        Ok(())
     }
 
     fn set_active_window(&mut self, window_id: usize) -> bool {
@@ -14273,6 +14319,8 @@ impl Editor {
                 self.cy += 1;
                 self.cx = leading_spaces;
                 self.mode = Mode::Insert;
+                self.insert_entry_cursor = Some(self.cursor_snapshot());
+                self.refresh_cursor_goal();
 
                 if self.cy >= self.vheight() {
                     self.vtop += 1;
@@ -14305,6 +14353,8 @@ impl Editor {
                 self.notify_change(runtime).await?;
                 self.cx = leading_spaces;
                 self.mode = Mode::Insert;
+                self.insert_entry_cursor = Some(self.cursor_snapshot());
+                self.refresh_cursor_goal();
                 self.render(buffer)?;
             }
             Action::MoveToTop => {
@@ -16430,6 +16480,7 @@ impl Editor {
         }
         self.cy = insertion_y.saturating_sub(self.vtop);
         self.cx = insertion_x.min(self.length_for_line(insertion_y));
+        self.refresh_cursor_goal();
         self.selection = None;
         self.notify_change(runtime).await?;
 
@@ -18041,6 +18092,7 @@ impl Editor {
         self.cy = snapshot.y.saturating_sub(self.vtop);
         self.cx = snapshot.x;
         self.check_bounds();
+        self.refresh_cursor_goal();
     }
 
     fn begin_transaction(&mut self, label: impl Into<String>) {
@@ -24048,6 +24100,355 @@ mod test {
             Editor::with_size(lsp, width, height, config, Theme::default(), vec![buffer]).unwrap();
         editor.test_disable_terminal_output();
         editor
+    }
+
+    #[derive(Debug)]
+    struct CursorObservation {
+        mode: Mode,
+        logical: (usize, usize),
+        window: (usize, usize, usize, usize, usize),
+        screen: Option<(usize, usize)>,
+        rendered: Option<(usize, usize)>,
+        terminal: Option<TerminalCursorState>,
+        flush_generation: u64,
+    }
+
+    struct RenderedCursorHarness {
+        editor: Editor,
+        buffer: RenderBuffer,
+        runtime: Runtime,
+    }
+
+    impl RenderedCursorHarness {
+        fn new(contents: &str, cursor: (usize, usize)) -> Self {
+            let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+            let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+            let text_buffer = Buffer::new(None, contents.to_string());
+            let mut editor = Editor::with_size(
+                lsp,
+                /*width*/ 60,
+                /*height*/ 12,
+                config,
+                Theme::default(),
+                vec![text_buffer],
+            )
+            .unwrap();
+            editor.splash_dismissed = true;
+            editor.cx = cursor.0;
+            editor.cy = cursor.1;
+            editor.refresh_cursor_goal();
+            editor.sync_to_window();
+            let mut buffer =
+                RenderBuffer::new(/*width*/ 60, /*height*/ 12, &Style::default());
+            editor.render(&mut buffer).unwrap();
+
+            let harness = Self {
+                editor,
+                buffer,
+                runtime: Runtime::new(),
+            };
+            harness.assert_synchronized("initial render");
+            harness
+        }
+
+        fn observation(&self) -> CursorObservation {
+            let window = self.editor.window_manager.active_window().unwrap();
+            CursorObservation {
+                mode: self.editor.mode,
+                logical: (self.editor.cx, self.editor.buffer_line()),
+                window: (
+                    window.cx,
+                    window.cy,
+                    window.vtop,
+                    window.vleft,
+                    window.skipcol,
+                ),
+                screen: self.editor.render_cursor_position(),
+                rendered: self.editor.last_rendered_cursor_position,
+                terminal: self.editor.flushed_terminal_cursor,
+                flush_generation: self.editor.terminal_flush_generation,
+            }
+        }
+
+        fn assert_synchronized(&self, label: &str) {
+            let observation = self.observation();
+            let expected_window = (
+                self.editor.cx,
+                self.editor.cy,
+                self.editor.vtop,
+                self.editor.vleft,
+                self.editor.skipcol,
+            );
+            assert_eq!(
+                observation.window, expected_window,
+                "window state diverged after {label}: {observation:?}"
+            );
+            assert_eq!(
+                observation.logical,
+                (
+                    observation.window.0,
+                    observation.window.2 + observation.window.1,
+                ),
+                "logical and window cursors diverged after {label}: {observation:?}"
+            );
+
+            let screen = observation.screen.unwrap_or_else(|| {
+                panic!("cursor was not renderable after {label}: {observation:?}")
+            });
+            assert!(
+                screen.0 < self.buffer.width && screen.1 < self.buffer.height,
+                "cursor was outside the terminal after {label}: {observation:?}"
+            );
+            assert!(
+                self.editor.stdout.buffer().is_empty(),
+                "terminal output remained buffered after {label}: {observation:?}"
+            );
+            assert!(
+                observation.flush_generation > 0,
+                "no terminal flush occurred after {label}: {observation:?}"
+            );
+
+            assert!(matches!(
+                observation.mode,
+                Mode::Normal | Mode::Insert | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+            ));
+            if self.editor.uses_synthetic_block_cursor() {
+                assert_eq!(
+                    observation.rendered,
+                    Some(screen),
+                    "synthetic cursor frame was stale after {label}: {observation:?}"
+                );
+                assert_eq!(
+                    observation.terminal,
+                    Some(TerminalCursorState::Hidden),
+                    "hardware cursor remained visible after {label}: {observation:?}"
+                );
+            } else {
+                assert_eq!(
+                    observation.terminal,
+                    Some(TerminalCursorState::Visible(screen)),
+                    "hardware cursor was stale after {label}: {observation:?}"
+                );
+            }
+        }
+
+        async fn press(&mut self, code: KeyCode, modifiers: KeyModifiers, label: &str) {
+            let previous_flush = self.editor.terminal_flush_generation;
+            self.editor
+                .process_editor_event(
+                    Event::Key(KeyEvent::new(code, modifiers)),
+                    &mut self.buffer,
+                    &mut self.runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+            assert!(
+                self.editor.terminal_flush_generation > previous_flush,
+                "event did not flush the terminal after {label}: {:?}",
+                self.observation()
+            );
+            self.assert_synchronized(label);
+        }
+
+        async fn press_char(&mut self, key: char) {
+            self.press(
+                KeyCode::Char(key),
+                KeyModifiers::NONE,
+                &format!("pressing {key:?}"),
+            )
+            .await;
+        }
+
+        async fn escape(&mut self) {
+            self.press(KeyCode::Esc, KeyModifiers::NONE, "pressing Esc")
+                .await;
+        }
+
+        fn assert_cursor(&self, expected: (usize, usize), label: &str) {
+            assert_eq!(
+                (self.editor.cx, self.editor.buffer_line()),
+                expected,
+                "logical cursor mismatch after {label}: {:?}",
+                self.observation()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bundled_insert_keys_keep_every_cursor_layer_synchronized() {
+        struct Case {
+            key: char,
+            contents: &'static str,
+            start: (usize, usize),
+            insert: (usize, usize),
+            after_type: (usize, usize),
+            after_escape: (usize, usize),
+        }
+
+        let cases = [
+            Case {
+                key: 'i',
+                contents: "hello",
+                start: (2, 0),
+                insert: (2, 0),
+                after_type: (3, 0),
+                after_escape: (2, 0),
+            },
+            Case {
+                key: 'I',
+                contents: "    hello",
+                start: (8, 0),
+                insert: (4, 0),
+                after_type: (5, 0),
+                after_escape: (4, 0),
+            },
+            Case {
+                key: 'a',
+                contents: "hello",
+                start: (2, 0),
+                insert: (3, 0),
+                after_type: (4, 0),
+                after_escape: (3, 0),
+            },
+            Case {
+                key: 'A',
+                contents: "hello",
+                start: (2, 0),
+                insert: (5, 0),
+                after_type: (6, 0),
+                after_escape: (5, 0),
+            },
+            Case {
+                key: 'a',
+                contents: "",
+                start: (0, 0),
+                insert: (0, 0),
+                after_type: (1, 0),
+                after_escape: (0, 0),
+            },
+            Case {
+                key: 'I',
+                contents: "\t👋x",
+                start: (2, 0),
+                insert: (1, 0),
+                after_type: (2, 0),
+                after_escape: (1, 0),
+            },
+            Case {
+                key: 'A',
+                contents: "\t👋x",
+                start: (0, 0),
+                insert: (3, 0),
+                after_type: (4, 0),
+                after_escape: (3, 0),
+            },
+            Case {
+                key: 'o',
+                contents: "    one\nnext",
+                start: (2, 0),
+                insert: (4, 1),
+                after_type: (5, 1),
+                after_escape: (4, 1),
+            },
+            Case {
+                key: 'O',
+                contents: "one\n    two",
+                start: (2, 1),
+                insert: (4, 1),
+                after_type: (5, 1),
+                after_escape: (4, 1),
+            },
+        ];
+
+        for case in cases {
+            let mut harness = RenderedCursorHarness::new(case.contents, case.start);
+            harness.press_char(case.key).await;
+            assert_eq!(harness.editor.mode, Mode::Insert, "key {:?}", case.key);
+            harness.assert_cursor(case.insert, &format!("pressing {:?}", case.key));
+
+            harness.press_char('x').await;
+            harness.assert_cursor(case.after_type, &format!("typing after {:?}", case.key));
+
+            harness.escape().await;
+            assert_eq!(harness.editor.mode, Mode::Normal, "key {:?}", case.key);
+            harness.assert_cursor(case.after_escape, &format!("escaping {:?}", case.key));
+        }
+    }
+
+    #[tokio::test]
+    async fn bundled_insert_keys_exit_immediately_at_the_entry_cursor() {
+        let cases = [
+            ('i', "hello", (2, 0), (2, 0)),
+            ('I', "    hello", (8, 0), (4, 0)),
+            ('a', "hello", (2, 0), (2, 0)),
+            ('A', "hello", (2, 0), (4, 0)),
+            ('o', "    one\nnext", (2, 0), (3, 1)),
+            ('O', "one\n    two", (2, 1), (3, 1)),
+        ];
+
+        for (key, contents, start, expected) in cases {
+            let mut harness = RenderedCursorHarness::new(contents, start);
+            harness.press_char(key).await;
+            harness.escape().await;
+            harness.assert_cursor(expected, &format!("escaping immediately after {key:?}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn bundled_change_keys_keep_every_cursor_layer_synchronized() {
+        for sequence in ["s", "S", "C", "cw", "c$", "cc"] {
+            let mut harness = RenderedCursorHarness::new("alpha beta", (2, 0));
+            for key in sequence.chars() {
+                harness.press_char(key).await;
+            }
+            assert_eq!(
+                harness.editor.mode,
+                Mode::Insert,
+                "sequence {sequence:?} did not enter Insert mode"
+            );
+            harness.press_char('x').await;
+            harness.escape().await;
+            assert_eq!(harness.editor.mode, Mode::Normal, "sequence {sequence:?}");
+        }
+
+        let mut visual = RenderedCursorHarness::new("alpha beta", (2, 0));
+        for key in ['v', 'l', 'c'] {
+            visual.press_char(key).await;
+        }
+        assert_eq!(visual.editor.mode, Mode::Insert);
+        visual.press_char('x').await;
+        visual.escape().await;
+        assert_eq!(visual.editor.mode, Mode::Normal);
+
+        let mut block = RenderedCursorHarness::new("alpha\nbravo", (2, 0));
+        block
+            .press(KeyCode::Char('v'), KeyModifiers::CONTROL, "pressing Ctrl-v")
+            .await;
+        block.press_char('j').await;
+        block.press_char('I').await;
+        assert_eq!(block.editor.mode, Mode::Insert);
+        block.press_char('x').await;
+        block.escape().await;
+        assert_eq!(block.editor.mode, Mode::Normal);
+        assert_eq!(block.editor.current_buffer().contents(), "alxpha\nbrxavo");
+    }
+
+    #[tokio::test]
+    async fn bundled_insert_edit_undo_and_redo_keep_every_cursor_layer_synchronized() {
+        let mut harness = RenderedCursorHarness::new("hello", (2, 0));
+        harness.press_char('a').await;
+        harness.press_char('x').await;
+        harness.escape().await;
+        assert_eq!(harness.editor.current_buffer().contents(), "helxlo");
+
+        harness.press_char('u').await;
+        assert_eq!(harness.editor.current_buffer().contents(), "hello");
+
+        harness
+            .press(KeyCode::Char('r'), KeyModifiers::CONTROL, "pressing Ctrl-r")
+            .await;
+        assert_eq!(harness.editor.current_buffer().contents(), "helxlo");
     }
 
     fn bracket_test_editor(contents: &str, width: usize, height: usize) -> Editor {

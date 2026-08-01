@@ -1705,7 +1705,7 @@ impl Editor {
         if change_set.is_empty() {
             self.set_cursor_style()?;
             self.draw_cursor_preserving_cursor_goal()?;
-            self.stdout.flush()?;
+            self.flush_terminal_output()?;
             return Ok(());
         }
 
@@ -1752,7 +1752,7 @@ impl Editor {
         self.stdout.queue(terminal::EnableLineWrap)?;
         self.set_cursor_style()?;
         self.draw_cursor_preserving_cursor_goal()?;
-        self.stdout.flush()?;
+        self.flush_terminal_output()?;
 
         Ok(())
     }
@@ -1975,6 +1975,10 @@ impl Editor {
 
         if !self.is_focused {
             self.stdout.queue(cursor::Hide)?;
+            #[cfg(test)]
+            {
+                self.pending_terminal_cursor = Some(super::TerminalCursorState::Hidden);
+            }
             return Ok(());
         }
 
@@ -1982,6 +1986,10 @@ impl Editor {
 
         if self.uses_synthetic_block_cursor() {
             self.stdout.queue(cursor::Hide)?;
+            #[cfg(test)]
+            {
+                self.pending_terminal_cursor = Some(super::TerminalCursorState::Hidden);
+            }
             return Ok(());
         }
 
@@ -1990,8 +1998,16 @@ impl Editor {
         if let Some((x, y)) = cursor_pos {
             self.stdout.queue(cursor::Show)?;
             self.stdout.queue(cursor::MoveTo(x as u16, y as u16))?;
+            #[cfg(test)]
+            {
+                self.pending_terminal_cursor = Some(super::TerminalCursorState::Visible((x, y)));
+            }
         } else {
             self.stdout.queue(cursor::Hide)?;
+            #[cfg(test)]
+            {
+                self.pending_terminal_cursor = Some(super::TerminalCursorState::Hidden);
+            }
         }
 
         Ok(())
