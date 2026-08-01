@@ -223,7 +223,7 @@ Esc = { EnterMode = "Normal" }
 "a" = [ { EnterMode = "Insert" }, "MoveRight" ]
 "A" = [ "MoveToLineEnd", { EnterMode = "Insert" }, "MoveRight" ]
 "i" = { EnterMode = "Insert" }
-"I" = [ { EnterMode = "Insert" }, "MoveToFirstLineChar" ]
+"I" = [ "MoveToFirstLineChar", { EnterMode = "Insert" } ]
 ";" = { RepeatCharSearch = 1 }
 ":" = { EnterMode = "Command" }
 "/" = { EnterSearch = "Forward" }

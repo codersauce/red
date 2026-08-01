@@ -28889,6 +28889,49 @@ while True:
     }
 
     #[tokio::test]
+    async fn insert_at_first_non_blank_renders_cursor_at_the_insert_position() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let contents = "    hello";
+        let buffer = Buffer::new(None, contents.to_string());
+        let mut editor =
+            Editor::with_size(lsp, 20, 5, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        editor.cx = 8;
+        editor.refresh_cursor_goal();
+        editor.sync_to_window();
+        let (initial_screen_x, expected_screen_y) = editor.render_cursor_position().unwrap();
+        let initial_display_col =
+            grapheme_to_column_with_tabs(contents, editor.cx, editor.active_tab_width());
+        let content_screen_x = initial_screen_x - initial_display_col;
+        let expected_position = (content_screen_x + 4, expected_screen_y);
+        let mut render_buffer = RenderBuffer::new(20, 5, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.mode, Mode::Insert);
+        assert_eq!(editor.cx, 4);
+        assert_eq!(
+            editor.insert_entry_cursor.as_ref().map(|cursor| cursor.x),
+            Some(4)
+        );
+        assert_eq!(editor.render_cursor_position(), Some(expected_position));
+        assert_eq!(
+            editor.last_rendered_cursor_position,
+            Some(expected_position)
+        );
+    }
+
+    #[tokio::test]
     async fn escape_after_append_renders_cursor_on_original_character() {
         let mut config = Config::default();
         config.keys.normal.insert(
