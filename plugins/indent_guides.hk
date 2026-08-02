@@ -78,8 +78,21 @@ struct IndentEditorInfo {
     theme: IndentTheme,
 }
 
-pub fn activate() {
-    red::state_set("indent_layout_key", "");
+struct IndentGuidesState {
+    layout_key: String,
+}
+
+#[red::state]
+fn initial_state() -> IndentGuidesState {
+    return IndentGuidesState { layout_key: "" };
+}
+
+fn state() -> IndentGuidesState {
+    return red::state();
+}
+
+#[red::lifecycle("activate")]
+fn initialize_guides() {
     refresh(EmptyEvent {});
 }
 
@@ -98,16 +111,16 @@ fn refresh(event: EmptyEvent) {
         + ":" + red::int(layout.cursor.y, -1)
         + ":" + red::int(layout.width, -1)
         + ":" + red::int(layout.height, -1);
-    if key == red::state("indent_layout_key") {
+    if key == state().layout_key {
         return;
     }
-    red::state_set("indent_layout_key", key);
+    red::state_patch(IndentGuidesState { layout_key: key });
     render(layout, red::editor_info());
 }
 
 #[red::on("theme:changed")]
 fn refresh_theme(event: EmptyEvent) {
-    red::state_set("indent_layout_key", "");
+    red::state_patch(IndentGuidesState { layout_key: "" });
     refresh(event);
 }
 
@@ -115,6 +128,7 @@ fn render(layout: IndentViewportLayout, info: IndentEditorInfo) {
     red::execute("SetDecorations", "indent-guides", build_decorations(layout, info));
 }
 
+#[red::lifecycle("deactivate")]
 fn deactivate() {
     red::execute("ClearDecorations", "indent-guides");
 }

@@ -63,13 +63,12 @@ struct LspSymbolsState {
     icon_overrides: Json,
     batch_timer: String,
     batch_index: i32,
-    // Picker handles and positions remain nullable until a flow is active.
-    batch_picker: Json,
+    batch_picker: Option<i32>,
     batch_kind: String,
     batch_workspace_only: bool,
     reference_file: String,
-    reference_position: Json,
-    picker: Json,
+    reference_position: Option<Position>,
+    picker: Option<i32>,
     request: i32,
 }
 
@@ -80,12 +79,12 @@ fn initial_state() -> LspSymbolsState {
         icon_overrides: Json {},
         batch_timer: "",
         batch_index: 0,
-        batch_picker: red::null(),
+        batch_picker: None,
         batch_kind: "",
         batch_workspace_only: false,
         reference_file: "",
-        reference_position: red::null(),
-        picker: red::null(),
+        reference_position: None,
+        picker: None,
         request: -1,
     };
 }
@@ -167,13 +166,13 @@ fn workspace_symbols() {
         cancelled: symbol_picker_cancelled,
     });
     let current = state();
-    current.picker = handle;
+    current.picker = Some(handle);
     save_state(current);
     request_workspace_symbols("");
 }
 
 fn workspace_query(query: String) {
-    if state().picker == red::null() {
+    if state().picker == None {
         return;
     }
     cancel_symbol_batch();
@@ -231,7 +230,7 @@ fn show_document_symbols(result: SymbolsResult, request_id: i32) {
             cancelled: symbol_picker_cancelled,
         });
         let current = state();
-        current.picker = handle;
+        current.picker = Some(handle);
         save_state(current);
         return;
     }
@@ -244,7 +243,7 @@ fn show_document_symbols(result: SymbolsResult, request_id: i32) {
         cancelled: symbol_picker_cancelled,
     });
     let current = state();
-    current.picker = handle;
+    current.picker = Some(handle);
     save_state(current);
     start_symbol_batch(result.symbols, false, handle);
 }
@@ -255,11 +254,11 @@ fn update_workspace_symbols(result: SymbolsResult, request_id: i32) {
         return;
     }
     current.request = -1;
-    let handle = current.picker;
     save_state(current);
-    if handle == red::null() {
+    let current = state();
+    let Some(handle) = current.picker else {
         return;
-    }
+    };
     if !result.ok {
         cancel_symbol_batch();
         red::execute("UpdatePickerItems", handle, []);
@@ -288,7 +287,7 @@ fn start_symbol_batch(symbols: [LspSymbol], workspace_only: bool, handle: i32) {
     red::state_set("lsp_symbol_batch_symbols", symbols);
     red::state_set("lsp_symbol_batch_items", []);
     current.batch_index = 0;
-    current.batch_picker = handle;
+    current.batch_picker = Some(handle);
     current.batch_kind = "symbols";
     current.batch_workspace_only = workspace_only;
     save_state(current);
@@ -301,11 +300,11 @@ fn start_reference_batch(result: ReferencesResult, handle: i32) {
     red::state_set("lsp_symbol_batch_symbols", result.references);
     red::state_set("lsp_symbol_batch_items", []);
     current.batch_index = 0;
-    current.batch_picker = handle;
+    current.batch_picker = Some(handle);
     current.batch_kind = "references";
     current.batch_workspace_only = false;
     current.reference_file = result.file;
-    current.reference_position = result.position;
+    current.reference_position = Some(result.position);
     save_state(current);
     schedule_symbol_batch();
 }
@@ -329,8 +328,11 @@ fn symbol_batch_timeout(event: TimerEvent) {
     let symbols = red::state("lsp_symbol_batch_symbols");
     let batch = [];
     let index = current.batch_index;
-    let handle = current.batch_picker;
-    if handle == red::null() || handle != current.picker {
+    let Some(handle) = current.batch_picker else {
+        clear_symbol_batch();
+        return;
+    };
+    if current.picker != Some(handle) {
         clear_symbol_batch();
         return;
     }
@@ -340,11 +342,11 @@ fn symbol_batch_timeout(event: TimerEvent) {
     while index < red::len(symbols) && index < 4096 && processed < 64 {
         let value = symbols[index];
         if kind == "references" {
-            if !is_current_reference(
-                value,
-                current.reference_file,
-                current.reference_position
-            ) {
+            let Some(position) = current.reference_position else {
+                clear_symbol_batch();
+                return;
+            };
+            if !is_current_reference(value, current.reference_file, position) {
                 batch = red::push(batch, reference_item(value));
             }
         } else if !workspace_only || is_workspace_symbol_kind(value.kind_name) {
@@ -394,11 +396,11 @@ fn clear_symbol_batch() {
     red::state_set("lsp_symbol_batch_symbols", []);
     red::state_set("lsp_symbol_batch_items", []);
     current.batch_index = 0;
-    current.batch_picker = red::null();
+    current.batch_picker = None;
     current.batch_kind = "";
     current.batch_workspace_only = false;
     current.reference_file = "";
-    current.reference_position = red::null();
+    current.reference_position = None;
     save_state(current);
 }
 
@@ -429,7 +431,7 @@ fn show_references(result: ReferencesResult, request_id: i32) {
             cancelled: symbol_picker_cancelled,
         });
         let current = state();
-        current.picker = handle;
+        current.picker = Some(handle);
         save_state(current);
         start_reference_batch(result, handle);
         return;
@@ -464,7 +466,7 @@ fn show_references(result: ReferencesResult, request_id: i32) {
         cancelled: symbol_picker_cancelled,
     });
     let current = state();
-    current.picker = handle;
+    current.picker = Some(handle);
     save_state(current);
 }
 
@@ -524,14 +526,14 @@ fn symbol_picker_cancelled(event: PickerCancelled) {
 fn begin_symbol_flow() {
     let handle = state().picker;
     finish_symbol_flow();
-    if handle != red::null() {
+    if let Some(handle) = handle {
         red::execute("ClosePicker", handle);
     }
 }
 
 fn finish_symbol_flow() {
     let current = state();
-    current.picker = red::null();
+    current.picker = None;
     save_state(current);
     cancel_symbol_batch();
     let current = state();

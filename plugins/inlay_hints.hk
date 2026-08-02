@@ -72,28 +72,49 @@ struct InlayDecoration {
     priority: i32,
 }
 
-pub fn activate() {
-    red::state_set("inlay_timer", "");
-    red::state_set("inlay_layout", red::null());
-    red::state_set("inlay_info", red::null());
-    red::state_set("inlay_hints", red::null());
-    red::state_set("inlay_info_loaded", false);
-    red::state_set("inlay_hints_loaded", false);
-    red::state_set("inlay_generation", 0);
-    red::state_set("inlay_hints_request", 0);
-    red::state_set("inlay_parameter_hints", false);
-    red::state_set("inlay_last_decorations", red::null());
-    red::request("GetConfig", config_loaded);
+struct InlayHintsState {
+    timer: String,
+    layout: Option<InlayViewportLayout>,
+    info: Option<InlayEditorInfo>,
+    hints: Option<InlayHintsResult>,
+    info_loaded: bool,
+    hints_loaded: bool,
+    generation: i32,
+    hints_request: i32,
+    parameter_hints: bool,
+    last_decorations: Option<[InlayDecoration]>,
+}
+
+#[red::state]
+fn initial_state() -> InlayHintsState {
+    return InlayHintsState {
+        timer: "",
+        layout: None,
+        info: None,
+        hints: None,
+        info_loaded: false,
+        hints_loaded: false,
+        generation: 0,
+        hints_request: 0,
+        parameter_hints: false,
+        last_decorations: None,
+    };
+}
+
+fn state() -> InlayHintsState {
+    return red::state();
+}
+
+#[red::lifecycle("activate")]
+fn initialize_hints() {
     refresh();
 }
 
+#[red::config]
 fn config_loaded(event: InlayConfigEvent) {
     let options = event.value.plugin_config.inlay_hints;
     if options != red::null() {
-        red::state_set(
-            "inlay_parameter_hints",
-            red::bool(options.parameter_hints, false)
-        );
+        red::state_patch(InlayHintsState { parameter_hints: red::bool(options.parameter_hints, false) });
         refresh();
     }
 }
@@ -103,27 +124,27 @@ fn config_loaded(event: InlayConfigEvent) {
 #[red::on("viewport:changed")]
 #[red::on("theme:changed")]
 fn schedule_refresh(event: EmptyEvent) {
-    let timer = red::string(red::state("inlay_timer"), "");
+    let timer = red::string(state().timer, "");
     if timer != "" {
         red::execute("CancelTimeout", timer);
     }
-    red::state_set("inlay_timer", red::execute("SetTimeout", 120));
+    red::state_patch(InlayHintsState { timer: red::execute("SetTimeout", 120) });
 }
 
 #[red::on("timeout:callback")]
 fn timeout_callback(event: TimerEvent) {
-    if event.timer_id != red::state("inlay_timer") {
+    if event.timer_id != state().timer {
         return;
     }
-    red::state_set("inlay_timer", "");
+    red::state_patch(InlayHintsState { timer: "" });
     refresh();
 }
 
 fn refresh() {
-    let generation = red::int(red::state("inlay_generation"), 0) + 1;
-    red::state_set("inlay_generation", generation);
-    red::state_set("inlay_info_loaded", false);
-    red::state_set("inlay_hints_loaded", false);
+    let generation = red::int(state().generation, 0) + 1;
+    red::state_patch(InlayHintsState { generation: generation });
+    red::state_patch(InlayHintsState { info_loaded: false });
+    red::state_patch(InlayHintsState { hints_loaded: false });
     let layout: InlayViewportLayout = red::viewport_layout();
     layout_loaded(layout);
 }
@@ -133,7 +154,7 @@ fn layout_loaded(layout: InlayViewportLayout) {
         red::execute("ClearDecorations", "inlay-hints");
         return;
     }
-    red::state_set("inlay_layout", layout);
+    red::state_patch(InlayHintsState { layout: Some(layout) });
     let start_line = layout.rows[0].line;
     let end_line = start_line;
     for row in layout.rows {
@@ -148,37 +169,44 @@ fn layout_loaded(layout: InlayViewportLayout) {
         start: Position { line: start_line, character: 0 },
         end: Position { line: end_line + 1, character: 0 },
     });
-    red::state_set("inlay_hints_request", hints_id);
+    red::state_patch(InlayHintsState { hints_request: hints_id });
     let info: InlayEditorInfo = red::editor_info();
     info_loaded(info);
 }
 
 fn info_loaded(info: InlayEditorInfo) {
-    red::state_set("inlay_info", info);
-    red::state_set("inlay_info_loaded", true);
+    red::state_patch(InlayHintsState { info: Some(info) });
+    red::state_patch(InlayHintsState { info_loaded: true });
     render_if_ready();
 }
 
 fn hints_loaded(result: InlayHintsResult, request_id: i32) {
-    if request_id != red::int(red::state("inlay_hints_request"), -2) {
+    if request_id != red::int(state().hints_request, -2) {
         return;
     }
-    red::state_set("inlay_hints", result);
-    red::state_set("inlay_hints_loaded", true);
+    red::state_patch(InlayHintsState { hints: Some(result) });
+    red::state_patch(InlayHintsState { hints_loaded: true });
     render_if_ready();
 }
 
 fn render_if_ready() {
-    if !red::state_bool("inlay_info_loaded") || !red::state_bool("inlay_hints_loaded") {
+    if !state().info_loaded || !state().hints_loaded {
         return;
     }
-    let result: InlayHintsResult = red::state("inlay_hints");
+    let Some(result) = state().hints else {
+        return;
+    };
     if !red::bool(result.ok, false) {
         red::execute("ClearDecorations", "inlay-hints");
         return;
     }
 
-    let layout: InlayViewportLayout = red::state("inlay_layout");
+    let Some(layout) = state().layout else {
+        return;
+    };
+    let Some(info) = state().info else {
+        return;
+    };
     let hints_by_line = group_hints_by_line(result.hints, layout.rows);
     let seen: [i32] = [];
     let decorations: [InlayDecoration] = [];
@@ -201,13 +229,13 @@ fn render_if_ready() {
             anchor: "eol",
             column: 0,
             text: " " + text,
-            style: hint_style(red::state("inlay_info")),
+            style: hint_style(info),
             priority: 1001,
         });
         row_index = row_index + 1;
     }
-    if decorations != red::state("inlay_last_decorations") {
-        red::state_set("inlay_last_decorations", decorations);
+    if state().last_decorations != Some(decorations) {
+        red::state_patch(InlayHintsState { last_decorations: Some(decorations) });
         red::execute("SetDecorations", "inlay-hints", decorations);
     }
 }
@@ -269,7 +297,7 @@ fn line_hint_text(hints: [InlayHint]) -> String {
             if text != "" {
                 type_hints = red::push(type_hints, text);
             }
-        } else if red::int(hint.kind, 0) == 2 && red::state_bool("inlay_parameter_hints") {
+        } else if red::int(hint.kind, 0) == 2 && state().parameter_hints {
             if red::ends_with(text, ":") {
                 text = red::slice(text, 0, red::len(text) - 1);
             }
@@ -363,12 +391,13 @@ fn hint_style(info: InlayEditorInfo) -> Style {
     };
 }
 
+#[red::lifecycle("deactivate")]
 fn deactivate() {
-    let timer = red::string(red::state("inlay_timer"), "");
+    let timer = red::string(state().timer, "");
     if timer != "" {
         red::execute("CancelTimeout", timer);
     }
-    red::state_set("inlay_timer", "");
-    red::state_set("inlay_last_decorations", red::null());
+    red::state_patch(InlayHintsState { timer: "" });
+    red::state_patch(InlayHintsState { last_decorations: None });
     red::execute("ClearDecorations", "inlay-hints");
 }

@@ -32,11 +32,25 @@ struct ThemePickerHandlers {
     selected: fn(ThemePickerItem),
 }
 
-pub fn activate() {
-    red::state_set("theme_original", "");
-    red::state_set("theme_config_loaded", false);
-    red::state_set("theme_assets_loaded", false);
-    red::state_set("theme_entries", []);
+struct ThemeBrowserState {
+    original: String,
+    config_loaded: bool,
+    assets_loaded: bool,
+    entries: [RuntimeAssetEntry],
+}
+
+#[red::state]
+fn initial_state() -> ThemeBrowserState {
+    return ThemeBrowserState {
+        original: "",
+        config_loaded: false,
+        assets_loaded: false,
+        entries: [],
+    };
+}
+
+fn state() -> ThemeBrowserState {
+    return red::state();
 }
 
 #[red::command(
@@ -47,17 +61,17 @@ pub fn activate() {
     aliases = ["colorscheme", "theme"],
 )]
 fn theme_browser() {
-    red::state_set("theme_original", "");
-    red::state_set("theme_config_loaded", false);
-    red::state_set("theme_assets_loaded", false);
-    red::state_set("theme_entries", []);
+    red::state_patch(ThemeBrowserState { original: "" });
+    red::state_patch(ThemeBrowserState { config_loaded: false });
+    red::state_patch(ThemeBrowserState { assets_loaded: false });
+    red::state_patch(ThemeBrowserState { entries: [] });
     red::request("GetConfig", config_loaded, "theme");
     red::request("ListRuntimeAssets", themes_loaded, "themes");
 }
 
 fn config_loaded(event: ThemeConfigValue) {
-    red::state_set("theme_original", red::string(event.value, ""));
-    red::state_set("theme_config_loaded", true);
+    red::state_patch(ThemeBrowserState { original: red::string(event.value, "") });
+    red::state_patch(ThemeBrowserState { config_loaded: true });
     open_picker_if_ready();
 }
 
@@ -67,17 +81,17 @@ fn themes_loaded(listing: RuntimeAssetListing) {
         return;
     }
 
-    red::state_set("theme_entries", listing.entries);
-    red::state_set("theme_assets_loaded", true);
+    red::state_patch(ThemeBrowserState { entries: listing.entries });
+    red::state_patch(ThemeBrowserState { assets_loaded: true });
     open_picker_if_ready();
 }
 
 fn open_picker_if_ready() {
-    if !red::state_bool("theme_config_loaded") || !red::state_bool("theme_assets_loaded") {
+    if !state().config_loaded || !state().assets_loaded {
         return;
     }
 
-    let entries = red::state("theme_entries");
+    let entries = state().entries;
     if red::len(entries) == 0 {
         red::execute("Print", "No themes found");
         return;
@@ -97,7 +111,7 @@ fn open_picker_if_ready() {
     red::execute("OpenPicker", "Themes", items, PickerOptions {
         placeholder: "Filter themes",
         status: status,
-        initial_selection: red::string(red::state("theme_original"), ""),
+        initial_selection: red::string(state().original, ""),
         presentation: "compact",
     }, ThemePickerHandlers {
         changed: theme_changed,
@@ -131,7 +145,7 @@ fn theme_changed(item: ThemePickerItem) {
 }
 
 fn theme_cancelled(event: PickerCancelled) {
-    let original = red::string(red::state("theme_original"), "");
+    let original = red::string(state().original, "");
     if original != "" {
         red::execute("PreviewTheme", original);
     }

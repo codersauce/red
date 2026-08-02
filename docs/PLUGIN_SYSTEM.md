@@ -36,9 +36,9 @@ fn ready(event: Json) {
 
 #[red::config("plugin_config")]
 fn configuration_loaded(event: Json) {
-    let state: PluginState = red::state();
-    state.greeting = event.value.hello.greeting;
-    red::state_set(state);
+    red::state_patch(PluginState {
+        greeting: event.value.hello.greeting,
+    });
 }
 
 #[red::lifecycle("before_exit")]
@@ -56,6 +56,9 @@ Static registration and state initialization happen before activation.
 Conventionally named `activate`, `before_exit`, `deactivate`, `state_export`,
 and `state_import` functions remain supported. Keep `red::on(event, callback)`
 for runtime-generated event names such as process IDs and filesystem watches.
+Prefer `red::state_patch(PluginState { field: value })` for bounded, named state
+updates. Full-record replacement through `red::state_set(state)` and legacy
+string-keyed storage remain available for explicit compatibility boundaries.
 
 ## Host API
 
@@ -67,6 +70,8 @@ Husk plugins use the versioned native `red` host module:
 | `red::on(event, callback)` | Subscribe to editor events |
 | `red::execute(action, ...)` | Call a fire-and-forget Rust host action |
 | `red::request(action, callback, ...)` | Issue a one-shot request and invoke the callback with its payload |
+| `red::state()` | Read the plugin's private `#[red::state]` record |
+| `red::state_patch(PluginState { field: value })` | Update named state fields without rebuilding the entire record |
 | `red::log(...)` | Write to Red's log |
 
 Execute and request actions cover editor state and edits, dialogs, pickers and agent composers, panels and workspace views, overlays and gutter signs, timers, filesystem watches, permitted processes, LSP helpers, and agent/recovery actions. The canonical signatures and compatibility policy live in [PLUGIN_API.md](PLUGIN_API.md) and [`src/plugin/host_api.json`](../src/plugin/host_api.json); use those rather than copying an incomplete action list from prose.

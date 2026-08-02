@@ -433,7 +433,9 @@ fn initial_state() -> PluginState {
 }
 
 #[red::config("plugin_config")]
-fn configuration_loaded(event: Json) {}
+fn configuration_loaded(event: Json) {
+    red::state_patch(PluginState { enabled: event.value.enabled });
+}
 
 #[red::lifecycle("deactivate")]
 fn release_resources() {}

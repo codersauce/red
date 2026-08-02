@@ -418,6 +418,11 @@ pub trait Host {
         None
     }
 
+    /// Keeps host-declared records nominal even under JavaScript compatibility.
+    fn preserves_nominal_record(&self, _plugin: &str, _type_name: &str) -> bool {
+        false
+    }
+
     /// Mark the start of replacement activation/state-import effects during a staged reload.
     fn begin_reload_replacement(&mut self, _program: &str) {}
 
@@ -4183,7 +4188,8 @@ impl Vm {
                     ))
                 } else if self.programs.get(&frame.plugin).is_some_and(|program| {
                     program.semantic_profile == SemanticProfile::LegacyJavaScript
-                }) {
+                }) && !host.preserves_nominal_record(&frame.plugin, &type_path)
+                {
                     Ok(Value::Object(Arc::new(object)))
                 } else {
                     Ok(Value::Struct {

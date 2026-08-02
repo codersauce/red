@@ -12,14 +12,27 @@ struct CursorMovedEvent {
     cause: String,
 }
 
+struct CoolSearchState {
+    highlight_active: bool,
+}
+
+#[red::state]
+fn initial_state() -> CoolSearchState {
+    return CoolSearchState { highlight_active: false };
+}
+
+fn state() -> CoolSearchState {
+    return red::state();
+}
+
 #[red::on("search:highlighted")]
 fn search_highlighted(event: EmptyEvent) {
-    red::state_set("highlight_active", true);
+    red::state_patch(CoolSearchState { highlight_active: true });
 }
 
 #[red::on("search:cleared")]
 fn search_cleared(event: EmptyEvent) {
-    red::state_set("highlight_active", false);
+    red::state_patch(CoolSearchState { highlight_active: false });
 }
 
 #[red::on("mode:changed")]
@@ -31,7 +44,7 @@ fn mode_changed(event: ModeChangedEvent) {
 
 #[red::on("cursor:moved")]
 fn cursor_moved(event: CursorMovedEvent) {
-    if !red::state_bool("highlight_active") {
+    if !state().highlight_active {
         return;
     }
 
@@ -47,11 +60,11 @@ fn cursor_moved(event: CursorMovedEvent) {
 }
 
 fn clear() {
-    if !red::state_bool("highlight_active") {
+    if !state().highlight_active {
         return;
     }
 
-    red::state_set("highlight_active", false);
+    red::state_patch(CoolSearchState { highlight_active: false });
     red::execute("ClearSearchHighlight");
 }
 

@@ -100,9 +100,9 @@ fn initial_state() -> SymbolsState {
 
 #[red::config("plugin_config")]
 fn configuration_loaded(event: Json) {
-    let state: SymbolsState = red::state();
-    state.enabled = event.value.symbols.enabled;
-    red::state_set(state);
+    red::state_patch(SymbolsState {
+        enabled: event.value.symbols.enabled,
+    });
 }
 
 #[red::command(
@@ -138,9 +138,20 @@ repeating `#[red::on(...)]`.
 `#[red::state]` marks one zero-argument initializer with an explicit named record
 return type. Red runs it after static registration and before activation, stores
 its concrete record privately for that plugin, and makes it available through
-`red::state()`. Replace the record with `red::state_set(state)`. Existing
-`red::state("key")` and `red::state_set("key", value)` calls remain supported
-and independent of the typed record.
+`red::state()`. Update individual named fields with a sparse record literal:
+
+```husk
+red::state_patch(SymbolsState { enabled: false });
+```
+
+Patches retain every omitted field and reject unknown fields or records that do
+not belong to the current plugin. They avoid rebuilding unrelated collections,
+which makes them preferable for state containing picker results, transcript
+blocks, or other larger values. Use `red::state_set(state)` only when replacing
+the complete record intentionally. Existing `red::state("key")` and
+`red::state_set("key", value)` calls remain supported and independent of the
+typed record; reserve them for explicit compatibility or high-volume payload
+boundaries that cannot safely live inside the typed state snapshot.
 
 `#[red::config("key")]` binds a one-argument callback to an initial `GetConfig`
 request. `#[red::config]` requests the complete configuration. Configuration

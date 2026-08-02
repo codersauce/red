@@ -39,8 +39,17 @@ struct RestoreResult {
     skipped_files: [SkippedFile],
 }
 
-pub fn activate() {
-    red::state_set("session_snapshot", red::null());
+struct SessionRestoreState {
+    snapshot: Option<SessionSnapshot>,
+}
+
+#[red::state]
+fn initial_state() -> SessionRestoreState {
+    return SessionRestoreState { snapshot: None };
+}
+
+fn state() -> SessionRestoreState {
+    return red::state();
 }
 
 #[red::on("editor:ready")]
@@ -60,12 +69,14 @@ fn snapshot_loaded(event: StoredSessionSnapshot) {
     if snapshot == red::null() || red::int(snapshot.version, 0) != 1 {
         return;
     }
-    red::state_set("session_snapshot", snapshot);
+    red::state_patch(SessionRestoreState { snapshot: Some(snapshot) });
     red::request("GetConfig", cwd_loaded, "cwd");
 }
 
 fn cwd_loaded(event: StringConfigValue) {
-    let snapshot: SessionSnapshot = red::state("session_snapshot");
+    let Some(snapshot) = state().snapshot else {
+        return;
+    };
     let saved_cwd = red::string(snapshot.cwd, "");
     let current_cwd = red::string(event.value, "");
     if saved_cwd != "" && current_cwd != "" && saved_cwd != current_cwd {
@@ -84,6 +95,7 @@ fn restore_finished(result: RestoreResult) {
     }
 }
 
+#[red::lifecycle("before_exit")]
 pub fn before_exit(snapshot: SessionSnapshot) {
     if snapshot == red::null() {
         return;
@@ -98,6 +110,7 @@ pub fn before_exit(snapshot: SessionSnapshot) {
     red::execute("SetStorage", "latest", snapshot);
 }
 
+#[red::lifecycle("deactivate")]
 fn deactivate() {
-    red::state_set("session_snapshot", red::null());
+    red::state_patch(SessionRestoreState { snapshot: None });
 }

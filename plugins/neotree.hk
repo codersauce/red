@@ -126,27 +126,71 @@ struct TreeWindowsResult {
     windows: [TreeWindow],
 }
 
-pub fn activate() {
-    red::state_set("created", false);
-    red::state_set("expanded", ["."]);
-    red::state_set("children", []);
-    red::state_set("watches", []);
-    red::state_set("status", GitStatusResult {
-        root: red::null(),
-        statuses: [],
-        error: red::null(),
-    });
-    red::state_set("status_entries", []);
-    red::state_set("cwd", ".");
-    red::state_set("current_file", "");
-    red::state_set("selected", []);
-    red::state_set("clipboard", []);
-    red::state_set("trash_history", []);
-    red::state_set("pending_kind", "");
-    red::state_set("pending_paths", []);
-    red::state_set("paste_queue", []);
-    red::state_set("paste_index", 0);
-    clear_reveal();
+struct NeoTreeStatusEntry {
+    path: String,
+    status: String,
+}
+
+struct NeoTreeState {
+    created: bool,
+    expanded: [String],
+    children: [Children],
+    watches: [Watch],
+    status: GitStatusResult,
+    status_entries: [NeoTreeStatusEntry],
+    cwd: String,
+    current_file: String,
+    selected: [String],
+    clipboard: [ClipboardEntry],
+    trash_history: [TrashBatch],
+    pending_kind: String,
+    pending_paths: [String],
+    paste_queue: [PasteEntry],
+    paste_index: i32,
+    pending_extension: String,
+    pending_source: String,
+    pending_parent: String,
+    reveal_target: String,
+    reveal_parts: [String],
+    reveal_index: i32,
+    reveal_parent: String,
+}
+
+#[red::state]
+fn initial_state() -> NeoTreeState {
+    return NeoTreeState {
+        created: false,
+        expanded: ["."],
+        children: [],
+        watches: [],
+        status: GitStatusResult {
+            root: "",
+            statuses: [],
+            error: red::null(),
+            status_index: Json {},
+        },
+        status_entries: [],
+        cwd: ".",
+        current_file: "",
+        selected: [],
+        clipboard: [],
+        trash_history: [],
+        pending_kind: "",
+        pending_paths: [],
+        paste_queue: [],
+        paste_index: 0,
+        pending_extension: "",
+        pending_source: "",
+        pending_parent: ".",
+        reveal_target: "",
+        reveal_parts: [],
+        reveal_index: 0,
+        reveal_parent: ".",
+    };
+}
+
+fn state() -> NeoTreeState {
+    return red::state();
 }
 
 #[red::command(
@@ -157,7 +201,7 @@ pub fn activate() {
     aliases = ["explorer", "neotree"],
 )]
 fn neotree() {
-    if red::state_bool("created") {
+    if state().created {
         close();
         return;
     }
@@ -166,7 +210,7 @@ fn neotree() {
 }
 
 fn show() {
-    red::state_set("created", true);
+    red::state_patch(NeoTreeState { created: true });
     red::execute("CreatePanel", "neotree", PanelConfig {
         side: "left",
         width: 30,
@@ -189,19 +233,20 @@ fn show() {
 }
 
 fn close() {
-    if !red::state_bool("created") {
+    if !state().created {
         return;
     }
 
-    for watch in red::state("watches") {
+    for watch in state().watches {
         red::execute("UnwatchDirectory", watch.id);
     }
-    red::state_set("watches", []);
+    red::state_patch(NeoTreeState { watches: [] });
     red::execute("ClosePanel", "neotree");
     red::execute("FocusEditor");
-    red::state_set("created", false);
+    red::state_patch(NeoTreeState { created: false });
 }
 
+#[red::lifecycle("deactivate")]
 fn deactivate() {
     close();
 }
@@ -219,7 +264,7 @@ fn panel_event(event: NeoTreePanelEvent) {
     }
 
     if event.action == "Ctrl-r" {
-        red::state_set("clipboard", []);
+        red::state_patch(NeoTreeState { clipboard: [] });
         red::execute("Print", "Neo-tree clipboard cleared");
         render();
         return;
@@ -298,7 +343,7 @@ fn panel_event(event: NeoTreePanelEvent) {
     if event.action == "b" {
         let name = path_name(row.path);
         open_path_prompt("basename", "Rename basename", basename(name), row.path, path_parent(row.path));
-        red::state_set("pending_extension", name_extension(name));
+        red::state_patch(NeoTreeState { pending_extension: name_extension(name) });
         return;
     }
 
@@ -353,9 +398,9 @@ fn open_path_prompt(kind: String, title: String, initial: String, source: String
         red::execute("Print", "The workspace root cannot be modified");
         return;
     }
-    red::state_set("pending_kind", kind);
-    red::state_set("pending_source", source);
-    red::state_set("pending_parent", parent);
+    red::state_patch(NeoTreeState { pending_kind: kind });
+    red::state_patch(NeoTreeState { pending_source: source });
+    red::state_patch(NeoTreeState { pending_parent: parent });
     red::execute("OpenInput", title, initial, ComposerHandlers {
         submitted: path_prompt_submitted,
         cancelled: path_prompt_cancelled,
@@ -363,7 +408,7 @@ fn open_path_prompt(kind: String, title: String, initial: String, source: String
 }
 
 fn path_prompt_cancelled(event: ComposerCancelled) {
-    red::state_set("pending_kind", "");
+    red::state_patch(NeoTreeState { pending_kind: "" });
 }
 
 fn path_prompt_submitted(value: String) {
@@ -372,9 +417,9 @@ fn path_prompt_submitted(value: String) {
         return;
     }
 
-    let kind = red::string(red::state("pending_kind"), "");
-    let source = red::string(red::state("pending_source"), "");
-    let parent = red::string(red::state("pending_parent"), ".");
+    let kind = red::string(state().pending_kind, "");
+    let source = red::string(state().pending_source, "");
+    let parent = red::string(state().pending_parent, ".");
     if kind == "create" || kind == "create_directory" {
         let create_kind = kind;
         if kind == "create" && red::ends_with(query, "/") {
@@ -391,7 +436,7 @@ fn path_prompt_submitted(value: String) {
     if kind == "rename" {
         destination = path_join(parent, query);
     } else if kind == "basename" {
-        destination = path_join(parent, query + red::string(red::state("pending_extension"), ""));
+        destination = path_join(parent, query + red::string(state().pending_extension, ""));
     } else {
         destination = workspace_path(query);
     }
@@ -409,25 +454,25 @@ fn request_operation(operation: Json) {
 }
 
 fn operation_loaded(result: FileOperationResult) {
-    let kind = red::string(red::state("pending_kind"), "operation");
+    let kind = red::string(state().pending_kind, "operation");
     if !red::bool(result.ok, false) {
         red::execute("Print", "Neo-tree " + kind + " failed: " + red::string(result.error, "unknown error"));
         return;
     }
 
     if kind == "trash" && red::bool(result.undo_supported, false) {
-        red::state_set("trash_history", red::push(red::state("trash_history"), TrashBatch {
-            paths: red::state("pending_paths"),
-        }));
+        red::state_patch(NeoTreeState { trash_history: red::push(state().trash_history, TrashBatch {
+            paths: state().pending_paths,
+        }) });
     }
-    red::state_set("selected", []);
-    red::state_set("pending_kind", "");
+    red::state_patch(NeoTreeState { selected: [] });
+    red::state_patch(NeoTreeState { pending_kind: "" });
     red::execute("Print", "Neo-tree " + kind + " complete");
     reset_tree();
 }
 
 fn selected_paths(row: TreePanelRow) -> [String] {
-    let paths = red::state("selected");
+    let paths = state().selected;
     if red::len(paths) == 0 {
         if row.path == "." {
             red::execute("Print", "The workspace root cannot be modified");
@@ -442,13 +487,13 @@ fn toggle_selection(path: String) {
     if path == "." {
         return;
     }
-    let selected = red::state("selected");
+    let selected = state().selected;
     if red::contains(selected, path) {
         selected = red::remove(selected, path);
     } else {
         selected = red::push(selected, path);
     }
-    red::state_set("selected", selected);
+    red::state_patch(NeoTreeState { selected: selected });
     render();
 }
 
@@ -456,8 +501,8 @@ fn confirm_removal(kind: String, paths: [String]) {
     if red::len(paths) == 0 {
         return;
     }
-    red::state_set("pending_kind", kind);
-    red::state_set("pending_paths", paths);
+    red::state_patch(NeoTreeState { pending_kind: kind });
+    red::state_patch(NeoTreeState { pending_paths: paths });
     let impact = "Move selected items to the system trash.";
     if kind == "delete" {
         impact = "Permanently delete selected items. This cannot be undone.";
@@ -469,30 +514,30 @@ fn confirm_removal(kind: String, paths: [String]) {
 }
 
 fn removal_cancelled(event: PickerCancelled) {
-    red::state_set("pending_kind", "");
-    red::state_set("pending_paths", []);
+    red::state_patch(NeoTreeState { pending_kind: "" });
+    red::state_patch(NeoTreeState { pending_paths: [] });
 }
 
 fn removal_confirmed(item: PickerItem) {
     if item.id != "accept" {
-        red::state_set("pending_kind", "");
+        red::state_patch(NeoTreeState { pending_kind: "" });
         return;
     }
     request_operation(PathsOperation {
-        kind: red::string(red::state("pending_kind"), ""),
-        paths: red::state("pending_paths"),
+        kind: red::string(state().pending_kind, ""),
+        paths: state().pending_paths,
     });
 }
 
 fn restore_last_trash() {
-    let history = red::state("trash_history");
+    let history = state().trash_history;
     if red::len(history) == 0 {
         red::execute("Print", "No trash operation is available to restore");
         return;
     }
     let batch = history[red::len(history) - 1];
-    red::state_set("pending_kind", "restore");
-    red::state_set("pending_paths", batch.paths);
+    red::state_patch(NeoTreeState { pending_kind: "restore" });
+    red::state_patch(NeoTreeState { pending_paths: batch.paths });
     red::request("FileOperation", restore_loaded, PathsOperation {
         kind: "undo_trash",
         paths: batch.paths,
@@ -504,15 +549,15 @@ fn restore_loaded(result: FileOperationResult) {
         red::execute("Print", "Neo-tree restore failed: " + red::string(result.error, "unknown error"));
         return;
     }
-    let history = red::state("trash_history");
+    let history = state().trash_history;
     let remaining: [TrashBatch] = [];
     let index = 0;
     while index < red::len(history) - 1 {
         remaining = red::push(remaining, history[index]);
         index = index + 1;
     }
-    red::state_set("trash_history", remaining);
-    red::state_set("pending_kind", "");
+    red::state_patch(NeoTreeState { trash_history: remaining });
+    red::state_patch(NeoTreeState { pending_kind: "" });
     red::execute("Print", "Neo-tree restore complete");
     reset_tree();
 }
@@ -522,7 +567,7 @@ fn update_clipboard(action: String, paths: [String]) {
         return;
     }
     let clipboard: [ClipboardEntry] = [];
-    for entry in red::state("clipboard") {
+    for entry in state().clipboard {
         if !red::contains(paths, entry.path) {
             clipboard = red::push(clipboard, entry);
         }
@@ -533,14 +578,14 @@ fn update_clipboard(action: String, paths: [String]) {
             action: action,
         });
     }
-    red::state_set("clipboard", clipboard);
-    red::state_set("selected", []);
+    red::state_patch(NeoTreeState { clipboard: clipboard });
+    red::state_patch(NeoTreeState { selected: [] });
     red::execute("Print", red::len(paths) + " item(s) marked to " + action);
     render();
 }
 
 fn paste_clipboard(row: TreePanelRow) {
-    let clipboard = red::state("clipboard");
+    let clipboard = state().clipboard;
     if red::len(clipboard) == 0 {
         red::execute("Print", "Neo-tree clipboard is empty");
         return;
@@ -557,16 +602,16 @@ fn paste_clipboard(row: TreePanelRow) {
             action: entry.action,
         });
     }
-    red::state_set("paste_queue", queue);
-    red::state_set("paste_index", 0);
+    red::state_patch(NeoTreeState { paste_queue: queue });
+    red::state_patch(NeoTreeState { paste_index: 0 });
     run_next_paste();
 }
 
 fn run_next_paste() {
-    let queue = red::state("paste_queue");
-    let index = red::int(red::state("paste_index"), 0);
+    let queue = state().paste_queue;
+    let index = red::int(state().paste_index, 0);
     if index >= red::len(queue) {
-        red::state_set("clipboard", []);
+        red::state_patch(NeoTreeState { clipboard: [] });
         red::execute("Print", "Neo-tree paste complete");
         reset_tree();
         return;
@@ -585,16 +630,16 @@ fn paste_loaded(result: FileOperationResult) {
         reset_tree();
         return;
     }
-    let index = red::int(red::state("paste_index"), 0);
-    let entry = red::state("paste_queue")[index];
+    let index = red::int(state().paste_index, 0);
+    let entry = state().paste_queue[index];
     let clipboard: [ClipboardEntry] = [];
-    for candidate in red::state("clipboard") {
+    for candidate in state().clipboard {
         if candidate.path != entry.source {
             clipboard = red::push(clipboard, candidate);
         }
     }
-    red::state_set("clipboard", clipboard);
-    red::state_set("paste_index", index + 1);
+    red::state_patch(NeoTreeState { clipboard: clipboard });
+    red::state_patch(NeoTreeState { paste_index: index + 1 });
     run_next_paste();
 }
 
@@ -623,12 +668,12 @@ fn show_help() {
 }
 
 fn reset_tree() {
-    for watch in red::state("watches") {
+    for watch in state().watches {
         red::execute("UnwatchDirectory", watch.id);
     }
-    red::state_set("watches", []);
-    red::state_set("children", []);
-    red::state_set("expanded", ["."]);
+    red::state_patch(NeoTreeState { watches: [] });
+    red::state_patch(NeoTreeState { children: [] });
+    red::state_patch(NeoTreeState { expanded: ["."] });
     clear_reveal();
     request_directory(".");
     request_git_status();
@@ -659,7 +704,7 @@ fn basename(name: String) -> String {
 }
 
 fn reload_visible_tree() {
-    for path in red::state("expanded") {
+    for path in state().expanded {
         request_directory(path);
     }
     request_git_status();
@@ -681,7 +726,7 @@ fn directory_loaded(listing: DirectoryListing) {
         watch_directory(listing.path);
     }
 
-    if red::string(red::state("reveal_target"), "") != "" {
+    if red::string(state().reveal_target, "") != "" {
         continue_reveal();
     } else {
         render();
@@ -689,8 +734,8 @@ fn directory_loaded(listing: DirectoryListing) {
 }
 
 fn git_status_loaded(result: GitStatusResult) {
-    red::state_set("status", result);
-    red::state_set("status_entries", red::neotree_core("status_entries", result.status_index));
+    red::state_patch(NeoTreeState { status: result });
+    red::state_patch(NeoTreeState { status_entries: red::neotree_core("status_entries", result.status_index) });
     render();
 }
 
@@ -704,18 +749,18 @@ fn watch_directory(path: String) {
         return;
     }
 
-    let watch_id = 700 + red::len(red::state("watches"));
-    let watches = red::push(red::state("watches"), Watch {
+    let watch_id = 700 + red::len(state().watches);
+    let watches = red::push(state().watches, Watch {
         path: path,
         id: watch_id,
     });
-    red::state_set("watches", watches);
+    red::state_patch(NeoTreeState { watches: watches });
     red::on("filesystem:changed:" + watch_id, directory_changed);
     red::execute("WatchDirectory", path, watch_id, false, 250);
 }
 
 fn is_watched(path: String) -> bool {
-    for watch in red::state("watches") {
+    for watch in state().watches {
         if watch.path == path {
             return true;
         }
@@ -725,7 +770,7 @@ fn is_watched(path: String) -> bool {
 
 fn cwd_loaded(event: CwdValueEvent) {
     let cwd = red::string(event.value, ".");
-    red::state_set("cwd", normalize_path(cwd));
+    red::state_patch(NeoTreeState { cwd: normalize_path(cwd) });
     try_reveal_current_file();
 }
 
@@ -736,20 +781,20 @@ fn windows_loaded(result: TreeWindowsResult) {
             path = red::string(window.buffer_path, "");
         }
     }
-    red::state_set("current_file", normalize_path(path));
+    red::state_patch(NeoTreeState { current_file: normalize_path(path) });
     try_reveal_current_file();
 }
 
 fn try_reveal_current_file() {
-    let file = red::string(red::state("current_file"), "");
-    let cwd = red::string(red::state("cwd"), ".");
+    let file = red::string(state().current_file, "");
+    let cwd = red::string(state().cwd, ".");
     let tree_path = tree_path_for_file(file, cwd);
     if tree_path == "" {
         render();
         return;
     }
 
-    if tree_path == red::string(red::state("reveal_target"), "") {
+    if tree_path == red::string(state().reveal_target, "") {
         return;
     }
 
@@ -766,18 +811,18 @@ fn start_reveal(tree_path: String) {
         return;
     }
 
-    red::state_set("reveal_target", tree_path);
-    red::state_set("reveal_parts", parts);
-    red::state_set("reveal_index", 0);
-    red::state_set("reveal_parent", ".");
+    red::state_patch(NeoTreeState { reveal_target: tree_path });
+    red::state_patch(NeoTreeState { reveal_parts: parts });
+    red::state_patch(NeoTreeState { reveal_index: 0 });
+    red::state_patch(NeoTreeState { reveal_parent: "." });
     add_expanded(".");
     continue_reveal();
 }
 
 fn continue_reveal() {
-    let parts = red::state("reveal_parts");
-    let index = red::int(red::state("reveal_index"), 0);
-    let parent = red::string(red::state("reveal_parent"), ".");
+    let parts = state().reveal_parts;
+    let index = red::int(state().reveal_index, 0);
+    let parent = red::string(state().reveal_parent, ".");
 
     if !has_children(parent) {
         request_directory(parent);
@@ -805,8 +850,8 @@ fn continue_reveal() {
     }
 
     add_expanded(child.path);
-    red::state_set("reveal_parent", child.path);
-    red::state_set("reveal_index", index + 1);
+    red::state_patch(NeoTreeState { reveal_parent: child.path });
+    red::state_patch(NeoTreeState { reveal_index: index + 1 });
     if has_children(child.path) {
         continue_reveal();
     } else {
@@ -816,10 +861,10 @@ fn continue_reveal() {
 }
 
 fn clear_reveal() {
-    red::state_set("reveal_target", "");
-    red::state_set("reveal_parts", []);
-    red::state_set("reveal_index", 0);
-    red::state_set("reveal_parent", ".");
+    red::state_patch(NeoTreeState { reveal_target: "" });
+    red::state_patch(NeoTreeState { reveal_parts: [] });
+    red::state_patch(NeoTreeState { reveal_index: 0 });
+    red::state_patch(NeoTreeState { reveal_parent: "." });
 }
 
 fn find_child(entries: [DirectoryEntry], name: String, kind: String) -> DirectoryEntry {
@@ -833,7 +878,7 @@ fn find_child(entries: [DirectoryEntry], name: String, kind: String) -> Director
 
 fn set_children(path: String, entries: [DirectoryEntry], truncated: bool) {
     let children: [Children] = [];
-    for child in red::state("children") {
+    for child in state().children {
         if child.path != path {
             children = red::push(children, child);
         }
@@ -843,11 +888,11 @@ fn set_children(path: String, entries: [DirectoryEntry], truncated: bool) {
         entries: entries,
         truncated: truncated,
     });
-    red::state_set("children", children);
+    red::state_patch(NeoTreeState { children: children });
 }
 
 fn has_children(path: String) -> bool {
-    for child in red::state("children") {
+    for child in state().children {
         if child.path == path {
             return true;
         }
@@ -856,7 +901,7 @@ fn has_children(path: String) -> bool {
 }
 
 fn children_for(path: String) -> [DirectoryEntry] {
-    for child in red::state("children") {
+    for child in state().children {
         if child.path == path {
             return child.entries;
         }
@@ -883,22 +928,22 @@ fn expand_directory(path: String) {
 }
 
 fn collapse_directory(path: String) {
-    red::state_set("expanded", red::remove(red::state("expanded"), path));
+    red::state_patch(NeoTreeState { expanded: red::remove(state().expanded, path) });
     render();
 }
 
 fn add_expanded(path: String) {
     if !is_expanded(path) {
-        red::state_set("expanded", red::push(red::state("expanded"), path));
+        red::state_patch(NeoTreeState { expanded: red::push(state().expanded, path) });
     }
 }
 
 fn is_expanded(path: String) -> bool {
-    return red::contains(red::state("expanded"), path);
+    return red::contains(state().expanded, path);
 }
 
 fn render() {
-    if !red::state_bool("created") {
+    if !state().created {
         return;
     }
     red::execute("UpdatePanel", "neotree", build_rows());
@@ -923,13 +968,13 @@ fn loading_rows() -> [TreePanelRow] {
 fn build_rows() -> [TreePanelRow] {
     return red::neotree_core(
         "build_rows",
-        red::string(red::state("cwd"), "."),
-        red::state("children"),
-        red::state("expanded"),
-        red::state("selected"),
-        red::state("clipboard"),
-        red::string(red::state("status").root, ""),
-        red::state("status_entries")
+        red::string(state().cwd, "."),
+        state().children,
+        state().expanded,
+        state().selected,
+        state().clipboard,
+        red::string(state().status.root, ""),
+        state().status_entries
     );
 }
 

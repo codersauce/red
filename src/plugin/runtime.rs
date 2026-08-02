@@ -160,6 +160,10 @@ struct Style {
     bold: bool,
     italic: bool,
 }
+struct PanelSegment {
+    text: String,
+    style: Style,
+}
 struct PickerItem {
     id: String,
     label: String,
@@ -201,6 +205,7 @@ extern "red" {
         fn log();
         fn state_bool() -> bool;
         fn state_set();
+        fn state_patch();
         fn state() -> JsValue;
         fn push() -> JsValue;
         fn extend() -> JsValue;
@@ -289,6 +294,7 @@ struct RedPluginPolicy {
     plugin_states: HashMap<String, HashMap<String, Value>>,
     typed_states: HashMap<String, Value>,
     state_initializers: HashMap<String, Callback>,
+    state_record_types: HashMap<String, String>,
     lifecycle_callbacks: HashMap<String, HashMap<String, Callback>>,
     config_bindings: HashMap<String, HashSet<Option<String>>>,
     next_request_id: i64,
@@ -307,6 +313,7 @@ impl Default for RedPluginPolicy {
             plugin_states: HashMap::new(),
             typed_states: HashMap::new(),
             state_initializers: HashMap::new(),
+            state_record_types: HashMap::new(),
             lifecycle_callbacks: HashMap::new(),
             config_bindings: HashMap::new(),
             next_request_id: 1,
@@ -393,6 +400,7 @@ impl RedPluginPolicy {
         self.plugin_states.remove(plugin);
         self.typed_states.remove(plugin);
         self.state_initializers.remove(plugin);
+        self.state_record_types.remove(plugin);
         self.lifecycle_callbacks.remove(plugin);
         self.config_bindings.remove(plugin);
     }
@@ -1786,14 +1794,18 @@ impl RedHost {
             "red::state_set" => {
                 if args.len() == 1 {
                     let value = args.first().cloned().unwrap_or(Value::Unit);
-                    if !matches!(value, Value::Struct { .. } | Value::Object(_)) {
+                    let Value::Struct { type_name, .. } = &value else {
                         anyhow::bail!("`red::state_set(state)` requires a state record");
-                    }
-                    if !self.policy().state_initializers.contains_key(plugin) {
+                    };
+                    let Some(expected_type) = self.policy().state_record_types.get(plugin) else {
                         anyhow::bail!(
                             "`red::state_set(state)` requires a `#[red::state]` initializer"
                         );
-                    }
+                    };
+                    anyhow::ensure!(
+                        type_name == expected_type,
+                        "state type `{type_name}` does not match plugin state `{expected_type}`"
+                    );
                     self.policy_mut()
                         .typed_states
                         .insert(plugin.to_string(), value);
@@ -1805,6 +1817,39 @@ impl RedHost {
                         .entry(plugin.to_string())
                         .or_default()
                         .insert(key, value);
+                }
+                Ok(Value::Unit)
+            }
+            "red::state_patch" => {
+                let Some(Value::Struct {
+                    type_name: patch_type,
+                    fields: patch,
+                }) = args.first()
+                else {
+                    anyhow::bail!("`red::state_patch(patch)` requires a typed state record");
+                };
+                let Some(Value::Struct {
+                    type_name: state_type,
+                    fields,
+                }) = self.policy_mut().typed_states.get_mut(plugin)
+                else {
+                    anyhow::bail!(
+                        "`red::state_patch(patch)` requires an initialized `#[red::state]` record"
+                    );
+                };
+                anyhow::ensure!(
+                    patch_type == state_type,
+                    "state patch type `{patch_type}` does not match plugin state `{state_type}`"
+                );
+                for name in patch.keys() {
+                    anyhow::ensure!(
+                        fields.contains_key(name),
+                        "state `{state_type}` has no field named `{name}`"
+                    );
+                }
+                let fields = Arc::make_mut(fields);
+                for (name, value) in patch.iter() {
+                    fields.insert(name.clone(), value.clone());
                 }
                 Ok(Value::Unit)
             }
@@ -2380,6 +2425,13 @@ impl Host for RedHost {
                         .push(function.callback().clone());
                 }
                 super::api::RedFunctionAnnotation::StateInitializer => {
+                    let Some(husk_ast::TypeExpr {
+                        kind: husk_ast::TypeExprKind::Named(name),
+                        ..
+                    }) = function.return_type()
+                    else {
+                        anyhow::bail!("state initializer has no named state record type");
+                    };
                     if self
                         .policy_mut()
                         .state_initializers
@@ -2388,6 +2440,9 @@ impl Host for RedHost {
                     {
                         anyhow::bail!("duplicate `#[red::state]` initializer for `{plugin}`");
                     }
+                    self.policy_mut()
+                        .state_record_types
+                        .insert(plugin.to_string(), name.name.clone());
                 }
                 super::api::RedFunctionAnnotation::Config { key } => {
                     if !self
@@ -2444,9 +2499,20 @@ impl Host for RedHost {
         if self.policy().state_initializers.get(plugin) != Some(callback) {
             anyhow::bail!("unknown state initializer for plugin `{plugin}`");
         }
-        if !matches!(value, Value::Struct { .. } | Value::Object(_)) {
+        let Value::Struct { type_name, .. } = &value else {
             anyhow::bail!("`#[red::state]` initializer must return a state record");
-        }
+        };
+        let expected_type = self
+            .policy()
+            .state_record_types
+            .get(plugin)
+            .ok_or_else(|| {
+                anyhow::anyhow!("state initializer has no record type for `{plugin}`")
+            })?;
+        anyhow::ensure!(
+            type_name == expected_type,
+            "state initializer returned `{type_name}` instead of `{expected_type}`"
+        );
         self.policy_mut()
             .typed_states
             .insert(plugin.to_string(), value);
@@ -2459,6 +2525,13 @@ impl Host for RedHost {
             .get(plugin)
             .and_then(|callbacks| callbacks.get(hook))
             .cloned()
+    }
+
+    fn preserves_nominal_record(&self, plugin: &str, type_name: &str) -> bool {
+        self.policy()
+            .state_record_types
+            .get(plugin)
+            .is_some_and(|expected| expected == type_name)
     }
 
     fn begin_reload_replacement(&mut self, plugin: &str) {
@@ -4312,8 +4385,9 @@ mod tests {
             #[red::config("plugin_config")]
             fn configured(event: Json) {
                 let state: PluginState = red::state();
-                state.count = state.count + event.value.increment;
-                red::state_set(state);
+                red::state_patch(PluginState {
+                    count: state.count + event.value.increment,
+                });
             }
 
             #[red::command(name = "Internal", visible = false)]
@@ -4408,6 +4482,85 @@ mod tests {
         assert!(error.contains("integer division by zero"), "{error}");
         assert!(runtime.registered_commands().is_empty());
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn typed_state_patches_reject_wrong_records_and_unknown_fields() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "patches",
+                r#"
+                    struct PluginState {
+                        count: i32,
+                        values: [String],
+                    }
+                    struct OtherState { count: i32 }
+
+                    #[red::state]
+                    fn initial_state() -> PluginState {
+                        return PluginState { count: 1, values: ["retained"] };
+                    }
+
+                    #[red::command(name = "WrongType")]
+                    fn wrong_type() {
+                        red::state_patch(OtherState { count: 2 });
+                    }
+
+                    #[red::command(name = "UnknownField")]
+                    fn unknown_field() {
+                        red::state_patch(PluginState { count: 99, missing: 2 });
+                    }
+
+                    #[red::command(name = "Update")]
+                    fn update() {
+                        red::state_patch(PluginState { count: 2 });
+                    }
+
+                    #[red::command(name = "Inspect")]
+                    fn inspect() {
+                        let state: PluginState = red::state();
+                        red::execute("Print", state.count + ":" + state.values[0]);
+                    }
+                "#,
+            )
+            .await
+            .unwrap();
+
+        let wrong_type = runtime
+            .execute_command("WrongType")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            wrong_type.contains("requires a typed state record"),
+            "{wrong_type}"
+        );
+
+        let unknown_field = runtime
+            .execute_command("UnknownField")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            unknown_field.contains("no field named `missing`"),
+            "{unknown_field}"
+        );
+
+        runtime.execute_command("Inspect").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "1:retained"
+        ));
+
+        runtime.execute_command("Update").await.unwrap();
+        runtime.execute_command("Inspect").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "2:retained"
+        ));
     }
 
     #[tokio::test]
@@ -4585,8 +4738,19 @@ mod tests {
         std::fs::write(
             source_directory.join("commands.hk"),
             r#"
+                struct ModuleState { opened: i32 }
+
+                #[red::state]
+                pub fn initial_state() -> ModuleState {
+                    return ModuleState { opened: 0 };
+                }
+
                 #[red::command(name = "FromModule", title = "Package command")]
-                pub fn open() { red::execute("Print", "package module"); }
+                pub fn open() {
+                    let state: ModuleState = red::state();
+                    red::state_patch(ModuleState { opened: state.opened + 1 });
+                    red::execute("Print", "package module: " + red::state().opened);
+                }
             "#,
         )
         .unwrap();
@@ -4599,7 +4763,7 @@ mod tests {
         runtime.execute_command("FromModule").await.unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::Action(Action::Print(message)) if message == "package module"
+            PluginRequest::Action(Action::Print(message)) if message == "package module: 1"
         ));
     }
 
@@ -9025,9 +9189,12 @@ mod tests {
             inner
                 .host
                 .policy()
-                .plugin_states
+                .typed_states
                 .get("barbecue")
-                .and_then(|state| state.get("barbecue_timer"))
+                .and_then(|state| match state {
+                    Value::Struct { fields, .. } => fields.get("timer"),
+                    _ => None,
+                })
                 .and_then(Value::as_str)
                 .expect("expected Barbecue refresh timer")
                 .to_string()
@@ -10084,7 +10251,7 @@ mod tests {
 
         let handle = open_project_search_picker(&mut runtime).await;
 
-        let query = ["project_search_", "process"].concat();
+        let query = ["ProjectSearch", "State"].concat();
         runtime
             .notify_picker(handle, PickerCallback::Query(query.clone()))
             .unwrap();
@@ -10162,7 +10329,7 @@ mod tests {
         assert!(item
             .detail
             .as_deref()
-            .is_some_and(|detail| detail.contains(&["project_search_", "process"].concat())));
+            .is_some_and(|detail| detail.contains(&["ProjectSearch", "State"].concat())));
 
         drain_requests();
         runtime

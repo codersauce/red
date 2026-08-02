@@ -66,9 +66,9 @@ fn open() {
 
 #[red::config("plugin_config")]
 fn configuration_loaded(event: Json) {
-    let state: PluginState = red::state();
-    state.enabled = event.value.my_plugin.enabled;
-    red::state_set(state);
+    red::state_patch(PluginState {
+        enabled: event.value.my_plugin.enabled,
+    });
 }
 
 #[red::on("editor:ready")]
@@ -83,6 +83,9 @@ that should stay out of the palette and colon completion. Keep imperative
 `red::on(event_name, handler)` for process IDs, filesystem watch IDs, or other
 event names that are only known at runtime. Existing keyed state, imperative
 registration, and conventionally named lifecycle functions remain compatible.
+Prefer sparse `red::state_patch(PluginState { field: value })` updates over
+replacing the complete state record, especially when other fields contain
+larger result collections.
 
 ## Lifecycle
 
