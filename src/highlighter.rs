@@ -102,6 +102,7 @@ const LANGUAGE_NAMES: &[(&str, &str)] = &[
     ("sh", "bash"),
     ("shell", "bash"),
     ("zsh", "bash"),
+    ("fish", "fish"),
     ("powershell", "powershell"),
     ("pwsh", "powershell"),
     ("ps1", "powershell"),
@@ -479,6 +480,13 @@ fn language_definitions() -> Vec<LanguageDefinition> {
             extensions: &["sh", "bash", "zsh"],
             language: || tree_sitter_bash::LANGUAGE.into(),
             highlight_queries: &[tree_sitter_bash::HIGHLIGHT_QUERY],
+            injection_query: None,
+        },
+        LanguageDefinition {
+            id: "fish",
+            extensions: &["fish"],
+            language: tree_sitter_fish::language,
+            highlight_queries: &[tree_sitter_fish::HIGHLIGHTS_QUERY],
             injection_query: None,
         },
         LanguageDefinition {
@@ -883,6 +891,10 @@ mod tests {
             Some("bash")
         );
         assert_eq!(
+            highlighter.language_id_for_file(Some("config.fish")),
+            Some("fish")
+        );
+        assert_eq!(
             highlighter.language_id_for_file(Some("bootstrap.ps1")),
             Some("powershell")
         );
@@ -950,6 +962,10 @@ mod tests {
             ("python", "def main():\n    return True\n"),
             ("bash", "if [ -f Cargo.toml ]; then\n  echo yes\nfi\n"),
             (
+                "fish",
+                "function greet --argument-names name\n    echo \"hello, $name\"\nend\n",
+            ),
+            (
                 "powershell",
                 "function Invoke-Greeting { param([string]$Name) Write-Host \"Hello $Name\" }\n",
             ),
@@ -984,6 +1000,7 @@ mod tests {
         assert_eq!(highlighter.language_id_for_name("jsx"), Some("jsx"));
         assert_eq!(highlighter.language_id_for_name("sh"), Some("bash"));
         assert_eq!(highlighter.language_id_for_name("shell"), Some("bash"));
+        assert_eq!(highlighter.language_id_for_name("fish"), Some("fish"));
         assert_eq!(highlighter.language_id_for_name("pwsh"), Some("powershell"));
         assert_eq!(highlighter.language_id_for_name("lua"), Some("lua"));
         assert_eq!(highlighter.language_id_for_name("hk"), Some("husk"));
@@ -999,6 +1016,7 @@ mod tests {
             highlighter.language_ids(),
             vec![
                 "bash",
+                "fish",
                 "husk",
                 "javascript",
                 "json",
@@ -1020,6 +1038,7 @@ mod tests {
     fn matches_language_ids_by_name_and_extension_prefix() {
         let highlighter = highlighter();
 
+        assert_eq!(highlighter.matching_language_ids("fi"), vec!["fish"]);
         assert_eq!(highlighter.matching_language_ids("ru"), vec!["rust"]);
         assert_eq!(highlighter.matching_language_ids("ym"), vec!["yaml"]);
         assert_eq!(highlighter.matching_language_ids(".rs"), vec!["rust"]);
@@ -1028,6 +1047,21 @@ mod tests {
             vec!["tsx", "typescript"]
         );
         assert!(highlighter.matching_language_ids("unknown").is_empty());
+    }
+
+    #[test]
+    fn fish_highlights_keywords_functions_variables_strings_and_comments() {
+        let theme = theme_with_scopes(&["keyword", "function", "constant", "string", "comment"]);
+        let mut highlighter = Highlighter::new(&theme).unwrap();
+        let code = "# Greeting\nfunction greet --argument-names name\n    if test -n \"$name\"\n        echo \"hello, $name\"\n    end\nend\n";
+        let styles = highlighter
+            .highlight_for_file(Some("greet.fish"), code)
+            .unwrap();
+
+        for token in ["# Greeting", "function", "greet", "if", "$name", "echo"] {
+            assert_token_highlighted(&styles, code, token);
+        }
+        assert_token_highlighted(&styles, code, "\"hello, $name\"");
     }
 
     #[test]
@@ -1231,6 +1265,30 @@ describe("StateStore", async () => {
                 .iter()
                 .any(|style| style.start <= echo_start && style.end >= echo_start + 4),
             "fenced shell command should be highlighted at Markdown byte offsets"
+        );
+    }
+
+    #[test]
+    fn markdown_highlights_fish_fenced_code() {
+        let mut highlighter = highlighter();
+        let code = "```fish\nfunction greet\n    echo hello\nend\n```\n";
+        let styles = highlighter
+            .highlight_for_file(Some("README.md"), code)
+            .unwrap();
+        let function_start = code.find("function").unwrap();
+        let echo_start = code.find("echo").unwrap();
+
+        assert!(
+            styles
+                .iter()
+                .any(|style| style.start <= function_start && style.end >= function_start + 8),
+            "fenced Fish `function` keyword should be highlighted at Markdown byte offsets"
+        );
+        assert!(
+            styles
+                .iter()
+                .any(|style| style.start <= echo_start && style.end >= echo_start + 4),
+            "fenced Fish command should be highlighted at Markdown byte offsets"
         );
     }
 

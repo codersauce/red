@@ -380,6 +380,7 @@ fn default_comment_templates() -> HashMap<String, String> {
         ("cpp", "// %s"),
         ("css", "/* %s */"),
         ("cxx", "// %s"),
+        ("fish", "# %s"),
         ("go", "// %s"),
         ("h", "// %s"),
         ("hpp", "// %s"),
@@ -686,6 +687,15 @@ pub fn default_language_servers() -> HashMap<String, LanguageServerConfig> {
                 })),
                 workspace_name: Some("husk".to_string()),
             },
+        ),
+        (
+            "fish".to_string(),
+            server(
+                "fish-lsp",
+                &["start"],
+                &[document("fish", &["fish"])],
+                &["config.fish", ".git"],
+            ),
         ),
         (
             "typescript".to_string(),
@@ -2311,6 +2321,11 @@ theme = "theme/nightfox.json"
         assert_eq!(rust.language_id, "rust");
         assert_eq!(rust.file_extensions, vec!["rs"]);
         assert_eq!(typescript.command, "typescript-language-server");
+        let fish = config.lsp.servers.get("fish").unwrap();
+        assert_eq!(fish.command, "fish-lsp");
+        assert_eq!(fish.args, vec!["start"]);
+        assert_eq!(fish.documents(), vec![document("fish", &["fish"])]);
+        assert_eq!(fish.root_markers, vec!["config.fish", ".git"]);
         let husk = config.lsp.servers.get("husk").unwrap();
         assert_eq!(
             husk.command,
@@ -2678,6 +2693,7 @@ input_position = "left"
     fn comment_configuration_defaults_cover_line_and_wrapping_comments() {
         let config = Config::default();
 
+        assert_eq!(config.commenting.languages["fish"], "# %s");
         assert_eq!(config.commenting.languages["rust"], "// %s");
         assert_eq!(config.commenting.languages["python"], "# %s");
         assert_eq!(config.commenting.languages["lua"], "-- %s");

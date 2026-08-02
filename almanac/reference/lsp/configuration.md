@@ -50,6 +50,7 @@ Red embeds default definitions for these server keys:
 | --- | --- | --- | --- |
 | `rust` | `rust-analyzer -v` | `rust` for `rs` | `Cargo.toml`, `.git` [@config] |
 | `husk` | current Red executable with `husk lsp --stdio` | `husk` for `hk`, `husk` | `Husk.toml`, `.git` [@config] |
+| `fish` | `fish-lsp start` | `fish` for `fish` | `config.fish`, `.git` [@config] |
 | `typescript` | `typescript-language-server --stdio` | TypeScript, TSX, JavaScript, and JSX selectors | `package.json`, `tsconfig.json`, `jsconfig.json`, `.git` [@config] |
 | `python` | `pyright-langserver --stdio` | `python` for `py`, `pyw` | `pyproject.toml`, `setup.py`, `requirements.txt`, `.git` [@config] |
 | `markdown` | `marksman server` | `markdown` for `md`, `markdown` | `.marksman.toml`, `.git` [@config] |
@@ -58,7 +59,9 @@ Red embeds default definitions for these server keys:
 | `yaml` | `yaml-language-server --stdio` | `yaml` for `yaml`, `yml` | `.git` [@config] |
 | `lua` | `lua-language-server` | `lua` for `lua` | Lua config markers and `.git` [@config] |
 
-The default TOML comments describe the same public set as covering Rust, Markdown, JavaScript/TypeScript, JSON, TOML, YAML, Python, and Lua [@defaults]. Husk is also embedded by code and covered by the dedicated Husk language-server documentation [@config] [@husk-doc].
+The default TOML comments describe the same public set as covering Rust, Fish, Markdown, JavaScript/TypeScript, JSON, TOML, YAML, Python, and Lua [@defaults]. Husk is also embedded by code and covered by the dedicated Husk language-server documentation [@config] [@husk-doc].
+
+Fish syntax highlighting works without a language server. For completions, diagnostics, formatting, and navigation, install `fish-lsp`; Red automatically launches `fish-lsp start` for `.fish` files and discovers the workspace using `config.fish` or `.git` [@config] [@defaults].
 
 ## Husk Integration
 

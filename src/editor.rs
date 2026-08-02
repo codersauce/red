@@ -3043,6 +3043,7 @@ impl Editor {
                 ("sh", 2),
                 ("bash", 2),
                 ("zsh", 2),
+                ("fish", 4),
                 ("py", 4),
                 ("pyw", 4),
             ]
@@ -25118,6 +25119,7 @@ mod test {
     #[test]
     fn language_viewports_report_expected_indentation() {
         for (file, expected_width) in [
+            ("fixture.fish", 4),
             ("fixture.js", 2),
             ("fixture.json", 2),
             ("fixture.yaml", 2),
