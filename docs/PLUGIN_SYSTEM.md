@@ -2,39 +2,60 @@
 
 Red uses Husk as its embedded scripting language. Plugins are `.hk` files loaded by the Rust editor process through the `husk` workspace crate.
 
-## Lifecycle
+## Declarative plugin entrypoint
 
-Every plugin may define these functions:
+Declare fixed commands, events, state, configuration, and lifecycle behavior
+beside their handlers:
 
-```rust
-pub fn activate() {
-    red::add_command("HelloWorld", hello_world, Json {
-        title: "Say hello",
-        category: "Example",
-        description: "Print a greeting",
-        aliases: ["greeting"],
-    });
-    red::on("editor:ready", ready);
+```husk
+struct PluginState {
+    greeting: String,
 }
 
+#[red::state]
+fn initial_state() -> PluginState {
+    return PluginState { greeting: "Hello from Husk" };
+}
+
+#[red::command(
+    name = "HelloWorld",
+    title = "Say hello",
+    category = "Example",
+    description = "Print a greeting",
+    aliases = ["greeting"],
+)]
 fn hello_world() {
-    red::execute("Print", "Hello from Husk");
+    let state: PluginState = red::state();
+    red::execute("Print", state.greeting);
 }
 
+#[red::on("editor:ready")]
 fn ready(event: Json) {
     red::log("ready");
 }
 
-pub fn before_exit(snapshot: Json) {
+#[red::config("plugin_config")]
+fn configuration_loaded(event: Json) {
+    let state: PluginState = red::state();
+    state.greeting = event.value.hello.greeting;
+    red::state_set(state);
+}
+
+#[red::lifecycle("before_exit")]
+fn save_state(snapshot: Json) {
     red::log("saving plugin state");
 }
 
-pub fn deactivate() {
+#[red::lifecycle("deactivate")]
+fn stop() {
     red::log("plugin stopped");
 }
 ```
 
-`activate` runs when Red initializes plugins. `before_exit` and `deactivate` are optional.
+Static registration and state initialization happen before activation.
+Conventionally named `activate`, `before_exit`, `deactivate`, `state_export`,
+and `state_import` functions remain supported. Keep `red::on(event, callback)`
+for runtime-generated event names such as process IDs and filesystem watches.
 
 ## Host API
 
@@ -55,9 +76,9 @@ currently pass arguments to the callback. Built-in commands and their abbreviati
 precedence over plugin commands with the same name.
 
 The optional command metadata object accepts `title`, `category`, `description`,
-and `aliases`. All fields are optional; `aliases` is an array of additional
-search terms, not alternate colon commands. When present, metadata is shown in
-the command palette with the command's effective keymaps and its exact `:Name`
+`aliases`, and `visible`. All fields are optional; `aliases` is an array of
+additional search terms, not alternate colon commands. `visible = false` hides
+a command from the palette and colon completion without disabling direct
 invocation. Existing two-argument registrations remain valid.
 
 Use `red::request` for actions that return a value:

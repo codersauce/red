@@ -127,14 +127,6 @@ struct TreeWindowsResult {
 }
 
 pub fn activate() {
-    red::add_command("NeoTree", neotree, CommandMetadata {
-        title: "Toggle file tree",
-        category: "File",
-        description: "Show or hide the workspace file tree",
-        aliases: ["explorer", "neotree"],
-    });
-    red::on("panel:event:neotree", panel_event);
-
     red::state_set("created", false);
     red::state_set("expanded", ["."]);
     red::state_set("children", []);
@@ -157,6 +149,13 @@ pub fn activate() {
     clear_reveal();
 }
 
+#[red::command(
+    name = "NeoTree",
+    title = "Toggle file tree",
+    category = "File",
+    description = "Show or hide the workspace file tree",
+    aliases = ["explorer", "neotree"],
+)]
 fn neotree() {
     if red::state_bool("created") {
         close();
@@ -207,6 +206,7 @@ fn deactivate() {
     close();
 }
 
+#[red::on("panel:event:neotree")]
 fn panel_event(event: NeoTreePanelEvent) {
     if event.action == "close" {
         close();

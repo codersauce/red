@@ -33,19 +33,19 @@ struct ThemePickerHandlers {
 }
 
 pub fn activate() {
-    red::add_command("ThemeBrowser", theme_browser, CommandMetadata {
-        title: "Browse themes",
-        category: "View",
-        description: "Preview and select an editor theme",
-        aliases: ["colorscheme", "theme"],
-    });
-
     red::state_set("theme_original", "");
     red::state_set("theme_config_loaded", false);
     red::state_set("theme_assets_loaded", false);
     red::state_set("theme_entries", []);
 }
 
+#[red::command(
+    name = "ThemeBrowser",
+    title = "Browse themes",
+    category = "View",
+    description = "Preview and select an editor theme",
+    aliases = ["colorscheme", "theme"],
+)]
 fn theme_browser() {
     red::state_set("theme_original", "");
     red::state_set("theme_config_loaded", false);

@@ -177,85 +177,6 @@ struct AgentPermissionEvent {
 }
 
 pub fn activate() {
-    red::add_command("Agent", prompt, CommandMetadata {
-        title: "Ask the agent",
-        category: "Agent",
-        description: "Open the agent prompt",
-        aliases: ["ask ai", "chat"],
-    });
-    red::add_command("AgentStart", start, CommandMetadata {
-        title: "Start agent session",
-        category: "Agent",
-        description: "Start a new agent session",
-        aliases: ["new chat"],
-    });
-    red::add_command("AgentPrompt", prompt, CommandMetadata {
-        title: "Open agent prompt",
-        category: "Agent",
-        description: "Ask a question in the active agent session",
-        aliases: ["ask ai", "chat"],
-    });
-    red::add_command("AgentOpen", open_conversation, CommandMetadata {
-        title: "Open agent conversation",
-        category: "Agent",
-        description: "Show and focus the conversation pane without opening a prompt",
-        aliases: ["show chat", "open chat"],
-    });
-    red::add_command("AgentCancel", cancel, CommandMetadata {
-        title: "Cancel agent request",
-        category: "Agent",
-        description: "Cancel the active agent request",
-        aliases: ["stop agent"],
-    });
-    red::add_command("AgentClear", clear_conversation, CommandMetadata {
-        title: "Clear agent conversation",
-        category: "Agent",
-        description: "Clear the visible conversation while preserving context",
-        aliases: ["clear chat"],
-    });
-    red::add_command("AgentClose", close_conversation, CommandMetadata {
-        title: "Close agent conversation",
-        category: "Agent",
-        description: "Hide the conversation pane without ending the session",
-        aliases: ["hide chat"],
-    });
-    red::add_command("AgentNew", new_conversation, CommandMetadata {
-        title: "Start new agent conversation",
-        category: "Agent",
-        description: "Reset the session and start a new conversation",
-        aliases: ["new conversation"],
-    });
-    red::add_command("AgentReview", review, CommandMetadata {
-        title: "Review agent changes",
-        category: "Agent",
-        description: "Review changes proposed by the agent",
-        aliases: ["proposals"],
-    });
-    red::add_command("AgentHistory", history, CommandMetadata {
-        title: "Show agent history",
-        category: "Agent",
-        description: "Inspect previous agent transactions",
-        aliases: ["transactions"],
-    });
-    red::on("agent:session_created", session_created);
-    red::on("agent:update", update);
-    red::on("agent:activity", activity);
-    red::on("agent:turn_started", turn_started);
-    red::on("agent:completed", completed);
-    red::on("agent:cancelled", cancelled);
-    red::on("agent:error", failed);
-    red::on("agent:session_lost", session_lost);
-    red::on("agent:proposals_changed", proposals_changed);
-    red::on("agent:proposal_applied", proposals_changed);
-    red::on("agent:proposal_conflict", proposal_conflict);
-    red::on("agent:permission_requested", permission_requested);
-    red::on("agent:transcript_restored", transcript_restored);
-    red::on("workspace:event:agent-review", review_event);
-    red::on("workspace:event:agent-history", history_event);
-    red::on("agent:credential_ready", setup_ready);
-    red::on("agent:backend_ready", setup_ready);
-    red::on("timeout:callback", stream_timeout);
-    red::on("panel:event:agent-conversation", panel_event);
     red::state_set("agent_session_id", "");
     red::state_set("agent_panel_created", false);
     red::state_set("agent_panel_open", false);
@@ -290,6 +211,13 @@ pub fn activate() {
     red::state_set("agent_thought", "");
 }
 
+#[red::command(
+    name = "AgentStart",
+    title = "Start agent session",
+    category = "Agent",
+    description = "Start a new agent session",
+    aliases = ["new chat"],
+)]
 fn start() {
     red::request("GetConfig", cwd_loaded, "cwd");
 }
@@ -298,6 +226,7 @@ fn cwd_loaded(result: AgentStringValueEvent) {
     red::execute("AgentNewSession", red::string(result.value, "."));
 }
 
+#[red::on("agent:session_created")]
 fn session_created(event: AgentSessionEvent) {
     let previous_session_id = red::string(red::state("agent_session_id"), "");
     let pending = red::string(red::state("agent_pending_prompt"), "");
@@ -330,6 +259,20 @@ fn session_created(event: AgentSessionEvent) {
     }
 }
 
+#[red::command(
+    name = "Agent",
+    title = "Ask the agent",
+    category = "Agent",
+    description = "Open the agent prompt",
+    aliases = ["ask ai", "chat"],
+)]
+#[red::command(
+    name = "AgentPrompt",
+    title = "Open agent prompt",
+    category = "Agent",
+    description = "Ask a question in the active agent session",
+    aliases = ["ask ai", "chat"],
+)]
 fn prompt() {
     if red::string(red::state("agent_session_id"), "") != "" {
         ensure_conversation_panel();
@@ -337,6 +280,13 @@ fn prompt() {
     red::request("GetStorage", prompt_history_loaded, "prompt_history");
 }
 
+#[red::command(
+    name = "AgentOpen",
+    title = "Open agent conversation",
+    category = "Agent",
+    description = "Show and focus the conversation pane without opening a prompt",
+    aliases = ["show chat", "open chat"],
+)]
 fn open_conversation() {
     let was_created = red::state_bool("agent_panel_created");
     ensure_conversation_panel();
@@ -507,6 +457,7 @@ fn remove_queued_prompt_block(block_id: String) {
     red::state_set("agent_queued_prompt_blocks", queued_blocks);
 }
 
+#[red::on("agent:turn_started")]
 fn turn_started(event: AgentSessionEvent) {
     if !is_current_session(event.session_id) {
         return;
@@ -547,6 +498,7 @@ fn render_status() {
 // Session activity is a discriminated union whose update payload changes for thought,
 // tool, command, and file events. Keep the envelope dynamic and immediately narrow it
 // through `session_update`; the stable result and UI models below remain concrete.
+#[red::on("agent:activity")]
 fn activity(event: Json) {
     if !is_current_session(red::string(event.session_id, "")) {
         return;
@@ -748,6 +700,7 @@ fn format_turn_elapsed(elapsed_ms: i64) -> String {
     return hours + "h " + remaining_minutes + "m " + remaining_seconds + "s";
 }
 
+#[red::on("panel:event:agent-conversation")]
 fn panel_event(event: AgentPanelEvent) {
     if event.action == "submit" {
         let text = red::string(event.text, "");
@@ -769,6 +722,13 @@ fn panel_event(event: AgentPanelEvent) {
     }
 }
 
+#[red::command(
+    name = "AgentClear",
+    title = "Clear agent conversation",
+    category = "Agent",
+    description = "Clear the visible conversation while preserving context",
+    aliases = ["clear chat"],
+)]
 fn clear_conversation() {
     reset_stream_render();
     red::state_set("agent_transcript_blocks", []);
@@ -792,6 +752,13 @@ fn reset_stream_render() {
     red::state_set("agent_stream_trimmed", false);
 }
 
+#[red::command(
+    name = "AgentClose",
+    title = "Close agent conversation",
+    category = "Agent",
+    description = "Hide the conversation pane without ending the session",
+    aliases = ["hide chat"],
+)]
 fn close_conversation() {
     if red::state_bool("agent_panel_open") {
         red::execute("SetPanelVisible", "agent-conversation", false);
@@ -800,6 +767,13 @@ fn close_conversation() {
     red::execute("FocusEditor");
 }
 
+#[red::command(
+    name = "AgentNew",
+    title = "Start new agent conversation",
+    category = "Agent",
+    description = "Reset the session and start a new conversation",
+    aliases = ["new conversation"],
+)]
 fn new_conversation() {
     let session_id = red::string(red::state("agent_session_id"), "");
     if session_id != "" {
@@ -824,6 +798,13 @@ fn new_conversation() {
 
 fn prompt_cancelled(event: ComposerCancelled) {}
 
+#[red::command(
+    name = "AgentCancel",
+    title = "Cancel agent request",
+    category = "Agent",
+    description = "Cancel the active agent request",
+    aliases = ["stop agent"],
+)]
 fn cancel() {
     let session_id = red::state("agent_session_id");
     if session_id != "" {
@@ -831,6 +812,7 @@ fn cancel() {
     }
 }
 
+#[red::on("agent:update")]
 fn update(event: AgentTextEvent) {
     if !is_current_session(event.session_id) {
         return;
@@ -894,6 +876,7 @@ fn update(event: AgentTextEvent) {
     red::state_set("agent_stream_timer", red::execute("SetTimeout", 50));
 }
 
+#[red::on("agent:completed")]
 fn completed(event: AgentCompletedEvent) {
     if !is_current_session(event.session_id) {
         return;
@@ -948,6 +931,7 @@ fn submit_next_queued() {
     dispatch_prompt_block(text, block_id);
 }
 
+#[red::on("agent:cancelled")]
 fn cancelled(event: AgentSessionEvent) {
     if !is_current_session(event.session_id) {
         return;
@@ -966,6 +950,7 @@ fn cancelled(event: AgentSessionEvent) {
     set_phase("stopping", "Stopping…");
 }
 
+#[red::on("agent:error")]
 fn failed(event: AgentErrorEvent) {
     if !is_current_session(red::string(event.session_id, "")) {
         return;
@@ -1006,6 +991,7 @@ fn failed(event: AgentErrorEvent) {
     }
 }
 
+#[red::on("agent:session_lost")]
 fn session_lost(event: AgentSessionLostEvent) {
     let session_id = red::string(red::state("agent_session_id"), "");
     let attempted = red::string(event.prompt, "");
@@ -1044,6 +1030,8 @@ fn setup_cancelled(event: PickerCancelled) {
     red::execute("Print", "Agent prompt saved. Press Space A when ready to retry");
 }
 
+#[red::on("agent:credential_ready")]
+#[red::on("agent:backend_ready")]
 fn setup_ready(event: EmptyEvent) {
     if red::string(red::state("agent_pending_prompt"), "") != "" {
         start();
@@ -1124,6 +1112,7 @@ fn append_transcript_block(role: String, text: String, block_id: String) {
     render_conversation();
 }
 
+#[red::on("timeout:callback")]
 fn stream_timeout(event: TimerEvent) {
     if event.timer_id != red::state("agent_stream_timer") {
         return;
@@ -1145,6 +1134,7 @@ fn flush_stream(block_id: String) {
     }
 }
 
+#[red::on("agent:transcript_restored")]
 fn transcript_restored(event: AgentTranscriptEvent) {
     let transcript = red::string(event.transcript, "");
     let blocks = legacy_transcript_blocks(transcript);
@@ -1287,6 +1277,13 @@ fn bounded_transcript_blocks(blocks: [AgentTextBlock], keep_id: String) -> Bound
     return BoundedAgentBlocks { blocks: bounded, trimmed: true };
 }
 
+#[red::command(
+    name = "AgentReview",
+    title = "Review agent changes",
+    category = "Agent",
+    description = "Review changes proposed by the agent",
+    aliases = ["proposals"],
+)]
 fn review() {
     red::state_set("agent_review_open", true);
     red::execute("OpenWorkspace", "agent-review", WorkspaceConfig {
@@ -1407,6 +1404,7 @@ fn render_proposals(result: AgentProposalsResult) {
     });
 }
 
+#[red::on("workspace:event:agent-review")]
 fn review_event(event: AgentReviewEvent) {
     if event.action == "q" || event.action == "escape" {
         red::state_set("agent_review_open", false);
@@ -1457,6 +1455,8 @@ fn show_proposal_detail(row: AgentProposalRow) {
     refresh_proposals();
 }
 
+#[red::on("agent:proposals_changed")]
+#[red::on("agent:proposal_applied")]
 fn proposals_changed(event: AgentSessionEvent) {
     if !is_current_session(event.session_id) && !red::state_bool("agent_review_open") {
         return;
@@ -1482,11 +1482,19 @@ fn proposals_ready(result: AgentProposalsResult) {
     red::execute("Print", "Agent changes ready: " + files + " files, " + hunks + " hunks. Use :AgentReview to review before applying");
 }
 
+#[red::on("agent:proposal_conflict")]
 fn proposal_conflict(event: AgentProposalConflictEvent) {
     red::execute("Print", "Agent proposal conflicts with current buffer: " + event.path);
     refresh_proposals();
 }
 
+#[red::command(
+    name = "AgentHistory",
+    title = "Show agent history",
+    category = "Agent",
+    description = "Inspect previous agent transactions",
+    aliases = ["transactions"],
+)]
 fn history() {
     red::state_set("agent_history_open", true);
     red::execute("OpenWorkspace", "agent-history", WorkspaceConfig {
@@ -1547,6 +1555,7 @@ fn render_history(result: AgentHistoryResult) {
     });
 }
 
+#[red::on("workspace:event:agent-history")]
 fn history_event(event: AgentHistoryEvent) {
     if event.action == "q" || event.action == "escape" {
         red::state_set("agent_history_open", false);
@@ -1573,6 +1582,7 @@ fn history_event(event: AgentHistoryEvent) {
     }
 }
 
+#[red::on("agent:permission_requested")]
 fn permission_requested(event: AgentPermissionEvent) {
     if !is_current_session(event.session_id) {
         return;

@@ -13,7 +13,7 @@
 //! editor loop indefinitely.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -63,13 +63,26 @@ static GIT_CORE_PROGRAM: OnceLock<Result<CompiledProgram, String>> = OnceLock::n
 static NEOTREE_CORE_PROGRAM: OnceLock<Result<CompiledProgram, String>> = OnceLock::new();
 
 /// User-facing metadata attached to a registered Red plugin command.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CommandMetadata {
     pub title: Option<String>,
     pub category: Option<String>,
     pub description: Option<String>,
     pub aliases: Vec<String>,
+    pub visible: bool,
+}
+
+impl Default for CommandMetadata {
+    fn default() -> Self {
+        Self {
+            title: None,
+            category: None,
+            description: None,
+            aliases: Vec::new(),
+            visible: true,
+        }
+    }
 }
 
 /// Opaque identifier for a one-shot request issued by a Red plugin.
@@ -128,6 +141,7 @@ struct CommandMetadata {
     category: String,
     description: String,
     aliases: [String],
+    visible: bool,
 }
 struct Position {
     line: i32,
@@ -273,6 +287,10 @@ struct RedPluginPolicy {
     picker_handlers: HashMap<PickerHandle, PickerRegistration>,
     composer_handlers: HashMap<ComposerHandle, ComposerRegistration>,
     plugin_states: HashMap<String, HashMap<String, Value>>,
+    typed_states: HashMap<String, Value>,
+    state_initializers: HashMap<String, Callback>,
+    lifecycle_callbacks: HashMap<String, HashMap<String, Callback>>,
+    config_bindings: HashMap<String, HashSet<Option<String>>>,
     next_request_id: i64,
     next_picker_handle: i32,
     next_composer_handle: i32,
@@ -287,6 +305,10 @@ impl Default for RedPluginPolicy {
             picker_handlers: HashMap::new(),
             composer_handlers: HashMap::new(),
             plugin_states: HashMap::new(),
+            typed_states: HashMap::new(),
+            state_initializers: HashMap::new(),
+            lifecycle_callbacks: HashMap::new(),
+            config_bindings: HashMap::new(),
             next_request_id: 1,
             next_picker_handle: 1,
             next_composer_handle: 1,
@@ -369,6 +391,10 @@ impl RedPluginPolicy {
         self.composer_handlers
             .retain(|_, registration| registration.plugin != plugin);
         self.plugin_states.remove(plugin);
+        self.typed_states.remove(plugin);
+        self.state_initializers.remove(plugin);
+        self.lifecycle_callbacks.remove(plugin);
+        self.config_bindings.remove(plugin);
     }
 
     fn allocate_request_id(&mut self) -> RequestId {
@@ -1758,24 +1784,51 @@ impl RedHost {
                 ))
             }
             "red::state_set" => {
-                let key = red_required_string(args, 0, path)?.to_string();
-                let value = args.get(1).cloned().unwrap_or(Value::Unit);
-                self.policy_mut()
-                    .plugin_states
-                    .entry(plugin.to_string())
-                    .or_default()
-                    .insert(key, value);
+                if args.len() == 1 {
+                    let value = args.first().cloned().unwrap_or(Value::Unit);
+                    if !matches!(value, Value::Struct { .. } | Value::Object(_)) {
+                        anyhow::bail!("`red::state_set(state)` requires a state record");
+                    }
+                    if !self.policy().state_initializers.contains_key(plugin) {
+                        anyhow::bail!(
+                            "`red::state_set(state)` requires a `#[red::state]` initializer"
+                        );
+                    }
+                    self.policy_mut()
+                        .typed_states
+                        .insert(plugin.to_string(), value);
+                } else {
+                    let key = red_required_string(args, 0, path)?.to_string();
+                    let value = args.get(1).cloned().unwrap_or(Value::Unit);
+                    self.policy_mut()
+                        .plugin_states
+                        .entry(plugin.to_string())
+                        .or_default()
+                        .insert(key, value);
+                }
                 Ok(Value::Unit)
             }
             "red::state" => {
-                let key = red_required_string(args, 0, path)?;
-                Ok(self
-                    .policy()
-                    .plugin_states
-                    .get(plugin)
-                    .and_then(|state| state.get(key))
-                    .cloned()
-                    .unwrap_or(Value::Unit))
+                if args.is_empty() {
+                    self.policy()
+                        .typed_states
+                        .get(plugin)
+                        .cloned()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "`red::state()` requires an initialized `#[red::state]` record"
+                            )
+                        })
+                } else {
+                    let key = red_required_string(args, 0, path)?;
+                    Ok(self
+                        .policy()
+                        .plugin_states
+                        .get(plugin)
+                        .and_then(|state| state.get(key))
+                        .cloned()
+                        .unwrap_or(Value::Unit))
+                }
             }
             "red::push" => {
                 let mut values = red_required_value_array(args, 0, path)?;
@@ -2273,16 +2326,19 @@ impl Host for RedHost {
         plugin: &str,
         function: &AnnotatedFunction,
     ) -> anyhow::Result<()> {
-        let annotations =
-            super::api::red_function_annotations(function.attributes(), function.parameter_count())
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "invalid Red plugin annotation at bytes {}..{}: {}",
-                        error.span.range.start,
-                        error.span.range.end,
-                        error.message
-                    )
-                })?;
+        let annotations = super::api::red_function_annotations(
+            function.attributes(),
+            function.parameter_count(),
+            function.return_type(),
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "invalid Red plugin annotation at bytes {}..{}: {}",
+                error.span.range.start,
+                error.span.range.end,
+                error.message
+            )
+        })?;
         for annotation in annotations {
             match annotation {
                 super::api::RedFunctionAnnotation::Command {
@@ -2291,6 +2347,7 @@ impl Host for RedHost {
                     category,
                     description,
                     aliases,
+                    visible,
                 } => {
                     if let Some(existing) = self.policy().commands.get(&name) {
                         if existing.callback.plugin() == plugin {
@@ -2310,6 +2367,7 @@ impl Host for RedHost {
                                 category,
                                 description,
                                 aliases,
+                                visible,
                             },
                         },
                     );
@@ -2321,9 +2379,86 @@ impl Host for RedHost {
                         .or_default()
                         .push(function.callback().clone());
                 }
+                super::api::RedFunctionAnnotation::StateInitializer => {
+                    if self
+                        .policy_mut()
+                        .state_initializers
+                        .insert(plugin.to_string(), function.callback().clone())
+                        .is_some()
+                    {
+                        anyhow::bail!("duplicate `#[red::state]` initializer for `{plugin}`");
+                    }
+                }
+                super::api::RedFunctionAnnotation::Config { key } => {
+                    if !self
+                        .policy_mut()
+                        .config_bindings
+                        .entry(plugin.to_string())
+                        .or_default()
+                        .insert(key.clone())
+                    {
+                        anyhow::bail!("duplicate `#[red::config]` binding for `{plugin}`");
+                    }
+                    let request_id = self.policy_mut().allocate_request_id();
+                    self.policy_mut()
+                        .pending_requests
+                        .insert(request_id, function.callback().clone());
+                    let arguments = key.into_iter().map(Value::String).collect::<Vec<_>>();
+                    if let Err(error) = self.request(plugin, request_id, "GetConfig", &arguments) {
+                        self.policy_mut().pending_requests.remove(&request_id);
+                        return Err(error);
+                    }
+                }
+                super::api::RedFunctionAnnotation::Lifecycle { hook } => {
+                    if self
+                        .policy_mut()
+                        .lifecycle_callbacks
+                        .entry(plugin.to_string())
+                        .or_default()
+                        .insert(hook.clone(), function.callback().clone())
+                        .is_some()
+                    {
+                        anyhow::bail!("duplicate lifecycle annotation `{hook}` for `{plugin}`");
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    fn pre_activation_callbacks(&self, plugin: &str) -> Vec<Callback> {
+        self.policy()
+            .state_initializers
+            .get(plugin)
+            .cloned()
+            .into_iter()
+            .collect()
+    }
+
+    fn complete_pre_activation_callback(
+        &mut self,
+        plugin: &str,
+        callback: &Callback,
+        value: Value,
+    ) -> anyhow::Result<()> {
+        if self.policy().state_initializers.get(plugin) != Some(callback) {
+            anyhow::bail!("unknown state initializer for plugin `{plugin}`");
+        }
+        if !matches!(value, Value::Struct { .. } | Value::Object(_)) {
+            anyhow::bail!("`#[red::state]` initializer must return a state record");
+        }
+        self.policy_mut()
+            .typed_states
+            .insert(plugin.to_string(), value);
+        Ok(())
+    }
+
+    fn lifecycle_callback(&self, plugin: &str, hook: &str) -> Option<Callback> {
+        self.policy()
+            .lifecycle_callbacks
+            .get(plugin)
+            .and_then(|callbacks| callbacks.get(hook))
+            .cloned()
     }
 
     fn begin_reload_replacement(&mut self, plugin: &str) {
@@ -4155,6 +4290,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_state_configuration_lifecycle_and_hidden_commands_work_together() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let source = r#"
+            struct PluginState { count: i32 }
+
+            #[red::state]
+            fn initial_state() -> PluginState {
+                return PluginState { count: 1 };
+            }
+
+            #[red::lifecycle("activate")]
+            fn initialize() {
+                let state: PluginState = red::state();
+                state.count = 2;
+                red::state_set(state);
+                red::state_set("legacy", 5);
+            }
+
+            #[red::config("plugin_config")]
+            fn configured(event: Json) {
+                let state: PluginState = red::state();
+                state.count = state.count + event.value.increment;
+                red::state_set(state);
+            }
+
+            #[red::command(name = "Internal", visible = false)]
+            fn inspect() {
+                let state: PluginState = red::state();
+                red::execute("Print", state.count + ":" + red::state("legacy"));
+            }
+
+            #[red::lifecycle("before_exit")]
+            fn capture(snapshot: Json) {
+                red::execute("Print", snapshot.label);
+            }
+
+            #[red::lifecycle("deactivate")]
+            fn shutdown() {
+                red::execute("Print", "shutdown");
+            }
+        "#;
+        let mut runtime = Runtime::new();
+        runtime.load_plugin("typed", source).await.unwrap();
+
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(key.as_deref(), Some("plugin_config"));
+                request_id
+            }
+            _ => panic!("expected configuration request"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({ "value": { "increment": 3 } }),
+            )
+            .await
+            .unwrap();
+
+        let command = runtime
+            .registered_commands()
+            .into_iter()
+            .find(|command| command.name == "Internal")
+            .unwrap();
+        assert!(!command.metadata.visible);
+        runtime.execute_command("Internal").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "5:5"
+        ));
+
+        runtime
+            .before_exit(serde_json::json!({ "label": "saving" }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "saving"
+        ));
+
+        runtime.deactivate_all().await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "shutdown"
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_typed_initializer_discards_staged_commands_and_config_requests() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        let error = runtime
+            .load_plugin(
+                "invalid-state",
+                r#"
+                    struct PluginState { count: i32 }
+
+                    #[red::state]
+                    fn initial_state() -> PluginState {
+                        return PluginState { count: 1 / 0 };
+                    }
+
+                    #[red::config("plugin_config")]
+                    fn configured(event: Json) {}
+
+                    #[red::command(name = "Leaked")]
+                    fn leaked() {}
+                "#,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("integer division by zero"), "{error}");
+        assert!(runtime.registered_commands().is_empty());
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn annotated_lifecycle_state_migration_preserves_reload_order() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "migration",
+                r#"
+                    #[red::lifecycle("state_export")]
+                    fn save() -> Json { return "preserved"; }
+
+                    #[red::lifecycle("deactivate")]
+                    fn stop() { red::execute("Print", "old teardown"); }
+                "#,
+            )
+            .await
+            .unwrap();
+
+        runtime
+            .load_plugin(
+                "migration",
+                r#"
+                    #[red::lifecycle("activate")]
+                    fn start() { red::execute("Print", "new activation"); }
+
+                    #[red::lifecycle("state_import")]
+                    fn restore(saved: Json) { red::execute("Print", saved); }
+                "#,
+            )
+            .await
+            .unwrap();
+
+        let messages = (0..3)
+            .map(|_| match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::Action(Action::Print(message)) => message,
+                _ => panic!("expected lifecycle print"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(messages, ["old teardown", "new activation", "preserved"]);
+    }
+
+    #[tokio::test]
     async fn annotated_command_collisions_preserve_the_existing_owner() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -4302,6 +4600,37 @@ mod tests {
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::Action(Action::Print(message)) if message == "package module"
+        ));
+    }
+
+    #[tokio::test]
+    async fn external_hello_package_registers_its_declarative_command() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/external-hello-plugin/Husk.toml");
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin_package("hello-panel", &manifest)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime.command_plugin("HelloPanel").as_deref(),
+            Some("hello-panel")
+        );
+        runtime.execute_command("HelloPanel").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::CreateTextPanel { id, .. } if id == "external-hello"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, .. } if id == "external-hello"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusPanel { id } if id == "external-hello"
         ));
     }
 

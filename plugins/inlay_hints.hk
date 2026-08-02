@@ -73,11 +73,6 @@ struct InlayDecoration {
 }
 
 pub fn activate() {
-    red::on("buffer:changed", schedule_refresh);
-    red::on("file:opened", schedule_refresh);
-    red::on("viewport:changed", schedule_refresh);
-    red::on("theme:changed", schedule_refresh);
-    red::on("timeout:callback", timeout_callback);
     red::state_set("inlay_timer", "");
     red::state_set("inlay_layout", red::null());
     red::state_set("inlay_info", red::null());
@@ -103,6 +98,10 @@ fn config_loaded(event: InlayConfigEvent) {
     }
 }
 
+#[red::on("buffer:changed")]
+#[red::on("file:opened")]
+#[red::on("viewport:changed")]
+#[red::on("theme:changed")]
 fn schedule_refresh(event: EmptyEvent) {
     let timer = red::string(red::state("inlay_timer"), "");
     if timer != "" {
@@ -111,6 +110,7 @@ fn schedule_refresh(event: EmptyEvent) {
     red::state_set("inlay_timer", red::execute("SetTimeout", 120));
 }
 
+#[red::on("timeout:callback")]
 fn timeout_callback(event: TimerEvent) {
     if event.timer_id != red::state("inlay_timer") {
         return;

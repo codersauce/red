@@ -57,39 +57,76 @@ struct ReferencesResult {
     references: [LspLocation],
 }
 
-pub fn activate() {
-    red::state_set("lsp_symbol_icons_enabled", true);
-    red::state_set("lsp_symbol_icon_overrides", Json {});
-    red::state_set("lsp_symbol_batch_timer", "");
-    red::state_set("lsp_symbol_batch_symbols", []);
-    red::state_set("lsp_symbol_batch_items", []);
-    red::state_set("lsp_symbol_batch_index", 0);
-    red::state_set("lsp_symbol_batch_picker", red::null());
-    red::state_set("lsp_symbol_batch_kind", "");
-    red::state_set("lsp_symbol_batch_workspace_only", false);
-    red::state_set("lsp_reference_file", "");
-    red::state_set("lsp_reference_position", red::null());
-    red::state_set("lsp_symbol_picker", red::null());
-    red::state_set("lsp_symbol_request", -1);
-    red::request("GetConfig", icon_config_loaded, "plugin_config");
+struct LspSymbolsState {
+    icons_enabled: bool,
+    // Symbol kinds are extensible, so icon overrides remain an open string map.
+    icon_overrides: Json,
+    batch_timer: String,
+    batch_index: i32,
+    // Picker handles and positions remain nullable until a flow is active.
+    batch_picker: Json,
+    batch_kind: String,
+    batch_workspace_only: bool,
+    reference_file: String,
+    reference_position: Json,
+    picker: Json,
+    request: i32,
 }
 
+#[red::state]
+fn initial_state() -> LspSymbolsState {
+    return LspSymbolsState {
+        icons_enabled: true,
+        icon_overrides: Json {},
+        batch_timer: "",
+        batch_index: 0,
+        batch_picker: red::null(),
+        batch_kind: "",
+        batch_workspace_only: false,
+        reference_file: "",
+        reference_position: red::null(),
+        picker: red::null(),
+        request: -1,
+    };
+}
+
+// Symbols/references and their picker rows may contain thousands of records.
+// Keep both high-volume payloads outside the small typed control-state snapshot
+// so routine timer and progress updates never copy an entire batch.
+#[red::lifecycle("activate")]
+fn initialize_symbol_batches() {
+    red::state_set("lsp_symbol_batch_symbols", []);
+    red::state_set("lsp_symbol_batch_items", []);
+}
+
+fn state() -> LspSymbolsState {
+    return red::state();
+}
+
+fn save_state(value: LspSymbolsState) {
+    red::state_set(value);
+}
+
+#[red::config("plugin_config")]
 fn icon_config_loaded(event: LspSymbolsConfigEvent) {
     let options = event.value.lsp_symbols.icons;
     if options == red::null() {
         return;
     }
-    red::state_set("lsp_symbol_icons_enabled", red::bool(options.enabled, true));
+    let current = state();
+    current.icons_enabled = red::bool(options.enabled, true);
     if options.overrides != red::null() {
-        red::state_set("lsp_symbol_icon_overrides", options.overrides);
+        current.icon_overrides = options.overrides;
     }
+    save_state(current);
 }
 
 fn symbol_icon(kind: String) -> Json {
-    if !red::state_bool("lsp_symbol_icons_enabled") {
+    let current = state();
+    if !current.icons_enabled {
         return "";
     }
-    let override = red::state("lsp_symbol_icon_overrides")[red::lower(kind)];
+    let override = current.icon_overrides[red::lower(kind)];
     if override != red::null() {
         return red::string(override, "");
     }
@@ -106,7 +143,9 @@ fn symbol_icon(kind: String) -> Json {
 fn document_symbols() {
     begin_symbol_flow();
     let request_id = red::request("DocumentSymbols", show_document_symbols);
-    red::state_set("lsp_symbol_request", request_id);
+    let current = state();
+    current.request = request_id;
+    save_state(current);
 }
 
 #[red::command(
@@ -127,12 +166,14 @@ fn workspace_symbols() {
         selected: open_symbol_selection,
         cancelled: symbol_picker_cancelled,
     });
-    red::state_set("lsp_symbol_picker", handle);
+    let current = state();
+    current.picker = handle;
+    save_state(current);
     request_workspace_symbols("");
 }
 
 fn workspace_query(query: String) {
-    if red::state("lsp_symbol_picker") == red::null() {
+    if state().picker == red::null() {
         return;
     }
     cancel_symbol_batch();
@@ -141,7 +182,9 @@ fn workspace_query(query: String) {
 
 fn request_workspace_symbols(query: String) {
     let request_id = red::request("WorkspaceSymbols", update_workspace_symbols, query);
-    red::state_set("lsp_symbol_request", request_id);
+    let current = state();
+    current.request = request_id;
+    save_state(current);
 }
 
 #[red::command(
@@ -154,14 +197,18 @@ fn request_workspace_symbols(query: String) {
 fn references() {
     begin_symbol_flow();
     let request_id = red::request("References", show_references);
-    red::state_set("lsp_symbol_request", request_id);
+    let current = state();
+    current.request = request_id;
+    save_state(current);
 }
 
 fn show_document_symbols(result: SymbolsResult, request_id: i32) {
-    if request_id != red::int(red::state("lsp_symbol_request"), -1) {
+    let current = state();
+    if request_id != current.request {
         return;
     }
-    red::state_set("lsp_symbol_request", -1);
+    current.request = -1;
+    save_state(current);
     if !result.ok {
         cancel_symbol_batch();
         red::execute("Print", "Document symbols unavailable: " + result.error);
@@ -183,7 +230,9 @@ fn show_document_symbols(result: SymbolsResult, request_id: i32) {
             selected: open_symbol_selection,
             cancelled: symbol_picker_cancelled,
         });
-        red::state_set("lsp_symbol_picker", handle);
+        let current = state();
+        current.picker = handle;
+        save_state(current);
         return;
     }
 
@@ -194,16 +243,20 @@ fn show_document_symbols(result: SymbolsResult, request_id: i32) {
         selected: open_symbol_selection,
         cancelled: symbol_picker_cancelled,
     });
-    red::state_set("lsp_symbol_picker", handle);
+    let current = state();
+    current.picker = handle;
+    save_state(current);
     start_symbol_batch(result.symbols, false, handle);
 }
 
 fn update_workspace_symbols(result: SymbolsResult, request_id: i32) {
-    if request_id != red::int(red::state("lsp_symbol_request"), -1) {
+    let current = state();
+    if request_id != current.request {
         return;
     }
-    red::state_set("lsp_symbol_request", -1);
-    let handle = red::state("lsp_symbol_picker");
+    current.request = -1;
+    let handle = current.picker;
+    save_state(current);
     if handle == red::null() {
         return;
     }
@@ -231,57 +284,66 @@ fn update_workspace_symbols(result: SymbolsResult, request_id: i32) {
 
 fn start_symbol_batch(symbols: [LspSymbol], workspace_only: bool, handle: i32) {
     cancel_symbol_batch();
+    let current = state();
     red::state_set("lsp_symbol_batch_symbols", symbols);
     red::state_set("lsp_symbol_batch_items", []);
-    red::state_set("lsp_symbol_batch_index", 0);
-    red::state_set("lsp_symbol_batch_picker", handle);
-    red::state_set("lsp_symbol_batch_kind", "symbols");
-    red::state_set("lsp_symbol_batch_workspace_only", workspace_only);
+    current.batch_index = 0;
+    current.batch_picker = handle;
+    current.batch_kind = "symbols";
+    current.batch_workspace_only = workspace_only;
+    save_state(current);
     schedule_symbol_batch();
 }
 
 fn start_reference_batch(result: ReferencesResult, handle: i32) {
     cancel_symbol_batch();
+    let current = state();
     red::state_set("lsp_symbol_batch_symbols", result.references);
     red::state_set("lsp_symbol_batch_items", []);
-    red::state_set("lsp_symbol_batch_index", 0);
-    red::state_set("lsp_symbol_batch_picker", handle);
-    red::state_set("lsp_symbol_batch_kind", "references");
-    red::state_set("lsp_symbol_batch_workspace_only", false);
-    red::state_set("lsp_reference_file", result.file);
-    red::state_set("lsp_reference_position", result.position);
+    current.batch_index = 0;
+    current.batch_picker = handle;
+    current.batch_kind = "references";
+    current.batch_workspace_only = false;
+    current.reference_file = result.file;
+    current.reference_position = result.position;
+    save_state(current);
     schedule_symbol_batch();
 }
 
 fn schedule_symbol_batch() {
-    red::state_set("lsp_symbol_batch_timer", red::execute("SetTimeout", 0));
+    let current = state();
+    current.batch_timer = red::execute("SetTimeout", 0);
+    save_state(current);
 }
 
 #[red::on("timeout:callback")]
 fn symbol_batch_timeout(event: TimerEvent) {
-    if event.timer_id != red::state("lsp_symbol_batch_timer") {
+    let current = state();
+    if event.timer_id != current.batch_timer {
         return;
     }
-    red::state_set("lsp_symbol_batch_timer", "");
+    current.batch_timer = "";
+    save_state(current);
 
+    let current = state();
     let symbols = red::state("lsp_symbol_batch_symbols");
     let batch = [];
-    let index = red::int(red::state("lsp_symbol_batch_index"), 0);
-    let handle = red::state("lsp_symbol_batch_picker");
-    if handle == red::null() || handle != red::state("lsp_symbol_picker") {
+    let index = current.batch_index;
+    let handle = current.batch_picker;
+    if handle == red::null() || handle != current.picker {
         clear_symbol_batch();
         return;
     }
-    let kind = red::string(red::state("lsp_symbol_batch_kind"), "symbols");
-    let workspace_only = red::state_bool("lsp_symbol_batch_workspace_only");
+    let kind = current.batch_kind;
+    let workspace_only = current.batch_workspace_only;
     let processed = 0;
     while index < red::len(symbols) && index < 4096 && processed < 64 {
         let value = symbols[index];
         if kind == "references" {
             if !is_current_reference(
                 value,
-                red::string(red::state("lsp_reference_file"), ""),
-                red::state("lsp_reference_position")
+                current.reference_file,
+                current.reference_position
             ) {
                 batch = red::push(batch, reference_item(value));
             }
@@ -293,9 +355,11 @@ fn symbol_batch_timeout(event: TimerEvent) {
     }
 
     // Keep the growing result out of helper-call frames and extend it once per batch.
-    let items = red::extend(red::state("lsp_symbol_batch_items"), batch);
+    let current = state();
+    let items: [PickerItem] = red::extend(red::state("lsp_symbol_batch_items"), batch);
     red::state_set("lsp_symbol_batch_items", items);
-    red::state_set("lsp_symbol_batch_index", index);
+    current.batch_index = index;
+    save_state(current);
     red::execute("UpdatePickerItems", handle, items);
 
     let noun = "symbols";
@@ -317,7 +381,7 @@ fn symbol_batch_timeout(event: TimerEvent) {
 }
 
 fn cancel_symbol_batch() {
-    let timer = red::string(red::state("lsp_symbol_batch_timer"), "");
+    let timer = state().batch_timer;
     if timer != "" {
         red::execute("CancelTimeout", timer);
     }
@@ -325,26 +389,31 @@ fn cancel_symbol_batch() {
 }
 
 fn clear_symbol_batch() {
-    red::state_set("lsp_symbol_batch_timer", "");
+    let current = state();
+    current.batch_timer = "";
     red::state_set("lsp_symbol_batch_symbols", []);
     red::state_set("lsp_symbol_batch_items", []);
-    red::state_set("lsp_symbol_batch_index", 0);
-    red::state_set("lsp_symbol_batch_picker", red::null());
-    red::state_set("lsp_symbol_batch_kind", "");
-    red::state_set("lsp_symbol_batch_workspace_only", false);
-    red::state_set("lsp_reference_file", "");
-    red::state_set("lsp_reference_position", red::null());
+    current.batch_index = 0;
+    current.batch_picker = red::null();
+    current.batch_kind = "";
+    current.batch_workspace_only = false;
+    current.reference_file = "";
+    current.reference_position = red::null();
+    save_state(current);
 }
 
-fn deactivate() {
+#[red::lifecycle("deactivate")]
+fn stop_symbol_flows() {
     begin_symbol_flow();
 }
 
 fn show_references(result: ReferencesResult, request_id: i32) {
-    if request_id != red::int(red::state("lsp_symbol_request"), -1) {
+    let current = state();
+    if request_id != current.request {
         return;
     }
-    red::state_set("lsp_symbol_request", -1);
+    current.request = -1;
+    save_state(current);
     if !result.ok {
         cancel_symbol_batch();
         red::execute("Print", "References unavailable: " + result.error);
@@ -359,7 +428,9 @@ fn show_references(result: ReferencesResult, request_id: i32) {
             selected: open_reference_selection,
             cancelled: symbol_picker_cancelled,
         });
-        red::state_set("lsp_symbol_picker", handle);
+        let current = state();
+        current.picker = handle;
+        save_state(current);
         start_reference_batch(result, handle);
         return;
     }
@@ -392,7 +463,9 @@ fn show_references(result: ReferencesResult, request_id: i32) {
         selected: open_reference_selection,
         cancelled: symbol_picker_cancelled,
     });
-    red::state_set("lsp_symbol_picker", handle);
+    let current = state();
+    current.picker = handle;
+    save_state(current);
 }
 
 fn symbol_items(symbols: [LspSymbol], workspace_only: bool) -> [PickerItem] {
@@ -449,7 +522,7 @@ fn symbol_picker_cancelled(event: PickerCancelled) {
 }
 
 fn begin_symbol_flow() {
-    let handle = red::state("lsp_symbol_picker");
+    let handle = state().picker;
     finish_symbol_flow();
     if handle != red::null() {
         red::execute("ClosePicker", handle);
@@ -457,9 +530,13 @@ fn begin_symbol_flow() {
 }
 
 fn finish_symbol_flow() {
-    red::state_set("lsp_symbol_picker", red::null());
+    let current = state();
+    current.picker = red::null();
+    save_state(current);
     cancel_symbol_batch();
-    red::state_set("lsp_symbol_request", -1);
+    let current = state();
+    current.request = -1;
+    save_state(current);
 }
 
 fn open_symbol(symbol: LspSymbol) {

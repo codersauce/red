@@ -15,7 +15,8 @@ use std::{
 
 use husk_ast::{
     Attribute, AttributeArgumentKind, AttributeValueKind, Expr, ExprKind, ExternItemKind, File,
-    ImplItemKind, ItemKind, LiteralKind, ModItemKind, Param, Span, Stmt, StmtKind, UnaryOp,
+    ImplItemKind, ItemKind, LiteralKind, ModItemKind, Param, Span, Stmt, StmtKind, TypeExpr,
+    TypeExprKind, UnaryOp,
 };
 use husk_diagnostics::{Diagnostic, Report, SourceFile};
 use once_cell::sync::Lazy;
@@ -66,9 +67,17 @@ pub(crate) enum RedFunctionAnnotation {
         category: Option<String>,
         description: Option<String>,
         aliases: Vec<String>,
+        visible: bool,
     },
     Event {
         name: String,
+    },
+    StateInitializer,
+    Config {
+        key: Option<String>,
+    },
+    Lifecycle {
+        hook: String,
     },
 }
 
@@ -96,6 +105,7 @@ fn annotation_value_error(span: &Span, message: impl Into<String>) -> RedAnnotat
 pub(crate) fn red_function_annotations(
     attributes: &[Attribute],
     parameter_count: usize,
+    return_type: Option<&TypeExpr>,
 ) -> Result<Vec<RedFunctionAnnotation>, RedAnnotationError> {
     let mut annotations = Vec::new();
     let mut events = HashSet::new();
@@ -134,6 +144,7 @@ pub(crate) fn red_function_annotations(
             let mut category = None;
             let mut description = None;
             let mut aliases = Vec::new();
+            let mut visible = true;
             for argument in arguments {
                 let AttributeArgumentKind::Named { name: key, value } = &argument.kind else {
                     return Err(annotation_value_error(
@@ -193,6 +204,15 @@ pub(crate) fn red_function_annotations(
                             aliases.push(text.to_string());
                         }
                     }
+                    "visible" => {
+                        let AttributeValueKind::Bool(visible_value) = &value.kind else {
+                            return Err(annotation_value_error(
+                                &value.span,
+                                "command metadata `visible` must be a boolean",
+                            ));
+                        };
+                        visible = *visible_value;
+                    }
                     _ => {
                         return Err(annotation_value_error(
                             &key.span,
@@ -213,6 +233,7 @@ pub(crate) fn red_function_annotations(
                 category,
                 description,
                 aliases,
+                visible,
             });
         } else if attribute.matches_path(&["red", "on"]) {
             if parameter_count != 1 {
@@ -259,6 +280,123 @@ pub(crate) fn red_function_annotations(
             }
             annotations.push(RedFunctionAnnotation::Event {
                 name: name.to_string(),
+            });
+        } else if attribute.matches_path(&["red", "state"]) {
+            if parameter_count != 0 {
+                return Err(annotation_error(
+                    attribute,
+                    "`#[red::state]` requires a function without parameters",
+                ));
+            }
+            if attribute.assignment.is_some() || attribute.arguments.is_some() {
+                return Err(annotation_error(
+                    attribute,
+                    "`#[red::state]` does not accept arguments or assignment",
+                ));
+            }
+            let is_record_type = matches!(
+                return_type.map(|ty| &ty.kind),
+                Some(TypeExprKind::Named(name)) if !matches!(
+                    name.name.as_str(),
+                    "Json" | "JsValue" | "bool" | "i32" | "i64" | "f64" | "String" | "str"
+                )
+            );
+            if !is_record_type {
+                return Err(annotation_error(
+                    attribute,
+                    "`#[red::state]` requires an explicit named state-record return type",
+                ));
+            }
+            annotations.push(RedFunctionAnnotation::StateInitializer);
+        } else if attribute.matches_path(&["red", "config"]) {
+            if parameter_count != 1 {
+                return Err(annotation_error(
+                    attribute,
+                    "`#[red::config]` requires a function with exactly one parameter",
+                ));
+            }
+            if attribute.assignment.is_some() {
+                return Err(annotation_error(
+                    attribute,
+                    "`#[red::config]` does not support direct assignment",
+                ));
+            }
+            let key = match attribute.arguments.as_deref() {
+                None | Some([]) => None,
+                Some([argument]) => {
+                    let AttributeArgumentKind::Positional(value) = &argument.kind else {
+                        return Err(annotation_value_error(
+                            &argument.span,
+                            "the configuration key must be a positional string",
+                        ));
+                    };
+                    let Some(key) = value.as_str() else {
+                        return Err(annotation_value_error(
+                            &value.span,
+                            "the configuration key must be a string",
+                        ));
+                    };
+                    if key.trim().is_empty() {
+                        return Err(annotation_value_error(
+                            &value.span,
+                            "configuration key cannot be empty",
+                        ));
+                    }
+                    Some(key.to_string())
+                }
+                Some(_) => {
+                    return Err(annotation_error(
+                        attribute,
+                        "`#[red::config]` accepts at most one configuration key",
+                    ));
+                }
+            };
+            annotations.push(RedFunctionAnnotation::Config { key });
+        } else if attribute.matches_path(&["red", "lifecycle"]) {
+            let Some([argument]) = attribute.arguments.as_deref() else {
+                return Err(annotation_error(
+                    attribute,
+                    "`#[red::lifecycle]` requires exactly one lifecycle-hook argument",
+                ));
+            };
+            if attribute.assignment.is_some() {
+                return Err(annotation_error(
+                    attribute,
+                    "`#[red::lifecycle]` does not support direct assignment",
+                ));
+            }
+            let AttributeArgumentKind::Positional(value) = &argument.kind else {
+                return Err(annotation_value_error(
+                    &argument.span,
+                    "the lifecycle hook must be a positional string",
+                ));
+            };
+            let Some(hook) = value.as_str() else {
+                return Err(annotation_value_error(
+                    &value.span,
+                    "the lifecycle hook must be a string",
+                ));
+            };
+            let expected_parameters = match hook {
+                "activate" | "deactivate" | "state_export" => 0,
+                "before_exit" | "state_import" => 1,
+                _ => {
+                    return Err(annotation_value_error(
+                        &value.span,
+                        format!("unknown lifecycle hook `{hook}`"),
+                    ));
+                }
+            };
+            if parameter_count != expected_parameters {
+                return Err(annotation_error(
+                    attribute,
+                    format!(
+                        "lifecycle hook `{hook}` requires exactly {expected_parameters} parameters"
+                    ),
+                ));
+            }
+            annotations.push(RedFunctionAnnotation::Lifecycle {
+                hook: hook.to_string(),
             });
         } else {
             let path = attribute
@@ -614,26 +752,61 @@ pub(crate) fn validate_parsed_source(
 fn validate_red_attribute_sites(file: &File) -> Vec<RedAnnotationError> {
     let mut errors = Vec::new();
     let mut commands = HashSet::new();
+    let mut state_initializer = false;
+    let mut configurations = HashSet::new();
+    let mut lifecycle_hooks = HashSet::new();
     for item in &file.items {
         match &item.kind {
-            ItemKind::Fn { params, .. } => {
-                match red_function_annotations(&item.attributes, params.len()) {
+            ItemKind::Fn {
+                params, ret_type, ..
+            } => {
+                match red_function_annotations(&item.attributes, params.len(), ret_type.as_ref()) {
                     Ok(annotations) => {
                         for annotation in annotations {
-                            if let RedFunctionAnnotation::Command { name, .. } = annotation {
-                                if !commands.insert(name.clone()) {
-                                    let attribute = item
-                                        .attributes
-                                        .iter()
-                                        .find(|attribute| {
-                                            attribute.matches_path(&["red", "command"])
-                                        })
-                                        .expect("a decoded command originated in an attribute");
-                                    errors.push(annotation_error(
-                                        attribute,
+                            let duplicate = match annotation {
+                                RedFunctionAnnotation::Command { name, .. }
+                                    if !commands.insert(name.clone()) =>
+                                {
+                                    Some((
+                                        "command",
                                         format!("duplicate command annotation `{name}`"),
-                                    ));
+                                    ))
                                 }
+                                RedFunctionAnnotation::StateInitializer if state_initializer => {
+                                    Some((
+                                        "state",
+                                        "duplicate state initializer annotation".to_string(),
+                                    ))
+                                }
+                                RedFunctionAnnotation::StateInitializer => {
+                                    state_initializer = true;
+                                    None
+                                }
+                                RedFunctionAnnotation::Config { key }
+                                    if !configurations.insert(key.clone()) =>
+                                {
+                                    Some((
+                                        "config",
+                                        "duplicate configuration annotation".to_string(),
+                                    ))
+                                }
+                                RedFunctionAnnotation::Lifecycle { hook }
+                                    if !lifecycle_hooks.insert(hook.clone()) =>
+                                {
+                                    Some((
+                                        "lifecycle",
+                                        format!("duplicate lifecycle annotation `{hook}`"),
+                                    ))
+                                }
+                                _ => None,
+                            };
+                            if let Some((kind, message)) = duplicate {
+                                let attribute = item
+                                    .attributes
+                                    .iter()
+                                    .find(|attribute| attribute.matches_path(&["red", kind]))
+                                    .expect("a decoded annotation originated in an attribute");
+                                errors.push(annotation_error(attribute, message));
                             }
                         }
                     }
@@ -825,17 +998,18 @@ mod tests {
         assert!(parsed.errors.is_empty(), "errors: {:?}", parsed.errors);
         let file = parsed.file.unwrap();
         assert_eq!(
-            red_function_annotations(&file.items[0].attributes, 0).unwrap(),
+            red_function_annotations(&file.items[0].attributes, 0, None).unwrap(),
             vec![RedFunctionAnnotation::Command {
                 name: "OpenSymbols".to_string(),
                 title: Some("Open symbols".to_string()),
                 category: Some("LSP".to_string()),
                 description: Some("Browse symbols".to_string()),
                 aliases: vec!["outline".to_string(), "symbols".to_string()],
+                visible: true,
             }]
         );
         assert_eq!(
-            red_function_annotations(&file.items[1].attributes, 1).unwrap(),
+            red_function_annotations(&file.items[1].attributes, 1, None).unwrap(),
             vec![
                 RedFunctionAnnotation::Event {
                     name: "editor:changed".to_string(),
@@ -844,6 +1018,68 @@ mod tests {
                     name: "timeout:callback".to_string(),
                 },
             ]
+        );
+        validate_source("valid", "plugins/valid.hk", source).unwrap();
+    }
+
+    #[test]
+    fn decodes_state_configuration_lifecycle_and_hidden_command_annotations() {
+        let source = r#"
+            struct PluginState { enabled: bool }
+
+            #[red::state]
+            fn initial_state() -> PluginState {
+                return PluginState { enabled: true };
+            }
+
+            #[red::config("plugin_config")]
+            fn configuration(event: Json) {}
+
+            #[red::config]
+            fn all_configuration(event: Json) {}
+
+            #[red::lifecycle("deactivate")]
+            fn stop() {}
+
+            #[red::command(name = "Internal", visible = false)]
+            fn internal() {}
+        "#;
+        let parsed = husk_parser::parse_str(source);
+        assert!(parsed.errors.is_empty(), "errors: {:?}", parsed.errors);
+        let file = parsed.file.unwrap();
+        let ItemKind::Fn { ret_type, .. } = &file.items[1].kind else {
+            panic!("expected state initializer");
+        };
+        assert_eq!(
+            red_function_annotations(&file.items[1].attributes, 0, ret_type.as_ref()).unwrap(),
+            [RedFunctionAnnotation::StateInitializer]
+        );
+        assert_eq!(
+            red_function_annotations(&file.items[2].attributes, 1, None).unwrap(),
+            [RedFunctionAnnotation::Config {
+                key: Some("plugin_config".to_string()),
+            }]
+        );
+        assert_eq!(
+            red_function_annotations(&file.items[3].attributes, 1, None).unwrap(),
+            [RedFunctionAnnotation::Config { key: None }]
+        );
+        assert_eq!(
+            red_function_annotations(&file.items[4].attributes, 0, None).unwrap(),
+            [RedFunctionAnnotation::Lifecycle {
+                hook: "deactivate".to_string(),
+            }]
+        );
+        assert_eq!(
+            red_function_annotations(&file.items[5].attributes, 0, None).unwrap(),
+            [RedFunctionAnnotation::Command {
+                name: "Internal".to_string(),
+                title: None,
+                category: None,
+                description: None,
+                aliases: Vec::new(),
+                visible: false,
+            }]
         );
         validate_source("valid", "plugins/valid.hk", source).unwrap();
     }
@@ -869,6 +1105,10 @@ mod tests {
                 "#[red::command(name = \"Open\", aliases = [42])] fn open() {}",
                 "command aliases must be strings",
             ),
+            (
+                "#[red::command(name = \"Open\", visible = \"no\")] fn open() {}",
+                "`visible` must be a boolean",
+            ),
             ("#[red::on(\"changed\")] fn changed() {}", "exactly one parameter"),
             (
                 "#[red::on(name = \"changed\")] fn changed(event: Json) {}",
@@ -890,6 +1130,43 @@ mod tests {
             (
                 "#[red::command(name = \"Open\")] fn first() {} #[red::command(name = \"Open\")] fn second() {}",
                 "duplicate command annotation",
+            ),
+            ("#[red::state] fn state() {}", "explicit named state-record return type"),
+            (
+                "#[red::state] fn state(value: i32) -> State {}",
+                "without parameters",
+            ),
+            (
+                "#[red::state] fn state() -> i32 { return 1; }",
+                "explicit named state-record return type",
+            ),
+            (
+                "#[red::config(\"\")] fn config(event: Json) {}",
+                "configuration key cannot be empty",
+            ),
+            (
+                "#[red::config(\"config\")] fn config() {}",
+                "exactly one parameter",
+            ),
+            (
+                "#[red::lifecycle(\"missing\")] fn stop() {}",
+                "unknown lifecycle hook",
+            ),
+            (
+                "#[red::lifecycle(\"deactivate\")] fn stop(event: Json) {}",
+                "requires exactly 0 parameters",
+            ),
+            (
+                "struct State {} #[red::state] fn first() -> State {} #[red::state] fn second() -> State {}",
+                "duplicate state initializer",
+            ),
+            (
+                "#[red::config(\"key\")] fn first(event: Json) {} #[red::config(\"key\")] fn second(event: Json) {}",
+                "duplicate configuration annotation",
+            ),
+            (
+                "#[red::lifecycle(\"deactivate\")] fn first() {} #[red::lifecycle(\"deactivate\")] fn second() {}",
+                "duplicate lifecycle annotation",
             ),
         ] {
             let error = validate_source("invalid", "plugins/invalid.hk", source)

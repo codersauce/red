@@ -337,6 +337,7 @@ pub struct AnnotatedFunction {
     callback: Callback,
     attributes: Vec<husk_ast::Attribute>,
     parameter_count: usize,
+    return_type: Option<husk_ast::TypeExpr>,
 }
 
 impl AnnotatedFunction {
@@ -356,6 +357,12 @@ impl AnnotatedFunction {
     #[must_use]
     pub const fn parameter_count(&self) -> usize {
         self.parameter_count
+    }
+
+    /// Returns the explicitly declared function result, when present.
+    #[must_use]
+    pub fn return_type(&self) -> Option<&husk_ast::TypeExpr> {
+        self.return_type.as_ref()
     }
 }
 
@@ -387,6 +394,28 @@ pub trait Host {
         _function: &AnnotatedFunction,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Returns state initializers that must complete before plugin activation.
+    fn pre_activation_callbacks(&self, _plugin: &str) -> Vec<Callback> {
+        Vec::new()
+    }
+
+    /// Publishes the result produced by a pre-activation callback.
+    ///
+    /// Returning an error aborts activation and its staged host effects.
+    fn complete_pre_activation_callback(
+        &mut self,
+        _plugin: &str,
+        _callback: &Callback,
+        _value: Value,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Returns an explicitly annotated lifecycle callback, if one exists.
+    fn lifecycle_callback(&self, _plugin: &str, _hook: &str) -> Option<Callback> {
+        None
     }
 
     /// Mark the start of replacement activation/state-import effects during a staged reload.
@@ -797,7 +826,11 @@ impl CompiledProgram {
         let imports = collect_function_imports(&file, &[]);
         for item in &file.items {
             if let ItemKind::Fn {
-                name, params, body, ..
+                name,
+                params,
+                body,
+                ret_type,
+                ..
             } = &item.kind
             {
                 functions.insert(
@@ -817,6 +850,7 @@ impl CompiledProgram {
                         test: test_descriptor(item, &name.name),
                         receiver: None,
                         attributes: item.attributes.clone(),
+                        return_type: ret_type.clone(),
                         declaration_order: functions.len(),
                     },
                 );
@@ -976,7 +1010,11 @@ impl CompiledProgram {
             let imports = collect_function_imports(&module.syntax, &module.module_path);
             for item in &module.syntax.items {
                 let ItemKind::Fn {
-                    name, params, body, ..
+                    name,
+                    params,
+                    body,
+                    ret_type,
+                    ..
                 } = &item.kind
                 else {
                     continue;
@@ -1001,6 +1039,7 @@ impl CompiledProgram {
                     test: test_descriptor(item, &key),
                     receiver: None,
                     attributes: item.attributes.clone(),
+                    return_type: ret_type.clone(),
                     declaration_order: functions.len(),
                 };
                 if functions.insert(key.clone(), function).is_some() {
@@ -1788,6 +1827,7 @@ struct Function {
     test: Option<TestDescriptor>,
     receiver: Option<SelfReceiver>,
     attributes: Vec<husk_ast::Attribute>,
+    return_type: Option<husk_ast::TypeExpr>,
     declaration_order: usize,
 }
 
@@ -2353,6 +2393,7 @@ fn insert_impl_functions(
                 test: None,
                 receiver: method.receiver,
                 attributes: Vec::new(),
+                return_type: None,
                 declaration_order: usize::MAX,
             };
             if functions.insert(key.clone(), function).is_some() {
@@ -2410,6 +2451,7 @@ fn insert_impl_functions(
                 test: None,
                 receiver: method.receiver,
                 attributes: Vec::new(),
+                return_type: None,
                 declaration_order: usize::MAX,
             };
             if functions.insert(key.clone(), function).is_some() {
@@ -3161,9 +3203,17 @@ impl Vm {
             self.unload_plugin(&name);
             return Err(error);
         }
-        if self.has_function(&name, "activate")
-            && let Err(error) =
-                self.call_function(&Callback::new(name.clone(), "activate"), Vec::new(), host)
+        for callback in host.pre_activation_callbacks(&name) {
+            let result = self
+                .call_function(&callback, Vec::new(), host)
+                .and_then(|value| host.complete_pre_activation_callback(&name, &callback, value));
+            if let Err(error) = result {
+                self.unload_plugin(&name);
+                return Err(error);
+            }
+        }
+        if let Some(callback) = self.lifecycle_callback(&name, "activate", host)
+            && let Err(error) = self.call_function(&callback, Vec::new(), host)
         {
             self.unload_plugin(&name);
             return Err(error);
@@ -3202,6 +3252,7 @@ impl Vm {
                         callback: self.resolved_callback(plugin, function_id)?,
                         attributes: function.attributes.clone(),
                         parameter_count: function.hir.parameters.len(),
+                        return_type: function.return_type.clone(),
                     },
                 ))
             })
@@ -3249,27 +3300,21 @@ impl Vm {
             return self.load_compiled_plugin(name, program, host);
         }
         let mut previous = self.clone();
-        let exported_state = if previous.has_function(&name, "state_export") {
-            previous.call_function(
-                &Callback::new(name.clone(), "state_export"),
-                Vec::new(),
-                host,
-            )?
-        } else {
-            Value::Null
-        };
+        let previous_deactivate = previous.lifecycle_callback(&name, "deactivate", host);
+        let exported_state =
+            if let Some(callback) = previous.lifecycle_callback(&name, "state_export", host) {
+                previous.call_function(&callback, Vec::new(), host)?
+            } else {
+                Value::Null
+            };
         let mut staged = self.clone();
         staged.load_compiled_plugin(name.clone(), program, host)?;
-        if staged.has_function(&name, "state_import") {
-            staged.call_function(
-                &Callback::new(name.clone(), "state_import"),
-                vec![exported_state],
-                host,
-            )?;
+        if let Some(callback) = staged.lifecycle_callback(&name, "state_import", host) {
+            staged.call_function(&callback, vec![exported_state], host)?;
         }
-        if previous.has_function(&name, "deactivate") {
+        if let Some(callback) = previous_deactivate {
             host.begin_reload_teardown(&name);
-            previous.call_function(&Callback::new(name.clone(), "deactivate"), Vec::new(), host)?;
+            previous.call_function(&callback, Vec::new(), host)?;
         }
         *self = staged;
         Ok(())
@@ -3283,9 +3328,8 @@ impl Vm {
     ///
     /// Returns the error raised by `deactivate`, if any.
     pub fn deactivate_plugin<H: Host>(&mut self, name: &str, host: &mut H) -> anyhow::Result<()> {
-        let result = if self.has_function(name, "deactivate") {
-            self.call_function(&Callback::new(name, "deactivate"), Vec::new(), host)
-                .map(|_| ())
+        let result = if let Some(callback) = self.lifecycle_callback(name, "deactivate", host) {
+            self.call_function(&callback, Vec::new(), host).map(|_| ())
         } else {
             Ok(())
         };
@@ -3431,9 +3475,7 @@ impl Vm {
         let callbacks = self
             .programs
             .keys()
-            .filter(|plugin| self.has_function(plugin, "before_exit"))
-            .cloned()
-            .map(|plugin| Callback::new(plugin, "before_exit"))
+            .filter_map(|plugin| self.lifecycle_callback(plugin, "before_exit", host))
             .collect::<Vec<_>>();
         for callback in callbacks {
             self.call_function(&callback, vec![Value::Json(snapshot.clone())], host)?;
@@ -3450,9 +3492,7 @@ impl Vm {
         let callbacks = self
             .programs
             .keys()
-            .filter(|plugin| self.has_function(plugin, "deactivate"))
-            .cloned()
-            .map(|plugin| Callback::new(plugin, "deactivate"))
+            .filter_map(|plugin| self.lifecycle_callback(plugin, "deactivate", host))
             .collect::<Vec<_>>();
         for callback in callbacks {
             self.call_function(&callback, Vec::new(), host)?;
@@ -3465,6 +3505,13 @@ impl Vm {
         self.programs
             .get(plugin)
             .is_some_and(|program| program.functions.contains(function))
+    }
+
+    fn lifecycle_callback<H: Host>(&self, plugin: &str, hook: &str, host: &H) -> Option<Callback> {
+        host.lifecycle_callback(plugin, hook).or_else(|| {
+            self.has_function(plugin, hook)
+                .then(|| Callback::new(plugin, hook))
+        })
     }
 
     fn resolved_callback(&self, plugin: &str, function_id: FunctionId) -> anyhow::Result<Callback> {

@@ -43,9 +43,6 @@ struct DoneTimer {
 }
 
 pub fn activate() {
-    red::on("editor:resize", resized);
-    red::on("lsp:progress", progress);
-    red::on("timeout:callback", timeout_callback);
     red::state_set("fidget_info", red::null());
     red::state_set("fidget_items", []);
     red::state_set("fidget_done_timers", []);
@@ -65,6 +62,7 @@ fn info_loaded(info: FidgetEditorInfo) {
     refresh();
 }
 
+#[red::on("editor:resize")]
 fn resized(size: [i32]) {
     let info: FidgetEditorInfo = red::state("fidget_info");
     info.size = size;
@@ -72,6 +70,7 @@ fn resized(size: [i32]) {
     refresh();
 }
 
+#[red::on("lsp:progress")]
 fn progress(event: LspProgressEvent) {
     let value = event.value;
     if value == red::null() {
@@ -189,6 +188,7 @@ fn start_animation() {
     red::state_set("fidget_animation", red::execute("SetTimeout", 100));
 }
 
+#[red::on("timeout:callback")]
 fn timeout_callback(event: TimerEvent) {
     if event.timer_id == red::state("fidget_animation") {
         red::state_set("fidget_animation", "");

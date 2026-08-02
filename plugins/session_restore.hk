@@ -40,10 +40,10 @@ struct RestoreResult {
 }
 
 pub fn activate() {
-    red::on("editor:ready", ready);
     red::state_set("session_snapshot", red::null());
 }
 
+#[red::on("editor:ready")]
 fn ready(event: EmptyEvent) {
     red::request("GetConfig", startup_count_loaded, "startup_file_count");
 }

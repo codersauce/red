@@ -418,11 +418,25 @@ fn expected_failure() {
     name = "OpenSymbols",
     title = "Open symbols",
     aliases = ["outline", "symbols"],
+    visible = true,
 )]
 fn open_symbols() {}
 
 #[red::on("editor:changed")]
 fn editor_changed(event: Json) {}
+
+struct PluginState { enabled: bool }
+
+#[red::state]
+fn initial_state() -> PluginState {
+    return PluginState { enabled: true };
+}
+
+#[red::config("plugin_config")]
+fn configuration_loaded(event: Json) {}
+
+#[red::lifecycle("deactivate")]
+fn release_resources() {}
 ```
 
 The supported forms are:
@@ -443,6 +457,13 @@ annotation paths, argument order, source spans, and values, but namespaced
 attributes remain inert unless their embedding host explicitly recognizes
 them. Existing unqualified attributes such as `#[test]`, `#[cfg(...)]`, and
 `#[js_name = "..."]` retain their current behavior.
+
+Red recognizes the `command`, `on`, `state`, `config`, and `lifecycle` attributes
+on top-level functions. Their callbacks are registered transactionally before
+activation; typed state is initialized before configuration callbacks run.
+The [plugin API guide](PLUGIN_API.md#declarative-plugin-authoring) documents
+their supported metadata, lifecycle signatures, and backward-compatible
+imperative alternatives.
 
 ## Tests
 

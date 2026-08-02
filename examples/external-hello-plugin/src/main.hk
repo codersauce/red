@@ -1,11 +1,9 @@
-pub fn activate() {
-    red::add_command("HelloPanel", open, Json {
-        title: "Open external hello panel",
-        category: "Examples",
-        description: "Proves that external UI packages do not depend on Replay",
-    });
-}
-
+#[red::command(
+    name = "HelloPanel",
+    title = "Open external hello panel",
+    category = "Examples",
+    description = "Proves that external UI packages do not depend on Replay",
+)]
 fn open() {
     red::execute("CreateTextPanel", "external-hello", PanelConfig {
         side: "right",

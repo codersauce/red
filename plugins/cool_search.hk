@@ -12,27 +12,24 @@ struct CursorMovedEvent {
     cause: String,
 }
 
-pub fn activate() {
-    red::on("search:highlighted", search_highlighted);
-    red::on("search:cleared", search_cleared);
-    red::on("mode:changed", mode_changed);
-    red::on("cursor:moved", cursor_moved);
-}
-
+#[red::on("search:highlighted")]
 fn search_highlighted(event: EmptyEvent) {
     red::state_set("highlight_active", true);
 }
 
+#[red::on("search:cleared")]
 fn search_cleared(event: EmptyEvent) {
     red::state_set("highlight_active", false);
 }
 
+#[red::on("mode:changed")]
 fn mode_changed(event: ModeChangedEvent) {
     if event.to == "Insert" {
         clear();
     }
 }
 
+#[red::on("cursor:moved")]
 fn cursor_moved(event: CursorMovedEvent) {
     if !red::state_bool("highlight_active") {
         return;

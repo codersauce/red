@@ -36,17 +36,16 @@ struct ProjectSearchPanelEvent {
 }
 
 pub fn activate() {
-    red::add_command("ProjectSearch", project_search, CommandMetadata {
-        title: "Search project",
-        category: "Search",
-        description: "Find text across the workspace",
-        aliases: ["ripgrep", "find text"],
-    });
-    red::on("panel:event:project-search-results", export_panel_event);
-    red::on("timeout:callback", timeout_callback);
     reset_state();
 }
 
+#[red::command(
+    name = "ProjectSearch",
+    title = "Search project",
+    category = "Search",
+    description = "Find text across the workspace",
+    aliases = ["ripgrep", "find text"],
+)]
 fn project_search() {
     close_search_picker();
     cancel_process();
@@ -136,6 +135,7 @@ fn schedule_run() {
     red::state_set("project_search_debounce", timer);
 }
 
+#[red::on("timeout:callback")]
 fn timeout_callback(event: TimerEvent) {
     if event.timer_id == red::state("project_search_debounce") {
         red::state_set("project_search_debounce", "");
@@ -547,6 +547,7 @@ fn export_results() {
     red::execute("FocusPanel", "project-search-results");
 }
 
+#[red::on("panel:event:project-search-results")]
 fn export_panel_event(event: ProjectSearchPanelEvent) {
     if event.action == "close" {
         red::execute("ClosePanel", "project-search-results");

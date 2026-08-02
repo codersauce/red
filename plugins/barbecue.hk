@@ -137,19 +137,6 @@ struct WindowBarActionEvent {
 }
 
 pub fn activate() {
-    red::on("editor:ready", refresh);
-    red::on("editor:state_restored", refresh);
-    red::on("cursor:moved", cursor_moved);
-    red::on("window:focused", refresh);
-    red::on("window:layout_changed", refresh);
-    red::on("window:buffer_changed", refresh);
-    red::on("window:closed", refresh);
-    red::on("buffer:changed", schedule_refresh);
-    red::on("file:opened", refresh);
-    red::on("file:saved", file_saved);
-    red::on("theme:changed", refresh_theme);
-    red::on("window_bar:action:barbecue", bar_action);
-    red::on("timeout:callback", timeout_callback);
     red::state_set("barbecue_cwd", "");
     red::state_set("barbecue_windows", []);
     red::state_set("barbecue_symbols", []);
@@ -183,6 +170,13 @@ fn create_bar() {
     });
 }
 
+#[red::on("editor:ready")]
+#[red::on("editor:state_restored")]
+#[red::on("window:focused")]
+#[red::on("window:layout_changed")]
+#[red::on("window:buffer_changed")]
+#[red::on("window:closed")]
+#[red::on("file:opened")]
 fn refresh(event: EmptyEvent) {
     if red::state_bool("barbecue_context_loaded") && !red::state_bool("barbecue_enabled") {
         return;
@@ -197,11 +191,13 @@ fn refresh(event: EmptyEvent) {
     }
 }
 
+#[red::on("theme:changed")]
 fn refresh_theme(event: EmptyEvent) {
     red::state_set("barbecue_info_loaded", false);
     refresh(EmptyEvent {});
 }
 
+#[red::on("buffer:changed")]
 fn schedule_refresh(event: EmptyEvent) {
     let timer = red::string(red::state("barbecue_timer"), "");
     if timer != "" {
@@ -210,6 +206,7 @@ fn schedule_refresh(event: EmptyEvent) {
     red::state_set("barbecue_timer", red::execute("SetTimeout", 120));
 }
 
+#[red::on("timeout:callback")]
 fn timeout_callback(event: TimerEvent) {
     if event.timer_id == red::state("barbecue_timer") {
         red::state_set("barbecue_timer", "");
@@ -297,6 +294,7 @@ fn symbol_record(result: BarbecueSymbolsResult) -> SymbolRecord {
     };
 }
 
+#[red::on("file:saved")]
 fn file_saved(event: FileSavedEvent) {
     let records: [SymbolRecord] = [];
     for record in red::state("barbecue_symbols") {
@@ -317,6 +315,7 @@ fn file_saved(event: FileSavedEvent) {
     refresh(EmptyEvent {});
 }
 
+#[red::on("cursor:moved")]
 fn cursor_moved(event: CursorMovedEvent) {
     let windows: [BarbecueWindow] = [];
     let updated = red::null();
@@ -770,6 +769,7 @@ fn kind_theme_key(kind: String) -> String {
     return "breadcrumb.foreground";
 }
 
+#[red::on("window_bar:action:barbecue")]
 fn bar_action(event: WindowBarActionEvent) {
     let action = red::string(event.action, "");
     if !red::starts_with(action, "jump:") {

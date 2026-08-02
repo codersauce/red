@@ -79,17 +79,16 @@ struct IndentEditorInfo {
 }
 
 pub fn activate() {
-    red::on("editor:ready", refresh);
-    red::on("editor:state_restored", refresh);
-    red::on("buffer:changed", refresh);
-    red::on("cursor:moved", refresh);
-    red::on("viewport:changed", refresh);
-    red::on("mode:changed", refresh);
-    red::on("theme:changed", refresh_theme);
     red::state_set("indent_layout_key", "");
     refresh(EmptyEvent {});
 }
 
+#[red::on("editor:ready")]
+#[red::on("editor:state_restored")]
+#[red::on("buffer:changed")]
+#[red::on("cursor:moved")]
+#[red::on("viewport:changed")]
+#[red::on("mode:changed")]
 fn refresh(event: EmptyEvent) {
     let layout: IndentViewportLayout = red::viewport_layout();
     let key = red::int(layout.buffer_index, -1)
@@ -106,6 +105,7 @@ fn refresh(event: EmptyEvent) {
     render(layout, red::editor_info());
 }
 
+#[red::on("theme:changed")]
 fn refresh_theme(event: EmptyEvent) {
     red::state_set("indent_layout_key", "");
     refresh(event);

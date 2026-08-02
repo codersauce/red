@@ -38,6 +38,52 @@ package cannot bind both a leader (`Space R`) and one of its descendants
 (`Space R g`). Install and update reject these ambiguous declarations instead
 of silently dropping one binding.
 
+## Husk entrypoint
+
+Prefer declaration-local attributes over registration-only `activate` blocks:
+
+```husk
+struct PluginState {
+    enabled: bool,
+}
+
+#[red::state]
+fn initial_state() -> PluginState {
+    return PluginState { enabled: true };
+}
+
+#[red::command(
+    name = "MyPlugin",
+    title = "Open my plugin",
+    category = "Extensions",
+)]
+fn open() {
+    let state: PluginState = red::state();
+    if state.enabled {
+        red::execute("Print", "Plugin is ready");
+    }
+}
+
+#[red::config("plugin_config")]
+fn configuration_loaded(event: Json) {
+    let state: PluginState = red::state();
+    state.enabled = event.value.my_plugin.enabled;
+    red::state_set(state);
+}
+
+#[red::on("editor:ready")]
+fn editor_ready(event: EmptyEvent) {}
+
+#[red::lifecycle("deactivate")]
+fn stop_background_work() {}
+```
+
+Use `visible = false` on `#[red::command(...)]` for directly callable commands
+that should stay out of the palette and colon completion. Keep imperative
+`red::on(event_name, handler)` for process IDs, filesystem watch IDs, or other
+event names that are only known at runtime. Existing keyed state, imperative
+registration, and conventionally named lifecycle functions remain compatible.
+
 ## Lifecycle
 
 Plugins may be enabled, disabled, updated, and removed:

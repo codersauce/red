@@ -26,15 +26,13 @@ struct BufferPickerHandlers {
     selected: fn(BufferPickerItem),
 }
 
-pub fn activate() {
-    red::add_command("BufferPicker", buffer_picker, CommandMetadata {
-        title: "Open buffer picker",
-        category: "Buffer",
-        description: "Find and switch between open buffers",
-        aliases: ["buffers"],
-    });
-}
-
+#[red::command(
+    name = "BufferPicker",
+    title = "Open buffer picker",
+    category = "Buffer",
+    description = "Find and switch between open buffers",
+    aliases = ["buffers"],
+)]
 fn buffer_picker() {
     red::request("GetEditorInfo", editor_info_loaded);
 }

@@ -107,33 +107,39 @@ pub(crate) fn entries(
         })
         .collect::<Vec<_>>();
 
-    entries.extend(plugin_commands.iter().map(|command| {
-        let action = Action::PluginCommand(command.name.clone());
-        let shortcuts = shortcuts_for_action(keys, &action);
-        let title = command
-            .metadata
-            .title
-            .clone()
-            .unwrap_or_else(|| humanize_identifier(&command.name));
-        let category = command
-            .metadata
-            .category
-            .as_deref()
-            .unwrap_or(command.plugin.as_str());
-        let description = command.metadata.description.as_deref().unwrap_or("");
-        let colon = (!colon_name_is_builtin(&command.name)).then(|| format!(":{}", command.name));
+    entries.extend(
+        plugin_commands
+            .iter()
+            .filter(|command| command.metadata.visible)
+            .map(|command| {
+                let action = Action::PluginCommand(command.name.clone());
+                let shortcuts = shortcuts_for_action(keys, &action);
+                let title = command
+                    .metadata
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| humanize_identifier(&command.name));
+                let category = command
+                    .metadata
+                    .category
+                    .as_deref()
+                    .unwrap_or(command.plugin.as_str());
+                let description = command.metadata.description.as_deref().unwrap_or("");
+                let colon =
+                    (!colon_name_is_builtin(&command.name)).then(|| format!(":{}", command.name));
 
-        CommandPaletteEntry {
-            id: format!("plugin.{}.{}", command.plugin, command.name),
-            title,
-            category: category.to_string(),
-            description: description.to_string(),
-            colon,
-            aliases: command.metadata.aliases.clone(),
-            shortcuts,
-            action,
-        }
-    }));
+                CommandPaletteEntry {
+                    id: format!("plugin.{}.{}", command.plugin, command.name),
+                    title,
+                    category: category.to_string(),
+                    description: description.to_string(),
+                    colon,
+                    aliases: command.metadata.aliases.clone(),
+                    shortcuts,
+                    action,
+                }
+            }),
+    );
 
     entries.sort_unstable_by(|left, right| {
         left.category
@@ -154,7 +160,7 @@ pub(crate) fn colon_completion_names(plugin_commands: &[RegisteredPluginCommand]
     names.extend(
         plugin_commands
             .iter()
-            .filter(|command| !colon_name_is_builtin(&command.name))
+            .filter(|command| command.metadata.visible && !colon_name_is_builtin(&command.name))
             .map(|command| command.name.clone()),
     );
     names.sort_unstable();
@@ -1230,6 +1236,7 @@ mod tests {
                 category: Some("Search".to_string()),
                 description: Some("Find text across the workspace".to_string()),
                 aliases: vec!["ripgrep".to_string()],
+                visible: true,
             },
         };
 
@@ -1273,6 +1280,26 @@ mod tests {
     }
 
     #[test]
+    fn hidden_plugin_commands_are_absent_from_palette_and_colon_completion() {
+        let plugin = RegisteredPluginCommand {
+            name: "InternalAction".to_string(),
+            plugin: "custom".to_string(),
+            metadata: CommandMetadata {
+                title: Some("Internal action".to_string()),
+                visible: false,
+                ..CommandMetadata::default()
+            },
+        };
+
+        assert!(!entries(&default_keys(), std::slice::from_ref(&plugin))
+            .iter()
+            .any(|entry| entry.id == "plugin.custom.InternalAction"));
+        assert!(!colon_completion_names(&[plugin])
+            .iter()
+            .any(|name| name == "InternalAction"));
+    }
+
+    #[test]
     fn palette_items_keep_category_shortcut_colon_and_description_separate() {
         let entries = entries(&default_keys(), &[]);
         let items = picker_items(&entries);
@@ -1309,6 +1336,7 @@ mod tests {
                     category: Some("Git".to_string()),
                     description: Some("Inspect and manage workspace changes".to_string()),
                     aliases: vec!["source control".to_string()],
+                    visible: true,
                 },
             },
             RegisteredPluginCommand {
@@ -1319,6 +1347,7 @@ mod tests {
                     category: Some("Other".to_string()),
                     description: Some("Get information together".to_string()),
                     aliases: vec![],
+                    visible: true,
                 },
             },
         ];

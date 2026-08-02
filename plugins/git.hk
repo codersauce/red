@@ -182,68 +182,6 @@ struct GitWorkspaceDocument {
 }
 
 pub fn activate() {
-    red::add_command("GitDashboard", dashboard, CommandMetadata {
-        title: "Open Git dashboard",
-        category: "Git",
-        description: "Inspect and manage workspace changes",
-        aliases: ["source control", "status"],
-    });
-    red::add_command("GitRefresh", force_refresh, CommandMetadata {
-        title: "Refresh Git status",
-        category: "Git",
-        description: "Refresh workspace Git information",
-        aliases: ["status"],
-    });
-    red::add_command("GitHunkPrevious", hunk_previous, CommandMetadata {
-        title: "Previous Git hunk",
-        category: "Git",
-        description: "Move to the previous changed hunk",
-        aliases: ["previous change"],
-    });
-    red::add_command("GitHunkNext", hunk_next, CommandMetadata {
-        title: "Next Git hunk",
-        category: "Git",
-        description: "Move to the next changed hunk",
-        aliases: ["next change"],
-    });
-    red::add_command("GitHunkStage", hunk_stage, CommandMetadata {
-        title: "Stage Git hunk",
-        category: "Git",
-        description: "Stage the changed hunk under the cursor",
-        aliases: ["stage change"],
-    });
-    red::add_command("GitHunkUnstage", hunk_unstage, CommandMetadata {
-        title: "Unstage Git hunk",
-        category: "Git",
-        description: "Unstage the changed hunk under the cursor",
-        aliases: ["unstage change"],
-    });
-    red::add_command("GitHunkReset", hunk_reset, CommandMetadata {
-        title: "Reset Git hunk",
-        category: "Git",
-        description: "Discard the changed hunk under the cursor",
-        aliases: ["discard change"],
-    });
-    red::add_command("GitSubmitMessage", submit_message, CommandMetadata {
-        title: "Submit Git message",
-        category: "Git",
-        description: "Submit the current Git commit message",
-        aliases: ["commit"],
-    });
-    red::add_command("GitCancelMessage", cancel_message, CommandMetadata {
-        title: "Cancel Git message",
-        category: "Git",
-        description: "Cancel the current Git commit message",
-        aliases: ["abort commit"],
-    });
-    red::on("workspace:event:git-dashboard", workspace_event);
-    red::on("buffer:changed", schedule_refresh);
-    red::on("file:opened", schedule_refresh);
-    red::on("file:saved", schedule_refresh);
-    red::on("window:buffer_changed", schedule_refresh);
-    red::on("window:focus_changed", schedule_refresh);
-    red::on("timeout:callback", timeout_callback);
-    red::on("filesystem:changed:1502", git_directory_changed);
     red::state_set("git_dashboard_open", false);
     red::state_set("git_process", "");
     red::state_set("git_status_initialized", false);
@@ -332,6 +270,13 @@ fn empty_state() -> GitState {
     };
 }
 
+#[red::command(
+    name = "GitDashboard",
+    title = "Open Git dashboard",
+    category = "Git",
+    description = "Inspect and manage workspace changes",
+    aliases = ["source control", "status"],
+)]
 fn dashboard() {
     if red::state_bool("git_dashboard_open") {
         close_dashboard();
@@ -363,10 +308,16 @@ fn schedule_poll() {
     red::state_set("git_poll_timer", red::execute("SetTimeout", 5000));
 }
 
+#[red::on("filesystem:changed:1502")]
 fn git_directory_changed(event: EmptyEvent) {
     force_refresh();
 }
 
+#[red::on("buffer:changed")]
+#[red::on("file:opened")]
+#[red::on("file:saved")]
+#[red::on("window:buffer_changed")]
+#[red::on("window:focus_changed")]
 fn schedule_refresh(event: EmptyEvent) {
     red::state_set("git_refresh_forced", true);
     let timer = red::string(red::state("git_refresh_timer"), "");
@@ -376,6 +327,7 @@ fn schedule_refresh(event: EmptyEvent) {
     red::state_set("git_refresh_timer", red::execute("SetTimeout", 120));
 }
 
+#[red::on("timeout:callback")]
 fn timeout_callback(event: TimerEvent) {
     if event.timer_id == red::state("git_detail_timer") {
         red::state_set("git_detail_timer", "");
@@ -396,6 +348,13 @@ fn timeout_callback(event: TimerEvent) {
     }
 }
 
+#[red::command(
+    name = "GitRefresh",
+    title = "Refresh Git status",
+    category = "Git",
+    description = "Refresh workspace Git information",
+    aliases = ["status"],
+)]
 fn force_refresh() {
     red::state_set("git_refresh_forced", true);
     refresh();
@@ -1059,6 +1018,7 @@ fn status_label(entry: GitEntry) -> String {
     return "~";
 }
 
+#[red::on("workspace:event:git-dashboard")]
 fn workspace_event(event: Json) {
     let row = event.row;
     if event.focus == "rows" && (
@@ -2257,12 +2217,67 @@ fn section_style(section: String) -> Style {
     return normal_style();
 }
 
+#[red::command(
+    name = "GitHunkPrevious",
+    title = "Previous Git hunk",
+    category = "Git",
+    description = "Move to the previous changed hunk",
+    aliases = ["previous change"],
+)]
 fn hunk_previous() { begin_hunk_action("previous"); }
+
+#[red::command(
+    name = "GitHunkNext",
+    title = "Next Git hunk",
+    category = "Git",
+    description = "Move to the next changed hunk",
+    aliases = ["next change"],
+)]
 fn hunk_next() { begin_hunk_action("next"); }
+
+#[red::command(
+    name = "GitHunkStage",
+    title = "Stage Git hunk",
+    category = "Git",
+    description = "Stage the changed hunk under the cursor",
+    aliases = ["stage change"],
+)]
 fn hunk_stage() { begin_hunk_action("stage"); }
+
+#[red::command(
+    name = "GitHunkUnstage",
+    title = "Unstage Git hunk",
+    category = "Git",
+    description = "Unstage the changed hunk under the cursor",
+    aliases = ["unstage change"],
+)]
 fn hunk_unstage() { begin_hunk_action("unstage"); }
+
+#[red::command(
+    name = "GitHunkReset",
+    title = "Reset Git hunk",
+    category = "Git",
+    description = "Discard the changed hunk under the cursor",
+    aliases = ["discard change"],
+)]
 fn hunk_reset() { begin_hunk_action("reset"); }
+
+#[red::command(
+    name = "GitSubmitMessage",
+    title = "Submit Git message",
+    category = "Git",
+    description = "Submit the current Git commit message",
+    aliases = ["commit"],
+)]
 fn submit_message() { red::request("GetBufferText", commit_buffer_text); }
+
+#[red::command(
+    name = "GitCancelMessage",
+    title = "Cancel Git message",
+    category = "Git",
+    description = "Cancel the current Git commit message",
+    aliases = ["abort commit"],
+)]
 fn cancel_message() { finish_commit_scratch(false, ""); }
 
 fn commit_menu() {

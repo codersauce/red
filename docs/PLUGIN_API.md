@@ -82,11 +82,29 @@ Accept/Cancel dialog. Cancel is selected by default; Left or `y` selects Accept,
 Both calls were introduced in host API `0.4.0`, and their callback handles remain owned
 and released by the calling plugin.
 
-## Command discovery metadata
+## Declarative plugin authoring
 
-Top-level functions can declare commands and event listeners directly:
+Top-level functions can declare commands, event listeners, state, configuration,
+and lifecycle hooks directly:
 
 ```husk
+struct SymbolsState {
+    request: i32,
+    enabled: bool,
+}
+
+#[red::state]
+fn initial_state() -> SymbolsState {
+    return SymbolsState { request: -1, enabled: true };
+}
+
+#[red::config("plugin_config")]
+fn configuration_loaded(event: Json) {
+    let state: SymbolsState = red::state();
+    state.enabled = event.value.symbols.enabled;
+    red::state_set(state);
+}
+
 #[red::command(
     name = "LspDocumentSymbols",
     title = "Show document symbols",
@@ -102,31 +120,57 @@ fn document_symbols() {
 fn symbol_batch_timeout(event: TimerEvent) {
     // Handle a host-owned timer notification.
 }
+
+#[red::lifecycle("deactivate")]
+fn stop_background_work() {
+    // Cancel timers or release plugin-owned resources.
+}
 ```
 
 `#[red::command]` requires a nonempty `name`, a zero-argument function, and
 optional string `title`, `category`, and `description` fields plus an optional
-string-array `aliases` field. `#[red::on]` takes exactly one nonempty event-name
-string and requires a one-argument function. A function may subscribe to
-multiple distinct events by repeating `#[red::on(...)]`.
+string-array `aliases` field. `visible = false` hides a command from the command
+palette and colon completion without disabling direct invocation or keymaps.
+`#[red::on]` takes exactly one nonempty event-name string and requires a
+one-argument function. A function may subscribe to multiple distinct events by
+repeating `#[red::on(...)]`.
+
+`#[red::state]` marks one zero-argument initializer with an explicit named record
+return type. Red runs it after static registration and before activation, stores
+its concrete record privately for that plugin, and makes it available through
+`red::state()`. Replace the record with `red::state_set(state)`. Existing
+`red::state("key")` and `red::state_set("key", value)` calls remain supported
+and independent of the typed record.
+
+`#[red::config("key")]` binds a one-argument callback to an initial `GetConfig`
+request. `#[red::config]` requests the complete configuration. Configuration
+requests are staged and delivered only after state initialization and activation
+succeed. Each key may be bound once per plugin.
+
+`#[red::lifecycle("hook")]` binds a function to `activate`, `deactivate`,
+`before_exit`, `state_export`, or `state_import`; activation, deactivation, and
+export callbacks take no arguments, while exit and import callbacks take one.
+An explicitly annotated hook takes precedence over a conventionally named
+function, which remains supported for compatibility.
 
 Red validates these annotations before activation, retains source diagnostics,
-and registers their generation-safe callbacks in source order before
-`activate()` runs. Registrations participate in the same transactional reload
-as imperative commands and listeners: failed validation, ownership conflicts,
-or activation failures cannot replace or leak the previous plugin's wiring.
+and registers their generation-safe callbacks in source order. State
+initialization, activation, configuration requests, and lifecycle registration
+participate in the same transactional reload as imperative commands and
+listeners: failed validation, ownership conflicts, initializer failures, or
+activation failures cannot replace or leak the previous plugin's wiring.
 Annotations are supported on top-level functions only, including functions in
 package source modules. Other attribute namespaces are ignored by Red.
 
 `red::add_command(name, callback[, metadata])` accepts an optional `Json` object
-with `title`, `category`, `description`, and `aliases: [String]`. Red uses these
-fields to populate the command palette; aliases are search terms and do not
-create alternate colon commands. The palette shows the exact, case-sensitive
-`:Name` invocation when it is available and resolves keymaps from the user's
-effective configuration. Existing two-argument registrations continue to work.
-Imperative `red::add_command` and `red::on` remain supported for dynamic or
-conditional registrations. Plugin state still belongs in `activate()`; typed
-declarative state is intentionally left for a later phase.
+with `title`, `category`, `description`, `aliases: [String]`, and `visible:
+bool`. Red uses visible commands to populate the command palette; aliases are
+search terms and do not create alternate colon commands. The palette shows the
+exact, case-sensitive `:Name` invocation when it is available and resolves
+keymaps from the user's effective configuration. Existing two-argument
+registrations continue to work. Imperative `red::add_command` and `red::on`
+remain supported for dynamic or conditional registrations, including
+process-specific and filesystem-watch-specific event names.
 
 ## Callback-scoped pickers
 
