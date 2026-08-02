@@ -59,6 +59,41 @@ struct AgentActivityRow {
     status: String,
 }
 
+struct AgentThoughtContent {
+    text: String,
+}
+
+struct AgentThoughtChunk {
+    content: Option<AgentThoughtContent>,
+}
+
+struct AgentToolCall {
+    title: Option<String>,
+    kind: Option<String>,
+    tool_call_id: Option<String>,
+    status: Option<String>,
+}
+
+struct AgentToolCallUpdate {
+    tool_call_id: Option<String>,
+    status: Option<String>,
+    title: Option<String>,
+}
+
+enum AgentActivityUpdate {
+    AgentThoughtChunk(AgentThoughtChunk),
+    ToolCall(AgentToolCall),
+    ToolCallUpdate(AgentToolCallUpdate),
+    Plan,
+    // Forward-compatible agent updates remain intentionally opaque.
+    Unknown(Json),
+}
+
+struct AgentActivityEvent {
+    session_id: String,
+    update: AgentActivityUpdate,
+}
+
 struct AgentTextBlock {
     id: String,
     kind: String,
@@ -101,7 +136,7 @@ struct AgentProposalFile {
 struct AgentProposalsResult {
     files: [AgentProposalFile],
     // The proposal API uses null or a human-readable error string.
-    error: Json,
+    error: Option<String>,
 }
 
 struct AgentProposalConflictEvent {
@@ -543,78 +578,89 @@ fn render_status() {
     });
 }
 
-// Session activity is a discriminated union whose update payload changes for thought,
-// tool, command, and file events. Keep the envelope dynamic and immediately narrow it
-// through `session_update`; the stable result and UI models below remain concrete.
 #[red::on("agent:activity")]
-fn activity(event: Json) {
-    if !is_current_session(red::string(event.session_id, "")) {
+fn activity(event: AgentActivityEvent) {
+    if !is_current_session(event.session_id) {
         return;
     }
-    let update = event.update;
-    let kind = red::string(update.session_update, "");
-    if kind == "agent_thought_chunk" {
-        if update.content != red::null() {
-            let text = red::string(update.content.text, "");
-            if text != "" {
-                let thought = red::string(state().thought, "") + text;
-                if red::len(thought) > 240 {
-                    thought = red::slice(thought, red::len(thought) - 240);
-                }
-                red::state_patch(AgentState { thought: thought });
-                render_activity();
+    match event.update {
+        AgentActivityUpdate::AgentThoughtChunk(update) => thought_activity(update),
+        AgentActivityUpdate::ToolCall(update) => tool_activity(update),
+        AgentActivityUpdate::ToolCallUpdate(update) => update_tool_activity(update),
+        AgentActivityUpdate::Plan => set_phase("working", "Planning…"),
+        AgentActivityUpdate::Unknown(update) => {},
+    }
+}
+
+fn optional_text(value: Option<String>, fallback: String) -> String {
+    if let Some(text) = value {
+        return text;
+    }
+    return fallback;
+}
+
+fn thought_activity(update: AgentThoughtChunk) {
+    if let Some(content) = update.content {
+        let text = content.text;
+        if text != "" {
+            let thought = state().thought + text;
+            if red::len(thought) > 240 {
+                thought = red::slice(thought, red::len(thought) - 240);
+            }
+            red::state_patch(AgentState { thought: thought });
+            render_activity();
+        }
+    }
+    set_phase("thinking", "Thinking…");
+}
+
+fn tool_activity(update: AgentToolCall) {
+    let title = optional_text(update.title, "");
+    if title == "" {
+        title = optional_text(update.kind, "Tool");
+    }
+    let rows = state().activity_rows;
+    if red::len(rows) < 100 {
+        rows = red::push(rows, AgentActivityRow {
+            id: optional_text(update.tool_call_id, ""),
+            title: title,
+            status: optional_text(update.status, "in_progress"),
+        });
+    }
+    red::state_patch(AgentState { activity_rows: rows });
+    render_activity();
+    set_phase("tool", title);
+}
+
+fn update_tool_activity(update: AgentToolCallUpdate) {
+    let target = optional_text(update.tool_call_id, "");
+    let status = optional_text(update.status, "");
+    let title = optional_text(update.title, "");
+    let rows = state().activity_rows;
+    let updated = [];
+    let active = "";
+    for row in rows {
+        if row.id == target && row.id != "" {
+            if status != "" {
+                row.status = status;
+            }
+            if title != "" {
+                row.title = title;
             }
         }
-        set_phase("thinking", "Thinking…");
-    } else if kind == "tool_call" {
-        let title = red::string(update.title, "");
-        if title == "" {
-            title = red::string(update.kind, "Tool");
+        if row.status == "in_progress" || row.status == "pending" {
+            active = row.title;
         }
-        let rows = state().activity_rows;
-        if red::len(rows) < 100 {
-            rows = red::push(rows, AgentActivityRow {
-                id: red::string(update.tool_call_id, ""),
-                title: title,
-                status: red::string(update.status, "in_progress"),
-            });
-        }
-        red::state_patch(AgentState { activity_rows: rows });
-        render_activity();
-        set_phase("tool", title);
-    } else if kind == "tool_call_update" {
-        let target = red::string(update.tool_call_id, "");
-        let status = red::string(update.status, "");
-        let title = red::string(update.title, "");
-        let rows = state().activity_rows;
-        let updated = [];
-        let active = "";
-        for row in rows {
-            if red::string(row.id, "") == target && red::string(row.id, "") != "" {
-                if status != "" {
-                    row.status = status;
-                }
-                if title != "" {
-                    row.title = title;
-                }
-            }
-            let row_status = red::string(row.status, "");
-            if row_status == "in_progress" || row_status == "pending" {
-                active = red::string(row.title, "");
-            }
-            updated = red::push(updated, row);
-        }
-        red::state_patch(AgentState { activity_rows: updated });
-        render_activity();
-        if active != "" {
-            set_phase("tool", active);
-        } else if state().streaming {
-            set_phase("streaming", "Writing…");
-        } else {
-            set_phase("working", "Working…");
-        }
-    } else if kind == "plan" {
-        set_phase("working", "Planning…");
+        updated = red::push(updated, row);
+    }
+    red::state_patch(AgentState { activity_rows: updated });
+    render_activity();
+    if active != "" {
+        set_phase("tool", active);
+    } else if state().streaming {
+        set_phase("streaming", "Writing…");
+    } else {
+        set_phase("working", "Working…");
     }
 }
 
@@ -1428,11 +1474,11 @@ fn render_proposals(result: AgentProposalsResult) {
             segments: [PanelSegment { text: "… review limited to 500 rows", style: muted_style() }],
         });
     }
-    if result.error != red::null() {
+    if let Some(error) = result.error {
         rows = red::push(rows, WorkspaceRow {
             id: "error",
             selectable: false,
-            segments: [PanelSegment { text: result.error, style: warning_style() }],
+            segments: [PanelSegment { text: error, style: warning_style() }],
         });
     } else if red::len(rows) == 0 {
         rows = red::push(rows, WorkspaceRow {

@@ -270,39 +270,45 @@ fn cancel_timers() {
     red::state_patch(ProjectSearchState { refresh: "" });
 }
 
-// Process events are a tagged union with variant-specific fields (`stdout`, `stderr`,
-// `error`, and `exit`), so the callback keeps the host's dynamic envelope.
-fn process_event(event: Json) {
-    if event.process_id != state().process {
-        return;
-    }
-
-    if event["type"] == "stdout" {
-        process_stdout(event.line);
-        return;
-    }
-    if event["type"] == "stderr" {
-        red::state_patch(ProjectSearchState { stderr: red::string(state().stderr, "") + event.line + "\n" });
-        return;
-    }
-    if event["type"] == "error" {
-        red::state_patch(ProjectSearchState { running: false });
-        red::state_patch(ProjectSearchState { error: event.message });
-        red::state_patch(ProjectSearchState { process: "" });
-        schedule_refresh();
-        return;
-    }
-    if event["type"] == "exit" {
-        red::state_patch(ProjectSearchState { running: false });
-        red::state_patch(ProjectSearchState { process: "" });
-        if !state().truncated && red::int(event.code, 0) != 0 && red::int(event.code, 0) != 1 {
-            let error = red::trim(red::string(state().stderr, ""));
-            if error == "" {
-                error = "rg exited with code " + red::int(event.code, 0);
+fn process_event(event: ProcessEvent) {
+    match event {
+        ProcessEvent::Stdout { process_id, line, plugin_name } => {
+            if process_id == state().process {
+                process_stdout(line);
             }
-            red::state_patch(ProjectSearchState { error: error });
         }
-        schedule_refresh();
+        ProcessEvent::Stderr { process_id, line, plugin_name } => {
+            if process_id == state().process {
+                red::state_patch(ProjectSearchState { stderr: state().stderr + line + "\n" });
+            }
+        }
+        ProcessEvent::Error { process_id, message, plugin_name } => {
+            if process_id == state().process {
+                red::state_patch(ProjectSearchState { running: false });
+                red::state_patch(ProjectSearchState { error: message });
+                red::state_patch(ProjectSearchState { process: "" });
+                schedule_refresh();
+            }
+        }
+        ProcessEvent::Exit { process_id, code, plugin_name } => {
+            if process_id != state().process {
+                return;
+            }
+            red::state_patch(ProjectSearchState { running: false });
+            red::state_patch(ProjectSearchState { process: "" });
+            let exit_code = 0;
+            if let Some(value) = code {
+                exit_code = value;
+            }
+            if !state().truncated && exit_code != 0 && exit_code != 1 {
+                let error = red::trim(state().stderr);
+                if error == "" {
+                    error = "rg exited with code " + exit_code;
+                }
+                red::state_patch(ProjectSearchState { error: error });
+            }
+            schedule_refresh();
+        }
     }
 }
 

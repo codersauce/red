@@ -100,7 +100,43 @@ fn config_loaded(result: Json, request_id: i32) {
 
 The callback is removed after the first response. Its second argument is the opaque request ID returned by `red::request`; plugins may retain that ID only to ignore stale responses. `red::on` remains for durable editor events and legacy resource-scoped notifications. New pickers and composers use callback-scoped `PickerHandlers` and `ComposerHandlers`; numeric resource event names are retained only for compatibility.
 
-Most existing event payloads still cross the compatibility boundary as `Json`. Callback-scoped pickers and composers use typed host records (or `String` for submitted text), and other host-defined payloads will migrate incrementally. Persisted state, arbitrary configuration, external process data, and plugin-owned payloads remain intentionally dynamic.
+Callback parameter types control how host events and request results are decoded.
+Records and arrays are decoded recursively, while missing or null `Option<T>` values
+become `None`. Tagged host payloads can use native Husk enums instead of manual JSON
+discrimination:
+
+```husk
+struct ToolCall {
+    title: Option<String>,
+}
+
+enum AgentUpdate {
+    ToolCall(ToolCall),
+    Unknown(Json),
+}
+
+struct AgentActivity {
+    session_id: String,
+    update: AgentUpdate,
+}
+
+#[red::on("agent:activity")]
+fn activity(event: AgentActivity) {
+    match event.update {
+        AgentUpdate::ToolCall(tool) => {
+            if let Some(title) = tool.title {
+                red::execute("Print", title);
+            }
+        }
+        AgentUpdate::Unknown(payload) => {},
+    }
+}
+```
+
+Snake-case `type` and `session_update` tags map to PascalCase enum variants;
+`Unknown(Json)` keeps future variants compatible. Callback-scoped pickers and
+composers also use typed host records or `String` for submitted text. Arbitrary
+configuration and plugin-owned payloads remain intentionally dynamic.
 
 ### Text panels
 

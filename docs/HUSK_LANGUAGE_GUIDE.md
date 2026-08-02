@@ -467,6 +467,16 @@ The [plugin API guide](PLUGIN_API.md#declarative-plugin-authoring) documents
 their supported metadata, lifecycle signatures, and backward-compatible
 imperative alternatives.
 
+Host event and request callbacks also use their declared parameter type when
+crossing the Red boundary. Nominal records, arrays, tuples, and nested
+`Option<T>` fields decode recursively; missing and null optional values become
+`None`. Tagged JSON objects map to Husk enums using their `type`,
+`session_update`, or `$case` discriminator. Snake-case tags match PascalCase
+variants, and an `Unknown(Json)` variant can retain future host payloads.
+Callbacks declared as `Json` remain dynamic. See the
+[host payload contract](PLUGIN_API.md#dynamic-json-boundary) for examples and
+outbound `Option<T>` serialization rules.
+
 ## Tests
 
 Test functions use Rust-like attributes:

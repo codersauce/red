@@ -61,7 +61,7 @@ struct BarbecueRange {
 struct BarbecueSymbol {
     id: String,
     // Root symbols have no parent, while nested symbols carry a string ID.
-    parent_id: Json,
+    parent_id: Option<String>,
     name: String,
     kind_name: String,
     file: String,
@@ -589,15 +589,18 @@ fn symbol_chain_for(symbols: [BarbecueSymbol], position: Position) -> [BarbecueS
         if contains_position(current.range, position) {
             chain = red::unshift(chain, current);
         }
-        let parent_id = red::string(current.parent_id, "");
-        if parent_id == "" {
-            current = red::null();
-        } else {
+        if let Some(parent_id) = symbol_parent_id(current) {
             current = symbol_by_id(containing, parent_id);
+        } else {
+            current = red::null();
         }
         steps = steps + 1;
     }
     return chain;
+}
+
+fn symbol_parent_id(symbol: BarbecueSymbol) -> Option<String> {
+    return symbol.parent_id;
 }
 
 fn symbol_by_id(symbols: [BarbecueSymbol], id: String) -> Json {

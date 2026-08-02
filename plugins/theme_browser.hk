@@ -10,7 +10,7 @@ struct ThemeConfigValue {
 
 struct RuntimeAssetListing {
     entries: [RuntimeAssetEntry],
-    error: Json,
+    error: Option<String>,
 }
 
 struct ThemePickerData {
@@ -76,8 +76,8 @@ fn config_loaded(event: ThemeConfigValue) {
 }
 
 fn themes_loaded(listing: RuntimeAssetListing) {
-    if listing.error != red::null() {
-        red::execute("Print", listing.error);
+    if let Some(error) = listing.error {
+        red::execute("Print", error);
         return;
     }
 

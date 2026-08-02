@@ -11,7 +11,7 @@
 struct GitEntry {
     path: String,
     // Non-renames have no original path.
-    original_path: Json,
+    original_path: Option<String>,
     x: String,
     y: String,
     kind: String,
@@ -572,62 +572,72 @@ fn watch_git_directory(git_dir: String) {
     }
 }
 
-// Process notifications are a tagged union (`stdout`, `stderr`, `error`, and `exit`).
-// Keep them dynamic until Husk can express and narrow discriminated unions.
-fn status_event(event: Json) {
-    if event.process_id != plugin_state().process {
-        return;
-    }
-    if event["type"] == "stdout" {
-        let output = red::string(event.line, "");
-        let initialized = plugin_state().status_initialized;
-        let changed = !initialized || output != red::string(plugin_state().status_output, "");
-        let forced = plugin_state().refresh_forced;
-        red::state_patch(GitPluginState { status_initialized: true });
-        red::state_patch(GitPluginState { refresh_forced: false });
-        if changed {
-            red::state_patch(GitPluginState { status_output: output });
-            red::state_patch(GitPluginState { state: parse_status(output) });
-        }
-        let refresh_detail = changed || forced;
-        if refresh_detail {
-            red::state_patch(GitPluginState { idle_polls: 0 });
-        } else {
-            let idle_polls = red::int(plugin_state().idle_polls, 0) + 1;
-            red::state_patch(GitPluginState { idle_polls: idle_polls });
-            if idle_polls >= 6 {
-                red::state_patch(GitPluginState { idle_polls: 0 });
-                refresh_detail = true;
+fn status_event(event: ProcessEvent) {
+    match event {
+        ProcessEvent::Stdout { process_id, line, plugin_name } => {
+            if process_id == plugin_state().process {
+                update_status(line);
             }
         }
-        if refresh_detail {
-            refresh_selected_detail(false);
+        ProcessEvent::Error { process_id, message, plugin_name } => {
+            if process_id == plugin_state().process {
+                render_error(message);
+            }
         }
-        let safe_sync_pending = plugin_state().safe_sync_pending;
-        if changed {
-            render_dashboard();
+        ProcessEvent::Exit { process_id, code, plugin_name } => {
+            if process_id != plugin_state().process {
+                return;
+            }
+            red::state_patch(GitPluginState { process: "" });
+            let exit_code = 0;
+            if let Some(value) = code {
+                exit_code = value;
+            }
+            if exit_code != 0 {
+                render_error("git status exited with " + exit_code);
+            }
         }
-        if changed || forced {
-            red::request("GetWindows", sign_windows_loaded);
-        }
-        if changed && (plugin_state().dashboard_open || safe_sync_pending) {
-            detect_operation();
-        }
-        if safe_sync_pending {
-            red::state_patch(GitPluginState { safe_sync_pending: false });
-            safe_sync_after_refresh();
-        }
-        return;
+        ProcessEvent::Stderr { process_id, line, plugin_name } => {}
     }
-    if event["type"] == "error" {
-        render_error(event.message);
-        return;
+}
+
+fn update_status(output: String) {
+    let initialized = plugin_state().status_initialized;
+    let changed = !initialized || output != red::string(plugin_state().status_output, "");
+    let forced = plugin_state().refresh_forced;
+    red::state_patch(GitPluginState { status_initialized: true });
+    red::state_patch(GitPluginState { refresh_forced: false });
+    if changed {
+        red::state_patch(GitPluginState { status_output: output });
+        red::state_patch(GitPluginState { state: parse_status(output) });
     }
-    if event["type"] == "exit" {
-        red::state_patch(GitPluginState { process: "" });
-        if red::int(event.code, 0) != 0 {
-            render_error("git status exited with " + red::int(event.code, 0));
+    let refresh_detail = changed || forced;
+    if refresh_detail {
+        red::state_patch(GitPluginState { idle_polls: 0 });
+    } else {
+        let idle_polls = red::int(plugin_state().idle_polls, 0) + 1;
+        red::state_patch(GitPluginState { idle_polls: idle_polls });
+        if idle_polls >= 6 {
+            red::state_patch(GitPluginState { idle_polls: 0 });
+            refresh_detail = true;
         }
+    }
+    if refresh_detail {
+        refresh_selected_detail(false);
+    }
+    let safe_sync_pending = plugin_state().safe_sync_pending;
+    if changed {
+        render_dashboard();
+    }
+    if changed || forced {
+        red::request("GetWindows", sign_windows_loaded);
+    }
+    if changed && (plugin_state().dashboard_open || safe_sync_pending) {
+        detect_operation();
+    }
+    if safe_sync_pending {
+        red::state_patch(GitPluginState { safe_sync_pending: false });
+        safe_sync_after_refresh();
     }
 }
 
@@ -745,14 +755,14 @@ fn spawn_operation_check(kind: String, args: [String]) {
     red::on("process:" + process_id, operation_check_event);
 }
 
-fn operation_check_event(event: Json) {
-    if event["type"] != "exit" {
+fn operation_check_event(event: ProcessEvent) {
+    let ProcessEvent::Exit { process_id, code, plugin_name } = event else {
         return;
-    }
+    };
     let remaining = [];
     let kind = "";
     for job in plugin_state().operation_jobs {
-        if job.id == event.process_id {
+        if job.id == process_id {
             kind = red::string(job.kind, "");
         } else {
             remaining = red::push(remaining, job);
@@ -760,7 +770,11 @@ fn operation_check_event(event: Json) {
     }
     if kind == "" { return; }
     red::state_patch(GitPluginState { operation_jobs: remaining });
-    if red::int(event.code, 1) == 0 {
+    let exit_code = 1;
+    if let Some(value) = code {
+        exit_code = value;
+    }
+    if exit_code == 0 {
         let candidate = red::string(plugin_state().operation_candidate, "");
         if candidate == "" || operation_rank(kind) < operation_rank(candidate) {
             red::state_patch(GitPluginState { operation_candidate: kind });
@@ -801,13 +815,13 @@ fn spawn_sign_diff(buffers: [SignBuffer], staged: bool) {
     red::on("process:" + process_id, sign_diff_event);
 }
 
-fn sign_diff_event(event: Json) {
-    if event["type"] != "stdout" {
+fn sign_diff_event(event: ProcessEvent) {
+    let ProcessEvent::Stdout { process_id, line, plugin_name } = event else {
         return;
-    }
+    };
     for job in plugin_state().sign_jobs {
-        if job.id == event.process_id {
-            let signs = signs_from_multi_patch(event.line, job.buffers, red::bool(job.staged, false));
+        if job.id == process_id {
+            let signs = signs_from_multi_patch(line, job.buffers, red::bool(job.staged, false));
             let all_signs = plugin_state().signs;
             for sign in signs {
                 if red::len(all_signs) >= 400 {
@@ -1121,11 +1135,13 @@ fn entry_path_segments(entry: GitEntry, secondary_style: Style) -> Json {
     if parent != "" {
         segments = red::push(segments, PanelSegment { text: "  " + parent, style: secondary_style });
     }
-    if entry.kind == "renamed" && entry.original_path != red::null() {
-        segments = red::push(segments, PanelSegment {
-            text: "  ← " + red::string(entry.original_path, ""),
-            style: secondary_style,
-        });
+    if entry.kind == "renamed" {
+        if let Some(original_path) = entry.original_path {
+            segments = red::push(segments, PanelSegment {
+                text: "  ← " + original_path,
+                style: secondary_style,
+            });
+        }
     }
     return segments;
 }
@@ -1335,17 +1351,26 @@ fn show_detail(row: Json, render_loading: bool) {
     if render_loading { render_dashboard(); }
 }
 
-fn detail_event(event: Json) {
-    if event.process_id != plugin_state().detail_process {
-        return;
+fn detail_event(event: ProcessEvent) {
+    match event {
+        ProcessEvent::Stdout { process_id, line, plugin_name } => {
+            if process_id == plugin_state().detail_process {
+                red::state_patch(GitPluginState {
+                    detail_pending_output: plugin_state().detail_pending_output + line,
+                });
+            }
+        }
+        ProcessEvent::Exit { process_id, code, plugin_name } => {
+            if process_id == plugin_state().detail_process {
+                finish_detail();
+            }
+        }
+        ProcessEvent::Stderr { process_id, line, plugin_name } => {}
+        ProcessEvent::Error { process_id, message, plugin_name } => {}
     }
-    if event["type"] == "stdout" {
-        red::state_patch(GitPluginState { detail_pending_output: red::string(plugin_state().detail_pending_output, "") + event.line });
-        return;
-    }
-    if event["type"] != "exit" {
-        return;
-    }
+}
+
+fn finish_detail() {
     red::state_patch(GitPluginState { detail_process: "" });
     let output = red::string(plugin_state().detail_pending_output, "");
     let path = red::string(plugin_state().detail_path, "");
@@ -1542,8 +1567,8 @@ fn confirmation_selected(item: PickerItem) {
     }
 }
 
-fn action_finished(event: Json) {
-    if event["type"] == "exit" {
+fn action_finished(event: ProcessEvent) {
+    if let ProcessEvent::Exit { process_id, code, plugin_name } = event {
         force_refresh();
     }
 }
@@ -1817,12 +1842,16 @@ fn capture_git(kind: String, args: [String]) {
     red::on("process:" + process_id, capture_event);
 }
 
-fn capture_event(event: Json) {
-    if event["type"] == "stdout" {
-        red::state_patch(GitPluginState { capture_output: red::string(plugin_state().capture_output, "") + event.line });
-    }
-    if event["type"] == "exit" {
-        capture_finished();
+fn capture_event(event: ProcessEvent) {
+    match event {
+        ProcessEvent::Stdout { process_id, line, plugin_name } => {
+            red::state_patch(GitPluginState {
+                capture_output: plugin_state().capture_output + line,
+            });
+        }
+        ProcessEvent::Exit { process_id, code, plugin_name } => capture_finished(),
+        ProcessEvent::Stderr { process_id, line, plugin_name } => {}
+        ProcessEvent::Error { process_id, message, plugin_name } => {}
     }
 }
 
@@ -2499,11 +2528,15 @@ fn run_commit(mode: String, message: String) {
     red::on("process:" + process_id, commit_finished);
 }
 
-fn commit_finished(event: Json) {
-    if event["type"] != "exit" {
+fn commit_finished(event: ProcessEvent) {
+    let ProcessEvent::Exit { process_id, code, plugin_name } = event else {
         return;
+    };
+    let exit_code = 1;
+    if let Some(value) = code {
+        exit_code = value;
     }
-    if red::int(event.code, 1) == 0 {
+    if exit_code == 0 {
         red::state_patch(GitPluginState { commit_retry_text: "" });
         force_refresh();
         return;
@@ -2580,20 +2613,24 @@ fn repository_path(path: String) -> String {
     return path;
 }
 
-fn hunk_diff_event(event: Json) {
-    if event["type"] == "stdout" {
-        let patch = event.line;
-        if plugin_state().hunk_unsaved {
-            patch = normalize_unsaved_patch(patch, red::string(plugin_state().hunk_path, ""));
+fn hunk_diff_event(event: ProcessEvent) {
+    match event {
+        ProcessEvent::Stdout { process_id, line, plugin_name } => {
+            let patch = line;
+            if plugin_state().hunk_unsaved {
+                patch = normalize_unsaved_patch(patch, plugin_state().hunk_path);
+            }
+            red::state_patch(GitPluginState { hunk_patch: patch });
         }
-        red::state_patch(GitPluginState { hunk_patch: patch });
-    }
-    if event["type"] == "exit" {
-        if plugin_state().hunk_unsaved && red::string(plugin_state().hunk_patch, "") == "" {
-            spawn_hunk_diff(red::string(plugin_state().hunk_action, ""));
-            return;
+        ProcessEvent::Exit { process_id, code, plugin_name } => {
+            if plugin_state().hunk_unsaved && plugin_state().hunk_patch == "" {
+                spawn_hunk_diff(plugin_state().hunk_action);
+                return;
+            }
+            red::request("GetSelection", hunk_selection_loaded);
         }
-        red::request("GetSelection", hunk_selection_loaded);
+        ProcessEvent::Stderr { process_id, line, plugin_name } => {}
+        ProcessEvent::Error { process_id, message, plugin_name } => {}
     }
 }
 
@@ -2601,12 +2638,8 @@ fn normalize_unsaved_patch(patch: String, path: String) -> String {
     return red::string(red::git_core("normalize_unsaved", patch, path), "");
 }
 
-fn hunk_selection_loaded(selection: GitSelection) {
-    if selection == red::null() {
-        red::state_patch(GitPluginState { hunk_selection: None });
-    } else {
-        red::state_patch(GitPluginState { hunk_selection: Some(selection) });
-    }
+fn hunk_selection_loaded(selection: Option<GitSelection>) {
+    red::state_patch(GitPluginState { hunk_selection: selection });
     red::request("GetCursorPosition", hunk_cursor_loaded);
 }
 
@@ -2726,12 +2759,19 @@ fn apply_hunk_args(action: String) -> [String] {
     return red::git_core("apply_hunk_args", action);
 }
 
-fn apply_hunk_check_finished(event: Json) {
-    if event.process_id != plugin_state().apply_check_process || event["type"] != "exit" {
+fn apply_hunk_check_finished(event: ProcessEvent) {
+    let ProcessEvent::Exit { process_id, code, plugin_name } = event else {
+        return;
+    };
+    if process_id != plugin_state().apply_check_process {
         return;
     }
     red::state_patch(GitPluginState { apply_check_process: "" });
-    if red::int(event.code, 1) != 0 {
+    let exit_code = 1;
+    if let Some(value) = code {
+        exit_code = value;
+    }
+    if exit_code != 0 {
         red::execute("Print", "Git rejected the selected patch; refresh and try again");
         return;
     }

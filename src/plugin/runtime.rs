@@ -22,6 +22,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use husk_ast::{
+    EnumVariantFields, File as HuskFile, ItemKind, StructField, TypeExpr, TypeExprKind,
+};
 use husk_runtime::{
     AnnotatedFunction, Callback, CompileOptions, CompiledProgram, Host, PackageLimits,
     ResolvedPackage, SemanticProfile, Value,
@@ -160,6 +163,12 @@ struct Style {
     bold: bool,
     italic: bool,
 }
+enum ProcessEvent {
+    Stdout { plugin_name: String, process_id: String, line: String },
+    Stderr { plugin_name: String, process_id: String, line: String },
+    Exit { plugin_name: String, process_id: String, code: Option<i32> },
+    Error { plugin_name: String, process_id: String, message: String },
+}
 struct PanelSegment {
     text: String,
     style: Style,
@@ -285,6 +294,374 @@ struct RedCommand {
 }
 
 #[derive(Debug, Clone)]
+enum PayloadTypeDefinition {
+    Record(Vec<(String, TypeExpr)>),
+    Enum(Vec<PayloadVariant>),
+}
+
+#[derive(Debug, Clone)]
+struct PayloadVariant {
+    name: String,
+    fields: PayloadVariantFields,
+}
+
+#[derive(Debug, Clone)]
+enum PayloadVariantFields {
+    Unit,
+    Tuple(Vec<TypeExpr>),
+    Record(Vec<(String, TypeExpr)>),
+}
+
+#[derive(Debug, Clone, Default)]
+struct PluginPayloadSchema {
+    definitions: HashMap<String, PayloadTypeDefinition>,
+    callback_parameters: HashMap<String, Vec<TypeExpr>>,
+}
+
+impl PluginPayloadSchema {
+    fn for_source(source: &HuskFile) -> Self {
+        let mut schema = Self::default();
+        schema.add_module(red_host_ast(), &[]);
+        schema.add_module(source, &[]);
+        schema
+    }
+
+    fn for_package(package: &ResolvedPackage) -> Self {
+        let mut schema = Self::default();
+        schema.add_module(red_host_ast(), &[]);
+        for module in &package.modules {
+            schema.add_module(&module.syntax, &module.module_path);
+        }
+        schema
+    }
+
+    fn add_module(&mut self, syntax: &HuskFile, module_path: &[String]) {
+        let qualify = |name: &str| {
+            if module_path.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}::{name}", module_path.join("::"))
+            }
+        };
+        for item in &syntax.items {
+            match &item.kind {
+                ItemKind::Struct { name, fields, .. } => {
+                    self.definitions.insert(
+                        qualify(&name.name),
+                        PayloadTypeDefinition::Record(payload_record_fields(fields)),
+                    );
+                }
+                ItemKind::Enum { name, variants, .. } => {
+                    let variants = variants
+                        .iter()
+                        .map(|variant| PayloadVariant {
+                            name: variant.name.name.clone(),
+                            fields: match &variant.fields {
+                                EnumVariantFields::Unit => PayloadVariantFields::Unit,
+                                EnumVariantFields::Tuple(fields) => {
+                                    PayloadVariantFields::Tuple(fields.clone())
+                                }
+                                EnumVariantFields::Struct(fields) => {
+                                    PayloadVariantFields::Record(payload_record_fields(fields))
+                                }
+                            },
+                        })
+                        .collect();
+                    self.definitions
+                        .insert(qualify(&name.name), PayloadTypeDefinition::Enum(variants));
+                }
+                ItemKind::Fn { name, params, .. } => {
+                    self.callback_parameters.insert(
+                        qualify(&name.name),
+                        params
+                            .iter()
+                            .map(|parameter| parameter.ty.clone())
+                            .collect(),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn callback_argument(
+        &self,
+        callback: &Callback,
+        index: usize,
+        payload: &serde_json::Value,
+    ) -> anyhow::Result<Value> {
+        let Some(parameter) = self
+            .callback_parameters
+            .get(callback.function())
+            .and_then(|parameters| parameters.get(index))
+        else {
+            return Ok(Value::from_json(payload.clone()));
+        };
+        let module = callback
+            .function()
+            .rsplit_once("::")
+            .map_or("", |(module, _)| module);
+        self.decode(parameter, module, payload, callback.function(), 0)
+    }
+
+    fn named_record(&self, name: &str, payload: &serde_json::Value) -> anyhow::Result<Value> {
+        let Some(PayloadTypeDefinition::Record(fields)) = self.definitions.get(name) else {
+            return Ok(Value::from_json(payload.clone()));
+        };
+        self.decode_record(name, fields, "", payload, name, 0)
+    }
+
+    fn decode(
+        &self,
+        expected: &TypeExpr,
+        module: &str,
+        payload: &serde_json::Value,
+        path: &str,
+        depth: usize,
+    ) -> anyhow::Result<Value> {
+        anyhow::ensure!(
+            depth < 64,
+            "host payload nesting exceeds the limit at `{path}`"
+        );
+        match &expected.kind {
+            TypeExprKind::Generic { name, args } if name.name == "Option" && args.len() == 1 => {
+                if payload.is_null() {
+                    Ok(option_payload(None))
+                } else {
+                    Ok(option_payload(Some(self.decode(
+                        &args[0],
+                        module,
+                        payload,
+                        path,
+                        depth + 1,
+                    )?)))
+                }
+            }
+            TypeExprKind::Array(element) => {
+                let Some(values) = payload.as_array() else {
+                    return Ok(Value::from_json(payload.clone()));
+                };
+                Ok(Value::Array(Arc::new(
+                    values
+                        .iter()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            self.decode(
+                                element,
+                                module,
+                                value,
+                                &format!("{path}[{index}]"),
+                                depth + 1,
+                            )
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?,
+                )))
+            }
+            TypeExprKind::Tuple(elements) => {
+                let Some(values) = payload.as_array() else {
+                    return Ok(Value::from_json(payload.clone()));
+                };
+                if values.len() != elements.len() {
+                    return Ok(Value::from_json(payload.clone()));
+                }
+                Ok(Value::Tuple(Arc::new(
+                    elements
+                        .iter()
+                        .zip(values)
+                        .enumerate()
+                        .map(|(index, (element, value))| {
+                            self.decode(
+                                element,
+                                module,
+                                value,
+                                &format!("{path}[{index}]"),
+                                depth + 1,
+                            )
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?,
+                )))
+            }
+            TypeExprKind::Named(name) => {
+                let qualified = if module.is_empty() {
+                    name.name.clone()
+                } else {
+                    format!("{module}::{}", name.name)
+                };
+                let (type_name, definition) = self
+                    .definitions
+                    .get(&qualified)
+                    .map(|definition| (qualified.as_str(), definition))
+                    .or_else(|| {
+                        self.definitions
+                            .get(&name.name)
+                            .map(|definition| (name.name.as_str(), definition))
+                    })
+                    .map_or((name.name.as_str(), None), |(name, definition)| {
+                        (name, Some(definition))
+                    });
+                match definition {
+                    Some(PayloadTypeDefinition::Record(fields)) => {
+                        self.decode_record(type_name, fields, module, payload, path, depth + 1)
+                    }
+                    Some(PayloadTypeDefinition::Enum(variants)) => {
+                        self.decode_enum(type_name, variants, module, payload, path, depth + 1)
+                    }
+                    None => Ok(Value::from_json(payload.clone())),
+                }
+            }
+            _ => Ok(Value::from_json(payload.clone())),
+        }
+    }
+
+    fn decode_record(
+        &self,
+        type_name: &str,
+        declared: &[(String, TypeExpr)],
+        module: &str,
+        payload: &serde_json::Value,
+        path: &str,
+        depth: usize,
+    ) -> anyhow::Result<Value> {
+        let Some(object) = payload.as_object() else {
+            return Ok(Value::from_json(payload.clone()));
+        };
+        let mut fields = object
+            .iter()
+            .map(|(name, value)| (name.clone(), Value::from_json(value.clone())))
+            .collect::<BTreeMap<_, _>>();
+        for (name, expected) in declared {
+            let field_path = format!("{path}.{name}");
+            if let Some(value) = object.get(name) {
+                fields.insert(
+                    name.clone(),
+                    self.decode(expected, module, value, &field_path, depth + 1)?,
+                );
+            } else if is_option_type(expected) {
+                fields.insert(name.clone(), option_payload(None));
+            }
+        }
+        Ok(Value::Struct {
+            type_name: type_name.to_string(),
+            fields: Arc::new(fields),
+        })
+    }
+
+    fn decode_enum(
+        &self,
+        type_name: &str,
+        variants: &[PayloadVariant],
+        module: &str,
+        payload: &serde_json::Value,
+        path: &str,
+        depth: usize,
+    ) -> anyhow::Result<Value> {
+        let tag = payload.as_str().or_else(|| {
+            payload.as_object().and_then(|object| {
+                ["$case", "type", "session_update"]
+                    .iter()
+                    .find_map(|name| object.get(*name).and_then(serde_json::Value::as_str))
+            })
+        });
+        let variant = tag.and_then(|tag| {
+            variants
+                .iter()
+                .find(|variant| variant.name == tag || payload_variant_name(&variant.name) == tag)
+        });
+        let Some(variant) =
+            variant.or_else(|| variants.iter().find(|variant| variant.name == "Unknown"))
+        else {
+            anyhow::bail!(
+                "unknown host event variant `{}` for `{type_name}` at `{path}`",
+                tag.unwrap_or("<missing>")
+            );
+        };
+        let fields = match &variant.fields {
+            PayloadVariantFields::Unit => Vec::new(),
+            PayloadVariantFields::Tuple(types) => {
+                if let Some(values) = payload.get("$fields").and_then(serde_json::Value::as_array) {
+                    anyhow::ensure!(
+                        values.len() == types.len(),
+                        "host variant `{type_name}::{}` has the wrong tuple arity at `{path}`",
+                        variant.name
+                    );
+                    types
+                        .iter()
+                        .zip(values)
+                        .enumerate()
+                        .map(|(index, (expected, value))| {
+                            self.decode(
+                                expected,
+                                module,
+                                value,
+                                &format!("{path}[{index}]"),
+                                depth + 1,
+                            )
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?
+                } else if types.len() == 1 {
+                    vec![self.decode(&types[0], module, payload, path, depth + 1)?]
+                } else {
+                    anyhow::bail!(
+                        "host variant `{type_name}::{}` has no tuple payload at `{path}`",
+                        variant.name
+                    );
+                }
+            }
+            PayloadVariantFields::Record(fields) => vec![self.decode_record(
+                &format!("{type_name}::{}", variant.name),
+                fields,
+                module,
+                payload,
+                path,
+                depth + 1,
+            )?],
+        };
+        Ok(Value::Variant {
+            type_name: type_name.to_string(),
+            case: variant.name.clone(),
+            fields: Arc::new(fields),
+        })
+    }
+}
+
+fn payload_record_fields(fields: &[StructField]) -> Vec<(String, TypeExpr)> {
+    fields
+        .iter()
+        .map(|field| (field.name.name.clone(), field.ty.clone()))
+        .collect()
+}
+
+fn is_option_type(ty: &TypeExpr) -> bool {
+    matches!(
+        &ty.kind,
+        TypeExprKind::Generic { name, args } if name.name == "Option" && args.len() == 1
+    )
+}
+
+fn option_payload(value: Option<Value>) -> Value {
+    Value::Variant {
+        type_name: "Option".to_string(),
+        case: if value.is_some() { "Some" } else { "None" }.to_string(),
+        fields: Arc::new(value.into_iter().collect()),
+    }
+}
+
+fn payload_variant_name(name: &str) -> String {
+    let mut result = String::new();
+    for (index, character) in name.chars().enumerate() {
+        if character.is_ascii_uppercase() {
+            if index > 0 {
+                result.push('_');
+            }
+            result.extend(character.to_lowercase());
+        } else {
+            result.push(character);
+        }
+    }
+    result
+}
+
+#[derive(Debug, Clone)]
 struct RedPluginPolicy {
     commands: HashMap<String, RedCommand>,
     event_listeners: HashMap<String, Vec<Callback>>,
@@ -295,6 +672,7 @@ struct RedPluginPolicy {
     typed_states: HashMap<String, Value>,
     state_initializers: HashMap<String, Callback>,
     state_record_types: HashMap<String, String>,
+    payload_schemas: HashMap<String, PluginPayloadSchema>,
     lifecycle_callbacks: HashMap<String, HashMap<String, Callback>>,
     config_bindings: HashMap<String, HashSet<Option<String>>>,
     next_request_id: i64,
@@ -314,6 +692,7 @@ impl Default for RedPluginPolicy {
             typed_states: HashMap::new(),
             state_initializers: HashMap::new(),
             state_record_types: HashMap::new(),
+            payload_schemas: HashMap::new(),
             lifecycle_callbacks: HashMap::new(),
             config_bindings: HashMap::new(),
             next_request_id: 1,
@@ -401,6 +780,7 @@ impl RedPluginPolicy {
         self.typed_states.remove(plugin);
         self.state_initializers.remove(plugin);
         self.state_record_types.remove(plugin);
+        self.payload_schemas.remove(plugin);
         self.lifecycle_callbacks.remove(plugin);
         self.config_bindings.remove(plugin);
     }
@@ -617,7 +997,11 @@ impl RedHost {
         let staged = self
             .staged_policy
             .get_or_insert_with(|| self.policy.clone());
+        let payload_schema = staged.payload_schemas.remove(plugin);
         staged.remove_plugin(plugin);
+        if let Some(schema) = payload_schema {
+            staged.payload_schemas.insert(plugin.to_string(), schema);
+        }
         self.policy_phase = PolicyPhase::Replacement;
     }
 
@@ -2110,7 +2494,13 @@ impl RedHost {
             }
             "red::git_core" => {
                 let operation = red_required_string(args, 0, path)?;
-                self.call_git_core(operation, &args[1..])
+                let value = self.call_git_core(operation, &args[1..])?;
+                if operation == "parse_status" {
+                    if let Some(schema) = self.policy().payload_schemas.get(plugin) {
+                        return schema.named_record("GitState", &value_to_json(&value));
+                    }
+                }
+                Ok(value)
             }
             "red::neotree_core" => {
                 let operation = red_required_string(args, 0, path)?;
@@ -2857,7 +3247,7 @@ fn red_value_to_log_string(value: &Value) -> String {
 
 fn first_json(args: &[Value]) -> anyhow::Result<serde_json::Value> {
     match args.first() {
-        Some(value) => Ok(value.to_json()),
+        Some(value) => Ok(value_to_json(value)),
         _ => anyhow::bail!("host action expected a JSON event payload"),
     }
 }
@@ -2938,12 +3328,34 @@ fn value_to_json(value: &Value) -> serde_json::Value {
         Value::Float(value) => serde_json::Number::from_f64(*value)
             .map_or(serde_json::Value::Null, serde_json::Value::Number),
         Value::String(value) => serde_json::Value::String(value.clone()),
-        Value::Array(_)
-        | Value::Tuple(_)
-        | Value::Range { .. }
-        | Value::Object(_)
-        | Value::Struct { .. }
-        | Value::Variant { .. } => value.to_json(),
+        Value::Array(values) | Value::Tuple(values) => {
+            serde_json::Value::Array(values.iter().map(value_to_json).collect())
+        }
+        Value::Object(fields) | Value::Struct { fields, .. } => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(name, value)| (name.clone(), value_to_json(value)))
+                .collect(),
+        ),
+        Value::Variant {
+            type_name,
+            case,
+            fields,
+        } if type_name == "Option" => match (case.as_str(), fields.as_slice()) {
+            ("None", []) => serde_json::Value::Null,
+            ("Some", [value]) => value_to_json(value),
+            _ => serde_json::Value::Null,
+        },
+        Value::Variant {
+            type_name,
+            case,
+            fields,
+        } => serde_json::json!({
+            "$type": type_name,
+            "$case": case,
+            "$fields": fields.iter().map(value_to_json).collect::<Vec<_>>(),
+        }),
+        Value::Range { .. } => value.to_json(),
         Value::Resource { .. } => serde_json::Value::Null,
         Value::Json(value) => value.clone(),
         Value::Callback(_) | Value::Closure(_) => serde_json::Value::Null,
@@ -3054,8 +3466,14 @@ impl Runtime {
                 &CompileOptions::legacy_runtime_compatibility(),
             )?
         };
+        let payload_schema = PluginPayloadSchema::for_source(program.syntax());
         let RuntimeInner { plugins, host, .. } = &mut *inner;
         host.begin_reload();
+        host.staged_policy
+            .as_mut()
+            .expect("reload staging must be active")
+            .payload_schemas
+            .insert(name.to_string(), payload_schema);
         let was_loaded = plugins.contains_key(name);
         let vm = plugins
             .entry(name.to_string())
@@ -3089,8 +3507,14 @@ impl Runtime {
                 &CompileOptions::legacy_runtime_compatibility(),
             )?
         };
+        let payload_schema = PluginPayloadSchema::for_package(&package);
         let RuntimeInner { plugins, host, .. } = &mut *inner;
         host.begin_reload();
+        host.staged_policy
+            .as_mut()
+            .expect("reload staging must be active")
+            .payload_schemas
+            .insert(name.to_string(), payload_schema);
         let was_loaded = plugins.contains_key(name);
         let vm = plugins
             .entry(name.to_string())
@@ -3186,12 +3610,8 @@ impl Runtime {
             .cloned()
             .unwrap_or_default();
         for callback in callbacks {
-            call_plugin_callback(
-                plugins,
-                host,
-                &callback,
-                vec![Value::from_json(args.clone())],
-            )?;
+            let argument = decoded_callback_payload(host, &callback, 0, &args)?;
+            call_plugin_callback(plugins, host, &callback, vec![argument])?;
         }
         Ok(())
     }
@@ -3213,14 +3633,12 @@ impl Runtime {
             .into_iter()
             .filter_map(|callback| {
                 let plugin = callback.plugin().to_string();
-                call_plugin_callback(
-                    plugins,
-                    host,
-                    &callback,
-                    vec![Value::from_json(args.clone())],
-                )
-                .err()
-                .map(|error| (plugin, error))
+                decoded_callback_payload(host, &callback, 0, &args)
+                    .and_then(|argument| {
+                        call_plugin_callback(plugins, host, &callback, vec![argument])
+                    })
+                    .err()
+                    .map(|error| (plugin, error))
             })
             .collect()
     }
@@ -3243,14 +3661,12 @@ impl Runtime {
             .into_iter()
             .filter(|callback| callback.plugin() == plugin)
             .filter_map(|callback| {
-                call_plugin_callback(
-                    plugins,
-                    host,
-                    &callback,
-                    vec![Value::from_json(args.clone())],
-                )
-                .err()
-                .map(|error| (plugin.to_string(), error))
+                decoded_callback_payload(host, &callback, 0, &args)
+                    .and_then(|argument| {
+                        call_plugin_callback(plugins, host, &callback, vec![argument])
+                    })
+                    .err()
+                    .map(|error| (plugin.to_string(), error))
             })
             .collect()
     }
@@ -3357,11 +3773,12 @@ impl Runtime {
         let Some(callback) = host.policy_mut().pending_requests.remove(&request_id) else {
             return Ok(false);
         };
+        let payload = decoded_callback_payload(host, &callback, 0, &payload)?;
         call_plugin_callback(
             plugins,
             host,
             &callback,
-            vec![Value::from_json(payload), Value::Int(request_id.get())],
+            vec![payload, Value::Int(request_id.get())],
         )?;
         Ok(true)
     }
@@ -3444,6 +3861,21 @@ fn call_plugin_callback(
     vm.call_callback(callback, args, host)
 }
 
+fn decoded_callback_payload(
+    host: &RedHost,
+    callback: &Callback,
+    index: usize,
+    payload: &serde_json::Value,
+) -> anyhow::Result<Value> {
+    host.policy()
+        .payload_schemas
+        .get(callback.plugin())
+        .map_or_else(
+            || Ok(Value::from_json(payload.clone())),
+            |schema| schema.callback_argument(callback, index, payload),
+        )
+}
+
 fn picker_callback_value(event: PickerCallback) -> Value {
     match event {
         PickerCallback::Selected(item) | PickerCallback::Changed(item) => {
@@ -3499,8 +3931,8 @@ fn typed_json_value(type_name: &str, value: serde_json::Value) -> Value {
     }
 }
 
-fn compile_plugin_source(name: &str, path: &str, source: &str) -> anyhow::Result<CompiledProgram> {
-    let host = RED_HOST_AST.get_or_init(|| {
+fn red_host_ast() -> &'static HuskFile {
+    RED_HOST_AST.get_or_init(|| {
         let parsed = husk_parser::parse_str(RED_HOST_DECLARATIONS);
         assert!(
             parsed.errors.is_empty(),
@@ -3510,7 +3942,11 @@ fn compile_plugin_source(name: &str, path: &str, source: &str) -> anyhow::Result
         parsed
             .file
             .expect("Red host declarations must produce an AST")
-    });
+    })
+}
+
+fn compile_plugin_source(name: &str, path: &str, source: &str) -> anyhow::Result<CompiledProgram> {
+    let host = red_host_ast();
     let options = CompileOptions::legacy_runtime_compatibility()
         .with_typecheck(true)
         .with_profile(SemanticProfile::LegacyJavaScript)
@@ -3524,17 +3960,7 @@ fn compile_plugin_package(
     name: &str,
     package: &ResolvedPackage,
 ) -> anyhow::Result<CompiledProgram> {
-    let host = RED_HOST_AST.get_or_init(|| {
-        let parsed = husk_parser::parse_str(RED_HOST_DECLARATIONS);
-        assert!(
-            parsed.errors.is_empty(),
-            "Red host declarations must parse: {:?}",
-            parsed.errors
-        );
-        parsed
-            .file
-            .expect("Red host declarations must produce an AST")
-    });
+    let host = red_host_ast();
     let options = CompileOptions::legacy_runtime_compatibility()
         .with_typecheck(true)
         .with_profile(SemanticProfile::LegacyJavaScript)
@@ -4564,6 +4990,393 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_callbacks_decode_nested_records_arrays_and_optional_fields() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "typed-payload",
+                r#"
+                    struct Child { label: Option<String> }
+                    struct Event {
+                        child: Child,
+                        items: [Child],
+                        missing: Option<i32>,
+                    }
+
+                    #[red::on("typed:record")]
+                    fn received(event: Event) {
+                        let label = option_label(event.child.label);
+                        let item = option_label(event.items[0].label);
+                        let missing = -1;
+                        if let Some(value) = event.missing {
+                            missing = value;
+                        }
+                        red::execute("Print", label + ":" + item + ":" + missing);
+                    }
+
+                    fn option_label(value: Option<String>) -> String {
+                        if let Some(label) = value {
+                            return label;
+                        }
+                        return "none";
+                    }
+                "#,
+            )
+            .await
+            .unwrap();
+
+        runtime
+            .notify(
+                "typed:record",
+                serde_json::json!({
+                    "child": { "label": "root" },
+                    "items": [{ "label": null }],
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "root:none:-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn event_callbacks_decode_tagged_variants_and_preserve_unknown_payloads() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "typed-variant",
+                r#"
+                    enum Event {
+                        ItemUpdated { id: String, detail: Option<String> },
+                        Message(String),
+                        Pair(String, Option<i32>),
+                        Unknown(Json),
+                    }
+
+                    #[red::on("typed:variant")]
+                    fn received(event: Event) {
+                        match event {
+                            Event::ItemUpdated { id, detail } => {
+                                let label = "none";
+                                if let Some(value) = detail {
+                                    label = value;
+                                }
+                                red::execute("Print", id + ":" + label);
+                            }
+                            Event::Unknown(value) => {
+                                red::execute("Print", "unknown:" + value["type"]);
+                            }
+                            Event::Message(value) => {
+                                red::execute("Print", "message:" + value);
+                            }
+                            Event::Pair(label, detail) => {
+                                let value = -1;
+                                if let Some(number) = detail {
+                                    value = number;
+                                }
+                                red::execute("Print", label + ":" + value);
+                            }
+                        }
+                    }
+                "#,
+            )
+            .await
+            .unwrap();
+
+        runtime
+            .notify(
+                "typed:variant",
+                serde_json::json!({ "type": "item_updated", "id": "42" }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "42:none"
+        ));
+
+        runtime
+            .notify(
+                "typed:variant",
+                serde_json::json!({ "$case": "Message", "$fields": ["ready"] }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "message:ready"
+        ));
+
+        runtime
+            .notify(
+                "typed:variant",
+                serde_json::json!({ "$case": "Pair", "$fields": ["count", null] }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "count:-1"
+        ));
+
+        runtime
+            .notify(
+                "typed:variant",
+                serde_json::json!({ "type": "future_event" }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "unknown:future_event"
+        ));
+    }
+
+    #[tokio::test]
+    async fn process_callbacks_decode_host_variants_and_optional_exit_codes() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "typed-process",
+                r#"
+                    #[red::on("typed:process")]
+                    fn received(event: ProcessEvent) {
+                        match event {
+                            ProcessEvent::Stdout { process_id, line, plugin_name } => {
+                                red::execute("Print", process_id + ":out:" + line);
+                            }
+                            ProcessEvent::Stderr { process_id, line, plugin_name } => {
+                                red::execute("Print", process_id + ":err:" + line);
+                            }
+                            ProcessEvent::Exit { process_id, code, plugin_name } => {
+                                let exit_code = "none";
+                                if let Some(value) = code {
+                                    exit_code = "" + value;
+                                }
+                                red::execute("Print", process_id + ":exit:" + exit_code);
+                            }
+                            ProcessEvent::Error { process_id, message, plugin_name } => {
+                                red::execute("Print", process_id + ":error:" + message);
+                            }
+                        }
+                    }
+                "#,
+            )
+            .await
+            .unwrap();
+
+        for (payload, expected) in [
+            (
+                serde_json::json!({
+                    "type": "stdout",
+                    "plugin_name": "typed-process",
+                    "process_id": "7",
+                    "line": "ready",
+                }),
+                "7:out:ready",
+            ),
+            (
+                serde_json::json!({
+                    "type": "exit",
+                    "plugin_name": "typed-process",
+                    "process_id": "7",
+                    "code": 0,
+                }),
+                "7:exit:0",
+            ),
+            (
+                serde_json::json!({
+                    "type": "exit",
+                    "plugin_name": "typed-process",
+                    "process_id": "8",
+                    "code": null,
+                }),
+                "8:exit:none",
+            ),
+            (
+                serde_json::json!({
+                    "type": "exit",
+                    "plugin_name": "typed-process",
+                    "process_id": "9",
+                }),
+                "9:exit:none",
+            ),
+        ] {
+            runtime.notify("typed:process", payload).await.unwrap();
+            match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::Action(Action::Print(message)) => assert_eq!(message, expected),
+                _ => panic!("expected typed process event response"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn request_callbacks_decode_optional_record_responses() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "typed-request",
+                r#"
+                    struct Snapshot { path: String }
+
+                    #[red::command(name = "ReadTypedSnapshot")]
+                    fn read() {
+                        red::request("GetConfig", received, "snapshot");
+                    }
+
+                    fn received(snapshot: Option<Snapshot>) {
+                        match snapshot {
+                            Some(value) => red::execute("Print", value.path),
+                            None => red::execute("Print", "missing"),
+                        }
+                    }
+                "#,
+            )
+            .await
+            .unwrap();
+
+        for (payload, expected) in [
+            (serde_json::Value::Null, "missing"),
+            (
+                serde_json::json!({ "path": "/repo/main.rs" }),
+                "/repo/main.rs",
+            ),
+        ] {
+            runtime.execute_command("ReadTypedSnapshot").await.unwrap();
+            let request_id = match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::GetConfig { request_id, .. } => request_id,
+                _ => panic!("expected typed snapshot request"),
+            };
+            runtime.resolve_request(request_id, payload).await.unwrap();
+            match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::Action(Action::Print(message)) => assert_eq!(message, expected),
+                _ => panic!("expected typed snapshot response"),
+            }
+        }
+    }
+
+    #[test]
+    fn host_json_serialization_unwraps_nested_options_and_preserves_other_variants() {
+        let record = Value::Struct {
+            type_name: "OptionalRecord".to_string(),
+            fields: Arc::new(BTreeMap::from([
+                ("present".to_string(), option_payload(Some(Value::Int(7)))),
+                ("missing".to_string(), option_payload(None)),
+                (
+                    "nested".to_string(),
+                    Value::Array(Arc::new(vec![option_payload(Some(Value::String(
+                        "nested".to_string(),
+                    )))])),
+                ),
+                (
+                    "variant".to_string(),
+                    Value::Variant {
+                        type_name: "Status".to_string(),
+                        case: "Ready".to_string(),
+                        fields: Arc::new(vec![option_payload(None)]),
+                    },
+                ),
+            ])),
+        };
+
+        assert_eq!(
+            value_to_json(&record),
+            serde_json::json!({
+                "present": 7,
+                "missing": null,
+                "nested": ["nested"],
+                "variant": {
+                    "$type": "Status",
+                    "$case": "Ready",
+                    "$fields": [null],
+                },
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn git_core_status_preserves_typed_rename_options_across_host_boundaries() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "typed-git-status",
+                r##"
+                    struct GitEntry {
+                        path: String,
+                        original_path: Option<String>,
+                        x: String,
+                        y: String,
+                        kind: String,
+                    }
+
+                    struct GitState {
+                        head: String,
+                        oid: String,
+                        upstream: String,
+                        ahead: i32,
+                        behind: i32,
+                        stash_count: i32,
+                        staged: [GitEntry],
+                        unstaged: [GitEntry],
+                        untracked: [GitEntry],
+                        conflicted: [GitEntry],
+                        truncated: bool,
+                    }
+
+                    #[red::command(name = "ReadTypedGitStatus")]
+                    fn read() {
+                        let output = "# branch.head typed\02 R. N... 100644 100644 100644 abc def R100 src/new.rs\0src/old.rs\0? notes.txt\0";
+                        let status: GitState = red::git_core("parse_status", output);
+                        let rename = status.staged[0];
+                        if let Some(original_path) = rename.original_path {
+                            red::execute("Print", rename.path + "←" + original_path);
+                        }
+                        let untracked = status.untracked[0];
+                        if let None = untracked.original_path {
+                            red::execute("Print", "untracked:none");
+                        }
+                        red::execute("SetStorage", "status", status);
+                    }
+                "##,
+            )
+            .await
+            .unwrap();
+
+        runtime.execute_command("ReadTypedGitStatus").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message))
+                if message == "src/new.rs←src/old.rs"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "untracked:none"
+        ));
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::SetPluginStorage { plugin, key, value } => {
+                assert_eq!(plugin, "typed-git-status");
+                assert_eq!(key, "status");
+                assert_eq!(value["staged"][0]["original_path"], "src/old.rs");
+                assert!(value["untracked"][0]["original_path"].is_null());
+            }
+            _ => panic!("expected typed Git status snapshot"),
+        }
+    }
+
+    #[tokio::test]
     async fn annotated_lifecycle_state_migration_preserves_reload_order() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -4654,10 +5467,15 @@ mod tests {
             .load_plugin(
                 "annotated-reload",
                 r#"
+                    struct StableEvent { label: Option<String> }
                     #[red::command(name = "Stable")]
                     fn stable() { red::execute("Print", "stable"); }
                     #[red::on("editor:changed")]
-                    fn changed(event: Json) { red::execute("Print", "original event"); }
+                    fn changed(event: StableEvent) {
+                        if let Some(label) = event.label {
+                            red::execute("Print", label);
+                        }
+                    }
                 "#,
             )
             .await
@@ -4667,10 +5485,13 @@ mod tests {
             .load_plugin(
                 "annotated-reload",
                 r#"
+                    struct ReplacementEvent { count: Option<i32> }
                     #[red::command(name = "Leaked")]
                     fn leaked() { red::execute("Print", "replacement"); }
                     #[red::on("editor:changed")]
-                    fn changed(event: Json) { red::execute("Print", "replacement event"); }
+                    fn changed(event: ReplacementEvent) {
+                        red::execute("Print", "replacement event");
+                    }
                     pub fn activate() { red::execute("Print", 1 / 0); }
                 "#,
             )
@@ -4686,7 +5507,10 @@ mod tests {
             PluginRequest::Action(Action::Print(message)) if message == "stable"
         ));
         runtime
-            .notify("editor:changed", serde_json::json!({}))
+            .notify(
+                "editor:changed",
+                serde_json::json!({ "label": "original event" }),
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -4739,6 +5563,7 @@ mod tests {
             source_directory.join("commands.hk"),
             r#"
                 struct ModuleState { opened: i32 }
+                struct ModuleEvent { label: Option<String> }
 
                 #[red::state]
                 pub fn initial_state() -> ModuleState {
@@ -4750,6 +5575,13 @@ mod tests {
                     let state: ModuleState = red::state();
                     red::state_patch(ModuleState { opened: state.opened + 1 });
                     red::execute("Print", "package module: " + red::state().opened);
+                }
+
+                #[red::on("package:typed")]
+                pub fn received(event: ModuleEvent) {
+                    if let Some(label) = event.label {
+                        red::execute("Print", "package event: " + label);
+                    }
                 }
             "#,
         )
@@ -4764,6 +5596,15 @@ mod tests {
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::Action(Action::Print(message)) if message == "package module: 1"
+        ));
+
+        runtime
+            .notify("package:typed", serde_json::json!({ "label": "decoded" }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "package event: decoded"
         ));
     }
 
@@ -4955,6 +5796,127 @@ mod tests {
             PluginRequest::AgentPrompt { session_id, text }
                 if session_id == "session-lazy" && text == "explain the workspace"
         ));
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_activity_decodes_typed_updates_and_ignores_future_variants() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-typed" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        let state = |runtime: &Runtime| {
+            let inner = runtime.inner.lock().unwrap();
+            value_to_json(inner.host.policy().typed_states.get("agent").unwrap())
+        };
+
+        runtime
+            .notify(
+                "agent:activity",
+                serde_json::json!({
+                    "session_id": "session-typed",
+                    "update": {
+                        "session_update": "agent_thought_chunk",
+                        "content": { "text": "inspect imports" },
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state(&runtime)["thought"], "inspect imports");
+        assert_eq!(state(&runtime)["ui_phase"], "thinking");
+        drain_requests();
+
+        runtime
+            .notify(
+                "agent:activity",
+                serde_json::json!({
+                    "session_id": "session-typed",
+                    "update": { "session_update": "agent_thought_chunk" },
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state(&runtime)["thought"], "inspect imports");
+        drain_requests();
+
+        runtime
+            .notify(
+                "agent:activity",
+                serde_json::json!({
+                    "session_id": "session-typed",
+                    "update": {
+                        "session_update": "tool_call",
+                        "tool_call_id": "tool-1",
+                        "kind": "Read file",
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+        let current = state(&runtime);
+        assert_eq!(current["activity_rows"][0]["title"], "Read file");
+        assert_eq!(current["activity_rows"][0]["status"], "in_progress");
+        assert_eq!(current["ui_phase"], "tool");
+        drain_requests();
+
+        runtime
+            .notify(
+                "agent:activity",
+                serde_json::json!({
+                    "session_id": "session-typed",
+                    "update": {
+                        "session_update": "tool_call_update",
+                        "tool_call_id": "tool-1",
+                        "status": "completed",
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+        let current = state(&runtime);
+        assert_eq!(current["activity_rows"][0]["title"], "Read file");
+        assert_eq!(current["activity_rows"][0]["status"], "completed");
+        assert_eq!(current["ui_phase"], "working");
+        drain_requests();
+
+        let previous = state(&runtime);
+        runtime
+            .notify(
+                "agent:activity",
+                serde_json::json!({
+                    "session_id": "session-typed",
+                    "update": { "session_update": "future_host_event", "new_field": 7 },
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state(&runtime), previous);
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime
+            .notify(
+                "agent:activity",
+                serde_json::json!({
+                    "session_id": "different-session",
+                    "update": { "session_update": "plan" },
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state(&runtime), previous);
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
     #[tokio::test]

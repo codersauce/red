@@ -271,11 +271,37 @@ reported without letting an untrusted process grow editor memory indefinitely.
 
 ## Dynamic JSON boundary
 
-`Json` remains intentional for persisted plugin state, arbitrary user configuration,
-external process data, and plugin-defined payloads such as `PickerItem.data`. Values with
-a host-defined shape should use nominal records instead. Picker callbacks are the first
-migrated slice; request results, editor events, styles, panel values, and the remaining
-bundled-plugin helpers will move incrementally as their host schemas become canonical.
+Event listeners and request callbacks decode host payloads according to their declared
+parameter types. Named records, arrays, tuples, and nested `Option<T>` values are
+decoded recursively. Both JSON `null` and omitted optional fields become `None`; a
+present value becomes `Some(value)`. Existing callbacks declared as `Json` retain their
+dynamic behavior, and additional object fields are preserved for compatibility.
+
+Tagged JSON objects also decode into nominal Husk enum variants. The host recognizes
+`type`, `session_update`, and `$case` discriminators and maps snake-case wire tags to
+PascalCase variants. Declare an `Unknown(Json)` case to preserve forward-compatible
+payloads when the host adds a new variant. Plugin process events share this host enum:
+
+```husk
+fn process_finished(event: ProcessEvent) {
+    match event {
+        ProcessEvent::Exit { process_id, code, plugin_name } => {
+            if let Some(exit_code) = code {
+                red::execute("Print", process_id + " exited with " + exit_code);
+            }
+        }
+        ProcessEvent::Stdout { line, process_id, plugin_name } => {}
+        ProcessEvent::Stderr { line, process_id, plugin_name } => {}
+        ProcessEvent::Error { message, process_id, plugin_name } => {}
+    }
+}
+```
+
+When typed records cross back into host actions or plugin storage, `None` serializes to
+JSON `null` and `Some(value)` serializes to the value itself, including inside arrays and
+nested records. `Json` remains intentional for persisted user-defined state, arbitrary
+configuration, genuinely open-ended process output, and plugin-defined payloads such as
+`PickerItem.data`. Prefer nominal records and enums whenever the host owns the shape.
 
 ## Transactional reload and state
 
