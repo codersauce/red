@@ -184,6 +184,9 @@ pub struct Config {
     pub scrolloff: Option<usize>,
     /// Whether long lines wrap to continuation rows.
     pub wrap: Option<bool>,
+    /// Show the cursor line's absolute number and distances on other lines.
+    /// Defaults to off.
+    pub relative_line_numbers: Option<bool>,
     /// Indent wrapped continuation rows to the line's leading whitespace,
     /// like vim's 'breakindent'. Defaults to on.
     pub breakindent: Option<bool>,
@@ -1213,6 +1216,7 @@ fn known_top_level_field(field: &str) -> bool {
             | "mouse_scroll_lines"
             | "scrolloff"
             | "wrap"
+            | "relative_line_numbers"
             | "breakindent"
             | "sidescroll"
             | "sidescrolloff"
@@ -2055,6 +2059,37 @@ wrap = "yes"
             loaded.config.keys.normal.get("x"),
             Some(&KeyAction::Single(Action::MoveScreenLineDown))
         );
+    }
+
+    #[test]
+    fn relative_line_numbers_are_an_optional_opt_in_setting() {
+        let defaults = Config::load_user_toml("", Path::new("/tmp/config.toml"), &[]).unwrap();
+        assert_eq!(defaults.config.relative_line_numbers, Some(false));
+
+        let enabled = Config::load_user_toml(
+            "relative_line_numbers = true",
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+        assert!(enabled.is_clean());
+        assert_eq!(enabled.config.relative_line_numbers, Some(true));
+    }
+
+    #[test]
+    fn invalid_relative_line_numbers_falls_back_independently() {
+        let loaded = Config::load_user_toml(
+            r#"relative_line_numbers = "yes""#,
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(loaded.config.relative_line_numbers, Some(false));
+        assert!(loaded.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == "relative_line_numbers"
+                && diagnostic.fallback == "kept the previous valid value"
+        }));
     }
 
     #[test]
