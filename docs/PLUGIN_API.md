@@ -278,7 +278,7 @@ present value becomes `Some(value)`. Existing callbacks declared as `Json` retai
 dynamic behavior, and additional object fields are preserved for compatibility.
 
 Tagged JSON objects also decode into nominal Husk enum variants. The host recognizes
-`type`, `session_update`, and `$case` discriminators and maps snake-case wire tags to
+`type`, `session_update`, `kind`, and `$case` discriminators and maps snake-case wire tags to
 PascalCase variants. Declare an `Unknown(Json)` case to preserve forward-compatible
 payloads when the host adds a new variant. Plugin process events share this host enum:
 

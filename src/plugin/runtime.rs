@@ -557,7 +557,7 @@ impl PluginPayloadSchema {
     ) -> anyhow::Result<Value> {
         let tag = payload.as_str().or_else(|| {
             payload.as_object().and_then(|object| {
-                ["$case", "type", "session_update"]
+                ["$case", "type", "session_update", "kind"]
                     .iter()
                     .find_map(|name| object.get(*name).and_then(serde_json::Value::as_str))
             })
@@ -2495,10 +2495,15 @@ impl RedHost {
             "red::git_core" => {
                 let operation = red_required_string(args, 0, path)?;
                 let value = self.call_git_core(operation, &args[1..])?;
-                if operation == "parse_status" {
-                    if let Some(schema) = self.policy().payload_schemas.get(plugin) {
-                        return schema.named_record("GitState", &value_to_json(&value));
-                    }
+                let record = match operation {
+                    "parse_status" => Some("GitState"),
+                    "detail_document" => Some("GitWorkspaceDocument"),
+                    _ => None,
+                };
+                if let Some((schema, record)) =
+                    self.policy().payload_schemas.get(plugin).zip(record)
+                {
+                    return schema.named_record(record, &value_to_json(&value));
                 }
                 Ok(value)
             }
@@ -5373,6 +5378,95 @@ mod tests {
                 assert!(value["untracked"][0]["original_path"].is_null());
             }
             _ => panic!("expected typed Git status snapshot"),
+        }
+    }
+
+    #[tokio::test]
+    async fn git_core_diff_preserves_typed_optional_line_and_hunk_metadata() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "typed-git-diff",
+                r##"
+                    struct GitWorkspaceLineData {
+                        path: String,
+                        section: String,
+                        patch_index: i32,
+                        hunk_id: Option<String>,
+                    }
+
+                    struct GitWorkspaceDocumentLine {
+                        id: String,
+                        text: String,
+                        kind: String,
+                        old_line: Option<i32>,
+                        new_line: Option<i32>,
+                        hunk_id: Option<String>,
+                        data: GitWorkspaceLineData,
+                    }
+
+                    struct GitWorkspaceDocument {
+                        path: String,
+                        lines: [GitWorkspaceDocumentLine],
+                    }
+
+                    #[red::command(name = "ReadTypedGitDiff")]
+                    fn read() {
+                        let patch = "diff --git a/file.rs b/file.rs\n--- a/file.rs\n+++ b/file.rs\n@@ -1 +1 @@\n-old\n+new";
+                        let document: GitWorkspaceDocument = red::git_core(
+                            "detail_document",
+                            patch,
+                            "file.rs",
+                            "unstaged"
+                        );
+                        let removed = document.lines[4];
+                        if let Some(line) = removed.old_line {
+                            red::execute("Print", "old:" + line);
+                        }
+                        if let None = removed.new_line {
+                            red::execute("Print", "old:new-none");
+                        }
+                        let added = document.lines[5];
+                        if let None = added.old_line {
+                            red::execute("Print", "new:old-none");
+                        }
+                        if let Some(line) = added.new_line {
+                            red::execute("Print", "new:" + line);
+                        }
+                        if let Some(hunk) = added.hunk_id {
+                            red::execute("Print", "hunk:" + hunk);
+                        }
+                        red::execute("SetStorage", "document", document);
+                    }
+                "##,
+            )
+            .await
+            .unwrap();
+
+        runtime.execute_command("ReadTypedGitDiff").await.unwrap();
+        for expected in ["old:1", "old:new-none", "new:old-none", "new:1"] {
+            assert!(matches!(
+                ACTION_DISPATCHER.recv_request(),
+                PluginRequest::Action(Action::Print(message)) if message == expected
+            ));
+        }
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message.starts_with("hunk:")
+        ));
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::SetPluginStorage { plugin, key, value } => {
+                assert_eq!(plugin, "typed-git-diff");
+                assert_eq!(key, "document");
+                assert_eq!(value["lines"][4]["old_line"], 1);
+                assert!(value["lines"][4]["new_line"].is_null());
+                assert!(value["lines"][5]["old_line"].is_null());
+                assert_eq!(value["lines"][5]["new_line"], 1);
+                assert!(value["lines"][5]["hunk_id"].is_string());
+            }
+            _ => panic!("expected typed Git diff snapshot"),
         }
     }
 
@@ -9636,6 +9730,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fidget_handles_numeric_tokens_typed_overrides_and_future_progress_variants() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("fidget", include_str!("../../plugins/fidget.hk"))
+            .await
+            .unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::EditorInfo(request_id) => request_id,
+            _ => panic!("expected Fidget editor information request"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({ "size": [80, 24], "theme": { "ui_style": {} } }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime
+            .notify(
+                "lsp:progress",
+                serde_json::json!({
+                    "token": 42,
+                    "kind": "begin",
+                    "message": "Override",
+                    "percentage": 65,
+                    "title": "Explicit title",
+                    "value": {
+                        "kind": "begin",
+                        "title": "Nested title",
+                        "message": "Nested message",
+                        "percentage": 25,
+                    },
+                    "lsp_client": { "name": "rust_analyzer" },
+                }),
+            )
+            .await
+            .unwrap();
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdateOverlay { id, lines } => {
+                assert_eq!(id, "fidget-progress");
+                assert_eq!(lines.len(), 2);
+                assert_eq!(lines[0].0, "Override (65%) Explicit title");
+                assert_eq!(lines[1].0, "rust-analyzer ⠋");
+            }
+            _ => panic!("expected typed Fidget overlay update"),
+        }
+
+        runtime
+            .notify(
+                "lsp:progress",
+                serde_json::json!({
+                    "token": 42,
+                    "value": { "kind": "future_progress", "message": "Ignore me" },
+                    "lsp_client": { "name": "rust_analyzer" },
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
     async fn fidget_cancels_animation_and_completion_timers() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -11795,6 +11956,77 @@ mod tests {
                 );
             }
             _ => panic!("expected Neo-tree delete file operation"),
+        }
+    }
+
+    #[tokio::test]
+    async fn neotree_handles_optional_selection_and_nullable_file_operation_errors() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("neotree", include_str!("../../plugins/neotree.hk"))
+            .await
+            .unwrap();
+
+        runtime
+            .notify(
+                "panel:event:neotree",
+                serde_json::json!({ "action": "a", "row": null }),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        for (error, expected) in [
+            (
+                serde_json::Value::Null,
+                "Neo-tree create failed: unknown error",
+            ),
+            (
+                serde_json::json!("permission denied"),
+                "Neo-tree create failed: permission denied",
+            ),
+        ] {
+            runtime
+                .notify(
+                    "panel:event:neotree",
+                    serde_json::json!({
+                        "action": "a",
+                        "row": { "path": ".", "kind": "directory" },
+                    }),
+                )
+                .await
+                .unwrap();
+            let handle = match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::OpenCallbackInput { handle, .. } => handle,
+                _ => panic!("expected Neo-tree create input"),
+            };
+            runtime
+                .notify_composer(handle, ComposerCallback::Submitted("new.rs".to_string()))
+                .unwrap();
+            let request_id = match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::FileOperation {
+                    operation,
+                    request_id,
+                } => {
+                    assert_eq!(operation["kind"], "create");
+                    request_id
+                }
+                _ => panic!("expected typed Neo-tree create operation"),
+            };
+            runtime
+                .resolve_request(
+                    request_id,
+                    serde_json::json!({ "ok": false, "error": error }),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                ACTION_DISPATCHER.recv_request(),
+                PluginRequest::Action(Action::Print(message)) if message == expected
+            ));
         }
     }
 

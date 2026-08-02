@@ -18,14 +18,34 @@ struct FidgetEditorInfo {
     theme: FidgetTheme,
 }
 
+struct FidgetProgressClient {
+    name: String,
+    workspace_root: Option<String>,
+}
+
+struct FidgetProgressDetails {
+    title: Option<String>,
+    message: Option<String>,
+    percentage: Option<f64>,
+}
+
+enum FidgetProgressValue {
+    Begin(FidgetProgressDetails),
+    Report(FidgetProgressDetails),
+    End(FidgetProgressDetails),
+    // The LSP progress protocol may gain additional work-done variants.
+    Unknown(Json),
+}
+
 struct LspProgressEvent {
-    value: Json,
-    kind: String,
+    value: FidgetProgressValue,
+    kind: Option<String>,
+    // LSP progress tokens are an intentionally untagged string-or-number union.
     token: Json,
-    lsp_client: Json,
-    message: String,
-    percentage: Json,
-    title: String,
+    lsp_client: Option<FidgetProgressClient>,
+    message: Option<String>,
+    percentage: Option<f64>,
+    title: Option<String>,
 }
 
 struct FidgetItem {
@@ -93,24 +113,49 @@ fn resized(size: [i32]) {
 
 #[red::on("lsp:progress")]
 fn progress(event: LspProgressEvent) {
-    let value = event.value;
-    if value == red::null() {
-        value = event;
+    let kind = "";
+    let details = FidgetProgressDetails {
+        title: None,
+        message: None,
+        percentage: None,
+    };
+    match event.value {
+        FidgetProgressValue::Begin(value) => {
+            kind = "begin";
+            details = value;
+        }
+        FidgetProgressValue::Report(value) => {
+            kind = "report";
+            details = value;
+        }
+        FidgetProgressValue::End(value) => {
+            kind = "end";
+            details = value;
+        }
+        FidgetProgressValue::Unknown(value) => {
+            return;
+        }
     }
-    let kind = red::string(event.kind, red::string(value.kind, ""));
+    if let Some(override_kind) = event.kind {
+        kind = override_kind;
+    }
     if event.token == red::null() || (kind != "begin" && kind != "report" && kind != "end") {
         return;
     }
     let token = red::string(event.token, "");
+    if token == "" {
+        token = "" + red::int(event.token, -1);
+    }
     let group = "LSP";
-    let client = event.lsp_client;
-    if client != red::null() && red::string(client.name, "") != "" {
-        group = red::string(client.name, "");
+    if let Some(client) = event.lsp_client {
+        if client.name != "" {
+            group = client.name;
+        }
     }
     if group == "rust_analyzer" {
         group = "rust-analyzer";
     }
-    let message = red::string(event.message, red::string(value.message, ""));
+    let message = optional_text(event.message, optional_text(details.message, ""));
     if message == "" {
         if kind == "end" {
             message = "Completed";
@@ -118,14 +163,16 @@ fn progress(event: LspProgressEvent) {
             message = "In progress...";
         }
     }
-    let percentage = event.percentage;
-    if percentage == red::null() {
-        percentage = value.percentage;
+    let percentage = details.percentage;
+    if let Some(override_percentage) = event.percentage {
+        percentage = Some(override_percentage);
     }
-    if kind != "end" && percentage != red::null() {
-        message = message + " (" + red::int(percentage, 0) + "%)";
+    if kind != "end" {
+        if let Some(value) = percentage {
+            message = message + " (" + red::int(value, 0) + "%)";
+        }
     }
-    let title = red::string(event.title, red::string(value.title, ""));
+    let title = optional_text(event.title, optional_text(details.title, ""));
     let items: [FidgetItem] = [];
     let found = false;
     for item in state().items {
@@ -261,16 +308,16 @@ fn refresh() {
             groups = red::push(groups, item.group);
         }
     }
-    let lines = [];
+    let lines: [(String, Style)] = [];
     for group in groups {
         if red::len(lines) > 0 {
-            lines = red::push(lines, ["--", message_style()]);
+            lines = red::push(lines, ("--", message_style()));
         }
         let icon = "✔";
         if group_active(group) {
             icon = spinner();
         }
-        lines = red::push(lines, [group + " " + icon, header_style()]);
+        lines = red::push(lines, (group + " " + icon, header_style()));
         let count = 0;
         for item in state().items {
             if item.group == group && count < 16 {
@@ -278,14 +325,14 @@ fn refresh() {
                 if red::string(item.title, "") != "" {
                     text = text + " " + item.title;
                 }
-                lines = red::push(lines, [truncate_line(text), message_style()]);
+                lines = red::push(lines, (truncate_line(text), message_style()));
                 count = count + 1;
             }
         }
     }
-    let rendered = [];
+    let rendered: [(String, Style)] = [];
     for line in red::reverse(lines) {
-        rendered = red::push(rendered, [truncate_line(red::string(line[0], "")), line[1]]);
+        rendered = red::push(rendered, (truncate_line(red::string(line[0], "")), line[1]));
     }
     red::execute("UpdateOverlay", "fidget-progress", rendered);
 }
@@ -313,9 +360,14 @@ fn group_active(group: String) -> bool {
     return false;
 }
 
-// Overlay lines are heterogeneous `[text, style]` host tuples, so their style slot
-// remains dynamic until the overlay protocol has a concrete line type.
-fn header_style() -> Json {
+fn optional_text(value: Option<String>, fallback: String) -> String {
+    if let Some(text) = value {
+        return text;
+    }
+    return fallback;
+}
+
+fn header_style() -> Style {
     let Some(info) = state().info else {
         return Style { fg: red::null(), bg: red::null(), bold: false, italic: false };
     };
@@ -326,7 +378,7 @@ fn header_style() -> Json {
     return style;
 }
 
-fn message_style() -> Json {
+fn message_style() -> Style {
     let Some(info) = state().info else {
         return Style { fg: red::null(), bg: red::null(), bold: false, italic: false };
     };

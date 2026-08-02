@@ -27,7 +27,7 @@ struct TreePanelRow {
 
 struct NeoTreePanelEvent {
     action: String,
-    row: TreePanelRow,
+    row: Option<TreePanelRow>,
 }
 
 struct DirectoryEntry {
@@ -40,8 +40,7 @@ struct DirectoryListing {
     path: String,
     entries: [DirectoryEntry],
     truncated: bool,
-    // Listing failures are nullable structured host errors.
-    error: Json,
+    error: Option<String>,
 }
 
 struct Children {
@@ -72,7 +71,7 @@ struct TrashBatch {
 
 struct FileOperationResult {
     ok: bool,
-    error: String,
+    error: Option<String>,
     undo_supported: bool,
 }
 
@@ -94,17 +93,23 @@ struct PathsOperation {
 
 struct FileStatResult {
     ok: bool,
-    error: String,
+    error: Option<String>,
     path: String,
     kind: String,
     size: i64,
     readonly: bool,
 }
 
+struct NeoTreeGitStatus {
+    path: String,
+    absolute_path: Option<String>,
+    status: String,
+}
+
 struct GitStatusResult {
-    root: String,
-    statuses: Json,
-    error: Json,
+    root: Option<String>,
+    statuses: [NeoTreeGitStatus],
+    error: Option<String>,
     // The status index is an open path-keyed map consumed by the typed core adapter.
     status_index: Json,
 }
@@ -164,9 +169,9 @@ fn initial_state() -> NeoTreeState {
         children: [],
         watches: [],
         status: GitStatusResult {
-            root: "",
+            root: None,
             statuses: [],
-            error: red::null(),
+            error: None,
             status_index: Json {},
         },
         status_entries: [],
@@ -280,13 +285,9 @@ fn panel_event(event: NeoTreePanelEvent) {
         return;
     }
 
-    let row = event.row;
-    if row == red::null() {
+    let Some(row) = event.row else {
         return;
-    }
-    if row.path == red::null() {
-        return;
-    }
+    };
 
     if event.action == "activate" || event.action == "toggle" {
         if row.kind == "directory" {
@@ -425,7 +426,7 @@ fn path_prompt_submitted(value: String) {
         if kind == "create" && red::ends_with(query, "/") {
             create_kind = "create_directory";
         }
-        request_operation(PathOperation {
+        request_path_operation(PathOperation {
             kind: create_kind,
             path: path_join(parent, query),
         });
@@ -440,23 +441,29 @@ fn path_prompt_submitted(value: String) {
     } else {
         destination = workspace_path(query);
     }
-    request_operation(MoveOperation {
+    request_move_operation(MoveOperation {
         kind: kind,
         source: source,
         destination: destination,
     });
 }
 
-// File operations are a tagged host union (`path`, `paths`, or source/destination),
-// so the shared request envelope remains dynamic while each response is concrete.
-fn request_operation(operation: Json) {
+fn request_path_operation(operation: PathOperation) {
+    red::request("FileOperation", operation_loaded, operation);
+}
+
+fn request_move_operation(operation: MoveOperation) {
+    red::request("FileOperation", operation_loaded, operation);
+}
+
+fn request_paths_operation(operation: PathsOperation) {
     red::request("FileOperation", operation_loaded, operation);
 }
 
 fn operation_loaded(result: FileOperationResult) {
     let kind = red::string(state().pending_kind, "operation");
     if !red::bool(result.ok, false) {
-        red::execute("Print", "Neo-tree " + kind + " failed: " + red::string(result.error, "unknown error"));
+        red::execute("Print", "Neo-tree " + kind + " failed: " + optional_text(result.error, "unknown error"));
         return;
     }
 
@@ -523,7 +530,7 @@ fn removal_confirmed(item: PickerItem) {
         red::state_patch(NeoTreeState { pending_kind: "" });
         return;
     }
-    request_operation(PathsOperation {
+    request_paths_operation(PathsOperation {
         kind: red::string(state().pending_kind, ""),
         paths: state().pending_paths,
     });
@@ -546,7 +553,7 @@ fn restore_last_trash() {
 
 fn restore_loaded(result: FileOperationResult) {
     if !red::bool(result.ok, false) {
-        red::execute("Print", "Neo-tree restore failed: " + red::string(result.error, "unknown error"));
+        red::execute("Print", "Neo-tree restore failed: " + optional_text(result.error, "unknown error"));
         return;
     }
     let history = state().trash_history;
@@ -626,7 +633,7 @@ fn run_next_paste() {
 
 fn paste_loaded(result: FileOperationResult) {
     if !red::bool(result.ok, false) {
-        red::execute("Print", "Neo-tree paste stopped: " + red::string(result.error, "unknown error"));
+        red::execute("Print", "Neo-tree paste stopped: " + optional_text(result.error, "unknown error"));
         reset_tree();
         return;
     }
@@ -645,7 +652,7 @@ fn paste_loaded(result: FileOperationResult) {
 
 fn stat_loaded(result: FileStatResult) {
     if !red::bool(result.ok, false) {
-        red::execute("Print", "Neo-tree details failed: " + red::string(result.error, "unknown error"));
+        red::execute("Print", "Neo-tree details failed: " + optional_text(result.error, "unknown error"));
         return;
     }
     red::execute("Print",
@@ -719,7 +726,7 @@ fn request_git_status() {
 }
 
 fn directory_loaded(listing: DirectoryListing) {
-    if listing.error != red::null() {
+    if let Some(error) = listing.error {
         set_children(listing.path, [], false);
     } else {
         set_children(listing.path, listing.entries, red::bool(listing.truncated, false));
@@ -834,12 +841,11 @@ fn continue_reveal() {
         kind = "file";
     }
 
-    let child = find_child(children_for(parent), parts[index], kind);
-    if child == red::null() {
+    let Some(child) = find_child(children_for(parent), parts[index], kind) else {
         clear_reveal();
         render();
         return;
-    }
+    };
 
     if kind == "file" {
         let row_id = child.path;
@@ -867,13 +873,13 @@ fn clear_reveal() {
     red::state_patch(NeoTreeState { reveal_parent: "." });
 }
 
-fn find_child(entries: [DirectoryEntry], name: String, kind: String) -> DirectoryEntry {
+fn find_child(entries: [DirectoryEntry], name: String, kind: String) -> Option<DirectoryEntry> {
     for entry in entries {
         if entry.kind == kind && entry.name == name {
-            return entry;
+            return Some(entry);
         }
     }
-    return red::null();
+    return None;
 }
 
 fn set_children(path: String, entries: [DirectoryEntry], truncated: bool) {
@@ -973,7 +979,7 @@ fn build_rows() -> [TreePanelRow] {
         state().expanded,
         state().selected,
         state().clipboard,
-        red::string(state().status.root, ""),
+        optional_text(state().status.root, ""),
         state().status_entries
     );
 }
@@ -986,6 +992,13 @@ fn segment(text: String, foreground: [String], bold: bool) -> TreePanelSegment {
             bold: bold,
         },
     };
+}
+
+fn optional_text(value: Option<String>, fallback: String) -> String {
+    if let Some(text) = value {
+        return text;
+    }
+    return fallback;
 }
 
 fn normalize_path(path: String) -> String {

@@ -162,7 +162,7 @@ struct GitWorkspaceLineData {
     section: String,
     patch_index: i32,
     // Metadata lines do not belong to a hunk.
-    hunk_id: Json,
+    hunk_id: Option<String>,
 }
 
 struct GitWorkspaceDocumentLine {
@@ -170,15 +170,48 @@ struct GitWorkspaceDocumentLine {
     text: String,
     kind: String,
     // Diff metadata lines have no old or new source line.
-    old_line: Json,
-    new_line: Json,
-    hunk_id: Json,
+    old_line: Option<i32>,
+    new_line: Option<i32>,
+    hunk_id: Option<String>,
     data: GitWorkspaceLineData,
 }
 
 struct GitWorkspaceDocument {
     path: String,
     lines: [GitWorkspaceDocumentLine],
+}
+
+struct GitWorkspaceRowData {
+    section: String,
+    path: String,
+    entry: Option<GitEntry>,
+}
+
+struct GitWorkspaceRow {
+    id: String,
+    selectable: bool,
+    depth: i32,
+    path: Option<String>,
+    segments: [PanelSegment],
+    right_segments: [PanelSegment],
+    data: Option<GitWorkspaceRowData>,
+}
+
+struct GitWorkspaceEvent {
+    action: String,
+    focus: String,
+    row: Option<GitWorkspaceRow>,
+    detail_index: i32,
+    detail_line: Option<GitWorkspaceDocumentLine>,
+    detail_selection: Option<[i32]>,
+}
+
+struct GitWorkspaceModel {
+    header: [PanelSegment],
+    rows: [GitWorkspaceRow],
+    detail: [[PanelSegment]],
+    detail_document: Option<GitWorkspaceDocument>,
+    footer: [PanelSegment],
 }
 
 struct GitRebaseCommit {
@@ -234,8 +267,7 @@ struct GitPluginState {
     detail_rendered_path: String,
     detail_rendered_section: String,
     detail_timer: String,
-    // Workspace rows are extensible host-defined UI records.
-    pending_detail_row: Json,
+    pending_detail_row: Option<GitWorkspaceRow>,
     safe_sync_pending: bool,
     confirm_mode: String,
     confirm_args: [String],
@@ -325,7 +357,7 @@ fn initial_state() -> GitPluginState {
         detail_rendered_path: "",
         detail_rendered_section: "",
         detail_timer: "",
-        pending_detail_row: red::null(),
+        pending_detail_row: None,
         safe_sync_pending: false,
         confirm_mode: "",
         confirm_args: [],
@@ -440,7 +472,7 @@ fn timeout_callback(event: TimerEvent) {
     if event.timer_id == plugin_state().detail_timer {
         red::state_patch(GitPluginState { detail_timer: "" });
         let row = plugin_state().pending_detail_row;
-        red::state_patch(GitPluginState { pending_detail_row: red::null() });
+        red::state_patch(GitPluginState { pending_detail_row: None });
         show_detail(row, true);
         return;
     }
@@ -652,9 +684,13 @@ fn refresh_selected_detail(render_loading: bool) {
             let entries = section_entries(state, section);
             if red::len(entries) > 0 {
                 let entry = entries[0];
-                show_detail(WorkspaceRow {
-                    data: Json { section: section, path: entry.path, entry: entry },
-                }, render_loading);
+                show_detail(Some(GitWorkspaceRow {
+                    data: Some(GitWorkspaceRowData {
+                        section: section,
+                        path: entry.path,
+                        entry: Some(entry),
+                    }),
+                }), render_loading);
                 return;
             }
         }
@@ -664,9 +700,13 @@ fn refresh_selected_detail(render_loading: bool) {
     if preferred_section != "" {
         for entry in section_entries(state, preferred_section) {
             if entry.path == path {
-                show_detail(WorkspaceRow {
-                    data: Json { section: preferred_section, path: path, entry: entry },
-                }, render_loading);
+                show_detail(Some(GitWorkspaceRow {
+                    data: Some(GitWorkspaceRowData {
+                        section: preferred_section,
+                        path: path,
+                        entry: Some(entry),
+                    }),
+                }), render_loading);
                 return;
             }
         }
@@ -677,9 +717,13 @@ fn refresh_selected_detail(render_loading: bool) {
         }
         for entry in section_entries(state, section) {
             if entry.path == path {
-                show_detail(WorkspaceRow {
-                    data: Json { section: section, path: path, entry: entry },
-                }, render_loading);
+                show_detail(Some(GitWorkspaceRow {
+                    data: Some(GitWorkspaceRowData {
+                        section: section,
+                        path: path,
+                        entry: Some(entry),
+                    }),
+                }), render_loading);
                 return;
             }
         }
@@ -874,25 +918,35 @@ fn signs_from_hunks(hunks: [SignHunk], staged: bool) -> [GitGutterSign] {
             index = index + 1;
             continue;
         }
-        let previous = red::null();
-        let next = red::null();
+        let previous: Option<SignHunk> = None;
+        let next: Option<SignHunk> = None;
         if index > 0 && hunks[index - 1].buffer_index == current_buffer {
-            previous = hunks[index - 1];
+            previous = Some(hunks[index - 1]);
         }
         if index + 1 < red::len(hunks) && hunks[index + 1].buffer_index == current_buffer {
-            next = hunks[index + 1];
+            next = Some(hunks[index + 1]);
+        }
+        let previous_touches_hunk = false;
+        let previous_starts_at_zero = false;
+        if let Some(previous_hunk) = previous {
+            previous_touches_hunk = hunk_change_end(previous_hunk) == hunk.new_start;
+            previous_starts_at_zero = previous_hunk.new_start == 0;
+        }
+        let next_follows_hunk = false;
+        if let Some(next_hunk) = next {
+            next_follows_hunk = next_hunk.new_start == hunk.new_start + 1;
         }
         let kind = hunk_kind(hunk);
         let change_end = hunk_change_end(hunk);
         let topdelete = kind == "delete"
-            && (hunk.new_start == 0 || (previous != red::null() && hunk_change_end(previous) == hunk.new_start))
-            && (next == red::null() || next.new_start != hunk.new_start + 1);
+            && (hunk.new_start == 0 || previous_touches_hunk)
+            && !next_follows_hunk;
         let line = hunk.new_start;
         while line <= change_end && buffer_signs < 200 && red::len(signs) < 400 {
             let sign_kind = kind;
             let changedelete = kind == "change"
                 && ((hunk.old_count > hunk.new_count && line == change_end)
-                    || (previous != red::null() && previous.new_start == 0));
+                    || previous_starts_at_zero);
             if topdelete {
                 sign_kind = "topdelete";
             } else if changedelete {
@@ -1039,9 +1093,9 @@ fn render_dashboard() {
         return;
     }
     let state = plugin_state().state;
-    let rows = [];
+    let rows: [GitWorkspaceRow] = [];
     if red::string(plugin_state().operation, "") != "" {
-        rows = red::push(rows, WorkspaceRow {
+        rows = red::push(rows, GitWorkspaceRow {
             id: "section:operation",
             selectable: false,
             segments: [PanelSegment {
@@ -1055,7 +1109,7 @@ fn render_dashboard() {
     rows = append_section(rows, "Unstaged", "unstaged", state.unstaged);
     rows = append_section(rows, "Untracked", "untracked", state.untracked);
     if red::bool(state.truncated, false) {
-        rows = red::push(rows, WorkspaceRow {
+        rows = red::push(rows, GitWorkspaceRow {
             id: "status-truncated",
             selectable: false,
             segments: [PanelSegment {
@@ -1065,21 +1119,17 @@ fn render_dashboard() {
         });
     }
     if red::len(rows) == 0 {
-        rows = red::push(rows, WorkspaceRow {
+        rows = red::push(rows, GitWorkspaceRow {
             id: "clean",
             selectable: false,
             segments: [PanelSegment { text: "Working tree clean", style: success_style() }],
         });
     }
-    let detail_document: Json = red::null();
-    if let Some(document) = plugin_state().detail_document {
-        detail_document = document;
-    }
-    red::execute("UpdateWorkspace", "git-dashboard", WorkspaceModel {
+    red::execute("UpdateWorkspace", "git-dashboard", GitWorkspaceModel {
         header: header_segments(state),
         rows: rows,
         detail: plugin_state().detail,
-        detail_document: detail_document,
+        detail_document: plugin_state().detail_document,
         footer: [PanelSegment {
             text: "Tab/Ctrl-w w focus  j/k scroll  [h/]h hunks  W wrap  v select  s/u/x line  S/U/X hunk  Enter open  ? help  q close",
             style: muted_style(),
@@ -1087,11 +1137,11 @@ fn render_dashboard() {
     });
 }
 
-fn append_section(rows: Json, title: String, section: String, entries: [GitEntry]) -> Json {
+fn append_section(rows: [GitWorkspaceRow], title: String, section: String, entries: [GitEntry]) -> [GitWorkspaceRow] {
     if red::len(entries) == 0 {
         return rows;
     }
-    rows = red::push(rows, WorkspaceRow {
+    rows = red::push(rows, GitWorkspaceRow {
         id: "section:" + section,
         selectable: false,
         segments: [PanelSegment { text: title + "  " + red::len(entries), style: heading_style() }],
@@ -1099,23 +1149,27 @@ fn append_section(rows: Json, title: String, section: String, entries: [GitEntry
     let status_style = section_style(section);
     let secondary_style = muted_style();
     for entry in entries {
-        rows = red::push(rows, WorkspaceRow {
+        rows = red::push(rows, GitWorkspaceRow {
             id: section + ":" + entry.path,
             selectable: true,
             depth: 1,
-            path: entry.path,
+            path: Some(entry.path),
             segments: entry_path_segments(entry, secondary_style),
             right_segments: [PanelSegment {
                 text: status_label(entry),
                 style: status_style,
             }],
-            data: Json { section: section, path: entry.path, entry: entry },
+            data: Some(GitWorkspaceRowData {
+                section: section,
+                path: entry.path,
+                entry: Some(entry),
+            }),
         });
     }
     return rows;
 }
 
-fn entry_path_segments(entry: GitEntry, secondary_style: Style) -> Json {
+fn entry_path_segments(entry: GitEntry, secondary_style: Style) -> [PanelSegment] {
     let parts = red::split(entry.path, "/");
     let filename = entry.path;
     let parent = "";
@@ -1146,7 +1200,7 @@ fn entry_path_segments(entry: GitEntry, secondary_style: Style) -> Json {
     return segments;
 }
 
-fn header_segments(state: GitState) -> Json {
+fn header_segments(state: GitState) -> [PanelSegment] {
     let branch = red::string(state.head, "unborn");
     if branch == "(detached)" {
         branch = "detached " + red::slice(red::string(state.oid, ""), 0, 8);
@@ -1181,7 +1235,7 @@ fn status_label(entry: GitEntry) -> String {
 }
 
 #[red::on("workspace:event:git-dashboard")]
-fn workspace_event(event: Json) {
+fn workspace_event(event: GitWorkspaceEvent) {
     let row = event.row;
     if event.focus == "rows" && (
         event.action == "up" ||
@@ -1235,24 +1289,36 @@ fn workspace_event(event: Json) {
         command_log();
         return;
     }
-    if event.action == "activate" && event.focus == "detail" && event.detail_line != red::null() {
-        let target_line = red::int(event.detail_line.new_line, red::int(event.detail_line.old_line, 1));
-        red::execute("OpenLocation", Location {
-            path: red::string(plugin_state().root, ".") + "/" + event.detail_line.data.path,
-            line: target_line - 1,
-            column: 0,
-        });
-        close_dashboard();
-        return;
+    if event.action == "activate" && event.focus == "detail" {
+        if let Some(line) = event.detail_line {
+            let target_line = 1;
+            if let Some(old_line) = line.old_line {
+                target_line = old_line;
+            }
+            if let Some(new_line) = line.new_line {
+                target_line = new_line;
+            }
+            red::execute("OpenLocation", Location {
+                path: plugin_state().root + "/" + line.data.path,
+                line: target_line - 1,
+                column: 0,
+            });
+            close_dashboard();
+            return;
+        }
     }
-    if event.action == "activate" && row != red::null() && row.data.path != red::null() {
-        red::execute("OpenLocation", Location {
-            path: red::string(plugin_state().root, ".") + "/" + row.data.path,
-            line: 0,
-            column: 0,
-        });
-        close_dashboard();
-        return;
+    if event.action == "activate" {
+        if let Some(selected_row) = row {
+            if let Some(data) = selected_row.data {
+                red::execute("OpenLocation", Location {
+                    path: plugin_state().root + "/" + data.path,
+                    line: 0,
+                    column: 0,
+                });
+                close_dashboard();
+                return;
+            }
+        }
     }
     if event.focus == "detail" && (
         event.action == "s" || event.action == "u" || event.action == "x" ||
@@ -1304,30 +1370,40 @@ fn cancel_detail_timer() {
         red::execute("CancelTimeout", timer);
     }
     red::state_patch(GitPluginState { detail_timer: "" });
-    red::state_patch(GitPluginState { pending_detail_row: red::null() });
+    red::state_patch(GitPluginState { pending_detail_row: None });
 }
 
-fn schedule_detail(row: Json) {
+fn schedule_detail(row: Option<GitWorkspaceRow>) {
     cancel_detail_timer();
-    if row == red::null() || row.data.path == red::null() {
-        show_detail(row, true);
+    let Some(selected_row) = row else {
+        show_detail(None, true);
+        return;
+    };
+    let Some(data) = selected_row.data else {
+        show_detail(None, true);
+        return;
+    };
+    if data.path == plugin_state().detail_path &&
+        data.section == plugin_state().detail_section {
         return;
     }
-    if row.data.path == plugin_state().detail_path &&
-        row.data.section == plugin_state().detail_section {
-        return;
-    }
-    red::state_patch(GitPluginState { pending_detail_row: row });
+    red::state_patch(GitPluginState { pending_detail_row: Some(selected_row) });
     red::state_patch(GitPluginState { detail_timer: red::execute("SetTimeout", 60) });
 }
 
-fn show_detail(row: Json, render_loading: bool) {
-    if row == red::null() || row.data.path == red::null() {
+fn show_detail(row: Option<GitWorkspaceRow>, render_loading: bool) {
+    let Some(selected_row) = row else {
         red::state_patch(GitPluginState { detail: [[PanelSegment { text: "Select a change to inspect its diff.", style: muted_style() }]] });
         red::state_patch(GitPluginState { detail_document: None });
         if render_loading { render_dashboard(); }
         return;
-    }
+    };
+    let Some(data) = selected_row.data else {
+        red::state_patch(GitPluginState { detail: [[PanelSegment { text: "Select a change to inspect its diff.", style: muted_style() }]] });
+        red::state_patch(GitPluginState { detail_document: None });
+        if render_loading { render_dashboard(); }
+        return;
+    };
     let previous = red::string(plugin_state().detail_process, "");
     if previous != "" {
         red::execute("KillProcess", previous);
@@ -1338,11 +1414,11 @@ fn show_detail(row: Json, render_loading: bool) {
         red::state_patch(GitPluginState { detail_output: "" });
     }
     red::state_patch(GitPluginState { detail_pending_output: "" });
-    red::state_patch(GitPluginState { detail_path: row.data.path });
-    red::state_patch(GitPluginState { detail_section: row.data.section });
+    red::state_patch(GitPluginState { detail_path: data.path });
+    red::state_patch(GitPluginState { detail_section: data.section });
     let process_id = red::execute("SpawnProcess", Process {
         command: "git",
-        args: red::git_core("detail_diff_args", row.data.section, row.data.path),
+        args: red::git_core("detail_diff_args", data.section, data.path),
         raw_output: true,
         cwd: red::string(plugin_state().root, "."),
     });
@@ -1399,11 +1475,11 @@ fn detail_document(output: String, path: String, section: String) -> GitWorkspac
     return red::git_core("detail_document", output, path, section);
 }
 
-fn detail_lines(output: String) -> Json {
+fn detail_lines(output: String) -> [[PanelSegment]] {
     if output == "" {
         return [[PanelSegment { text: "No textual diff available.", style: muted_style() }]];
     }
-    let detail = [];
+    let detail: [[PanelSegment]] = [];
     let count = 0;
     for line in red::split(output, "\n") {
         if count >= 1000 {
@@ -1423,18 +1499,21 @@ fn detail_lines(output: String) -> Json {
     return detail;
 }
 
-fn run_row_action(row: Json, action: String) {
-    if row == red::null() || row.data.path == red::null() {
+fn run_row_action(row: Option<GitWorkspaceRow>, action: String) {
+    let Some(selected_row) = row else {
         return;
-    }
+    };
+    let Some(data) = selected_row.data else {
+        return;
+    };
     let args = [];
     if action == "add" {
-        args = ["add", "--", row.data.path];
+        args = ["add", "--", data.path];
     } else if action == "restore-staged" {
-        args = ["restore", "--staged", "--", row.data.path];
+        args = ["restore", "--staged", "--", data.path];
     } else {
-        args = ["restore", "--worktree", "--", row.data.path];
-        confirm_git("Discard change", row.data.path, args);
+        args = ["restore", "--worktree", "--", data.path];
+        confirm_git("Discard change", data.path, args);
         return;
     }
     let process_id = red::execute("SpawnProcess", Process {
@@ -1445,11 +1524,10 @@ fn run_row_action(row: Json, action: String) {
     red::on("process:" + process_id, action_finished);
 }
 
-fn run_detail_action(event: Json) {
-    let line = event.detail_line;
-    if line == red::null() || line.data == red::null() {
+fn run_detail_action(event: GitWorkspaceEvent) {
+    let Some(line) = event.detail_line else {
         return;
-    }
+    };
     let action = event.action;
     let hunk_action = action == "S" || action == "U" || action == "X";
     let normalized = red::lower(action);
@@ -1469,20 +1547,26 @@ fn run_detail_action(event: Json) {
     let patch = red::string(plugin_state().detail_output, "");
     let selected = "";
     if hunk_action {
-        selected = patch_for_dashboard_hunk(patch, red::string(line.hunk_id, ""));
+        let hunk_id = "";
+        if let Some(value) = line.hunk_id {
+            hunk_id = value;
+        }
+        selected = patch_for_dashboard_hunk(patch, hunk_id);
     } else {
-        if line.kind != "added" && line.kind != "removed" && event.detail_selection == red::null() {
-            red::execute("Print", "Select an added or removed line");
-            return;
+        if line.kind != "added" && line.kind != "removed" {
+            if let None = event.detail_selection {
+                red::execute("Print", "Select an added or removed line");
+                return;
+            }
         }
         let start_index = red::int(line.data.patch_index, 0);
         let end_index = start_index;
-        if event.detail_selection != red::null() {
+        if let Some(selection) = event.detail_selection {
             let Some(document) = plugin_state().detail_document else {
                 return;
             };
-            let first = red::int(event.detail_selection[0], event.detail_index);
-            let last = red::int(event.detail_selection[1], event.detail_index);
+            let first = red::int(selection[0], event.detail_index);
+            let last = red::int(selection[1], event.detail_index);
             if first >= 0 && last < red::len(document.lines) {
                 start_index = red::int(document.lines[first].data.patch_index, start_index);
                 end_index = red::int(document.lines[last].data.patch_index, end_index);
@@ -2310,8 +2394,8 @@ fn rebase_item_selected(value: String) {
 
 fn render_error(message: String) {
     if plugin_state().dashboard_open {
-        red::execute("UpdateWorkspace", "git-dashboard", WorkspaceModel {
-            rows: [WorkspaceRow {
+        red::execute("UpdateWorkspace", "git-dashboard", GitWorkspaceModel {
+            rows: [GitWorkspaceRow {
                 id: "git-error",
                 selectable: false,
                 segments: [PanelSegment { text: message, style: warning_style() }],
