@@ -20,8 +20,9 @@ before activation. Diagnostics retain source spans and use stable families:
 `HUSK-P0001` for parsing, `HUSK-T0001` for semantic/type errors, and `HUSK-A0001` for a
 literal host call absent from the canonical schema. Literal host calls also check
 required/optional arity (`HUSK-A0002`) and obvious literal argument types
-(`HUSK-A0003`) against the machine-readable signature. `--no-typecheck` is an unsupported
-development escape hatch; compatibility guarantees do not apply while it is enabled.
+(`HUSK-A0003`) against the machine-readable signature. Invalid static plugin
+annotations use `HUSK-A0004`. `--no-typecheck` is an unsupported development
+escape hatch; compatibility guarantees do not apply while it is enabled.
 
 Red `0.6.0` retains the complete `0.4.0` contract, so existing packages that
 declare `"red_api_version": "^0.4.0"` continue to load. New packages should
@@ -83,12 +84,49 @@ and released by the calling plugin.
 
 ## Command discovery metadata
 
+Top-level functions can declare commands and event listeners directly:
+
+```husk
+#[red::command(
+    name = "LspDocumentSymbols",
+    title = "Show document symbols",
+    category = "LSP",
+    description = "Find symbols in the current document",
+    aliases = ["outline", "symbols"],
+)]
+fn document_symbols() {
+    red::request("DocumentSymbols", show_document_symbols);
+}
+
+#[red::on("timeout:callback")]
+fn symbol_batch_timeout(event: TimerEvent) {
+    // Handle a host-owned timer notification.
+}
+```
+
+`#[red::command]` requires a nonempty `name`, a zero-argument function, and
+optional string `title`, `category`, and `description` fields plus an optional
+string-array `aliases` field. `#[red::on]` takes exactly one nonempty event-name
+string and requires a one-argument function. A function may subscribe to
+multiple distinct events by repeating `#[red::on(...)]`.
+
+Red validates these annotations before activation, retains source diagnostics,
+and registers their generation-safe callbacks in source order before
+`activate()` runs. Registrations participate in the same transactional reload
+as imperative commands and listeners: failed validation, ownership conflicts,
+or activation failures cannot replace or leak the previous plugin's wiring.
+Annotations are supported on top-level functions only, including functions in
+package source modules. Other attribute namespaces are ignored by Red.
+
 `red::add_command(name, callback[, metadata])` accepts an optional `Json` object
 with `title`, `category`, `description`, and `aliases: [String]`. Red uses these
 fields to populate the command palette; aliases are search terms and do not
 create alternate colon commands. The palette shows the exact, case-sensitive
 `:Name` invocation when it is available and resolves keymaps from the user's
 effective configuration. Existing two-argument registrations continue to work.
+Imperative `red::add_command` and `red::on` remain supported for dynamic or
+conditional registrations. Plugin state still belongs in `activate()`; typed
+declarative state is intentionally left for a later phase.
 
 ## Callback-scoped pickers
 
@@ -187,7 +225,8 @@ bundled-plugin helpers will move incrementally as their host schemas become cano
 ## Transactional reload and state
 
 User plugin files are polled with a 250 ms debounce. A replacement VM is parsed,
-typechecked, activated, and migrated before it replaces the live program. A bad save
+typechecked, statically registered, activated, and migrated before it replaces
+the live program. A bad save
 leaves the previous callbacks and program active and records an `active_with_reload_error`
 status. Host requests, editor actions, logs, and timers produced while staging are
 published only after a successful swap. Starting or killing a process from reload-time

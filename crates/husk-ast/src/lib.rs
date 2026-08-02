@@ -7,16 +7,102 @@ use std::sync::Arc;
 // Attributes
 // ============================================================================
 
-/// An attribute like `#[getter]` or `#[js_name = "innerHTML"]` or `#[cfg(test)]`.
+/// A source attribute such as `#[test]`, `#[js_name = "innerHTML"]`, or
+/// `#[red::command(name = "Open", aliases = ["open"])]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attribute {
-    /// The attribute name (e.g., "getter", "setter", "js_name", "cfg", "test")
+    /// Final path segment, retained for compatibility with existing consumers.
     pub name: Ident,
-    /// Optional value for key-value attributes (e.g., "innerHTML" for `#[js_name = "innerHTML"]`)
+    /// Complete attribute path, including its final [`Self::name`] segment.
+    pub path: Vec<Ident>,
+    /// Structured value for direct assignments such as `#[js_name = "innerHTML"]`.
+    pub assignment: Option<AttributeValue>,
+    /// Structured arguments when the attribute uses parenthesized metadata.
+    pub arguments: Option<Vec<AttributeArgument>>,
+    /// Legacy string projection for existing JavaScript and test attributes.
     pub value: Option<String>,
-    /// Optional cfg predicate for `#[cfg(...)]` attributes
+    /// Legacy conditional-compilation projection for unqualified `#[cfg(...)]`.
     pub cfg_predicate: Option<CfgPredicate>,
     pub span: Span,
+}
+
+impl Attribute {
+    /// Returns whether this is an unqualified attribute with the given name.
+    #[must_use]
+    pub fn is(&self, name: &str) -> bool {
+        self.path.len() == 1 && self.name.name == name
+    }
+
+    /// Returns whether all attribute path segments match `segments`.
+    #[must_use]
+    pub fn matches_path(&self, segments: &[&str]) -> bool {
+        self.path.len() == segments.len()
+            && self
+                .path
+                .iter()
+                .zip(segments)
+                .all(|(actual, expected)| actual.name == *expected)
+    }
+
+    /// Returns the first named argument matching `name`.
+    #[must_use]
+    pub fn argument(&self, name: &str) -> Option<&AttributeValue> {
+        self.arguments.as_ref()?.iter().find_map(|argument| {
+            let AttributeArgumentKind::Named { name: key, value } = &argument.kind else {
+                return None;
+            };
+            (key.name == name).then_some(value)
+        })
+    }
+}
+
+/// One positional value, named value, or nested metadata group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributeArgument {
+    pub kind: AttributeArgumentKind,
+    pub span: Span,
+}
+
+/// The supported static forms inside an attribute argument list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttributeArgumentKind {
+    Positional(AttributeValue),
+    Named {
+        name: Ident,
+        value: AttributeValue,
+    },
+    Nested {
+        path: Vec<Ident>,
+        arguments: Vec<AttributeArgument>,
+    },
+}
+
+/// One static attribute value together with its exact source span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributeValue {
+    pub kind: AttributeValueKind,
+    pub span: Span,
+}
+
+/// Values permitted in attributes never execute Husk expressions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttributeValueKind {
+    String(String),
+    Bool(bool),
+    Integer(i64),
+    Path(Vec<Ident>),
+    Array(Vec<AttributeValue>),
+}
+
+impl AttributeValue {
+    /// Returns the string contents when this metadata value is a string.
+    #[must_use]
+    pub fn as_str(&self) -> Option<&str> {
+        let AttributeValueKind::String(value) = &self.kind else {
+            return None;
+        };
+        Some(value)
+    }
 }
 
 // ============================================================================
@@ -592,7 +678,7 @@ impl TraitMethod {
     pub fn js_name(&self) -> Option<&str> {
         self.attributes
             .iter()
-            .find(|a| a.name.name == "js_name")
+            .find(|attribute| attribute.is("js_name"))
             .and_then(|a| a.value.as_deref())
     }
 }
@@ -652,19 +738,23 @@ pub struct ExternProperty {
 impl ExternProperty {
     /// Returns whether the property has a `#[getter]` attribute.
     pub fn has_getter(&self) -> bool {
-        self.attributes.iter().any(|a| a.name.name == "getter")
+        self.attributes
+            .iter()
+            .any(|attribute| attribute.is("getter"))
     }
 
     /// Returns whether the property has a `#[setter]` attribute.
     pub fn has_setter(&self) -> bool {
-        self.attributes.iter().any(|a| a.name.name == "setter")
+        self.attributes
+            .iter()
+            .any(|attribute| attribute.is("setter"))
     }
 
     /// Returns the JS name if specified via #[js_name = "..."], otherwise None.
     pub fn js_name(&self) -> Option<&str> {
         self.attributes
             .iter()
-            .find(|a| a.name.name == "js_name")
+            .find(|attribute| attribute.is("js_name"))
             .and_then(|a| a.value.as_deref())
     }
 }
@@ -688,7 +778,7 @@ impl ImplMethod {
     pub fn js_name(&self) -> Option<&str> {
         self.attributes
             .iter()
-            .find(|a| a.name.name == "js_name")
+            .find(|attribute| attribute.is("js_name"))
             .and_then(|a| a.value.as_deref())
     }
 }
@@ -729,39 +819,43 @@ impl Item {
     pub fn cfg_predicate(&self) -> Option<&CfgPredicate> {
         self.attributes
             .iter()
-            .find(|a| a.name.name == "cfg")
+            .find(|attribute| attribute.is("cfg"))
             .and_then(|a| a.cfg_predicate.as_ref())
     }
 
     /// Returns true if this item has a #[test] attribute.
     pub fn is_test(&self) -> bool {
-        self.attributes.iter().any(|a| a.name.name == "test")
+        self.attributes.iter().any(|attribute| attribute.is("test"))
     }
 
     /// Returns whether this item has an `#[ignore]` attribute.
     pub fn is_ignored(&self) -> bool {
-        self.attributes.iter().any(|a| a.name.name == "ignore")
+        self.attributes
+            .iter()
+            .any(|attribute| attribute.is("ignore"))
     }
 
     /// Returns whether this item has a `#[should_panic]` attribute.
     pub fn should_panic(&self) -> bool {
         self.attributes
             .iter()
-            .any(|a| a.name.name == "should_panic")
+            .any(|attribute| attribute.is("should_panic"))
     }
 
     /// Returns the expected panic message if #[should_panic(expected = "...")] is present.
     pub fn expected_panic_message(&self) -> Option<&str> {
         self.attributes
             .iter()
-            .find(|a| a.name.name == "should_panic")
+            .find(|attribute| attribute.is("should_panic"))
             .and_then(|a| a.value.as_deref())
     }
 
     /// Returns whether this item, usually an enum, has an `#[untagged]` attribute.
     /// Untagged enums serialize without a tag field, matching TypeScript's untagged unions.
     pub fn is_untagged(&self) -> bool {
-        self.attributes.iter().any(|a| a.name.name == "untagged")
+        self.attributes
+            .iter()
+            .any(|attribute| attribute.is("untagged"))
     }
 }
 
@@ -835,7 +929,9 @@ pub struct ModItem {
 
 impl ModItem {
     pub fn is_default(&self) -> bool {
-        self.attributes.iter().any(|a| a.name.name == "default")
+        self.attributes
+            .iter()
+            .any(|attribute| attribute.is("default"))
     }
 }
 
@@ -861,13 +957,15 @@ impl ExternItem {
     /// When on a `mod` declaration, indicates the module uses default import
     /// and all functions are methods on the default export.
     pub fn is_default(&self) -> bool {
-        self.attributes.iter().any(|a| a.name.name == "default")
+        self.attributes
+            .iter()
+            .any(|attribute| attribute.is("default"))
     }
 
     /// Returns the JS name if specified via #[js_name = "..."], otherwise None.
     pub fn js_name(&self) -> Option<&str> {
         self.attributes.iter().find_map(|attr| {
-            if attr.name.name == "js_name" {
+            if attr.is("js_name") {
                 attr.value.as_deref()
             } else {
                 None
@@ -879,7 +977,7 @@ impl ExternItem {
     /// This is used for class module callables where the module itself is the constructor.
     pub fn module_call(&self) -> Option<&str> {
         self.attributes.iter().find_map(|attr| {
-            if attr.name.name == "module_call" {
+            if attr.is("module_call") {
                 attr.value.as_deref()
             } else {
                 None
@@ -891,7 +989,7 @@ impl ExternItem {
     /// This is used for namespace member functions (e.g., express.json).
     pub fn namespace(&self) -> Option<&str> {
         self.attributes.iter().find_map(|attr| {
-            if attr.name.name == "ns" {
+            if attr.is("ns") {
                 attr.value.as_deref()
             } else {
                 None
@@ -925,6 +1023,66 @@ impl SetFilePath for Span {
 impl SetFilePath for Ident {
     fn set_file_path(&mut self, file: Arc<str>) {
         self.span.set_file_path(file);
+    }
+}
+
+impl SetFilePath for Attribute {
+    fn set_file_path(&mut self, file: Arc<str>) {
+        self.span.set_file_path(file.clone());
+        self.name.set_file_path(file.clone());
+        for segment in &mut self.path {
+            segment.set_file_path(file.clone());
+        }
+        if let Some(value) = &mut self.assignment {
+            value.set_file_path(file.clone());
+        }
+        if let Some(arguments) = &mut self.arguments {
+            for argument in arguments {
+                argument.set_file_path(file.clone());
+            }
+        }
+    }
+}
+
+impl SetFilePath for AttributeArgument {
+    fn set_file_path(&mut self, file: Arc<str>) {
+        self.span.set_file_path(file.clone());
+        match &mut self.kind {
+            AttributeArgumentKind::Positional(value) => value.set_file_path(file),
+            AttributeArgumentKind::Named { name, value } => {
+                name.set_file_path(file.clone());
+                value.set_file_path(file);
+            }
+            AttributeArgumentKind::Nested { path, arguments } => {
+                for segment in path {
+                    segment.set_file_path(file.clone());
+                }
+                for argument in arguments {
+                    argument.set_file_path(file.clone());
+                }
+            }
+        }
+    }
+}
+
+impl SetFilePath for AttributeValue {
+    fn set_file_path(&mut self, file: Arc<str>) {
+        self.span.set_file_path(file.clone());
+        match &mut self.kind {
+            AttributeValueKind::Path(path) => {
+                for segment in path {
+                    segment.set_file_path(file.clone());
+                }
+            }
+            AttributeValueKind::Array(values) => {
+                for value in values {
+                    value.set_file_path(file.clone());
+                }
+            }
+            AttributeValueKind::String(_)
+            | AttributeValueKind::Bool(_)
+            | AttributeValueKind::Integer(_) => {}
+        }
     }
 }
 
@@ -1223,8 +1381,7 @@ impl SetFilePath for Item {
     fn set_file_path(&mut self, file: Arc<str>) {
         self.span.set_file_path(file.clone());
         for attr in &mut self.attributes {
-            attr.span.set_file_path(file.clone());
-            attr.name.set_file_path(file.clone());
+            attr.set_file_path(file.clone());
         }
         match &mut self.kind {
             ItemKind::Mod { name } => name.set_file_path(file),
@@ -1244,8 +1401,7 @@ impl SetFilePath for Item {
                 }
                 for param in params {
                     for attr in &mut param.attributes {
-                        attr.span.set_file_path(file.clone());
-                        attr.name.set_file_path(file.clone());
+                        attr.set_file_path(file.clone());
                     }
                     param.name.set_file_path(file.clone());
                     param.ty.set_file_path(file.clone());
@@ -1323,11 +1479,13 @@ impl SetFilePath for Item {
                 for item in &mut trait_def.items {
                     item.span.set_file_path(file.clone());
                     let TraitItemKind::Method(method) = &mut item.kind;
+                    for attr in &mut method.attributes {
+                        attr.set_file_path(file.clone());
+                    }
                     method.name.set_file_path(file.clone());
                     for param in &mut method.params {
                         for attr in &mut param.attributes {
-                            attr.span.set_file_path(file.clone());
-                            attr.name.set_file_path(file.clone());
+                            attr.set_file_path(file.clone());
                         }
                         param.name.set_file_path(file.clone());
                         param.ty.set_file_path(file.clone());
@@ -1367,14 +1525,12 @@ impl SetFilePath for ImplBlock {
             match &mut item.kind {
                 ImplItemKind::Method(method) => {
                     for attr in &mut method.attributes {
-                        attr.span.set_file_path(file.clone());
-                        attr.name.set_file_path(file.clone());
+                        attr.set_file_path(file.clone());
                     }
                     method.name.set_file_path(file.clone());
                     for param in &mut method.params {
                         for attr in &mut param.attributes {
-                            attr.span.set_file_path(file.clone());
-                            attr.name.set_file_path(file.clone());
+                            attr.set_file_path(file.clone());
                         }
                         param.name.set_file_path(file.clone());
                         param.ty.set_file_path(file.clone());
@@ -1388,8 +1544,7 @@ impl SetFilePath for ImplBlock {
                 }
                 ImplItemKind::Property(prop) => {
                     for attr in &mut prop.attributes {
-                        attr.span.set_file_path(file.clone());
-                        attr.name.set_file_path(file.clone());
+                        attr.set_file_path(file.clone());
                     }
                     prop.name.set_file_path(file.clone());
                     prop.ty.set_file_path(file.clone());
@@ -1403,8 +1558,7 @@ impl SetFilePath for ExternItem {
     fn set_file_path(&mut self, file: Arc<str>) {
         self.span.set_file_path(file.clone());
         for attr in &mut self.attributes {
-            attr.span.set_file_path(file.clone());
-            attr.name.set_file_path(file.clone());
+            attr.set_file_path(file.clone());
         }
         match &mut self.kind {
             ExternItemKind::Fn {
@@ -1415,8 +1569,7 @@ impl SetFilePath for ExternItem {
                 name.set_file_path(file.clone());
                 for param in params {
                     for attr in &mut param.attributes {
-                        attr.span.set_file_path(file.clone());
-                        attr.name.set_file_path(file.clone());
+                        attr.set_file_path(file.clone());
                     }
                     param.name.set_file_path(file.clone());
                     param.ty.set_file_path(file.clone());
@@ -1456,14 +1609,12 @@ impl SetFilePath for ExternItem {
                     match &mut item.kind {
                         ImplItemKind::Method(method) => {
                             for attr in &mut method.attributes {
-                                attr.span.set_file_path(file.clone());
-                                attr.name.set_file_path(file.clone());
+                                attr.set_file_path(file.clone());
                             }
                             method.name.set_file_path(file.clone());
                             for param in &mut method.params {
                                 for attr in &mut param.attributes {
-                                    attr.span.set_file_path(file.clone());
-                                    attr.name.set_file_path(file.clone());
+                                    attr.set_file_path(file.clone());
                                 }
                                 param.name.set_file_path(file.clone());
                                 param.ty.set_file_path(file.clone());
@@ -1477,8 +1628,7 @@ impl SetFilePath for ExternItem {
                         }
                         ImplItemKind::Property(prop) => {
                             for attr in &mut prop.attributes {
-                                attr.span.set_file_path(file.clone());
-                                attr.name.set_file_path(file.clone());
+                                attr.set_file_path(file.clone());
                             }
                             prop.name.set_file_path(file.clone());
                             prop.ty.set_file_path(file.clone());
@@ -1501,6 +1651,9 @@ impl SetFilePath for ExternItem {
 impl SetFilePath for ModItem {
     fn set_file_path(&mut self, file: Arc<str>) {
         self.span.set_file_path(file.clone());
+        for attr in &mut self.attributes {
+            attr.set_file_path(file.clone());
+        }
         match &mut self.kind {
             ModItemKind::Fn {
                 name,
@@ -1510,8 +1663,7 @@ impl SetFilePath for ModItem {
                 name.set_file_path(file.clone());
                 for param in params {
                     for attr in &mut param.attributes {
-                        attr.span.set_file_path(file.clone());
-                        attr.name.set_file_path(file.clone());
+                        attr.set_file_path(file.clone());
                     }
                     param.name.set_file_path(file.clone());
                     param.ty.set_file_path(file.clone());

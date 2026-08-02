@@ -328,6 +328,37 @@ impl Callback {
     }
 }
 
+/// A statically annotated top-level function discovered before plugin activation.
+///
+/// Its callback is already bound to the newly loaded program generation, so hosts
+/// can safely retain it across transactional reloads.
+#[derive(Debug, Clone)]
+pub struct AnnotatedFunction {
+    callback: Callback,
+    attributes: Vec<husk_ast::Attribute>,
+    parameter_count: usize,
+}
+
+impl AnnotatedFunction {
+    /// Returns the generation-safe callback for the annotated function.
+    #[must_use]
+    pub fn callback(&self) -> &Callback {
+        &self.callback
+    }
+
+    /// Returns the attributes in their original source order.
+    #[must_use]
+    pub fn attributes(&self) -> &[husk_ast::Attribute] {
+        &self.attributes
+    }
+
+    /// Returns the number of declared function parameters.
+    #[must_use]
+    pub const fn parameter_count(&self) -> usize {
+        self.parameter_count
+    }
+}
+
 /// Rust host operations callable from Husk.
 pub trait Host {
     /// Writes a plugin-scoped diagnostic message.
@@ -344,6 +375,18 @@ pub trait Host {
         _args: &[Value],
     ) -> Option<anyhow::Result<Value>> {
         None
+    }
+
+    /// Register static function annotations before the plugin's `activate` hook.
+    ///
+    /// Hosts that do not interpret attributes can retain the default no-op.
+    /// Returning an error aborts plugin activation and its staged host effects.
+    fn register_annotated_function(
+        &mut self,
+        _plugin: &str,
+        _function: &AnnotatedFunction,
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 
     /// Mark the start of replacement activation/state-import effects during a staged reload.
@@ -773,6 +816,8 @@ impl CompiledProgram {
                         imports: imports.clone(),
                         test: test_descriptor(item, &name.name),
                         receiver: None,
+                        attributes: item.attributes.clone(),
+                        declaration_order: functions.len(),
                     },
                 );
             }
@@ -955,6 +1000,8 @@ impl CompiledProgram {
                     imports: imports.clone(),
                     test: test_descriptor(item, &key),
                     receiver: None,
+                    attributes: item.attributes.clone(),
+                    declaration_order: functions.len(),
                 };
                 if functions.insert(key.clone(), function).is_some() {
                     anyhow::bail!("duplicate package function `{key}`");
@@ -1740,6 +1787,8 @@ struct Function {
     imports: HashMap<String, String>,
     test: Option<TestDescriptor>,
     receiver: Option<SelfReceiver>,
+    attributes: Vec<husk_ast::Attribute>,
+    declaration_order: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2303,6 +2352,8 @@ fn insert_impl_functions(
                 imports: imports.clone(),
                 test: None,
                 receiver: method.receiver,
+                attributes: Vec::new(),
+                declaration_order: usize::MAX,
             };
             if functions.insert(key.clone(), function).is_some() {
                 anyhow::bail!("duplicate package function or method `{key}`");
@@ -2358,6 +2409,8 @@ fn insert_impl_functions(
                 imports: imports.clone(),
                 test: None,
                 receiver: method.receiver,
+                attributes: Vec::new(),
+                declaration_order: usize::MAX,
             };
             if functions.insert(key.clone(), function).is_some() {
                 anyhow::bail!("duplicate package function or method `{key}`");
@@ -3104,12 +3157,58 @@ impl Vm {
             .insert(name.clone(), program_generation);
         host.begin_reload_replacement(&name);
         self.programs.insert(name.clone(), program.into());
+        if let Err(error) = self.register_annotated_functions(&name, host) {
+            self.unload_plugin(&name);
+            return Err(error);
+        }
         if self.has_function(&name, "activate")
             && let Err(error) =
                 self.call_function(&Callback::new(name.clone(), "activate"), Vec::new(), host)
         {
             self.unload_plugin(&name);
             return Err(error);
+        }
+        Ok(())
+    }
+
+    fn register_annotated_functions<H: Host>(
+        &self,
+        plugin: &str,
+        host: &mut H,
+    ) -> anyhow::Result<()> {
+        let program = self
+            .programs
+            .get(plugin)
+            .ok_or_else(|| anyhow::anyhow!("unknown Husk program `{plugin}`"))?;
+        let mut functions = program
+            .functions
+            .entries
+            .iter()
+            .filter(|function| !function.attributes.is_empty())
+            .map(|function| {
+                let function_id =
+                    program
+                        .functions
+                        .id(&function.qualified_name)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "annotated Husk function `{}` has no function ID",
+                                function.qualified_name
+                            )
+                        })?;
+                Ok((
+                    function.declaration_order,
+                    AnnotatedFunction {
+                        callback: self.resolved_callback(plugin, function_id)?,
+                        attributes: function.attributes.clone(),
+                        parameter_count: function.hir.parameters.len(),
+                    },
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        functions.sort_by_key(|(order, _)| *order);
+        for (_, function) in functions {
+            host.register_annotated_function(plugin, &function)?;
         }
         Ok(())
     }
@@ -6311,6 +6410,184 @@ mod tests {
                 "OldTeardown"
             ]
         );
+    }
+
+    #[test]
+    fn annotated_functions_register_in_declaration_order_before_activation() {
+        #[derive(Default)]
+        struct AnnotationHost {
+            effects: Vec<String>,
+            callbacks: Vec<Callback>,
+        }
+
+        impl Host for AnnotationHost {
+            fn log(&mut self, _message: &str) {}
+
+            fn register_annotated_function(
+                &mut self,
+                _plugin: &str,
+                function: &AnnotatedFunction,
+            ) -> anyhow::Result<()> {
+                self.effects
+                    .push(format!("register:{}", function.callback().function()));
+                self.callbacks.push(function.callback().clone());
+                Ok(())
+            }
+
+            fn call_module(
+                &mut self,
+                _plugin: &str,
+                path: &str,
+                args: &[Value],
+            ) -> Option<anyhow::Result<Value>> {
+                (path == "test::effect").then(|| {
+                    let value = args
+                        .first()
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow::anyhow!("expected an effect name"))?;
+                    self.effects.push(value.to_string());
+                    Ok(Value::Unit)
+                })
+            }
+        }
+
+        let mut host = AnnotationHost::default();
+        let mut vm = Vm::new();
+        vm.load_plugin(
+            "annotations",
+            r#"
+                #[example::bind]
+                fn zebra() { test::effect("zebra"); }
+                #[example::bind]
+                fn alpha() { test::effect("alpha"); }
+                pub fn activate() { test::effect("activate"); }
+            "#,
+            &mut host,
+        )
+        .unwrap();
+
+        assert_eq!(
+            host.effects,
+            ["register:zebra", "register:alpha", "activate"]
+        );
+        let callback = host.callbacks[0].clone();
+        vm.call_callback(&callback, Vec::new(), &mut host).unwrap();
+        assert_eq!(host.effects.last().map(String::as_str), Some("zebra"));
+
+        vm.reload_plugin_at(
+            "annotations",
+            "plugins/annotations.hk",
+            r#"#[example::bind] fn zebra() { test::effect("new"); }"#,
+            &mut host,
+        )
+        .unwrap();
+        let error = vm
+            .call_callback(&callback, Vec::new(), &mut host)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("stale Husk callback"), "{error}");
+    }
+
+    #[test]
+    fn annotation_registration_failure_prevents_activation_and_unloads_program() {
+        #[derive(Default)]
+        struct RejectingHost {
+            activated: bool,
+        }
+
+        impl Host for RejectingHost {
+            fn log(&mut self, _message: &str) {}
+
+            fn register_annotated_function(
+                &mut self,
+                _plugin: &str,
+                _function: &AnnotatedFunction,
+            ) -> anyhow::Result<()> {
+                anyhow::bail!("annotation registration rejected")
+            }
+
+            fn call_module(
+                &mut self,
+                _plugin: &str,
+                path: &str,
+                _args: &[Value],
+            ) -> Option<anyhow::Result<Value>> {
+                (path == "test::activate").then(|| {
+                    self.activated = true;
+                    Ok(Value::Unit)
+                })
+            }
+        }
+
+        let mut host = RejectingHost::default();
+        let mut vm = Vm::new();
+        let error = vm
+            .load_plugin(
+                "rejected",
+                r#"
+                    #[example::bind]
+                    fn handler() {}
+                    pub fn activate() { test::activate(); }
+                "#,
+                &mut host,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("annotation registration rejected"),
+            "{error}"
+        );
+        assert!(!host.activated);
+        assert!(!vm.has_function("rejected", "handler"));
+    }
+
+    #[test]
+    fn annotated_package_module_functions_are_available_to_embedding_hosts() {
+        #[derive(Default)]
+        struct AnnotationHost {
+            functions: Vec<String>,
+        }
+
+        impl Host for AnnotationHost {
+            fn log(&mut self, _message: &str) {}
+
+            fn register_annotated_function(
+                &mut self,
+                _plugin: &str,
+                function: &AnnotatedFunction,
+            ) -> anyhow::Result<()> {
+                self.functions
+                    .push(function.callback().function().to_string());
+                Ok(())
+            }
+        }
+
+        let package = ResolvedPackage::from_sources(
+            "annotations",
+            r#"
+                [package]
+                name = "annotations"
+                version = "0.1.0"
+                entry = "src/main.hk"
+            "#,
+            &[
+                ("src/main.hk", "mod tools; pub fn activate() {}"),
+                (
+                    "src/tools.hk",
+                    "#[example::bind(name = \"Open\")] pub fn open() {}",
+                ),
+            ],
+            PackageLimits::default(),
+        )
+        .unwrap();
+        let program =
+            CompiledProgram::compile_package(&package, &CompileOptions::default()).unwrap();
+        let mut host = AnnotationHost::default();
+        let mut vm = Vm::new();
+        vm.load_compiled_plugin("annotations", program, &mut host)
+            .unwrap();
+
+        assert_eq!(host.functions, ["tools::open"]);
     }
 
     #[test]

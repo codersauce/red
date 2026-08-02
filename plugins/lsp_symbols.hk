@@ -72,27 +72,6 @@ pub fn activate() {
     red::state_set("lsp_symbol_picker", red::null());
     red::state_set("lsp_symbol_request", -1);
     red::request("GetConfig", icon_config_loaded, "plugin_config");
-
-    red::add_command("LspDocumentSymbols", document_symbols, CommandMetadata {
-        title: "Show document symbols",
-        category: "LSP",
-        description: "Find symbols in the current document",
-        aliases: ["outline", "symbols"],
-    });
-    red::add_command("LspWorkspaceSymbols", workspace_symbols, CommandMetadata {
-        title: "Search workspace symbols",
-        category: "LSP",
-        description: "Find symbols across the workspace",
-        aliases: ["symbols"],
-    });
-    red::add_command("LspReferences", references, CommandMetadata {
-        title: "Find references",
-        category: "LSP",
-        description: "Find references to the symbol under the cursor",
-        aliases: ["usages", "references"],
-    });
-
-    red::on("timeout:callback", symbol_batch_timeout);
 }
 
 fn icon_config_loaded(event: LspSymbolsConfigEvent) {
@@ -117,12 +96,26 @@ fn symbol_icon(kind: String) -> Json {
     return red::null();
 }
 
+#[red::command(
+    name = "LspDocumentSymbols",
+    title = "Show document symbols",
+    category = "LSP",
+    description = "Find symbols in the current document",
+    aliases = ["outline", "symbols"],
+)]
 fn document_symbols() {
     begin_symbol_flow();
     let request_id = red::request("DocumentSymbols", show_document_symbols);
     red::state_set("lsp_symbol_request", request_id);
 }
 
+#[red::command(
+    name = "LspWorkspaceSymbols",
+    title = "Search workspace symbols",
+    category = "LSP",
+    description = "Find symbols across the workspace",
+    aliases = ["symbols"],
+)]
 fn workspace_symbols() {
     begin_symbol_flow();
     let handle = red::execute("OpenPicker", "Workspace Symbols", [], PickerOptions {
@@ -151,6 +144,13 @@ fn request_workspace_symbols(query: String) {
     red::state_set("lsp_symbol_request", request_id);
 }
 
+#[red::command(
+    name = "LspReferences",
+    title = "Find references",
+    category = "LSP",
+    description = "Find references to the symbol under the cursor",
+    aliases = ["usages", "references"],
+)]
 fn references() {
     begin_symbol_flow();
     let request_id = red::request("References", show_references);
@@ -257,6 +257,7 @@ fn schedule_symbol_batch() {
     red::state_set("lsp_symbol_batch_timer", red::execute("SetTimeout", 0));
 }
 
+#[red::on("timeout:callback")]
 fn symbol_batch_timeout(event: TimerEvent) {
     if event.timer_id != red::state("lsp_symbol_batch_timer") {
         return;

@@ -3,7 +3,8 @@
 //! This is a hand-written recursive-descent parser for the MVP syntax.
 
 use husk_ast::{
-    AssignOp, Attribute, BinaryOp, Block, CfgPredicate, ClosureParam, EnumVariant,
+    AssignOp, Attribute, AttributeArgument, AttributeArgumentKind, AttributeValue,
+    AttributeValueKind, BinaryOp, Block, CfgPredicate, ClosureParam, EnumVariant,
     EnumVariantFields, Expr, ExprKind, ExternProperty, File, FormatPlaceholder, FormatSegment,
     FormatSpec, FormatString, Ident, ImplBlock, ImplItem, ImplItemKind, ImplMethod, Item, ItemKind,
     Literal, LiteralKind, MatchArm, Param, Pattern, PatternKind, SelfReceiver, Span, Stmt,
@@ -11,6 +12,8 @@ use husk_ast::{
     TypeParam,
 };
 use husk_lexer::{Keyword, Lexer, Token, TokenKind};
+
+const MAX_ATTRIBUTE_METADATA_DEPTH: usize = 32;
 
 fn debug_log(msg: &str) {
     match std::env::var("HUSKC_DEBUG") {
@@ -1282,8 +1285,7 @@ impl<'src> Parser<'src> {
         })
     }
 
-    /// Parse a single attribute like `#[getter]`, `#[js_name = "innerHTML"]`, or `#[cfg(test)]`.
-    /// Returns None if no attribute is found (not an error).
+    /// Parse one namespaced attribute and its static, structured metadata.
     fn parse_attribute(&mut self) -> Option<Attribute> {
         if !self.matches_token(&TokenKind::Hash) {
             return None;
@@ -1295,70 +1297,53 @@ impl<'src> Parser<'src> {
             return None;
         }
 
-        let name = self.parse_ident("expected attribute name")?;
+        let first = self.parse_ident("expected attribute name")?;
+        let path = self.parse_attribute_path(first)?;
+        let name = path.last()?.clone();
 
-        // Check for `(...)` syntax (cfg predicates or should_panic(expected = "..."))
-        let (cfg_predicate, value) = if self.matches_token(&TokenKind::LParen) {
-            if name.name == "cfg" {
-                // Parse cfg predicate
-                let pred = self.parse_cfg_predicate()?;
-                if !self.matches_token(&TokenKind::RParen) {
-                    self.error_here("expected `)` to close cfg predicate");
-                    return None;
-                }
-                (Some(pred), None)
-            } else if name.name == "should_panic" {
-                // Parse optional expected = "message"
-                let val = if matches!(&self.current().kind, TokenKind::Ident(s) if s == "expected")
-                {
-                    self.advance(); // consume `expected`
-                    if !self.matches_token(&TokenKind::Eq) {
-                        self.error_here("expected `=` after `expected`");
-                        return None;
-                    }
-                    if let TokenKind::StringLiteral(ref s) = self.current().kind {
-                        let val = s.clone();
-                        self.advance();
-                        Some(val)
-                    } else {
-                        self.error_here("expected string literal after `expected =`");
-                        None
-                    }
-                } else {
-                    None
-                };
-                if !self.matches_token(&TokenKind::RParen) {
-                    self.error_here("expected `)` to close should_panic attribute");
-                    return None;
-                }
-                (None, val)
-            } else {
-                // Unknown attribute with parentheses, skip contents
-                let mut depth = 1;
-                while depth > 0 && !self.is_at_end() {
-                    if self.matches_token(&TokenKind::LParen) {
-                        depth += 1;
-                    } else if self.matches_token(&TokenKind::RParen) {
-                        depth -= 1;
-                    } else {
-                        self.advance();
-                    }
-                }
-                (None, None)
-            }
+        let (assignment, arguments) = if self.matches_token(&TokenKind::LParen) {
+            (None, Some(self.parse_attribute_arguments(0)?))
         } else if self.matches_token(&TokenKind::Eq) {
-            // Check for `= "value"` syntax
-            if let TokenKind::StringLiteral(ref s) = self.current().kind {
-                let val = s.clone();
-                self.advance();
-                (None, Some(val))
-            } else {
-                self.error_here("expected string literal after `=` in attribute");
-                (None, None)
-            }
+            (Some(self.parse_attribute_value(0)?), None)
         } else {
             (None, None)
         };
+
+        let cfg_predicate = if path.len() == 1 && name.name == "cfg" {
+            let arguments = arguments.as_deref().unwrap_or_default();
+            if arguments.len() != 1 {
+                self.error_here("`cfg` requires exactly one predicate");
+                return None;
+            }
+            Some(self.attribute_cfg_predicate(&arguments[0])?)
+        } else {
+            None
+        };
+
+        let value = assignment
+            .as_ref()
+            .and_then(AttributeValue::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                arguments.as_ref().and_then(|arguments| {
+                    let argument = arguments.first()?;
+                    match &argument.kind {
+                        AttributeArgumentKind::Named { name, value } if name.name == "expected" => {
+                            value.as_str().map(str::to_string)
+                        }
+                        AttributeArgumentKind::Positional(value) if arguments.len() == 1 => {
+                            match &value.kind {
+                                AttributeValueKind::String(value) => Some(value.clone()),
+                                AttributeValueKind::Path(path) if path.len() == 1 => {
+                                    Some(path[0].name.clone())
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                })
+            });
 
         if !self.matches_token(&TokenKind::RBracket) {
             self.error_here("expected `]` to close attribute");
@@ -1368,6 +1353,9 @@ impl<'src> Parser<'src> {
         let end = self.previous().span.range.end;
         Some(Attribute {
             name,
+            path,
+            assignment,
+            arguments,
             value,
             cfg_predicate,
             span: Span {
@@ -1377,90 +1365,208 @@ impl<'src> Parser<'src> {
         })
     }
 
-    /// Parse a cfg predicate like `test`, `not(test)`, `all(test, debug)`, `any(node, bun)`.
-    fn parse_cfg_predicate(&mut self) -> Option<CfgPredicate> {
-        // Check for combinators: all(...), any(...), not(...)
-        if let TokenKind::Ident(ref name) = self.current().kind.clone() {
-            match name.as_str() {
-                "all" => {
-                    self.advance();
-                    if !self.matches_token(&TokenKind::LParen) {
-                        self.error_here("expected `(` after `all`");
-                        return None;
-                    }
-                    let predicates = self.parse_cfg_predicate_list()?;
-                    if !self.matches_token(&TokenKind::RParen) {
-                        self.error_here("expected `)` to close `all(...)`");
-                        return None;
-                    }
-                    return Some(CfgPredicate::All(predicates));
-                }
-                "any" => {
-                    self.advance();
-                    if !self.matches_token(&TokenKind::LParen) {
-                        self.error_here("expected `(` after `any`");
-                        return None;
-                    }
-                    let predicates = self.parse_cfg_predicate_list()?;
-                    if !self.matches_token(&TokenKind::RParen) {
-                        self.error_here("expected `)` to close `any(...)`");
-                        return None;
-                    }
-                    return Some(CfgPredicate::Any(predicates));
-                }
-                "not" => {
-                    self.advance();
-                    if !self.matches_token(&TokenKind::LParen) {
-                        self.error_here("expected `(` after `not`");
-                        return None;
-                    }
-                    let inner = self.parse_cfg_predicate()?;
-                    if !self.matches_token(&TokenKind::RParen) {
-                        self.error_here("expected `)` to close `not(...)`");
-                        return None;
-                    }
-                    return Some(CfgPredicate::Not(Box::new(inner)));
-                }
-                _ => {}
-            }
+    fn parse_attribute_path(&mut self, first: Ident) -> Option<Vec<Ident>> {
+        let mut path = vec![first];
+        while self.matches_token(&TokenKind::ColonColon) {
+            path.push(self.parse_ident("expected identifier after `::` in attribute path")?);
         }
-
-        // Simple flag or key-value
-        let key = self.parse_ident("expected cfg predicate name")?;
-
-        if self.matches_token(&TokenKind::Eq) {
-            // Key-value: target = "esm"
-            if let TokenKind::StringLiteral(ref s) = self.current().kind {
-                let val = s.clone();
-                self.advance();
-                Some(CfgPredicate::KeyValue {
-                    key: key.name,
-                    value: val,
-                })
-            } else {
-                self.error_here("expected string literal value in cfg predicate");
-                None
-            }
-        } else {
-            // Simple flag: test, debug
-            Some(CfgPredicate::Flag(key.name))
-        }
+        Some(path)
     }
 
-    /// Parse a comma-separated list of cfg predicates.
-    fn parse_cfg_predicate_list(&mut self) -> Option<Vec<CfgPredicate>> {
-        let mut predicates = Vec::new();
-        loop {
-            // Check for empty or end
-            if matches!(self.current().kind, TokenKind::RParen) {
-                break;
+    fn parse_attribute_arguments(&mut self, depth: usize) -> Option<Vec<AttributeArgument>> {
+        if depth >= MAX_ATTRIBUTE_METADATA_DEPTH {
+            self.error_here("attribute metadata exceeds the maximum nesting depth of 32");
+            return None;
+        }
+
+        let mut arguments = Vec::new();
+        while !matches!(self.current().kind, TokenKind::RParen) {
+            if self.is_at_end() {
+                self.error_here("expected `)` to close attribute arguments");
+                return None;
             }
-            predicates.push(self.parse_cfg_predicate()?);
+            arguments.push(self.parse_attribute_argument(depth + 1)?);
             if !self.matches_token(&TokenKind::Comma) {
                 break;
             }
         }
-        Some(predicates)
+        if !self.matches_token(&TokenKind::RParen) {
+            self.error_here("expected `)` to close attribute arguments");
+            return None;
+        }
+        Some(arguments)
+    }
+
+    fn parse_attribute_argument(&mut self, depth: usize) -> Option<AttributeArgument> {
+        let start = self.current().span.range.start;
+        if matches!(self.current().kind, TokenKind::Ident(_)) {
+            let first = self.parse_ident("expected attribute argument")?;
+            let path = self.parse_attribute_path(first)?;
+            let kind = if self.matches_token(&TokenKind::Eq) {
+                if path.len() != 1 {
+                    self.error_here("named attribute arguments cannot contain `::`");
+                    return None;
+                }
+                AttributeArgumentKind::Named {
+                    name: path.into_iter().next()?,
+                    value: self.parse_attribute_value(depth)?,
+                }
+            } else if self.matches_token(&TokenKind::LParen) {
+                AttributeArgumentKind::Nested {
+                    path,
+                    arguments: self.parse_attribute_arguments(depth)?,
+                }
+            } else {
+                let end = path.last()?.span.range.end;
+                AttributeArgumentKind::Positional(AttributeValue {
+                    kind: AttributeValueKind::Path(path),
+                    span: Span {
+                        range: start..end,
+                        file: None,
+                    },
+                })
+            };
+            let end = self.previous().span.range.end;
+            return Some(AttributeArgument {
+                kind,
+                span: Span {
+                    range: start..end,
+                    file: None,
+                },
+            });
+        }
+
+        let value = self.parse_attribute_value(depth)?;
+        let span = value.span.clone();
+        Some(AttributeArgument {
+            kind: AttributeArgumentKind::Positional(value),
+            span,
+        })
+    }
+
+    fn parse_attribute_value(&mut self, depth: usize) -> Option<AttributeValue> {
+        if depth >= MAX_ATTRIBUTE_METADATA_DEPTH {
+            self.error_here("attribute metadata exceeds the maximum nesting depth of 32");
+            return None;
+        }
+
+        let token = self.current().clone();
+        let start = token.span.range.start;
+        let kind = match token.kind.clone() {
+            TokenKind::StringLiteral(value) => {
+                self.advance();
+                AttributeValueKind::String(value)
+            }
+            TokenKind::Keyword(Keyword::True) => {
+                self.advance();
+                AttributeValueKind::Bool(true)
+            }
+            TokenKind::Keyword(Keyword::False) => {
+                self.advance();
+                AttributeValueKind::Bool(false)
+            }
+            TokenKind::IntLiteral(value) => {
+                self.advance();
+                let Ok(value) = value.parse::<i64>() else {
+                    self.error_at_token(&token, "attribute integer is outside the i64 range");
+                    return None;
+                };
+                AttributeValueKind::Integer(value)
+            }
+            TokenKind::Minus => {
+                self.advance();
+                let number = self.current().clone();
+                let TokenKind::IntLiteral(value) = &number.kind else {
+                    self.error_here("expected an integer after `-` in attribute metadata");
+                    return None;
+                };
+                let Ok(value) = format!("-{value}").parse::<i64>() else {
+                    self.error_at_token(&number, "attribute integer is outside the i64 range");
+                    return None;
+                };
+                self.advance();
+                AttributeValueKind::Integer(value)
+            }
+            TokenKind::Ident(_) => {
+                let first = self.parse_ident("expected attribute value")?;
+                AttributeValueKind::Path(self.parse_attribute_path(first)?)
+            }
+            TokenKind::LBracket => {
+                self.advance();
+                let mut values = Vec::new();
+                while !matches!(self.current().kind, TokenKind::RBracket) {
+                    if self.is_at_end() {
+                        self.error_here("expected `]` to close attribute array");
+                        return None;
+                    }
+                    values.push(self.parse_attribute_value(depth + 1)?);
+                    if !self.matches_token(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                if !self.matches_token(&TokenKind::RBracket) {
+                    self.error_here("expected `]` to close attribute array");
+                    return None;
+                }
+                AttributeValueKind::Array(values)
+            }
+            _ => {
+                self.error_at_token(&token, "expected a static attribute value");
+                return None;
+            }
+        };
+
+        Some(AttributeValue {
+            kind,
+            span: Span {
+                range: start..self.previous().span.range.end,
+                file: None,
+            },
+        })
+    }
+
+    fn attribute_cfg_predicate(&mut self, argument: &AttributeArgument) -> Option<CfgPredicate> {
+        match &argument.kind {
+            AttributeArgumentKind::Positional(AttributeValue {
+                kind: AttributeValueKind::Path(path),
+                ..
+            }) if path.len() == 1 => Some(CfgPredicate::Flag(path[0].name.clone())),
+            AttributeArgumentKind::Named { name, value } => {
+                let Some(value) = value.as_str() else {
+                    self.error_here("expected string literal value in cfg predicate");
+                    return None;
+                };
+                Some(CfgPredicate::KeyValue {
+                    key: name.name.clone(),
+                    value: value.to_string(),
+                })
+            }
+            AttributeArgumentKind::Nested { path, arguments } if path.len() == 1 => {
+                let predicates = arguments
+                    .iter()
+                    .map(|argument| self.attribute_cfg_predicate(argument))
+                    .collect::<Option<Vec<_>>>()?;
+                match path[0].name.as_str() {
+                    "all" => Some(CfgPredicate::All(predicates)),
+                    "any" => Some(CfgPredicate::Any(predicates)),
+                    "not" if predicates.len() == 1 => {
+                        Some(CfgPredicate::Not(Box::new(predicates.into_iter().next()?)))
+                    }
+                    "not" => {
+                        self.error_here("`not(...)` requires exactly one cfg predicate");
+                        None
+                    }
+                    _ => {
+                        self.error_here("unknown cfg predicate group");
+                        None
+                    }
+                }
+            }
+            _ => {
+                self.error_here("expected a cfg predicate");
+                None
+            }
+        }
     }
 
     /// Parse zero or more attributes: `#[getter] #[setter] #[js_name = "foo"]`
@@ -4536,6 +4642,135 @@ pub fn derive_binding_from_package(package: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_namespaced_attributes_with_structured_static_metadata() {
+        let source = r#"
+            #[red::command(
+                name = "OpenSymbols",
+                enabled = true,
+                priority = -12,
+                aliases = ["outline", "symbols"],
+                nested(flag, target = "editor"),
+            )]
+            fn open_symbols() {}
+        "#;
+        let parsed = parse_str(source);
+        assert!(parsed.errors.is_empty(), "errors: {:?}", parsed.errors);
+        let attribute = &parsed.file.unwrap().items[0].attributes[0];
+        assert!(attribute.matches_path(&["red", "command"]));
+        assert!(!attribute.is("command"));
+        assert_eq!(
+            attribute.argument("name").and_then(AttributeValue::as_str),
+            Some("OpenSymbols")
+        );
+        assert!(matches!(
+            attribute.argument("enabled").map(|value| &value.kind),
+            Some(AttributeValueKind::Bool(true))
+        ));
+        assert!(matches!(
+            attribute.argument("priority").map(|value| &value.kind),
+            Some(AttributeValueKind::Integer(-12))
+        ));
+        assert!(matches!(
+            attribute.argument("aliases").map(|value| &value.kind),
+            Some(AttributeValueKind::Array(values)) if values.len() == 2
+        ));
+        assert!(matches!(
+            attribute.arguments.as_ref().and_then(|arguments| arguments.last()).map(|argument| &argument.kind),
+            Some(AttributeArgumentKind::Nested { path, arguments })
+                if path[0].name == "nested" && arguments.len() == 2
+        ));
+    }
+
+    #[test]
+    fn preserves_legacy_attribute_and_cfg_projections() {
+        let parsed = parse_str(
+            r#"
+                #[cfg(all(test, not(target = "browser")))]
+                #[should_panic(expected = "failure")]
+                #[infer_closure(map_like)]
+                fn sample() {}
+            "#,
+        );
+        assert!(parsed.errors.is_empty(), "errors: {:?}", parsed.errors);
+        let file = parsed.file.unwrap();
+        let item = &file.items[0];
+        assert!(matches!(
+            item.cfg_predicate(),
+            Some(CfgPredicate::All(predicates)) if predicates.len() == 2
+        ));
+        assert_eq!(item.expected_panic_message(), Some("failure"));
+        assert_eq!(item.attributes[2].value.as_deref(), Some("map_like"));
+    }
+
+    #[test]
+    fn namespaced_builtin_lookalikes_do_not_change_language_behavior() {
+        let parsed = parse_str("#[vendor::test]\nfn sample() {}");
+        assert!(parsed.errors.is_empty(), "errors: {:?}", parsed.errors);
+        let item = &parsed.file.unwrap().items[0];
+        assert!(!item.is_test());
+    }
+
+    #[test]
+    fn rejects_executable_or_out_of_range_attribute_values() {
+        for source in [
+            "#[red::command(name = make_name())] fn sample() {}",
+            "#[red::command(weight = 1.5)] fn sample() {}",
+            "#[red::command(weight = 9223372036854775808)] fn sample() {}",
+            "#[red::command(name = { value: 1 })] fn sample() {}",
+        ] {
+            let parsed = parse_str(source);
+            assert!(!parsed.errors.is_empty(), "unexpectedly accepted {source}");
+        }
+
+        let parsed = parse_str("#[red::command(weight = -9223372036854775808)] fn sample() {}");
+        assert!(parsed.errors.is_empty(), "errors: {:?}", parsed.errors);
+    }
+
+    #[test]
+    fn rejects_excessively_nested_attribute_metadata() {
+        let nested = format!(
+            "#[red::command(values = {}0{})] fn sample() {{}}",
+            "[".repeat(MAX_ATTRIBUTE_METADATA_DEPTH),
+            "]".repeat(MAX_ATTRIBUTE_METADATA_DEPTH),
+        );
+        let parsed = parse_str(&nested);
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|error| error.message.contains("maximum nesting depth"))
+        );
+    }
+
+    #[test]
+    fn propagates_file_paths_into_all_attribute_metadata_spans() {
+        use husk_ast::SetFilePath;
+
+        let parsed = parse_str(
+            r#"#[red::command(name = "Open", aliases = ["open"], group(flag))] fn sample() {}"#,
+        );
+        assert!(parsed.errors.is_empty(), "errors: {:?}", parsed.errors);
+        let mut file = parsed.file.unwrap();
+        file.items[0].set_file_path("sample.hk".into());
+        let attribute = &file.items[0].attributes[0];
+        assert_eq!(attribute.span.file.as_deref(), Some("sample.hk"));
+        assert!(
+            attribute
+                .path
+                .iter()
+                .all(|segment| segment.span.file.as_deref() == Some("sample.hk"))
+        );
+        assert!(
+            attribute
+                .arguments
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|argument| argument.span.file.as_deref() == Some("sample.hk"))
+        );
+    }
 
     #[test]
     fn fragment_entry_points_distinguish_complete_incomplete_and_invalid_input() {

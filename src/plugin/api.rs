@@ -8,10 +8,14 @@
 //! Validation is deliberately conservative: a call that cannot be resolved safely is
 //! rejected rather than deferred to a dynamic runtime failure.
 
-use std::{collections::HashMap, ops::Range};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+};
 
 use husk_ast::{
-    Expr, ExprKind, File, ImplItemKind, ItemKind, LiteralKind, Span, Stmt, StmtKind, UnaryOp,
+    Attribute, AttributeArgumentKind, AttributeValueKind, Expr, ExprKind, ExternItemKind, File,
+    ImplItemKind, ItemKind, LiteralKind, ModItemKind, Param, Span, Stmt, StmtKind, UnaryOp,
 };
 use husk_diagnostics::{Diagnostic, Report, SourceFile};
 use once_cell::sync::Lazy;
@@ -52,6 +56,226 @@ static HOST_CALLS: Lazy<HashMap<(&'static str, &'static str), &'static HostCall>
             .map(|call| ((call.kind.as_str(), call.name.as_str()), call))
             .collect()
     });
+
+/// Validated, host-specific wiring declared on a top-level Husk function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RedFunctionAnnotation {
+    Command {
+        name: String,
+        title: Option<String>,
+        category: Option<String>,
+        description: Option<String>,
+        aliases: Vec<String>,
+    },
+    Event {
+        name: String,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct RedAnnotationError {
+    pub span: Span,
+    pub message: String,
+}
+
+fn annotation_error(attribute: &Attribute, message: impl Into<String>) -> RedAnnotationError {
+    RedAnnotationError {
+        span: attribute.span.clone(),
+        message: message.into(),
+    }
+}
+
+fn annotation_value_error(span: &Span, message: impl Into<String>) -> RedAnnotationError {
+    RedAnnotationError {
+        span: span.clone(),
+        message: message.into(),
+    }
+}
+
+/// Validate and decode Red annotations while leaving unrelated namespaces inert.
+pub(crate) fn red_function_annotations(
+    attributes: &[Attribute],
+    parameter_count: usize,
+) -> Result<Vec<RedFunctionAnnotation>, RedAnnotationError> {
+    let mut annotations = Vec::new();
+    let mut events = HashSet::new();
+
+    for attribute in attributes {
+        if attribute
+            .path
+            .first()
+            .is_none_or(|segment| segment.name != "red")
+        {
+            continue;
+        }
+        if attribute.matches_path(&["red", "command"]) {
+            if parameter_count != 0 {
+                return Err(annotation_error(
+                    attribute,
+                    "`#[red::command]` requires a function without parameters",
+                ));
+            }
+            let Some(arguments) = attribute.arguments.as_ref() else {
+                return Err(annotation_error(
+                    attribute,
+                    "`#[red::command]` requires named metadata arguments",
+                ));
+            };
+            if attribute.assignment.is_some() {
+                return Err(annotation_error(
+                    attribute,
+                    "`#[red::command]` does not support direct assignment",
+                ));
+            }
+
+            let mut seen = HashSet::new();
+            let mut name = None;
+            let mut title = None;
+            let mut category = None;
+            let mut description = None;
+            let mut aliases = Vec::new();
+            for argument in arguments {
+                let AttributeArgumentKind::Named { name: key, value } = &argument.kind else {
+                    return Err(annotation_value_error(
+                        &argument.span,
+                        "`#[red::command]` accepts named metadata arguments only",
+                    ));
+                };
+                if !seen.insert(key.name.as_str()) {
+                    return Err(annotation_value_error(
+                        &key.span,
+                        format!("duplicate command metadata key `{}`", key.name),
+                    ));
+                }
+                match key.name.as_str() {
+                    "name" | "title" | "category" | "description" => {
+                        let Some(text) = value.as_str() else {
+                            return Err(annotation_value_error(
+                                &value.span,
+                                format!("command metadata `{}` must be a string", key.name),
+                            ));
+                        };
+                        if key.name == "name" && text.trim().is_empty() {
+                            return Err(annotation_value_error(
+                                &value.span,
+                                "command name cannot be empty",
+                            ));
+                        }
+                        let target = match key.name.as_str() {
+                            "name" => &mut name,
+                            "title" => &mut title,
+                            "category" => &mut category,
+                            "description" => &mut description,
+                            _ => unreachable!("matched metadata keys above"),
+                        };
+                        *target = Some(text.to_string());
+                    }
+                    "aliases" => {
+                        let AttributeValueKind::Array(values) = &value.kind else {
+                            return Err(annotation_value_error(
+                                &value.span,
+                                "command metadata `aliases` must be an array of strings",
+                            ));
+                        };
+                        for alias in values {
+                            let Some(text) = alias.as_str() else {
+                                return Err(annotation_value_error(
+                                    &alias.span,
+                                    "command aliases must be strings",
+                                ));
+                            };
+                            if text.trim().is_empty() {
+                                return Err(annotation_value_error(
+                                    &alias.span,
+                                    "command aliases cannot be empty",
+                                ));
+                            }
+                            aliases.push(text.to_string());
+                        }
+                    }
+                    _ => {
+                        return Err(annotation_value_error(
+                            &key.span,
+                            format!("unknown command metadata key `{}`", key.name),
+                        ));
+                    }
+                }
+            }
+            let Some(name) = name else {
+                return Err(annotation_error(
+                    attribute,
+                    "`#[red::command]` requires a nonempty `name`",
+                ));
+            };
+            annotations.push(RedFunctionAnnotation::Command {
+                name,
+                title,
+                category,
+                description,
+                aliases,
+            });
+        } else if attribute.matches_path(&["red", "on"]) {
+            if parameter_count != 1 {
+                return Err(annotation_error(
+                    attribute,
+                    "`#[red::on]` requires a function with exactly one parameter",
+                ));
+            }
+            let Some(arguments) = attribute.arguments.as_ref() else {
+                return Err(annotation_error(
+                    attribute,
+                    "`#[red::on]` requires exactly one event-name argument",
+                ));
+            };
+            if arguments.len() != 1 {
+                return Err(annotation_error(
+                    attribute,
+                    "`#[red::on]` requires exactly one event-name argument",
+                ));
+            }
+            let AttributeArgumentKind::Positional(value) = &arguments[0].kind else {
+                return Err(annotation_value_error(
+                    &arguments[0].span,
+                    "the event name must be a positional string",
+                ));
+            };
+            let Some(name) = value.as_str() else {
+                return Err(annotation_value_error(
+                    &value.span,
+                    "the event name must be a string",
+                ));
+            };
+            if name.trim().is_empty() {
+                return Err(annotation_value_error(
+                    &value.span,
+                    "event name cannot be empty",
+                ));
+            }
+            if !events.insert(name) {
+                return Err(annotation_error(
+                    attribute,
+                    format!("duplicate event annotation `{name}` on the same function"),
+                ));
+            }
+            annotations.push(RedFunctionAnnotation::Event {
+                name: name.to_string(),
+            });
+        } else {
+            let path = attribute
+                .path
+                .iter()
+                .map(|segment| segment.name.as_str())
+                .collect::<Vec<_>>()
+                .join("::");
+            return Err(annotation_error(
+                attribute,
+                format!("unknown Red attribute `#[{path}]`"),
+            ));
+        }
+    }
+
+    Ok(annotations)
+}
 
 struct HostCallSite<'a> {
     kind: &'static str,
@@ -275,6 +499,22 @@ pub(crate) fn validate_parsed_source(
 ) -> anyhow::Result<()> {
     let mut source_file = None;
     let mut diagnostics = Vec::new();
+    for error in validate_red_attribute_sites(file) {
+        diagnostics.push(
+            Diagnostic::new(
+                "HUSK-A0004",
+                error.message,
+                source_file
+                    .get_or_insert_with(|| SourceFile::new(path, source))
+                    .clone(),
+                error.span,
+                "invalid Red plugin annotation",
+            )
+            .with_note(format!(
+                "plugin `{name}` declares static host wiring; see docs/PLUGIN_API.md"
+            )),
+        );
+    }
     for site in host_call_sites(file) {
         let Some(call) = HOST_CALLS.get(&(site.kind, site.action)).copied() else {
             diagnostics.push(
@@ -371,6 +611,123 @@ pub(crate) fn validate_parsed_source(
     }
 }
 
+fn validate_red_attribute_sites(file: &File) -> Vec<RedAnnotationError> {
+    let mut errors = Vec::new();
+    let mut commands = HashSet::new();
+    for item in &file.items {
+        match &item.kind {
+            ItemKind::Fn { params, .. } => {
+                match red_function_annotations(&item.attributes, params.len()) {
+                    Ok(annotations) => {
+                        for annotation in annotations {
+                            if let RedFunctionAnnotation::Command { name, .. } = annotation {
+                                if !commands.insert(name.clone()) {
+                                    let attribute = item
+                                        .attributes
+                                        .iter()
+                                        .find(|attribute| {
+                                            attribute.matches_path(&["red", "command"])
+                                        })
+                                        .expect("a decoded command originated in an attribute");
+                                    errors.push(annotation_error(
+                                        attribute,
+                                        format!("duplicate command annotation `{name}`"),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => errors.push(error),
+                }
+                reject_parameter_annotations(params, &mut errors);
+            }
+            ItemKind::Trait(definition) => {
+                reject_red_attributes(&item.attributes, &mut errors);
+                for trait_item in &definition.items {
+                    let husk_ast::TraitItemKind::Method(method) = &trait_item.kind;
+                    reject_red_attributes(&method.attributes, &mut errors);
+                    reject_parameter_annotations(&method.params, &mut errors);
+                }
+            }
+            ItemKind::Impl(block) => {
+                reject_red_attributes(&item.attributes, &mut errors);
+                for impl_item in &block.items {
+                    match &impl_item.kind {
+                        ImplItemKind::Method(method) => {
+                            reject_red_attributes(&method.attributes, &mut errors);
+                            reject_parameter_annotations(&method.params, &mut errors);
+                        }
+                        ImplItemKind::Property(property) => {
+                            reject_red_attributes(&property.attributes, &mut errors);
+                        }
+                    }
+                }
+            }
+            ItemKind::ExternBlock { items, .. } => {
+                reject_red_attributes(&item.attributes, &mut errors);
+                for extern_item in items {
+                    reject_red_attributes(&extern_item.attributes, &mut errors);
+                    match &extern_item.kind {
+                        ExternItemKind::Fn { params, .. } => {
+                            reject_parameter_annotations(params, &mut errors);
+                        }
+                        ExternItemKind::Mod { items, .. } => {
+                            for mod_item in items {
+                                reject_red_attributes(&mod_item.attributes, &mut errors);
+                                let ModItemKind::Fn { params, .. } = &mod_item.kind;
+                                reject_parameter_annotations(params, &mut errors);
+                            }
+                        }
+                        ExternItemKind::Impl { items, .. } => {
+                            for impl_item in items {
+                                match &impl_item.kind {
+                                    ImplItemKind::Method(method) => {
+                                        reject_red_attributes(&method.attributes, &mut errors);
+                                        reject_parameter_annotations(&method.params, &mut errors);
+                                    }
+                                    ImplItemKind::Property(property) => {
+                                        reject_red_attributes(&property.attributes, &mut errors);
+                                    }
+                                }
+                            }
+                        }
+                        ExternItemKind::Struct { .. }
+                        | ExternItemKind::Static { .. }
+                        | ExternItemKind::Const { .. } => {}
+                    }
+                }
+            }
+            ItemKind::Mod { .. }
+            | ItemKind::Struct { .. }
+            | ItemKind::Enum { .. }
+            | ItemKind::TypeAlias { .. }
+            | ItemKind::Use { .. } => reject_red_attributes(&item.attributes, &mut errors),
+        }
+    }
+    errors
+}
+
+fn reject_parameter_annotations(parameters: &[Param], errors: &mut Vec<RedAnnotationError>) {
+    for parameter in parameters {
+        reject_red_attributes(&parameter.attributes, errors);
+    }
+}
+
+fn reject_red_attributes(attributes: &[Attribute], errors: &mut Vec<RedAnnotationError>) {
+    for attribute in attributes {
+        if attribute
+            .path
+            .first()
+            .is_some_and(|segment| segment.name == "red")
+        {
+            errors.push(annotation_error(
+                attribute,
+                "Red annotations are only supported on top-level functions",
+            ));
+        }
+    }
+}
+
 fn signature_parameters(signature: &str) -> Vec<(&str, &str, bool)> {
     let body = signature
         .strip_prefix('(')
@@ -447,6 +804,114 @@ fn literal_matches(expected: &str, actual: &str) -> bool {
 mod tests {
     use super::*;
     use regex::Regex;
+
+    #[test]
+    fn decodes_structured_command_and_event_annotations() {
+        let source = r#"
+            #[red::command(
+                name = "OpenSymbols",
+                title = "Open symbols",
+                category = "LSP",
+                description = "Browse symbols",
+                aliases = ["outline", "symbols"],
+            )]
+            fn open_symbols() {}
+
+            #[red::on("editor:changed")]
+            #[red::on("timeout:callback")]
+            fn changed(event: Json) {}
+        "#;
+        let parsed = husk_parser::parse_str(source);
+        assert!(parsed.errors.is_empty(), "errors: {:?}", parsed.errors);
+        let file = parsed.file.unwrap();
+        assert_eq!(
+            red_function_annotations(&file.items[0].attributes, 0).unwrap(),
+            vec![RedFunctionAnnotation::Command {
+                name: "OpenSymbols".to_string(),
+                title: Some("Open symbols".to_string()),
+                category: Some("LSP".to_string()),
+                description: Some("Browse symbols".to_string()),
+                aliases: vec!["outline".to_string(), "symbols".to_string()],
+            }]
+        );
+        assert_eq!(
+            red_function_annotations(&file.items[1].attributes, 1).unwrap(),
+            vec![
+                RedFunctionAnnotation::Event {
+                    name: "editor:changed".to_string(),
+                },
+                RedFunctionAnnotation::Event {
+                    name: "timeout:callback".to_string(),
+                },
+            ]
+        );
+        validate_source("valid", "plugins/valid.hk", source).unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_red_annotation_schemas_with_source_diagnostics() {
+        for (source, expected) in [
+            (
+                "#[red::command(name = \"Open\")] fn open(value: i32) {}",
+                "without parameters",
+            ),
+            ("#[red::command(title = \"Open\")] fn open() {}", "requires a nonempty `name`"),
+            ("#[red::command(name = \"\")] fn open() {}", "command name cannot be empty"),
+            (
+                "#[red::command(name = \"Open\", name = \"Again\")] fn open() {}",
+                "duplicate command metadata key",
+            ),
+            (
+                "#[red::command(name = \"Open\", unknown = true)] fn open() {}",
+                "unknown command metadata key",
+            ),
+            (
+                "#[red::command(name = \"Open\", aliases = [42])] fn open() {}",
+                "command aliases must be strings",
+            ),
+            ("#[red::on(\"changed\")] fn changed() {}", "exactly one parameter"),
+            (
+                "#[red::on(name = \"changed\")] fn changed(event: Json) {}",
+                "positional string",
+            ),
+            (
+                "#[red::on(\"changed\")] #[red::on(\"changed\")] fn changed(event: Json) {}",
+                "duplicate event annotation",
+            ),
+            ("#[red::missing] fn changed() {}", "unknown Red attribute"),
+            (
+                "#[red::command(name = \"Open\")] struct Item {}",
+                "only supported on top-level functions",
+            ),
+            (
+                "fn open(#[red::on(\"changed\")] value: Json) {}",
+                "only supported on top-level functions",
+            ),
+            (
+                "#[red::command(name = \"Open\")] fn first() {} #[red::command(name = \"Open\")] fn second() {}",
+                "duplicate command annotation",
+            ),
+        ] {
+            let error = validate_source("invalid", "plugins/invalid.hk", source)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("HUSK-A0004"), "missing code: {error}");
+            assert!(
+                error.contains(expected),
+                "expected {expected:?} in {error:?} for {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_attribute_namespaces_remain_inert() {
+        validate_source(
+            "valid",
+            "plugins/valid.hk",
+            r#"#[other::command(name = "Open")] fn open(value: i32) {}"#,
+        )
+        .unwrap();
+    }
 
     #[test]
     fn schema_version_matches_runtime_contract() {

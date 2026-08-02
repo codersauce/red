@@ -203,7 +203,7 @@ impl StdlibIndex {
     fn extract_js_name(attrs: &[Attribute]) -> Option<String> {
         attrs
             .iter()
-            .find(|a| a.name.name == "js_name")
+            .find(|attribute| attribute.is("js_name"))
             .and_then(|a| a.value.clone())
     }
 
@@ -213,7 +213,7 @@ impl StdlibIndex {
         return_type: &Option<TypeExpr>,
     ) -> InferenceStrategy {
         // Check for explicit #[infer_closure(...)] attribute first
-        if let Some(attr) = attrs.iter().find(|a| a.name.name == "infer_closure") {
+        if let Some(attr) = attrs.iter().find(|attribute| attribute.is("infer_closure")) {
             return Self::parse_inference_attr(attr);
         }
 

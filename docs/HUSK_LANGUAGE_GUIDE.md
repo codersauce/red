@@ -401,6 +401,49 @@ bundle metadata, stages the full extension set, atomically replaces
 under `vendor/` and older locks without an adapter-report digest remain
 supported.
 
+## Attributes
+
+Attributes attach static metadata to declarations. Their names may contain
+namespace segments, and their arguments are data rather than executable Husk
+expressions:
+
+```husk
+#[test]
+#[should_panic(expected = "missing value")]
+fn expected_failure() {
+    panic("missing value");
+}
+
+#[red::command(
+    name = "OpenSymbols",
+    title = "Open symbols",
+    aliases = ["outline", "symbols"],
+)]
+fn open_symbols() {}
+
+#[red::on("editor:changed")]
+fn editor_changed(event: Json) {}
+```
+
+The supported forms are:
+
+```text
+attribute = "#[" path ("=" value | "(" arguments? ")")? "]"
+path      = identifier ("::" identifier)*
+arguments = argument ("," argument)* ","?
+argument  = value | identifier "=" value | path "(" arguments? ")"
+value     = string | bool | signed-integer | path | "[" values? "]"
+values    = value ("," value)* ","?
+```
+
+Integer values must fit in `i64`; arrays and nested metadata groups have a
+bounded nesting depth. Calls, floating-point values, object expressions, and
+other executable expressions are rejected. The Husk runtime preserves
+annotation paths, argument order, source spans, and values, but namespaced
+attributes remain inert unless their embedding host explicitly recognizes
+them. Existing unqualified attributes such as `#[test]`, `#[cfg(...)]`, and
+`#[js_name = "..."]` retain their current behavior.
+
 ## Tests
 
 Test functions use Rust-like attributes:

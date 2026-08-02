@@ -23,8 +23,8 @@ use std::{
 };
 
 use husk_runtime::{
-    Callback, CompileOptions, CompiledProgram, Host, PackageLimits, ResolvedPackage,
-    SemanticProfile, Value,
+    AnnotatedFunction, Callback, CompileOptions, CompiledProgram, Host, PackageLimits,
+    ResolvedPackage, SemanticProfile, Value,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -2268,6 +2268,64 @@ impl Host for RedHost {
         RedHost::call_module(self, plugin, path, args)
     }
 
+    fn register_annotated_function(
+        &mut self,
+        plugin: &str,
+        function: &AnnotatedFunction,
+    ) -> anyhow::Result<()> {
+        let annotations =
+            super::api::red_function_annotations(function.attributes(), function.parameter_count())
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "invalid Red plugin annotation at bytes {}..{}: {}",
+                        error.span.range.start,
+                        error.span.range.end,
+                        error.message
+                    )
+                })?;
+        for annotation in annotations {
+            match annotation {
+                super::api::RedFunctionAnnotation::Command {
+                    name,
+                    title,
+                    category,
+                    description,
+                    aliases,
+                } => {
+                    if let Some(existing) = self.policy().commands.get(&name) {
+                        if existing.callback.plugin() == plugin {
+                            anyhow::bail!("duplicate command annotation `{name}`");
+                        }
+                        anyhow::bail!(
+                            "command `{name}` is already registered by plugin `{}`",
+                            existing.callback.plugin()
+                        );
+                    }
+                    self.policy_mut().commands.insert(
+                        name,
+                        RedCommand {
+                            callback: function.callback().clone(),
+                            metadata: CommandMetadata {
+                                title,
+                                category,
+                                description,
+                                aliases,
+                            },
+                        },
+                    );
+                }
+                super::api::RedFunctionAnnotation::Event { name } => {
+                    self.policy_mut()
+                        .event_listeners
+                        .entry(name)
+                        .or_default()
+                        .push(function.callback().clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn begin_reload_replacement(&mut self, plugin: &str) {
         RedHost::begin_reload_replacement(self, plugin);
     }
@@ -4025,6 +4083,226 @@ mod tests {
         );
         assert_eq!(commands[1].metadata.category.as_deref(), Some("Search"));
         assert_eq!(commands[1].metadata.aliases, vec!["ripgrep"]);
+    }
+
+    #[tokio::test]
+    async fn annotated_commands_and_events_register_before_activation() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let source = r#"
+            pub fn activate() {
+                red::state_set("ready", true);
+            }
+
+            #[red::command(
+                name = "OpenSymbols",
+                title = "Open symbols",
+                category = "LSP",
+                description = "Browse document symbols",
+                aliases = ["outline", "symbols"],
+            )]
+            fn open() {
+                red::execute("Print", "command");
+            }
+
+            #[red::on("editor:changed")]
+            #[red::on("timeout:callback")]
+            fn changed(event: Json) {
+                red::execute("Print", "event");
+            }
+        "#;
+        let mut runtime = Runtime::new();
+        runtime.load_plugin("annotated", source).await.unwrap();
+
+        assert_eq!(
+            runtime.command_plugin("OpenSymbols").as_deref(),
+            Some("annotated")
+        );
+        let command = runtime
+            .registered_commands()
+            .into_iter()
+            .find(|command| command.name == "OpenSymbols")
+            .unwrap();
+        assert_eq!(command.metadata.title.as_deref(), Some("Open symbols"));
+        assert_eq!(command.metadata.category.as_deref(), Some("LSP"));
+        assert_eq!(
+            command.metadata.description.as_deref(),
+            Some("Browse document symbols")
+        );
+        assert_eq!(command.metadata.aliases, ["outline", "symbols"]);
+
+        runtime.execute_command("OpenSymbols").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "command"
+        ));
+        runtime
+            .notify("editor:changed", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "event"
+        ));
+        runtime
+            .notify("timeout:callback", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "event"
+        ));
+    }
+
+    #[tokio::test]
+    async fn annotated_command_collisions_preserve_the_existing_owner() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "first",
+                r#"
+                    #[red::command(name = "Shared")]
+                    fn shared() { red::execute("Print", "first"); }
+                "#,
+            )
+            .await
+            .unwrap();
+        let error = runtime
+            .load_plugin(
+                "second",
+                r#"
+                    #[red::command(name = "Shared")]
+                    fn shared() { red::execute("Print", "second"); }
+                    pub fn activate() { red::execute("Print", "leaked"); }
+                "#,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("already registered by plugin `first`"),
+            "{error}"
+        );
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        assert_eq!(runtime.command_plugin("Shared").as_deref(), Some("first"));
+        runtime.execute_command("Shared").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "first"
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_annotated_reload_preserves_previous_commands_and_events() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "annotated-reload",
+                r#"
+                    #[red::command(name = "Stable")]
+                    fn stable() { red::execute("Print", "stable"); }
+                    #[red::on("editor:changed")]
+                    fn changed(event: Json) { red::execute("Print", "original event"); }
+                "#,
+            )
+            .await
+            .unwrap();
+
+        let error = runtime
+            .load_plugin(
+                "annotated-reload",
+                r#"
+                    #[red::command(name = "Leaked")]
+                    fn leaked() { red::execute("Print", "replacement"); }
+                    #[red::on("editor:changed")]
+                    fn changed(event: Json) { red::execute("Print", "replacement event"); }
+                    pub fn activate() { red::execute("Print", 1 / 0); }
+                "#,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("integer division by zero"), "{error}");
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        assert_eq!(runtime.command_plugin("Leaked"), None);
+        runtime.execute_command("Stable").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "stable"
+        ));
+        runtime
+            .notify("editor:changed", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "original event"
+        ));
+    }
+
+    #[tokio::test]
+    async fn annotation_validation_remains_safe_without_static_typechecking() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime.set_typecheck_enabled(false);
+        let error = runtime
+            .load_plugin(
+                "unchecked",
+                r#"
+                    #[red::command(title = "Missing name")]
+                    fn broken() {}
+                    pub fn activate() { red::execute("Print", "leaked"); }
+                "#,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires a nonempty `name`"), "{error}");
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+        assert!(runtime.registered_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn annotated_package_module_commands_register_and_execute() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let directory = tempfile::tempdir().unwrap();
+        let source_directory = directory.path().join("src");
+        std::fs::create_dir(&source_directory).unwrap();
+        std::fs::write(
+            directory.path().join("Husk.toml"),
+            "[package]\nname = \"module-annotations\"\nversion = \"0.1.0\"\nentry = \"src/main.hk\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source_directory.join("main.hk"),
+            "mod commands; pub fn activate() {}",
+        )
+        .unwrap();
+        std::fs::write(
+            source_directory.join("commands.hk"),
+            r#"
+                #[red::command(name = "FromModule", title = "Package command")]
+                pub fn open() { red::execute("Print", "package module"); }
+            "#,
+        )
+        .unwrap();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin_package("module-annotations", &directory.path().join("Husk.toml"))
+            .await
+            .unwrap();
+        runtime.execute_command("FromModule").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message)) if message == "package module"
+        ));
     }
 
     #[tokio::test]
@@ -10853,6 +11131,37 @@ mod tests {
         assert!(!runtime
             .notify_picker(handle, PickerCallback::Selected(item))
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn lsp_symbols_annotations_preserve_all_command_discovery_metadata() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        load_lsp_symbols(&mut runtime).await;
+
+        let commands = runtime.registered_commands();
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect::<Vec<_>>(),
+            ["LspDocumentSymbols", "LspReferences", "LspWorkspaceSymbols"]
+        );
+        let document = &commands[0];
+        assert_eq!(document.plugin, "lsp_symbols");
+        assert_eq!(
+            document.metadata.title.as_deref(),
+            Some("Show document symbols")
+        );
+        assert_eq!(document.metadata.category.as_deref(), Some("LSP"));
+        assert_eq!(
+            document.metadata.description.as_deref(),
+            Some("Find symbols in the current document")
+        );
+        assert_eq!(document.metadata.aliases, ["outline", "symbols"]);
+        assert_eq!(commands[1].metadata.aliases, ["usages", "references"]);
+        assert_eq!(commands[2].metadata.aliases, ["symbols"]);
     }
 
     #[tokio::test]

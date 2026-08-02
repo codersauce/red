@@ -23,7 +23,7 @@ the interpreter must update this matrix and its conformance tests intentionally.
 
 | Construct | Status | Current production behavior |
 | --- | --- | --- |
-| Function | Executed | Stored by unqualified name. Parameter and return types, type parameters, visibility, and attributes do not affect execution. A later duplicate name replaces an earlier one. |
+| Function | Executed | Stored by qualified source-module name. Parameter and return types, type parameters, and visibility do not affect execution. Structured source attributes are retained and offered to the embedding host before activation; hosts that do not recognize an attribute leave it inert. |
 | Struct | Compile-only | Parsed, then discarded while constructing `Program`. Struct *expressions* separately become anonymous objects. |
 | Enum | Compile-only | Parsed, then discarded. |
 | Type alias | Compile-only | Parsed, then discarded. |
