@@ -4,6 +4,44 @@
 // and completion schedules removal rather than blocking the editor. Deactivation cancels
 // animation and completion timers before removing the overlay.
 
+struct FidgetUiStyle {
+    popup_title: Style,
+    muted: Style,
+}
+
+struct FidgetTheme {
+    ui_style: FidgetUiStyle,
+}
+
+struct FidgetEditorInfo {
+    size: [i32],
+    theme: FidgetTheme,
+}
+
+struct LspProgressEvent {
+    value: Json,
+    kind: String,
+    token: Json,
+    lsp_client: Json,
+    message: String,
+    percentage: Json,
+    title: String,
+}
+
+struct FidgetItem {
+    token: String,
+    group: String,
+    message: String,
+    title: String,
+    done: bool,
+}
+
+struct DoneTimer {
+    id: String,
+    group: String,
+    token: String,
+}
+
 pub fn activate() {
     red::on("editor:resize", resized);
     red::on("lsp:progress", progress);
@@ -16,7 +54,7 @@ pub fn activate() {
     red::request("GetEditorInfo", info_loaded);
 }
 
-fn info_loaded(info: Json) {
+fn info_loaded(info: FidgetEditorInfo) {
     red::state_set("fidget_info", info);
     red::execute("CreateOverlay", "fidget-progress", OverlayConfig {
         align: "bottom",
@@ -27,14 +65,14 @@ fn info_loaded(info: Json) {
     refresh();
 }
 
-fn resized(size: Json) {
-    let info = red::state("fidget_info");
+fn resized(size: [i32]) {
+    let info: FidgetEditorInfo = red::state("fidget_info");
     info.size = size;
     red::state_set("fidget_info", info);
     refresh();
 }
 
-fn progress(event: Json) {
+fn progress(event: LspProgressEvent) {
     let value = event.value;
     if value == red::null() {
         value = event;
@@ -68,7 +106,7 @@ fn progress(event: Json) {
         message = message + " (" + red::int(percentage, 0) + "%)";
     }
     let title = red::string(event.title, red::string(value.title, ""));
-    let items = [];
+    let items: [FidgetItem] = [];
     let found = false;
     for item in red::state("fidget_items") {
         if item.token == token && item.group == group {
@@ -122,7 +160,7 @@ fn schedule_done(group: String, token: String) {
 }
 
 fn clear_done_timer(group: String, token: String) {
-    let timers = [];
+    let timers: [DoneTimer] = [];
     for timer in red::state("fidget_done_timers") {
         if timer.group != group || timer.token != token {
             timers = red::push(timers, timer);
@@ -151,7 +189,7 @@ fn start_animation() {
     red::state_set("fidget_animation", red::execute("SetTimeout", 100));
 }
 
-fn timeout_callback(event: Json) {
+fn timeout_callback(event: TimerEvent) {
     if event.timer_id == red::state("fidget_animation") {
         red::state_set("fidget_animation", "");
         red::state_set("fidget_frame", red::int(red::state("fidget_frame"), 0) + 1);
@@ -159,7 +197,7 @@ fn timeout_callback(event: Json) {
         start_animation();
         return;
     }
-    let timers = [];
+    let timers: [DoneTimer] = [];
     for timer in red::state("fidget_done_timers") {
         if timer.id == event.timer_id {
             remove_item(timer.group, timer.token);
@@ -172,7 +210,7 @@ fn timeout_callback(event: Json) {
 }
 
 fn remove_item(group: String, token: String) {
-    let items = [];
+    let items: [FidgetItem] = [];
     for item in red::state("fidget_items") {
         if item.group != group || item.token != token {
             items = red::push(items, item);
@@ -196,7 +234,7 @@ fn spinner() -> String {
 }
 
 fn refresh() {
-    let groups = [];
+    let groups: [String] = [];
     for item in red::state("fidget_items") {
         if !red::contains(groups, item.group) {
             groups = red::push(groups, item.group);
@@ -251,6 +289,8 @@ fn group_active(group: String) -> bool {
     return false;
 }
 
+// Overlay lines are heterogeneous `[text, style]` host tuples, so their style slot
+// remains dynamic until the overlay protocol has a concrete line type.
 fn header_style() -> Json {
     let style = red::state("fidget_info").theme.ui_style.popup_title;
     if style == red::null() {

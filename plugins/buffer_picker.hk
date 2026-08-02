@@ -3,8 +3,31 @@
 // The editor snapshot is authoritative for buffer identity and active state. Selection
 // requests a normal buffer switch and never mutates buffer contents.
 
+struct BufferSummary {
+    name: String,
+}
+
+struct EditorInfo {
+    buffers: [BufferSummary],
+}
+
+struct BufferPickerData {
+    name: String,
+}
+
+struct BufferPickerItem {
+    id: String,
+    label: String,
+    kind: String,
+    data: BufferPickerData,
+}
+
+struct BufferPickerHandlers {
+    selected: fn(BufferPickerItem),
+}
+
 pub fn activate() {
-    red::add_command("BufferPicker", buffer_picker, Json {
+    red::add_command("BufferPicker", buffer_picker, CommandMetadata {
         title: "Open buffer picker",
         category: "Buffer",
         description: "Find and switch between open buffers",
@@ -16,16 +39,16 @@ fn buffer_picker() {
     red::request("GetEditorInfo", editor_info_loaded);
 }
 
-fn editor_info_loaded(info: Json) {
-    let items = [];
+fn editor_info_loaded(info: EditorInfo) {
+    let items: [BufferPickerItem] = [];
     let index = 0;
     while index < red::len(info.buffers) && index < 500 {
         let buffer = info.buffers[index];
-        items = red::push(items, PickerItem {
+        items = red::push(items, BufferPickerItem {
             id: buffer.name,
             label: buffer.name,
             kind: "Buffer",
-            data: Json {
+            data: BufferPickerData {
                 name: buffer.name,
             },
         });
@@ -39,11 +62,11 @@ fn editor_info_loaded(info: Json) {
     red::execute("OpenPicker", "Buffers", items, PickerOptions {
         placeholder: "Filter buffers",
         status: status,
-    }, PickerHandlers {
+    }, BufferPickerHandlers {
         selected: buffer_selected,
     });
 }
 
-fn buffer_selected(item: PickerItem) {
+fn buffer_selected(item: BufferPickerItem) {
     red::execute("OpenBuffer", item.data.name);
 }

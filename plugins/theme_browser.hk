@@ -4,8 +4,36 @@
 // cancellation restores the original, and only explicit selection persists the chosen
 // theme through the core configuration boundary.
 
+struct ThemeConfigValue {
+    value: String,
+}
+
+struct RuntimeAssetListing {
+    entries: [RuntimeAssetEntry],
+    error: Json,
+}
+
+struct ThemePickerData {
+    theme: String,
+}
+
+struct ThemePickerItem {
+    id: String,
+    label: String,
+    kind: String,
+    annotation: String,
+    detail: String,
+    data: ThemePickerData,
+}
+
+struct ThemePickerHandlers {
+    changed: fn(ThemePickerItem),
+    cancelled: fn(PickerCancelled),
+    selected: fn(ThemePickerItem),
+}
+
 pub fn activate() {
-    red::add_command("ThemeBrowser", theme_browser, Json {
+    red::add_command("ThemeBrowser", theme_browser, CommandMetadata {
         title: "Browse themes",
         category: "View",
         description: "Preview and select an editor theme",
@@ -27,13 +55,13 @@ fn theme_browser() {
     red::request("ListRuntimeAssets", themes_loaded, "themes");
 }
 
-fn config_loaded(event: Json) {
+fn config_loaded(event: ThemeConfigValue) {
     red::state_set("theme_original", red::string(event.value, ""));
     red::state_set("theme_config_loaded", true);
     open_picker_if_ready();
 }
 
-fn themes_loaded(listing: Json) {
+fn themes_loaded(listing: RuntimeAssetListing) {
     if listing.error != red::null() {
         red::execute("Print", listing.error);
         return;
@@ -55,7 +83,7 @@ fn open_picker_if_ready() {
         return;
     }
 
-    let items = [];
+    let items: [ThemePickerItem] = [];
     let index = 0;
     while index < red::len(entries) && index < 500 {
         items = red::push(items, theme_item(entries[index]));
@@ -71,14 +99,14 @@ fn open_picker_if_ready() {
         status: status,
         initial_selection: red::string(red::state("theme_original"), ""),
         presentation: "compact",
-    }, PickerHandlers {
+    }, ThemePickerHandlers {
         changed: theme_changed,
         cancelled: theme_cancelled,
         selected: theme_selected,
     });
 }
 
-fn theme_item(entry: RuntimeAssetEntry) -> PickerItem {
+fn theme_item(entry: RuntimeAssetEntry) -> ThemePickerItem {
     let name = red::string(entry.name, entry.file);
 
     let detail = entry.source;
@@ -86,19 +114,19 @@ fn theme_item(entry: RuntimeAssetEntry) -> PickerItem {
         detail = detail + " shadows " + red::len(entry.shadows) + " lower-priority source";
     }
 
-    return PickerItem {
+    return ThemePickerItem {
         id: entry.file,
         label: name,
         kind: "Theme",
         annotation: entry.file,
         detail: detail,
-        data: Json {
+        data: ThemePickerData {
             theme: entry.file,
         },
     };
 }
 
-fn theme_changed(item: PickerItem) {
+fn theme_changed(item: ThemePickerItem) {
     red::execute("PreviewTheme", item.data.theme);
 }
 
@@ -109,6 +137,6 @@ fn theme_cancelled(event: PickerCancelled) {
     }
 }
 
-fn theme_selected(item: PickerItem) {
+fn theme_selected(item: ThemePickerItem) {
     red::execute("SetTheme", item.data.theme);
 }

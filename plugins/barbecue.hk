@@ -5,6 +5,137 @@
 // symbol ancestry is resolved from the small set of ranges containing the cursor; deactivate
 // cancels pending work and removes the plugin's chrome.
 
+struct BarbecueIconOptions {
+    // Symbol kinds are extensible, so overrides are an open string map.
+    overrides: Json,
+}
+
+struct BarbecueOptions {
+    enabled: bool,
+    truncate_marker: String,
+    separator: String,
+    nerd_font: bool,
+    show_directory: bool,
+    show_folder_icon: bool,
+    show_file: bool,
+    show_symbols: bool,
+    icons: BarbecueIconOptions,
+}
+
+struct BarbecuePluginConfig {
+    barbecue: BarbecueOptions,
+}
+
+struct BarbecueConfigValue {
+    cwd: String,
+    plugin_config: BarbecuePluginConfig,
+}
+
+struct BarbecueConfigEvent {
+    value: BarbecueConfigValue,
+}
+
+struct BarbecueCursor {
+    x: i32,
+    y: i32,
+}
+
+struct BarbecueWindow {
+    window_id: i32,
+    buffer_index: i32,
+    buffer_path: String,
+    revision: i32,
+    cursor: BarbecueCursor,
+    lsp_position: Position,
+}
+
+struct BarbecueWindowsResult {
+    windows: [BarbecueWindow],
+}
+
+struct BarbecueRange {
+    start: Position,
+    end: Position,
+}
+
+struct BarbecueSymbol {
+    id: String,
+    // Root symbols have no parent, while nested symbols carry a string ID.
+    parent_id: Json,
+    name: String,
+    kind_name: String,
+    file: String,
+    depth: i32,
+    range: BarbecueRange,
+    selection_range: BarbecueRange,
+}
+
+struct BarbecueSymbolsResult {
+    ok: bool,
+    file: String,
+    buffer_index: i32,
+    revision: i32,
+    symbols: [BarbecueSymbol],
+}
+
+struct SymbolRecord {
+    file: String,
+    buffer_index: i32,
+    revision: i32,
+    symbols: [BarbecueSymbol],
+}
+
+struct FileSavedEvent {
+    file: String,
+    buffer_index: i32,
+}
+
+struct CursorMovedEvent {
+    window_id: i32,
+    x: i32,
+    y: i32,
+    lsp_character: i32,
+}
+
+struct RenderedWindow {
+    window_id: i32,
+    buffer_path: String,
+}
+
+struct BarbecueThemeStyle {
+    bg: Json,
+}
+
+struct BarbecueTheme {
+    style: BarbecueThemeStyle,
+}
+
+struct BarbecueEditorInfo {
+    theme: BarbecueTheme,
+}
+
+struct BarThemeStyleSpec {
+    foreground: [String],
+    background: [String],
+    bold: bool,
+}
+
+struct BarWindowStyle {
+    semantic: BarThemeStyleSpec,
+    style: Style,
+}
+
+struct BarSegment {
+    id: String,
+    text: String,
+    style: BarWindowStyle,
+    action: String,
+}
+
+struct WindowBarActionEvent {
+    action: String,
+}
+
 pub fn activate() {
     red::on("editor:ready", refresh);
     red::on("editor:state_restored", refresh);
@@ -39,7 +170,7 @@ pub fn activate() {
     red::state_set("barbecue_enabled", true);
     red::state_set("barbecue_truncate_marker", "…");
     create_bar();
-    refresh(red::null());
+    refresh(EmptyEvent {});
 }
 
 fn create_bar() {
@@ -52,7 +183,7 @@ fn create_bar() {
     });
 }
 
-fn refresh(event: Json) {
+fn refresh(event: EmptyEvent) {
     if red::state_bool("barbecue_context_loaded") && !red::state_bool("barbecue_enabled") {
         return;
     }
@@ -61,16 +192,17 @@ fn refresh(event: Json) {
     }
     red::request("GetWindows", windows_loaded);
     if !red::state_bool("barbecue_info_loaded") {
-        info_loaded(red::editor_info());
+        let info: BarbecueEditorInfo = red::editor_info();
+        info_loaded(info);
     }
 }
 
-fn refresh_theme(event: Json) {
+fn refresh_theme(event: EmptyEvent) {
     red::state_set("barbecue_info_loaded", false);
-    refresh(red::null());
+    refresh(EmptyEvent {});
 }
 
-fn schedule_refresh(event: Json) {
+fn schedule_refresh(event: EmptyEvent) {
     let timer = red::string(red::state("barbecue_timer"), "");
     if timer != "" {
         red::execute("CancelTimeout", timer);
@@ -78,14 +210,14 @@ fn schedule_refresh(event: Json) {
     red::state_set("barbecue_timer", red::execute("SetTimeout", 120));
 }
 
-fn timeout_callback(event: Json) {
+fn timeout_callback(event: TimerEvent) {
     if event.timer_id == red::state("barbecue_timer") {
         red::state_set("barbecue_timer", "");
-        refresh(red::null());
+        refresh(EmptyEvent {});
     }
 }
 
-fn config_loaded(event: Json) {
+fn config_loaded(event: BarbecueConfigEvent) {
     let config = event.value;
     red::state_set("barbecue_cwd", red::string(config.cwd, ""));
     red::state_set("barbecue_context_loaded", true);
@@ -111,14 +243,14 @@ fn config_loaded(event: Json) {
     render_windows();
 }
 
-fn windows_loaded(result: Json) {
+fn windows_loaded(result: BarbecueWindowsResult) {
     retain_rendered_windows(result.windows);
     red::state_set("barbecue_windows", result.windows);
     render_windows();
     if !red::state_bool("barbecue_show_symbols") {
         return;
     }
-    let buffers = [];
+    let buffers: [i32] = [];
     for window in result.windows {
         let buffer_index = red::int(window.buffer_index, -1);
         if buffer_index < 0 || red::contains(buffers, buffer_index) {
@@ -129,17 +261,17 @@ fn windows_loaded(result: Json) {
     }
 }
 
-fn info_loaded(info: Json) {
+fn info_loaded(info: BarbecueEditorInfo) {
     red::state_set("barbecue_info", info);
     red::state_set("barbecue_info_loaded", true);
     render_windows();
 }
 
-fn symbols_loaded(result: Json) {
+fn symbols_loaded(result: BarbecueSymbolsResult) {
     if !red::bool(result.ok, false) {
         return;
     }
-    let records = [];
+    let records: [SymbolRecord] = [];
     let should_add = true;
     for record in red::state("barbecue_symbols") {
         if record.file != result.file {
@@ -156,7 +288,7 @@ fn symbols_loaded(result: Json) {
     render_windows();
 }
 
-fn symbol_record(result: Json) -> Json {
+fn symbol_record(result: BarbecueSymbolsResult) -> SymbolRecord {
     return SymbolRecord {
         file: result.file,
         buffer_index: red::int(result.buffer_index, -1),
@@ -165,8 +297,8 @@ fn symbol_record(result: Json) -> Json {
     };
 }
 
-fn file_saved(event: Json) {
-    let records = [];
+fn file_saved(event: FileSavedEvent) {
+    let records: [SymbolRecord] = [];
     for record in red::state("barbecue_symbols") {
         if record.file != event.file
             && red::int(record.buffer_index, -1) != red::int(event.buffer_index, -2) {
@@ -174,7 +306,7 @@ fn file_saved(event: Json) {
         }
     }
     red::state_set("barbecue_symbols", records);
-    let fallback_records = [];
+    let fallback_records: [SymbolRecord] = [];
     for record in red::state("barbecue_fallback_symbols") {
         if record.file != event.file
             && red::int(record.buffer_index, -1) != red::int(event.buffer_index, -2) {
@@ -182,11 +314,11 @@ fn file_saved(event: Json) {
         }
     }
     red::state_set("barbecue_fallback_symbols", fallback_records);
-    refresh(red::null());
+    refresh(EmptyEvent {});
 }
 
-fn cursor_moved(event: Json) {
-    let windows = [];
+fn cursor_moved(event: CursorMovedEvent) {
+    let windows: [BarbecueWindow] = [];
     let updated = red::null();
     for window in red::state("barbecue_windows") {
         if red::int(window.window_id, -1) == red::int(event.window_id, -2) {
@@ -210,7 +342,7 @@ fn render_windows() {
     }
 }
 
-fn render_window(window: Json) {
+fn render_window(window: BarbecueWindow) {
     if should_defer_symbol_render(window) {
         return;
     }
@@ -226,7 +358,7 @@ fn render_window(window: Json) {
     red::execute("UpdateWindowBar", "barbecue", window.window_id, segments);
 }
 
-fn should_defer_symbol_render(window: Json) -> bool {
+fn should_defer_symbol_render(window: BarbecueWindow) -> bool {
     if !red::state_bool("barbecue_show_symbols") || has_symbols_for(window) {
         return false;
     }
@@ -239,7 +371,7 @@ fn should_defer_symbol_render(window: Json) -> bool {
     return false;
 }
 
-fn has_symbols_for(window: Json) -> bool {
+fn has_symbols_for(window: BarbecueWindow) -> bool {
     for record in red::state("barbecue_symbols") {
         if record.file == window.buffer_path && red::int(record.revision, -1) == red::int(window.revision, -1) {
             return true;
@@ -248,8 +380,8 @@ fn has_symbols_for(window: Json) -> bool {
     return false;
 }
 
-fn remember_rendered_window(window: Json) {
-    let rendered_windows = [];
+fn remember_rendered_window(window: BarbecueWindow) {
+    let rendered_windows: [RenderedWindow] = [];
     for rendered in red::state("barbecue_rendered_windows") {
         if red::int(rendered.window_id, -1) != red::int(window.window_id, -1) {
             rendered_windows = red::push(rendered_windows, rendered);
@@ -262,8 +394,8 @@ fn remember_rendered_window(window: Json) {
     red::state_set("barbecue_rendered_windows", rendered_windows);
 }
 
-fn retain_rendered_windows(windows: Json) {
-    let rendered_windows = [];
+fn retain_rendered_windows(windows: [BarbecueWindow]) {
+    let rendered_windows: [RenderedWindow] = [];
     for rendered in red::state("barbecue_rendered_windows") {
         for window in windows {
             if red::int(rendered.window_id, -1) == red::int(window.window_id, -2) {
@@ -274,8 +406,8 @@ fn retain_rendered_windows(windows: Json) {
     red::state_set("barbecue_rendered_windows", rendered_windows);
 }
 
-fn segments_for(window: Json) -> Json {
-    let segments = [];
+fn segments_for(window: BarbecueWindow) -> [BarSegment] {
+    let segments: [BarSegment] = [];
     let path = normalize_path(red::string(window.buffer_path, ""));
     let cwd = normalize_path(red::string(red::state("barbecue_cwd"), ""));
     if cwd != "" && red::starts_with(path, cwd + "/") {
@@ -296,7 +428,7 @@ fn segments_for(window: Json) -> Json {
                 if red::state_bool("barbecue_show_folder_icon") && red::state_bool("barbecue_nerd_font") {
                     text = " " + text;
                 }
-                segments = red::push(segments, WindowBarSegment {
+                segments = red::push(segments, BarSegment {
                     id: "directory:" + index + ":" + part,
                     text: text,
                     style: directory_style(),
@@ -308,13 +440,13 @@ fn segments_for(window: Json) -> Json {
     if red::state_bool("barbecue_show_file") {
         segments = add_separator(segments);
         if red::state_bool("barbecue_nerd_font") {
-            segments = red::push(segments, WindowBarSegment {
+            segments = red::push(segments, BarSegment {
                 id: "file-icon",
                 text: file_icon(file) + " ",
                 style: file_icon_style(file),
             });
         }
-        segments = red::push(segments, WindowBarSegment {
+        segments = red::push(segments, BarSegment {
             id: "file",
             text: file,
             style: file_style(),
@@ -325,7 +457,7 @@ fn segments_for(window: Json) -> Json {
         let index = 0;
         for symbol in chain {
             segments = add_separator(segments);
-            segments = red::push(segments, WindowBarSegment {
+            segments = red::push(segments, BarSegment {
                 id: "symbol:" + symbol.id,
                 text: symbol_icon(symbol.kind_name) + " " + symbol.name,
                 style: symbol_style(symbol.kind_name, index == red::len(chain) - 1),
@@ -337,9 +469,9 @@ fn segments_for(window: Json) -> Json {
     return segments;
 }
 
-fn add_separator(segments: Json) -> Json {
+fn add_separator(segments: [BarSegment]) -> [BarSegment] {
     if red::len(segments) > 0 {
-        segments = red::push(segments, WindowBarSegment {
+        segments = red::push(segments, BarSegment {
             id: "separator:" + red::len(segments),
             text: " " + red::string(red::state("barbecue_separator"), "") + " ",
             style: separator_style(),
@@ -348,7 +480,7 @@ fn add_separator(segments: Json) -> Json {
     return segments;
 }
 
-fn symbols_for(window: Json) -> Json {
+fn symbols_for(window: BarbecueWindow) -> [BarbecueSymbol] {
     for record in red::state("barbecue_symbols") {
         if record.file == window.buffer_path && red::int(record.revision, -1) == red::int(window.revision, -1) {
             return record.symbols;
@@ -357,7 +489,7 @@ fn symbols_for(window: Json) -> Json {
     return [];
 }
 
-fn symbol_chain(window: Json) -> Json {
+fn symbol_chain(window: BarbecueWindow) -> [BarbecueSymbol] {
     let position = window_position(window);
     let symbols = symbols_for(window);
     let chain = symbol_chain_for(symbols, position);
@@ -374,8 +506,8 @@ fn symbol_chain(window: Json) -> Json {
     return [];
 }
 
-fn remember_fallback_symbols(window: Json, symbols: Json) {
-    let records = [];
+fn remember_fallback_symbols(window: BarbecueWindow, symbols: [BarbecueSymbol]) {
+    let records: [SymbolRecord] = [];
     let should_add = true;
     for record in red::state("barbecue_fallback_symbols") {
         if record.file != window.buffer_path {
@@ -396,11 +528,11 @@ fn remember_fallback_symbols(window: Json, symbols: Json) {
     red::state_set("barbecue_fallback_symbols", records);
 }
 
-fn symbol_chain_for(symbols: Json, position: Json) -> Json {
+fn symbol_chain_for(symbols: [BarbecueSymbol], position: Position) -> [BarbecueSymbol] {
     // Breadcrumb rendering runs once per window, so keep each callback's scan bounded.
     let leaf = red::null();
     let leaf_depth = -1;
-    let containing = [];
+    let containing: [BarbecueSymbol] = [];
     let index = 0;
     while index < red::len(symbols) && index < 512 {
         let symbol = symbols[index];
@@ -416,7 +548,7 @@ fn symbol_chain_for(symbols: Json, position: Json) -> Json {
     if leaf == red::null() {
         return [];
     }
-    let chain = [];
+    let chain: [BarbecueSymbol] = [];
     let current = leaf;
     let steps = 0;
     while current != red::null() && steps <= red::len(containing) {
@@ -434,7 +566,7 @@ fn symbol_chain_for(symbols: Json, position: Json) -> Json {
     return chain;
 }
 
-fn symbol_by_id(symbols: Json, id: String) -> Json {
+fn symbol_by_id(symbols: [BarbecueSymbol], id: String) -> Json {
     for symbol in symbols {
         if red::string(symbol.id, "") == id {
             return symbol;
@@ -443,7 +575,7 @@ fn symbol_by_id(symbols: Json, id: String) -> Json {
     return red::null();
 }
 
-fn window_position(window: Json) -> Json {
+fn window_position(window: BarbecueWindow) -> Position {
     if window.lsp_position != red::null() {
         return window.lsp_position;
     }
@@ -453,7 +585,7 @@ fn window_position(window: Json) -> Json {
     };
 }
 
-fn contains_position(range: Json, position: Json) -> bool {
+fn contains_position(range: BarbecueRange, position: Position) -> bool {
     if range.start == red::null() || range.end == red::null() {
         return false;
     }
@@ -482,8 +614,8 @@ fn file_icon(file: String) -> String {
     return "";
 }
 
-fn file_icon_style(file: String) -> Json {
-    let info = red::state("barbecue_info");
+fn file_icon_style(file: String) -> BarWindowStyle {
+    let info: BarbecueEditorInfo = red::state("barbecue_info");
     let light = false;
     if info != red::null() {
         light = red::is_light_color(info.theme.style.bg);
@@ -492,8 +624,8 @@ fn file_icon_style(file: String) -> Json {
     if color == red::null() {
         return file_style();
     }
-    return WindowBarStyle {
-        semantic: ThemeStyleSpec {
+    return BarWindowStyle {
+        semantic: BarThemeStyleSpec {
             background: ["breadcrumb.background", "editor.background"],
         },
         style: Style {
@@ -589,38 +721,38 @@ fn symbol_icon(kind: String) -> String {
     return "";
 }
 
-fn normal_style() -> Json {
-    return WindowBarStyle { semantic: ThemeStyleSpec {
+fn normal_style() -> BarWindowStyle {
+    return BarWindowStyle { semantic: BarThemeStyleSpec {
         foreground: ["breadcrumb.foreground", "editor.foreground"],
         background: ["breadcrumb.background", "editor.background"],
     }};
 }
-fn separator_style() -> Json {
-    return WindowBarStyle { semantic: ThemeStyleSpec {
+fn separator_style() -> BarWindowStyle {
+    return BarWindowStyle { semantic: BarThemeStyleSpec {
         foreground: ["breadcrumb.foreground", "descriptionForeground", "editor.foreground"],
         background: ["breadcrumb.background", "editor.background"],
     }};
 }
-fn directory_style() -> Json {
-    return WindowBarStyle { semantic: ThemeStyleSpec {
+fn directory_style() -> BarWindowStyle {
+    return BarWindowStyle { semantic: BarThemeStyleSpec {
         foreground: ["symbolIcon.folderForeground", "breadcrumb.foreground", "editor.foreground"],
         background: ["breadcrumb.background", "editor.background"],
     }};
 }
-fn file_style() -> Json {
-    return WindowBarStyle { semantic: ThemeStyleSpec {
+fn file_style() -> BarWindowStyle {
+    return BarWindowStyle { semantic: BarThemeStyleSpec {
         foreground: ["symbolIcon.fileForeground", "breadcrumb.foreground", "editor.foreground"],
         background: ["breadcrumb.background", "editor.background"],
     }};
 }
-fn symbol_style(kind: String, current: bool) -> Json {
+fn symbol_style(kind: String, current: bool) -> BarWindowStyle {
     if !current {
-        return WindowBarStyle { semantic: ThemeStyleSpec {
+        return BarWindowStyle { semantic: BarThemeStyleSpec {
             foreground: [kind_theme_key(kind), "breadcrumb.foreground", "editor.foreground"],
             background: ["breadcrumb.background", "editor.background"],
         }};
     }
-    return WindowBarStyle { semantic: ThemeStyleSpec {
+    return BarWindowStyle { semantic: BarThemeStyleSpec {
         foreground: ["breadcrumb.focusForeground", "breadcrumb.activeSelectionForeground", "list.activeSelectionForeground", "editor.foreground"],
         background: ["breadcrumb.background", "editor.background"],
         bold: true,
@@ -638,7 +770,7 @@ fn kind_theme_key(kind: String) -> String {
     return "breadcrumb.foreground";
 }
 
-fn bar_action(event: Json) {
+fn bar_action(event: WindowBarActionEvent) {
     let action = red::string(event.action, "");
     if !red::starts_with(action, "jump:") {
         return;

@@ -7,6 +7,56 @@
 // are converted in cancellable timer batches so no callback monopolizes the Husk instruction
 // budget; a final safety ceiling bounds pathological server responses.
 
+struct SymbolIconOptions {
+    enabled: bool,
+    // Symbol kinds are extensible, so icon overrides remain an open string map.
+    overrides: Json,
+}
+
+struct LspSymbolsPluginOptions {
+    icons: SymbolIconOptions,
+}
+
+struct LspSymbolsConfigValue {
+    lsp_symbols: LspSymbolsPluginOptions,
+}
+
+struct LspSymbolsConfigEvent {
+    value: LspSymbolsConfigValue,
+}
+
+struct LspTextRange {
+    start: Position,
+    end: Position,
+}
+
+struct LspSymbol {
+    name: String,
+    detail: String,
+    kind_name: String,
+    file: String,
+    selection_range: LspTextRange,
+}
+
+struct LspLocation {
+    file: String,
+    range: LspTextRange,
+}
+
+struct SymbolsResult {
+    ok: bool,
+    error: String,
+    symbols: [LspSymbol],
+}
+
+struct ReferencesResult {
+    ok: bool,
+    error: String,
+    file: String,
+    position: Position,
+    references: [LspLocation],
+}
+
 pub fn activate() {
     red::state_set("lsp_symbol_icons_enabled", true);
     red::state_set("lsp_symbol_icon_overrides", Json {});
@@ -23,19 +73,19 @@ pub fn activate() {
     red::state_set("lsp_symbol_request", -1);
     red::request("GetConfig", icon_config_loaded, "plugin_config");
 
-    red::add_command("LspDocumentSymbols", document_symbols, Json {
+    red::add_command("LspDocumentSymbols", document_symbols, CommandMetadata {
         title: "Show document symbols",
         category: "LSP",
         description: "Find symbols in the current document",
         aliases: ["outline", "symbols"],
     });
-    red::add_command("LspWorkspaceSymbols", workspace_symbols, Json {
+    red::add_command("LspWorkspaceSymbols", workspace_symbols, CommandMetadata {
         title: "Search workspace symbols",
         category: "LSP",
         description: "Find symbols across the workspace",
         aliases: ["symbols"],
     });
-    red::add_command("LspReferences", references, Json {
+    red::add_command("LspReferences", references, CommandMetadata {
         title: "Find references",
         category: "LSP",
         description: "Find references to the symbol under the cursor",
@@ -45,7 +95,7 @@ pub fn activate() {
     red::on("timeout:callback", symbol_batch_timeout);
 }
 
-fn icon_config_loaded(event: Json) {
+fn icon_config_loaded(event: LspSymbolsConfigEvent) {
     let options = event.value.lsp_symbols.icons;
     if options == red::null() {
         return;
@@ -107,7 +157,7 @@ fn references() {
     red::state_set("lsp_symbol_request", request_id);
 }
 
-fn show_document_symbols(result: Json, request_id: i32) {
+fn show_document_symbols(result: SymbolsResult, request_id: i32) {
     if request_id != red::int(red::state("lsp_symbol_request"), -1) {
         return;
     }
@@ -148,7 +198,7 @@ fn show_document_symbols(result: Json, request_id: i32) {
     start_symbol_batch(result.symbols, false, handle);
 }
 
-fn update_workspace_symbols(result: Json, request_id: i32) {
+fn update_workspace_symbols(result: SymbolsResult, request_id: i32) {
     if request_id != red::int(red::state("lsp_symbol_request"), -1) {
         return;
     }
@@ -179,7 +229,7 @@ fn update_workspace_symbols(result: Json, request_id: i32) {
     red::execute("UpdatePickerStatus", handle, count + " symbols");
 }
 
-fn start_symbol_batch(symbols: Json, workspace_only: bool, handle: Json) {
+fn start_symbol_batch(symbols: [LspSymbol], workspace_only: bool, handle: i32) {
     cancel_symbol_batch();
     red::state_set("lsp_symbol_batch_symbols", symbols);
     red::state_set("lsp_symbol_batch_items", []);
@@ -190,7 +240,7 @@ fn start_symbol_batch(symbols: Json, workspace_only: bool, handle: Json) {
     schedule_symbol_batch();
 }
 
-fn start_reference_batch(result: Json, handle: Json) {
+fn start_reference_batch(result: ReferencesResult, handle: i32) {
     cancel_symbol_batch();
     red::state_set("lsp_symbol_batch_symbols", result.references);
     red::state_set("lsp_symbol_batch_items", []);
@@ -207,7 +257,7 @@ fn schedule_symbol_batch() {
     red::state_set("lsp_symbol_batch_timer", red::execute("SetTimeout", 0));
 }
 
-fn symbol_batch_timeout(event: Json) {
+fn symbol_batch_timeout(event: TimerEvent) {
     if event.timer_id != red::state("lsp_symbol_batch_timer") {
         return;
     }
@@ -289,7 +339,7 @@ fn deactivate() {
     begin_symbol_flow();
 }
 
-fn show_references(result: Json, request_id: i32) {
+fn show_references(result: ReferencesResult, request_id: i32) {
     if request_id != red::int(red::state("lsp_symbol_request"), -1) {
         return;
     }
@@ -344,8 +394,8 @@ fn show_references(result: Json, request_id: i32) {
     red::state_set("lsp_symbol_picker", handle);
 }
 
-fn symbol_items(symbols: Json, workspace_only: bool) -> Json {
-    let items = [];
+fn symbol_items(symbols: [LspSymbol], workspace_only: bool) -> [PickerItem] {
+    let items: [PickerItem] = [];
     for symbol in symbols {
         if !workspace_only || is_workspace_symbol_kind(symbol.kind_name) {
             items = red::push(items, symbol_item(symbol));
@@ -354,7 +404,7 @@ fn symbol_items(symbols: Json, workspace_only: bool) -> Json {
     return items;
 }
 
-fn symbol_item(symbol: Json) -> PickerItem {
+fn symbol_item(symbol: LspSymbol) -> PickerItem {
     let line = symbol.selection_range.start.line;
     let character = symbol.selection_range.start.character;
     return PickerItem {
@@ -369,7 +419,7 @@ fn symbol_item(symbol: Json) -> PickerItem {
     };
 }
 
-fn reference_item(location: Json) -> PickerItem {
+fn reference_item(location: LspLocation) -> PickerItem {
     let line = location.range.start.line;
     let character = location.range.start.character;
     return PickerItem {
@@ -411,7 +461,7 @@ fn finish_symbol_flow() {
     red::state_set("lsp_symbol_request", -1);
 }
 
-fn open_symbol(symbol: Json) {
+fn open_symbol(symbol: LspSymbol) {
     red::execute("OpenLocation", Location {
         path: symbol.file,
         line: symbol.selection_range.start.line,
@@ -420,7 +470,7 @@ fn open_symbol(symbol: Json) {
     });
 }
 
-fn open_reference(location: Json) {
+fn open_reference(location: LspLocation) {
     red::execute("OpenLocation", Location {
         path: location.file,
         line: location.range.start.line,
@@ -429,7 +479,7 @@ fn open_reference(location: Json) {
     });
 }
 
-fn is_current_reference(location: Json, file: String, position: Json) -> bool {
+fn is_current_reference(location: LspLocation, file: String, position: Position) -> bool {
     return location.file == file && location.range.start.line <= position.line && location.range.end.line >= position.line;
 }
 

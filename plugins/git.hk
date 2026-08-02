@@ -8,56 +8,229 @@
 // Picker callbacks are owner-scoped: each menu item carries its flow context, while the
 // active prompt handle is retained only so query changes update the correct picker.
 
+struct GitEntry {
+    path: String,
+    // Non-renames have no original path.
+    original_path: Json,
+    x: String,
+    y: String,
+    kind: String,
+}
+
+struct GitState {
+    head: String,
+    oid: String,
+    upstream: String,
+    ahead: i32,
+    behind: i32,
+    stash_count: i32,
+    staged: [GitEntry],
+    unstaged: [GitEntry],
+    untracked: [GitEntry],
+    conflicted: [GitEntry],
+    truncated: bool,
+}
+
+struct GitSignGlyphs {
+    add: String,
+    change: String,
+    delete: String,
+    topdelete: String,
+    changedelete: String,
+}
+
+struct GitPluginOptions {
+    signs: GitSignGlyphs,
+    staged_signs: GitSignGlyphs,
+    signs_staged: GitSignGlyphs,
+}
+
+struct GitPluginConfig {
+    git: GitPluginOptions,
+}
+
+struct GitConfigValue {
+    executable: String,
+    plugin_config: GitPluginConfig,
+}
+
+struct GitConfigEvent {
+    value: GitConfigValue,
+}
+
+struct GitStringValueEvent {
+    value: String,
+}
+
+struct GitThemeUiStyle {
+    muted: Style,
+    popup_title: Style,
+}
+
+struct GitTheme {
+    // Theme color keys are open-ended and their values may be null or color variants.
+    colors: Json,
+    style: Style,
+    ui_style: GitThemeUiStyle,
+}
+
+struct GitEditorInfo {
+    theme: GitTheme,
+}
+
+struct GitWindow {
+    active: bool,
+    buffer_index: i32,
+    buffer_path: String,
+}
+
+struct GitWindowsResult {
+    windows: [GitWindow],
+}
+
+struct SignBuffer {
+    path: String,
+    buffer_index: i32,
+}
+
+struct SignHunk {
+    buffer_index: i32,
+    old_start: i32,
+    old_count: i32,
+    new_start: i32,
+    new_count: i32,
+}
+
+struct SignAppearance {
+    text: String,
+    style: Style,
+}
+
+struct SignAppearances {
+    add: SignAppearance,
+    change: SignAppearance,
+    delete: SignAppearance,
+    topdelete: SignAppearance,
+    changedelete: SignAppearance,
+}
+
+struct GitGutterSign {
+    buffer_index: i32,
+    line: i32,
+    text: String,
+    priority: i32,
+    style: Style,
+}
+
+struct OperationJob {
+    id: String,
+    kind: String,
+}
+
+struct SignJob {
+    id: String,
+    buffers: [SignBuffer],
+    staged: bool,
+}
+
+struct GitBufferTextEvent {
+    text: String,
+}
+
+struct GitScratchOpenedEvent {
+    buffer_index: i32,
+}
+
+struct GitRestoreResult {
+    restored: bool,
+    warnings: [String],
+}
+
+struct GitCursorPosition {
+    x: i32,
+    y: i32,
+}
+
+struct GitSelection {
+    buffer_index: i32,
+    start: GitCursorPosition,
+    end: GitCursorPosition,
+}
+
+struct GitWorkspaceLineData {
+    path: String,
+    section: String,
+    patch_index: i32,
+    // Metadata lines do not belong to a hunk.
+    hunk_id: Json,
+}
+
+struct GitWorkspaceDocumentLine {
+    id: String,
+    text: String,
+    kind: String,
+    // Diff metadata lines have no old or new source line.
+    old_line: Json,
+    new_line: Json,
+    hunk_id: Json,
+    data: GitWorkspaceLineData,
+}
+
+struct GitWorkspaceDocument {
+    path: String,
+    lines: [GitWorkspaceDocumentLine],
+}
+
 pub fn activate() {
-    red::add_command("GitDashboard", dashboard, Json {
+    red::add_command("GitDashboard", dashboard, CommandMetadata {
         title: "Open Git dashboard",
         category: "Git",
         description: "Inspect and manage workspace changes",
         aliases: ["source control", "status"],
     });
-    red::add_command("GitRefresh", force_refresh, Json {
+    red::add_command("GitRefresh", force_refresh, CommandMetadata {
         title: "Refresh Git status",
         category: "Git",
         description: "Refresh workspace Git information",
         aliases: ["status"],
     });
-    red::add_command("GitHunkPrevious", hunk_previous, Json {
+    red::add_command("GitHunkPrevious", hunk_previous, CommandMetadata {
         title: "Previous Git hunk",
         category: "Git",
         description: "Move to the previous changed hunk",
         aliases: ["previous change"],
     });
-    red::add_command("GitHunkNext", hunk_next, Json {
+    red::add_command("GitHunkNext", hunk_next, CommandMetadata {
         title: "Next Git hunk",
         category: "Git",
         description: "Move to the next changed hunk",
         aliases: ["next change"],
     });
-    red::add_command("GitHunkStage", hunk_stage, Json {
+    red::add_command("GitHunkStage", hunk_stage, CommandMetadata {
         title: "Stage Git hunk",
         category: "Git",
         description: "Stage the changed hunk under the cursor",
         aliases: ["stage change"],
     });
-    red::add_command("GitHunkUnstage", hunk_unstage, Json {
+    red::add_command("GitHunkUnstage", hunk_unstage, CommandMetadata {
         title: "Unstage Git hunk",
         category: "Git",
         description: "Unstage the changed hunk under the cursor",
         aliases: ["unstage change"],
     });
-    red::add_command("GitHunkReset", hunk_reset, Json {
+    red::add_command("GitHunkReset", hunk_reset, CommandMetadata {
         title: "Reset Git hunk",
         category: "Git",
         description: "Discard the changed hunk under the cursor",
         aliases: ["discard change"],
     });
-    red::add_command("GitSubmitMessage", submit_message, Json {
+    red::add_command("GitSubmitMessage", submit_message, CommandMetadata {
         title: "Submit Git message",
         category: "Git",
         description: "Submit the current Git commit message",
         aliases: ["commit"],
     });
-    red::add_command("GitCancelMessage", cancel_message, Json {
+    red::add_command("GitCancelMessage", cancel_message, CommandMetadata {
         title: "Cancel Git message",
         category: "Git",
         description: "Cancel the current Git commit message",
@@ -83,14 +256,14 @@ pub fn activate() {
     red::state_set("git_command_log", []);
     red::state_set("git_info", red::null());
     red::state_set("git_executable", "red");
-    red::state_set("git_sign_glyphs", Json {
+    red::state_set("git_sign_glyphs", GitSignGlyphs {
         add: "+",
         change: "~",
         delete: "_",
         topdelete: "‾",
         changedelete: "~",
     });
-    red::state_set("git_staged_sign_glyphs", Json {
+    red::state_set("git_staged_sign_glyphs", GitSignGlyphs {
         add: "┃",
         change: "┃",
         delete: "▁",
@@ -143,7 +316,7 @@ pub fn activate() {
     schedule_poll();
 }
 
-fn empty_state() -> Json {
+fn empty_state() -> GitState {
     return GitState {
         head: "",
         oid: "",
@@ -190,11 +363,11 @@ fn schedule_poll() {
     red::state_set("git_poll_timer", red::execute("SetTimeout", 5000));
 }
 
-fn git_directory_changed(event: Json) {
+fn git_directory_changed(event: EmptyEvent) {
     force_refresh();
 }
 
-fn schedule_refresh(event: Json) {
+fn schedule_refresh(event: EmptyEvent) {
     red::state_set("git_refresh_forced", true);
     let timer = red::string(red::state("git_refresh_timer"), "");
     if timer != "" {
@@ -203,7 +376,7 @@ fn schedule_refresh(event: Json) {
     red::state_set("git_refresh_timer", red::execute("SetTimeout", 120));
 }
 
-fn timeout_callback(event: Json) {
+fn timeout_callback(event: TimerEvent) {
     if event.timer_id == red::state("git_detail_timer") {
         red::state_set("git_detail_timer", "");
         let row = red::state("git_pending_detail_row");
@@ -248,13 +421,13 @@ fn refresh() {
     red::on("process:" + process_id, status_event);
 }
 
-fn git_cwd_loaded(event: Json) {
+fn git_cwd_loaded(event: GitStringValueEvent) {
     let cwd = red::string(event.value, ".");
     red::state_set("git_root", cwd);
     capture_git("root", ["rev-parse", "--show-toplevel"]);
 }
 
-fn git_config_loaded(event: Json) {
+fn git_config_loaded(event: GitConfigEvent) {
     let config = event.value;
     red::state_set("git_executable", red::string(config.executable, "red"));
     let options = config.plugin_config.git;
@@ -266,13 +439,13 @@ fn git_config_loaded(event: Json) {
     merge_sign_glyphs("git_staged_sign_glyphs", options.signs_staged);
 }
 
-fn merge_sign_glyphs(key: String, configured: Json) {
+fn merge_sign_glyphs(key: String, configured: GitSignGlyphs) {
     if configured == red::null() {
         return;
     }
     let glyphs = red::state(key);
     for kind in ["add", "change", "delete", "topdelete", "changedelete"] {
-        let value = red::string(configured[kind], "");
+        let value = configured_sign_glyph(configured, kind);
         if value != "" {
             glyphs[kind] = value;
         }
@@ -280,7 +453,15 @@ fn merge_sign_glyphs(key: String, configured: Json) {
     red::state_set(key, glyphs);
 }
 
-fn git_info_loaded(info: Json) {
+fn configured_sign_glyph(configured: GitSignGlyphs, kind: String) -> String {
+    if kind == "add" { return red::string(configured.add, ""); }
+    if kind == "change" { return red::string(configured.change, ""); }
+    if kind == "delete" { return red::string(configured.delete, ""); }
+    if kind == "topdelete" { return red::string(configured.topdelete, ""); }
+    return red::string(configured.changedelete, "");
+}
+
+fn git_info_loaded(info: GitEditorInfo) {
     red::state_set("git_info", info);
     render_dashboard();
 }
@@ -300,6 +481,8 @@ fn watch_git_directory(git_dir: String) {
     }
 }
 
+// Process notifications are a tagged union (`stdout`, `stderr`, `error`, and `exit`).
+// Keep them dynamic until Husk can express and narrow discriminated unions.
 fn status_event(event: Json) {
     if event.process_id != red::state("git_process") {
         return;
@@ -404,7 +587,7 @@ fn refresh_selected_detail(render_loading: bool) {
     if render_loading { render_dashboard(); }
 }
 
-fn sign_windows_loaded(result: Json) {
+fn sign_windows_loaded(result: GitWindowsResult) {
     for job in red::state("git_sign_jobs") {
         let process_id = red::string(job.id, "");
         if process_id != "" {
@@ -449,7 +632,7 @@ fn detect_operation() {
     spawn_operation_check("rebase", ["rebase", "--show-current-patch"]);
 }
 
-fn spawn_operation_check(kind: String, args: Json) {
+fn spawn_operation_check(kind: String, args: [String]) {
     let process_id = red::execute("SpawnProcess", Process {
         command: "git",
         args: args,
@@ -499,8 +682,8 @@ fn operation_rank(kind: String) -> i32 {
     return 3;
 }
 
-fn spawn_sign_diff(buffers: Json, staged: bool) {
-    let paths = [];
+fn spawn_sign_diff(buffers: [SignBuffer], staged: bool) {
+    let paths: [String] = [];
     for buffer in buffers {
         paths = red::push(paths, buffer.path);
     }
@@ -539,8 +722,8 @@ fn sign_diff_event(event: Json) {
     }
 }
 
-fn signs_from_multi_patch(patch: String, buffers: Json, staged: bool) -> Json {
-    let hunks = red::git_core("sign_hunks", patch, buffers);
+fn signs_from_multi_patch(patch: String, buffers: [SignBuffer], staged: bool) -> [GitGutterSign] {
+    let hunks: [SignHunk] = red::git_core("sign_hunks", patch, buffers);
     return signs_from_hunks(hunks, staged);
 }
 
@@ -561,8 +744,8 @@ fn sign_repository_path(path: String) -> String {
     return repository_path(path);
 }
 
-fn signs_from_hunks(hunks: Json, staged: bool) -> Json {
-    let signs = [];
+fn signs_from_hunks(hunks: [SignHunk], staged: bool) -> [GitGutterSign] {
+    let signs: [GitGutterSign] = [];
     let appearances = sign_appearances(staged);
     let current_buffer = -1;
     let buffer_signs = 0;
@@ -633,13 +816,13 @@ fn signs_from_hunks(hunks: Json, staged: bool) -> Json {
     return signs;
 }
 
-fn hunk_kind(hunk: Json) -> String {
+fn hunk_kind(hunk: SignHunk) -> String {
     if hunk.old_count == 0 { return "add"; }
     if hunk.new_count == 0 { return "delete"; }
     return "change";
 }
 
-fn hunk_change_end(hunk: Json) -> i32 {
+fn hunk_change_end(hunk: SignHunk) -> i32 {
     let kind = hunk_kind(hunk);
     if kind == "delete" { return hunk.new_start; }
     if kind == "add" { return hunk.new_start + hunk.new_count - 1; }
@@ -653,12 +836,12 @@ fn git_sign(
     line: i32,
     kind: String,
     staged: bool,
-    appearances: Json
-) -> Json {
+    appearances: SignAppearances
+) -> GitGutterSign {
     let safe_line = line;
     if safe_line < 0 { safe_line = 0; }
-    let appearance = appearances[kind];
-    return GutterSign {
+    let appearance = sign_appearance(appearances, kind);
+    return GitGutterSign {
         buffer_index: buffer_index,
         line: safe_line,
         text: appearance.text,
@@ -667,7 +850,15 @@ fn git_sign(
     };
 }
 
-fn sign_appearances(staged: bool) -> Json {
+fn sign_appearance(appearances: SignAppearances, kind: String) -> SignAppearance {
+    if kind == "add" { return appearances.add; }
+    if kind == "change" { return appearances.change; }
+    if kind == "delete" { return appearances.delete; }
+    if kind == "topdelete" { return appearances.topdelete; }
+    return appearances.changedelete;
+}
+
+fn sign_appearances(staged: bool) -> SignAppearances {
     return SignAppearances {
         add: SignAppearance { text: sign_glyph("add", staged), style: sign_style("add", staged) },
         change: SignAppearance { text: sign_glyph("change", staged), style: sign_style("change", staged) },
@@ -693,7 +884,7 @@ fn staged_priority(staged: bool) -> i32 {
     return 10;
 }
 
-fn sign_style(kind: String, staged: bool) -> Json {
+fn sign_style(kind: String, staged: bool) -> Style {
     let style = normal_style();
     let info = red::state("git_info");
     if info == red::null() {
@@ -724,7 +915,7 @@ fn sign_style(kind: String, staged: bool) -> Json {
     return style;
 }
 
-fn parse_status(output: String) -> Json {
+fn parse_status(output: String) -> GitState {
     return red::git_core("parse_status", output);
 }
 
@@ -777,7 +968,7 @@ fn render_dashboard() {
     });
 }
 
-fn append_section(rows: Json, title: String, section: String, entries: Json) -> Json {
+fn append_section(rows: Json, title: String, section: String, entries: [GitEntry]) -> Json {
     if red::len(entries) == 0 {
         return rows;
     }
@@ -805,7 +996,7 @@ fn append_section(rows: Json, title: String, section: String, entries: Json) -> 
     return rows;
 }
 
-fn entry_path_segments(entry: Json, secondary_style: Json) -> Json {
+fn entry_path_segments(entry: GitEntry, secondary_style: Style) -> Json {
     let parts = red::split(entry.path, "/");
     let filename = entry.path;
     let parent = "";
@@ -834,7 +1025,7 @@ fn entry_path_segments(entry: Json, secondary_style: Json) -> Json {
     return segments;
 }
 
-fn header_segments(state: Json) -> Json {
+fn header_segments(state: GitState) -> Json {
     let branch = red::string(state.head, "unborn");
     if branch == "(detached)" {
         branch = "detached " + red::slice(red::string(state.oid, ""), 0, 8);
@@ -859,7 +1050,7 @@ fn operation_header() -> String {
     return "  " + operation;
 }
 
-fn status_label(entry: Json) -> String {
+fn status_label(entry: GitEntry) -> String {
     if entry.kind == "untracked" { return "?"; }
     if entry.kind == "conflicted" { return "!"; }
     if entry.x == "R" || entry.y == "R" { return "R"; }
@@ -1081,7 +1272,7 @@ fn detail_event(event: Json) {
     render_dashboard();
 }
 
-fn detail_document(output: String, path: String, section: String) -> Json {
+fn detail_document(output: String, path: String, section: String) -> GitWorkspaceDocument {
     return red::git_core("detail_document", output, path, section);
 }
 
@@ -1200,7 +1391,7 @@ fn patch_for_dashboard_range(patch: String, start_index: i32, end_index: i32) ->
     return red::string(red::git_core("dashboard_range", patch, start_index, end_index), "");
 }
 
-fn confirm_git(title: String, impact: String, args: Json) {
+fn confirm_git(title: String, impact: String, args: [String]) {
     red::state_set("git_confirm_mode", "git");
     red::state_set("git_confirm_args", args);
     open_confirmation(title, impact);
@@ -1257,7 +1448,7 @@ fn action_finished(event: Json) {
     }
 }
 
-fn run_simple_git(args: Json) {
+fn run_simple_git(args: [String]) {
     record_command(args);
     let process_id = red::execute("SpawnProcess", Process {
         command: "git",
@@ -1267,7 +1458,7 @@ fn run_simple_git(args: Json) {
     red::on("process:" + process_id, action_finished);
 }
 
-fn record_command(args: Json) {
+fn record_command(args: [String]) {
     let log = red::state("git_command_log");
     log = red::push(log, "git " + red::join(args, " "));
     red::state_set("git_command_log", log);
@@ -1401,7 +1592,7 @@ fn git_entity_kind(kind: String) -> String {
     return "Action";
 }
 
-fn open_choices(kind: String, title: String, choices: Json) {
+fn open_choices(kind: String, title: String, choices: [String]) {
     let items = [];
     for choice in choices {
         items = red::push(items, PickerItem {
@@ -1414,11 +1605,11 @@ fn open_choices(kind: String, title: String, choices: Json) {
     open_menu_picker(title, items, "");
 }
 
-fn open_items(title: String, items: Json) {
+fn open_items(title: String, items: [PickerItem]) {
     open_menu_picker(title, items, "Filter");
 }
 
-fn open_menu_picker(title: String, items: Json, placeholder: String) {
+fn open_menu_picker(title: String, items: [PickerItem], placeholder: String) {
     red::execute("OpenPicker", title, items, PickerOptions {
         placeholder: placeholder,
     }, PickerHandlers {
@@ -1514,7 +1705,7 @@ fn prompt_submitted(item: PickerItem) {
     }
 }
 
-fn capture_git(kind: String, args: Json) {
+fn capture_git(kind: String, args: [String]) {
     red::state_set("git_capture_kind", kind);
     red::state_set("git_capture_output", "");
     record_command(args);
@@ -2001,7 +2192,7 @@ fn render_error(message: String) {
     }
 }
 
-fn normal_style() -> Json {
+fn normal_style() -> Style {
     let info = red::state("git_info");
     if info == red::null() {
         return Style { fg: red::null(), bg: red::null(), bold: false, italic: false };
@@ -2012,7 +2203,7 @@ fn normal_style() -> Json {
     }
     return style;
 }
-fn muted_style() -> Json {
+fn muted_style() -> Style {
     let info = red::state("git_info");
     if info == red::null() { return normal_style(); }
     let ui = info.theme.ui_style;
@@ -2021,7 +2212,7 @@ fn muted_style() -> Json {
     if style == red::null() { return normal_style(); }
     return style;
 }
-fn heading_style() -> Json {
+fn heading_style() -> Style {
     let info = red::state("git_info");
     if info == red::null() {
         let style = normal_style();
@@ -2039,8 +2230,8 @@ fn heading_style() -> Json {
     style.bold = true;
     return style;
 }
-fn branch_style() -> Json { return heading_style(); }
-fn success_style() -> Json {
+fn branch_style() -> Style { return heading_style(); }
+fn success_style() -> Style {
     let style = normal_style();
     let info = red::state("git_info");
     if info == red::null() { return style; }
@@ -2050,7 +2241,7 @@ fn success_style() -> Json {
     if color != red::null() { style.fg = color; }
     return style;
 }
-fn warning_style() -> Json {
+fn warning_style() -> Style {
     let style = normal_style();
     let info = red::state("git_info");
     if info == red::null() { return style; }
@@ -2060,7 +2251,7 @@ fn warning_style() -> Json {
     if color != red::null() { style.fg = color; }
     return style;
 }
-fn section_style(section: String) -> Json {
+fn section_style(section: String) -> Style {
     if section == "staged" { return success_style(); }
     if section == "conflicted" { return warning_style(); }
     return normal_style();
@@ -2099,24 +2290,25 @@ fn commit_choice(item: PickerItem) {
 }
 
 fn commit_snapshot_loaded(snapshot: Json) {
+    // Editor snapshots are opaque capabilities that are only stored and passed back.
     red::state_set("git_commit_snapshot", snapshot);
     let text = red::string(red::state("git_commit_retry_text"), "");
     red::state_set("git_commit_retry_text", "");
     red::request("OpenScratchBuffer", commit_scratch_opened, "[Git Commit].gitcommit", text);
 }
 
-fn commit_scratch_opened(event: Json) {
+fn commit_scratch_opened(event: GitScratchOpenedEvent) {
     red::state_set("git_commit_buffer", red::int(event.buffer_index, -1));
     close_dashboard();
 }
 
-fn restore_finished(result: Json) {
+fn restore_finished(result: GitRestoreResult) {
     if !red::bool(result.restored, false) {
         red::log("Git scratch restore did not restore editor state", result.warnings);
     }
 }
 
-fn commit_buffer_text(event: Json) {
+fn commit_buffer_text(event: GitBufferTextEvent) {
     if red::int(red::state("git_commit_buffer"), -1) < 0 {
         return;
     }
@@ -2175,7 +2367,7 @@ fn begin_hunk_action(action: String) {
     red::request("GetWindows", hunk_windows_loaded);
 }
 
-fn hunk_windows_loaded(result: Json) {
+fn hunk_windows_loaded(result: GitWindowsResult) {
     let path = "";
     let buffer_index = -1;
     for window in result.windows {
@@ -2200,7 +2392,7 @@ fn hunk_windows_loaded(result: Json) {
     spawn_hunk_diff(action);
 }
 
-fn hunk_buffer_text(event: Json) {
+fn hunk_buffer_text(event: GitBufferTextEvent) {
     red::state_set("git_hunk_unsaved", true);
     red::state_set("git_hunk_patch", "");
     let path = red::string(red::state("git_hunk_path"), "");
@@ -2260,12 +2452,12 @@ fn normalize_unsaved_patch(patch: String, path: String) -> String {
     return red::string(red::git_core("normalize_unsaved", patch, path), "");
 }
 
-fn hunk_selection_loaded(selection: Json) {
+fn hunk_selection_loaded(selection: GitSelection) {
     red::state_set("git_hunk_selection", selection);
     red::request("GetCursorPosition", hunk_cursor_loaded);
 }
 
-fn hunk_cursor_loaded(cursor: Json) {
+fn hunk_cursor_loaded(cursor: GitCursorPosition) {
     let action = red::string(red::state("git_hunk_action"), "");
     let patch = red::string(red::state("git_hunk_patch"), "");
     if action == "next" || action == "previous" {
@@ -2344,7 +2536,7 @@ fn print_hunk_boundary(forward: bool) {
     }
 }
 
-fn hunk_starts(patch: String) -> Json {
+fn hunk_starts(patch: String) -> [i32] {
     return red::git_core("hunk_starts", patch);
 }
 
@@ -2375,7 +2567,7 @@ fn apply_hunk(action: String, patch: String) {
     red::on("process:" + process_id, apply_hunk_check_finished);
 }
 
-fn apply_hunk_args(action: String) -> Json {
+fn apply_hunk_args(action: String) -> [String] {
     return red::git_core("apply_hunk_args", action);
 }
 

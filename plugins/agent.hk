@@ -5,62 +5,233 @@
 // handlers ignore foreign session IDs, queued prompts remain FIFO, and deactivate closes
 // plugin UI resources without claiming that an active Codex process survived recovery.
 
+struct AgentSessionEvent {
+    session_id: String,
+}
+
+struct AgentTextEvent {
+    session_id: String,
+    text: String,
+}
+
+struct AgentCompletedEvent {
+    session_id: String,
+    stop_reason: String,
+    elapsed_ms: i64,
+}
+
+struct AgentErrorEvent {
+    session_id: String,
+    message: String,
+}
+
+struct AgentSessionLostEvent {
+    session_id: String,
+    prompt: String,
+}
+
+struct AgentPanelEvent {
+    action: String,
+    text: String,
+}
+
+struct AgentTranscriptEvent {
+    transcript: String,
+}
+
+struct AgentStringValueEvent {
+    value: String,
+}
+
+struct AgentStoredValueEvent {
+    // Plugin storage may be absent or contain an arbitrary prior-version payload.
+    value: Json,
+}
+
+struct AgentPromptQueueItem {
+    text: String,
+    block_id: String,
+}
+
+struct AgentActivityRow {
+    id: String,
+    title: String,
+    status: String,
+}
+
+struct AgentTextBlock {
+    id: String,
+    kind: String,
+    format: String,
+    text: String,
+}
+
+struct BoundedAgentBlocks {
+    blocks: [AgentTextBlock],
+    trimmed: bool,
+}
+
+struct TextPanelComposerConfig {
+    placeholder: String,
+    rows: i32,
+}
+
+struct TextPanelHeaderAction {
+    id: String,
+    label: String,
+    compact_label: String,
+}
+
+struct AgentProposalHunk {
+    id: String,
+    old_start: i32,
+    old_end: i32,
+    old_text: String,
+    new_text: String,
+}
+
+struct AgentProposalFile {
+    session_id: String,
+    path: String,
+    conflict: bool,
+    message: String,
+    hunks: [AgentProposalHunk],
+}
+
+struct AgentProposalsResult {
+    files: [AgentProposalFile],
+    // The proposal API uses null or a human-readable error string.
+    error: Json,
+}
+
+struct AgentProposalConflictEvent {
+    session_id: String,
+    path: String,
+}
+
+struct AgentProposalRowData {
+    session_id: String,
+    path: String,
+    hunk_id: String,
+    old_text: String,
+    new_text: String,
+    conflict: bool,
+}
+
+struct AgentProposalRow {
+    data: AgentProposalRowData,
+}
+
+struct AgentReviewEvent {
+    action: String,
+    row: AgentProposalRow,
+}
+
+struct AgentEdit {
+    old_text: String,
+    new_text: String,
+}
+
+struct AgentEditOrigin {
+    kind: String,
+    session_id: String,
+    turn_id: String,
+}
+
+struct AgentHistoryEntry {
+    transaction_id: String,
+    label: String,
+    current: bool,
+    origin: AgentEditOrigin,
+    edits: [AgentEdit],
+}
+
+struct AgentHistoryResult {
+    entries: [AgentHistoryEntry],
+}
+
+struct AgentHistoryRowData {
+    transaction_id: String,
+    edits: [AgentEdit],
+}
+
+struct AgentHistoryRow {
+    data: AgentHistoryRowData,
+}
+
+struct AgentHistoryEvent {
+    action: String,
+    row: AgentHistoryRow,
+}
+
+struct AgentPermissionOption {
+    option_id: String,
+    name: String,
+    kind: String,
+}
+
+struct AgentPermissionEvent {
+    session_id: String,
+    request_id: String,
+    options: [AgentPermissionOption],
+}
+
 pub fn activate() {
-    red::add_command("Agent", prompt, Json {
+    red::add_command("Agent", prompt, CommandMetadata {
         title: "Ask the agent",
         category: "Agent",
         description: "Open the agent prompt",
         aliases: ["ask ai", "chat"],
     });
-    red::add_command("AgentStart", start, Json {
+    red::add_command("AgentStart", start, CommandMetadata {
         title: "Start agent session",
         category: "Agent",
         description: "Start a new agent session",
         aliases: ["new chat"],
     });
-    red::add_command("AgentPrompt", prompt, Json {
+    red::add_command("AgentPrompt", prompt, CommandMetadata {
         title: "Open agent prompt",
         category: "Agent",
         description: "Ask a question in the active agent session",
         aliases: ["ask ai", "chat"],
     });
-    red::add_command("AgentOpen", open_conversation, Json {
+    red::add_command("AgentOpen", open_conversation, CommandMetadata {
         title: "Open agent conversation",
         category: "Agent",
         description: "Show and focus the conversation pane without opening a prompt",
         aliases: ["show chat", "open chat"],
     });
-    red::add_command("AgentCancel", cancel, Json {
+    red::add_command("AgentCancel", cancel, CommandMetadata {
         title: "Cancel agent request",
         category: "Agent",
         description: "Cancel the active agent request",
         aliases: ["stop agent"],
     });
-    red::add_command("AgentClear", clear_conversation, Json {
+    red::add_command("AgentClear", clear_conversation, CommandMetadata {
         title: "Clear agent conversation",
         category: "Agent",
         description: "Clear the visible conversation while preserving context",
         aliases: ["clear chat"],
     });
-    red::add_command("AgentClose", close_conversation, Json {
+    red::add_command("AgentClose", close_conversation, CommandMetadata {
         title: "Close agent conversation",
         category: "Agent",
         description: "Hide the conversation pane without ending the session",
         aliases: ["hide chat"],
     });
-    red::add_command("AgentNew", new_conversation, Json {
+    red::add_command("AgentNew", new_conversation, CommandMetadata {
         title: "Start new agent conversation",
         category: "Agent",
         description: "Reset the session and start a new conversation",
         aliases: ["new conversation"],
     });
-    red::add_command("AgentReview", review, Json {
+    red::add_command("AgentReview", review, CommandMetadata {
         title: "Review agent changes",
         category: "Agent",
         description: "Review changes proposed by the agent",
         aliases: ["proposals"],
     });
-    red::add_command("AgentHistory", history, Json {
+    red::add_command("AgentHistory", history, CommandMetadata {
         title: "Show agent history",
         category: "Agent",
         description: "Inspect previous agent transactions",
@@ -123,11 +294,11 @@ fn start() {
     red::request("GetConfig", cwd_loaded, "cwd");
 }
 
-fn cwd_loaded(result: Json) {
+fn cwd_loaded(result: AgentStringValueEvent) {
     red::execute("AgentNewSession", red::string(result.value, "."));
 }
 
-fn session_created(event: Json) {
+fn session_created(event: AgentSessionEvent) {
     let previous_session_id = red::string(red::state("agent_session_id"), "");
     let pending = red::string(red::state("agent_pending_prompt"), "");
     let pending_block_id = red::string(red::state("agent_pending_prompt_block_id"), "");
@@ -181,11 +352,11 @@ fn ensure_conversation_panel() {
             side: "right",
             width: 62,
             title: "Agent",
-            composer: Json { placeholder: "Ask a follow-up…", rows: 3 },
+            composer: TextPanelComposerConfig { placeholder: "Ask a follow-up…", rows: 3 },
             header_actions: [
-                Json { id: "clear", label: "Clear", compact_label: "C" },
-                Json { id: "new", label: "New", compact_label: "N" },
-                Json { id: "close", label: "×", compact_label: "×" },
+                TextPanelHeaderAction { id: "clear", label: "Clear", compact_label: "C" },
+                TextPanelHeaderAction { id: "new", label: "New", compact_label: "N" },
+                TextPanelHeaderAction { id: "close", label: "×", compact_label: "×" },
             ],
         });
         red::state_set("agent_panel_created", true);
@@ -199,7 +370,7 @@ fn ensure_conversation_panel() {
     }
 }
 
-fn prompt_history_loaded(result: Json) {
+fn prompt_history_loaded(result: AgentStoredValueEvent) {
     let history = [];
     if result.value != red::null() {
         for entry in result.value {
@@ -259,12 +430,12 @@ fn submit_prompt(text: String) {
         let generation = red::int(red::state("agent_block_generation"), 0) + 1;
         let block_id = "user:" + generation;
         red::state_set("agent_block_generation", generation);
-        queue = red::push(queue, Json { text: text, block_id: block_id });
+        queue = red::push(queue, AgentPromptQueueItem { text: text, block_id: block_id });
         red::state_set("agent_prompt_queue", queue);
         // Pending blocks render below the active stream but do not enter the
         // committed transcript until their FIFO turn is dispatched.
         let queued_blocks = red::state("agent_queued_prompt_blocks");
-        queued_blocks = red::push(queued_blocks, TextPanelBlock {
+        queued_blocks = red::push(queued_blocks, AgentTextBlock {
             id: block_id,
             kind: "user",
             format: "plain",
@@ -336,8 +507,8 @@ fn remove_queued_prompt_block(block_id: String) {
     red::state_set("agent_queued_prompt_blocks", queued_blocks);
 }
 
-fn turn_started(event: Json) {
-    if !is_current_session_event(event) {
+fn turn_started(event: AgentSessionEvent) {
+    if !is_current_session(event.session_id) {
         return;
     }
     set_phase("waiting", "Waiting for agent…");
@@ -373,8 +544,11 @@ fn render_status() {
     });
 }
 
+// Session activity is a discriminated union whose update payload changes for thought,
+// tool, command, and file events. Keep the envelope dynamic and immediately narrow it
+// through `session_update`; the stable result and UI models below remain concrete.
 fn activity(event: Json) {
-    if !is_current_session_event(event) {
+    if !is_current_session(red::string(event.session_id, "")) {
         return;
     }
     let update = event.update;
@@ -399,7 +573,7 @@ fn activity(event: Json) {
         }
         let rows = red::state("agent_activity_rows");
         if red::len(rows) < 100 {
-            rows = red::push(rows, Json {
+            rows = red::push(rows, AgentActivityRow {
                 id: red::string(update.tool_call_id, ""),
                 title: title,
                 status: red::string(update.status, "in_progress"),
@@ -455,7 +629,7 @@ fn ensure_activity_block() -> String {
     block_id = "activity:" + generation;
     red::state_set("agent_activity_block_id", block_id);
     let blocks = red::state("agent_transcript_blocks");
-    blocks = red::push(blocks, TextPanelBlock {
+    blocks = red::push(blocks, AgentTextBlock {
         id: block_id,
         kind: "activity",
         format: "plain",
@@ -502,7 +676,7 @@ fn render_activity() {
 }
 
 /// Collapse the finished turn's timeline into a one-line summary (or drop it).
-fn collapse_activity(elapsed_ms: Json) {
+fn collapse_activity(elapsed_ms: i64) {
     let block_id = red::string(red::state("agent_activity_block_id"), "");
     red::state_set("agent_activity_block_id", "");
     let rows = red::state("agent_activity_rows");
@@ -518,7 +692,7 @@ fn collapse_activity(elapsed_ms: Json) {
         let generation = red::int(red::state("agent_block_generation"), 0) + 1;
         red::state_set("agent_block_generation", generation);
         block_id = "activity:" + generation;
-        blocks = red::push(blocks, TextPanelBlock {
+        blocks = red::push(blocks, AgentTextBlock {
             id: block_id,
             kind: "activity",
             format: "plain",
@@ -552,7 +726,7 @@ fn collapse_activity(elapsed_ms: Json) {
     render_conversation();
 }
 
-fn format_turn_elapsed(elapsed_ms: Json) -> String {
+fn format_turn_elapsed(elapsed_ms: i64) -> String {
     let ms = red::int(elapsed_ms, 0);
     if ms <= 0 {
         return "";
@@ -574,7 +748,7 @@ fn format_turn_elapsed(elapsed_ms: Json) -> String {
     return hours + "h " + remaining_minutes + "m " + remaining_seconds + "s";
 }
 
-fn panel_event(event: Json) {
+fn panel_event(event: AgentPanelEvent) {
     if event.action == "submit" {
         let text = red::string(event.text, "");
         if red::trim(text) != "" {
@@ -657,8 +831,8 @@ fn cancel() {
     }
 }
 
-fn update(event: Json) {
-    if !is_current_session_event(event) {
+fn update(event: AgentTextEvent) {
+    if !is_current_session(event.session_id) {
         return;
     }
     let delta = red::string(event.text, "");
@@ -681,7 +855,7 @@ fn update(event: Json) {
         red::state_set("agent_stream_block_id", block_id);
 
         let blocks = red::state("agent_transcript_blocks");
-        blocks = red::push(blocks, TextPanelBlock {
+        blocks = red::push(blocks, AgentTextBlock {
             id: block_id,
             kind: "agent",
             format: "markdown",
@@ -720,8 +894,8 @@ fn update(event: Json) {
     red::state_set("agent_stream_timer", red::execute("SetTimeout", 50));
 }
 
-fn completed(event: Json) {
-    if !is_current_session_event(event) {
+fn completed(event: AgentCompletedEvent) {
+    if !is_current_session(event.session_id) {
         return;
     }
     red::state_set("agent_turn_active", false);
@@ -774,8 +948,8 @@ fn submit_next_queued() {
     dispatch_prompt_block(text, block_id);
 }
 
-fn cancelled(event: Json) {
-    if !is_current_session_event(event) {
+fn cancelled(event: AgentSessionEvent) {
+    if !is_current_session(event.session_id) {
         return;
     }
     let session_id = red::string(event.session_id, "");
@@ -792,8 +966,8 @@ fn cancelled(event: Json) {
     set_phase("stopping", "Stopping…");
 }
 
-fn failed(event: Json) {
-    if !is_current_session_event(event) {
+fn failed(event: AgentErrorEvent) {
+    if !is_current_session(red::string(event.session_id, "")) {
         return;
     }
     if red::string(event.session_id, "") == "" && red::state_bool("agent_turn_active") {
@@ -832,10 +1006,10 @@ fn failed(event: Json) {
     }
 }
 
-fn session_lost(event: Json) {
+fn session_lost(event: AgentSessionLostEvent) {
     let session_id = red::string(red::state("agent_session_id"), "");
     let attempted = red::string(event.prompt, "");
-    if !is_current_session_event(event) && (session_id != "" || attempted == "") {
+    if !is_current_session(red::string(event.session_id, "")) && (session_id != "" || attempted == "") {
         return;
     }
     red::state_set("agent_turn_active", false);
@@ -854,7 +1028,7 @@ fn session_lost(event: Json) {
         red::execute("Print", "Codex app-server stopped; retrying the saved prompt");
         start();
     } else if red::string(red::state("agent_pending_prompt"), "") != "" {
-        failed(Json { message: "Codex app-server stopped" });
+        failed(AgentErrorEvent { session_id: "", message: "Codex app-server stopped" });
     } else {
         red::execute("Print", "Codex app-server stopped. Press Space A to start a new session");
     }
@@ -870,7 +1044,7 @@ fn setup_cancelled(event: PickerCancelled) {
     red::execute("Print", "Agent prompt saved. Press Space A when ready to retry");
 }
 
-fn setup_ready(event: Json) {
+fn setup_ready(event: EmptyEvent) {
     if red::string(red::state("agent_pending_prompt"), "") != "" {
         start();
     }
@@ -939,7 +1113,7 @@ fn append_transcript_block(role: String, text: String, block_id: String) {
         block_id = kind + ":" + generation;
     }
     let blocks = red::state("agent_transcript_blocks");
-    blocks = red::push(blocks, TextPanelBlock {
+    blocks = red::push(blocks, AgentTextBlock {
         id: block_id,
         kind: kind,
         format: "plain",
@@ -950,7 +1124,7 @@ fn append_transcript_block(role: String, text: String, block_id: String) {
     render_conversation();
 }
 
-fn stream_timeout(event: Json) {
+fn stream_timeout(event: TimerEvent) {
     if event.timer_id != red::state("agent_stream_timer") {
         return;
     }
@@ -971,7 +1145,7 @@ fn flush_stream(block_id: String) {
     }
 }
 
-fn transcript_restored(event: Json) {
+fn transcript_restored(event: AgentTranscriptEvent) {
     let transcript = red::string(event.transcript, "");
     let blocks = legacy_transcript_blocks(transcript);
     let generation = red::len(blocks);
@@ -998,7 +1172,7 @@ fn render_conversation() {
     let bounded = bounded_transcript_blocks(blocks, keep_id);
     blocks = bounded.blocks;
     if red::len(blocks) == 0 {
-        blocks = [TextPanelBlock {
+        blocks = [AgentTextBlock {
             id: "empty",
             kind: "activity",
             format: "plain",
@@ -1008,8 +1182,8 @@ fn render_conversation() {
     red::execute("UpdateTextPanel", "agent-conversation", blocks);
 }
 
-fn legacy_transcript_blocks(transcript: String) -> Json {
-    let blocks = [];
+fn legacy_transcript_blocks(transcript: String) -> [AgentTextBlock] {
+    let blocks: [AgentTextBlock] = [];
     let index = 0;
     let kind = "";
     let format = "plain";
@@ -1046,7 +1220,7 @@ fn legacy_transcript_blocks(transcript: String) -> Json {
 
         if next_kind != "" {
             if kind != "" {
-                blocks = red::push(blocks, TextPanelBlock {
+                blocks = red::push(blocks, AgentTextBlock {
                     id: kind + ":" + index,
                     kind: kind,
                     format: format,
@@ -1070,7 +1244,7 @@ fn legacy_transcript_blocks(transcript: String) -> Json {
     }
 
     if kind != "" {
-        blocks = red::push(blocks, TextPanelBlock {
+        blocks = red::push(blocks, AgentTextBlock {
             id: kind + ":" + index,
             kind: kind,
             format: format,
@@ -1080,17 +1254,17 @@ fn legacy_transcript_blocks(transcript: String) -> Json {
     return blocks;
 }
 
-fn bounded_transcript_blocks(blocks: Json, keep_id: String) -> Json {
+fn bounded_transcript_blocks(blocks: [AgentTextBlock], keep_id: String) -> BoundedAgentBlocks {
     let total = 0;
     for block in blocks {
         total = total + red::len(red::string(block.text, ""));
     }
     if total <= 20000 {
-        return Json { blocks: blocks, trimmed: false };
+        return BoundedAgentBlocks { blocks: blocks, trimmed: false };
     }
 
     let excess = total - 20000;
-    let bounded = [];
+    let bounded: [AgentTextBlock] = [];
     let block_index = 0;
     for block in blocks {
         block_index = block_index + 1;
@@ -1110,7 +1284,7 @@ fn bounded_transcript_blocks(blocks: Json, keep_id: String) -> Json {
         }
         bounded = red::push(bounded, block);
     }
-    return Json { blocks: bounded, trimmed: true };
+    return BoundedAgentBlocks { blocks: bounded, trimmed: true };
 }
 
 fn review() {
@@ -1130,7 +1304,7 @@ fn refresh_proposals() {
     red::request("AgentProposals", render_proposals, red::state("agent_session_id"));
 }
 
-fn render_proposals(result: Json) {
+fn render_proposals(result: AgentProposalsResult) {
     let rows = [];
     let file_index = 0;
     let truncated = false;
@@ -1150,7 +1324,14 @@ fn render_proposals(result: Json) {
                 text: status,
                 style: status_style,
             }],
-            data: Json { session_id: file.session_id, path: file.path, hunk_id: "", conflict: file.conflict },
+            data: AgentProposalRowData {
+                session_id: file.session_id,
+                path: file.path,
+                hunk_id: "",
+                old_text: "",
+                new_text: "",
+                conflict: file.conflict,
+            },
         });
         if file.conflict {
             if red::len(rows) < 499 {
@@ -1175,7 +1356,7 @@ fn render_proposals(result: Json) {
                         text: "chars " + hunk.old_start + ".." + hunk.old_end,
                         style: normal_style(),
                     }],
-                    data: Json {
+                    data: AgentProposalRowData {
                         session_id: file.session_id,
                         path: file.path,
                         hunk_id: hunk.id,
@@ -1226,7 +1407,7 @@ fn render_proposals(result: Json) {
     });
 }
 
-fn review_event(event: Json) {
+fn review_event(event: AgentReviewEvent) {
     if event.action == "q" || event.action == "escape" {
         red::state_set("agent_review_open", false);
         red::execute("CloseWorkspace", "agent-review");
@@ -1249,7 +1430,7 @@ fn review_event(event: Json) {
     }
 }
 
-fn show_proposal_detail(row: Json) {
+fn show_proposal_detail(row: AgentProposalRow) {
     if row.data.hunk_id == "" {
         return;
     }
@@ -1276,8 +1457,8 @@ fn show_proposal_detail(row: Json) {
     refresh_proposals();
 }
 
-fn proposals_changed(event: Json) {
-    if !is_current_session_event(event) && !red::state_bool("agent_review_open") {
+fn proposals_changed(event: AgentSessionEvent) {
+    if !is_current_session(event.session_id) && !red::state_bool("agent_review_open") {
         return;
     }
     refresh_proposals();
@@ -1286,7 +1467,7 @@ fn proposals_changed(event: Json) {
     }
 }
 
-fn proposals_ready(result: Json) {
+fn proposals_ready(result: AgentProposalsResult) {
     let files = red::len(result.files);
     if files == 0 || red::state_bool("agent_review_open") || red::state_bool("agent_proposal_notice") {
         return;
@@ -1301,7 +1482,7 @@ fn proposals_ready(result: Json) {
     red::execute("Print", "Agent changes ready: " + files + " files, " + hunks + " hunks. Use :AgentReview to review before applying");
 }
 
-fn proposal_conflict(event: Json) {
+fn proposal_conflict(event: AgentProposalConflictEvent) {
     red::execute("Print", "Agent proposal conflicts with current buffer: " + event.path);
     refresh_proposals();
 }
@@ -1322,7 +1503,7 @@ fn refresh_history() {
     }
 }
 
-fn render_history(result: Json) {
+fn render_history(result: AgentHistoryResult) {
     let rows = [];
     let index = 0;
     while index < red::len(result.entries) && index < 500 {
@@ -1341,7 +1522,7 @@ fn render_history(result: Json) {
                 PanelSegment { text: entry.label, style: normal_style() },
             ],
             right_segments: [PanelSegment { text: origin, style: muted_style() }],
-            data: Json { transaction_id: entry.transaction_id, edits: entry.edits },
+            data: AgentHistoryRowData { transaction_id: entry.transaction_id, edits: entry.edits },
         });
         index = index + 1;
     }
@@ -1366,7 +1547,7 @@ fn render_history(result: Json) {
     });
 }
 
-fn history_event(event: Json) {
+fn history_event(event: AgentHistoryEvent) {
     if event.action == "q" || event.action == "escape" {
         red::state_set("agent_history_open", false);
         red::execute("CloseWorkspace", "agent-history");
@@ -1392,8 +1573,8 @@ fn history_event(event: Json) {
     }
 }
 
-fn permission_requested(event: Json) {
-    if !is_current_session_event(event) {
+fn permission_requested(event: AgentPermissionEvent) {
+    if !is_current_session(event.session_id) {
         return;
     }
     red::state_set("agent_permission_request_id", event.request_id);
@@ -1427,8 +1608,7 @@ fn permission_selected(item: PickerItem) {
     red::state_set("agent_permission_request_id", "");
 }
 
-fn is_current_session_event(event: Json) -> bool {
-    let session_id = red::string(event.session_id, "");
+fn is_current_session(session_id: String) -> bool {
     return session_id == "" || session_id == red::string(red::state("agent_session_id"), "");
 }
 
@@ -1437,17 +1617,17 @@ fn permission_cancelled(event: PickerCancelled) {
     red::state_set("agent_permission_request_id", "");
 }
 
-fn normal_style() -> Json {
+fn normal_style() -> Style {
     return Style { fg: red::null(), bg: red::null(), bold: false, italic: false };
 }
-fn muted_style() -> Json { return normal_style(); }
-fn heading_style() -> Json {
+fn muted_style() -> Style { return normal_style(); }
+fn heading_style() -> Style {
     let style = normal_style();
     style.bold = true;
     return style;
 }
-fn success_style() -> Json { return normal_style(); }
-fn warning_style() -> Json {
+fn success_style() -> Style { return normal_style(); }
+fn warning_style() -> Style {
     let style = normal_style();
     style.bold = true;
     return style;

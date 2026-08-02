@@ -4,8 +4,39 @@
 // locations explicitly, and refreshes are batched to protect the editor loop. Query
 // history is plugin storage, while result text belongs to the current process only.
 
+struct StringValueEvent {
+    value: String,
+}
+
+struct StoredValueEvent {
+    // Storage values are user-defined JSON and are keyed by arbitrary workspace paths.
+    value: Json,
+}
+
+struct RipgrepSubmatch {
+    start: i32,
+    end: i32,
+}
+
+struct RipgrepMatchData {
+    // Ripgrep text fields may be `{ text }` or `{ bytes }` depending on UTF-8 validity.
+    path: Json,
+    lines: Json,
+    line_number: i32,
+    submatches: [RipgrepSubmatch],
+}
+
+struct ProjectSearchPanelRow {
+    id: String,
+}
+
+struct ProjectSearchPanelEvent {
+    action: String,
+    row: ProjectSearchPanelRow,
+}
+
 pub fn activate() {
-    red::add_command("ProjectSearch", project_search, Json {
+    red::add_command("ProjectSearch", project_search, CommandMetadata {
         title: "Search project",
         category: "Search",
         description: "Find text across the workspace",
@@ -48,13 +79,13 @@ fn reset_state() {
     red::state_set("project_search_truncated", false);
 }
 
-fn cwd_loaded(event: Json) {
+fn cwd_loaded(event: StringValueEvent) {
     let cwd = red::string(event.value, ".");
     red::state_set("project_search_cwd", cwd);
     red::request("GetStorage", history_loaded, "history_by_cwd");
 }
 
-fn history_loaded(event: Json) {
+fn history_loaded(event: StoredValueEvent) {
     let history_by_cwd = event.value;
     if history_by_cwd == red::null() {
         history_by_cwd = Json {};
@@ -105,7 +136,7 @@ fn schedule_run() {
     red::state_set("project_search_debounce", timer);
 }
 
-fn timeout_callback(event: Json) {
+fn timeout_callback(event: TimerEvent) {
     if event.timer_id == red::state("project_search_debounce") {
         red::state_set("project_search_debounce", "");
         run_search(red::string(red::state("project_search_query"), ""));
@@ -142,8 +173,8 @@ fn run_search(query: String) {
     red::on("process:" + process_id, process_event);
 }
 
-fn ripgrep_args(query: String) -> Json {
-    let args = [
+fn ripgrep_args(query: String) -> [String] {
+    let args: [String] = [
         "--json",
         "--color=never",
         "--no-heading",
@@ -195,6 +226,8 @@ fn cancel_timers() {
     red::state_set("project_search_refresh", "");
 }
 
+// Process events are a tagged union with variant-specific fields (`stdout`, `stderr`,
+// `error`, and `exit`), so the callback keeps the host's dynamic envelope.
 fn process_event(event: Json) {
     if event.process_id != red::state("project_search_process") {
         return;
@@ -313,7 +346,7 @@ fn append_flag(flags: String, flag: String) -> String {
     return flags + " " + flag;
 }
 
-fn match_item(data: Json, index: i32) -> PickerItem {
+fn match_item(data: RipgrepMatchData, index: i32) -> PickerItem {
     let path = red::text_field(data.path);
     let normalized_path = red::replace_all(path, "\\", "/");
     let path_parts = red::split(normalized_path, "/");
@@ -416,7 +449,7 @@ fn open_current(item: PickerItem) {
     open_item(item, "current");
 }
 
-fn open_item(item: Json, target: String) {
+fn open_item(item: PickerItem, target: String) {
     if item == red::null() {
         return;
     }
@@ -514,7 +547,7 @@ fn export_results() {
     red::execute("FocusPanel", "project-search-results");
 }
 
-fn export_panel_event(event: Json) {
+fn export_panel_event(event: ProjectSearchPanelEvent) {
     if event.action == "close" {
         red::execute("ClosePanel", "project-search-results");
         return;

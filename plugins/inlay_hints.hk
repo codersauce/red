@@ -4,6 +4,74 @@
 // before rendering. Request IDs reject stale LSP results, and deactivation cancels the
 // pending timeout and clears the decoration namespace.
 
+struct InlayHintsOptions {
+    parameter_hints: bool,
+}
+
+struct InlayPluginConfig {
+    inlay_hints: InlayHintsOptions,
+}
+
+struct InlayConfigValue {
+    plugin_config: InlayPluginConfig,
+}
+
+struct InlayConfigEvent {
+    value: InlayConfigValue,
+}
+
+struct InlayViewportRow {
+    line: i32,
+}
+
+struct InlayViewportLayout {
+    buffer_index: i32,
+    rows: [InlayViewportRow],
+}
+
+struct InlayHint {
+    kind: i32,
+    position: Position,
+    // LSP permits either a string or an array of label parts here.
+    label: Json,
+}
+
+struct InlayHintsResult {
+    ok: bool,
+    hints: [InlayHint],
+}
+
+struct InlayHintGroup {
+    line: i32,
+    hints: [InlayHint],
+}
+
+struct InlayThemeBaseStyle {
+    fg: Json,
+    bg: Json,
+}
+
+struct InlayTheme {
+    // Theme colors form an open-ended nullable color map at the host boundary.
+    colors: Json,
+    gutter_style: InlayThemeBaseStyle,
+    style: InlayThemeBaseStyle,
+}
+
+struct InlayEditorInfo {
+    theme: InlayTheme,
+}
+
+struct InlayDecoration {
+    buffer_index: i32,
+    line: i32,
+    anchor: String,
+    column: i32,
+    text: String,
+    style: Style,
+    priority: i32,
+}
+
 pub fn activate() {
     red::on("buffer:changed", schedule_refresh);
     red::on("file:opened", schedule_refresh);
@@ -24,7 +92,7 @@ pub fn activate() {
     refresh();
 }
 
-fn config_loaded(event: Json) {
+fn config_loaded(event: InlayConfigEvent) {
     let options = event.value.plugin_config.inlay_hints;
     if options != red::null() {
         red::state_set(
@@ -35,7 +103,7 @@ fn config_loaded(event: Json) {
     }
 }
 
-fn schedule_refresh(event: Json) {
+fn schedule_refresh(event: EmptyEvent) {
     let timer = red::string(red::state("inlay_timer"), "");
     if timer != "" {
         red::execute("CancelTimeout", timer);
@@ -43,7 +111,7 @@ fn schedule_refresh(event: Json) {
     red::state_set("inlay_timer", red::execute("SetTimeout", 120));
 }
 
-fn timeout_callback(event: Json) {
+fn timeout_callback(event: TimerEvent) {
     if event.timer_id != red::state("inlay_timer") {
         return;
     }
@@ -56,10 +124,11 @@ fn refresh() {
     red::state_set("inlay_generation", generation);
     red::state_set("inlay_info_loaded", false);
     red::state_set("inlay_hints_loaded", false);
-    layout_loaded(red::viewport_layout());
+    let layout: InlayViewportLayout = red::viewport_layout();
+    layout_loaded(layout);
 }
 
-fn layout_loaded(layout: Json) {
+fn layout_loaded(layout: InlayViewportLayout) {
     if red::len(layout.rows) == 0 {
         red::execute("ClearDecorations", "inlay-hints");
         return;
@@ -75,22 +144,22 @@ fn layout_loaded(layout: Json) {
             end_line = row.line;
         }
     }
-    let generation = red::int(red::state("inlay_generation"), 0);
     let hints_id = red::request("InlayHints", hints_loaded, Range {
         start: Position { line: start_line, character: 0 },
         end: Position { line: end_line + 1, character: 0 },
     });
     red::state_set("inlay_hints_request", hints_id);
-    info_loaded(red::editor_info());
+    let info: InlayEditorInfo = red::editor_info();
+    info_loaded(info);
 }
 
-fn info_loaded(info: Json) {
+fn info_loaded(info: InlayEditorInfo) {
     red::state_set("inlay_info", info);
     red::state_set("inlay_info_loaded", true);
     render_if_ready();
 }
 
-fn hints_loaded(result: Json, request_id: i32) {
+fn hints_loaded(result: InlayHintsResult, request_id: i32) {
     if request_id != red::int(red::state("inlay_hints_request"), -2) {
         return;
     }
@@ -103,16 +172,16 @@ fn render_if_ready() {
     if !red::state_bool("inlay_info_loaded") || !red::state_bool("inlay_hints_loaded") {
         return;
     }
-    let result = red::state("inlay_hints");
+    let result: InlayHintsResult = red::state("inlay_hints");
     if !red::bool(result.ok, false) {
         red::execute("ClearDecorations", "inlay-hints");
         return;
     }
 
-    let layout = red::state("inlay_layout");
+    let layout: InlayViewportLayout = red::state("inlay_layout");
     let hints_by_line = group_hints_by_line(result.hints, layout.rows);
-    let seen = [];
-    let decorations = [];
+    let seen: [i32] = [];
+    let decorations: [InlayDecoration] = [];
     let row_index = 0;
     while row_index < red::len(layout.rows) && row_index < 64 {
         let row = layout.rows[row_index];
@@ -126,7 +195,7 @@ fn render_if_ready() {
             row_index = row_index + 1;
             continue;
         }
-        decorations = red::push(decorations, Decoration {
+        decorations = red::push(decorations, InlayDecoration {
             buffer_index: layout.buffer_index,
             line: row.line,
             anchor: "eol",
@@ -143,9 +212,9 @@ fn render_if_ready() {
     }
 }
 
-fn group_hints_by_line(hints: Json, rows: Json) -> Json {
+fn group_hints_by_line(hints: [InlayHint], rows: [InlayViewportRow]) -> [InlayHintGroup] {
     // Bound both visible rows and hints per line before the insertion sort below.
-    let grouped = [];
+    let grouped: [InlayHintGroup] = [];
     let row_index = 0;
     while row_index < red::len(rows) && red::len(grouped) < 64 {
         let line = rows[row_index].line;
@@ -156,7 +225,7 @@ fn group_hints_by_line(hints: Json, rows: Json) -> Json {
             }
         }
         if !found {
-            grouped = red::push(grouped, Json { line: line, hints: [] });
+            grouped = red::push(grouped, InlayHintGroup { line: line, hints: [] });
         }
         row_index = row_index + 1;
     }
@@ -164,7 +233,7 @@ fn group_hints_by_line(hints: Json, rows: Json) -> Json {
     while index < red::len(hints) && index < 256 {
         let hint = hints[index];
         let line = red::int(hint.position.line, -1);
-        let updated = [];
+        let updated: [InlayHintGroup] = [];
         for group in grouped {
             if group.line == line {
                 if red::len(group.hints) < 24 {
@@ -179,7 +248,7 @@ fn group_hints_by_line(hints: Json, rows: Json) -> Json {
     return grouped;
 }
 
-fn hints_for_line(grouped: Json, line: i32) -> Json {
+fn hints_for_line(grouped: [InlayHintGroup], line: i32) -> [InlayHint] {
     for group in grouped {
         if group.line == line {
             return group.hints;
@@ -188,9 +257,9 @@ fn hints_for_line(grouped: Json, line: i32) -> Json {
     return [];
 }
 
-fn line_hint_text(hints: Json) -> String {
-    let type_hints = [];
-    let parameter_hints = [];
+fn line_hint_text(hints: [InlayHint]) -> String {
+    let type_hints: [String] = [];
+    let parameter_hints: [String] = [];
     for hint in sorted_line_hints(hints) {
         let text = red::trim(label_text(hint.label));
         if red::int(hint.kind, 0) == 1 {
@@ -225,11 +294,11 @@ fn line_hint_text(hints: Json) -> String {
     return result;
 }
 
-fn sorted_line_hints(hints: Json) -> Json {
-    let sorted = [];
+fn sorted_line_hints(hints: [InlayHint]) -> [InlayHint] {
+    let sorted: [InlayHint] = [];
     for hint in hints {
         let inserted = false;
-        let next = [];
+        let next: [InlayHint] = [];
         for current in sorted {
             if !inserted && red::int(hint.position.character, 0) < red::int(current.position.character, 0) {
                 next = red::push(next, hint);
@@ -257,7 +326,7 @@ fn label_text(label: Json) -> String {
     return text;
 }
 
-fn join_text(values: Json, separator: String) -> String {
+fn join_text(values: [String], separator: String) -> String {
     let joined = "";
     for value in values {
         if joined != "" {
@@ -268,7 +337,7 @@ fn join_text(values: Json, separator: String) -> String {
     return joined;
 }
 
-fn hint_style(info: Json) -> Json {
+fn hint_style(info: InlayEditorInfo) -> Style {
     let fg = info.theme.colors["editorInlayHint.typeForeground"];
     if fg == red::null() {
         fg = info.theme.colors["editorInlayHint.foreground"];

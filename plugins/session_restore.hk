@@ -5,23 +5,57 @@
 // boundary. `before_exit` stores presentation-compatible state but does not write dirty
 // buffers to their backing files.
 
+struct IntegerConfigValue {
+    value: i32,
+}
+
+struct StringConfigValue {
+    value: String,
+}
+
+struct SessionBuffer {
+    path: String,
+    dirty: bool,
+}
+
+struct SessionSnapshot {
+    version: i32,
+    cwd: String,
+    buffers: [SessionBuffer],
+}
+
+struct StoredSessionSnapshot {
+    value: SessionSnapshot,
+}
+
+struct SkippedFile {
+    path: String,
+    reason: String,
+}
+
+struct RestoreResult {
+    restored: bool,
+    warnings: [String],
+    skipped_files: [SkippedFile],
+}
+
 pub fn activate() {
     red::on("editor:ready", ready);
     red::state_set("session_snapshot", red::null());
 }
 
-fn ready(event: Json) {
+fn ready(event: EmptyEvent) {
     red::request("GetConfig", startup_count_loaded, "startup_file_count");
 }
 
-fn startup_count_loaded(event: Json) {
+fn startup_count_loaded(event: IntegerConfigValue) {
     if red::int(event.value, 0) > 0 {
         return;
     }
     red::request("GetStorage", snapshot_loaded, "latest");
 }
 
-fn snapshot_loaded(event: Json) {
+fn snapshot_loaded(event: StoredSessionSnapshot) {
     let snapshot = event.value;
     if snapshot == red::null() || red::int(snapshot.version, 0) != 1 {
         return;
@@ -30,8 +64,8 @@ fn snapshot_loaded(event: Json) {
     red::request("GetConfig", cwd_loaded, "cwd");
 }
 
-fn cwd_loaded(event: Json) {
-    let snapshot = red::state("session_snapshot");
+fn cwd_loaded(event: StringConfigValue) {
+    let snapshot: SessionSnapshot = red::state("session_snapshot");
     let saved_cwd = red::string(snapshot.cwd, "");
     let current_cwd = red::string(event.value, "");
     if saved_cwd != "" && current_cwd != "" && saved_cwd != current_cwd {
@@ -41,7 +75,7 @@ fn cwd_loaded(event: Json) {
     red::request("RestoreEditorState", restore_finished, snapshot);
 }
 
-fn restore_finished(result: Json) {
+fn restore_finished(result: RestoreResult) {
     if !red::bool(result.restored, false) {
         red::log("Session restore did not restore files", result.warnings);
     }
@@ -50,11 +84,11 @@ fn restore_finished(result: Json) {
     }
 }
 
-pub fn before_exit(snapshot: Json) {
+pub fn before_exit(snapshot: SessionSnapshot) {
     if snapshot == red::null() {
         return;
     }
-    let buffers = [];
+    let buffers: [SessionBuffer] = [];
     for buffer in snapshot.buffers {
         if red::string(buffer.path, "") != "" && !red::bool(buffer.dirty, false) {
             buffers = red::push(buffers, buffer);

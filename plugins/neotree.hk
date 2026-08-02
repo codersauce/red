@@ -5,8 +5,129 @@
 // IDs are normalized project-relative paths. All mutations are performed by Red's
 // workspace-confined filesystem host API.
 
+struct TreeThemeStyleSpec {
+    foreground: [String],
+    background: [String],
+    bold: bool,
+}
+
+struct TreePanelSegment {
+    text: String,
+    semantic: TreeThemeStyleSpec,
+}
+
+struct TreePanelRow {
+    id: String,
+    path: String,
+    expanded: bool,
+    kind: String,
+    segments: [TreePanelSegment],
+    right_segments: [TreePanelSegment],
+}
+
+struct NeoTreePanelEvent {
+    action: String,
+    row: TreePanelRow,
+}
+
+struct DirectoryEntry {
+    name: String,
+    path: String,
+    kind: String,
+}
+
+struct DirectoryListing {
+    path: String,
+    entries: [DirectoryEntry],
+    truncated: bool,
+    // Listing failures are nullable structured host errors.
+    error: Json,
+}
+
+struct Children {
+    path: String,
+    entries: [DirectoryEntry],
+    truncated: bool,
+}
+
+struct Watch {
+    path: String,
+    id: i32,
+}
+
+struct ClipboardEntry {
+    path: String,
+    action: String,
+}
+
+struct PasteEntry {
+    source: String,
+    destination: String,
+    action: String,
+}
+
+struct TrashBatch {
+    paths: [String],
+}
+
+struct FileOperationResult {
+    ok: bool,
+    error: String,
+    undo_supported: bool,
+}
+
+struct PathOperation {
+    kind: String,
+    path: String,
+}
+
+struct MoveOperation {
+    kind: String,
+    source: String,
+    destination: String,
+}
+
+struct PathsOperation {
+    kind: String,
+    paths: [String],
+}
+
+struct FileStatResult {
+    ok: bool,
+    error: String,
+    path: String,
+    kind: String,
+    size: i64,
+    readonly: bool,
+}
+
+struct GitStatusResult {
+    root: String,
+    statuses: Json,
+    error: Json,
+    // The status index is an open path-keyed map consumed by the typed core adapter.
+    status_index: Json,
+}
+
+struct DirectoryChangedEvent {
+    path: String,
+}
+
+struct CwdValueEvent {
+    value: String,
+}
+
+struct TreeWindow {
+    active: bool,
+    buffer_path: String,
+}
+
+struct TreeWindowsResult {
+    windows: [TreeWindow],
+}
+
 pub fn activate() {
-    red::add_command("NeoTree", neotree, Json {
+    red::add_command("NeoTree", neotree, CommandMetadata {
         title: "Toggle file tree",
         category: "File",
         description: "Show or hide the workspace file tree",
@@ -18,7 +139,7 @@ pub fn activate() {
     red::state_set("expanded", ["."]);
     red::state_set("children", []);
     red::state_set("watches", []);
-    red::state_set("status", Json {
+    red::state_set("status", GitStatusResult {
         root: red::null(),
         statuses: [],
         error: red::null(),
@@ -86,7 +207,7 @@ fn deactivate() {
     close();
 }
 
-fn panel_event(event: Json) {
+fn panel_event(event: NeoTreePanelEvent) {
     if event.action == "close" {
         close();
         return;
@@ -162,7 +283,7 @@ fn panel_event(event: Json) {
     }
 
     if event.action == "i" {
-        red::request("FileOperation", stat_loaded, Json {
+        red::request("FileOperation", stat_loaded, PathOperation {
             kind: "stat",
             path: row.path,
         });
@@ -215,7 +336,7 @@ fn panel_event(event: Json) {
     }
 }
 
-fn open_create_prompt(row: Json, directory: bool) {
+fn open_create_prompt(row: TreePanelRow, directory: bool) {
     let parent = row.path;
     if row.kind != "directory" {
         parent = path_parent(row.path);
@@ -259,7 +380,7 @@ fn path_prompt_submitted(value: String) {
         if kind == "create" && red::ends_with(query, "/") {
             create_kind = "create_directory";
         }
-        request_operation(Json {
+        request_operation(PathOperation {
             kind: create_kind,
             path: path_join(parent, query),
         });
@@ -274,18 +395,20 @@ fn path_prompt_submitted(value: String) {
     } else {
         destination = workspace_path(query);
     }
-    request_operation(Json {
+    request_operation(MoveOperation {
         kind: kind,
         source: source,
         destination: destination,
     });
 }
 
+// File operations are a tagged host union (`path`, `paths`, or source/destination),
+// so the shared request envelope remains dynamic while each response is concrete.
 fn request_operation(operation: Json) {
     red::request("FileOperation", operation_loaded, operation);
 }
 
-fn operation_loaded(result: Json) {
+fn operation_loaded(result: FileOperationResult) {
     let kind = red::string(red::state("pending_kind"), "operation");
     if !red::bool(result.ok, false) {
         red::execute("Print", "Neo-tree " + kind + " failed: " + red::string(result.error, "unknown error"));
@@ -303,7 +426,7 @@ fn operation_loaded(result: Json) {
     reset_tree();
 }
 
-fn selected_paths(row: Json) -> Json {
+fn selected_paths(row: TreePanelRow) -> [String] {
     let paths = red::state("selected");
     if red::len(paths) == 0 {
         if row.path == "." {
@@ -329,7 +452,7 @@ fn toggle_selection(path: String) {
     render();
 }
 
-fn confirm_removal(kind: String, paths: Json) {
+fn confirm_removal(kind: String, paths: [String]) {
     if red::len(paths) == 0 {
         return;
     }
@@ -355,7 +478,7 @@ fn removal_confirmed(item: PickerItem) {
         red::state_set("pending_kind", "");
         return;
     }
-    request_operation(Json {
+    request_operation(PathsOperation {
         kind: red::string(red::state("pending_kind"), ""),
         paths: red::state("pending_paths"),
     });
@@ -370,19 +493,19 @@ fn restore_last_trash() {
     let batch = history[red::len(history) - 1];
     red::state_set("pending_kind", "restore");
     red::state_set("pending_paths", batch.paths);
-    red::request("FileOperation", restore_loaded, Json {
+    red::request("FileOperation", restore_loaded, PathsOperation {
         kind: "undo_trash",
         paths: batch.paths,
     });
 }
 
-fn restore_loaded(result: Json) {
+fn restore_loaded(result: FileOperationResult) {
     if !red::bool(result.ok, false) {
         red::execute("Print", "Neo-tree restore failed: " + red::string(result.error, "unknown error"));
         return;
     }
     let history = red::state("trash_history");
-    let remaining = [];
+    let remaining: [TrashBatch] = [];
     let index = 0;
     while index < red::len(history) - 1 {
         remaining = red::push(remaining, history[index]);
@@ -394,11 +517,11 @@ fn restore_loaded(result: Json) {
     reset_tree();
 }
 
-fn update_clipboard(action: String, paths: Json) {
+fn update_clipboard(action: String, paths: [String]) {
     if red::len(paths) == 0 {
         return;
     }
-    let clipboard = [];
+    let clipboard: [ClipboardEntry] = [];
     for entry in red::state("clipboard") {
         if !red::contains(paths, entry.path) {
             clipboard = red::push(clipboard, entry);
@@ -416,7 +539,7 @@ fn update_clipboard(action: String, paths: Json) {
     render();
 }
 
-fn paste_clipboard(row: Json) {
+fn paste_clipboard(row: TreePanelRow) {
     let clipboard = red::state("clipboard");
     if red::len(clipboard) == 0 {
         red::execute("Print", "Neo-tree clipboard is empty");
@@ -426,7 +549,7 @@ fn paste_clipboard(row: Json) {
     if row.kind != "directory" {
         destination = path_parent(row.path);
     }
-    let queue = [];
+    let queue: [PasteEntry] = [];
     for entry in clipboard {
         queue = red::push(queue, PasteEntry {
             source: entry.path,
@@ -449,14 +572,14 @@ fn run_next_paste() {
         return;
     }
     let entry = queue[index];
-    red::request("FileOperation", paste_loaded, Json {
+    red::request("FileOperation", paste_loaded, MoveOperation {
         kind: entry.action,
         source: entry.source,
         destination: entry.destination,
     });
 }
 
-fn paste_loaded(result: Json) {
+fn paste_loaded(result: FileOperationResult) {
     if !red::bool(result.ok, false) {
         red::execute("Print", "Neo-tree paste stopped: " + red::string(result.error, "unknown error"));
         reset_tree();
@@ -464,7 +587,7 @@ fn paste_loaded(result: Json) {
     }
     let index = red::int(red::state("paste_index"), 0);
     let entry = red::state("paste_queue")[index];
-    let clipboard = [];
+    let clipboard: [ClipboardEntry] = [];
     for candidate in red::state("clipboard") {
         if candidate.path != entry.source {
             clipboard = red::push(clipboard, candidate);
@@ -475,7 +598,7 @@ fn paste_loaded(result: Json) {
     run_next_paste();
 }
 
-fn stat_loaded(result: Json) {
+fn stat_loaded(result: FileStatResult) {
     if !red::bool(result.ok, false) {
         red::execute("Print", "Neo-tree details failed: " + red::string(result.error, "unknown error"));
         return;
@@ -550,7 +673,7 @@ fn request_git_status() {
     red::request("GetGitStatus", git_status_loaded, ".");
 }
 
-fn directory_loaded(listing: Json) {
+fn directory_loaded(listing: DirectoryListing) {
     if listing.error != red::null() {
         set_children(listing.path, [], false);
     } else {
@@ -565,13 +688,13 @@ fn directory_loaded(listing: Json) {
     }
 }
 
-fn git_status_loaded(result: Json) {
+fn git_status_loaded(result: GitStatusResult) {
     red::state_set("status", result);
     red::state_set("status_entries", red::neotree_core("status_entries", result.status_index));
     render();
 }
 
-fn directory_changed(event: Json) {
+fn directory_changed(event: DirectoryChangedEvent) {
     request_directory(event.path);
     request_git_status();
 }
@@ -600,13 +723,13 @@ fn is_watched(path: String) -> bool {
     return false;
 }
 
-fn cwd_loaded(event: Json) {
+fn cwd_loaded(event: CwdValueEvent) {
     let cwd = red::string(event.value, ".");
     red::state_set("cwd", normalize_path(cwd));
     try_reveal_current_file();
 }
 
-fn windows_loaded(result: Json) {
+fn windows_loaded(result: TreeWindowsResult) {
     let path = "";
     for window in result.windows {
         if red::bool(window.active, false) {
@@ -699,7 +822,7 @@ fn clear_reveal() {
     red::state_set("reveal_parent", ".");
 }
 
-fn find_child(entries: Json, name: String, kind: String) -> Json {
+fn find_child(entries: [DirectoryEntry], name: String, kind: String) -> DirectoryEntry {
     for entry in entries {
         if entry.kind == kind && entry.name == name {
             return entry;
@@ -708,8 +831,8 @@ fn find_child(entries: Json, name: String, kind: String) -> Json {
     return red::null();
 }
 
-fn set_children(path: String, entries: Json, truncated: bool) {
-    let children = [];
+fn set_children(path: String, entries: [DirectoryEntry], truncated: bool) {
+    let children: [Children] = [];
     for child in red::state("children") {
         if child.path != path {
             children = red::push(children, child);
@@ -732,7 +855,7 @@ fn has_children(path: String) -> bool {
     return false;
 }
 
-fn children_for(path: String) -> Json {
+fn children_for(path: String) -> [DirectoryEntry] {
     for child in red::state("children") {
         if child.path == path {
             return child.entries;
@@ -781,9 +904,9 @@ fn render() {
     red::execute("UpdatePanel", "neotree", build_rows());
 }
 
-fn loading_rows() -> Json {
+fn loading_rows() -> [TreePanelRow] {
     return [
-        PanelRow {
+        TreePanelRow {
             id: "loading",
             path: ".",
             expanded: false,
@@ -797,7 +920,7 @@ fn loading_rows() -> Json {
     ];
 }
 
-fn build_rows() -> Json {
+fn build_rows() -> [TreePanelRow] {
     return red::neotree_core(
         "build_rows",
         red::string(red::state("cwd"), "."),
@@ -810,10 +933,10 @@ fn build_rows() -> Json {
     );
 }
 
-fn segment(text: String, foreground: Json, bold: bool) -> Json {
-    return PanelSegment {
+fn segment(text: String, foreground: [String], bold: bool) -> TreePanelSegment {
+    return TreePanelSegment {
         text: text,
-        semantic: ThemeStyleSpec {
+        semantic: TreeThemeStyleSpec {
             foreground: foreground,
             bold: bold,
         },

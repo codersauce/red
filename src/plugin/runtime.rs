@@ -122,6 +122,30 @@ impl ComposerHandle {
 
 pub(super) const RED_HOST_DECLARATIONS: &str = r#"
 type Json = JsValue;
+struct EmptyEvent {}
+struct CommandMetadata {
+    title: String,
+    category: String,
+    description: String,
+    aliases: [String],
+}
+struct Position {
+    line: i32,
+    character: i32,
+}
+struct Range {
+    start: Position,
+    end: Position,
+}
+struct TimerEvent {
+    timer_id: String,
+}
+struct Style {
+    fg: Json,
+    bg: Json,
+    bold: bool,
+    italic: bool,
+}
 struct PickerItem {
     id: String,
     label: String,

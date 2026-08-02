@@ -4,6 +4,80 @@
 // in display columns, and replaces one namespace per refresh. It does not infer cursor
 // coordinates from UTF-8 bytes, and deactivate clears every guide atomically.
 
+struct ViewportIndentation {
+    shift_width: i32,
+    tab_width: i32,
+}
+
+struct ViewportCursor {
+    x: i32,
+    y: i32,
+}
+
+struct ViewportRow {
+    line: i32,
+    text: String,
+    indent_width: i32,
+    first_segment: bool,
+}
+
+struct IndentViewportLayout {
+    buffer_index: i32,
+    revision: i32,
+    vtop: i32,
+    width: i32,
+    height: i32,
+    cursor: ViewportCursor,
+    indentation: ViewportIndentation,
+    rows: [ViewportRow],
+}
+
+struct SourceRow {
+    line: i32,
+    text: String,
+    indent_width: i32,
+}
+
+struct MeasuredRow {
+    line: i32,
+    width: i32,
+}
+
+struct IndentScope {
+    active: bool,
+    column: i32,
+    start: i32,
+    end: i32,
+}
+
+struct IndentDecoration {
+    buffer_index: i32,
+    anchor: String,
+    line: i32,
+    column: i32,
+    text: String,
+    style: Style,
+    priority: i32,
+    repeat_linebreak: bool,
+    only_whitespace: bool,
+}
+
+struct ThemeBaseStyle {
+    fg: Json,
+    bg: Json,
+}
+
+struct IndentTheme {
+    // Theme colors are an open-ended map whose values may be null or any supported color form.
+    colors: Json,
+    gutter_style: ThemeBaseStyle,
+    style: ThemeBaseStyle,
+}
+
+struct IndentEditorInfo {
+    theme: IndentTheme,
+}
+
 pub fn activate() {
     red::on("editor:ready", refresh);
     red::on("editor:state_restored", refresh);
@@ -13,11 +87,11 @@ pub fn activate() {
     red::on("mode:changed", refresh);
     red::on("theme:changed", refresh_theme);
     red::state_set("indent_layout_key", "");
-    refresh(red::null());
+    refresh(EmptyEvent {});
 }
 
-fn refresh(event: Json) {
-    let layout = red::viewport_layout();
+fn refresh(event: EmptyEvent) {
+    let layout: IndentViewportLayout = red::viewport_layout();
     let key = red::int(layout.buffer_index, -1)
         + ":" + red::int(layout.revision, -1)
         + ":" + red::int(layout.vtop, -1)
@@ -32,12 +106,12 @@ fn refresh(event: Json) {
     render(layout, red::editor_info());
 }
 
-fn refresh_theme(event: Json) {
+fn refresh_theme(event: EmptyEvent) {
     red::state_set("indent_layout_key", "");
     refresh(event);
 }
 
-fn render(layout: Json, info: Json) {
+fn render(layout: IndentViewportLayout, info: IndentEditorInfo) {
     red::execute("SetDecorations", "indent-guides", build_decorations(layout, info));
 }
 
@@ -45,13 +119,13 @@ fn deactivate() {
     red::execute("ClearDecorations", "indent-guides");
 }
 
-fn build_decorations(layout: Json, info: Json) -> Json {
+fn build_decorations(layout: IndentViewportLayout, info: IndentEditorInfo) -> [IndentDecoration] {
     let shift_width = positive_or(red::int(layout.indentation.shift_width, 4), 4);
     let tab_width = positive_or(red::int(layout.indentation.tab_width, shift_width), shift_width);
     let buffer_index = red::int(layout.buffer_index, 0);
     let rows = measured_rows(unique_first_segment_rows(layout.rows), tab_width);
     let scope = active_scope(layout, rows, shift_width);
-    let decorations = [];
+    let decorations: [IndentDecoration] = [];
     let guide = red::char(9474);
     let guide_style = indent_style(info);
     let active_guide_style = scope_style(info);
@@ -83,15 +157,15 @@ fn build_decorations(layout: Json, info: Json) -> Json {
     return decorations;
 }
 
-fn unique_first_segment_rows(source_rows: Json) -> Json {
-    let rows = [];
+fn unique_first_segment_rows(source_rows: [ViewportRow]) -> [SourceRow] {
+    let rows: [SourceRow] = [];
     let i = 0;
 
     while i < red::len(source_rows) && red::len(rows) < 500 {
         let row = source_rows[i];
         let line = red::int(row.line, 0);
         if red::bool(row.first_segment, true) {
-            rows = red::push(rows, Row {
+            rows = red::push(rows, SourceRow {
                 line: line,
                 text: red::string(row.text, ""),
                 indent_width: red::int(row.indent_width, -1),
@@ -103,8 +177,8 @@ fn unique_first_segment_rows(source_rows: Json) -> Json {
     return rows;
 }
 
-fn measured_rows(rows: Json, tab_width: int) -> Json {
-    let measured = [];
+fn measured_rows(rows: [SourceRow], tab_width: i32) -> [MeasuredRow] {
+    let measured: [MeasuredRow] = [];
     let i = 0;
     let previous = -1;
 
@@ -112,7 +186,7 @@ fn measured_rows(rows: Json, tab_width: int) -> Json {
         let row = rows[i];
         if !is_blank(row.text) {
             let width = non_blank_indent(row, tab_width);
-            measured = red::push(measured, Row { line: row.line, width: width });
+            measured = red::push(measured, MeasuredRow { line: row.line, width: width });
             previous = width;
             i = i + 1;
             continue;
@@ -135,7 +209,7 @@ fn measured_rows(rows: Json, tab_width: int) -> Json {
             width = after;
         }
         while i < end {
-            measured = red::push(measured, Row { line: rows[i].line, width: width });
+            measured = red::push(measured, MeasuredRow { line: rows[i].line, width: width });
             i = i + 1;
         }
     }
@@ -143,7 +217,7 @@ fn measured_rows(rows: Json, tab_width: int) -> Json {
     return measured;
 }
 
-fn non_blank_indent(row: Json, tab_width: int) -> int {
+fn non_blank_indent(row: SourceRow, tab_width: i32) -> i32 {
     let width = red::int(row.indent_width, -1);
     if width >= 0 {
         return width;
@@ -151,18 +225,18 @@ fn non_blank_indent(row: Json, tab_width: int) -> int {
     return leading_indent_width(row.text, tab_width);
 }
 
-fn active_scope(layout: Json, rows: Json, shift_width: int) -> Json {
+fn active_scope(layout: IndentViewportLayout, rows: [MeasuredRow], shift_width: i32) -> IndentScope {
     let cursor_line = red::int(layout.cursor.y, 0);
     let cursor_index = 0;
     while cursor_index < red::len(rows) && rows[cursor_index].line != cursor_line {
         cursor_index = cursor_index + 1;
     }
     if cursor_index >= red::len(rows) {
-        return Scope { active: false };
+        return IndentScope { active: false, column: 0, start: 0, end: 0 };
     }
     let current_indent = rows[cursor_index].width;
     if current_indent < shift_width {
-        return Scope { active: false };
+        return IndentScope { active: false, column: 0, start: 0, end: 0 };
     }
 
     let level = (current_indent / shift_width) * shift_width;
@@ -192,7 +266,7 @@ fn active_scope(layout: Json, rows: Json, shift_width: int) -> Json {
         index = index + 1;
     }
 
-    return Scope {
+    return IndentScope {
         active: true,
         column: level - shift_width,
         start: start,
@@ -200,7 +274,7 @@ fn active_scope(layout: Json, rows: Json, shift_width: int) -> Json {
     };
 }
 
-fn leading_indent_width(line: String, tab_width: int) -> int {
+fn leading_indent_width(line: String, tab_width: i32) -> i32 {
     let width = 0;
     let i = 0;
     let tab = red::char(9);
@@ -222,7 +296,7 @@ fn leading_indent_width(line: String, tab_width: int) -> int {
     return width;
 }
 
-fn guide_text(indent_width: int, shift_width: int, guide: String) -> String {
+fn guide_text(indent_width: i32, shift_width: i32, guide: String) -> String {
     let text = "";
     let column = 0;
     while column < indent_width {
@@ -240,7 +314,7 @@ fn is_blank(text: String) -> bool {
     return red::trim(text) == "";
 }
 
-fn positive_or(value: int, fallback: int) -> int {
+fn positive_or(value: i32, fallback: i32) -> i32 {
     if value > 0 {
         return value;
     }
@@ -250,15 +324,15 @@ fn positive_or(value: int, fallback: int) -> int {
     return 1;
 }
 
-fn min_int(left: int, right: int) -> int {
+fn min_int(left: i32, right: i32) -> i32 {
     if left < right {
         return left;
     }
     return right;
 }
 
-fn indent_decoration(buffer_index: int, line: int, text: String, style: Json) -> Json {
-    return Decoration {
+fn indent_decoration(buffer_index: i32, line: i32, text: String, style: Style) -> IndentDecoration {
+    return IndentDecoration {
         buffer_index: buffer_index,
         anchor: "column",
         line: line,
@@ -271,8 +345,8 @@ fn indent_decoration(buffer_index: int, line: int, text: String, style: Json) ->
     };
 }
 
-fn scope_decoration(buffer_index: int, line: int, column: int, text: String, style: Json) -> Json {
-    return Decoration {
+fn scope_decoration(buffer_index: i32, line: i32, column: i32, text: String, style: Style) -> IndentDecoration {
+    return IndentDecoration {
         buffer_index: buffer_index,
         anchor: "column",
         line: line,
@@ -285,7 +359,7 @@ fn scope_decoration(buffer_index: int, line: int, column: int, text: String, sty
     };
 }
 
-fn indent_style(info: Json) -> Json {
+fn indent_style(info: IndentEditorInfo) -> Style {
     let fg = info.theme.colors["editorIndentGuide.background"];
     if fg == red::null() {
         fg = info.theme.colors["tree.inactiveIndentGuidesStroke"];
@@ -304,7 +378,7 @@ fn indent_style(info: Json) -> Json {
     };
 }
 
-fn scope_style(info: Json) -> Json {
+fn scope_style(info: IndentEditorInfo) -> Style {
     let fg = info.theme.colors["editorIndentGuide.activeBackground"];
     if fg == red::null() {
         fg = info.theme.colors["tree.indentGuidesStroke"];
@@ -323,7 +397,7 @@ fn scope_style(info: Json) -> Json {
     };
 }
 
-fn theme_foreground(info: Json) -> Json {
+fn theme_foreground(info: IndentEditorInfo) -> Json {
     let color = info.theme.colors["editor.foreground"];
     if color != red::null() {
         return color;
@@ -334,7 +408,7 @@ fn theme_foreground(info: Json) -> Json {
     return Color { Rgb: Json { r: 255, g: 255, b: 255 } };
 }
 
-fn theme_background(info: Json) -> Json {
+fn theme_background(info: IndentEditorInfo) -> Json {
     let color = info.theme.colors["editor.background"];
     if color != red::null() {
         return color;

@@ -3,6 +3,15 @@
 // Search and cursor events replace one decoration namespace atomically. Leaving a
 // search-related mode clears that namespace so highlights cannot survive stale state.
 
+struct ModeChangedEvent {
+    to: String,
+}
+
+struct CursorMovedEvent {
+    mode: String,
+    cause: String,
+}
+
 pub fn activate() {
     red::on("search:highlighted", search_highlighted);
     red::on("search:cleared", search_cleared);
@@ -10,21 +19,21 @@ pub fn activate() {
     red::on("cursor:moved", cursor_moved);
 }
 
-fn search_highlighted(event: Json) {
+fn search_highlighted(event: EmptyEvent) {
     red::state_set("highlight_active", true);
 }
 
-fn search_cleared(event: Json) {
+fn search_cleared(event: EmptyEvent) {
     red::state_set("highlight_active", false);
 }
 
-fn mode_changed(event: Json) {
+fn mode_changed(event: ModeChangedEvent) {
     if event.to == "Insert" {
         clear();
     }
 }
 
-fn cursor_moved(event: Json) {
+fn cursor_moved(event: CursorMovedEvent) {
     if !red::state_bool("highlight_active") {
         return;
     }
