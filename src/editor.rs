@@ -3306,7 +3306,8 @@ impl Editor {
             self.render(buffer)
         } else if self.can_render_cursor_motion_delta() {
             self.render_cursor_motion_delta(buffer)
-        } else if self.uses_synthetic_block_cursor()
+        } else if self.relative_line_numbers_enabled()
+            || self.uses_synthetic_block_cursor()
             || !self.last_rendered_bracket_rows.is_empty()
             || self.matching_bracket_positions().is_some()
         {
@@ -3775,6 +3776,10 @@ impl Editor {
 
     fn active_tab_width(&self) -> usize {
         self.tab_width_for_buffer_index(self.buffer_manager.active_index())
+    }
+
+    fn relative_line_numbers_enabled(&self) -> bool {
+        self.config.relative_line_numbers.unwrap_or(false)
     }
 
     fn break_indent_options_for_buffer_index(&self, buffer_index: usize) -> BreakIndentOptions {
@@ -7202,6 +7207,9 @@ impl Editor {
                             "log_file" => json!(self.config.log_file),
                             "mouse_scroll_lines" => json!(self.config.mouse_scroll_lines),
                             "scrolloff" => json!(self.config.scrolloff),
+                            "relative_line_numbers" => {
+                                json!(self.config.relative_line_numbers)
+                            }
                             "show_diagnostics" => json!(self.config.show_diagnostics),
                             "startup_file_count" => json!(self.config.startup_file_count),
                             "cwd" => json!(std::env::current_dir()
@@ -7222,6 +7230,7 @@ impl Editor {
                             "log_file": self.config.log_file,
                             "mouse_scroll_lines": self.config.mouse_scroll_lines,
                             "scrolloff": self.config.scrolloff,
+                            "relative_line_numbers": self.config.relative_line_numbers,
                             "show_diagnostics": self.config.show_diagnostics,
                             "startup_file_count": self.config.startup_file_count,
                             "cwd": std::env::current_dir().ok().map(|path| path.to_string_lossy().to_string()),
@@ -8025,7 +8034,7 @@ impl Editor {
                 !from_waiting_key_action && self.should_drain_repeated_motion(&ev, &action);
             let action_span = perf::PerfSpan::start("event:handle_action");
             let should_quit = self
-                .handle_key_action(&ev, &action, buffer, runtime)
+                .handle_resolved_key_action(&ev, &action, buffer, runtime)
                 .await?;
             drop(action_span);
             if should_quit {
@@ -8197,13 +8206,51 @@ impl Editor {
             self.render(buffer)
         } else if self.can_render_cursor_motion_delta() {
             self.render_cursor_motion_delta(buffer)
-        } else if self.uses_synthetic_block_cursor()
+        } else if self.relative_line_numbers_enabled()
+            || self.uses_synthetic_block_cursor()
             || !self.last_rendered_bracket_rows.is_empty()
             || self.matching_bracket_positions().is_some()
         {
             self.render_motion_frame(buffer)
         } else {
             self.draw_cursor_preserving_cursor_goal()
+        }
+    }
+
+    async fn handle_key_action_with_deferred_motion(
+        &mut self,
+        ev: &event::Event,
+        action: &KeyAction,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<bool> {
+        let was_deferring_motion = self.defer_motion_render;
+        self.defer_motion_render = true;
+        let result = self.handle_key_action(ev, action, buffer, runtime).await;
+        self.defer_motion_render = was_deferring_motion;
+
+        let quit = result?;
+        if !was_deferring_motion {
+            self.flush_deferred_plugin_event(runtime).await?;
+            self.flush_deferred_motion_render(buffer)?;
+        }
+        Ok(quit)
+    }
+
+    async fn handle_resolved_key_action(
+        &mut self,
+        ev: &event::Event,
+        action: &KeyAction,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<bool> {
+        // A count is one input command even though KeyAction expands it internally.
+        // Keep that render boundary for both direct input and replayed events.
+        if self.should_defer_counted_relative_motion(action) {
+            self.handle_key_action_with_deferred_motion(ev, action, buffer, runtime)
+                .await
+        } else {
+            self.handle_key_action(ev, action, buffer, runtime).await
         }
     }
 
@@ -8328,6 +8375,11 @@ impl Editor {
             && self.pending_operator.is_none()
             && self.waiting_key_action.is_none()
             && Self::key_action_is_pure_motion(action)
+    }
+
+    fn should_defer_counted_relative_motion(&self, action: &KeyAction) -> bool {
+        self.relative_line_numbers_enabled()
+            && matches!(action, KeyAction::Repeating(_, repeated) if Self::key_action_is_pure_motion(repeated))
     }
 
     fn key_action_is_pure_motion(action: &KeyAction) -> bool {
@@ -8562,7 +8614,7 @@ impl Editor {
             for event in &change.events {
                 if let Some(action) = self.handle_event_with_runtime(event, Some(runtime))? {
                     if self
-                        .handle_key_action(event, &action, buffer, runtime)
+                        .handle_resolved_key_action(event, &action, buffer, runtime)
                         .await?
                     {
                         anyhow::bail!("repeated change attempted to quit the editor");
@@ -8635,7 +8687,7 @@ impl Editor {
                     self.handle_event_with_runtime(&replay.event, Some(runtime))?
                 {
                     if self
-                        .handle_key_action(&replay.event, &action, buffer, runtime)
+                        .handle_resolved_key_action(&replay.event, &action, buffer, runtime)
                         .await?
                     {
                         anyhow::bail!("macro attempted to quit the editor");
@@ -25229,6 +25281,150 @@ mod test {
         assert_eq!(
             render_buffer.cells[row5].style.fg, styled,
             "upward delta render must keep highlighting"
+        );
+    }
+
+    #[tokio::test]
+    async fn relative_line_numbers_repaint_the_whole_gutter_after_cursor_motion() {
+        let config = Config {
+            relative_line_numbers: Some(true),
+            ..Default::default()
+        };
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "one\ntwo\nthree\nfour".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 30, 8, config, Theme::default(), vec![buffer]).unwrap();
+        let mut render_buffer = RenderBuffer::new(30, 8, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor.render(&mut render_buffer).unwrap();
+        assert_eq!(
+            render_text_rows(&render_buffer)[2]
+                .chars()
+                .take(4)
+                .collect::<String>(),
+            "  2 "
+        );
+        assert!(!editor.can_render_cursor_motion_delta());
+
+        editor
+            .execute(&Action::MoveDown, &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            render_text_rows(&render_buffer)[2]
+                .chars()
+                .take(4)
+                .collect::<String>(),
+            "  1 ",
+            "moving the cursor must refresh relative numbers outside the old and new cursor rows"
+        );
+    }
+
+    fn counted_down_motion_editor(relative_line_numbers: bool) -> (Editor, RenderBuffer, Runtime) {
+        let mut config = Config {
+            relative_line_numbers: Some(relative_line_numbers),
+            ..Default::default()
+        };
+        config
+            .keys
+            .normal
+            .insert("j".to_string(), KeyAction::Single(Action::MoveDown));
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let content = (1..=30)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let buffer = Buffer::new(None, content);
+        let mut editor =
+            Editor::with_size(lsp, 40, 20, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+
+        (
+            editor,
+            RenderBuffer::new(40, 20, &Style::default()),
+            Runtime::new(),
+        )
+    }
+
+    async fn run_counted_down_motion(relative_line_numbers: bool) -> (Editor, RenderBuffer, u64) {
+        let (mut editor, mut render_buffer, mut runtime) =
+            counted_down_motion_editor(relative_line_numbers);
+
+        editor.render(&mut render_buffer).unwrap();
+        for key in ['1', '0'] {
+            editor
+                .process_editor_event(
+                    Event::Key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)),
+                    &mut render_buffer,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+        }
+        let generation_before_motion = editor.render_generation;
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        (editor, render_buffer, generation_before_motion)
+    }
+
+    #[tokio::test]
+    async fn counted_relative_line_motion_renders_only_the_final_frame() {
+        let (editor, render_buffer, generation_before_motion) = run_counted_down_motion(true).await;
+
+        assert_eq!(editor.buffer_line(), 10);
+        assert_eq!(
+            editor.render_generation,
+            generation_before_motion.wrapping_add(1)
+        );
+        let rows = render_text_rows(&render_buffer);
+        assert_eq!(rows[10].chars().take(5).collect::<String>(), "  11 ");
+        assert_eq!(rows[15].chars().take(5).collect::<String>(), "   5 ");
+    }
+
+    #[tokio::test]
+    async fn macro_replayed_counted_relative_line_motion_renders_only_the_final_frame() {
+        let _guard = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        let (mut editor, mut render_buffer, mut runtime) = counted_down_motion_editor(true);
+        install_event_recorder(&mut editor, &mut runtime).await;
+        editor.set_register('a', Content::charwise("10j".to_string()));
+        editor.render(&mut render_buffer).unwrap();
+        let generation_before_motion = editor.render_generation;
+
+        editor
+            .play_macro('a', &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(editor.buffer_line(), 10);
+        assert_eq!(
+            editor.render_generation,
+            generation_before_motion.wrapping_add(1)
+        );
+        assert_eq!(
+            collect_print_requests(),
+            vec!["cursor:MoveDown:0,0->0,10:Normal".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn counted_motion_keeps_the_existing_render_path_without_relative_numbers() {
+        let (editor, _, generation_before_motion) = run_counted_down_motion(false).await;
+
+        assert_eq!(editor.buffer_line(), 10);
+        assert_eq!(
+            editor.render_generation,
+            generation_before_motion.wrapping_add(10)
         );
     }
 

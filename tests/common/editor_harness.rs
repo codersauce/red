@@ -606,6 +606,48 @@ mod tests {
     }
 
     #[test]
+    fn test_relative_line_numbers_show_distances_and_absolute_cursor_line() {
+        let content = (1..=12)
+            .map(|line| format!("Line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let config = Config {
+            relative_line_numbers: Some(true),
+            ..Default::default()
+        };
+        let buffer = Buffer::new(None, content);
+        let mut harness = EditorHarness::with_config(buffer, config);
+        harness.set_viewport_cursor(0, 0, 4);
+
+        let first_row = harness.render_row(0).unwrap();
+        let cursor_row = harness.render_row(4).unwrap();
+        let lower_row = harness.render_row(7).unwrap();
+
+        assert_eq!(first_row.chars().take(5).collect::<String>(), "   4 ");
+        assert_eq!(cursor_row.chars().take(5).collect::<String>(), "   5 ");
+        assert_eq!(lower_row.chars().take(5).collect::<String>(), "   3 ");
+    }
+
+    #[test]
+    fn test_relative_line_numbers_leave_wrapped_continuations_blank() {
+        let config = Config {
+            relative_line_numbers: Some(true),
+            ..Default::default()
+        };
+        let buffer = Buffer::new(None, "abcdefghi\nsecond".to_string());
+        let mut harness = EditorHarness::with_config_and_size(buffer, config, 12, 8);
+        harness.set_viewport_cursor(0, 0, 1);
+
+        let first_row = harness.render_row(0).unwrap();
+        let continuation_row = harness.render_row(1).unwrap();
+        let cursor_row = harness.render_row(2).unwrap();
+
+        assert_eq!(first_row.chars().take(4).collect::<String>(), "  1 ");
+        assert_eq!(continuation_row.chars().take(4).collect::<String>(), "    ");
+        assert_eq!(cursor_row.chars().take(4).collect::<String>(), "  2 ");
+    }
+
+    #[test]
     fn test_plugin_gutter_sign_precedes_line_number() {
         let mut harness = EditorHarness::with_content("Line 1\nLine 2");
         harness.editor.test_set_gutter_signs(

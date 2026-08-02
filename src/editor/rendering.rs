@@ -240,6 +240,11 @@ impl Editor {
     /// Renders the entire editor state to the terminal
     /// This is the main entry point for all rendering operations
     pub fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        if self.relative_line_numbers_enabled() && self.defer_motion_render {
+            self.deferred_motion_needs_full_render = true;
+            return Ok(());
+        }
+
         let _span = super::perf::PerfSpan::start("render:full");
         self.update_gutter_width();
         self.apply_panel_layout();
@@ -365,6 +370,7 @@ impl Editor {
 
     pub(crate) fn can_render_cursor_motion_delta(&self) -> bool {
         self.terminal_output_enabled
+            && !self.relative_line_numbers_enabled()
             && self.uses_synthetic_block_cursor()
             && self.current_dialog.is_none()
             && !self.panel_manager.has_focused_panel()
@@ -520,7 +526,18 @@ impl Editor {
         let segment = layout.row(row).filter(|segment| segment.first_segment);
         let line_number = segment
             .filter(|segment| segment.line < line_count)
-            .map(|segment| segment.line + 1);
+            .map(|segment| {
+                if self.relative_line_numbers_enabled() {
+                    let cursor_line = window.vtop + window.cy;
+                    if segment.line == cursor_line {
+                        segment.line + 1
+                    } else {
+                        segment.line.abs_diff(cursor_line)
+                    }
+                } else {
+                    segment.line + 1
+                }
+            });
         let number_text = line_number
             .map(|line_number| format!("{line_number:>number_width$} "))
             .unwrap_or_else(|| " ".repeat(number_width + 1));
