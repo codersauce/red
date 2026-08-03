@@ -137,6 +137,11 @@ artifact. A package cannot self-approve native code through its manifest.
 If a package and user configuration define the same language ID, the explicit
 user definition wins.
 
+First-party language packs are maintained as standalone plugin repositories.
+For example, the Swift pack supplies its own Tree-sitter grammar, highlight
+queries, SwiftPM root detection, and SourceKit-LSP configuration without adding
+Swift-specific code to Red.
+
 ## Reload without restarting
 
 After editing your configuration, installing a package, or approving a grammar,

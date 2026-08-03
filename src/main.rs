@@ -346,6 +346,8 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
                 };
                 let companion = if plugin.has_companion {
                     "companion"
+                } else if plugin.has_languages {
+                    "language"
                 } else {
                     "husk"
                 };

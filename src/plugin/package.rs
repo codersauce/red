@@ -172,6 +172,8 @@ pub struct InstalledPlugin {
     pub enabled: bool,
     pub compatible: bool,
     pub has_companion: bool,
+    /// Whether the package contributes one or more language definitions.
+    pub has_languages: bool,
     pub source: PluginInstallSource,
     pub package_root: PathBuf,
 }
@@ -917,6 +919,7 @@ fn installed_from_record(record: PluginInstallRecord) -> Result<InstalledPlugin>
         enabled: record.enabled,
         compatible: manifest.plugin.red_api.matches(&host_api),
         has_companion: manifest.companion.is_some(),
+        has_languages: !manifest.languages.is_empty(),
         source: record.source,
         package_root: record.package_root,
     })
@@ -1109,8 +1112,56 @@ builtin = "rust"
         let manifest = PluginPackageManifest::load(&installed.package_root).unwrap();
 
         assert_eq!(installed.id.as_str(), "build-languages");
+        assert!(installed.has_languages);
+        assert!(!installed.has_companion);
         assert_eq!(manifest.languages["buildspec"].filenames, ["Buildfile"]);
         assert!(manifest.husk_entry(&installed.package_root).is_none());
+    }
+
+    #[test]
+    fn language_only_manifest_declares_native_highlighting_and_lsp() {
+        let manifest: PluginPackageManifest = toml::from_str(&format!(
+            r#"
+schema_version = 1
+
+[plugin]
+id = "acme-language"
+name = "Acme language support"
+version = "0.1.0"
+red_api = "^{RED_HOST_API_VERSION}"
+
+[languages.acme]
+extensions = ["acme"]
+filenames = ["Acmefile"]
+comment = "// %s"
+
+[languages.acme.grammar]
+path = "grammars/acme.so"
+symbol = "tree_sitter_acme"
+highlights = ["queries/highlights.scm"]
+
+[languages.acme.lsp]
+command = "acme-language-server"
+root_markers = ["Acmefile", ".git"]
+"#
+        ))
+        .unwrap();
+        let language = manifest.languages.get("acme").unwrap();
+        let grammar = language.grammar.as_ref().unwrap();
+        let server = language.lsp.as_ref().unwrap();
+
+        assert_eq!(manifest.plugin.id.as_str(), "acme-language");
+        assert_eq!(language.extensions, ["acme"]);
+        assert_eq!(language.filenames, ["Acmefile"]);
+        assert_eq!(language.comment.as_deref(), Some("// %s"));
+        assert_eq!(grammar.path.as_deref(), Some(Path::new("grammars/acme.so")));
+        assert_eq!(grammar.symbol.as_deref(), Some("tree_sitter_acme"));
+        assert_eq!(
+            grammar.highlights,
+            [PathBuf::from("queries/highlights.scm")]
+        );
+        assert_eq!(server.command.as_deref(), Some("acme-language-server"));
+        assert_eq!(server.root_markers, ["Acmefile", ".git"]);
     }
 
     #[test]
