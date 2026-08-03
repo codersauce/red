@@ -524,12 +524,14 @@ impl Editor {
         let number_width = self.line_number_width_for_window(window);
         let gutter_style = self.theme.gutter_style.fallback_bg(&self.theme.style);
         let segment = layout.row(row).filter(|segment| segment.first_segment);
+        let cursor_line = window.vtop + window.cy;
+        let is_cursor_line =
+            segment.is_some_and(|segment| segment.line < line_count && segment.line == cursor_line);
         let line_number = segment
             .filter(|segment| segment.line < line_count)
             .map(|segment| {
                 if self.relative_line_numbers_enabled() {
-                    let cursor_line = window.vtop + window.cy;
-                    if segment.line == cursor_line {
+                    if is_cursor_line {
                         segment.line + 1
                     } else {
                         segment.line.abs_diff(cursor_line)
@@ -539,12 +541,26 @@ impl Editor {
                 }
             });
         let number_text = line_number
-            .map(|line_number| format!("{line_number:>number_width$} "))
+            .map(|line_number| {
+                if self.relative_line_numbers_enabled() && is_cursor_line {
+                    format!("{line_number:<number_width$} ")
+                } else {
+                    format!("{line_number:>number_width$} ")
+                }
+            })
             .unwrap_or_else(|| " ".repeat(number_width + 1));
         let text = format!("{}{number_text}", " ".repeat(GUTTER_SIGN_COLUMN_WIDTH));
         let term_x = window.position.x;
         let term_y = self.window_to_terminal_y(window, row);
         buffer.set_text(term_x, term_y, &text, &gutter_style);
+        if is_cursor_line {
+            buffer.set_text(
+                term_x + GUTTER_SIGN_COLUMN_WIDTH,
+                term_y,
+                &number_text,
+                &self.theme.current_line_number_style(),
+            );
+        }
 
         let Some(segment) = segment else {
             return;

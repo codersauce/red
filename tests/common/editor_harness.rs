@@ -607,7 +607,7 @@ mod tests {
 
     #[test]
     fn test_relative_line_numbers_show_distances_and_absolute_cursor_line() {
-        let content = (1..=12)
+        let content = (1..=120)
             .map(|line| format!("Line {line}"))
             .collect::<Vec<_>>()
             .join("\n");
@@ -621,11 +621,11 @@ mod tests {
 
         let first_row = harness.render_row(0).unwrap();
         let cursor_row = harness.render_row(4).unwrap();
-        let lower_row = harness.render_row(7).unwrap();
+        let two_digit_row = harness.render_row(14).unwrap();
 
-        assert_eq!(first_row.chars().take(5).collect::<String>(), "   4 ");
-        assert_eq!(cursor_row.chars().take(5).collect::<String>(), "   5 ");
-        assert_eq!(lower_row.chars().take(5).collect::<String>(), "   3 ");
+        assert_eq!(first_row.chars().take(6).collect::<String>(), "    4 ");
+        assert_eq!(cursor_row.chars().take(6).collect::<String>(), "  5   ");
+        assert_eq!(two_digit_row.chars().take(6).collect::<String>(), "   10 ");
     }
 
     #[test]

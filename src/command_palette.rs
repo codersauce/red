@@ -33,6 +33,7 @@ pub(crate) const BUILTIN_COLON_COMMANDS: &[&str] = &[
     "only",
     "noh",
     "nohlsearch",
+    "set",
     "wrap",
     "nowrap",
     "syntax",
@@ -556,6 +557,24 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Some(":nowrap"),
             &[],
             Action::SetWrap(false),
+        ),
+        builtin(
+            "view.enable_relative_line_numbers",
+            "Enable relative line numbers",
+            "View",
+            "Show each non-cursor line's distance from the cursor",
+            Some(":set relativenumber"),
+            &[":set rnu"],
+            Action::SetRelativeLineNumbers(true),
+        ),
+        builtin(
+            "view.disable_relative_line_numbers",
+            "Disable relative line numbers",
+            "View",
+            "Show absolute numbers on every line",
+            Some(":set norelativenumber"),
+            &[":set nornu"],
+            Action::SetRelativeLineNumbers(false),
         ),
         builtin(
             "view.syntax",
@@ -1199,6 +1218,26 @@ mod tests {
         assert!(syntax.aliases.iter().any(|alias| alias == ":syn"));
         assert!(syntax.aliases.iter().any(|alias| alias == ":ft"));
         assert_eq!(syntax.action, Action::OpenSyntaxPicker);
+    }
+
+    #[test]
+    fn palette_lists_relative_line_number_set_commands() {
+        let entries = entries(&default_keys(), &[]);
+        let enable = entries
+            .iter()
+            .find(|entry| entry.id == "view.enable_relative_line_numbers")
+            .expect("relative line number enable action should appear in the command palette");
+        let disable = entries
+            .iter()
+            .find(|entry| entry.id == "view.disable_relative_line_numbers")
+            .expect("relative line number disable action should appear in the command palette");
+
+        assert_eq!(enable.colon.as_deref(), Some(":set relativenumber"));
+        assert!(enable.aliases.iter().any(|alias| alias == ":set rnu"));
+        assert_eq!(enable.action, Action::SetRelativeLineNumbers(true));
+        assert_eq!(disable.colon.as_deref(), Some(":set norelativenumber"));
+        assert!(disable.aliases.iter().any(|alias| alias == ":set nornu"));
+        assert_eq!(disable.action, Action::SetRelativeLineNumbers(false));
     }
 
     #[test]
