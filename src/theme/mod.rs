@@ -66,6 +66,16 @@ pub struct ThemeStyleSpec {
 }
 
 impl Theme {
+    pub(crate) fn current_line_number_style(&self) -> Style {
+        let mut style = self.gutter_style.fallback_bg(&self.style);
+        style.fg = self
+            .colors
+            .get("editorLineNumber.activeForeground")
+            .copied()
+            .or(self.style.fg);
+        style
+    }
+
     pub fn get_style(&self, scope: &str) -> Option<Style> {
         compatible_scopes(scope).into_iter().find_map(|candidate| {
             self.token_styles.iter().find_map(|ts| {
@@ -611,6 +621,71 @@ mod tests {
             token_styles,
             ..Theme::default()
         }
+    }
+
+    #[test]
+    fn current_line_number_style_prefers_theme_active_foreground() {
+        let active = Color::Rgb {
+            r: 180,
+            g: 190,
+            b: 200,
+        };
+        let gutter_background = Color::Rgb {
+            r: 20,
+            g: 21,
+            b: 22,
+        };
+        let mut theme = Theme {
+            gutter_style: Style {
+                fg: Some(Color::Rgb {
+                    r: 70,
+                    g: 71,
+                    b: 72,
+                }),
+                bg: Some(gutter_background),
+                italic: true,
+                ..Style::default()
+            },
+            ..Theme::default()
+        };
+        theme
+            .colors
+            .insert("editorLineNumber.activeForeground".to_string(), active);
+
+        let style = theme.current_line_number_style();
+
+        assert_eq!(style.fg, Some(active));
+        assert_eq!(style.bg, Some(gutter_background));
+        assert!(style.italic);
+    }
+
+    #[test]
+    fn current_line_number_style_falls_back_to_editor_foreground() {
+        let editor_foreground = Color::Rgb {
+            r: 210,
+            g: 211,
+            b: 212,
+        };
+        let theme = Theme {
+            style: Style {
+                fg: Some(editor_foreground),
+                ..Style::default()
+            },
+            gutter_style: Style {
+                fg: Some(Color::Rgb {
+                    r: 80,
+                    g: 81,
+                    b: 82,
+                }),
+                ..Style::default()
+            },
+            ..Theme::default()
+        };
+
+        assert_eq!(
+            theme.current_line_number_style().fg,
+            Some(editor_foreground)
+        );
     }
 
     fn cursor_contrast_theme(editor_fg: Color, editor_bg: Color, cursor_fg: Color) -> Theme {

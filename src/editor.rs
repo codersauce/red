@@ -1359,6 +1359,7 @@ pub enum Action {
     ScrollCursorToViewEnd,
     ToggleWrap,
     SetWrap(bool),
+    SetRelativeLineNumbers(bool),
 
     DeletePreviousChar,
     DeleteCharAtCursorPos,
@@ -10593,6 +10594,26 @@ impl Editor {
             return vec![Action::SetSyntax(syntax.to_string())];
         }
 
+        if name == "set" {
+            let mut options = arguments.split_whitespace();
+            let Some(option) = options.next() else {
+                self.last_error = Some("usage: set {relativenumber|norelativenumber}".to_string());
+                return Vec::new();
+            };
+            if options.next().is_some() {
+                self.last_error = Some("usage: set {relativenumber|norelativenumber}".to_string());
+                return Vec::new();
+            }
+            return match option {
+                "relativenumber" | "rnu" => vec![Action::SetRelativeLineNumbers(true)],
+                "norelativenumber" | "nornu" => vec![Action::SetRelativeLineNumbers(false)],
+                _ => {
+                    self.last_error = Some(format!("unknown option {option:?}"));
+                    Vec::new()
+                }
+            };
+        }
+
         let parsed = command::parse(command_palette::BUILTIN_COLON_COMMANDS, cmd);
 
         let Some(parsed) = parsed else {
@@ -15143,6 +15164,10 @@ impl Editor {
                 self.wrap = *wrap;
                 self.vleft = 0;
                 self.skipcol = 0;
+                self.render(buffer)?;
+            }
+            Action::SetRelativeLineNumbers(enabled) => {
+                self.config.relative_line_numbers = Some(*enabled);
                 self.render(buffer)?;
             }
             Action::MoveToNextWord => {
@@ -22323,6 +22348,65 @@ mod test {
     }
 
     #[tokio::test]
+    async fn set_relative_line_number_commands_update_and_repaint_the_gutter() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let content = (1..=120)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = Editor::with_size(
+            lsp,
+            40,
+            10,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, content)],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        editor.vtop = 28;
+        editor.cy = 3;
+        let mut buffer = RenderBuffer::new(40, 10, &Style::default());
+        let mut runtime = Runtime::new();
+
+        enter_colon_command(&mut editor, &mut buffer, &mut runtime, "set relativenumber").await;
+
+        assert!(editor.relative_line_numbers_enabled());
+        let rows = render_text_rows(&buffer);
+        assert_eq!(rows[2].chars().take(6).collect::<String>(), "    1 ");
+        assert_eq!(rows[3].chars().take(6).collect::<String>(), "  32  ");
+
+        enter_colon_command(
+            &mut editor,
+            &mut buffer,
+            &mut runtime,
+            "set norelativenumber",
+        )
+        .await;
+
+        assert!(!editor.relative_line_numbers_enabled());
+        let rows = render_text_rows(&buffer);
+        assert_eq!(rows[2].chars().take(6).collect::<String>(), "   31 ");
+        assert_eq!(rows[3].chars().take(6).collect::<String>(), "   32 ");
+    }
+
+    #[test]
+    fn set_relative_line_number_aliases_match_neovim() {
+        let mut editor = test_editor(40, 10);
+        let runtime = Runtime::new();
+
+        assert_eq!(
+            editor.handle_command("set rnu", &runtime),
+            vec![Action::SetRelativeLineNumbers(true)]
+        );
+        assert_eq!(
+            editor.handle_command("set nornu", &runtime),
+            vec![Action::SetRelativeLineNumbers(false)]
+        );
+    }
+
+    #[tokio::test]
     async fn syntax_picker_opens_from_colon_command_and_applies_selected_language() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
@@ -25286,24 +25370,55 @@ mod test {
 
     #[tokio::test]
     async fn relative_line_numbers_repaint_the_whole_gutter_after_cursor_motion() {
+        let normal_line_number = Color::Rgb {
+            r: 70,
+            g: 71,
+            b: 72,
+        };
+        let active_line_number = Color::Rgb {
+            r: 180,
+            g: 190,
+            b: 200,
+        };
         let config = Config {
             relative_line_numbers: Some(true),
             ..Default::default()
         };
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
         let buffer = Buffer::new(None, "one\ntwo\nthree\nfour".to_string());
-        let mut editor =
-            Editor::with_size(lsp, 30, 8, config, Theme::default(), vec![buffer]).unwrap();
+        let mut theme = Theme {
+            gutter_style: Style {
+                fg: Some(normal_line_number),
+                ..Style::default()
+            },
+            ..Theme::default()
+        };
+        theme.colors.insert(
+            "editorLineNumber.activeForeground".to_string(),
+            active_line_number,
+        );
+        let mut editor = Editor::with_size(lsp, 30, 8, config, theme, vec![buffer]).unwrap();
         let mut render_buffer = RenderBuffer::new(30, 8, &Style::default());
         let mut runtime = Runtime::new();
 
         editor.render(&mut render_buffer).unwrap();
+        let number_column = GUTTER_SIGN_COLUMN_WIDTH;
         assert_eq!(
             render_text_rows(&render_buffer)[2]
                 .chars()
                 .take(4)
                 .collect::<String>(),
             "  2 "
+        );
+        assert_eq!(
+            render_buffer.cells[number_column].style.fg,
+            Some(active_line_number)
+        );
+        assert_eq!(
+            render_buffer.cells[2 * render_buffer.width + number_column]
+                .style
+                .fg,
+            Some(normal_line_number)
         );
         assert!(!editor.can_render_cursor_motion_delta());
 
@@ -25319,6 +25434,68 @@ mod test {
                 .collect::<String>(),
             "  1 ",
             "moving the cursor must refresh relative numbers outside the old and new cursor rows"
+        );
+        assert_eq!(
+            render_buffer.cells[number_column].style.fg,
+            Some(normal_line_number)
+        );
+        assert_eq!(
+            render_buffer.cells[render_buffer.width + number_column]
+                .style
+                .fg,
+            Some(active_line_number)
+        );
+    }
+
+    #[test]
+    fn absolute_line_numbers_use_the_theme_active_foreground_on_the_cursor_line() {
+        let normal_line_number = Color::Rgb {
+            r: 70,
+            g: 71,
+            b: 72,
+        };
+        let active_line_number = Color::Rgb {
+            r: 180,
+            g: 190,
+            b: 200,
+        };
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+        let mut theme = Theme {
+            gutter_style: Style {
+                fg: Some(normal_line_number),
+                ..Style::default()
+            },
+            ..Theme::default()
+        };
+        theme.colors.insert(
+            "editorLineNumber.activeForeground".to_string(),
+            active_line_number,
+        );
+        let mut editor = Editor::with_size(lsp, 30, 8, config, theme, vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        editor.cy = 1;
+        let mut render_buffer = RenderBuffer::new(30, 8, &Style::default());
+
+        editor.render(&mut render_buffer).unwrap();
+
+        let number_column = GUTTER_SIGN_COLUMN_WIDTH;
+        assert_eq!(
+            render_buffer.cells[number_column].style.fg,
+            Some(normal_line_number)
+        );
+        assert_eq!(
+            render_buffer.cells[render_buffer.width + number_column]
+                .style
+                .fg,
+            Some(active_line_number)
+        );
+        assert_eq!(
+            render_buffer.cells[2 * render_buffer.width + number_column]
+                .style
+                .fg,
+            Some(normal_line_number)
         );
     }
 
