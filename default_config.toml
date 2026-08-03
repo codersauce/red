@@ -133,6 +133,34 @@ waiting = "steady_underscore"
 # language_id = "javascript"
 # file_extensions = ["js", "mjs", "cjs"]
 
+# Unified language definitions can configure syntax, exact filenames, comments,
+# indentation, trusted Tree-sitter grammars, and LSP from one table. Exact
+# filenames are case-sensitive; file extensions are case-insensitive.
+#
+# [languages.buildspec]
+# extensions = ["build"]
+# filenames = ["Buildfile"]
+# aliases = ["build-script"]
+# comment = "# %s"
+# indent_width = 2
+#
+# [languages.buildspec.grammar]
+# builtin = "rust"
+# # Native libraries require `red language trust buildspec` first:
+# # path = "~/.local/share/nvim/site/parser/buildspec.so"
+# # symbol = "tree_sitter_buildspec"
+# # highlights = ["~/.config/red/queries/buildspec/highlights.scm"]
+#
+# [languages.buildspec.lsp]
+# command = "build-language-server"
+# args = ["--stdio"]
+# root_markers = ["Buildfile", ".git"]
+#
+# [languages.buildspec.lsp.settings.build]
+# validate = true
+#
+# Apply language changes without restarting using `:languages reload`.
+
 # Comment templates use Neovim's commentstring format. The single %s is
 # replaced with each selected line. Add or override languages and extensions
 # here without installing or starting a language server.

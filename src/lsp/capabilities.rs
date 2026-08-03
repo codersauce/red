@@ -359,6 +359,7 @@ pub fn get_client_capabilities_with_options(
 
     let workspace = WorkspaceClientCapabilities::builder()
         .apply_edit(true)
+        .configuration(true)
         .symbol(
             WorkspaceSymbolClientCapabilities::builder()
                 .dynamic_registration(false)
@@ -515,6 +516,7 @@ mod tests {
             json!("textOnlyTransactional")
         );
         assert_eq!(capabilities["workspace"]["applyEdit"], json!(true));
+        assert_eq!(capabilities["workspace"]["configuration"], json!(true));
         assert_eq!(workspace_edit["documentChanges"], json!(cfg!(unix)));
         assert_eq!(
             workspace_edit["failureHandling"],

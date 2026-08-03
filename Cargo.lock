@@ -1674,6 +1674,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2239,6 +2249,7 @@ dependencies = [
  "include_dir",
  "json_comments",
  "lazy_static",
+ "libloading",
  "nix",
  "once_cell",
  "path-absolutize",
@@ -2262,6 +2273,7 @@ dependencies = [
  "tree-sitter-fish",
  "tree-sitter-javascript",
  "tree-sitter-json",
+ "tree-sitter-language",
  "tree-sitter-lua",
  "tree-sitter-md",
  "tree-sitter-powershell",

@@ -39,6 +39,7 @@ pub(crate) const BUILTIN_COLON_COMMANDS: &[&str] = &[
     "syntax",
     "syn",
     "ft",
+    "languages",
     "config-diagnostics",
 ];
 
@@ -368,6 +369,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Some(":config-diagnostics"),
             &[],
             Action::ConfigDiagnostics,
+        ),
+        builtin(
+            "editor.reload_languages",
+            "Reload language definitions",
+            "Editor",
+            "Reload language packs, trusted grammars, highlighting, and language servers",
+            Some(":languages reload"),
+            &["reload syntax", "reload grammar", "reload language server"],
+            Action::ReloadLanguages,
         ),
         builtin(
             "file.save",

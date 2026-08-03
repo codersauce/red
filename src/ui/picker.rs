@@ -29,7 +29,7 @@ use crate::{
     color::Color,
     config::{KeyAction, PickerIconStyle, PickerIconsConfig, PickerInputPosition},
     editor::{Action, Editor, PickerCallback, RenderBuffer, StyleInfo},
-    highlighter::Highlighter,
+    highlighter::{Highlighter, LanguageRegistry},
     plugin::PickerHandle,
     theme::{SelectionForegroundPriority, Style, Theme},
     unicode_utils::{
@@ -193,12 +193,16 @@ struct PreviewHighlightSpan {
 
 struct PreviewHighlighter {
     highlighter: RefCell<Option<Highlighter>>,
+    registry: Arc<LanguageRegistry>,
 }
 
 impl PreviewHighlighter {
-    fn new(theme: &Theme) -> Self {
+    fn new(theme: &Theme, registry: Arc<LanguageRegistry>) -> Self {
         Self {
-            highlighter: RefCell::new(Highlighter::new(theme).ok()),
+            highlighter: RefCell::new(
+                Highlighter::with_registry(theme, Arc::clone(&registry)).ok(),
+            ),
+            registry,
         }
     }
 
@@ -216,7 +220,8 @@ impl PreviewHighlighter {
                 let Some(language_id) = highlighter.language_id_for_name(language) else {
                     return Vec::new();
                 };
-                highlighter.highlight(language_id, text)
+                let language_id = language_id.to_string();
+                highlighter.highlight(&language_id, text)
             }
             PickerPreview::Text { language: None, .. } => Ok(Vec::new()),
             PickerPreview::Location { path, .. } => {
@@ -459,7 +464,7 @@ impl Picker {
             item_preview_root: None,
             placeholder: None,
             preview_scroll: 0,
-            preview_highlighter: PreviewHighlighter::new(&editor.theme),
+            preview_highlighter: PreviewHighlighter::new(&editor.theme, editor.language_registry()),
             preview_text_cache: RefCell::new(VecDeque::new()),
             history_key: None,
             history: Vec::new(),
@@ -496,7 +501,8 @@ impl Picker {
         self.dialog.title_style = theme.ui_style.popup_title.clone();
         self.dialog.theme = theme.clone();
         self.theme = theme.clone();
-        self.preview_highlighter = PreviewHighlighter::new(theme);
+        self.preview_highlighter =
+            PreviewHighlighter::new(theme, Arc::clone(&self.preview_highlighter.registry));
     }
 
     fn set_presentation_for_viewport(

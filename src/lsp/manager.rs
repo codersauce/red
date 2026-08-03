@@ -65,6 +65,7 @@ where
 pub struct LspManager {
     config: LspConfig,
     document_selectors: HashMap<String, DocumentSelector>,
+    filename_selectors: HashMap<String, DocumentSelector>,
     clients: HashMap<String, RealLspClient>,
     client_poll_order: Vec<String>,
     failed_clients: HashSet<String>,
@@ -77,14 +78,23 @@ impl LspManager {
     /// Builds routing tables without starting any server processes.
     pub fn new(config: LspConfig) -> Self {
         let mut document_selectors = HashMap::new();
+        let mut filename_selectors = HashMap::new();
         if config.enabled {
             let mut servers = config.servers.iter().collect::<Vec<_>>();
             servers.sort_unstable_by_key(|(name, _)| *name);
             for (server_name, server) in servers {
                 for document in server.documents() {
-                    for extension in document.file_extensions {
+                    for extension in &document.file_extensions {
                         document_selectors
                             .entry(extension.trim_start_matches('.').to_ascii_lowercase())
+                            .or_insert_with(|| DocumentSelector {
+                                server_name: server_name.clone(),
+                                language_id: document.language_id.clone(),
+                            });
+                    }
+                    for filename in document.filenames {
+                        filename_selectors
+                            .entry(filename)
                             .or_insert_with(|| DocumentSelector {
                                 server_name: server_name.clone(),
                                 language_id: document.language_id.clone(),
@@ -97,6 +107,7 @@ impl LspManager {
         Self {
             config,
             document_selectors,
+            filename_selectors,
             clients: HashMap::new(),
             client_poll_order: Vec::new(),
             failed_clients: HashSet::new(),
@@ -115,8 +126,13 @@ impl LspManager {
             return None;
         }
 
-        let extension = normalized_extension(file)?;
-        let selector = self.document_selectors.get(&extension)?;
+        let filename = Path::new(file).file_name().and_then(|name| name.to_str());
+        let selector = filename
+            .and_then(|name| self.filename_selectors.get(name))
+            .or_else(|| {
+                normalized_extension(file)
+                    .and_then(|extension| self.document_selectors.get(&extension))
+            })?;
         let server = self.config.servers.get(&selector.server_name)?;
 
         let path = Path::new(file);
@@ -246,6 +262,70 @@ fn find_workspace_root(path: &Path, server: &LanguageServerConfig) -> PathBuf {
 
 #[async_trait::async_trait]
 impl LspClient for LspManager {
+    async fn reconfigure(&mut self, config: LspConfig) -> Result<Vec<String>, LspError> {
+        let changed = self
+            .config
+            .servers
+            .keys()
+            .chain(config.servers.keys())
+            .filter(|name| self.config.servers.get(*name) != config.servers.get(*name))
+            .cloned()
+            .collect::<HashSet<_>>();
+        let disabled = self.config.enabled != config.enabled;
+        let mut affected = self
+            .document_clients
+            .iter()
+            .filter(|(_, client)| {
+                disabled
+                    || client
+                        .split_once(':')
+                        .is_some_and(|(server, _)| changed.contains(server))
+            })
+            .map(|(file, _)| file.clone())
+            .collect::<Vec<_>>();
+        affected.sort_unstable();
+
+        let keys = self
+            .clients
+            .keys()
+            .filter(|key| {
+                disabled
+                    || key
+                        .split_once(':')
+                        .is_some_and(|(server, _)| changed.contains(server))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Some(mut client) = self.clients.remove(&key) {
+                client.shutdown().await?;
+            }
+        }
+        self.failed_clients.retain(|key| {
+            !disabled
+                && !key
+                    .split_once(':')
+                    .is_some_and(|(server, _)| changed.contains(server))
+        });
+        for file in &affected {
+            self.document_clients.remove(file);
+        }
+        self.opened_documents.retain(|document| {
+            !disabled
+                && !changed
+                    .iter()
+                    .any(|server| document.starts_with(&format!("{server}:")))
+        });
+        let replacement = Self::new(config);
+        self.config = replacement.config;
+        self.document_selectors = replacement.document_selectors;
+        self.filename_selectors = replacement.filename_selectors;
+        self.client_poll_order
+            .retain(|key| self.clients.contains_key(key));
+        self.next_client_poll = 0;
+        Ok(affected)
+    }
+
     async fn initialize(&mut self) -> Result<(), LspError> {
         Ok(())
     }
@@ -715,10 +795,12 @@ mod tests {
             args: Vec::new(),
             language_id: language_id.to_string(),
             file_extensions: extensions.iter().map(|ext| ext.to_string()).collect(),
+            filenames: Vec::new(),
             documents: Vec::new(),
             root_markers: vec![".git".to_string()],
             env: HashMap::new(),
             initialization_options: None,
+            settings: None,
             workspace_name: None,
         }
     }
@@ -729,16 +811,19 @@ mod tests {
             args: Vec::new(),
             language_id: String::new(),
             file_extensions: Vec::new(),
+            filenames: Vec::new(),
             documents: documents
                 .iter()
                 .map(|(language_id, extensions)| LanguageDocumentConfig {
                     language_id: language_id.to_string(),
                     file_extensions: extensions.iter().map(|ext| ext.to_string()).collect(),
+                    filenames: Vec::new(),
                 })
                 .collect(),
             root_markers: vec![".git".to_string()],
             env: HashMap::new(),
             initialization_options: None,
+            settings: None,
             workspace_name: None,
         }
     }
@@ -860,6 +945,97 @@ mod tests {
         let document = manager.resolve_document("component.TSX").unwrap();
         assert_eq!(document.language_id, "typescriptreact");
         assert_eq!(document.server_name, "web");
+    }
+
+    #[test]
+    fn exact_filenames_take_priority_over_extension_selectors() {
+        let mut filename_server = server("container", &[]);
+        filename_server.documents = vec![LanguageDocumentConfig {
+            language_id: "dockerfile".to_string(),
+            file_extensions: Vec::new(),
+            filenames: vec!["Container.toml".to_string()],
+        }];
+        let manager = LspManager::new(LspConfig {
+            enabled: true,
+            format_on_save: false,
+            servers: HashMap::from([
+                ("container".to_string(), filename_server),
+                ("toml".to_string(), server("toml", &["toml"])),
+            ]),
+        });
+
+        let document = manager.resolve_document("Container.toml").unwrap();
+        assert_eq!(document.server_name, "container");
+        assert_eq!(document.language_id, "dockerfile");
+        assert_eq!(
+            manager
+                .resolve_document("container.toml")
+                .unwrap()
+                .server_name,
+            "toml"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconfigure_rebuilds_exact_filename_routing() {
+        let mut manager = LspManager::new(LspConfig::default());
+        let mut server = server("dockerfile", &[]);
+        server.filenames = vec!["Dockerfile".to_string()];
+        let config = LspConfig {
+            enabled: true,
+            format_on_save: false,
+            servers: HashMap::from([("docker".to_string(), server)]),
+        };
+
+        assert!(manager.resolve_document("Dockerfile").is_none());
+        assert!(manager.reconfigure(config).await.unwrap().is_empty());
+        assert_eq!(
+            manager.resolve_document("Dockerfile").unwrap().language_id,
+            "dockerfile"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconfigure_preserves_unmodified_running_clients_and_open_documents() {
+        let root = std::env::current_dir().unwrap();
+        let rust = server("rust", &["rs"]);
+        let mut manager = LspManager::new(LspConfig {
+            enabled: true,
+            format_on_save: false,
+            servers: HashMap::from([("rust".to_string(), rust.clone())]),
+        });
+        let file = root.join("preserved.rs").to_string_lossy().into_owned();
+        let document = manager.resolve_document(&file).unwrap();
+        let key = client_key(&document);
+        let (request_tx, _request_rx) = tokio::sync::mpsc::channel(1);
+        let (_response_tx, response_rx) = tokio::sync::mpsc::channel(1);
+        manager.clients.insert(
+            key.clone(),
+            RealLspClient::with_test_channels(request_tx, response_rx, rust.clone(), root),
+        );
+        manager.document_clients.insert(file.clone(), key.clone());
+        manager.opened_documents.insert(document_key(&document));
+
+        let affected = manager
+            .reconfigure(LspConfig {
+                enabled: true,
+                format_on_save: false,
+                servers: HashMap::from([
+                    ("rust".to_string(), rust),
+                    ("python".to_string(), server("python", &["py"])),
+                ]),
+            })
+            .await
+            .unwrap();
+
+        assert!(affected.is_empty());
+        assert!(manager.clients.contains_key(&key));
+        assert_eq!(manager.document_clients.get(&file), Some(&key));
+        assert!(manager.opened_documents.contains(&document_key(&document)));
+        assert_eq!(
+            manager.resolve_document("example.py").unwrap().language_id,
+            "python"
+        );
     }
 
     #[test]

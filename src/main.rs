@@ -28,13 +28,14 @@ use crossterm::{style, QueueableCommand};
 
 use red::assets;
 use red::buffer::Buffer;
-use red::cli::{Args, PluginCommand, RootCommand};
+use red::cli::{Args, LanguageCommand, PluginCommand, RootCommand};
 use red::config::{
     Config, ConfigDiagnosticSeverity, ConfigRecovery, KeyAction, Keys, LoadedConfig,
 };
 use red::editor::{Action, Editor};
 #[cfg(any(unix, test))]
 use red::headless::{InputEvent as DetachedInput, KeyCode as DetachedKeyCode, KeyModifier};
+use red::language::GrammarTrustStore;
 use red::logger::Logger;
 use red::lsp::{LspClient, LspManager};
 use red::onboarding;
@@ -83,8 +84,12 @@ async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
     args.validate_utility_args()?;
 
-    if let Some(RootCommand::Plugin(plugin)) = &args.command {
-        return run_plugin_command(&plugin.command).await;
+    match &args.command {
+        Some(RootCommand::Plugin(plugin)) => return run_plugin_command(&plugin.command).await,
+        Some(RootCommand::Language(language)) => {
+            return run_language_command(&language.command, &args.config_overrides)
+        }
+        None => {}
     }
 
     if let Some(session) = &args.attach {
@@ -238,6 +243,7 @@ async fn run() -> anyhow::Result<()> {
     let diagnostics = std::mem::take(&mut loaded.diagnostics);
     let recovery = loaded.recovery;
     let mut editor = Editor::new_with_preferences(lsp, loaded.config, theme, buffers, preferences)?;
+    editor.set_language_reload_source(config_file, args.config_overrides.clone());
     editor.set_config_diagnostics(diagnostics, recovery);
     if let Some(snapshot) = &resumed_session {
         for divergence in editor.restore_session_snapshot(snapshot)? {
@@ -298,7 +304,9 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
     match command {
         PluginCommand::Install(arguments) => {
             let installed = if let Some(path) = &arguments.path {
-                manager.install_path(path).await?
+                manager
+                    .install_path_with_trust(path, arguments.trust_native_grammars)
+                    .await?
             } else {
                 let source = arguments
                     .source
@@ -309,7 +317,9 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
                     .map_or((source, None), |(repository, version)| {
                         (repository, Some(version))
                     });
-                manager.install_github(repository, version).await?
+                manager
+                    .install_github_with_trust(repository, version, arguments.trust_native_grammars)
+                    .await?
             };
             println!(
                 "Installed {} {} ({})",
@@ -346,7 +356,17 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
             }
         }
         PluginCommand::Update(arguments) if arguments.all => {
-            let results = manager.update_all().await;
+            let results = if arguments.trust_native_grammars {
+                let mut results = Vec::new();
+                for plugin in manager.list()?.into_iter().filter(|plugin| plugin.enabled) {
+                    let id = plugin.id;
+                    let result = manager.update_with_trust(&id, true).await;
+                    results.push((id, result));
+                }
+                results
+            } else {
+                manager.update_all().await
+            };
             for (id, result) in results {
                 match result {
                     Ok(plugin) => println!("Updated {} to {}", id, plugin.version),
@@ -361,7 +381,9 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
                     .as_deref()
                     .expect("clap requires an id or --all"),
             )?;
-            let plugin = manager.update(&id).await?;
+            let plugin = manager
+                .update_with_trust(&id, arguments.trust_native_grammars)
+                .await?;
             println!("Updated {} to {}", plugin.id, plugin.version);
         }
         PluginCommand::Disable(arguments) => {
@@ -382,6 +404,64 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
             } else {
                 println!("Removed {id}; saved data was preserved");
             }
+        }
+    }
+    Ok(())
+}
+
+fn run_language_command(command: &LanguageCommand, overrides: &[String]) -> anyhow::Result<()> {
+    let value = match command {
+        LanguageCommand::Trust(arguments) | LanguageCommand::Untrust(arguments) => {
+            arguments.language_or_path.as_str()
+        }
+    };
+    let config_dir = Config::config_dir();
+    let loaded = Config::load_user_file(&Config::path("config.toml"), overrides)?;
+    let mut path = loaded
+        .config
+        .languages
+        .get(value)
+        .and_then(|language| language.grammar.as_ref())
+        .and_then(|grammar| grammar.path.clone())
+        .map(|path| {
+            let expanded = expand_user_path(&path.to_string_lossy())?;
+            Ok::<_, anyhow::Error>(if expanded.is_absolute() {
+                expanded
+            } else {
+                config_dir.join(expanded)
+            })
+        })
+        .transpose()?;
+    if path.is_none() {
+        let manager = red::plugin::package::PluginPackageManager::new(&config_dir);
+        for installed in manager
+            .list()?
+            .into_iter()
+            .filter(|plugin| plugin.enabled && plugin.compatible)
+        {
+            let manifest =
+                red::plugin::package::PluginPackageManifest::load(&installed.package_root)?;
+            if let Some(language) = manifest.languages.get(value) {
+                path = manifest.grammar_path(&installed.package_root, value, language);
+                if path.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+    let path = match path {
+        Some(path) => path,
+        None => expand_user_path(value)?,
+    };
+    let trust = GrammarTrustStore::new(config_dir);
+    match command {
+        LanguageCommand::Trust(_) => {
+            let digest = trust.trust_path(&path)?;
+            println!("Trusted native grammar {} ({digest})", path.display());
+        }
+        LanguageCommand::Untrust(_) => {
+            trust.revoke_path(&path)?;
+            println!("Revoked native grammar trust for {}", path.display());
         }
     }
     Ok(())
@@ -770,6 +850,11 @@ fn finalize_runtime_config(
     {
         let manifest = red::plugin::package::PluginPackageManifest::load(&installed.package_root)?;
         apply_plugin_default_keymaps(&mut loaded.config.keys, &manifest.keymaps);
+        red::language::merge_package_languages(
+            &mut loaded.config,
+            &manifest,
+            &installed.package_root,
+        );
         let Some(entrypoint) = manifest.husk_entry(&installed.package_root) else {
             continue;
         };
@@ -779,6 +864,7 @@ fn finalize_runtime_config(
             .entry(installed.id.to_string())
             .or_insert_with(|| entrypoint.to_string_lossy().into_owned());
     }
+    red::language::finalize_language_configuration(&mut loaded, &config_dir)?;
     for plugin in loaded.config.missing_plugins(&config_dir) {
         loaded.config.plugins.remove(&plugin);
         loaded.add_runtime_diagnostic(

@@ -6,13 +6,14 @@
 //! reordering rows does not silently move focus to unrelated content.
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     color::Color,
     config::PickerIconsConfig,
     editor::render_buffer::RenderBuffer,
-    highlighter::Highlighter,
+    highlighter::{Highlighter, LanguageRegistry},
     theme::{SelectionForegroundPriority, Style, Theme},
     ui::{IconCatalog, ScreenRect},
     unicode_utils::{display_width, fit_display_width, truncate_display_width},
@@ -336,7 +337,17 @@ impl PluginWorkspace {
         }
     }
 
+    #[cfg(test)]
     fn update(&mut self, model: WorkspaceModel, theme: &Theme) {
+        self.update_with_registry(model, theme, &Arc::new(LanguageRegistry::bundled()));
+    }
+
+    fn update_with_registry(
+        &mut self,
+        model: WorkspaceModel,
+        theme: &Theme,
+        registry: &Arc<LanguageRegistry>,
+    ) {
         let selected_id = self
             .model
             .rows
@@ -375,7 +386,8 @@ impl PluginWorkspace {
             )
         });
         if self.model.detail_document != model.detail_document {
-            self.detail_highlights = highlight_document(model.detail_document.as_ref(), theme);
+            self.detail_highlights =
+                highlight_document(model.detail_document.as_ref(), theme, registry);
         }
         self.model = model;
         self.selected = selected;
@@ -747,10 +759,21 @@ impl WorkspaceManager {
     }
 
     pub fn update(&mut self, id: &str, model: WorkspaceModel, theme: &Theme) -> bool {
+        self.update_with_registry(id, model, theme, &Arc::new(LanguageRegistry::bundled()))
+    }
+
+    /// Updates workspace content using the editor's current shared language registry.
+    pub fn update_with_registry(
+        &mut self,
+        id: &str,
+        model: WorkspaceModel,
+        theme: &Theme,
+        registry: &Arc<LanguageRegistry>,
+    ) -> bool {
         let Some(workspace) = self.active.as_mut().filter(|workspace| workspace.id == id) else {
             return false;
         };
-        workspace.update(model, theme);
+        workspace.update_with_registry(model, theme, registry);
         true
     }
 
@@ -768,9 +791,14 @@ impl WorkspaceManager {
     }
 
     pub fn update_theme(&mut self, theme: &Theme) {
+        self.update_theme_with_registry(theme, &Arc::new(LanguageRegistry::bundled()));
+    }
+
+    /// Rebuilds workspace detail colors against the editor's shared language registry.
+    pub fn update_theme_with_registry(&mut self, theme: &Theme, registry: &Arc<LanguageRegistry>) {
         if let Some(workspace) = self.active.as_mut() {
             workspace.detail_highlights =
-                highlight_document(workspace.model.detail_document.as_ref(), theme);
+                highlight_document(workspace.model.detail_document.as_ref(), theme, registry);
         }
     }
 
@@ -925,11 +953,12 @@ impl WorkspaceManager {
 fn highlight_document(
     document: Option<&WorkspaceDocument>,
     theme: &Theme,
+    registry: &Arc<LanguageRegistry>,
 ) -> Vec<Vec<crate::editor::StyleInfo>> {
     let Some(document) = document else {
         return Vec::new();
     };
-    let Some(mut highlighter) = Highlighter::new(theme).ok() else {
+    let Some(mut highlighter) = Highlighter::with_registry(theme, Arc::clone(registry)).ok() else {
         return (0..document.lines.len()).map(|_| Vec::new()).collect();
     };
 

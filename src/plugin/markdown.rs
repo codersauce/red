@@ -627,8 +627,8 @@ fn highlighted_code_lines(
 ) -> Vec<Vec<RenderedTextSpan>> {
     let styles = highlighter
         .and_then(|highlighter| {
-            let language = highlighter.language_id_for_name(language)?;
-            highlighter.highlight(language, code).ok()
+            let language = highlighter.language_id_for_name(language)?.to_string();
+            highlighter.highlight(&language, code).ok()
         })
         .unwrap_or_default();
     let mut lines = Vec::new();
