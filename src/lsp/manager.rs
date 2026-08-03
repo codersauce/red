@@ -263,27 +263,34 @@ fn find_workspace_root(path: &Path, server: &LanguageServerConfig) -> PathBuf {
 #[async_trait::async_trait]
 impl LspClient for LspManager {
     async fn reconfigure(&mut self, config: LspConfig) -> Result<Vec<String>, LspError> {
+        let replacement = Self::new(config);
         let changed = self
             .config
             .servers
             .keys()
-            .chain(config.servers.keys())
-            .filter(|name| self.config.servers.get(*name) != config.servers.get(*name))
+            .chain(replacement.config.servers.keys())
+            .filter(|name| self.config.servers.get(*name) != replacement.config.servers.get(*name))
             .cloned()
             .collect::<HashSet<_>>();
-        let disabled = self.config.enabled != config.enabled;
+        let disabled = self.config.enabled != replacement.config.enabled;
         let mut affected = self
             .document_clients
             .iter()
-            .filter(|(_, client)| {
+            .filter(|(file, client)| {
                 disabled
                     || client
                         .split_once(':')
                         .is_some_and(|(server, _)| changed.contains(server))
+                    || self.resolve_document(file) != replacement.resolve_document(file)
             })
             .map(|(file, _)| file.clone())
             .collect::<Vec<_>>();
         affected.sort_unstable();
+        let affected_documents = affected
+            .iter()
+            .filter_map(|file| self.resolve_document(file))
+            .map(|document| document_key(&document))
+            .collect::<HashSet<_>>();
 
         let keys = self
             .clients
@@ -296,9 +303,25 @@ impl LspClient for LspManager {
             })
             .cloned()
             .collect::<Vec<_>>();
+        let replaced_clients = keys.iter().cloned().collect::<HashSet<_>>();
+        for file in &affected {
+            let Some(key) = self.document_clients.get(file).cloned() else {
+                continue;
+            };
+            if replaced_clients.contains(&key) {
+                continue;
+            }
+            if let Some(client) = self.clients.get_mut(&key) {
+                if let Err(error) = client.did_close(file).await {
+                    log!("[lsp] could not close rerouted document {file}: {error}");
+                }
+            }
+        }
         for key in keys {
             if let Some(mut client) = self.clients.remove(&key) {
-                client.shutdown().await?;
+                if let Err(error) = client.shutdown().await {
+                    log!("[lsp] could not shut down replaced client {key}: {error}");
+                }
             }
         }
         self.failed_clients.retain(|key| {
@@ -312,11 +335,11 @@ impl LspClient for LspManager {
         }
         self.opened_documents.retain(|document| {
             !disabled
+                && !affected_documents.contains(document)
                 && !changed
                     .iter()
                     .any(|server| document.starts_with(&format!("{server}:")))
         });
-        let replacement = Self::new(config);
         self.config = replacement.config;
         self.document_selectors = replacement.document_selectors;
         self.filename_selectors = replacement.filename_selectors;
@@ -1036,6 +1059,95 @@ mod tests {
             manager.resolve_document("example.py").unwrap().language_id,
             "python"
         );
+    }
+
+    #[tokio::test]
+    async fn reconfigure_reopens_documents_when_an_exact_filename_takes_precedence() {
+        let root = std::env::current_dir().unwrap();
+        let toml = server("toml", &["toml"]);
+        let mut manager = LspManager::new(LspConfig {
+            enabled: true,
+            format_on_save: false,
+            servers: HashMap::from([("toml".to_string(), toml.clone())]),
+        });
+        let file = root.join("Container.toml").to_string_lossy().into_owned();
+        let document = manager.resolve_document(&file).unwrap();
+        let key = client_key(&document);
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        let (_response_tx, response_rx) = tokio::sync::mpsc::channel(1);
+        manager.clients.insert(
+            key.clone(),
+            RealLspClient::with_test_channels(request_tx, response_rx, toml.clone(), root),
+        );
+        manager.document_clients.insert(file.clone(), key.clone());
+        manager.opened_documents.insert(document_key(&document));
+
+        let mut container = server("dockerfile", &[]);
+        container.filenames = vec!["Container.toml".to_string()];
+        let affected = manager
+            .reconfigure(LspConfig {
+                enabled: true,
+                format_on_save: false,
+                servers: HashMap::from([
+                    ("toml".to_string(), toml),
+                    ("container".to_string(), container),
+                ]),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(affected, std::slice::from_ref(&file));
+        assert!(manager.clients.contains_key(&key));
+        assert!(!manager.document_clients.contains_key(&file));
+        assert!(!manager.opened_documents.contains(&document_key(&document)));
+        assert_eq!(
+            manager.resolve_document(&file).unwrap().server_name,
+            "container"
+        );
+        let OutboundMessage::Notification(notification) = request_rx.try_recv().unwrap() else {
+            panic!("expected the preserved client to receive a close notification");
+        };
+        assert_eq!(notification.method, "textDocument/didClose");
+    }
+
+    #[tokio::test]
+    async fn reconfigure_commits_new_routing_when_old_client_shutdown_fails() {
+        let root = std::env::current_dir().unwrap();
+        let rust = server("rust", &["rs"]);
+        let mut manager = LspManager::new(LspConfig {
+            enabled: true,
+            format_on_save: false,
+            servers: HashMap::from([("rust".to_string(), rust.clone())]),
+        });
+        let file = root.join("replacement.rs").to_string_lossy().into_owned();
+        let document = manager.resolve_document(&file).unwrap();
+        let key = client_key(&document);
+        let (request_tx, request_rx) = tokio::sync::mpsc::channel(1);
+        drop(request_rx);
+        let (_response_tx, response_rx) = tokio::sync::mpsc::channel(1);
+        manager.clients.insert(
+            key.clone(),
+            RealLspClient::with_test_channels(request_tx, response_rx, rust.clone(), root),
+        );
+        manager.document_clients.insert(file.clone(), key.clone());
+        manager.opened_documents.insert(document_key(&document));
+
+        let mut replacement = rust;
+        replacement.command = "replacement-lsp".to_string();
+        let affected = manager
+            .reconfigure(LspConfig {
+                enabled: true,
+                format_on_save: false,
+                servers: HashMap::from([("rust".to_string(), replacement)]),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(affected, std::slice::from_ref(&file));
+        assert_eq!(manager.config.servers["rust"].command, "replacement-lsp");
+        assert!(!manager.clients.contains_key(&key));
+        assert!(!manager.document_clients.contains_key(&file));
+        assert!(!manager.opened_documents.contains(&document_key(&document)));
     }
 
     #[test]

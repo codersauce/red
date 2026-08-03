@@ -186,16 +186,20 @@ impl GrammarTrustStore {
     ) -> Result<PathBuf> {
         let (canonical, digest) = inspect_native_grammar(path)?;
         let key = canonical.to_string_lossy().into_owned();
-        if explicitly_trusted {
-            self.record_approval(&canonical, &digest)?;
-        } else {
-            let trust = self.load()?;
-            anyhow::ensure!(
-                trust.grammars.get(&key) == Some(&digest),
+        let trust = self.load()?;
+        match trust.grammars.get(&key) {
+            Some(approved_digest) => anyhow::ensure!(
+                approved_digest == &digest,
+                "native grammar {} changed since its approval; run `red language trust {}` to approve its current contents",
+                canonical.display(),
+                canonical.display()
+            ),
+            None if explicitly_trusted => self.record_approval(&canonical, &digest)?,
+            None => anyhow::bail!(
                 "native grammar {} is not approved; run `red language trust {}` or set grammar.trusted = true explicitly",
                 canonical.display(),
                 canonical.display()
-            );
+            ),
         }
 
         let extension = canonical
@@ -329,5 +333,22 @@ mod tests {
         trust.approved_grammar_path(&grammar, false).unwrap();
         trust.revoke_path(&grammar).unwrap();
         assert!(trust.approved_grammar_path(&grammar, false).is_err());
+    }
+
+    #[test]
+    fn persistent_configuration_trust_does_not_approve_replaced_grammar() {
+        let directory = tempfile::tempdir().unwrap();
+        let grammar = directory.path().join("example.so");
+        fs::write(&grammar, b"original grammar").unwrap();
+        let trust = GrammarTrustStore::new(directory.path().join("config"));
+
+        trust.approved_grammar_path(&grammar, true).unwrap();
+        fs::write(&grammar, b"replaced grammar").unwrap();
+
+        assert!(trust.approved_grammar_path(&grammar, true).is_err());
+        assert!(trust.approved_grammar_path(&grammar, false).is_err());
+
+        trust.trust_path(&grammar).unwrap();
+        assert!(trust.approved_grammar_path(&grammar, true).is_ok());
     }
 }

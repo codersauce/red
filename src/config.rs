@@ -118,6 +118,7 @@ pub struct LoadedConfig {
     pub recovery: ConfigRecovery,
     source_path: PathBuf,
     source_text: String,
+    override_fragments: Vec<String>,
 }
 
 impl LoadedConfig {
@@ -132,38 +133,35 @@ impl LoadedConfig {
         &self.source_path
     }
 
-    /// Returns legacy server definitions explicitly written in the user layer.
+    /// Returns legacy server definitions explicitly supplied by the user or CLI.
     #[must_use]
     pub fn explicit_language_server_names(&self) -> HashSet<String> {
-        self.source_text
-            .parse::<toml::Value>()
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("lsp")
-                    .and_then(|lsp| lsp.get("servers"))
-                    .and_then(toml::Value::as_table)
-                    .cloned()
-            })
-            .map(|servers| servers.into_iter().map(|(name, _)| name).collect())
-            .unwrap_or_default()
+        self.explicit_names_at_path("lsp", "servers")
     }
 
-    /// Returns legacy comment templates explicitly written in the user layer.
+    /// Returns legacy comment templates explicitly supplied by the user or CLI.
     #[must_use]
     pub fn explicit_comment_language_names(&self) -> HashSet<String> {
-        self.source_text
-            .parse::<toml::Value>()
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("commenting")
-                    .and_then(|commenting| commenting.get("languages"))
-                    .and_then(toml::Value::as_table)
-                    .cloned()
-            })
-            .map(|languages| languages.into_iter().map(|(name, _)| name).collect())
-            .unwrap_or_default()
+        self.explicit_names_at_path("commenting", "languages")
+    }
+
+    fn explicit_names_at_path(&self, section: &str, entries: &str) -> HashSet<String> {
+        let mut names = HashSet::new();
+        for source in std::iter::once(self.source_text.as_str())
+            .chain(self.override_fragments.iter().map(String::as_str))
+        {
+            let Ok(value) = source.parse::<toml::Value>() else {
+                continue;
+            };
+            if let Some(table) = value
+                .get(section)
+                .and_then(|section| section.get(entries))
+                .and_then(toml::Value::as_table)
+            {
+                names.extend(table.keys().cloned());
+            }
+        }
+        names
     }
 
     /// Adds a post-load validation problem using the original user source.
@@ -1254,6 +1252,7 @@ impl Config {
                     format!("could not read the user configuration: {error}"),
                 )?;
                 apply_strict_overrides(&mut loaded.config, overrides)?;
+                loaded.override_fragments = overrides.to_vec();
                 Ok(loaded)
             }
         }
@@ -1293,6 +1292,7 @@ impl Config {
                         loaded.diagnostics[0].column = Some(column);
                     }
                     apply_strict_overrides(&mut loaded.config, overrides)?;
+                    loaded.override_fragments = overrides.to_vec();
                     return Ok(loaded);
                 }
             };
@@ -1377,6 +1377,7 @@ impl Config {
             diagnostics,
             source_path: path.to_path_buf(),
             source_text: contents.to_string(),
+            override_fragments: overrides.to_vec(),
         })
     }
 
@@ -1486,6 +1487,7 @@ fn safe_loaded_config(path: &Path, code: &str, message: String) -> anyhow::Resul
         recovery: ConfigRecovery::WholeFileFallback,
         source_path: path.to_path_buf(),
         source_text: String::new(),
+        override_fragments: Vec::new(),
     })
 }
 
@@ -3690,6 +3692,37 @@ command = "generated-server"
         assert_eq!(server.documents().len(), 1);
         assert_eq!(server.documents()[0].file_extensions, ["new", "old"]);
         assert_eq!(server.documents()[0].filenames, ["Customfile"]);
+    }
+
+    #[test]
+    fn language_local_settings_preserve_explicit_command_line_overrides() {
+        let mut loaded = Config::load_user_toml(
+            r##"
+[languages.custom]
+extensions = ["new"]
+comment = "# %s"
+
+[languages.custom.lsp]
+command = "generated-server"
+"##,
+            Path::new("/tmp/config.toml"),
+            &[
+                r#"lsp.servers.custom = { command = "override-server", language_id = "custom", file_extensions = ["old"] }"#.to_string(),
+                r#"commenting.languages.custom = "// %s""#.to_string(),
+            ],
+        )
+        .unwrap();
+        let explicit_servers = loaded.explicit_language_server_names();
+        let explicit_comments = loaded.explicit_comment_language_names();
+        loaded
+            .config
+            .apply_language_definitions(&explicit_servers, &explicit_comments)
+            .unwrap();
+
+        assert_eq!(loaded.config.commenting.languages["custom"], "// %s");
+        let server = loaded.config.lsp.servers.get("custom").unwrap();
+        assert_eq!(server.command, "override-server");
+        assert_eq!(server.documents()[0].file_extensions, ["new", "old"]);
     }
 
     #[test]
