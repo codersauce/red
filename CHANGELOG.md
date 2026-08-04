@@ -6,6 +6,7 @@ All notable changes to Red are documented in this file.
 
 ### Features
 
+- **languages:** Add curated pack catalog, verified release installs, and manager UI
 - **picker:** Highlight file search matches ([96ffa91](https://github.com/codersauce/red/commit/96ffa91082b70ccbddc8c38e3866506fb35c5eec))
 - **picker:** Improve file result ranking ([c4856c1](https://github.com/codersauce/red/commit/c4856c15534bb6ced6194d5369cd16b7d16aff43))
 - **plugins:** Add external package platform ([cf32ae1](https://github.com/codersauce/red/commit/cf32ae18904a09205ba0f4c4d2a4a1463f1b13fd))

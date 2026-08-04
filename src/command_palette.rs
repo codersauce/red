@@ -40,6 +40,7 @@ pub(crate) const BUILTIN_COLON_COMMANDS: &[&str] = &[
     "syn",
     "ft",
     "languages",
+    "plugins",
     "config-diagnostics",
 ];
 
@@ -849,11 +850,11 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
         ),
         builtin(
             "debug.plugins",
-            "List plugins",
-            "Debug",
-            "Show loaded plugin information",
-            None,
-            &["plugin list"],
+            "Language packs",
+            "Extensions",
+            "Browse, install, update, and manage language packs",
+            Some(":plugins"),
+            &["plugin list", "languages", "catalog"],
             Action::ListPlugins,
         ),
         builtin(
@@ -1021,7 +1022,7 @@ fn action_label(action: &Action) -> String {
         Action::MoveWindowToTop => "Move window to top edge".to_string(),
         Action::MoveWindowToRight => "Move window to right edge".to_string(),
         Action::ViewLogs => "View logs".to_string(),
-        Action::ListPlugins => "List plugins".to_string(),
+        Action::ListPlugins => "Language packs".to_string(),
         Action::DumpBuffer => "Dump buffer".to_string(),
         Action::DumpDiagnostics => "Dump diagnostics".to_string(),
         Action::DumpCapabilities => "Dump LSP capabilities".to_string(),
@@ -1228,6 +1229,18 @@ mod tests {
         assert!(syntax.aliases.iter().any(|alias| alias == ":syn"));
         assert!(syntax.aliases.iter().any(|alias| alias == ":ft"));
         assert_eq!(syntax.action, Action::OpenSyntaxPicker);
+    }
+
+    #[test]
+    fn palette_advertises_the_language_pack_colon_command() {
+        let entries = entries(&default_keys(), &[]);
+        let language_packs = entries
+            .iter()
+            .find(|entry| entry.id == "debug.plugins")
+            .expect("language packs should appear in the command palette");
+
+        assert_eq!(language_packs.colon.as_deref(), Some(":plugins"));
+        assert_eq!(language_packs.action, Action::ListPlugins);
     }
 
     #[test]

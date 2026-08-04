@@ -3076,6 +3076,8 @@ pub struct PickerBuilder {
     filter_tie_breaker: Option<FilterTieBreaker>,
     filter_highlight_action: Option<FilterHighlightAction>,
     placeholder: Option<String>,
+    status: Option<String>,
+    busy: bool,
     history_key: Option<String>,
 }
 
@@ -3097,6 +3099,8 @@ impl PickerBuilder {
             filter_tie_breaker: None,
             filter_highlight_action: None,
             placeholder: None,
+            status: None,
+            busy: false,
             history_key: None,
         }
     }
@@ -3161,6 +3165,18 @@ impl PickerBuilder {
         self
     }
 
+    /// Sets the picker footer status shown before any live updates arrive.
+    pub fn status(mut self, status: impl Into<String>) -> Self {
+        self.status = Some(status.into());
+        self
+    }
+
+    /// Starts the picker with its asynchronous busy indicator active.
+    pub fn busy(mut self, busy: bool) -> Self {
+        self.busy = busy;
+        self
+    }
+
     pub fn history_key(mut self, key: impl Into<String>) -> Self {
         self.history_key = Some(key.into());
         self
@@ -3180,6 +3196,8 @@ impl PickerBuilder {
         let filter_tie_breaker = self.filter_tie_breaker;
         let filter_highlight_action = self.filter_highlight_action;
         let placeholder = self.placeholder;
+        let status = self.status;
+        let busy = self.busy;
         let history_key = self.history_key;
 
         let mut picker = Picker::new(title, editor, &items, id);
@@ -3195,6 +3213,8 @@ impl PickerBuilder {
         picker.filter_tie_breaker = filter_tie_breaker;
         picker.filter_highlight_action = filter_highlight_action;
         picker.placeholder = placeholder;
+        picker.status = status;
+        picker.set_busy(busy);
         if let Some(history_key) = history_key {
             let history = editor.picker_history(&history_key).to_vec();
             picker.set_history(history_key, history);

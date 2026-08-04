@@ -11,6 +11,7 @@
 //! schema, but must not independently redefine its version.
 
 mod api;
+pub mod catalog;
 pub mod companion;
 pub mod decoration;
 pub mod document;

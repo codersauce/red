@@ -84,7 +84,38 @@ loading them. Missing symbols, incompatible Tree-sitter ABIs, invalid queries,
 and unapproved or changed binaries quarantine only the affected language at
 startup.
 
-## Install a reusable language package
+## Browse and install language packs
+
+Open **Language packs** from the command palette to browse Red's catalog. The
+picker labels official and curated packs separately from custom sources, shows
+host and target compatibility, and reports missing language-server commands.
+Installing a pack is always an explicit action.
+
+The same catalog is available from the CLI:
+
+```shell
+red plugin catalog
+red plugin install --catalog go-language
+```
+
+Catalog entries resolve to immutable, target-specific release archives. Red
+checks the archive's declared byte length and SHA-256 digest before extracting
+it, validates its manifest against the catalog entry, and verifies every
+bundled grammar digest. The catalog establishes provenance and integrity; it
+does not make native grammar code safe. Choose the separate approval action in
+the picker or pass `--trust-native-grammars` only when you want Red to load
+those exact verified grammar bytes:
+
+```shell
+red plugin install --catalog swift-language --trust-native-grammars
+```
+
+The default catalog is published from
+[`codersauce/red-language-packs`](https://github.com/codersauce/red-language-packs).
+Set `RED_PLUGIN_CATALOG_URL` or pass `--catalog-url` to use another catalog that
+follows the same schema.
+
+## Create or install a custom language package
 
 A package needs `red-plugin.toml` but does not need a Husk entrypoint or native
 companion:
@@ -123,24 +154,30 @@ root_markers = ["Acmefile", ".git"]
 
 Bundled grammar and query paths are package-relative, cannot traverse outside
 the package, and cannot escape through symlinks. Downloaded grammars must use
-a GitHub HTTPS URL and a matching SHA-256 digest. Install explicitly:
+a GitHub HTTPS URL and a matching SHA-256 digest.
+
+The editor's **Add custom source** action accepts either a local path or
+`owner/repository[@git-ref]`. Custom sources are clearly marked as unreviewed.
+On the CLI, install them explicitly:
 
 ```shell
-red plugin install --path ./acme-languages --trust-native-grammars
-red plugin install acme/red-languages --trust-native-grammars
+red plugin install --path ./acme-languages
+red plugin install acme/red-languages
 ```
 
-Omit `--trust-native-grammars` to install the package without approving its
+Omit `--trust-native-grammars` to install any package without approving its
 native grammar. Run `red language trust acme` after inspecting the installed
-artifact. A package cannot self-approve native code through its manifest.
+artifact, or use the manager's trust action. A package cannot self-approve
+native code through its manifest.
 
 If a package and user configuration define the same language ID, the explicit
 user definition wins.
 
-First-party language packs are maintained as standalone plugin repositories.
-For example, the Swift pack supplies its own Tree-sitter grammar, highlight
-queries, SwiftPM root detection, and SourceKit-LSP configuration without adding
-Swift-specific code to Red.
+First-party language packs are maintained together in the language-pack
+monorepo, while each pack keeps an independent version, release tag, artifact,
+and catalog entry. For example, the Swift pack supplies its own Tree-sitter
+grammar, highlight queries, SwiftPM root detection, and SourceKit-LSP
+configuration without adding Swift-specific code to Red.
 
 ## Reload without restarting
 

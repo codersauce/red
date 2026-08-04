@@ -62,6 +62,7 @@ clap = { version = "4.5.26", features = ["derive", "env"] }
 crossterm = { version = "0.27.0", features = ["event-stream", "serde"] }
 futures = "0.3.30"
 fuzzy-matcher = "0.3.7"
+flate2 = "1.0"
 husk-ast.workspace = true
 husk-cli.workspace = true
 husk-diagnostics.workspace = true
@@ -86,6 +87,7 @@ serde_json = "1.0.113"
 semver = "1.0"
 sha2 = "0.10"
 similar = "2.6.0"
+tar = "0.4"
 textwrap = "0.16"
 tempfile = "3.15.0"
 thiserror = "1.0"

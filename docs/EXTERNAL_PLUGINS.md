@@ -9,11 +9,13 @@ The editor remains the authority for buffers, undo history, UI focus, sessions,
 and user confirmations. Plugins request attributed operations through the
 versioned host API; they do not edit Red's internal state directly.
 
-The same manager is available in the editor through `:plugins`. It opens
-immediately from local installation records and supports install, update,
-enable/disable, and data-preserving removal. The destructive purge remains an
-explicit CLI operation. Network and build work runs after selection rather than
-during editor startup.
+The same manager is available in the editor through `:plugins` or **Language
+packs** in the command palette. It opens immediately from local installation
+records, then fetches the curated catalog in the background. It supports
+catalog and custom installs, update, native-grammar trust, enable/disable, and
+data-preserving removal. The destructive purge remains an explicit CLI
+operation. Network and build work runs after selection rather than during
+editor startup.
 
 Packages using companion RPC or document transactions declare:
 
@@ -28,6 +30,18 @@ red_api = "^0.6.0"
 red plugin install --path ~/code/my-red-plugin
 red plugin list
 ```
+
+Language-only packages can also be installed from the catalog:
+
+```console
+red plugin catalog
+red plugin install --catalog go-language
+```
+
+Catalog packages are immutable release bundles with catalog-recorded checksums.
+Custom `owner/repository` sources remain supported and are presented as
+unreviewed. Neither source type receives implicit approval to execute a native
+Tree-sitter grammar.
 
 Path installs are linked through an installation record, so editing a package
 and restarting or reloading Red picks up the local source without copying it.

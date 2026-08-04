@@ -298,6 +298,7 @@ async fn run() -> anyhow::Result<()> {
 }
 
 async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
+    use red::plugin::catalog::{catalog_url, PluginCatalog};
     use red::plugin::package::{PluginId, PluginPackageManager};
 
     let manager = PluginPackageManager::new(Config::config_dir());
@@ -306,6 +307,12 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
             let installed = if let Some(path) = &arguments.path {
                 manager
                     .install_path_with_trust(path, arguments.trust_native_grammars)
+                    .await?
+            } else if let Some(id) = &arguments.catalog {
+                let id = PluginId::parse(id)?;
+                let url = arguments.catalog_url.clone().unwrap_or_else(catalog_url);
+                manager
+                    .install_catalog(&url, &id, arguments.trust_native_grammars)
                     .await?
             } else {
                 let source = arguments
@@ -327,6 +334,31 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
                 installed.version,
                 installed.package_root.display()
             );
+        }
+        PluginCommand::Catalog(arguments) => {
+            let url = arguments.catalog_url.clone().unwrap_or_else(catalog_url);
+            let catalog = PluginCatalog::fetch(&url).await?;
+            let host_api = semver::Version::parse(red::plugin::RED_HOST_API_VERSION)?;
+            for package in catalog.packages {
+                let compatibility = if package.red_api.matches(&host_api) {
+                    "compatible"
+                } else {
+                    "incompatible"
+                };
+                let target = if package.artifact(red::language::host_target()).is_some() {
+                    red::language::host_target()
+                } else {
+                    "unavailable"
+                };
+                println!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    package.id,
+                    package.version,
+                    package.tier.label(),
+                    compatibility,
+                    target
+                );
+            }
         }
         PluginCommand::List => {
             let plugins = manager.list()?;

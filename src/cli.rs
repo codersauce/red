@@ -131,6 +131,8 @@ pub struct PluginArgs {
 pub enum PluginCommand {
     /// Install a plugin from GitHub or a local development checkout.
     Install(PluginInstallArgs),
+    /// List curated language packs available for this Red release.
+    Catalog(PluginCatalogArgs),
     /// List installed external plugins.
     List,
     /// Update one plugin or every enabled plugin.
@@ -146,14 +148,30 @@ pub enum PluginCommand {
 #[derive(Debug, ClapArgs)]
 pub struct PluginInstallArgs {
     /// GitHub repository in `owner/repository` form, optionally followed by `@tag`.
-    #[arg(required_unless_present = "path", conflicts_with = "path")]
+    #[arg(
+        required_unless_present_any = ["path", "catalog"],
+        conflicts_with_all = ["path", "catalog"]
+    )]
     pub source: Option<String>,
     /// Install a local package checkout for development.
-    #[arg(long, value_name = "DIRECTORY")]
+    #[arg(long, value_name = "DIRECTORY", conflicts_with = "catalog")]
     pub path: Option<PathBuf>,
+    /// Install a curated language pack by its stable catalog id.
+    #[arg(long, value_name = "ID", conflicts_with_all = ["source", "path"])]
+    pub catalog: Option<String>,
+    /// Override the official catalog URL for this catalog installation.
+    #[arg(long, value_name = "URL", requires = "catalog")]
+    pub catalog_url: Option<String>,
     /// Explicitly approve the current verified native grammars shipped by the package.
     #[arg(long)]
     pub trust_native_grammars: bool,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct PluginCatalogArgs {
+    /// Override the official catalog URL.
+    #[arg(long, value_name = "URL")]
+    pub catalog_url: Option<String>,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -310,6 +328,42 @@ mod tests {
                 }),
             }))
         ));
+
+        let args = Args::try_parse_from([
+            "red",
+            "plugin",
+            "install",
+            "--catalog",
+            "go-language",
+            "--trust-native-grammars",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(RootCommand::Plugin(PluginArgs {
+                command: PluginCommand::Install(PluginInstallArgs {
+                    source: None,
+                    path: None,
+                    catalog: Some(_),
+                    trust_native_grammars: true,
+                    ..
+                }),
+            }))
+        ));
+
+        assert_eq!(
+            Args::try_parse_from([
+                "red",
+                "plugin",
+                "install",
+                "codersauce/replay",
+                "--catalog",
+                "go-language",
+            ])
+            .unwrap_err()
+            .kind(),
+            ErrorKind::ArgumentConflict
+        );
 
         let args = Args::try_parse_from(["red", "plugin", "update", "--all"]).unwrap();
         assert!(matches!(

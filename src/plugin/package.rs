@@ -1,18 +1,20 @@
 //! External plugin package manifests, installation records, and lifecycle operations.
 //!
 //! Packages live in isolated directories below Red's configuration directory. An
-//! installation record may point at a local development checkout or contain a package
-//! fetched directly from GitHub. Updates are staged and validated before an atomic
-//! directory swap so a failed install never replaces a working plugin.
+//! installation record may point at a local development checkout, a GitHub repository,
+//! or an immutable curated-catalog bundle. Updates are staged and validated before an
+//! atomic directory swap so a failed install never replaces a working plugin.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt, fs,
+    io::{Cursor, Read as _},
     path::{Component, Path, PathBuf},
     process::Stdio,
 };
 
 use anyhow::{Context, Result};
+use flate2::read::GzDecoder;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,7 +22,10 @@ use tokio::{io::AsyncWriteExt as _, process::Command};
 
 use crate::{config::LanguageConfig, language::GrammarTrustStore};
 
-use super::{Runtime, RED_HOST_API_VERSION};
+use super::{
+    catalog::{validate_catalog_url, CatalogArtifact, CatalogPackage, PluginCatalog},
+    Runtime, RED_HOST_API_VERSION,
+};
 
 /// File name of the Red-specific package manifest.
 pub const PLUGIN_MANIFEST_FILE: &str = "red-plugin.toml";
@@ -28,6 +33,10 @@ pub const PLUGIN_MANIFEST_FILE: &str = "red-plugin.toml";
 pub const INSTALL_RECORD_FILE: &str = ".red-install.json";
 /// Current external plugin manifest schema.
 pub const PLUGIN_MANIFEST_SCHEMA: u32 = 1;
+const MAX_PACKAGE_ARCHIVE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_PACKAGE_UNPACKED_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_PACKAGE_ARCHIVE_FILES: usize = 1024;
+const MAX_CATALOG_GRAMMAR_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A parsed and validated stable plugin identifier.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -148,6 +157,14 @@ pub enum PluginInstallSource {
         repository: String,
         requested_version: Option<String>,
     },
+    Catalog {
+        catalog_url: String,
+        package: PluginId,
+        version: Version,
+        resolved_commit: String,
+        artifact_url: String,
+        artifact_sha256: String,
+    },
 }
 
 /// Crash-safe record associated with an installed plugin.
@@ -172,8 +189,11 @@ pub struct InstalledPlugin {
     pub enabled: bool,
     pub compatible: bool,
     pub has_companion: bool,
+    pub has_husk: bool,
     /// Whether the package contributes one or more language definitions.
     pub has_languages: bool,
+    pub has_native_grammars: bool,
+    pub languages: Vec<String>,
     pub source: PluginInstallSource,
     pub package_root: PathBuf,
 }
@@ -482,12 +502,115 @@ impl PluginPackageManager {
         self.install_companion_artifact(&manifest, &staging).await?;
         self.install_language_artifacts(&manifest, &staging, false)
             .await?;
-        self.activate_github_package(&manifest, &staging, &destination, trust_native_grammars)?;
+        self.activate_remote_package(&manifest, &staging, &destination, trust_native_grammars)?;
         self.installed(&id)?
             .ok_or_else(|| anyhow::anyhow!("installed plugin `{id}` could not be read"))
     }
 
-    fn activate_github_package(
+    /// Installs the current compatible release of one curated catalog package.
+    pub async fn install_catalog(
+        &self,
+        catalog_url: &str,
+        id: &PluginId,
+        trust_native_grammars: bool,
+    ) -> Result<InstalledPlugin> {
+        let catalog = PluginCatalog::fetch(catalog_url).await?;
+        let package = catalog.installable(id, host_target())?;
+        self.install_catalog_package(catalog_url, package, trust_native_grammars)
+            .await
+    }
+
+    /// Installs one already-resolved catalog entry after revalidating its release bundle.
+    pub async fn install_catalog_package(
+        &self,
+        catalog_url: &str,
+        package: &CatalogPackage,
+        trust_native_grammars: bool,
+    ) -> Result<InstalledPlugin> {
+        validate_catalog_url(catalog_url)?;
+        package.validate()?;
+        let host_api = Version::parse(RED_HOST_API_VERSION)?;
+        anyhow::ensure!(
+            package.red_api.matches(&host_api),
+            "language pack `{}` requires Red API `{}`, but this release provides `{host_api}`",
+            package.id,
+            package.red_api
+        );
+        let artifact = package.artifact(host_target()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "language pack `{}` has no release for `{}`",
+                package.id,
+                host_target()
+            )
+        })?;
+        let bytes = download_catalog_artifact(artifact).await?;
+        self.install_catalog_archive(
+            catalog_url,
+            package,
+            artifact,
+            &bytes,
+            trust_native_grammars,
+        )
+        .await
+    }
+
+    async fn install_catalog_archive(
+        &self,
+        catalog_url: &str,
+        package: &CatalogPackage,
+        artifact: &CatalogArtifact,
+        bytes: &[u8],
+        trust_native_grammars: bool,
+    ) -> Result<InstalledPlugin> {
+        verify_catalog_artifact_bytes(artifact, bytes)?;
+        let staging = self.staging_dir("catalog");
+        if let Some(parent) = staging.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        remove_if_exists(&staging)?;
+        fs::create_dir_all(&staging)?;
+        if let Err(error) = extract_catalog_archive(bytes, &staging) {
+            let _ = remove_if_exists(&staging);
+            return Err(error);
+        }
+
+        let result = async {
+            let manifest = PluginPackageManifest::load(&staging)?;
+            validate_catalog_manifest(package, artifact, &manifest, &staging)?;
+            validate_husk_package(&manifest, &staging).await?;
+            let id = manifest.plugin.id.clone();
+            let destination = self.packages_dir().join(id.as_str());
+            let record = PluginInstallRecord {
+                schema_version: 1,
+                id: id.clone(),
+                version: manifest.plugin.version.clone(),
+                enabled: true,
+                source: PluginInstallSource::Catalog {
+                    catalog_url: catalog_url.to_string(),
+                    package: package.id.clone(),
+                    version: package.version.clone(),
+                    resolved_commit: package.resolved_commit.clone(),
+                    artifact_url: artifact.url.clone(),
+                    artifact_sha256: artifact.sha256.clone(),
+                },
+                package_root: destination.clone(),
+                installed_at_ms: now_ms(),
+            };
+            write_record(&staging, &record)?;
+            self.install_language_artifacts(&manifest, &staging, false)
+                .await?;
+            self.activate_remote_package(&manifest, &staging, &destination, trust_native_grammars)?;
+            self.installed(&id)?
+                .ok_or_else(|| anyhow::anyhow!("installed plugin `{id}` could not be read"))
+        }
+        .await;
+        if result.is_err() {
+            let _ = remove_if_exists(&staging);
+        }
+        result
+    }
+
+    fn activate_remote_package(
         &self,
         manifest: &PluginPackageManifest,
         staging: &Path,
@@ -597,6 +720,15 @@ impl PluginPackageManager {
         write_record_atomic(&install_dir, &record)
     }
 
+    /// Explicitly approves every current native grammar shipped by one installed package.
+    pub fn trust_package_grammars(&self, id: &PluginId) -> Result<()> {
+        let installed = self
+            .installed(id)?
+            .ok_or_else(|| anyhow::anyhow!("plugin `{id}` is not installed"))?;
+        let manifest = PluginPackageManifest::load(&installed.package_root)?;
+        self.approve_package_grammars(&manifest, &installed.package_root)
+    }
+
     /// Updates an installed package from its retained source.
     pub async fn update(&self, id: &PluginId) -> Result<InstalledPlugin> {
         self.update_with_trust(id, false).await
@@ -626,6 +758,14 @@ impl PluginPackageManager {
                     trust_native_grammars,
                 )
                 .await
+            }
+            PluginInstallSource::Catalog {
+                catalog_url,
+                package,
+                ..
+            } => {
+                self.install_catalog(&catalog_url, &package, trust_native_grammars)
+                    .await
             }
         }
     }
@@ -977,6 +1117,17 @@ fn installed_from_record(record: PluginInstallRecord) -> Result<InstalledPlugin>
         "install record id does not match plugin manifest"
     );
     let host_api = Version::parse(RED_HOST_API_VERSION)?;
+    let has_husk = manifest.husk_entry(&record.package_root).is_some();
+    let languages = manifest.languages.keys().cloned().collect::<Vec<_>>();
+    let has_native_grammars = manifest.languages.iter().any(|(id, language)| {
+        language
+            .grammar
+            .as_ref()
+            .is_some_and(|grammar| grammar.builtin.is_none())
+            && manifest
+                .grammar_path(&record.package_root, id, language)
+                .is_some()
+    });
     Ok(InstalledPlugin {
         id: record.id,
         name: manifest.plugin.name,
@@ -984,10 +1135,228 @@ fn installed_from_record(record: PluginInstallRecord) -> Result<InstalledPlugin>
         enabled: record.enabled,
         compatible: manifest.plugin.red_api.matches(&host_api),
         has_companion: manifest.companion.is_some(),
+        has_husk,
         has_languages: !manifest.languages.is_empty(),
+        has_native_grammars,
+        languages,
         source: record.source,
         package_root: record.package_root,
     })
+}
+
+async fn download_catalog_artifact(artifact: &CatalogArtifact) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        artifact.size <= MAX_PACKAGE_ARCHIVE_BYTES as u64,
+        "catalog package archive exceeds the {MAX_PACKAGE_ARCHIVE_BYTES} byte safety limit"
+    );
+    let mut response = reqwest::get(&artifact.url)
+        .await
+        .with_context(|| format!("failed to download catalog package from {}", artifact.url))?
+        .error_for_status()
+        .with_context(|| format!("catalog package download failed for {}", artifact.url))?;
+    if let Some(length) = response.content_length() {
+        anyhow::ensure!(
+            length <= MAX_PACKAGE_ARCHIVE_BYTES as u64,
+            "catalog package archive exceeds the {MAX_PACKAGE_ARCHIVE_BYTES} byte safety limit"
+        );
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(artifact.size).unwrap_or_default());
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(
+            bytes.len().saturating_add(chunk.len()) <= MAX_PACKAGE_ARCHIVE_BYTES,
+            "catalog package archive exceeds the {MAX_PACKAGE_ARCHIVE_BYTES} byte safety limit"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    verify_catalog_artifact_bytes(artifact, &bytes)?;
+    Ok(bytes)
+}
+
+fn verify_catalog_artifact_bytes(artifact: &CatalogArtifact, bytes: &[u8]) -> Result<()> {
+    anyhow::ensure!(
+        bytes.len() as u64 == artifact.size,
+        "catalog package size mismatch: expected {}, got {}",
+        artifact.size,
+        bytes.len()
+    );
+    let actual = format!("{:x}", Sha256::digest(bytes));
+    anyhow::ensure!(
+        actual.eq_ignore_ascii_case(&artifact.sha256),
+        "catalog package checksum mismatch: expected {}, got {actual}",
+        artifact.sha256
+    );
+    Ok(())
+}
+
+fn extract_catalog_archive(bytes: &[u8], destination: &Path) -> Result<()> {
+    let decoder = GzDecoder::new(Cursor::new(bytes));
+    let mut archive = tar::Archive::new(decoder);
+    let mut paths = BTreeSet::new();
+    let mut total_size = 0_u64;
+    let mut count = 0_usize;
+    for entry in archive
+        .entries()
+        .context("failed to read catalog package archive")?
+    {
+        let mut entry = entry.context("failed to read catalog package entry")?;
+        count = count.saturating_add(1);
+        anyhow::ensure!(
+            count <= MAX_PACKAGE_ARCHIVE_FILES,
+            "catalog package archive exceeds the {MAX_PACKAGE_ARCHIVE_FILES} file safety limit"
+        );
+        let relative = safe_archive_path(&entry.path()?)?;
+        anyhow::ensure!(
+            relative != Path::new(INSTALL_RECORD_FILE),
+            "catalog package archive contains Red's reserved install record"
+        );
+        anyhow::ensure!(
+            paths.insert(relative.clone()),
+            "catalog package archive repeats {}",
+            relative.display()
+        );
+        let target = destination.join(&relative);
+        let kind = entry.header().entry_type();
+        if kind.is_dir() {
+            fs::create_dir_all(&target)?;
+            continue;
+        }
+        anyhow::ensure!(
+            kind.is_file(),
+            "catalog package archive contains unsupported entry {}",
+            relative.display()
+        );
+        let size = entry.header().size()?;
+        total_size = total_size.saturating_add(size);
+        anyhow::ensure!(
+            total_size <= MAX_PACKAGE_UNPACKED_BYTES,
+            "catalog package archive exceeds the {MAX_PACKAGE_UNPACKED_BYTES} byte unpacked safety limit"
+        );
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut output = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&target)
+            .with_context(|| {
+                format!("failed to create catalog package file {}", target.display())
+            })?;
+        let copied = std::io::copy(
+            &mut entry.by_ref().take(size.saturating_add(1)),
+            &mut output,
+        )?;
+        anyhow::ensure!(
+            copied == size,
+            "catalog package entry {} has an invalid size",
+            relative.display()
+        );
+        output.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = entry.header().mode()? & 0o777;
+            fs::set_permissions(&target, fs::Permissions::from_mode(mode))?;
+        }
+    }
+    anyhow::ensure!(
+        destination.join(PLUGIN_MANIFEST_FILE).is_file(),
+        "catalog package archive has no root {PLUGIN_MANIFEST_FILE}"
+    );
+    Ok(())
+}
+
+fn safe_archive_path(path: &Path) -> Result<PathBuf> {
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(value) => safe.push(value),
+            _ => anyhow::bail!(
+                "catalog package archive contains unsafe path {}",
+                path.display()
+            ),
+        }
+    }
+    anyhow::ensure!(
+        !safe.as_os_str().is_empty(),
+        "catalog package archive contains an empty path"
+    );
+    Ok(safe)
+}
+
+fn validate_catalog_manifest(
+    package: &CatalogPackage,
+    artifact: &CatalogArtifact,
+    manifest: &PluginPackageManifest,
+    package_root: &Path,
+) -> Result<()> {
+    anyhow::ensure!(
+        manifest.plugin.id == package.id,
+        "catalog package id does not match its manifest"
+    );
+    anyhow::ensure!(
+        manifest.plugin.name == package.name,
+        "catalog package name does not match its manifest"
+    );
+    anyhow::ensure!(
+        manifest.plugin.version == package.version,
+        "catalog package version does not match its manifest"
+    );
+    anyhow::ensure!(
+        manifest.plugin.red_api == package.red_api,
+        "catalog package Red API requirement does not match its manifest"
+    );
+    anyhow::ensure!(
+        manifest.plugin.husk_manifest.is_none()
+            && manifest.plugin.entry.is_none()
+            && manifest.companion.is_none()
+            && manifest.activation.events.is_empty()
+            && manifest.activation.commands.is_empty()
+            && manifest.keymaps.is_empty(),
+        "catalog language packs cannot contain Husk code, native companions, activation events, or keymaps"
+    );
+    let manifest_languages = manifest.languages.keys().cloned().collect::<BTreeSet<_>>();
+    let catalog_languages = package.languages.iter().cloned().collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        manifest_languages == catalog_languages,
+        "catalog language list does not match its manifest"
+    );
+
+    let mut actual_grammars = BTreeMap::new();
+    for (language_id, language) in &manifest.languages {
+        let Some(grammar) = &language.grammar else {
+            continue;
+        };
+        anyhow::ensure!(
+            grammar.targets.values().all(|target| target.url.is_none()),
+            "catalog package grammars must be bundled instead of downloaded indirectly"
+        );
+        let Some(path) = manifest.grammar_path(package_root, language_id, language) else {
+            continue;
+        };
+        let metadata = fs::metadata(&path)
+            .with_context(|| format!("failed to inspect catalog grammar {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.len() <= MAX_CATALOG_GRAMMAR_BYTES,
+            "catalog grammar {} exceeds the safety limit",
+            path.display()
+        );
+        let bytes = fs::read(&path)
+            .with_context(|| format!("failed to read catalog grammar {}", path.display()))?;
+        actual_grammars.insert(language_id.clone(), format!("{:x}", Sha256::digest(bytes)));
+    }
+    let grammar_digests_match = actual_grammars.len() == artifact.grammars.len()
+        && actual_grammars.iter().all(|(language, actual)| {
+            artifact
+                .grammars
+                .get(language)
+                .is_some_and(|expected| actual.eq_ignore_ascii_case(expected))
+        });
+    anyhow::ensure!(
+        grammar_digests_match,
+        "catalog grammar digests do not match the package manifest"
+    );
+    Ok(())
 }
 
 fn read_record(path: &Path) -> Result<PluginInstallRecord> {
@@ -1133,6 +1502,82 @@ fn set_executable(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn catalog_package(artifact: CatalogArtifact) -> CatalogPackage {
+        CatalogPackage {
+            id: PluginId::parse("build-languages").unwrap(),
+            name: "Language package".to_string(),
+            version: Version::parse("1.0.0").unwrap(),
+            red_api: VersionReq::parse(&format!("^{RED_HOST_API_VERSION}")).unwrap(),
+            description: "Buildspec syntax support".to_string(),
+            repository: "codersauce/red-language-packs".to_string(),
+            source_path: PathBuf::from("packs/buildspec"),
+            resolved_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            license: "MIT".to_string(),
+            tier: super::super::catalog::CatalogTier::Official,
+            languages: vec!["buildspec".to_string()],
+            requirements: Vec::new(),
+            artifacts: BTreeMap::from([(host_target().to_string(), artifact)]),
+        }
+    }
+
+    fn catalog_archive() -> (Vec<u8>, CatalogArtifact) {
+        use flate2::{write::GzEncoder, Compression};
+
+        let package = tempfile::tempdir().unwrap();
+        let grammars = package.path().join("grammars");
+        fs::create_dir_all(&grammars).unwrap();
+        let grammar = b"catalog grammar bytes";
+        fs::write(grammars.join("buildspec.so"), grammar).unwrap();
+        fs::write(
+            package.path().join(PLUGIN_MANIFEST_FILE),
+            format!(
+                r#"
+schema_version = 1
+
+[plugin]
+id = "build-languages"
+name = "Language package"
+version = "1.0.0"
+red_api = "^{RED_HOST_API_VERSION}"
+
+[languages.buildspec]
+extensions = ["build"]
+
+[languages.buildspec.grammar]
+path = "grammars/buildspec.so"
+symbol = "tree_sitter_buildspec"
+"#
+            ),
+        )
+        .unwrap();
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        builder
+            .append_path_with_name(
+                package.path().join(PLUGIN_MANIFEST_FILE),
+                PLUGIN_MANIFEST_FILE,
+            )
+            .unwrap();
+        builder
+            .append_path_with_name(
+                package.path().join("grammars/buildspec.so"),
+                "grammars/buildspec.so",
+            )
+            .unwrap();
+        let encoder = builder.into_inner().unwrap();
+        let bytes = encoder.finish().unwrap();
+        let artifact = CatalogArtifact {
+            url: "https://github.com/codersauce/red-language-packs/releases/download/buildspec%2Fv1.0.0/buildspec.tar.gz".to_string(),
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+            size: bytes.len() as u64,
+            grammars: BTreeMap::from([(
+                "buildspec".to_string(),
+                format!("{:x}", Sha256::digest(grammar)),
+            )]),
+        };
+        (bytes, artifact)
+    }
+
     fn write_package(root: &Path, id: &str, version: &str) {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(
@@ -1240,6 +1685,121 @@ symbol = "tree_sitter_buildspec"
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
+    #[tokio::test]
+    async fn catalog_archive_installs_as_an_independent_language_package() {
+        let config = tempfile::tempdir().unwrap();
+        let manager = PluginPackageManager::new(config.path());
+        let (bytes, artifact) = catalog_archive();
+        let package = catalog_package(artifact.clone());
+
+        let installed = manager
+            .install_catalog_archive(
+                "https://raw.githubusercontent.com/codersauce/red-language-packs/main/catalog/v1.json",
+                &package,
+                &artifact,
+                &bytes,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(installed.id.as_str(), "build-languages");
+        assert_eq!(installed.languages, ["buildspec"]);
+        assert!(!installed.has_husk);
+        assert!(matches!(
+            installed.source,
+            PluginInstallSource::Catalog {
+                package,
+                artifact_sha256,
+                ..
+            } if package.as_str() == "build-languages" && artifact_sha256 == artifact.sha256
+        ));
+        assert!(installed
+            .package_root
+            .join("grammars/buildspec.so")
+            .is_file());
+    }
+
+    #[tokio::test]
+    async fn catalog_package_install_revalidates_caller_supplied_metadata() {
+        let config = tempfile::tempdir().unwrap();
+        let manager = PluginPackageManager::new(config.path());
+        let (_, artifact) = catalog_archive();
+        let package = catalog_package(artifact);
+
+        let error = manager
+            .install_catalog_package("https://example.com/catalog.json", &package, false)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("GitHub HTTPS"));
+        assert!(manager.list().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn catalog_archive_accepts_uppercase_grammar_digests() {
+        let config = tempfile::tempdir().unwrap();
+        let manager = PluginPackageManager::new(config.path());
+        let (bytes, mut artifact) = catalog_archive();
+        for digest in artifact.grammars.values_mut() {
+            *digest = digest.to_ascii_uppercase();
+        }
+        let package = catalog_package(artifact.clone());
+
+        let installed = manager
+            .install_catalog_archive(
+                "https://raw.githubusercontent.com/codersauce/red-language-packs/main/catalog/v1.json",
+                &package,
+                &artifact,
+                &bytes,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(installed.id.as_str(), "build-languages");
+        assert!(installed
+            .package_root
+            .join("grammars/buildspec.so")
+            .is_file());
+    }
+
+    #[tokio::test]
+    async fn catalog_archive_rejects_mismatched_grammar_without_replacing_installation() {
+        let config = tempfile::tempdir().unwrap();
+        let manager = PluginPackageManager::new(config.path());
+        let (bytes, mut artifact) = catalog_archive();
+        artifact.grammars.insert(
+            "buildspec".to_string(),
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string(),
+        );
+        let package = catalog_package(artifact.clone());
+
+        let error = manager
+            .install_catalog_archive(
+                "https://raw.githubusercontent.com/codersauce/red-language-packs/main/catalog/v1.json",
+                &package,
+                &artifact,
+                &bytes,
+                true,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("grammar digests"));
+        assert!(manager.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn catalog_archive_paths_reject_escape_and_absolute_components() {
+        assert!(safe_archive_path(Path::new("../red-plugin.toml")).is_err());
+        assert!(safe_archive_path(Path::new("/red-plugin.toml")).is_err());
+        assert_eq!(
+            safe_archive_path(Path::new("./queries/highlights.scm")).unwrap(),
+            PathBuf::from("queries/highlights.scm")
+        );
+    }
+
     #[test]
     fn grammar_download_directory_creates_real_package_directories() {
         let package = tempfile::tempdir().unwrap();
@@ -1293,7 +1853,7 @@ symbol = "tree_sitter_buildspec"
         let manifest = PluginPackageManifest::load(&staging).unwrap();
 
         let error = manager
-            .activate_github_package(&manifest, &staging, &destination, true)
+            .activate_remote_package(&manifest, &staging, &destination, true)
             .unwrap_err();
 
         assert!(error.to_string().contains("safety limit"));
@@ -1317,7 +1877,7 @@ symbol = "tree_sitter_buildspec"
         let manifest = PluginPackageManifest::load(&staging).unwrap();
 
         let error = manager
-            .activate_github_package(&manifest, &staging, &destination, true)
+            .activate_remote_package(&manifest, &staging, &destination, true)
             .unwrap_err();
 
         assert!(error.to_string().contains("safety limit"));
