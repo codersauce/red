@@ -40,6 +40,7 @@ pub(crate) const BUILTIN_COLON_COMMANDS: &[&str] = &[
     "syn",
     "ft",
     "languages",
+    "plugins",
     "config-diagnostics",
 ];
 
@@ -852,7 +853,7 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             "Language packs",
             "Extensions",
             "Browse, install, update, and manage language packs",
-            None,
+            Some(":plugins"),
             &["plugin list", "languages", "catalog"],
             Action::ListPlugins,
         ),
@@ -1228,6 +1229,18 @@ mod tests {
         assert!(syntax.aliases.iter().any(|alias| alias == ":syn"));
         assert!(syntax.aliases.iter().any(|alias| alias == ":ft"));
         assert_eq!(syntax.action, Action::OpenSyntaxPicker);
+    }
+
+    #[test]
+    fn palette_advertises_the_language_pack_colon_command() {
+        let entries = entries(&default_keys(), &[]);
+        let language_packs = entries
+            .iter()
+            .find(|entry| entry.id == "debug.plugins")
+            .expect("language packs should appear in the command palette");
+
+        assert_eq!(language_packs.colon.as_deref(), Some(":plugins"));
+        assert_eq!(language_packs.action, Action::ListPlugins);
     }
 
     #[test]

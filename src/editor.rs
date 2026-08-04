@@ -11045,6 +11045,15 @@ impl Editor {
             };
         }
 
+        if name == "plugins" {
+            return if arguments.trim().is_empty() {
+                vec![Action::ListPlugins]
+            } else {
+                self.last_error = Some("usage: plugins".to_string());
+                Vec::new()
+            };
+        }
+
         if name == "set" {
             let mut options = arguments.split_whitespace();
             let Some(option) = options.next() else {
@@ -23448,6 +23457,19 @@ builtin = "rust"
             editor.handle_command("set nornu", &runtime),
             vec![Action::SetRelativeLineNumbers(false)]
         );
+    }
+
+    #[test]
+    fn plugins_colon_command_opens_the_language_pack_manager() {
+        let mut editor = test_editor(40, 10);
+        let runtime = Runtime::new();
+
+        assert_eq!(
+            editor.handle_command("plugins", &runtime),
+            vec![Action::ListPlugins]
+        );
+        assert!(editor.handle_command("plugins extra", &runtime).is_empty());
+        assert_eq!(editor.last_error.as_deref(), Some("usage: plugins"));
     }
 
     #[tokio::test]
