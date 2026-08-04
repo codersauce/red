@@ -10556,7 +10556,11 @@ impl Editor {
 
     fn row_panel_prefers_key(event: &KeyEvent) -> bool {
         !event.modifiers.intersects(
-            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::HYPER,
+            KeyModifiers::CONTROL
+                | KeyModifiers::ALT
+                | KeyModifiers::SUPER
+                | KeyModifiers::HYPER
+                | KeyModifiers::META,
         ) && matches!(event.code, KeyCode::Char(c) if !matches!(c, ':' | ';'))
     }
 

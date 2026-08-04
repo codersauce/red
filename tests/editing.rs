@@ -5253,6 +5253,10 @@ fn focused_panel_allows_global_builtin_hotkeys() {
         .keys
         .normal
         .insert("x".to_string(), KeyAction::Single(Action::FilePicker));
+    config
+        .keys
+        .normal
+        .insert("Meta-p".to_string(), KeyAction::Single(Action::FilePicker));
     let mut harness = EditorHarness::with_config(buffer, config);
     add_tree_panel(&mut harness);
     assert!(harness.editor.test_focus_panel("tree"));
@@ -5263,6 +5267,7 @@ fn focused_panel_allows_global_builtin_hotkeys() {
             KeyModifiers::CONTROL,
             Action::FilePicker,
         ),
+        (KeyCode::Char('p'), KeyModifiers::META, Action::FilePicker),
         (KeyCode::Char('z'), KeyModifiers::CONTROL, Action::Suspend),
         (KeyCode::F(1), KeyModifiers::NONE, Action::CommandPalette),
     ] {
