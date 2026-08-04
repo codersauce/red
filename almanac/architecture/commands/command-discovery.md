@@ -30,6 +30,8 @@ The low-level parser in `src/command.rs` receives the authoritative built-in com
 
 The editor adds command-specific handling around that parser. It special-cases register, join, and syntax commands before calling the built-in parser, then maps parsed command names to semantic `Action` values such as save, quit, buffer movement, deletion, edit/reload, split, wrap, syntax, and config diagnostics [@editor-dispatch]. If built-in parsing fails but the runtime has a registered plugin command with the exact input name, the editor returns `Action::PluginCommand`; otherwise it records an unknown-command error [@editor-dispatch].
 
+Advertising a built-in colon form is a parser and dispatch change, not only palette metadata. A built-in command that appears in docs or `CommandPaletteEntry::colon` must also be present in the built-in command list passed to `command::parse` and must map to an `Action` in `Editor::handle_command`; otherwise the palette can describe a `:<name>` form that direct colon input still reports as unknown [@command-palette] [@editor-dispatch].
+
 ## Completion Names
 
 Colon completion uses the palette module's command-name inventory rather than the parser alone. `colon_completion_names` starts with built-in colon commands, adds special built-ins such as `commands`, `command-palette`, debug commands, registers, undotree, `j`, and `join`, and then appends plugin command names that do not collide with built-in colon names [@command-palette]. The editor uses that list for command-line completion when the current command fragment has no whitespace and is not in a file or syntax completion context [@editor-dispatch].
