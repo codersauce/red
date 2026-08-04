@@ -26,7 +26,7 @@ mod session_manager;
 
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ffi::OsStr,
     fs,
     io::Write as _,
@@ -135,44 +135,271 @@ const MAX_DIRECTORY_LISTING_ENTRIES: usize = 160;
 const AGENT_BRIDGE_CAPACITY: usize = 64;
 const PLUGIN_MANAGER_PICKER_ID: i32 = 9_101;
 const PLUGIN_MANAGER_ACTION_PICKER_ID: i32 = 9_102;
+const PLUGIN_MANAGER_INSTALL_PICKER_ID: i32 = 9_103;
 
 #[cfg(not(test))]
 type TerminalOutput = std::io::Stdout;
 #[cfg(test)]
 type TerminalOutput = Box<dyn std::io::Write + Send>;
 
+struct PluginManagerOperationOutcome {
+    message: String,
+    reload_languages: bool,
+    restart_plugins: bool,
+}
+
 async fn apply_plugin_manager_operation(
     manager: &plugin::package::PluginPackageManager,
     operation: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<PluginManagerOperationOutcome> {
     let (verb, raw_id) = operation
         .split_once('\t')
         .ok_or_else(|| anyhow::anyhow!("invalid plugin operation"))?;
     let id = plugin::package::PluginId::parse(raw_id)?;
     match verb {
         "enable" => {
+            let installed = manager
+                .installed(&id)?
+                .ok_or_else(|| anyhow::anyhow!("plugin `{id}` is not installed"))?;
             manager.set_enabled(&id, true)?;
-            Ok(format!("Enabled plugin {id}."))
+            Ok(PluginManagerOperationOutcome {
+                message: format!("Enabled plugin {id}."),
+                reload_languages: installed.has_languages,
+                restart_plugins: installed.has_husk || installed.has_companion,
+            })
         }
         "disable" => {
+            let installed = manager
+                .installed(&id)?
+                .ok_or_else(|| anyhow::anyhow!("plugin `{id}` is not installed"))?;
             manager.set_enabled(&id, false)?;
-            Ok(format!("Disabled plugin {id}."))
+            Ok(PluginManagerOperationOutcome {
+                message: format!("Disabled plugin {id}."),
+                reload_languages: installed.has_languages,
+                restart_plugins: installed.has_husk || installed.has_companion,
+            })
         }
         "update" => {
             let installed = manager.update(&id).await?;
-            Ok(format!(
-                "Updated {} to {}.",
-                installed.name, installed.version
-            ))
+            Ok(PluginManagerOperationOutcome {
+                message: if installed.has_native_grammars {
+                    format!(
+                        "Updated {} to {}. Approve its current native grammars before loading them.",
+                        installed.name, installed.version
+                    )
+                } else {
+                    format!("Updated {} to {}.", installed.name, installed.version)
+                },
+                reload_languages: installed.has_languages && !installed.has_native_grammars,
+                restart_plugins: installed.has_husk || installed.has_companion,
+            })
+        }
+        "trust" => {
+            let installed = manager
+                .installed(&id)?
+                .ok_or_else(|| anyhow::anyhow!("plugin `{id}` is not installed"))?;
+            manager.trust_package_grammars(&id)?;
+            Ok(PluginManagerOperationOutcome {
+                message: format!(
+                    "Approved the current native grammars for {}.",
+                    installed.name
+                ),
+                reload_languages: installed.has_languages,
+                restart_plugins: false,
+            })
         }
         "remove" => {
+            let installed = manager
+                .installed(&id)?
+                .ok_or_else(|| anyhow::anyhow!("plugin `{id}` is not installed"))?;
             manager.remove(&id, false)?;
-            Ok(format!(
-                "Removed plugin {id}; its private data was preserved."
-            ))
+            Ok(PluginManagerOperationOutcome {
+                message: format!("Removed plugin {id}; its private data was preserved."),
+                reload_languages: installed.has_languages,
+                restart_plugins: installed.has_husk || installed.has_companion,
+            })
         }
         _ => anyhow::bail!("unknown plugin operation `{verb}`"),
     }
+}
+
+fn plugin_manager_items(
+    installed: &[plugin::package::InstalledPlugin],
+    catalog: &BTreeMap<plugin::package::PluginId, plugin::catalog::CatalogPackage>,
+    catalog_url: &str,
+) -> Vec<PickerItem> {
+    let installed_by_id = installed
+        .iter()
+        .map(|package| (&package.id, package))
+        .collect::<BTreeMap<_, _>>();
+    let mut items = vec![PickerItem {
+        id: "custom-source".to_string(),
+        icon: None,
+        label: "Install from GitHub or local path…".to_string(),
+        kind: Some("Custom source".to_string()),
+        annotation: None,
+        detail: Some("Enter owner/repo[@ref] or a development checkout path".to_string()),
+        data: Value::Null,
+        matches: Vec::new(),
+        detail_matches: Vec::new(),
+        preview: Some(PickerPreview::Text {
+            text: "Custom sources are not reviewed by the Red catalog. Red still validates the package and requires separate approval before loading a native grammar.".to_string(),
+            language: None,
+        }),
+    }];
+
+    for package in catalog.values() {
+        let installed_at_id = installed_by_id.get(&package.id).copied();
+        let installed = installed_at_id
+            .filter(|installed| installed_from_catalog(installed, catalog_url, &package.id));
+        let custom_install = installed_at_id
+            .filter(|installed| !installed_from_catalog(installed, catalog_url, &package.id));
+        let requirements = package
+            .requirements
+            .iter()
+            .map(|requirement| {
+                let state = if command_available(&requirement.command) {
+                    "available"
+                } else {
+                    "not found on PATH"
+                };
+                let importance = if requirement.optional {
+                    "optional"
+                } else {
+                    "required"
+                };
+                format!(
+                    "{} — {} ({importance}; {state})",
+                    requirement.command, requirement.purpose
+                )
+            })
+            .collect::<Vec<_>>();
+        let artifact = package.artifact(crate::language::host_target());
+        let native_grammars = artifact
+            .map(|artifact| artifact.grammars.len())
+            .unwrap_or_default();
+        let annotation = match (installed, custom_install) {
+            (Some(installed), _) if installed.version < package.version => {
+                format!("{} → {} available", installed.version, package.version)
+            }
+            (Some(installed), _) => format!("{} installed", installed.version),
+            (None, Some(custom)) => {
+                format!(
+                    "{} available; custom {} installed",
+                    package.version, custom.version
+                )
+            }
+            (None, None) => package.version.to_string(),
+        };
+        let host_api = semver::Version::parse(plugin::RED_HOST_API_VERSION)
+            .expect("Red host API version is valid SemVer");
+        let compatible = package.red_api.matches(&host_api);
+        let availability = if !compatible {
+            format!("Requires Red API {}", package.red_api)
+        } else if artifact.is_some() {
+            package.tier.label().to_string()
+        } else {
+            "Unavailable on this platform".to_string()
+        };
+        let mut preview = format!(
+            "{}\n\nLanguages: {}\nPublisher: {}\nReview tier: {}",
+            package.description,
+            package.languages.join(", "),
+            package.repository,
+            package.tier.label()
+        );
+        if native_grammars > 0 {
+            preview.push_str(&format!(
+                "\n\nNative grammars: {native_grammars}. Installing does not approve them automatically."
+            ));
+        }
+        if !requirements.is_empty() {
+            preview.push_str("\n\nExternal requirements:\n- ");
+            preview.push_str(&requirements.join("\n- "));
+        }
+        items.push(PickerItem {
+            id: installed.map_or_else(
+                || format!("catalog:{}", package.id),
+                |_| format!("installed:{}", package.id),
+            ),
+            icon: None,
+            label: package.name.clone(),
+            kind: Some(availability),
+            annotation: Some(annotation),
+            detail: Some(package.description.clone()),
+            data: json!({ "package": package.id.as_str() }),
+            matches: Vec::new(),
+            detail_matches: Vec::new(),
+            preview: Some(PickerPreview::Text {
+                text: preview,
+                language: None,
+            }),
+        });
+    }
+
+    for package in installed {
+        if catalog.contains_key(&package.id)
+            && installed_from_catalog(package, catalog_url, &package.id)
+        {
+            continue;
+        }
+        items.push(PickerItem {
+            id: format!("installed:{}", package.id),
+            icon: None,
+            label: package.name.clone(),
+            kind: Some("Custom source".to_string()),
+            annotation: Some(format!(
+                "{} {}",
+                package.version,
+                if package.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            )),
+            detail: Some(format!("Languages: {}", package.languages.join(", "))),
+            data: json!({ "package": package.id.as_str() }),
+            matches: Vec::new(),
+            detail_matches: Vec::new(),
+            preview: None,
+        });
+    }
+    items
+}
+
+fn installed_from_catalog(
+    installed: &plugin::package::InstalledPlugin,
+    catalog_url: &str,
+    package_id: &plugin::package::PluginId,
+) -> bool {
+    matches!(
+        &installed.source,
+        plugin::package::PluginInstallSource::Catalog {
+            catalog_url: source_catalog_url,
+            package,
+            ..
+        } if source_catalog_url == catalog_url && package == package_id
+    )
+}
+
+fn command_available(command: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|directory| {
+        let candidate = directory.join(command);
+        if candidate.is_file() {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            ["exe", "cmd", "bat"]
+                .iter()
+                .any(|extension| candidate.with_extension(extension).is_file())
+        }
+        #[cfg(not(windows))]
+        false
+    })
 }
 const MACRO_MAX_REPLAY_DEPTH: usize = 20;
 const MACRO_MAX_REPLAY_EVENTS: usize = 10_000;
@@ -1539,9 +1766,23 @@ pub enum Action {
     ResolvePluginRequest(i64, Value),
     ViewLogs,
     ListPlugins,
+    PluginManagerSelect(String),
+    PluginManagerCatalogLoaded {
+        catalog_url: String,
+        packages: Vec<plugin::catalog::CatalogPackage>,
+        error: Option<String>,
+    },
+    PluginManagerCatalogInstall {
+        id: String,
+        trust_native_grammars: bool,
+    },
     PluginManagerInstall(String),
     PluginManagerAction(String),
-    PluginManagerFinished(String),
+    PluginManagerFinished {
+        message: String,
+        reload_languages: bool,
+        restart_plugins: bool,
+    },
 
     // Window management actions
     SplitHorizontal,
@@ -1860,6 +2101,10 @@ pub struct Editor {
 
     /// Plugin system registry
     plugin_registry: PluginRegistry,
+
+    /// Last successfully fetched curated package catalog used by the manager picker.
+    plugin_catalog: BTreeMap<plugin::package::PluginId, plugin::catalog::CatalogPackage>,
+    plugin_catalog_url: String,
 
     /// Lazily spawned native companions owned by installed plugins.
     companion_manager: Arc<tokio::sync::Mutex<plugin::companion::CompanionManager>>,
@@ -3172,6 +3417,8 @@ impl Editor {
             language_config_overrides: Vec::new(),
             theme,
             plugin_registry,
+            plugin_catalog: BTreeMap::new(),
+            plugin_catalog_url: plugin::catalog::catalog_url(),
             companion_manager: Arc::new(tokio::sync::Mutex::new(
                 plugin::companion::CompanionManager::new(Config::config_dir()),
             )),
@@ -14772,32 +15019,264 @@ impl Editor {
             Action::ListPlugins => {
                 add_to_history = false;
                 let manager = plugin::package::PluginPackageManager::new(Config::config_dir());
-                let mut items = vec!["Install plugin…".to_string()];
-                match manager.list() {
-                    Ok(installed) => {
-                        items.extend(installed.into_iter().map(|plugin| {
-                            format!(
-                                "{}\t{}\t{}\t{}",
-                                plugin.id,
-                                plugin.name,
-                                plugin.version,
-                                if plugin.enabled {
-                                    "enabled"
-                                } else {
-                                    "disabled"
-                                }
-                            )
-                        }));
+                let installed = match manager.list() {
+                    Ok(installed) => installed,
+                    Err(error) => {
+                        self.last_error = Some(error.to_string());
+                        Vec::new()
                     }
-                    Err(error) => self.last_error = Some(error.to_string()),
-                }
-                self.current_dialog = Some(Box::new(Picker::new(
-                    Some("Plugin manager".to_string()),
-                    self,
-                    &items,
-                    Some(PLUGIN_MANAGER_PICKER_ID),
-                )));
+                };
+                let items = plugin_manager_items(
+                    &installed,
+                    &self.plugin_catalog,
+                    &self.plugin_catalog_url,
+                );
+                let picker = Picker::builder()
+                    .title("Language packs")
+                    .structured_items(items)
+                    .id(PLUGIN_MANAGER_PICKER_ID)
+                    .placeholder("Filter language packs")
+                    .status("Refreshing the curated catalog…")
+                    .busy(true)
+                    .select_action(Action::PluginManagerSelect)
+                    .build(self);
+                self.current_dialog = Some(Box::new(picker));
+                let catalog_url = plugin::catalog::catalog_url();
+                tokio::spawn(async move {
+                    let (packages, error) =
+                        match plugin::catalog::PluginCatalog::fetch(&catalog_url).await {
+                            Ok(catalog) => (catalog.packages, None),
+                            Err(error) => (Vec::new(), Some(error.to_string())),
+                        };
+                    ACTION_DISPATCHER.send_request(PluginRequest::Action(
+                        Action::PluginManagerCatalogLoaded {
+                            catalog_url,
+                            packages,
+                            error,
+                        },
+                    ));
+                });
                 self.render(buffer)?;
+            }
+            Action::PluginManagerCatalogLoaded {
+                catalog_url,
+                packages,
+                error,
+            } => {
+                add_to_history = false;
+                if error.is_none() {
+                    self.plugin_catalog = packages
+                        .iter()
+                        .cloned()
+                        .map(|package| (package.id.clone(), package))
+                        .collect();
+                    self.plugin_catalog_url = catalog_url.clone();
+                }
+                let manager = plugin::package::PluginPackageManager::new(Config::config_dir());
+                let installed = manager.list().unwrap_or_default();
+                let items = plugin_manager_items(
+                    &installed,
+                    &self.plugin_catalog,
+                    &self.plugin_catalog_url,
+                );
+                if let Some(dialog) = &mut self.current_dialog {
+                    dialog.update_picker(PLUGIN_MANAGER_PICKER_ID, PickerUpdate::Items(items));
+                    dialog.update_picker(
+                        PLUGIN_MANAGER_PICKER_ID,
+                        PickerUpdate::Status(Some(error.as_ref().map_or_else(
+                            || format!("{} curated pack(s)", self.plugin_catalog.len()),
+                            |error| format!("Catalog unavailable: {error}"),
+                        ))),
+                    );
+                    dialog.update_picker(PLUGIN_MANAGER_PICKER_ID, PickerUpdate::Busy(false));
+                }
+                self.render(buffer)?;
+            }
+            Action::PluginManagerSelect(selection) => {
+                add_to_history = false;
+                if selection == "custom-source" {
+                    self.current_dialog = Some(Box::new(InputPrompt::new(
+                        self,
+                        "GitHub owner/repo[@ref] or local path",
+                        "",
+                        Action::PluginManagerInstall,
+                    )));
+                } else if let Some(raw_id) = selection.strip_prefix("installed:") {
+                    let id = plugin::package::PluginId::parse(raw_id)?;
+                    let manager = plugin::package::PluginPackageManager::new(Config::config_dir());
+                    let installed = manager
+                        .installed(&id)?
+                        .ok_or_else(|| anyhow::anyhow!("plugin `{id}` is no longer installed"))?;
+                    let toggle = if installed.enabled {
+                        "disable"
+                    } else {
+                        "enable"
+                    };
+                    let mut actions = vec![format!("{toggle}\t{id}"), format!("update\t{id}")];
+                    if installed.has_native_grammars {
+                        actions.push(format!("trust\t{id}"));
+                    }
+                    actions.push(format!("remove\t{id}"));
+                    self.current_dialog = Some(Box::new(Picker::new(
+                        Some(format!("Manage {id}")),
+                        self,
+                        &actions,
+                        Some(PLUGIN_MANAGER_ACTION_PICKER_ID),
+                    )));
+                } else if let Some(raw_id) = selection.strip_prefix("catalog:") {
+                    let id = plugin::package::PluginId::parse(raw_id)?;
+                    let manager = plugin::package::PluginPackageManager::new(Config::config_dir());
+                    let replacing_custom = manager.installed(&id)?.is_some_and(|installed| {
+                        !installed_from_catalog(&installed, &self.plugin_catalog_url, &id)
+                    });
+                    let package = self.plugin_catalog.get(&id).ok_or_else(|| {
+                        anyhow::anyhow!("language pack `{id}` is no longer in the catalog")
+                    })?;
+                    let host_api = semver::Version::parse(plugin::RED_HOST_API_VERSION)?;
+                    anyhow::ensure!(
+                        package.red_api.matches(&host_api),
+                        "language pack `{id}` requires Red API `{}`, but this release provides `{host_api}`",
+                        package.red_api
+                    );
+                    let artifact = package
+                        .artifact(crate::language::host_target())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "language pack `{id}` is unavailable for `{}`",
+                                crate::language::host_target()
+                            )
+                        })?;
+                    let has_native_grammars = !artifact.grammars.is_empty();
+                    let mut install_details = Vec::new();
+                    if replacing_custom {
+                        install_details
+                            .push("Replaces the custom package currently installed under this ID");
+                    }
+                    if has_native_grammars {
+                        install_details.push(
+                            "Language metadata is installed, but native highlighting remains disabled",
+                        );
+                    }
+                    let mut choices = vec![PickerItem {
+                        id: "cancel".to_string(),
+                        icon: None,
+                        label: "Cancel".to_string(),
+                        kind: Some("Safe default".to_string()),
+                        annotation: None,
+                        detail: Some("Leave the package unchanged".to_string()),
+                        data: Value::Null,
+                        matches: Vec::new(),
+                        detail_matches: Vec::new(),
+                        preview: None,
+                    }];
+                    choices.push(PickerItem {
+                        id: "install".to_string(),
+                        icon: None,
+                        label: if has_native_grammars {
+                            "Install without approving native grammars".to_string()
+                        } else {
+                            "Install language pack".to_string()
+                        },
+                        kind: Some("Install".to_string()),
+                        annotation: Some(package.version.to_string()),
+                        detail: (!install_details.is_empty()).then(|| install_details.join(". ")),
+                        data: Value::Null,
+                        matches: Vec::new(),
+                        detail_matches: Vec::new(),
+                        preview: None,
+                    });
+                    if has_native_grammars {
+                        let digests = artifact
+                            .grammars
+                            .iter()
+                            .map(|(language, digest)| format!("{language}: {digest}"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        choices.push(PickerItem {
+                            id: "install-and-trust".to_string(),
+                            icon: None,
+                            label: "Install and approve native grammars".to_string(),
+                            kind: Some("Runs native code".to_string()),
+                            annotation: Some(format!("{} verified grammar(s)", artifact.grammars.len())),
+                            detail: Some(
+                                "Approve these exact catalog-verified bytes for in-process syntax highlighting"
+                                    .to_string(),
+                            ),
+                            data: Value::Null,
+                            matches: Vec::new(),
+                            detail_matches: Vec::new(),
+                            preview: Some(PickerPreview::Text {
+                                text: format!(
+                                    "Native Tree-sitter grammars execute inside Red. Approval is bound to these exact SHA-256 digests and is invalidated when they change:\n\n{digests}"
+                                ),
+                                language: None,
+                            }),
+                        });
+                    }
+                    let raw_id = id.to_string();
+                    let picker = Picker::builder()
+                        .title(&format!("Install {}", package.name))
+                        .structured_items(choices)
+                        .id(PLUGIN_MANAGER_INSTALL_PICKER_ID)
+                        .select_action(move |choice| match choice.as_str() {
+                            "cancel" => Action::Refresh,
+                            "install-and-trust" => Action::PluginManagerCatalogInstall {
+                                id: raw_id.clone(),
+                                trust_native_grammars: true,
+                            },
+                            _ => Action::PluginManagerCatalogInstall {
+                                id: raw_id.clone(),
+                                trust_native_grammars: false,
+                            },
+                        })
+                        .build(self);
+                    self.current_dialog = Some(Box::new(picker));
+                }
+                self.render(buffer)?;
+            }
+            Action::PluginManagerCatalogInstall {
+                id,
+                trust_native_grammars,
+            } => {
+                add_to_history = false;
+                let id = plugin::package::PluginId::parse(id)?;
+                let trust_native_grammars = *trust_native_grammars;
+                let package = self.plugin_catalog.get(&id).ok_or_else(|| {
+                    anyhow::anyhow!("language pack `{id}` is no longer in the catalog")
+                })?;
+                let catalog_url = self.plugin_catalog_url.clone();
+                self.last_error = Some(format!("Installing {}…", package.name));
+                tokio::spawn(async move {
+                    let manager = plugin::package::PluginPackageManager::new(Config::config_dir());
+                    let result = manager
+                        .install_catalog(&catalog_url, &id, trust_native_grammars)
+                        .await;
+                    let (message, reload_languages) = match result {
+                        Ok(package)
+                            if package.has_native_grammars && !trust_native_grammars => (
+                            format!(
+                                "Installed {} {}. Its native grammar remains disabled until you approve it.",
+                                package.name, package.version
+                            ),
+                            false,
+                        ),
+                        Ok(package) => {
+                            let reload_languages = package.has_languages;
+                            (
+                                format!("Installed {} {}.", package.name, package.version),
+                                reload_languages,
+                            )
+                        }
+                        Err(error) => (format!("Language pack install failed: {error}"), false),
+                    };
+                    ACTION_DISPATCHER.send_request(PluginRequest::Action(
+                        Action::PluginManagerFinished {
+                            message,
+                            reload_languages,
+                            restart_plugins: false,
+                        },
+                    ));
+                });
             }
             Action::PluginManagerInstall(source) => {
                 add_to_history = false;
@@ -14819,15 +15298,27 @@ impl Editor {
                                 });
                             manager.install_github(repository, version).await
                         };
-                        let message = match result {
-                            Ok(plugin) => format!(
-                                "Installed {} {}. Restart Red to activate it.",
-                                plugin.name, plugin.version
+                        let (message, reload_languages, restart_plugins) = match result {
+                            Ok(plugin) => (
+                                if plugin.has_native_grammars {
+                                    format!(
+                                        "Installed {} {}. Its native grammar remains disabled until you approve it.",
+                                        plugin.name, plugin.version
+                                    )
+                                } else {
+                                    format!("Installed {} {}.", plugin.name, plugin.version)
+                                },
+                                plugin.has_languages && !plugin.has_native_grammars,
+                                plugin.has_husk || plugin.has_companion,
                             ),
-                            Err(error) => format!("Plugin install failed: {error}"),
+                            Err(error) => (format!("Plugin install failed: {error}"), false, false),
                         };
                         ACTION_DISPATCHER.send_request(PluginRequest::Action(
-                            Action::PluginManagerFinished(message),
+                            Action::PluginManagerFinished {
+                                message,
+                                reload_languages,
+                                restart_plugins,
+                            },
                         ));
                     });
                 }
@@ -14839,18 +15330,42 @@ impl Editor {
                 tokio::spawn(async move {
                     let manager = plugin::package::PluginPackageManager::new(Config::config_dir());
                     let result = apply_plugin_manager_operation(&manager, &operation).await;
-                    let message = match result {
-                        Ok(message) => format!("{message} Restart Red to refresh plugins."),
-                        Err(error) => format!("Plugin operation failed: {error}"),
+                    let (message, reload_languages, restart_plugins) = match result {
+                        Ok(outcome) => (
+                            outcome.message,
+                            outcome.reload_languages,
+                            outcome.restart_plugins,
+                        ),
+                        Err(error) => (format!("Plugin operation failed: {error}"), false, false),
                     };
                     ACTION_DISPATCHER.send_request(PluginRequest::Action(
-                        Action::PluginManagerFinished(message),
+                        Action::PluginManagerFinished {
+                            message,
+                            reload_languages,
+                            restart_plugins,
+                        },
                     ));
                 });
             }
-            Action::PluginManagerFinished(message) => {
+            Action::PluginManagerFinished {
+                message,
+                reload_languages,
+                restart_plugins,
+            } => {
                 add_to_history = false;
-                self.last_error = Some(message.clone());
+                let mut message = message.clone();
+                if *reload_languages {
+                    match self.reload_languages().await {
+                        Ok(_) => message.push_str(" Language definitions reloaded."),
+                        Err(error) => message.push_str(&format!(
+                            " The package was changed, but language reload failed: {error}"
+                        )),
+                    }
+                }
+                if *restart_plugins {
+                    message.push_str(" Restart Red to refresh plugin code.");
+                }
+                self.last_error = Some(message);
             }
             Action::Command(cmd) => {
                 log!("Handling command: {cmd}");
@@ -15928,31 +16443,7 @@ impl Editor {
             }
             Action::Picked(item, id) => {
                 log!("picked: {item} - {id:?}");
-                if *id == Some(PLUGIN_MANAGER_PICKER_ID) {
-                    if item == "Install plugin…" {
-                        self.current_dialog = Some(Box::new(InputPrompt::new(
-                            self,
-                            "GitHub owner/repo[@tag] or local path",
-                            "",
-                            Action::PluginManagerInstall,
-                        )));
-                    } else if let Some(plugin_id) = item.split('\t').next() {
-                        let enabled = item.ends_with("\tenabled");
-                        let toggle = if enabled { "disable" } else { "enable" };
-                        let actions = vec![
-                            format!("{toggle}\t{plugin_id}"),
-                            format!("update\t{plugin_id}"),
-                            format!("remove\t{plugin_id}"),
-                        ];
-                        self.current_dialog = Some(Box::new(Picker::new(
-                            Some(format!("Manage {plugin_id}")),
-                            self,
-                            &actions,
-                            Some(PLUGIN_MANAGER_ACTION_PICKER_ID),
-                        )));
-                    }
-                    self.render(buffer)?;
-                } else if *id == Some(PLUGIN_MANAGER_ACTION_PICKER_ID) {
+                if *id == Some(PLUGIN_MANAGER_ACTION_PICKER_ID) {
                     return self
                         .execute(&Action::PluginManagerAction(item.clone()), buffer, runtime)
                         .await;
@@ -22137,6 +22628,146 @@ impl Editor {
 mod test {
     use super::*;
     use std::path::PathBuf;
+
+    fn catalog_test_package() -> plugin::catalog::CatalogPackage {
+        plugin::catalog::CatalogPackage {
+            id: plugin::package::PluginId::parse("go-language").unwrap(),
+            name: "Go language support".to_string(),
+            version: semver::Version::parse("0.2.0").unwrap(),
+            red_api: semver::VersionReq::parse(&format!(
+                "^{}",
+                plugin::RED_HOST_API_VERSION
+            ))
+            .unwrap(),
+            description: "Go syntax and gopls integration".to_string(),
+            repository: "codersauce/red-language-packs".to_string(),
+            source_path: PathBuf::from("packs/go"),
+            resolved_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            license: "MIT".to_string(),
+            tier: plugin::catalog::CatalogTier::Official,
+            languages: vec!["go".to_string()],
+            requirements: vec![plugin::catalog::CatalogRequirement {
+                command: "gopls".to_string(),
+                purpose: "Language intelligence".to_string(),
+                optional: true,
+            }],
+            artifacts: BTreeMap::from([(
+                crate::language::host_target().to_string(),
+                plugin::catalog::CatalogArtifact {
+                    url: "https://github.com/codersauce/red-language-packs/releases/download/go%2Fv0.2.0/go.tar.gz".to_string(),
+                    sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                    size: 100,
+                    grammars: BTreeMap::from([(
+                        "go".to_string(),
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            .to_string(),
+                    )]),
+                },
+            )]),
+        }
+    }
+
+    #[test]
+    fn language_pack_picker_keeps_custom_sources_separate_from_curated_entries() {
+        let package = catalog_test_package();
+        let catalog = BTreeMap::from([(package.id.clone(), package)]);
+
+        let items =
+            plugin_manager_items(&[], &catalog, plugin::catalog::DEFAULT_PLUGIN_CATALOG_URL);
+
+        assert_eq!(items[0].id, "custom-source");
+        assert_eq!(items[0].kind.as_deref(), Some("Custom source"));
+        assert_eq!(items[1].id, "catalog:go-language");
+        assert_eq!(items[1].kind.as_deref(), Some("Official"));
+        let preview = match items[1].preview.as_ref().unwrap() {
+            PickerPreview::Text { text, .. } => text,
+            PickerPreview::Location { .. } => panic!("expected text preview"),
+        };
+        assert!(preview.contains("does not approve them automatically"));
+    }
+
+    #[test]
+    fn language_pack_picker_reports_catalog_updates_for_installed_packages() {
+        let package = catalog_test_package();
+        let id = package.id.clone();
+        let catalog = BTreeMap::from([(id.clone(), package)]);
+        let installed = plugin::package::InstalledPlugin {
+            id,
+            name: "Go language support".to_string(),
+            version: semver::Version::parse("0.1.0").unwrap(),
+            enabled: true,
+            compatible: true,
+            has_companion: false,
+            has_husk: false,
+            has_languages: true,
+            has_native_grammars: true,
+            languages: vec!["go".to_string()],
+            source: plugin::package::PluginInstallSource::Catalog {
+                catalog_url: plugin::catalog::DEFAULT_PLUGIN_CATALOG_URL.to_string(),
+                package: plugin::package::PluginId::parse("go-language").unwrap(),
+                version: semver::Version::parse("0.1.0").unwrap(),
+                resolved_commit: "fedcba9876543210fedcba9876543210fedcba98".to_string(),
+                artifact_url: "https://github.com/codersauce/red-language-packs/releases/download/go%2Fv0.1.0/go.tar.gz".to_string(),
+                artifact_sha256:
+                    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                        .to_string(),
+            },
+            package_root: PathBuf::from("/tmp/go-language"),
+        };
+
+        let items = plugin_manager_items(
+            &[installed],
+            &catalog,
+            plugin::catalog::DEFAULT_PLUGIN_CATALOG_URL,
+        );
+
+        assert_eq!(items[1].id, "installed:go-language");
+        assert_eq!(
+            items[1].annotation.as_deref(),
+            Some("0.1.0 → 0.2.0 available")
+        );
+    }
+
+    #[test]
+    fn language_pack_picker_does_not_label_a_custom_id_collision_as_officially_installed() {
+        let package = catalog_test_package();
+        let id = package.id.clone();
+        let catalog = BTreeMap::from([(id.clone(), package)]);
+        let installed = plugin::package::InstalledPlugin {
+            id,
+            name: "Locally modified Go support".to_string(),
+            version: semver::Version::parse("9.0.0").unwrap(),
+            enabled: true,
+            compatible: true,
+            has_companion: false,
+            has_husk: false,
+            has_languages: true,
+            has_native_grammars: true,
+            languages: vec!["go".to_string()],
+            source: plugin::package::PluginInstallSource::GitHub {
+                repository: "someone/custom-go-pack".to_string(),
+                requested_version: None,
+            },
+            package_root: PathBuf::from("/tmp/go-language"),
+        };
+
+        let items = plugin_manager_items(
+            &[installed],
+            &catalog,
+            plugin::catalog::DEFAULT_PLUGIN_CATALOG_URL,
+        );
+
+        assert_eq!(items[1].id, "catalog:go-language");
+        assert_eq!(items[1].kind.as_deref(), Some("Official"));
+        assert!(items[1]
+            .annotation
+            .as_deref()
+            .unwrap()
+            .contains("custom 9.0.0 installed"));
+        assert_eq!(items[2].id, "installed:go-language");
+        assert_eq!(items[2].kind.as_deref(), Some("Custom source"));
+    }
 
     fn drain_plugin_requests() {
         while ACTION_DISPATCHER.try_recv_request().is_some() {}
