@@ -33,8 +33,8 @@ pub struct PluginRegistry {
 }
 
 /// Host API version used for plugin compatibility checks.
-pub const RED_HOST_API_VERSION: &str = "0.6.0";
-const SUPPORTED_HOST_API_VERSIONS: &[&str] = &["0.4.0", RED_HOST_API_VERSION];
+pub const RED_HOST_API_VERSION: &str = "0.7.0";
+pub(crate) const SUPPORTED_HOST_API_VERSIONS: &[&str] = &["0.4.0", "0.6.0", RED_HOST_API_VERSION];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PluginModification {
@@ -897,18 +897,22 @@ fn check_api_compatibility(metadata: &PluginMetadata) -> anyhow::Result<()> {
     };
     let requirement = VersionReq::parse(requirement)
         .map_err(|error| anyhow::anyhow!("invalid red_api_version `{requirement}`: {error}"))?;
-    let compatible = SUPPORTED_HOST_API_VERSIONS
-        .iter()
-        .map(|version| Version::parse(version))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .any(|version| requirement.matches(&version));
+    let compatible = host_api_requirement_is_supported(&requirement)?;
     anyhow::ensure!(
         compatible,
         "plugin requires Red host API `{requirement}`, but this release supports {}; see docs/PLUGIN_API.md",
         SUPPORTED_HOST_API_VERSIONS.join(", ")
     );
     Ok(())
+}
+
+pub(crate) fn host_api_requirement_is_supported(requirement: &VersionReq) -> anyhow::Result<bool> {
+    Ok(SUPPORTED_HOST_API_VERSIONS
+        .iter()
+        .map(|version| Version::parse(version))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .any(|version| requirement.matches(&version)))
 }
 
 fn diagnostic_stage(error: &anyhow::Error) -> &'static str {
@@ -1409,6 +1413,9 @@ mod tests {
     fn pre_one_minor_host_api_requirements_do_not_cross_minor_versions() {
         let mut metadata = PluginMetadata::minimal("composer-plugin".to_string());
         metadata.red_api_version = Some("^0.4.0".to_string());
+        check_api_compatibility(&metadata).unwrap();
+
+        metadata.red_api_version = Some("^0.6.0".to_string());
         check_api_compatibility(&metadata).unwrap();
 
         metadata.red_api_version = Some("^0.5.0".to_string());

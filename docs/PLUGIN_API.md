@@ -1,6 +1,6 @@
 # Husk plugin compatibility
 
-Red host API version `0.6.0` is defined by
+Red host API version `0.7.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -24,9 +24,9 @@ required/optional arity (`HUSK-A0002`) and obvious literal argument types
 annotations use `HUSK-A0004`. `--no-typecheck` is an unsupported development
 escape hatch; compatibility guarantees do not apply while it is enabled.
 
-Red `0.6.0` retains the complete `0.4.0` contract, so existing packages that
-declare `"red_api_version": "^0.4.0"` continue to load. New packages should
-target `"red_api_version": "^0.6.0"` to use the external-package primitives.
+Red `0.7.0` retains the complete `0.4.0` and `0.6.0` contracts, so existing
+packages that declare either minor continue to load. New packages should target
+`"red_api_version": "^0.7.0"` to use global command scope.
 
 ## External package primitives
 
@@ -134,7 +134,8 @@ string-array `aliases` field. `visible = false` hides a command from the command
 palette and colon completion without disabling direct invocation or keymaps.
 The optional `scope` is `"editor"` by default. Set it to `"global"` only for
 commands that are safe and meaningful when a plugin panel owns focus, such as
-workspace pickers or pane toggles.
+workspace pickers or pane toggles. Packages using command scope must declare
+`"red_api_version": "^0.7.0"`.
 `#[red::on]` takes exactly one nonempty event-name string and requires a
 one-argument function. A function may subscribe to multiple distinct events by
 repeating `#[red::on(...)]`.
@@ -224,7 +225,7 @@ payloads use the declared `PickerItem`, `PickerCancelled`, and `PickerActionEven
 the `PickerItem.data` field remains `Json` so a plugin can attach its own payload.
 
 `OpenPicker` was added in host API `0.3.0`. New plugins targeting this Red release should
-declare `"red_api_version": "^0.6.0"`. The numeric-ID `OpenDynamicPicker` API remains
+declare `"red_api_version": "^0.7.0"`. The numeric-ID `OpenDynamicPicker` API remains
 available for compatibility, but new plugins should not use it.
 
 ## Agent composer

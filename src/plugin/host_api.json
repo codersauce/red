@@ -1,5 +1,5 @@
 {
-  "version": "0.6.0",
+  "version": "0.7.0",
   "calls": [
     { "name": "Print", "kind": "execute", "signature": "(message: String)", "introduced": "0.1.0" },
     { "name": "FilePicker", "kind": "execute", "signature": "()", "introduced": "0.1.0" },

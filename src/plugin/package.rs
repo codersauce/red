@@ -24,7 +24,8 @@ use crate::{config::LanguageConfig, language::GrammarTrustStore};
 
 use super::{
     catalog::{validate_catalog_url, CatalogArtifact, CatalogPackage, PluginCatalog},
-    Runtime, RED_HOST_API_VERSION,
+    registry::{host_api_requirement_is_supported, SUPPORTED_HOST_API_VERSIONS},
+    Runtime,
 };
 
 /// File name of the Red-specific package manifest.
@@ -231,11 +232,11 @@ impl PluginPackageManifest {
                 || !self.languages.is_empty(),
             "plugin package must declare a Husk entrypoint, native companion, or language"
         );
-        let host_api = Version::parse(RED_HOST_API_VERSION)?;
         anyhow::ensure!(
-            self.plugin.red_api.matches(&host_api),
-            "plugin requires Red host API `{}`, but this release provides `{host_api}`",
-            self.plugin.red_api
+            host_api_requirement_is_supported(&self.plugin.red_api)?,
+            "plugin requires Red host API `{}`, but this release supports {}",
+            self.plugin.red_api,
+            SUPPORTED_HOST_API_VERSIONS.join(", ")
         );
 
         for relative in self
@@ -529,12 +530,12 @@ impl PluginPackageManager {
     ) -> Result<InstalledPlugin> {
         validate_catalog_url(catalog_url)?;
         package.validate()?;
-        let host_api = Version::parse(RED_HOST_API_VERSION)?;
         anyhow::ensure!(
-            package.red_api.matches(&host_api),
-            "language pack `{}` requires Red API `{}`, but this release provides `{host_api}`",
+            host_api_requirement_is_supported(&package.red_api)?,
+            "language pack `{}` requires Red API `{}`, but this release supports {}",
             package.id,
-            package.red_api
+            package.red_api,
+            SUPPORTED_HOST_API_VERSIONS.join(", ")
         );
         let artifact = package.artifact(host_target()).ok_or_else(|| {
             anyhow::anyhow!(
@@ -1116,7 +1117,6 @@ fn installed_from_record(record: PluginInstallRecord) -> Result<InstalledPlugin>
         manifest.plugin.id == record.id,
         "install record id does not match plugin manifest"
     );
-    let host_api = Version::parse(RED_HOST_API_VERSION)?;
     let has_husk = manifest.husk_entry(&record.package_root).is_some();
     let languages = manifest.languages.keys().cloned().collect::<Vec<_>>();
     let has_native_grammars = manifest.languages.iter().any(|(id, language)| {
@@ -1133,7 +1133,7 @@ fn installed_from_record(record: PluginInstallRecord) -> Result<InstalledPlugin>
         name: manifest.plugin.name,
         version: manifest.plugin.version,
         enabled: record.enabled,
-        compatible: manifest.plugin.red_api.matches(&host_api),
+        compatible: host_api_requirement_is_supported(&manifest.plugin.red_api)?,
         has_companion: manifest.companion.is_some(),
         has_husk,
         has_languages: !manifest.languages.is_empty(),
@@ -1501,6 +1501,7 @@ fn set_executable(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin::RED_HOST_API_VERSION;
 
     fn catalog_package(artifact: CatalogArtifact) -> CatalogPackage {
         CatalogPackage {
@@ -1667,6 +1668,24 @@ symbol = "tree_sitter_buildspec"
             ),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn package_manifest_accepts_supported_prior_host_api() {
+        let package = tempfile::tempdir().unwrap();
+        write_package(package.path(), "compatible-package", "1.0.0");
+        let manifest_path = package.path().join(PLUGIN_MANIFEST_FILE);
+        let source = fs::read_to_string(&manifest_path)
+            .unwrap()
+            .replace(&format!("^{RED_HOST_API_VERSION}"), "^0.6.0");
+        fs::write(&manifest_path, source).unwrap();
+
+        let manifest = PluginPackageManifest::load(package.path()).unwrap();
+
+        assert_eq!(
+            manifest.plugin.red_api,
+            VersionReq::parse("^0.6.0").unwrap()
+        );
     }
 
     #[tokio::test]
