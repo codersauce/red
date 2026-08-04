@@ -291,16 +291,7 @@ fn plugin_manager_items(
             }
             (None, None) => package.version.to_string(),
         };
-        let host_api = semver::Version::parse(plugin::RED_HOST_API_VERSION)
-            .expect("Red host API version is valid SemVer");
-        let compatible = package.red_api.matches(&host_api);
-        let availability = if !compatible {
-            format!("Requires Red API {}", package.red_api)
-        } else if artifact.is_some() {
-            package.tier.label().to_string()
-        } else {
-            "Unavailable on this platform".to_string()
-        };
+        let (availability, unavailable_message) = catalog_package_availability(package);
         let mut preview = format!(
             "{}\n\nLanguages: {}\nPublisher: {}\nReview tier: {}",
             package.description,
@@ -319,7 +310,14 @@ fn plugin_manager_items(
         }
         items.push(PickerItem {
             id: installed.map_or_else(
-                || format!("catalog:{}", package.id),
+                || {
+                    let prefix = if unavailable_message.is_some() {
+                        "unavailable"
+                    } else {
+                        "catalog"
+                    };
+                    format!("{prefix}:{}", package.id)
+                },
                 |_| format!("installed:{}", package.id),
             ),
             icon: None,
@@ -365,6 +363,35 @@ fn plugin_manager_items(
         });
     }
     items
+}
+
+fn catalog_package_availability(
+    package: &plugin::catalog::CatalogPackage,
+) -> (String, Option<String>) {
+    let host_api = semver::Version::parse(plugin::RED_HOST_API_VERSION)
+        .expect("Red host API version is valid SemVer");
+    if !package.red_api.matches(&host_api) {
+        return (
+            format!("Requires Red API {}", package.red_api),
+            Some(format!(
+                "Language pack `{}` requires Red API `{}`, but this release provides `{host_api}`.",
+                package.id, package.red_api
+            )),
+        );
+    }
+
+    let host_target = crate::language::host_target();
+    if package.artifact(host_target).is_none() {
+        return (
+            "Unavailable on this platform".to_string(),
+            Some(format!(
+                "Language pack `{}` is unavailable for `{host_target}`.",
+                package.id
+            )),
+        );
+    }
+
+    (package.tier.label().to_string(), None)
 }
 
 fn installed_from_catalog(
@@ -15101,6 +15128,35 @@ impl Editor {
                         "",
                         Action::PluginManagerInstall,
                     )));
+                } else if let Some(raw_id) = selection.strip_prefix("unavailable:") {
+                    let id = plugin::package::PluginId::parse(raw_id)?;
+                    let message = self
+                        .plugin_catalog
+                        .get(&id)
+                        .and_then(|package| catalog_package_availability(package).1)
+                        .unwrap_or_else(|| {
+                            format!(
+                                "Language pack `{id}` changed availability; select it again to continue."
+                            )
+                        });
+                    self.last_error = Some(message.clone());
+                    let manager = plugin::package::PluginPackageManager::new(Config::config_dir());
+                    let installed = manager.list().unwrap_or_default();
+                    let items = plugin_manager_items(
+                        &installed,
+                        &self.plugin_catalog,
+                        &self.plugin_catalog_url,
+                    );
+                    let picker = Picker::builder()
+                        .title("Language packs")
+                        .structured_items(items)
+                        .id(PLUGIN_MANAGER_PICKER_ID)
+                        .placeholder("Filter language packs")
+                        .status(message)
+                        .busy(false)
+                        .select_action(Action::PluginManagerSelect)
+                        .build(self);
+                    self.current_dialog = Some(Box::new(picker));
                 } else if let Some(raw_id) = selection.strip_prefix("installed:") {
                     let id = plugin::package::PluginId::parse(raw_id)?;
                     let manager = plugin::package::PluginPackageManager::new(Config::config_dir());
@@ -22685,6 +22741,43 @@ mod test {
             PickerPreview::Location { .. } => panic!("expected text preview"),
         };
         assert!(preview.contains("does not approve them automatically"));
+    }
+
+    #[test]
+    fn language_pack_picker_keeps_api_incompatible_catalog_entries_recoverable() {
+        let mut package = catalog_test_package();
+        package.red_api = semver::VersionReq::parse(">=999.0.0").unwrap();
+        let catalog = BTreeMap::from([(package.id.clone(), package)]);
+
+        let items =
+            plugin_manager_items(&[], &catalog, plugin::catalog::DEFAULT_PLUGIN_CATALOG_URL);
+
+        assert_eq!(items[1].id, "unavailable:go-language");
+        assert_eq!(items[1].kind.as_deref(), Some("Requires Red API >=999.0.0"));
+        let (_, message) = catalog_package_availability(
+            &catalog[&plugin::package::PluginId::parse("go-language").unwrap()],
+        );
+        assert!(message.unwrap().contains("this release provides"));
+    }
+
+    #[test]
+    fn language_pack_picker_keeps_unsupported_targets_recoverable() {
+        let mut package = catalog_test_package();
+        package.artifacts.clear();
+        let catalog = BTreeMap::from([(package.id.clone(), package)]);
+
+        let items =
+            plugin_manager_items(&[], &catalog, plugin::catalog::DEFAULT_PLUGIN_CATALOG_URL);
+
+        assert_eq!(items[1].id, "unavailable:go-language");
+        assert_eq!(
+            items[1].kind.as_deref(),
+            Some("Unavailable on this platform")
+        );
+        let (_, message) = catalog_package_availability(
+            &catalog[&plugin::package::PluginId::parse("go-language").unwrap()],
+        );
+        assert!(message.unwrap().contains(crate::language::host_target()));
     }
 
     #[test]
