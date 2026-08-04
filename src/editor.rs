@@ -8455,11 +8455,29 @@ impl Editor {
         let mut drain_repeated_motion = false;
 
         let from_waiting_key_action = self.waiting_key_action.is_some();
+        let started_with_panel_focus = self.panel_manager.focused_panel_id().is_some();
         let started_in_normal = self.is_normal();
         let semantic_can_start = started_in_normal || self.is_visual();
         let was_recording_macro = self.macro_recording.is_some();
         let resolve_span = perf::PerfSpan::start("event:resolve_action");
-        let action = self.handle_event_with_runtime(&ev, Some(runtime))?;
+        let mut action = self.handle_event_with_runtime(&ev, Some(runtime))?;
+        if started_with_panel_focus {
+            let pending_commands = action.as_ref().map_or_else(Vec::new, |action| {
+                Self::pending_panel_plugin_commands(action, runtime)
+            });
+            if !pending_commands.is_empty() {
+                for command in pending_commands {
+                    self.plugin_registry
+                        .ensure_command_registered(runtime, &command)
+                        .await;
+                }
+                action = if from_waiting_key_action {
+                    action.and_then(|action| self.key_action_for_panel(&action, Some(runtime)))
+                } else {
+                    self.handle_event_with_runtime(&ev, Some(runtime))?
+                };
+            }
+        }
         if !sensitive_input {
             if was_recording_macro && self.macro_recording.is_some() {
                 self.record_macro_event(&ev);
@@ -10769,34 +10787,73 @@ impl Editor {
                 _ => None,
             })?;
 
-        Self::key_action_for_panel(action, runtime)
+        self.key_action_for_panel(action, runtime)
     }
 
-    fn key_action_for_panel(action: &KeyAction, runtime: Option<&Runtime>) -> Option<KeyAction> {
+    fn key_action_for_panel(
+        &self,
+        action: &KeyAction,
+        runtime: Option<&Runtime>,
+    ) -> Option<KeyAction> {
         match action {
-            KeyAction::Single(action) => Self::action_runs_from_panel(action, runtime)
+            KeyAction::Single(action) => self
+                .action_runs_from_panel(action, runtime)
                 .then(|| KeyAction::Single(action.clone())),
             KeyAction::Multiple(actions) => actions
                 .iter()
-                .all(|action| Self::action_runs_from_panel(action, runtime))
+                .all(|action| self.action_runs_from_panel(action, runtime))
                 .then(|| KeyAction::Multiple(actions.clone())),
             KeyAction::Nested(actions) => {
                 let actions = actions
                     .iter()
                     .filter_map(|(key, action)| {
-                        Self::key_action_for_panel(action, runtime)
+                        self.key_action_for_panel(action, runtime)
                             .map(|action| (key.clone(), action))
                     })
                     .collect::<HashMap<_, _>>();
                 (!actions.is_empty()).then_some(KeyAction::Nested(actions))
             }
-            KeyAction::Repeating(times, action) => Self::key_action_for_panel(action, runtime)
+            KeyAction::Repeating(times, action) => self
+                .key_action_for_panel(action, runtime)
                 .map(|action| KeyAction::Repeating(*times, Box::new(action))),
             KeyAction::None => None,
         }
     }
 
-    fn action_runs_from_panel(action: &Action, runtime: Option<&Runtime>) -> bool {
+    fn pending_panel_plugin_commands(action: &KeyAction, runtime: &Runtime) -> Vec<String> {
+        let mut commands = Vec::new();
+        Self::collect_pending_panel_plugin_commands(action, runtime, &mut commands);
+        commands
+    }
+
+    fn collect_pending_panel_plugin_commands(
+        action: &KeyAction,
+        runtime: &Runtime,
+        commands: &mut Vec<String>,
+    ) {
+        match action {
+            KeyAction::Single(Action::PluginCommand(command)) => {
+                if runtime.command_scope(command).is_none() && !commands.contains(command) {
+                    commands.push(command.clone());
+                }
+            }
+            KeyAction::Multiple(actions) => {
+                for action in actions {
+                    if let Action::PluginCommand(command) = action {
+                        if runtime.command_scope(command).is_none() && !commands.contains(command) {
+                            commands.push(command.clone());
+                        }
+                    }
+                }
+            }
+            KeyAction::Repeating(_, action) => {
+                Self::collect_pending_panel_plugin_commands(action, runtime, commands);
+            }
+            KeyAction::None | KeyAction::Single(_) | KeyAction::Nested(_) => {}
+        }
+    }
+
+    fn action_runs_from_panel(&self, action: &Action, runtime: Option<&Runtime>) -> bool {
         match action {
             Action::EnterMode(Mode::Command | Mode::Search)
             | Action::FilePicker
@@ -10826,7 +10883,10 @@ impl Editor {
             | Action::MaximizeWindow
             | Action::OnlyWindow => true,
             Action::PluginCommand(command) => runtime.is_some_and(|runtime| {
-                runtime.command_scope(command) == Some(plugin::CommandScope::Global)
+                runtime.command_scope(command).map_or_else(
+                    || self.plugin_registry.has_pending_command(command),
+                    |scope| scope == plugin::CommandScope::Global,
+                )
             }),
             _ => false,
         }
@@ -30580,6 +30640,126 @@ while True:
             render_buffer.cells[cursor_index].style, focused_style,
             "focusing a panel should repaint the synthetic editor cursor away"
         );
+    }
+
+    #[tokio::test]
+    async fn focused_panel_lazy_activates_plugin_commands_before_checking_scope() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let root = tempfile::tempdir().unwrap();
+        let husk_root = root.path().join("husk");
+        std::fs::create_dir_all(husk_root.join("src")).unwrap();
+        std::fs::write(
+            root.path().join("red-plugin.toml"),
+            r#"
+                schema_version = 1
+
+                [plugin]
+                id = "lazy-panel-commands"
+                name = "Lazy Panel Commands"
+                version = "0.1.0"
+                red_api = "^0.7.0"
+                husk_manifest = "husk/Husk.toml"
+
+                [activation]
+                commands = ["LazyGlobal", "LazyContextual"]
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            husk_root.join("Husk.toml"),
+            r#"
+                schema_version = 1
+
+                [package]
+                name = "lazy-panel-commands"
+                version = "0.1.0"
+                entry = "src/main.hk"
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            husk_root.join("src/main.hk"),
+            r#"
+                pub fn activate() {
+                    red::add_command("LazyGlobal", run_global, Json { scope: "global" });
+                    red::add_command("LazyContextual", run_contextual);
+                    red::on("panel:event:tree", panel_event);
+                }
+
+                fn run_global() { red::execute("Print", "global command"); }
+                fn run_contextual() { red::execute("Print", "contextual command"); }
+
+                fn panel_event(event: Json) {
+                    if event.action == "Ctrl-t" {
+                        red::execute("Print", "panel fallback");
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+
+        let mut editor = test_editor(40, 10);
+        editor.config.keys.normal.insert(
+            "Ctrl-v".to_string(),
+            KeyAction::Single(Action::PluginCommand("LazyGlobal".to_string())),
+        );
+        editor.config.keys.normal.insert(
+            "Ctrl-t".to_string(),
+            KeyAction::Single(Action::PluginCommand("LazyContextual".to_string())),
+        );
+        editor.test_create_panel(
+            "tree",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Left,
+                width: 10,
+                ..plugin::PanelConfig::default()
+            },
+        );
+        assert!(editor.test_focus_panel("tree"));
+        editor.plugin_registry.add(
+            "lazy-panel-commands",
+            husk_root.join("Husk.toml").to_str().unwrap(),
+        );
+        let mut runtime = Runtime::new();
+        editor
+            .plugin_registry
+            .initialize(&mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(
+            editor.plugin_registry.statuses().get("lazy-panel-commands"),
+            Some(&plugin::PluginStatus::Pending)
+        );
+        let mut render_buffer = RenderBuffer::new(40, 10, &Style::default());
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            editor.plugin_registry.statuses().get("lazy-panel-commands"),
+            Some(&plugin::PluginStatus::Active)
+        );
+        assert_eq!(collect_print_requests(), ["panel fallback"]);
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(collect_print_requests(), ["global command"]);
     }
 
     #[test]

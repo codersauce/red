@@ -290,24 +290,7 @@ impl PluginRegistry {
 
     /// Executes a plugin command and quarantines its owner on callback failure.
     pub async fn execute(&mut self, runtime: &mut Runtime, command: &str) -> anyhow::Result<()> {
-        if runtime.command_plugin(command).is_none() {
-            let candidate = self
-                .plugins
-                .iter()
-                .find(|(name, _)| {
-                    matches!(self.statuses.get(name), Some(PluginStatus::Pending))
-                        && self.metadata.get(name).is_some_and(|metadata| {
-                            metadata
-                                .activation_events
-                                .iter()
-                                .any(|event| event == &format!("onCommand:{command}"))
-                        })
-                })
-                .cloned();
-            if let Some((name, path)) = candidate {
-                self.activate_one(runtime, &name, &path).await;
-            }
-        }
+        self.ensure_command_registered(runtime, command).await;
         let owner = runtime.command_plugin(command);
         if let Err(error) = runtime.execute_command(command).await {
             crate::log!("Plugin command `{command}` failed: {error:?}");
@@ -322,6 +305,35 @@ impl PluginRegistry {
             }
         }
         Ok(())
+    }
+
+    /// Activates the pending plugin that declares `command`, if any.
+    pub(crate) async fn ensure_command_registered(&mut self, runtime: &mut Runtime, command: &str) {
+        if runtime.command_plugin(command).is_some() {
+            return;
+        }
+        if let Some((name, path)) = self.pending_command_plugin(command) {
+            self.activate_one(runtime, &name, &path).await;
+        }
+    }
+
+    pub(crate) fn has_pending_command(&self, command: &str) -> bool {
+        self.pending_command_plugin(command).is_some()
+    }
+
+    fn pending_command_plugin(&self, command: &str) -> Option<(String, String)> {
+        self.plugins
+            .iter()
+            .find(|(name, _)| {
+                matches!(self.statuses.get(name), Some(PluginStatus::Pending))
+                    && self.metadata.get(name).is_some_and(|metadata| {
+                        metadata
+                            .activation_events
+                            .iter()
+                            .any(|event| event == &format!("onCommand:{command}"))
+                    })
+            })
+            .cloned()
     }
 
     /// Broadcasts an event while isolating and quarantining per-plugin failures.
