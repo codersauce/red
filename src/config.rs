@@ -11,13 +11,13 @@
 //! the editor has one acknowledgement and display path.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt, fs, io,
     ops::Range,
     path::{Path, PathBuf},
 };
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
 
 use crate::assets;
@@ -118,12 +118,53 @@ pub struct LoadedConfig {
     pub recovery: ConfigRecovery,
     source_path: PathBuf,
     source_text: String,
+    override_fragments: Vec<String>,
 }
 
 impl LoadedConfig {
     /// Returns whether loading required no fallback and produced no diagnostics.
     pub fn is_clean(&self) -> bool {
         self.recovery == ConfigRecovery::Clean && self.diagnostics.is_empty()
+    }
+
+    /// Returns the user configuration file whose contents produced this snapshot.
+    #[must_use]
+    pub fn source_path(&self) -> &Path {
+        &self.source_path
+    }
+
+    /// Returns legacy server definitions explicitly supplied by the user or CLI.
+    #[must_use]
+    pub fn explicit_language_server_names(&self) -> HashSet<String> {
+        self.explicit_names_at_path("lsp", "servers")
+            .into_iter()
+            .filter(|name| self.config.lsp.servers.contains_key(name))
+            .collect()
+    }
+
+    /// Returns legacy comment templates explicitly supplied by the user or CLI.
+    #[must_use]
+    pub fn explicit_comment_language_names(&self) -> HashSet<String> {
+        self.explicit_names_at_path("commenting", "languages")
+    }
+
+    fn explicit_names_at_path(&self, section: &str, entries: &str) -> HashSet<String> {
+        let mut names = HashSet::new();
+        for source in std::iter::once(self.source_text.as_str())
+            .chain(self.override_fragments.iter().map(String::as_str))
+        {
+            let Ok(value) = source.parse::<toml::Value>() else {
+                continue;
+            };
+            if let Some(table) = value
+                .get(section)
+                .and_then(|section| section.get(entries))
+                .and_then(toml::Value::as_table)
+            {
+                names.extend(table.keys().cloned());
+            }
+        }
+        names
     }
 
     /// Adds a post-load validation problem using the original user source.
@@ -212,6 +253,9 @@ pub struct Config {
     /// Language-server routing and behavior.
     #[serde(default)]
     pub lsp: LspConfig,
+    /// User-defined syntax, grammar, formatting, and language-server definitions.
+    #[serde(default)]
+    pub languages: HashMap<String, LanguageConfig>,
     /// Language-specific templates used by Vim-style line commenting.
     #[serde(default)]
     pub commenting: CommentingConfig,
@@ -585,6 +629,105 @@ pub struct LspConfig {
     pub servers: HashMap<String, LanguageServerConfig>,
 }
 
+/// One configurable language shared by highlighting, editing, and LSP routing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LanguageConfig {
+    /// Case-insensitive file extensions, with or without leading dots.
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    /// Case-sensitive exact file names, such as `Dockerfile` or `Makefile`.
+    #[serde(default)]
+    pub filenames: Vec<String>,
+    /// Additional names accepted by syntax selection and injected fenced blocks.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    /// Vim-style line-comment template containing a single `%s` placeholder.
+    #[serde(default)]
+    pub comment: Option<String>,
+    /// Preferred indentation width for files recognized as this language.
+    #[serde(default)]
+    pub indent_width: Option<usize>,
+    /// Bundled or explicitly trusted native Tree-sitter grammar.
+    #[serde(default)]
+    pub grammar: Option<LanguageGrammarConfig>,
+    /// Language-server launch and settings associated with this language.
+    #[serde(default)]
+    pub lsp: Option<LanguageLspConfig>,
+}
+
+/// Source, highlighting queries, and platform artifacts for one grammar.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LanguageGrammarConfig {
+    /// Existing bundled grammar to reuse rather than opening native code.
+    #[serde(default)]
+    pub builtin: Option<String>,
+    /// Shared-library path; relative package paths remain inside their package.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    /// Exported grammar symbol; defaults to `tree_sitter_<language>`.
+    #[serde(default)]
+    pub symbol: Option<String>,
+    /// Ordered paths to Tree-sitter highlight query files.
+    #[serde(default)]
+    pub highlights: Vec<PathBuf>,
+    /// Optional Tree-sitter injection query file.
+    #[serde(default)]
+    pub injections: Option<PathBuf>,
+    /// Explicit consent to loading this exact configuration-owned native grammar.
+    #[serde(default)]
+    pub trusted: bool,
+    /// Package-bundled or downloadable native artifacts by Rust target triple.
+    #[serde(default)]
+    pub targets: BTreeMap<String, LanguageGrammarArtifact>,
+}
+
+/// One bundled or SHA-256-verified downloadable platform grammar.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LanguageGrammarArtifact {
+    /// Package-relative bundled grammar shared library.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    /// GitHub HTTPS release artifact URL.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Expected lowercase or uppercase SHA-256 artifact digest.
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
+/// Language-local launch and dynamic `workspace/configuration` settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LanguageLspConfig {
+    /// Existing named server to reuse instead of declaring a new executable.
+    #[serde(default)]
+    pub server: Option<String>,
+    /// Language-server executable launched directly, without a shell.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Command-line arguments supplied to the language server.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Workspace root markers searched from the document's parent directory.
+    #[serde(default)]
+    pub root_markers: Vec<String>,
+    /// Environment additions supplied only to the language-server process.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// JSON initialization options included in the LSP initialize request.
+    #[serde(default)]
+    pub initialization_options: Option<Value>,
+    /// JSON settings returned to server `workspace/configuration` requests.
+    #[serde(default)]
+    pub settings: Option<Value>,
+    /// Optional display name reported for the workspace folder.
+    #[serde(default)]
+    pub workspace_name: Option<String>,
+}
+
 impl Default for LspConfig {
     fn default() -> Self {
         Self {
@@ -610,6 +753,9 @@ pub struct LanguageServerConfig {
     /// Legacy single-document-selector extensions.
     #[serde(default)]
     pub file_extensions: Vec<String>,
+    /// Legacy single-document-selector exact file names.
+    #[serde(default)]
+    pub filenames: Vec<String>,
     /// Preferred set of document selectors sharing this server.
     #[serde(default)]
     pub documents: Vec<LanguageDocumentConfig>,
@@ -620,8 +766,15 @@ pub struct LanguageServerConfig {
     #[serde(default)]
     pub env: HashMap<String, String>,
     /// JSON passed as LSP initialization options.
-    #[serde(default, skip_serializing)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_toml_compatible_json"
+    )]
     pub initialization_options: Option<Value>,
+    /// JSON settings returned to server `workspace/configuration` requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<Value>,
     /// Optional display name reported for the workspace folder.
     pub workspace_name: Option<String>,
 }
@@ -635,6 +788,41 @@ pub struct LanguageDocumentConfig {
     /// File extensions, with or without leading dots.
     #[serde(default)]
     pub file_extensions: Vec<String>,
+    /// Case-sensitive exact file names routed independently of extensions.
+    #[serde(default)]
+    pub filenames: Vec<String>,
+}
+
+fn serialize_toml_compatible_json<S>(
+    value: &Option<Value>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut value = value.clone();
+    if let Some(value) = &mut value {
+        remove_json_nulls(value);
+    }
+    value.serialize(serializer)
+}
+
+fn remove_json_nulls(value: &mut Value) {
+    match value {
+        Value::Object(values) => {
+            values.retain(|_, value| !value.is_null());
+            for value in values.values_mut() {
+                remove_json_nulls(value);
+            }
+        }
+        Value::Array(values) => {
+            values.retain(|value| !value.is_null());
+            for value in values {
+                remove_json_nulls(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 impl LanguageServerConfig {
@@ -644,14 +832,106 @@ impl LanguageServerConfig {
             return self.documents.clone();
         }
 
-        if self.language_id.is_empty() || self.file_extensions.is_empty() {
+        if self.language_id.is_empty()
+            || (self.file_extensions.is_empty() && self.filenames.is_empty())
+        {
             return Vec::new();
         }
 
         vec![LanguageDocumentConfig {
             language_id: self.language_id.clone(),
             file_extensions: self.file_extensions.clone(),
+            filenames: self.filenames.clone(),
         }]
+    }
+}
+
+impl Config {
+    /// Materializes language-local comment templates and LSP document selectors.
+    pub fn apply_language_definitions(
+        &mut self,
+        explicit_servers: &HashSet<String>,
+        explicit_comment_languages: &HashSet<String>,
+    ) -> anyhow::Result<()> {
+        let mut languages = self.languages.iter().collect::<Vec<_>>();
+        languages.sort_unstable_by_key(|(id, _)| *id);
+        for (id, language) in languages {
+            if let Some(comment) = &language.comment {
+                anyhow::ensure!(
+                    comment.matches("%s").count() == 1,
+                    "language `{id}` comment must contain exactly one `%s` placeholder"
+                );
+                if !explicit_comment_languages.contains(id) {
+                    self.commenting
+                        .languages
+                        .insert(id.clone(), comment.clone());
+                }
+            }
+            if let Some(width) = language.indent_width {
+                anyhow::ensure!(width > 0, "language `{id}` indent_width must be positive");
+            }
+
+            let Some(lsp) = &language.lsp else {
+                continue;
+            };
+            let server_name = lsp.server.as_deref().unwrap_or(id);
+            anyhow::ensure!(
+                lsp.command.is_some() || self.lsp.servers.contains_key(server_name),
+                "language `{id}` references unknown language server `{server_name}`"
+            );
+            if let Some(command) = &lsp.command {
+                anyhow::ensure!(
+                    !command.trim().is_empty(),
+                    "language `{id}` LSP command is empty"
+                );
+                if !explicit_servers.contains(server_name) {
+                    self.lsp.servers.insert(
+                        server_name.to_string(),
+                        LanguageServerConfig {
+                            command: command.clone(),
+                            args: lsp.args.clone(),
+                            language_id: String::new(),
+                            file_extensions: Vec::new(),
+                            filenames: Vec::new(),
+                            documents: Vec::new(),
+                            root_markers: lsp.root_markers.clone(),
+                            env: lsp.env.clone(),
+                            initialization_options: lsp.initialization_options.clone(),
+                            settings: lsp.settings.clone(),
+                            workspace_name: lsp.workspace_name.clone(),
+                        },
+                    );
+                }
+            }
+            let server = self.lsp.servers.get_mut(server_name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "language `{id}` language server `{server_name}` was not configured"
+                )
+            })?;
+            if server.documents.is_empty() {
+                server.documents = server.documents();
+            }
+            let selector = LanguageDocumentConfig {
+                language_id: id.clone(),
+                file_extensions: language.extensions.clone(),
+                filenames: language.filenames.clone(),
+            };
+            if let Some(existing) = server
+                .documents
+                .iter_mut()
+                .find(|document| document.language_id == *id)
+            {
+                existing.file_extensions.extend(selector.file_extensions);
+                existing.file_extensions.sort_unstable();
+                existing.file_extensions.dedup();
+                existing.filenames.extend(selector.filenames);
+                existing.filenames.sort_unstable();
+                existing.filenames.dedup();
+            } else {
+                server.documents.push(selector);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -665,10 +945,12 @@ pub fn default_language_servers() -> HashMap<String, LanguageServerConfig> {
                 args: vec!["-v".to_string()],
                 language_id: "rust".to_string(),
                 file_extensions: vec!["rs".to_string()],
+                filenames: Vec::new(),
                 documents: Vec::new(),
                 root_markers: vec!["Cargo.toml".to_string(), ".git".to_string()],
                 env: HashMap::new(),
                 initialization_options: Some(rust_analyzer_initialization_options()),
+                settings: None,
                 workspace_name: Some("red".to_string()),
             },
         ),
@@ -681,6 +963,7 @@ pub fn default_language_servers() -> HashMap<String, LanguageServerConfig> {
                 args: vec!["husk".to_string(), "lsp".to_string(), "--stdio".to_string()],
                 language_id: String::new(),
                 file_extensions: Vec::new(),
+                filenames: Vec::new(),
                 documents: vec![document("husk", &["hk", "husk"])],
                 root_markers: vec!["Husk.toml".to_string(), ".git".to_string()],
                 env: HashMap::new(),
@@ -688,6 +971,7 @@ pub fn default_language_servers() -> HashMap<String, LanguageServerConfig> {
                     "looseSemanticProfile": "legacyJavaScript",
                     "declarations": [crate::plugin::husk_lsp_declarations()]
                 })),
+                settings: None,
                 workspace_name: Some("husk".to_string()),
             },
         ),
@@ -788,6 +1072,7 @@ fn server(
         args: args.iter().map(|arg| arg.to_string()).collect(),
         language_id: String::new(),
         file_extensions: Vec::new(),
+        filenames: Vec::new(),
         documents: documents.to_vec(),
         root_markers: root_markers
             .iter()
@@ -795,6 +1080,7 @@ fn server(
             .collect(),
         env: HashMap::new(),
         initialization_options: None,
+        settings: None,
         workspace_name: None,
     }
 }
@@ -806,6 +1092,7 @@ fn document(language_id: &str, file_extensions: &[&str]) -> LanguageDocumentConf
             .iter()
             .map(|extension| extension.to_string())
             .collect(),
+        filenames: Vec::new(),
     }
 }
 
@@ -968,6 +1255,7 @@ impl Config {
                     format!("could not read the user configuration: {error}"),
                 )?;
                 apply_strict_overrides(&mut loaded.config, overrides)?;
+                loaded.override_fragments = overrides.to_vec();
                 Ok(loaded)
             }
         }
@@ -1007,6 +1295,7 @@ impl Config {
                         loaded.diagnostics[0].column = Some(column);
                     }
                     apply_strict_overrides(&mut loaded.config, overrides)?;
+                    loaded.override_fragments = overrides.to_vec();
                     return Ok(loaded);
                 }
             };
@@ -1091,6 +1380,7 @@ impl Config {
             diagnostics,
             source_path: path.to_path_buf(),
             source_text: contents.to_string(),
+            override_fragments: overrides.to_vec(),
         })
     }
 
@@ -1183,6 +1473,7 @@ fn safe_loaded_config(path: &Path, code: &str, message: String) -> anyhow::Resul
     config.agent = AgentConfig::default();
     config.lsp.enabled = false;
     config.lsp.servers.clear();
+    config.languages.clear();
     Ok(LoadedConfig {
         config,
         diagnostics: vec![ConfigDiagnostic {
@@ -1199,6 +1490,7 @@ fn safe_loaded_config(path: &Path, code: &str, message: String) -> anyhow::Resul
         recovery: ConfigRecovery::WholeFileFallback,
         source_path: path.to_path_buf(),
         source_text: String::new(),
+        override_fragments: Vec::new(),
     })
 }
 
@@ -1226,6 +1518,7 @@ fn known_top_level_field(field: &str) -> bool {
             | "key_hints"
             | "clipboard"
             | "lsp"
+            | "languages"
             | "commenting"
             | "matchit"
             | "disable_ai"
@@ -1278,7 +1571,8 @@ fn apply_user_value(
 
     let atomic_dynamic_entry = matches!(
         path,
-        [first, _] if first == "plugins" || first == "plugin_permissions"
+        [first, _]
+            if first == "plugins" || first == "plugin_permissions" || first == "languages"
     ) || matches!(path, [first, second, _] if first == "lsp" && second == "servers")
         || matches!(path, [first, second, _] if first == "matchit" && second == "languages");
     let agent_unit = path.first().is_some_and(|part| part == "agent");
@@ -1320,6 +1614,8 @@ fn apply_user_value(
             } else if matches!(path, [first, second, _] if first == "lsp" && second == "servers") {
                 disabled_servers.insert(path[2].clone());
                 "disabled the affected language server"
+            } else if matches!(path, [first, _] if first == "languages") {
+                "ignored the affected language definition"
             } else if path.first().is_some_and(|part| part == "agent") {
                 *disable_agent = true;
                 "disabled agent support"
@@ -1379,15 +1675,44 @@ fn known_schema_path(path: &[String]) -> bool {
                 | "args"
                 | "language_id"
                 | "file_extensions"
+                | "filenames"
                 | "documents"
                 | "root_markers"
                 | "env"
                 | "initialization_options"
+                | "settings"
                 | "workspace_name"
         ),
-        ["lsp", "servers", _, "env", _] | ["lsp", "servers", _, "initialization_options", ..] => {
-            true
+        ["lsp", "servers", _, "env", _]
+        | ["lsp", "servers", _, "initialization_options", ..]
+        | ["lsp", "servers", _, "settings", ..] => true,
+        ["languages", _] => true,
+        ["languages", _, field] => matches!(
+            *field,
+            "extensions" | "filenames" | "aliases" | "comment" | "indent_width" | "grammar" | "lsp"
+        ),
+        ["languages", _, "grammar", field] => matches!(
+            *field,
+            "builtin" | "path" | "symbol" | "highlights" | "injections" | "trusted" | "targets"
+        ),
+        ["languages", _, "grammar", "targets", _] => true,
+        ["languages", _, "grammar", "targets", _, field] => {
+            matches!(*field, "path" | "url" | "sha256")
         }
+        ["languages", _, "lsp", field] => matches!(
+            *field,
+            "server"
+                | "command"
+                | "args"
+                | "root_markers"
+                | "env"
+                | "initialization_options"
+                | "settings"
+                | "workspace_name"
+        ),
+        ["languages", _, "lsp", "env", _]
+        | ["languages", _, "lsp", "initialization_options", ..]
+        | ["languages", _, "lsp", "settings", ..] => true,
         ["commenting", "languages"] | ["commenting", "languages", _] => true,
         ["matchit", field] => matches!(*field, "enabled" | "pairs" | "languages"),
         ["matchit", "languages", _] | ["matchit", "languages", _, "groups"] => true,
@@ -3250,12 +3575,225 @@ file_extensions = ["js"]
                 LanguageDocumentConfig {
                     language_id: "typescript".to_string(),
                     file_extensions: vec!["ts".to_string()],
+                    filenames: Vec::new(),
                 },
                 LanguageDocumentConfig {
                     language_id: "javascript".to_string(),
                     file_extensions: vec!["js".to_string()],
+                    filenames: Vec::new(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn unified_language_configuration_supports_filenames_aliases_grammar_and_lsp_settings() {
+        let loaded = Config::load_user_toml(
+            r##"
+[languages.buildspec]
+extensions = ["build"]
+filenames = ["Buildfile"]
+aliases = ["build-script"]
+comment = "# %s"
+indent_width = 2
+
+[languages.buildspec.grammar]
+builtin = "rust"
+
+[languages.buildspec.lsp]
+command = "build-language-server"
+args = ["--stdio"]
+root_markers = ["Buildfile"]
+
+[languages.buildspec.lsp.settings.build]
+validate = true
+"##,
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+        let definition = loaded.config.languages.get("buildspec").unwrap();
+
+        assert_eq!(definition.extensions, ["build"]);
+        assert_eq!(definition.filenames, ["Buildfile"]);
+        assert_eq!(definition.aliases, ["build-script"]);
+        assert_eq!(definition.comment.as_deref(), Some("# %s"));
+        assert_eq!(definition.indent_width, Some(2));
+        assert_eq!(
+            definition
+                .grammar
+                .as_ref()
+                .and_then(|grammar| grammar.builtin.as_deref()),
+            Some("rust")
+        );
+        assert_eq!(
+            definition
+                .lsp
+                .as_ref()
+                .and_then(|lsp| lsp.settings.as_ref()),
+            Some(&json!({ "build": { "validate": true } }))
+        );
+    }
+
+    #[test]
+    fn invalid_language_definition_does_not_quarantine_other_languages() {
+        let loaded = Config::load_user_toml(
+            r#"
+[languages.valid]
+extensions = ["ok"]
+
+[languages.invalid]
+indent_width = "not a number"
+"#,
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+
+        assert!(loaded.config.languages.contains_key("valid"));
+        assert!(!loaded.config.languages.contains_key("invalid"));
+        assert!(loaded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.path == "languages.invalid"));
+    }
+
+    #[test]
+    fn language_local_lsp_and_commenting_preserve_explicit_legacy_overrides() {
+        let mut loaded = Config::load_user_toml(
+            r##"
+[commenting.languages]
+custom = "// %s"
+
+[lsp.servers.custom]
+command = "explicit-server"
+language_id = "custom"
+file_extensions = ["old"]
+
+[languages.custom]
+extensions = ["new"]
+filenames = ["Customfile"]
+comment = "# %s"
+
+[languages.custom.lsp]
+command = "generated-server"
+"##,
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+        let explicit_servers = loaded.explicit_language_server_names();
+        let explicit_comments = loaded.explicit_comment_language_names();
+        loaded
+            .config
+            .apply_language_definitions(&explicit_servers, &explicit_comments)
+            .unwrap();
+
+        assert_eq!(loaded.config.commenting.languages["custom"], "// %s");
+        let server = loaded.config.lsp.servers.get("custom").unwrap();
+        assert_eq!(server.command, "explicit-server");
+        assert_eq!(server.documents().len(), 1);
+        assert_eq!(server.documents()[0].file_extensions, ["new", "old"]);
+        assert_eq!(server.documents()[0].filenames, ["Customfile"]);
+    }
+
+    #[test]
+    fn language_local_lsp_recovers_from_a_quarantined_explicit_server() {
+        let mut loaded = Config::load_user_toml(
+            r#"
+[lsp.servers.custom]
+command = ["invalid"]
+
+[languages.custom]
+extensions = ["custom"]
+
+[languages.custom.lsp]
+command = "generated-server"
+"#,
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+
+        assert!(!loaded.config.lsp.servers.contains_key("custom"));
+        let explicit_servers = loaded.explicit_language_server_names();
+        let explicit_comments = loaded.explicit_comment_language_names();
+        assert!(!explicit_servers.contains("custom"));
+        loaded
+            .config
+            .apply_language_definitions(&explicit_servers, &explicit_comments)
+            .unwrap();
+
+        assert_eq!(
+            loaded.config.lsp.servers["custom"].command,
+            "generated-server"
+        );
+        assert!(loaded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.path == r#"lsp.servers["custom"]"#));
+    }
+
+    #[test]
+    fn language_local_settings_preserve_explicit_command_line_overrides() {
+        let mut loaded = Config::load_user_toml(
+            r##"
+[languages.custom]
+extensions = ["new"]
+comment = "# %s"
+
+[languages.custom.lsp]
+command = "generated-server"
+"##,
+            Path::new("/tmp/config.toml"),
+            &[
+                r#"lsp.servers.custom = { command = "override-server", language_id = "custom", file_extensions = ["old"] }"#.to_string(),
+                r#"commenting.languages.custom = "// %s""#.to_string(),
+            ],
+        )
+        .unwrap();
+        let explicit_servers = loaded.explicit_language_server_names();
+        let explicit_comments = loaded.explicit_comment_language_names();
+        loaded
+            .config
+            .apply_language_definitions(&explicit_servers, &explicit_comments)
+            .unwrap();
+
+        assert_eq!(loaded.config.commenting.languages["custom"], "// %s");
+        let server = loaded.config.lsp.servers.get("custom").unwrap();
+        assert_eq!(server.command, "override-server");
+        assert_eq!(server.documents()[0].file_extensions, ["new", "old"]);
+    }
+
+    #[test]
+    fn lsp_initialization_options_and_settings_survive_configuration_round_trips() {
+        let config = Config::from_user_toml_with_overrides(
+            r#"
+[lsp.servers.custom]
+command = "custom-lsp"
+language_id = "custom"
+file_extensions = ["custom"]
+
+[lsp.servers.custom.initialization_options]
+mode = "strict"
+
+[lsp.servers.custom.settings.custom]
+validation = true
+"#,
+            &[],
+        )
+        .unwrap();
+        let serialized = toml::to_string(&config).unwrap();
+        let round_trip: Config = toml::from_str(&serialized).unwrap();
+        let server = round_trip.lsp.servers.get("custom").unwrap();
+
+        assert_eq!(
+            server.initialization_options,
+            Some(json!({ "mode": "strict" }))
+        );
+        assert_eq!(
+            server.settings,
+            Some(json!({ "custom": { "validation": true } }))
         );
     }
 }

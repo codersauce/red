@@ -3,6 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use red::config::LspConfig;
 use red::lsp::{
     Diagnostic, InboundMessage, LspClient, LspError, Range, ServerCapabilities, ServerRequest,
 };
@@ -67,6 +68,7 @@ pub enum LspEvent {
 #[derive(Clone, Default)]
 pub struct RecordingLsp {
     events: Arc<Mutex<Vec<LspEvent>>>,
+    reconfigurations: Arc<Mutex<Vec<LspConfig>>>,
     workspace_root: Option<PathBuf>,
     fail_next_did_open: bool,
     fail_next_did_change: bool,
@@ -76,6 +78,7 @@ impl RecordingLsp {
     pub fn with_workspace_root(root: &Path) -> Self {
         Self {
             events: Arc::default(),
+            reconfigurations: Arc::default(),
             workspace_root: Some(root.to_path_buf()),
             fail_next_did_open: false,
             fail_next_did_change: false,
@@ -83,6 +86,10 @@ impl RecordingLsp {
     }
     pub fn events(&self) -> Arc<Mutex<Vec<LspEvent>>> {
         Arc::clone(&self.events)
+    }
+
+    pub fn reconfigurations(&self) -> Arc<Mutex<Vec<LspConfig>>> {
+        Arc::clone(&self.reconfigurations)
     }
 
     pub fn failing_next_did_open() -> Self {
@@ -271,6 +278,11 @@ impl LspClient for MockLsp {
 
 #[async_trait::async_trait]
 impl LspClient for RecordingLsp {
+    async fn reconfigure(&mut self, config: LspConfig) -> Result<Vec<String>, LspError> {
+        self.reconfigurations.lock().unwrap().push(config);
+        Ok(Vec::new())
+    }
+
     async fn initialize(&mut self) -> Result<(), LspError> {
         Ok(())
     }

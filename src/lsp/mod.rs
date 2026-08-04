@@ -307,6 +307,14 @@ pub fn next_id() -> usize {
 /// Returned integers are request IDs whose results arrive through
 /// [`Self::recv_response`].
 pub trait LspClient: std::any::Any + Send {
+    /// Rebuilds document routing while preserving unaffected active server clients.
+    async fn reconfigure(
+        &mut self,
+        _config: crate::config::LspConfig,
+    ) -> Result<Vec<String>, LspError> {
+        Ok(Vec::new())
+    }
+
     /// Performs the LSP initialize/initialized handshake.
     async fn initialize(&mut self) -> Result<(), LspError>;
     /// Opens a document and establishes its initial version.

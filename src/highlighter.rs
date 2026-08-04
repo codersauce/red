@@ -5,23 +5,294 @@
 //! against the current theme. Parsing is scoped to the text supplied by the caller;
 //! viewport caching and conversion from slice-relative spans belong to the editor.
 
-use std::{collections::HashMap, ops::Range, path::Path};
+use std::{
+    collections::HashMap,
+    fs,
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
+use anyhow::Context as _;
 use husk_lexer::{Keyword, Lexer, TokenKind, Trivia};
+use libloading::Library;
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
+use tree_sitter_language::LanguageFn;
 
 use crate::{
+    config::{LanguageConfig, LanguageGrammarConfig},
     editor::StyleInfo,
+    language::GrammarTrustStore,
     theme::{Style, Theme},
+    utils::expand_user_path,
 };
 
 #[derive(Clone, Copy)]
-struct LanguageDefinition {
+struct BundledLanguageDefinition {
     id: &'static str,
     extensions: &'static [&'static str],
     language: fn() -> Language,
     highlight_queries: &'static [&'static str],
     injection_query: Option<&'static str>,
+}
+
+#[derive(Clone)]
+enum GrammarSource {
+    Bundled(fn() -> Language),
+    Dynamic(Arc<DynamicGrammar>),
+}
+
+struct DynamicGrammar {
+    language: Language,
+    // The grammar and every parser/query using it must be dropped before its library.
+    _library: Arc<Library>,
+}
+
+#[derive(Clone)]
+struct RuntimeLanguageDefinition {
+    id: String,
+    extensions: Vec<String>,
+    filenames: Vec<String>,
+    aliases: Vec<String>,
+    grammar: Option<GrammarSource>,
+    highlight_queries: Vec<String>,
+    injection_query: Option<String>,
+}
+
+/// Immutable language routing and grammar definitions shared by all render surfaces.
+#[derive(Clone)]
+pub struct LanguageRegistry {
+    languages: HashMap<String, RuntimeLanguageDefinition>,
+    extensions: HashMap<String, String>,
+    filenames: HashMap<String, String>,
+    aliases: HashMap<String, String>,
+}
+
+impl LanguageRegistry {
+    /// Builds Red's complete set of bundled language definitions.
+    #[must_use]
+    pub fn bundled() -> Self {
+        let mut registry = Self {
+            languages: HashMap::new(),
+            extensions: HashMap::new(),
+            filenames: HashMap::new(),
+            aliases: HashMap::new(),
+        };
+        for definition in language_definitions() {
+            registry.insert(RuntimeLanguageDefinition {
+                id: definition.id.to_string(),
+                extensions: definition
+                    .extensions
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                filenames: Vec::new(),
+                aliases: LANGUAGE_NAMES
+                    .iter()
+                    .filter(|(_, language)| *language == definition.id)
+                    .map(|(alias, _)| (*alias).to_string())
+                    .collect(),
+                grammar: Some(GrammarSource::Bundled(definition.language)),
+                highlight_queries: definition
+                    .highlight_queries
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                injection_query: definition.injection_query.map(ToString::to_string),
+            });
+        }
+        registry
+    }
+
+    /// Validates and prepares a complete language snapshot before exposing it to rendering.
+    pub fn from_config(
+        configured: &HashMap<String, LanguageConfig>,
+        config_dir: &Path,
+    ) -> anyhow::Result<Self> {
+        let mut registry = Self::bundled();
+        let trust = GrammarTrustStore::new(config_dir);
+        let mut languages = configured.iter().collect::<Vec<_>>();
+        languages.sort_unstable_by_key(|(language, _)| *language);
+        for (id, config) in languages {
+            anyhow::ensure!(
+                !id.trim().is_empty()
+                    && id.bytes().all(|byte| byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'-' | b'_')),
+                "invalid language identifier `{id}`"
+            );
+
+            let inherited = registry.languages.get(id).cloned();
+            let mut definition = inherited.unwrap_or_else(|| RuntimeLanguageDefinition {
+                id: id.clone(),
+                extensions: Vec::new(),
+                filenames: Vec::new(),
+                aliases: Vec::new(),
+                grammar: None,
+                highlight_queries: Vec::new(),
+                injection_query: None,
+            });
+            if !config.extensions.is_empty() {
+                definition.extensions = config
+                    .extensions
+                    .iter()
+                    .map(|extension| extension.trim_start_matches('.').to_ascii_lowercase())
+                    .collect();
+            }
+            if !config.filenames.is_empty() {
+                definition.filenames.clone_from(&config.filenames);
+            }
+            definition.aliases.extend(config.aliases.iter().cloned());
+
+            if let Some(grammar) = &config.grammar {
+                if let Some(builtin) = &grammar.builtin {
+                    let bundled = registry.languages.get(builtin).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "language `{id}` refers to unknown bundled grammar `{builtin}`"
+                        )
+                    })?;
+                    definition.grammar.clone_from(&bundled.grammar);
+                    definition
+                        .highlight_queries
+                        .clone_from(&bundled.highlight_queries);
+                    definition
+                        .injection_query
+                        .clone_from(&bundled.injection_query);
+                }
+                if let Some(path) = grammar_path(grammar, config_dir)? {
+                    let symbol = grammar
+                        .symbol
+                        .clone()
+                        .unwrap_or_else(|| format!("tree_sitter_{}", id.replace('-', "_")));
+                    definition.grammar = Some(load_dynamic_grammar(
+                        &trust,
+                        &path,
+                        &symbol,
+                        grammar.trusted,
+                    )?);
+                }
+                if !grammar.highlights.is_empty() {
+                    definition.highlight_queries = grammar
+                        .highlights
+                        .iter()
+                        .map(|path| read_query(path, config_dir, "highlight"))
+                        .collect::<anyhow::Result<_>>()?;
+                }
+                if let Some(path) = &grammar.injections {
+                    definition.injection_query = Some(read_query(path, config_dir, "injection")?);
+                }
+            }
+
+            if let Some(source) = &definition.grammar {
+                let language = grammar_language(source);
+                let mut parser = Parser::new();
+                parser.set_language(&language).with_context(|| {
+                    format!("language `{id}` uses an incompatible Tree-sitter grammar")
+                })?;
+                if !definition.highlight_queries.is_empty() {
+                    Query::new(&language, &definition.highlight_queries.join("\n")).with_context(
+                        || format!("language `{id}` has an invalid highlight query"),
+                    )?;
+                }
+                if let Some(query) = &definition.injection_query {
+                    Query::new(&language, query).with_context(|| {
+                        format!("language `{id}` has an invalid injection query")
+                    })?;
+                }
+            }
+            registry.insert(definition);
+        }
+        Ok(registry)
+    }
+
+    fn insert(&mut self, definition: RuntimeLanguageDefinition) {
+        let id = definition.id.clone();
+        if let Some(previous) = self.languages.remove(&id) {
+            self.extensions
+                .retain(|_, language| language != &previous.id);
+            self.filenames
+                .retain(|_, language| language != &previous.id);
+            self.aliases.retain(|_, language| language != &previous.id);
+        }
+        for extension in &definition.extensions {
+            self.extensions.insert(extension.clone(), id.clone());
+        }
+        for filename in &definition.filenames {
+            self.filenames.insert(filename.clone(), id.clone());
+        }
+        self.aliases.insert(id.clone(), id.clone());
+        for alias in &definition.aliases {
+            self.aliases.insert(alias.to_ascii_lowercase(), id.clone());
+        }
+        self.languages.insert(id, definition);
+    }
+}
+
+fn grammar_path(
+    grammar: &LanguageGrammarConfig,
+    config_dir: &Path,
+) -> anyhow::Result<Option<PathBuf>> {
+    if let Some(path) = &grammar.path {
+        return resolve_language_path(path, config_dir).map(Some);
+    }
+    let Some(artifact) = grammar.targets.get(crate::language::host_target()) else {
+        return Ok(None);
+    };
+    artifact
+        .path
+        .as_ref()
+        .map(|path| resolve_language_path(path, config_dir))
+        .transpose()
+}
+
+fn resolve_language_path(path: &Path, config_dir: &Path) -> anyhow::Result<PathBuf> {
+    let path = expand_user_path(&path.to_string_lossy())?;
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        config_dir.join(path)
+    })
+}
+
+fn read_query(path: &Path, config_dir: &Path, kind: &str) -> anyhow::Result<String> {
+    let path = resolve_language_path(path, config_dir)?;
+    fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {kind} query {}", path.display()))
+}
+
+fn load_dynamic_grammar(
+    trust: &GrammarTrustStore,
+    path: &Path,
+    symbol: &str,
+    explicitly_trusted: bool,
+) -> anyhow::Result<GrammarSource> {
+    let staged = trust.approved_grammar_path(path, explicitly_trusted)?;
+    // SAFETY: Native code is opened only after explicit path-and-digest approval.
+    // The immutable staged file prevents source replacement after that decision.
+    let library =
+        Arc::new(unsafe { Library::new(&staged) }.with_context(|| {
+            format!("failed to open trusted native grammar {}", staged.display())
+        })?);
+    // SAFETY: Tree-sitter grammar exports have this documented C ABI. The symbol is
+    // held only long enough to construct a Language; the Arc keeps its library loaded.
+    let function = unsafe {
+        *library
+            .get::<unsafe extern "C" fn() -> *const ()>(symbol.as_bytes())
+            .with_context(|| format!("native grammar does not export `{symbol}`"))?
+    };
+    // SAFETY: The approved symbol is a generated Tree-sitter grammar function.
+    let language = Language::new(unsafe { LanguageFn::from_raw(function) });
+    Ok(GrammarSource::Dynamic(Arc::new(DynamicGrammar {
+        language,
+        _library: library,
+    })))
+}
+
+fn grammar_language(source: &GrammarSource) -> Language {
+    match source {
+        GrammarSource::Bundled(language) => language(),
+        GrammarSource::Dynamic(grammar) => grammar.language.clone(),
+    }
 }
 
 struct LanguageHighlighter {
@@ -32,7 +303,7 @@ struct LanguageHighlighter {
 }
 
 struct Injection {
-    language_id: &'static str,
+    language_id: String,
     content_start: usize,
     content_end: usize,
 }
@@ -44,9 +315,8 @@ struct RawInjection {
 }
 
 pub struct Highlighter {
-    languages: HashMap<&'static str, LanguageDefinition>,
-    extensions: HashMap<&'static str, &'static str>,
-    highlighters: HashMap<&'static str, LanguageHighlighter>,
+    highlighters: HashMap<String, LanguageHighlighter>,
+    registry: Arc<LanguageRegistry>,
     theme: Theme,
     husk_styles: HuskStyles,
 }
@@ -123,31 +393,33 @@ const YAML_ADDITIONAL_HIGHLIGHTS_QUERY: &str = r#"
 
 impl Highlighter {
     pub fn new(theme: &Theme) -> anyhow::Result<Self> {
-        let languages = language_definitions()
-            .into_iter()
-            .map(|definition| (definition.id, definition))
-            .collect::<HashMap<_, _>>();
-        let extensions = languages
-            .values()
-            .flat_map(|definition| {
-                definition
-                    .extensions
-                    .iter()
-                    .map(|extension| (*extension, definition.id))
-            })
-            .collect::<HashMap<_, _>>();
+        Self::with_registry(theme, Arc::new(LanguageRegistry::bundled()))
+    }
 
+    /// Creates a highlighter sharing one immutable runtime language snapshot.
+    pub fn with_registry(theme: &Theme, registry: Arc<LanguageRegistry>) -> anyhow::Result<Self> {
         Ok(Self {
-            languages,
-            extensions,
             highlighters: HashMap::new(),
+            registry,
             theme: theme.clone(),
             husk_styles: HuskStyles::new(theme),
         })
     }
 
-    pub fn language_id_for_file(&self, file: Option<&str>) -> Option<&'static str> {
-        let extension = file_extension(file?)?;
+    /// Returns the immutable language snapshot used by this rendering surface.
+    #[must_use]
+    pub fn registry(&self) -> Arc<LanguageRegistry> {
+        Arc::clone(&self.registry)
+    }
+
+    pub fn language_id_for_file(&self, file: Option<&str>) -> Option<&str> {
+        let file = file?;
+        if let Some(filename) = Path::new(file).file_name().and_then(|name| name.to_str()) {
+            if let Some(language) = self.registry.filenames.get(filename) {
+                return Some(language.as_str());
+            }
+        }
+        let extension = file_extension(file)?;
         self.language_id_for_extension(&extension)
     }
 
@@ -159,41 +431,58 @@ impl Highlighter {
         matches!(language_id, Some("yaml"))
     }
 
-    pub fn language_id_for_extension(&self, extension: &str) -> Option<&'static str> {
+    pub fn language_id_for_extension(&self, extension: &str) -> Option<&str> {
         let extension = extension.trim_start_matches('.').to_ascii_lowercase();
-        self.extensions.get(extension.as_str()).copied()
+        self.registry
+            .extensions
+            .get(extension.as_str())
+            .map(String::as_str)
     }
 
-    pub fn language_id_for_name(&self, name: &str) -> Option<&'static str> {
-        language_id_for_name(name).or_else(|| self.language_id_for_extension(name))
+    pub fn language_id_for_name(&self, name: &str) -> Option<&str> {
+        let name = name.trim().to_ascii_lowercase();
+        let name = name.split_whitespace().next().unwrap_or_default();
+        self.registry
+            .aliases
+            .get(name)
+            .map(String::as_str)
+            .or_else(|| self.language_id_for_extension(name))
     }
 
     /// Returns the bundled canonical language identifiers in display order.
-    pub fn language_ids(&self) -> Vec<&'static str> {
-        let mut language_ids = self.languages.keys().copied().collect::<Vec<_>>();
+    pub fn language_ids(&self) -> Vec<&str> {
+        let mut language_ids = self
+            .registry
+            .languages
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         language_ids.sort_unstable();
         language_ids
     }
 
     /// Returns canonical language identifiers matching a name or extension prefix.
-    pub fn matching_language_ids(&self, prefix: &str) -> Vec<&'static str> {
+    pub fn matching_language_ids(&self, prefix: &str) -> Vec<&str> {
         let prefix = prefix.trim_start_matches('.').to_ascii_lowercase();
         let mut language_ids = self
+            .registry
             .languages
             .keys()
-            .copied()
+            .map(String::as_str)
             .filter(|language| language.starts_with(&prefix))
             .chain(
-                self.extensions
+                self.registry
+                    .extensions
                     .iter()
                     .filter(|(extension, _)| extension.starts_with(&prefix))
-                    .map(|(_, language)| *language),
+                    .map(|(_, language)| language.as_str()),
             )
             .chain(
-                LANGUAGE_NAMES
+                self.registry
+                    .aliases
                     .iter()
                     .filter(|(name, _)| name.starts_with(&prefix))
-                    .map(|(_, language)| *language),
+                    .map(|(_, language)| language.as_str()),
             )
             .collect::<Vec<_>>();
         language_ids.sort_unstable();
@@ -209,7 +498,8 @@ impl Highlighter {
         let Some(language_id) = self.language_id_for_file(file) else {
             return Ok(Vec::new());
         };
-        self.highlight(language_id, code)
+        let language_id = language_id.to_string();
+        self.highlight(&language_id, code)
     }
 
     pub fn highlight(&mut self, language_id: &str, code: &str) -> anyhow::Result<Vec<StyleInfo>> {
@@ -226,12 +516,18 @@ impl Highlighter {
             return Ok(highlight_husk(code, &self.husk_styles));
         }
 
-        let Some(definition) = self.languages.get(language_id).copied() else {
+        let Some(definition) = self.registry.languages.get(language_id).cloned() else {
             return Ok(Vec::new());
         };
+        let Some(grammar) = &definition.grammar else {
+            return Ok(Vec::new());
+        };
+        if definition.highlight_queries.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        if !self.highlighters.contains_key(definition.id) {
-            let language = (definition.language)();
+        if !self.highlighters.contains_key(&definition.id) {
+            let language = grammar_language(grammar);
             let mut parser = Parser::new();
             parser.set_language(&language)?;
             let highlight_query = definition.highlight_queries.join("\n");
@@ -243,10 +539,11 @@ impl Highlighter {
                 .collect();
             let injection_query = definition
                 .injection_query
+                .as_deref()
                 .map(|query| Query::new(&language, query))
                 .transpose()?;
             self.highlighters.insert(
-                definition.id,
+                definition.id.clone(),
                 LanguageHighlighter {
                     parser,
                     query,
@@ -260,7 +557,7 @@ impl Highlighter {
         let mut raw_injections = Vec::new();
 
         {
-            let Some(highlighter) = self.highlighters.get_mut(definition.id) else {
+            let Some(highlighter) = self.highlighters.get_mut(&definition.id) else {
                 return Ok(Vec::new());
             };
             let Some(tree) = highlighter.parser.parse(code, None) else {
@@ -310,7 +607,7 @@ impl Highlighter {
             .filter_map(|injection| {
                 let language_id = self.language_id_for_name(&injection.language_name)?;
                 Some(Injection {
-                    language_id,
+                    language_id: language_id.to_string(),
                     content_start: injection.content_start,
                     content_end: injection.content_end,
                 })
@@ -323,7 +620,7 @@ impl Highlighter {
                 continue;
             };
             let mut injected_colors =
-                self.highlight_with_depth(injection.language_id, injected_code, depth + 1)?;
+                self.highlight_with_depth(&injection.language_id, injected_code, depth + 1)?;
             for color in &mut injected_colors {
                 color.start += injection.content_start;
                 color.end += injection.content_start;
@@ -384,81 +681,71 @@ fn collect_injections(
     injections
 }
 
-fn language_id_for_name(name: &str) -> Option<&'static str> {
-    let name = name.trim().to_ascii_lowercase();
-    let name = name.split_whitespace().next().unwrap_or_default();
-
-    LANGUAGE_NAMES
-        .iter()
-        .find(|(candidate, _)| *candidate == name)
-        .map(|(_, language)| *language)
-}
-
 fn file_extension(file: &str) -> Option<String> {
     Path::new(file)
         .extension()
         .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
 }
 
-fn language_definitions() -> Vec<LanguageDefinition> {
+fn language_definitions() -> Vec<BundledLanguageDefinition> {
     vec![
-        LanguageDefinition {
+        BundledLanguageDefinition {
             id: "rust",
             extensions: &["rs"],
             language: || tree_sitter_rust::LANGUAGE.into(),
             highlight_queries: &[tree_sitter_rust::HIGHLIGHTS_QUERY],
             injection_query: None,
         },
-        LanguageDefinition {
+        BundledLanguageDefinition {
             id: "markdown",
             extensions: &["md", "markdown"],
             language: || tree_sitter_md::LANGUAGE.into(),
             highlight_queries: &[MARKDOWN_HIGHLIGHT_QUERY],
             injection_query: Some(MARKDOWN_INJECTION_QUERY),
         },
-        LanguageDefinition {
+        BundledLanguageDefinition {
             id: "javascript",
             extensions: &["js", "mjs", "cjs"],
             language: || tree_sitter_javascript::LANGUAGE.into(),
             highlight_queries: JAVASCRIPT_HIGHLIGHT_QUERIES,
             injection_query: None,
         },
-        LanguageDefinition {
+        BundledLanguageDefinition {
             id: "jsx",
             extensions: &["jsx"],
             language: || tree_sitter_javascript::LANGUAGE.into(),
             highlight_queries: JSX_HIGHLIGHT_QUERIES,
             injection_query: None,
         },
-        LanguageDefinition {
+        BundledLanguageDefinition {
             id: "typescript",
             extensions: &["ts"],
             language: || tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             highlight_queries: TYPESCRIPT_HIGHLIGHT_QUERIES,
             injection_query: None,
         },
-        LanguageDefinition {
+        BundledLanguageDefinition {
             id: "tsx",
             extensions: &["tsx"],
             language: || tree_sitter_typescript::LANGUAGE_TSX.into(),
             highlight_queries: TSX_HIGHLIGHT_QUERIES,
             injection_query: None,
         },
-        LanguageDefinition {
+        BundledLanguageDefinition {
             id: "json",
             extensions: &["json"],
             language: || tree_sitter_json::LANGUAGE.into(),
             highlight_queries: &[tree_sitter_json::HIGHLIGHTS_QUERY],
             injection_query: None,
         },
-        LanguageDefinition {
+        BundledLanguageDefinition {
             id: "toml",
             extensions: &["toml"],
             language: || tree_sitter_toml_ng::LANGUAGE.into(),
             highlight_queries: &[tree_sitter_toml_ng::HIGHLIGHTS_QUERY],
             injection_query: None,
         },
-        LanguageDefinition {
+        BundledLanguageDefinition {
             id: "yaml",
             extensions: &["yml", "yaml"],
             language: || tree_sitter_yaml::LANGUAGE.into(),
@@ -468,42 +755,42 @@ fn language_definitions() -> Vec<LanguageDefinition> {
             ],
             injection_query: None,
         },
-        LanguageDefinition {
+        BundledLanguageDefinition {
             id: "python",
             extensions: &["py", "pyw"],
             language: || tree_sitter_python::LANGUAGE.into(),
             highlight_queries: &[tree_sitter_python::HIGHLIGHTS_QUERY],
             injection_query: None,
         },
-        LanguageDefinition {
+        BundledLanguageDefinition {
             id: "bash",
             extensions: &["sh", "bash", "zsh"],
             language: || tree_sitter_bash::LANGUAGE.into(),
             highlight_queries: &[tree_sitter_bash::HIGHLIGHT_QUERY],
             injection_query: None,
         },
-        LanguageDefinition {
+        BundledLanguageDefinition {
             id: "fish",
             extensions: &["fish"],
             language: tree_sitter_fish::language,
             highlight_queries: &[tree_sitter_fish::HIGHLIGHTS_QUERY],
             injection_query: None,
         },
-        LanguageDefinition {
+        BundledLanguageDefinition {
             id: "powershell",
             extensions: &["ps1", "psm1", "psd1"],
             language: || tree_sitter_powershell::LANGUAGE.into(),
             highlight_queries: &[tree_sitter_powershell::HIGHLIGHTS_QUERY],
             injection_query: None,
         },
-        LanguageDefinition {
+        BundledLanguageDefinition {
             id: "lua",
             extensions: &["lua"],
             language: || tree_sitter_lua::LANGUAGE.into(),
             highlight_queries: &[tree_sitter_lua::HIGHLIGHTS_QUERY],
             injection_query: None,
         },
-        LanguageDefinition {
+        BundledLanguageDefinition {
             id: "husk",
             extensions: &["hk", "husk"],
             language: || tree_sitter_rust::LANGUAGE.into(),
@@ -907,6 +1194,97 @@ mod tests {
             Some("husk")
         );
         assert_eq!(highlighter.language_id_for_file(Some("LICENSE")), None);
+    }
+
+    #[test]
+    fn configurable_languages_share_bundled_grammars_aliases_and_exact_filenames() {
+        let directory = tempfile::tempdir().unwrap();
+        let languages = HashMap::from([(
+            "buildspec".to_string(),
+            LanguageConfig {
+                extensions: vec!["build".to_string()],
+                filenames: vec!["Buildfile".to_string()],
+                aliases: vec!["build-script".to_string()],
+                grammar: Some(LanguageGrammarConfig {
+                    builtin: Some("rust".to_string()),
+                    ..LanguageGrammarConfig::default()
+                }),
+                ..LanguageConfig::default()
+            },
+        )]);
+        let registry =
+            Arc::new(LanguageRegistry::from_config(&languages, directory.path()).unwrap());
+        let theme = theme_with_scopes(&["keyword", "function", "string"]);
+        let mut highlighter = Highlighter::with_registry(&theme, registry).unwrap();
+
+        assert_eq!(
+            highlighter.language_id_for_file(Some("project/Buildfile")),
+            Some("buildspec")
+        );
+        assert_eq!(
+            highlighter.language_id_for_file(Some("project/buildfile")),
+            None
+        );
+        assert_eq!(
+            highlighter.language_id_for_file(Some("project/example.BUILD")),
+            Some("buildspec")
+        );
+        assert_eq!(
+            highlighter.language_id_for_name("BUILD-SCRIPT"),
+            Some("buildspec")
+        );
+        assert!(!highlighter
+            .highlight_for_file(Some("Buildfile"), "fn main() {}")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn language_without_a_grammar_remains_available_without_highlighting() {
+        let directory = tempfile::tempdir().unwrap();
+        let languages = HashMap::from([(
+            "plain-custom".to_string(),
+            LanguageConfig {
+                filenames: vec!["Customfile".to_string()],
+                ..LanguageConfig::default()
+            },
+        )]);
+        let registry =
+            Arc::new(LanguageRegistry::from_config(&languages, directory.path()).unwrap());
+        let mut highlighter = Highlighter::with_registry(&Theme::default(), registry).unwrap();
+
+        assert_eq!(
+            highlighter.language_id_for_file(Some("Customfile")),
+            Some("plain-custom")
+        );
+        assert!(highlighter
+            .highlight_for_file(Some("Customfile"), "hello")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn unapproved_native_grammar_is_rejected_before_dynamic_loading() {
+        let directory = tempfile::tempdir().unwrap();
+        let grammar = directory.path().join("untrusted.so");
+        fs::write(&grammar, b"not a dynamic library").unwrap();
+        let languages = HashMap::from([(
+            "unsafe-example".to_string(),
+            LanguageConfig {
+                extensions: vec!["unsafe".to_string()],
+                grammar: Some(LanguageGrammarConfig {
+                    path: Some(grammar),
+                    ..LanguageGrammarConfig::default()
+                }),
+                ..LanguageConfig::default()
+            },
+        )]);
+
+        let error = match LanguageRegistry::from_config(&languages, directory.path()) {
+            Ok(_) => panic!("unapproved native grammar must not be loaded"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not approved"));
     }
 
     #[test]

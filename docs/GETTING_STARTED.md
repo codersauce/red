@@ -174,6 +174,7 @@ Enter Command mode with `:` or `;`.
 | `:close` / `:only` | Close the window or keep only the current window |
 | `:wrap` / `:nowrap` | Enable or disable wrapping |
 | `:syntax [language]` / `:syn [language]` / `:ft [language]` | Choose buffer-local syntax; use `auto` to reset or `off` to disable |
+| `:languages reload` | Reload custom language definitions, trusted grammars, and changed language servers |
 | `:join [count]` / `:join! [count]` | Join with normalized or preserved spacing |
 | `:commands` | Open the command palette |
 

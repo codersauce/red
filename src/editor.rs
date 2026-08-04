@@ -79,7 +79,7 @@ use crate::{
     comment::CommentSyntax,
     config::{Config, ConfigDiagnostic, ConfigDiagnosticSource, ConfigRecovery, KeyAction},
     dispatcher::Dispatcher,
-    highlighter::Highlighter,
+    highlighter::{Highlighter, LanguageRegistry},
     log,
     lsp::{
         apply_workspace_resource_operations, file_path as lsp_file_path, get_client_capabilities,
@@ -1444,6 +1444,7 @@ pub enum Action {
     OpenSyntaxPicker,
     SetSyntax(String),
     ConfigDiagnostics,
+    ReloadLanguages,
     ShowDialog,
     CloseDialog,
     ClearDiagnostics(String, Vec<usize>),
@@ -1651,7 +1652,7 @@ pub struct HighlightSpan {
 struct ViewportHighlightEntry {
     revision: u64,
     file: Option<String>,
-    language_id: Option<&'static str>,
+    language_id: Option<String>,
     /// First buffer line included in the parse.
     start_line: usize,
     /// Byte offset of each parsed line within the parsed text, plus a final
@@ -1850,6 +1851,9 @@ pub struct Editor {
     /// Recoverable configuration problems retained until explicitly acknowledged.
     config_diagnostics: Vec<ConfigDiagnostic>,
     config_diagnostics_acknowledged: bool,
+    /// Original configuration source and strict overrides reused by explicit language reloads.
+    language_config_path: PathBuf,
+    language_config_overrides: Vec<String>,
 
     /// Visual theme settings
     pub theme: Theme,
@@ -2864,6 +2868,116 @@ impl Editor {
         }
     }
 
+    /// Records the exact configuration inputs that explicit language reloads must reuse.
+    pub fn set_language_reload_source(&mut self, path: PathBuf, overrides: Vec<String>) {
+        self.language_config_path = path;
+        self.language_config_overrides = overrides;
+    }
+
+    /// Atomically replaces language definitions while retaining unrelated live LSP clients.
+    pub async fn reload_languages(&mut self) -> anyhow::Result<usize> {
+        let mut loaded =
+            Config::load_user_file(&self.language_config_path, &self.language_config_overrides)?;
+        anyhow::ensure!(
+            loaded.recovery != ConfigRecovery::WholeFileFallback,
+            "configuration is invalid; the previous languages remain active"
+        );
+        let config_dir = self
+            .language_config_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(Config::config_dir);
+        crate::language::finalize_language_configuration(&mut loaded, &config_dir)?;
+        if let Some(diagnostic) = loaded
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.path.starts_with("languages."))
+        {
+            anyhow::bail!(
+                "{}; the previous languages remain active",
+                diagnostic.message
+            );
+        }
+
+        let registry = Arc::new(LanguageRegistry::from_config(
+            &loaded.config.languages,
+            &config_dir,
+        )?);
+        let highlighter = Highlighter::with_registry(&self.theme, Arc::clone(&registry))?;
+        let indentation = Self::configured_indentation(&loaded.config);
+        let previous_routing = crate::lsp::LspManager::new(self.config.lsp.clone());
+        let updated_routing = crate::lsp::LspManager::new(loaded.config.lsp.clone());
+        let affected = self.lsp.reconfigure(loaded.config.lsp.clone()).await?;
+        let affected = affected.into_iter().collect::<HashSet<_>>();
+
+        let documents = self
+            .buffer_manager
+            .iter()
+            .filter_map(|buffer| {
+                let file = buffer.file.clone()?;
+                let uri = buffer.uri().ok().flatten()?;
+                Some((file, uri, buffer.contents()))
+            })
+            .collect::<Vec<_>>();
+        let mut reopened = Vec::new();
+        for (file, uri, contents) in &documents {
+            let gained_route = previous_routing.resolve_document(file).is_none()
+                && updated_routing.resolve_document(file).is_some();
+            let route_changed = affected.contains(file) || gained_route;
+            if route_changed || !self.lsp_coordinator.is_document_opened(uri) {
+                if let Err(error) = self.lsp.did_open(file, contents).await {
+                    self.lsp
+                        .reconfigure(self.config.lsp.clone())
+                        .await
+                        .map_err(|rollback_error| {
+                            anyhow::anyhow!(
+                                "failed to reopen {file}: {error}; failed to restore previous LSP routing: {rollback_error}"
+                            )
+                        })?;
+                    for (previous_file, previous_uri, previous_contents) in &documents {
+                        if affected.contains(previous_file)
+                            && self.lsp_coordinator.is_document_opened(previous_uri)
+                            && previous_routing.resolve_document(previous_file).is_some()
+                        {
+                            self.lsp
+                                .did_open(previous_file, previous_contents)
+                                .await
+                                .map_err(|restore_error| {
+                                    anyhow::anyhow!(
+                                        "failed to reopen {file}: {error}; failed to restore {previous_file}: {restore_error}"
+                                    )
+                                })?;
+                        }
+                    }
+                    return Err(error.into());
+                }
+                reopened.push((uri.clone(), route_changed));
+            }
+        }
+        for (uri, route_changed) in reopened {
+            if route_changed {
+                self.lsp_coordinator.mark_document_closed(&uri);
+                self.diagnostics.remove(&uri);
+            }
+            self.lsp_coordinator.mark_document_opened(uri);
+        }
+
+        let count = loaded.config.languages.len();
+        self.config.languages = loaded.config.languages;
+        self.config.lsp = loaded.config.lsp;
+        self.config.commenting = loaded.config.commenting;
+        self.config_diagnostics = loaded.diagnostics;
+        self.config_diagnostics_acknowledged = self.config_diagnostics.is_empty();
+        self.highlighter = highlighter;
+        self.indentation = indentation;
+        self.highlight_cache.clear();
+        self.bracket_match_cache = None;
+        self.workspace_manager
+            .update_theme_with_registry(&self.theme, &registry);
+        self.force_full_redraw = true;
+        Ok(count)
+    }
+
     fn config_diagnostics_banner(&self) -> Option<String> {
         (!self.config_diagnostics_acknowledged && !self.config_diagnostics.is_empty()).then(|| {
             format!(
@@ -3024,37 +3138,14 @@ impl Editor {
             .unwrap_or(0)
             + 2;
         let size = (width as u16, height as u16);
-        let highlighter = Highlighter::new(&theme)?;
+        let registry = Arc::new(LanguageRegistry::from_config(
+            &config.languages,
+            &Config::config_dir(),
+        )?);
+        let highlighter = Highlighter::with_registry(&theme, registry)?;
 
         let mut plugin_registry = PluginRegistry::new();
-        let indentation = HashMap::from_iter(
-            [
-                ("rs", 4),
-                ("js", 2),
-                ("jsx", 2),
-                ("mjs", 2),
-                ("cjs", 2),
-                ("ts", 2),
-                ("tsx", 2),
-                ("json", 2),
-                ("jsonc", 2),
-                ("toml", 2),
-                ("yaml", 2),
-                ("yml", 2),
-                ("sh", 2),
-                ("bash", 2),
-                ("zsh", 2),
-                ("fish", 4),
-                ("py", 4),
-                ("pyw", 4),
-            ]
-            .map(|(file_type, shift_width)| {
-                (
-                    file_type.to_string(),
-                    Indentation::new(shift_width, shift_width, true),
-                )
-            }),
-        );
+        let indentation = Self::configured_indentation(&config);
 
         let mut window_manager = WindowManager::new(0, (width, height));
         let wrap = config.wrap.unwrap_or(true);
@@ -3077,6 +3168,8 @@ impl Editor {
             config,
             config_diagnostics: Vec::new(),
             config_diagnostics_acknowledged: true,
+            language_config_path: Config::path("config.toml"),
+            language_config_overrides: Vec::new(),
             theme,
             plugin_registry,
             companion_manager: Arc::new(tokio::sync::Mutex::new(
@@ -3753,7 +3846,53 @@ impl Editor {
         self.indentation_for_buffer_index(self.buffer_manager.active_index())
     }
 
+    fn configured_indentation(config: &Config) -> HashMap<String, Indentation> {
+        let mut indentation = HashMap::from_iter(
+            [
+                ("rs", 4),
+                ("js", 2),
+                ("jsx", 2),
+                ("mjs", 2),
+                ("cjs", 2),
+                ("ts", 2),
+                ("tsx", 2),
+                ("json", 2),
+                ("jsonc", 2),
+                ("toml", 2),
+                ("yaml", 2),
+                ("yml", 2),
+                ("sh", 2),
+                ("bash", 2),
+                ("zsh", 2),
+                ("fish", 4),
+                ("py", 4),
+                ("pyw", 4),
+            ]
+            .map(|(file_type, shift_width)| {
+                (
+                    file_type.to_string(),
+                    Indentation::new(shift_width, shift_width, true),
+                )
+            }),
+        );
+        for (language, definition) in &config.languages {
+            if let Some(width) = definition.indent_width {
+                let settings = Indentation::new(width, width, true);
+                indentation.insert(language.clone(), settings);
+                for extension in &definition.extensions {
+                    indentation.insert(extension.trim_start_matches('.').to_string(), settings);
+                }
+            }
+        }
+        indentation
+    }
+
     fn indentation_for_buffer_index(&self, buffer_index: usize) -> Indentation {
+        if let Some(language) = self.highlight_language_id_for_buffer_index(buffer_index) {
+            if let Some(indentation) = self.indentation.get(&language) {
+                return *indentation;
+            }
+        }
         let file_type = self
             .buffer_manager
             .get(buffer_index)
@@ -3806,6 +3945,11 @@ impl Editor {
 
     pub(crate) fn picker_input_position(&self) -> crate::config::PickerInputPosition {
         self.config.picker.input_position
+    }
+
+    /// Returns the immutable language snapshot shared by editor-owned render surfaces.
+    pub(crate) fn language_registry(&self) -> Arc<LanguageRegistry> {
+        self.highlighter.registry()
     }
 
     pub(crate) fn picker_icons(&self) -> crate::config::PickerIconsConfig {
@@ -4251,14 +4395,18 @@ impl Editor {
             .map(style_info_to_highlight_spans)
     }
 
-    fn highlight_language_id_for_buffer_index(&self, buffer_index: usize) -> Option<&'static str> {
+    fn highlight_language_id_for_buffer_index(&self, buffer_index: usize) -> Option<String> {
         let buffer = self.buffer_manager.get(buffer_index)?;
         match buffer.syntax_selection() {
             SyntaxSelection::Auto => self
                 .highlighter
-                .language_id_for_file(buffer.file.as_deref()),
+                .language_id_for_file(buffer.file.as_deref())
+                .map(ToString::to_string),
             SyntaxSelection::Off => None,
-            SyntaxSelection::Language(language) => self.highlighter.language_id_for_name(language),
+            SyntaxSelection::Language(language) => self
+                .highlighter
+                .language_id_for_name(language)
+                .map(ToString::to_string),
         }
     }
 
@@ -4281,7 +4429,9 @@ impl Editor {
         let revision = buffer.revision();
         let file = buffer.file.clone();
         let language_id = self.highlight_language_id_for_buffer_index(buffer_index);
-        let requires_document_prefix = self.highlighter.requires_document_prefix(language_id);
+        let requires_document_prefix = self
+            .highlighter
+            .requires_document_prefix(language_id.as_deref());
         let line_count = buffer.len();
         if vtop >= line_count {
             return Ok(Vec::new());
@@ -4334,7 +4484,7 @@ impl Editor {
             }
             line_offsets.push(text.len());
 
-            let spans = self.highlight_spans_for_language(language_id, &text)?;
+            let spans = self.highlight_spans_for_language(language_id.as_deref(), &text)?;
             if self.highlight_cache.len() >= 32 {
                 self.highlight_cache.clear();
             }
@@ -7733,7 +7883,12 @@ impl Editor {
                     needs_render = true;
                 }
                 PluginRequest::UpdateWorkspace { id, model } => {
-                    if self.workspace_manager.update(&id, model, &self.theme) {
+                    if self.workspace_manager.update_with_registry(
+                        &id,
+                        model,
+                        &self.theme,
+                        &self.highlighter.registry(),
+                    ) {
                         needs_render = true;
                     }
                 }
@@ -10592,6 +10747,15 @@ impl Editor {
                 return Vec::new();
             }
             return vec![Action::SetSyntax(syntax.to_string())];
+        }
+
+        if name == "languages" {
+            return if arguments.trim() == "reload" {
+                vec![Action::ReloadLanguages]
+            } else {
+                self.last_error = Some("usage: languages reload".to_string());
+                Vec::new()
+            };
         }
 
         if name == "set" {
@@ -15676,8 +15840,8 @@ impl Editor {
             Action::SetSyntax(syntax) => {
                 let syntax = syntax.trim();
                 let (selection, label) = match syntax.to_ascii_lowercase().as_str() {
-                    "auto" => (SyntaxSelection::Auto, "auto"),
-                    "off" => (SyntaxSelection::Off, "off"),
+                    "auto" => (SyntaxSelection::Auto, "auto".to_string()),
+                    "off" => (SyntaxSelection::Off, "off".to_string()),
                     _ => {
                         let Some(language_id) = self.highlighter.language_id_for_name(syntax)
                         else {
@@ -15688,7 +15852,7 @@ impl Editor {
                         };
                         (
                             SyntaxSelection::Language(language_id.to_string()),
-                            language_id,
+                            language_id.to_string(),
                         )
                     }
                 };
@@ -15703,6 +15867,20 @@ impl Editor {
             Action::ConfigDiagnostics => {
                 self.release_current_dialog_callbacks(runtime);
                 self.open_config_diagnostics();
+                self.render(buffer)?;
+            }
+            Action::ReloadLanguages => {
+                match self.reload_languages().await {
+                    Ok(count) => {
+                        self.last_error = Some(format!(
+                            "reloaded {count} configured language{}",
+                            if count == 1 { "" } else { "s" }
+                        ));
+                    }
+                    Err(error) => {
+                        self.last_error = Some(format!("language reload failed: {error:#}"));
+                    }
+                }
                 self.render(buffer)?;
             }
             Action::ShowDialog => {
@@ -17597,11 +17775,12 @@ impl Editor {
         } else {
             parse_vscode_theme_contents(&theme_asset.read_to_string()?)?
         };
-        let highlighter = Highlighter::new(&theme)?;
+        let highlighter = Highlighter::with_registry(&theme, self.highlighter.registry())?;
         self.theme = theme;
         self.highlighter = highlighter;
         self.highlight_cache.clear();
-        self.workspace_manager.update_theme(&self.theme);
+        self.workspace_manager
+            .update_theme_with_registry(&self.theme, &self.highlighter.registry());
         self.force_full_redraw = true;
         if let Some(dialog) = &mut self.current_dialog {
             dialog.set_theme(&self.theme);
@@ -22241,6 +22420,101 @@ mod test {
     }
 
     #[tokio::test]
+    async fn explicit_language_reload_updates_detection_and_preserves_dirty_buffer() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r##"
+[languages.buildspec]
+extensions = ["build"]
+filenames = ["Buildfile"]
+comment = "# %s"
+indent_width = 2
+
+[languages.buildspec.grammar]
+builtin = "rust"
+"##,
+        )
+        .unwrap();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 12);
+        editor.buffer_manager[0].file = Some(
+            directory
+                .path()
+                .join("Buildfile")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let contents = editor.buffer_manager[0].contents();
+        editor.set_language_reload_source(config_path, Vec::new());
+
+        assert_eq!(editor.reload_languages().await.unwrap(), 1);
+        assert_eq!(editor.current_language_id().as_deref(), Some("buildspec"));
+        assert_eq!(editor.buffer_manager[0].contents(), contents);
+        assert_eq!(editor.indentation().shift_width, 2);
+        assert_eq!(editor.config.commenting.languages["buildspec"], "# %s");
+    }
+
+    #[tokio::test]
+    async fn rejected_language_reload_keeps_previous_registry_and_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[languages.buildspec]\nfilenames = [\"Buildfile\"]\n",
+        )
+        .unwrap();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 12);
+        editor.buffer_manager[0].file = Some(
+            directory
+                .path()
+                .join("Buildfile")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        editor.set_language_reload_source(config_path.clone(), Vec::new());
+        editor.reload_languages().await.unwrap();
+
+        std::fs::write(
+            &config_path,
+            "[languages.replacement]\nfilenames = [\"Buildfile\"]\nindent_width = 0\n",
+        )
+        .unwrap();
+        let error = editor.reload_languages().await.unwrap_err();
+
+        assert!(error.to_string().contains("indent_width"));
+        assert_eq!(editor.current_language_id().as_deref(), Some("buildspec"));
+        assert!(editor.config.languages.contains_key("buildspec"));
+        assert!(!editor.config.languages.contains_key("replacement"));
+    }
+
+    #[tokio::test]
+    async fn colon_language_reload_dispatches_the_explicit_reload_action() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[languages.buildspec]\nfilenames = [\"Buildfile\"]\n",
+        )
+        .unwrap();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 12);
+        editor.set_language_reload_source(config_path, Vec::new());
+        let mut buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 12, &Style::default());
+        let mut runtime = Runtime::new();
+
+        enter_colon_command(&mut editor, &mut buffer, &mut runtime, "languages reload").await;
+
+        assert!(editor.config.languages.contains_key("buildspec"));
+        assert_eq!(
+            editor.last_error.as_deref(),
+            Some("reloaded 1 configured language")
+        );
+    }
+
+    #[tokio::test]
     async fn command_tab_completes_registered_plugin_names() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
@@ -24948,7 +25222,10 @@ mod test {
             .set_syntax_selection(SyntaxSelection::Language("rust".to_string()));
         let forced = editor.viewport_highlight_spans(0, 10, 20).unwrap();
         assert!(!forced.is_empty());
-        assert_eq!(editor.highlight_cache[&0].language_id, Some("rust"));
+        assert_eq!(
+            editor.highlight_cache[&0].language_id.as_deref(),
+            Some("rust")
+        );
 
         editor
             .current_buffer_mut()
@@ -25032,7 +25309,10 @@ mod test {
         let spans = editor.viewport_highlight_spans(0, 30, 20).unwrap();
 
         assert!(!spans.is_empty());
-        assert_eq!(editor.highlight_cache[&0].language_id, Some("yaml"));
+        assert_eq!(
+            editor.highlight_cache[&0].language_id.as_deref(),
+            Some("yaml")
+        );
         assert_eq!(editor.highlight_cache[&0].start_line, 0);
     }
 
@@ -27307,10 +27587,12 @@ mod test {
                 args: Vec::new(),
                 language_id: "rust".to_string(),
                 file_extensions: vec!["rs".to_string()],
+                filenames: Vec::new(),
                 documents: Vec::new(),
                 root_markers: vec![".red-root".to_string()],
                 env: HashMap::new(),
                 initialization_options: None,
+                settings: None,
                 workspace_name: None,
             },
         )]);
@@ -27947,10 +28229,12 @@ while True:
                 ],
                 language_id: "rust".to_string(),
                 file_extensions: vec!["rs".to_string()],
+                filenames: Vec::new(),
                 documents: Vec::new(),
                 root_markers: vec![".red-root".to_string()],
                 env: HashMap::new(),
                 initialization_options: None,
+                settings: None,
                 workspace_name: None,
             },
         )]);
@@ -28036,10 +28320,12 @@ while True:
                         ],
                         language_id: language.to_string(),
                         file_extensions: vec![extension.to_string()],
+                        filenames: Vec::new(),
                         documents: Vec::new(),
                         root_markers: vec![".red-root".to_string()],
                         env: HashMap::new(),
                         initialization_options: None,
+                        settings: None,
                         workspace_name: None,
                     },
                 )

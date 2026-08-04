@@ -1,9 +1,10 @@
 use crossterm::event::{Event, KeyCode, KeyModifiers, MouseEventKind};
+use std::sync::Arc;
 
 use crate::{
     config::KeyAction,
     editor::{Action, Editor, RenderBuffer},
-    highlighter::Highlighter,
+    highlighter::{Highlighter, LanguageRegistry},
     lsp::{Command as LspCommand, CommandLinkGroup},
     plugin::markdown::{
         render_hover_markdown_lines_with_highlighter, wrap_plain_text, RenderedTextLine,
@@ -44,6 +45,7 @@ pub struct HoverInfo {
     scroll: usize,
     lines: Vec<RenderedTextLine>,
     theme: Theme,
+    registry: Arc<LanguageRegistry>,
     dialog: Dialog,
 }
 
@@ -72,6 +74,7 @@ impl HoverInfo {
             format,
             hover_width_limit(&source, format, viewport_width),
             &theme,
+            &editor.language_registry(),
             &actions,
         );
         let (x, y, height) = hover_geometry(
@@ -111,6 +114,7 @@ impl HoverInfo {
             .with_surface_theme(&theme, SurfaceRole::Dialog)
             .with_footer_style(&theme.ui_style.muted),
             theme,
+            registry: editor.language_registry(),
         };
         info.update_chrome();
         info
@@ -164,6 +168,7 @@ impl HoverInfo {
             self.format,
             hover_width_limit(&self.source, self.format, viewport_width),
             &self.theme,
+            &self.registry,
             &self.actions,
         );
         let (x, y, height) = hover_geometry(
@@ -360,12 +365,13 @@ fn render_lines(
     format: HoverInfoFormat,
     available_width: usize,
     theme: &Theme,
+    registry: &Arc<LanguageRegistry>,
     actions: &[HoverAction],
 ) -> (Vec<RenderedTextLine>, Vec<Option<usize>>, usize) {
     if available_width == 0 {
         return (Vec::new(), Vec::new(), 0);
     }
-    let mut highlighter = Highlighter::new(theme).ok();
+    let mut highlighter = Highlighter::with_registry(theme, Arc::clone(registry)).ok();
     let content_lines = match format {
         HoverInfoFormat::Markdown => render_hover_markdown_lines_with_highlighter(
             source,

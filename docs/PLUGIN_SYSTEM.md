@@ -208,6 +208,16 @@ bundled-plugin implementation detail, not public plugin APIs.
 
 `buffer:changed`, cursor, mode, viewport, file, theme, window, LSP, timer, picker, composer, panel, process, filesystem, workspace, and agent events are emitted by the production runtime. Subscribe only to the events a plugin needs and debounce expensive work.
 
+## Language packages
+
+External packages may also contribute reusable `[languages.<id>]` definitions
+without a Husk entrypoint or native companion. A language pack can bundle
+target-specific Tree-sitter grammars or download SHA-256-verified GitHub
+release artifacts. Native grammars are never trusted by package metadata;
+installation requires explicit `--trust-native-grammars` approval or a later
+`red language trust <id>`. See the [language extensions guide](LANGUAGES.md)
+for the manifest format, LSP settings, and `:languages reload` workflow.
+
 ## Validation
 
 Run:

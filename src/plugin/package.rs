@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{io::AsyncWriteExt as _, process::Command};
 
+use crate::{config::LanguageConfig, language::GrammarTrustStore};
+
 use super::{Runtime, RED_HOST_API_VERSION};
 
 /// File name of the Red-specific package manifest.
@@ -72,6 +74,9 @@ pub struct PluginPackageManifest {
     #[serde(default)]
     pub keymaps: BTreeMap<String, BTreeMap<String, String>>,
     pub companion: Option<PluginCompanionManifest>,
+    /// Reusable language definitions contributed without requiring a Husk entrypoint.
+    #[serde(default)]
+    pub languages: BTreeMap<String, LanguageConfig>,
     #[serde(default)]
     pub migration: PluginMigration,
 }
@@ -167,6 +172,8 @@ pub struct InstalledPlugin {
     pub enabled: bool,
     pub compatible: bool,
     pub has_companion: bool,
+    /// Whether the package contributes one or more language definitions.
+    pub has_languages: bool,
     pub source: PluginInstallSource,
     pub package_root: PathBuf,
 }
@@ -200,8 +207,9 @@ impl PluginPackageManifest {
         anyhow::ensure!(
             self.plugin.husk_manifest.is_some()
                 || self.plugin.entry.is_some()
-                || self.companion.is_some(),
-            "plugin package must declare a Husk entrypoint or native companion"
+                || self.companion.is_some()
+                || !self.languages.is_empty(),
+            "plugin package must declare a Husk entrypoint, native companion, or language"
         );
         let host_api = Version::parse(RED_HOST_API_VERSION)?;
         anyhow::ensure!(
@@ -257,6 +265,51 @@ impl PluginPackageManifest {
                 "legacy session migration keys cannot be empty"
             );
         }
+        for (id, language) in &self.languages {
+            anyhow::ensure!(
+                !id.trim().is_empty()
+                    && id.bytes().all(|byte| byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'-' | b'_')),
+                "invalid package language identifier `{id}`"
+            );
+            let Some(grammar) = &language.grammar else {
+                continue;
+            };
+            for relative in grammar
+                .path
+                .iter()
+                .chain(grammar.highlights.iter())
+                .chain(grammar.injections.iter())
+            {
+                validate_package_file(package_root, relative)?;
+            }
+            for (target, artifact) in &grammar.targets {
+                anyhow::ensure!(
+                    !target.trim().is_empty(),
+                    "language grammar target is empty"
+                );
+                anyhow::ensure!(
+                    artifact.path.is_some() != artifact.url.is_some(),
+                    "language `{id}` grammar target `{target}` must have exactly one path or URL"
+                );
+                if let Some(path) = &artifact.path {
+                    validate_package_file(package_root, path)?;
+                }
+                if let Some(url) = &artifact.url {
+                    anyhow::ensure!(
+                        url.starts_with("https://github.com/")
+                            || url.starts_with("https://api.github.com/"),
+                        "language grammar artifacts must use a GitHub HTTPS URL"
+                    );
+                    let digest = artifact.sha256.as_deref().unwrap_or_default();
+                    anyhow::ensure!(
+                        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                        "language `{id}` grammar target `{target}` has an invalid SHA-256 digest"
+                    );
+                }
+            }
+        }
         validate_keymaps(&self.keymaps)?;
         Ok(())
     }
@@ -289,6 +342,34 @@ impl PluginPackageManifest {
                 })
         })
     }
+
+    /// Resolves one language grammar for the running host without loading native code.
+    #[must_use]
+    pub fn grammar_path(
+        &self,
+        package_root: &Path,
+        id: &str,
+        language: &LanguageConfig,
+    ) -> Option<PathBuf> {
+        let grammar = language.grammar.as_ref()?;
+        if let Some(path) = &grammar.path {
+            return Some(package_root.join(path));
+        }
+        let artifact = grammar.targets.get(host_target())?;
+        artifact
+            .path
+            .as_ref()
+            .map(|path| package_root.join(path))
+            .or_else(|| {
+                artifact.url.as_ref().map(|_| {
+                    package_root
+                        .join(".red")
+                        .join("grammars")
+                        .join(host_target())
+                        .join(grammar_filename(id))
+                })
+            })
+    }
 }
 
 impl PluginPackageManager {
@@ -314,11 +395,22 @@ impl PluginPackageManager {
 
     /// Installs a local development checkout without copying its source.
     pub async fn install_path(&self, source: &Path) -> Result<InstalledPlugin> {
+        self.install_path_with_trust(source, false).await
+    }
+
+    /// Installs a local package, optionally approving its current native grammar bytes.
+    pub async fn install_path_with_trust(
+        &self,
+        source: &Path,
+        trust_native_grammars: bool,
+    ) -> Result<InstalledPlugin> {
         let source = source
             .canonicalize()
             .with_context(|| format!("failed to resolve plugin path {}", source.display()))?;
         let manifest = PluginPackageManifest::load(&source)?;
         validate_husk_package(&manifest, &source).await?;
+        self.install_language_artifacts(&manifest, &source, trust_native_grammars)
+            .await?;
         let install_source = PluginInstallSource::Path {
             path: source.clone(),
         };
@@ -330,6 +422,17 @@ impl PluginPackageManager {
         &self,
         repository: &str,
         requested_version: Option<&str>,
+    ) -> Result<InstalledPlugin> {
+        self.install_github_with_trust(repository, requested_version, false)
+            .await
+    }
+
+    /// Installs a GitHub package and optionally approves verified native grammars.
+    pub async fn install_github_with_trust(
+        &self,
+        repository: &str,
+        requested_version: Option<&str>,
+        trust_native_grammars: bool,
     ) -> Result<InstalledPlugin> {
         validate_github_repository(repository)?;
         let staging = self.staging_dir("github");
@@ -377,9 +480,26 @@ impl PluginPackageManager {
         };
         write_record(&staging, &record)?;
         self.install_companion_artifact(&manifest, &staging).await?;
-        atomic_replace_directory(&staging, &destination)?;
+        self.install_language_artifacts(&manifest, &staging, false)
+            .await?;
+        self.activate_github_package(&manifest, &staging, &destination, trust_native_grammars)?;
         self.installed(&id)?
             .ok_or_else(|| anyhow::anyhow!("installed plugin `{id}` could not be read"))
+    }
+
+    fn activate_github_package(
+        &self,
+        manifest: &PluginPackageManifest,
+        staging: &Path,
+        destination: &Path,
+        trust_native_grammars: bool,
+    ) -> Result<()> {
+        atomic_replace_directory_validated(staging, destination, |activated| {
+            if trust_native_grammars {
+                self.approve_package_grammars(manifest, activated)?;
+            }
+            Ok(())
+        })
     }
 
     /// Lists installed packages in stable identifier order.
@@ -479,17 +599,33 @@ impl PluginPackageManager {
 
     /// Updates an installed package from its retained source.
     pub async fn update(&self, id: &PluginId) -> Result<InstalledPlugin> {
+        self.update_with_trust(id, false).await
+    }
+
+    /// Updates a package, optionally approving the new bytes of its native grammars.
+    pub async fn update_with_trust(
+        &self,
+        id: &PluginId,
+        trust_native_grammars: bool,
+    ) -> Result<InstalledPlugin> {
         let installed = self
             .installed(id)?
             .ok_or_else(|| anyhow::anyhow!("plugin `{id}` is not installed"))?;
         match installed.source {
-            PluginInstallSource::Path { path } => self.install_path(&path).await,
+            PluginInstallSource::Path { path } => {
+                self.install_path_with_trust(&path, trust_native_grammars)
+                    .await
+            }
             PluginInstallSource::GitHub {
                 repository,
                 requested_version,
             } => {
-                self.install_github(&repository, requested_version.as_deref())
-                    .await
+                self.install_github_with_trust(
+                    &repository,
+                    requested_version.as_deref(),
+                    trust_native_grammars,
+                )
+                .await
             }
         }
     }
@@ -588,6 +724,60 @@ impl PluginPackageManager {
         Ok(())
     }
 
+    async fn install_language_artifacts(
+        &self,
+        manifest: &PluginPackageManifest,
+        package_root: &Path,
+        trust_native_grammars: bool,
+    ) -> Result<()> {
+        for (id, language) in &manifest.languages {
+            let Some(grammar) = &language.grammar else {
+                continue;
+            };
+            let Some(artifact) = grammar.targets.get(host_target()) else {
+                continue;
+            };
+            let Some(url) = &artifact.url else {
+                continue;
+            };
+            let directory = grammar_download_directory(package_root)?;
+            let bytes = reqwest::get(url)
+                .await
+                .with_context(|| format!("failed to download grammar for `{id}` from {url}"))?
+                .error_for_status()
+                .with_context(|| format!("grammar download failed for `{id}` from {url}"))?
+                .bytes()
+                .await?;
+            let actual = format!("{:x}", Sha256::digest(&bytes));
+            let expected = artifact.sha256.as_deref().unwrap_or_default();
+            anyhow::ensure!(
+                actual.eq_ignore_ascii_case(expected),
+                "grammar checksum mismatch for `{id}`: expected {expected}, got {actual}"
+            );
+            let filename = grammar_filename(id);
+            let path = directory.join(&filename);
+            publish_downloaded_grammar(&path, &bytes).await?;
+        }
+        if trust_native_grammars {
+            self.approve_package_grammars(manifest, package_root)?;
+        }
+        Ok(())
+    }
+
+    fn approve_package_grammars(
+        &self,
+        manifest: &PluginPackageManifest,
+        package_root: &Path,
+    ) -> Result<()> {
+        let trust = GrammarTrustStore::new(&self.config_dir);
+        let paths = manifest
+            .languages
+            .iter()
+            .filter_map(|(id, language)| manifest.grammar_path(package_root, id, language))
+            .collect::<Vec<_>>();
+        trust.trust_paths(&paths)
+    }
+
     fn staging_dir(&self, label: &str) -> PathBuf {
         self.packages_dir().join(format!(
             ".red-stage-{label}-{}-{}",
@@ -670,6 +860,97 @@ fn validate_relative_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_package_file(package_root: &Path, relative: &Path) -> Result<()> {
+    validate_relative_path(relative)?;
+    let path = package_root.join(relative);
+    anyhow::ensure!(
+        path.is_file(),
+        "plugin package file does not exist: {}",
+        path.display()
+    );
+    let canonical_root = package_root.canonicalize()?;
+    let canonical_path = path.canonicalize()?;
+    anyhow::ensure!(
+        canonical_path.starts_with(canonical_root),
+        "plugin package file escapes its package: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn grammar_filename(id: &str) -> String {
+    let extension = if cfg!(target_os = "windows") {
+        "dll"
+    } else if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    };
+    format!("{id}.{extension}")
+}
+
+fn grammar_download_directory(package_root: &Path) -> Result<PathBuf> {
+    let mut directory = package_root.to_path_buf();
+    for component in [".red", "grammars", host_target()] {
+        directory.push(component);
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) => {
+                anyhow::ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "grammar download directory contains a symbolic link: {}",
+                    directory.display()
+                );
+                anyhow::ensure!(
+                    metadata.is_dir(),
+                    "grammar download destination is not a directory: {}",
+                    directory.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&directory).with_context(|| {
+                    format!(
+                        "failed to create grammar download directory {}",
+                        directory.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect grammar download directory {}",
+                        directory.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(directory)
+}
+
+async fn publish_downloaded_grammar(path: &Path, bytes: &[u8]) -> Result<()> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("downloaded grammar path has no parent"))?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".red-grammar-")
+        .tempfile_in(directory)
+        .with_context(|| {
+            format!(
+                "failed to create downloaded grammar replacement in {}",
+                directory.display()
+            )
+        })?;
+    let mut file = tokio::fs::File::from_std(temporary.reopen()?);
+    file.write_all(bytes).await?;
+    file.sync_all().await?;
+    drop(file);
+    temporary
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to publish downloaded grammar {}", path.display()))
+}
+
 fn validate_github_repository(repository: &str) -> Result<()> {
     let parts = repository.split('/').collect::<Vec<_>>();
     anyhow::ensure!(
@@ -703,6 +984,7 @@ fn installed_from_record(record: PluginInstallRecord) -> Result<InstalledPlugin>
         enabled: record.enabled,
         compatible: manifest.plugin.red_api.matches(&host_api),
         has_companion: manifest.companion.is_some(),
+        has_languages: !manifest.languages.is_empty(),
         source: record.source,
         package_root: record.package_root,
     })
@@ -731,6 +1013,14 @@ fn write_record_atomic(directory: &Path, record: &PluginInstallRecord) -> Result
 }
 
 fn atomic_replace_directory(staging: &Path, destination: &Path) -> Result<()> {
+    atomic_replace_directory_validated(staging, destination, |_| Ok(()))
+}
+
+fn atomic_replace_directory_validated(
+    staging: &Path,
+    destination: &Path,
+    validate: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     let parent = destination
         .parent()
         .ok_or_else(|| anyhow::anyhow!("plugin destination has no parent"))?;
@@ -761,6 +1051,25 @@ fn atomic_replace_directory(staging: &Path, destination: &Path) -> Result<()> {
                 destination.display()
             )
         });
+    }
+    if let Err(error) = validate(destination) {
+        if let Err(rollback_error) = remove_if_exists(destination).and_then(|()| {
+            if backup.exists() {
+                fs::rename(&backup, destination).with_context(|| {
+                    format!(
+                        "failed to restore previous plugin installation {}",
+                        destination.display()
+                    )
+                })?;
+            }
+            Ok(())
+        }) {
+            return Err(error).context(format!(
+                "failed to roll back plugin installation {}: {rollback_error:#}",
+                destination.display()
+            ));
+        }
+        return Err(error);
     }
     remove_if_exists(&backup)?;
     Ok(())
@@ -794,17 +1103,7 @@ fn now_ms() -> u64 {
 }
 
 fn host_target() -> &'static str {
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        "aarch64-apple-darwin"
-    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        "x86_64-apple-darwin"
-    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        "x86_64-unknown-linux-gnu"
-    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        "x86_64-pc-windows-msvc"
-    } else {
-        "unsupported"
-    }
+    crate::language::host_target()
 }
 
 fn companion_binary_name() -> &'static str {
@@ -867,6 +1166,251 @@ entry = "src/main.hk"
         )
         .unwrap();
         fs::write(root.join("src/main.hk"), "pub fn activate() {}").unwrap();
+    }
+
+    fn write_language_package(root: &Path, id: &str) {
+        fs::write(
+            root.join(PLUGIN_MANIFEST_FILE),
+            format!(
+                r#"
+schema_version = 1
+
+[plugin]
+id = "{id}"
+name = "Language package"
+version = "1.0.0"
+red_api = "^{RED_HOST_API_VERSION}"
+
+[languages.buildspec]
+extensions = ["build"]
+filenames = ["Buildfile"]
+
+[languages.buildspec.grammar]
+builtin = "rust"
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_oversized_native_language_package(root: &Path, id: &str, version: &str) {
+        let grammar_dir = root.join("grammars");
+        fs::create_dir_all(&grammar_dir).unwrap();
+        fs::File::create(grammar_dir.join("buildspec.so"))
+            .unwrap()
+            .set_len(64 * 1024 * 1024 + 1)
+            .unwrap();
+        fs::write(
+            root.join(PLUGIN_MANIFEST_FILE),
+            format!(
+                r#"
+schema_version = 1
+
+[plugin]
+id = "{id}"
+name = "Native language package"
+version = "{version}"
+red_api = "^{RED_HOST_API_VERSION}"
+
+[languages.buildspec]
+extensions = ["build"]
+
+[languages.buildspec.grammar]
+path = "grammars/buildspec.so"
+symbol = "tree_sitter_buildspec"
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn downloaded_grammar_replaces_existing_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(grammar_filename("buildspec"));
+
+        publish_downloaded_grammar(&path, b"original grammar")
+            .await
+            .unwrap();
+        publish_downloaded_grammar(&path, b"replacement grammar")
+            .await
+            .unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"replacement grammar");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn grammar_download_directory_creates_real_package_directories() {
+        let package = tempfile::tempdir().unwrap();
+
+        let directory = grammar_download_directory(package.path()).unwrap();
+
+        assert_eq!(
+            directory,
+            package
+                .path()
+                .join(".red")
+                .join("grammars")
+                .join(host_target())
+        );
+        assert!(directory.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grammar_download_directory_rejects_every_symlinked_component() {
+        for depth in 0..3 {
+            let package = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let components = [".red", "grammars", host_target()];
+            let mut parent = package.path().to_path_buf();
+            for component in components.iter().take(depth) {
+                parent.push(component);
+                fs::create_dir(&parent).unwrap();
+            }
+            let symlink = parent.join(components[depth]);
+            std::os::unix::fs::symlink(outside.path(), &symlink).unwrap();
+
+            let error = grammar_download_directory(package.path()).unwrap_err();
+
+            assert!(error.to_string().contains("symbolic link"));
+            assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn github_update_restores_previous_installation_when_grammar_approval_fails() {
+        let config = tempfile::tempdir().unwrap();
+        let previous = tempfile::tempdir().unwrap();
+        write_language_package(previous.path(), "build-languages");
+        let manager = PluginPackageManager::new(config.path());
+        let original = manager.install_path(previous.path()).await.unwrap();
+        let destination = manager.packages_dir().join(original.id.as_str());
+        let staging = manager.staging_dir("github-test");
+        fs::create_dir_all(&staging).unwrap();
+        write_oversized_native_language_package(&staging, "build-languages", "2.0.0");
+        let manifest = PluginPackageManifest::load(&staging).unwrap();
+
+        let error = manager
+            .activate_github_package(&manifest, &staging, &destination, true)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("safety limit"));
+        let restored = manager.installed(&original.id).unwrap().unwrap();
+        assert_eq!(restored.version, Version::parse("1.0.0").unwrap());
+        assert_eq!(
+            restored.package_root,
+            previous.path().canonicalize().unwrap()
+        );
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn failed_github_grammar_approval_does_not_publish_new_installation() {
+        let config = tempfile::tempdir().unwrap();
+        let manager = PluginPackageManager::new(config.path());
+        let destination = manager.packages_dir().join("build-languages");
+        let staging = manager.staging_dir("github-test");
+        fs::create_dir_all(&staging).unwrap();
+        write_oversized_native_language_package(&staging, "build-languages", "1.0.0");
+        let manifest = PluginPackageManifest::load(&staging).unwrap();
+
+        let error = manager
+            .activate_github_package(&manifest, &staging, &destination, true)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("safety limit"));
+        assert!(!destination.exists());
+        assert!(manager.list().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn language_only_package_installs_without_husk_or_native_companion() {
+        let config = tempfile::tempdir().unwrap();
+        let package = tempfile::tempdir().unwrap();
+        write_language_package(package.path(), "build-languages");
+        let manager = PluginPackageManager::new(config.path());
+
+        let installed = manager.install_path(package.path()).await.unwrap();
+        let manifest = PluginPackageManifest::load(&installed.package_root).unwrap();
+
+        assert_eq!(installed.id.as_str(), "build-languages");
+        assert!(installed.has_languages);
+        assert!(!installed.has_companion);
+        assert_eq!(manifest.languages["buildspec"].filenames, ["Buildfile"]);
+        assert!(manifest.husk_entry(&installed.package_root).is_none());
+    }
+
+    #[test]
+    fn language_only_manifest_declares_native_highlighting_and_lsp() {
+        let manifest: PluginPackageManifest = toml::from_str(&format!(
+            r#"
+schema_version = 1
+
+[plugin]
+id = "acme-language"
+name = "Acme language support"
+version = "0.1.0"
+red_api = "^{RED_HOST_API_VERSION}"
+
+[languages.acme]
+extensions = ["acme"]
+filenames = ["Acmefile"]
+comment = "// %s"
+
+[languages.acme.grammar]
+path = "grammars/acme.so"
+symbol = "tree_sitter_acme"
+highlights = ["queries/highlights.scm"]
+
+[languages.acme.lsp]
+command = "acme-language-server"
+root_markers = ["Acmefile", ".git"]
+"#
+        ))
+        .unwrap();
+        let language = manifest.languages.get("acme").unwrap();
+        let grammar = language.grammar.as_ref().unwrap();
+        let server = language.lsp.as_ref().unwrap();
+
+        assert_eq!(manifest.plugin.id.as_str(), "acme-language");
+        assert_eq!(language.extensions, ["acme"]);
+        assert_eq!(language.filenames, ["Acmefile"]);
+        assert_eq!(language.comment.as_deref(), Some("// %s"));
+        assert_eq!(grammar.path.as_deref(), Some(Path::new("grammars/acme.so")));
+        assert_eq!(grammar.symbol.as_deref(), Some("tree_sitter_acme"));
+        assert_eq!(
+            grammar.highlights,
+            [PathBuf::from("queries/highlights.scm")]
+        );
+        assert_eq!(server.command.as_deref(), Some("acme-language-server"));
+        assert_eq!(server.root_markers, ["Acmefile", ".git"]);
+    }
+
+    #[test]
+    fn language_package_rejects_unsafe_grammar_paths_and_unverified_urls() {
+        let package = tempfile::tempdir().unwrap();
+        write_language_package(package.path(), "build-languages");
+        let manifest_path = package.path().join(PLUGIN_MANIFEST_FILE);
+        let mut source = fs::read_to_string(&manifest_path).unwrap();
+        source.push_str("path = \"../unsafe.so\"\n");
+        fs::write(&manifest_path, source).unwrap();
+        assert!(PluginPackageManifest::load(package.path())
+            .unwrap_err()
+            .to_string()
+            .contains("unsafe component"));
+
+        write_language_package(package.path(), "build-languages");
+        let mut source = fs::read_to_string(&manifest_path).unwrap();
+        source.push_str(
+            "\n[languages.buildspec.grammar.targets.aarch64-apple-darwin]\nurl = \"https://example.com/grammar.so\"\nsha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\n",
+        );
+        fs::write(&manifest_path, source).unwrap();
+        assert!(PluginPackageManifest::load(package.path())
+            .unwrap_err()
+            .to_string()
+            .contains("GitHub HTTPS"));
     }
 
     #[test]

@@ -1091,6 +1091,47 @@ impl LspClient for RealLspClient {
                         }
                     }
                     InboundMessage::ServerRequest(request)
+                        if request.method == "workspace/configuration" =>
+                    {
+                        let items = request
+                            .params
+                            .get("items")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        let settings = self.config.settings.as_ref();
+                        let values = items
+                            .iter()
+                            .map(|item| {
+                                let Some(section) = item.get("section").and_then(Value::as_str)
+                                else {
+                                    return settings.cloned().unwrap_or(Value::Null);
+                                };
+                                settings
+                                    .and_then(|settings| {
+                                        section
+                                            .split('.')
+                                            .try_fold(settings, |value: &Value, part| {
+                                                value.get(part)
+                                            })
+                                    })
+                                    .cloned()
+                                    .or_else(|| {
+                                        settings.and_then(|value| value.get(section)).cloned()
+                                    })
+                                    .unwrap_or(Value::Null)
+                            })
+                            .collect::<Vec<_>>();
+                        self.request_tx
+                            .send(OutboundMessage::Response(ServerResponse {
+                                id: request.id.clone(),
+                                result: Some(Value::Array(values)),
+                                error: None,
+                            }))
+                            .await?;
+                        return Ok(None);
+                    }
+                    InboundMessage::ServerRequest(request)
                         if request.method != "workspace/applyEdit" =>
                     {
                         self.request_tx
@@ -1840,10 +1881,12 @@ mod test {
             ],
             language_id: "husk".to_string(),
             file_extensions: vec!["hk".to_string()],
+            filenames: Vec::new(),
             documents: Vec::new(),
             root_markers: Vec::new(),
             env: HashMap::new(),
             initialization_options: None,
+            settings: None,
             workspace_name: None,
         };
         let mut client = RealLspClient::start(config, std::env::current_dir().unwrap())
@@ -2121,6 +2164,13 @@ mod test {
             params: json!({}),
             timestamp: Instant::now(),
         };
+        let mut config = default_language_servers()
+            .remove("rust")
+            .expect("default Rust LSP config must exist");
+        config.settings = Some(json!({
+            "rust-analyzer": { "cargo": { "allFeatures": true } },
+            "flat.key": "literal"
+        }));
         let mut client = RealLspClient {
             request_tx,
             response_rx,
@@ -2138,9 +2188,7 @@ mod test {
             server_capabilities: None,
             child: None,
             process_monitor: None,
-            config: default_language_servers()
-                .remove("rust")
-                .expect("default Rust LSP config must exist"),
+            config,
             workspace_root: std::env::current_dir().unwrap(),
         };
 
@@ -2148,7 +2196,14 @@ mod test {
             "jsonrpc": "2.0",
             "id": 31,
             "method": "workspace/configuration",
-            "params": { "items": [] }
+            "params": {
+                "items": [
+                    { "section": "rust-analyzer.cargo.allFeatures" },
+                    { "section": "flat.key" },
+                    { "section": "missing" },
+                    {}
+                ]
+            }
         }))
         .unwrap();
         process_lsp_message(&server_request, &response_tx)
@@ -2170,16 +2225,19 @@ mod test {
 
         assert!(client.recv_response().await.unwrap().is_none());
         let Some(OutboundMessage::Response(response)) = request_rx.recv().await else {
-            panic!("expected method-not-found response");
+            panic!("expected workspace configuration response");
         };
         assert_eq!(response.id, json!(31));
         assert_eq!(
-            response
-                .error
-                .as_ref()
-                .and_then(|error| error["code"].as_i64()),
-            Some(-32601)
+            response.result,
+            Some(json!([
+                true,
+                "literal",
+                null,
+                { "rust-analyzer": { "cargo": { "allFeatures": true } }, "flat.key": "literal" }
+            ]))
         );
+        assert!(response.error.is_none());
         assert!(client.pending_responses.contains_key(&31));
 
         let Some((second_message, second_method)) = client.recv_response().await.unwrap() else {

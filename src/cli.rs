@@ -97,6 +97,28 @@ pub struct Args {
 pub enum RootCommand {
     /// Install and manage external plugin packages.
     Plugin(PluginArgs),
+    /// Inspect and approve explicitly configured native language grammars.
+    Language(LanguageArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct LanguageArgs {
+    #[command(subcommand)]
+    pub command: LanguageCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LanguageCommand {
+    /// Approve the exact current bytes of a native grammar path or language id.
+    Trust(LanguageTrustArgs),
+    /// Revoke the current approval associated with a native grammar path or id.
+    Untrust(LanguageTrustArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct LanguageTrustArgs {
+    /// Configured language identifier or path to its native grammar shared library.
+    pub language_or_path: String,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -129,6 +151,9 @@ pub struct PluginInstallArgs {
     /// Install a local package checkout for development.
     #[arg(long, value_name = "DIRECTORY")]
     pub path: Option<PathBuf>,
+    /// Explicitly approve the current verified native grammars shipped by the package.
+    #[arg(long)]
+    pub trust_native_grammars: bool,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -139,6 +164,9 @@ pub struct PluginUpdateArgs {
     /// Update every enabled external plugin.
     #[arg(long)]
     pub all: bool,
+    /// Explicitly approve the updated bytes of package-provided native grammars.
+    #[arg(long)]
+    pub trust_native_grammars: bool,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -265,6 +293,7 @@ mod tests {
                 command: PluginCommand::Install(PluginInstallArgs {
                     source: Some(_),
                     path: None,
+                    ..
                 }),
             }))
         ));
@@ -277,6 +306,7 @@ mod tests {
                 command: PluginCommand::Install(PluginInstallArgs {
                     source: None,
                     path: Some(_),
+                    ..
                 }),
             }))
         ));
@@ -287,6 +317,33 @@ mod tests {
             Some(RootCommand::Plugin(PluginArgs {
                 command: PluginCommand::Update(PluginUpdateArgs { all: true, .. }),
             }))
+        ));
+
+        let args = Args::try_parse_from([
+            "red",
+            "plugin",
+            "install",
+            "--path",
+            "../languages",
+            "--trust-native-grammars",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(RootCommand::Plugin(PluginArgs {
+                command: PluginCommand::Install(PluginInstallArgs {
+                    trust_native_grammars: true,
+                    ..
+                }),
+            }))
+        ));
+
+        let args = Args::try_parse_from(["red", "language", "trust", "css"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(RootCommand::Language(LanguageArgs {
+                command: LanguageCommand::Trust(LanguageTrustArgs { language_or_path }),
+            })) if language_or_path == "css"
         ));
     }
 

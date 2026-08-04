@@ -185,6 +185,12 @@ setting that ships with Red. Custom themes go in `~/.config/red/themes/`, and
 custom Husk plugins go in `~/.config/red/plugins/`. Run `red --runtime-files`
 to see every visible runtime asset and its source.
 
+Add new highlighting, exact filenames, comment syntax, indentation, and language
+servers through a unified `[languages.<id>]` configuration or an installable
+language pack. Native Tree-sitter grammars require explicit digest-bound trust;
+`:languages reload` applies validated changes without restarting the editor.
+See the [language extensions guide](docs/LANGUAGES.md).
+
 ## Plugins and themes
 
 Bundled plugins and themes are embedded in the binary and upgrade with Red.
@@ -225,6 +231,7 @@ platform details.
 | --- | --- |
 | [Getting started](docs/GETTING_STARTED.md) | Editing, keymaps, LSP, Git, CLI, and troubleshooting |
 | [Husk language server](docs/HUSK_LSP.md) | Husk editor features, external crates, configuration, and safety boundaries |
+| [Language extensions](docs/LANGUAGES.md) | Custom syntax, trusted Tree-sitter grammars, language packs, LSP settings, and live reload |
 | [Vim compatibility](docs/VIM_COMPATIBILITY.md) | Supported behavior and intentional differences |
 | [Agent workflow](docs/AGENT_WORKFLOW.md) | Codex prerequisites, review model, commands, and safety |
 | [Plugin system](docs/PLUGIN_SYSTEM.md) | Husk lifecycle, runtime architecture, and validation |
