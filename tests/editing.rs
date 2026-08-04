@@ -5437,7 +5437,16 @@ fn focused_row_panel_pages_with_control_keys_and_page_keys() {
 #[tokio::test]
 async fn focused_agent_panel_keeps_global_leader_until_the_composer_is_focused() {
     let buffer = Buffer::new(None, "abcdef".to_string());
-    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    let mut config = default_key_config();
+    config
+        .keys
+        .normal
+        .insert("q".to_string(), KeyAction::Single(Action::FilePicker));
+    config
+        .keys
+        .normal
+        .insert("Ctrl-c".to_string(), KeyAction::Single(Action::Suspend));
+    let mut harness = EditorHarness::with_config(buffer, config);
     harness.editor.test_create_text_panel(
         "agent",
         PanelConfig {
@@ -5494,6 +5503,25 @@ async fn focused_agent_panel_keeps_global_leader_until_the_composer_is_focused()
             "Agent".to_string()
         )))
     );
+
+    for (code, modifiers, expected) in [
+        (KeyCode::Char('q'), KeyModifiers::NONE, "close"),
+        (KeyCode::Char('c'), KeyModifiers::CONTROL, "interrupt"),
+    ] {
+        let action = harness
+            .editor
+            .test_handle_event_with_runtime(Event::Key(KeyEvent::new(code, modifiers)), &runtime)
+            .unwrap();
+        assert!(matches!(
+            action,
+            Some(KeyAction::Multiple(actions))
+                if actions.iter().any(|action| matches!(
+                    action,
+                    Action::NotifyPlugins(name, payload)
+                        if name == "panel:event:agent" && payload["action"] == expected
+                ))
+        ));
+    }
 
     assert!(harness.editor.test_focus_text_panel_composer("agent"));
     let action = harness

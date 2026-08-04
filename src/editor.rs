@@ -10264,13 +10264,6 @@ impl Editor {
             if !self.panel_manager.focused_text_input_active() && self.handle_repeater(ev) {
                 return Ok(None);
             }
-            if self.panel_manager.focused_text_panel_has_composer()
-                && !self.panel_manager.focused_text_input_active()
-            {
-                if let Some(action) = self.panel_global_key_action(ev, runtime) {
-                    return Ok(Some(action));
-                }
-            }
             if let Some(action) = self.handle_panel_event(ev, runtime) {
                 return Ok(Some(action));
             }
@@ -10506,6 +10499,18 @@ impl Editor {
                     KeyCode::Left | KeyCode::Char('h') => "collapse",
                     KeyCode::Right | KeyCode::Char('l') => "expand",
                     KeyCode::Enter => "activate",
+                    KeyCode::Char(' ')
+                        if event.modifiers.is_empty()
+                            && self.panel_manager.focused_text_panel_has_composer()
+                            && !self.panel_manager.focused_text_input_active() =>
+                    {
+                        if let Some(action @ KeyAction::Nested(_)) =
+                            self.panel_global_key_action(ev, runtime)
+                        {
+                            return Some(action);
+                        }
+                        "toggle"
+                    }
                     KeyCode::Char(' ') => "toggle",
                     KeyCode::Char('q') => "close",
                     KeyCode::Char('R') => "refresh",
