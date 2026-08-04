@@ -32,4 +32,6 @@ Use [Resource Ownership](resource-ownership) when plugin work touches panels, wo
 
 [Bundled Husk Plugins](../../concepts/plugins/bundled-husk-plugins) explains how shipped plugins relate to embedded runtime assets and pure Husk packages. [Callback-Scoped Dialogs](../../concepts/plugins/callback-scoped-dialogs) explains the handle-based picker and composer model used by plugin callbacks.
 
+Use [Official Language Pack Distribution](../../decisions/plugins/language-pack-distribution) when external plugin work touches first-party language-pack cataloging, release artifact boundaries, or native grammar approval.
+
 For exact lookup, use [Host API](../../reference/plugins/host-api). For a task-oriented workflow, use [Write A Husk Plugin](../../guides/plugins/write-a-husk-plugin).
