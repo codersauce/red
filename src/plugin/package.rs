@@ -15,6 +15,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
+use husk_runtime::{PackageLimits, ResolvedPackage};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -24,7 +25,10 @@ use crate::{config::LanguageConfig, language::GrammarTrustStore};
 
 use super::{
     catalog::{validate_catalog_url, CatalogArtifact, CatalogPackage, PluginCatalog},
-    registry::{host_api_requirement_is_supported, SUPPORTED_HOST_API_VERSIONS},
+    registry::{
+        host_api_requirement_is_supported, host_api_requirement_requires_at_least,
+        SUPPORTED_HOST_API_VERSIONS,
+    },
     Runtime,
 };
 
@@ -38,6 +42,7 @@ const MAX_PACKAGE_ARCHIVE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_PACKAGE_UNPACKED_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PACKAGE_ARCHIVE_FILES: usize = 1024;
 const MAX_CATALOG_GRAMMAR_BYTES: u64 = 64 * 1024 * 1024;
+const COMMAND_SCOPE_API_VERSION: &str = "0.7.0";
 
 /// A parsed and validated stable plugin identifier.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -263,6 +268,16 @@ impl PluginPackageManifest {
                 target.display()
             );
         }
+        if self.uses_command_scope(package_root) {
+            anyhow::ensure!(
+                host_api_requirement_requires_at_least(
+                    &self.plugin.red_api,
+                    COMMAND_SCOPE_API_VERSION
+                )?,
+                "plugin uses command scope introduced in Red host API {COMMAND_SCOPE_API_VERSION}, but manifest range `{}` includes an older supported API; declare `red_api = \"^{COMMAND_SCOPE_API_VERSION}\"` or later",
+                self.plugin.red_api
+            );
+        }
         for (target, artifact) in self
             .companion
             .iter()
@@ -333,6 +348,24 @@ impl PluginPackageManifest {
         }
         validate_keymaps(&self.keymaps)?;
         Ok(())
+    }
+
+    fn uses_command_scope(&self, package_root: &Path) -> bool {
+        if let Some(manifest) = &self.plugin.husk_manifest {
+            return ResolvedPackage::open(package_root.join(manifest), PackageLimits::default())
+                .is_ok_and(|package| {
+                    package
+                        .modules
+                        .iter()
+                        .any(|module| super::api::source_uses_command_scope(&module.syntax))
+                });
+        }
+        self.plugin.entry.as_ref().is_some_and(|entry| {
+            fs::read_to_string(package_root.join(entry))
+                .ok()
+                .and_then(|source| husk_parser::parse_str(&source).file)
+                .is_some_and(|file| super::api::source_uses_command_scope(&file))
+        })
     }
 
     /// Returns the absolute Husk source or package manifest used by the registry.
@@ -1686,6 +1719,61 @@ symbol = "tree_sitter_buildspec"
             manifest.plugin.red_api,
             VersionReq::parse("^0.6.0").unwrap()
         );
+    }
+
+    #[test]
+    fn package_manifest_requires_current_api_for_command_scope() {
+        for (label, plugin_source) in [
+            (
+                "declarative",
+                r#"
+                    #[red::command(name = "Test", scope = "global")]
+                    pub fn test() {}
+                "#,
+            ),
+            (
+                "imperative",
+                r#"
+                    pub fn activate() {
+                        red::add_command("Test", test, Json { scope: "global" });
+                    }
+                    fn test() {}
+                "#,
+            ),
+        ] {
+            let package = tempfile::tempdir().unwrap();
+            write_package(package.path(), &format!("{label}-scope"), "1.0.0");
+            fs::write(package.path().join("src/main.hk"), plugin_source).unwrap();
+            let manifest_path = package.path().join(PLUGIN_MANIFEST_FILE);
+            let source = fs::read_to_string(&manifest_path)
+                .unwrap()
+                .replace(&format!("^{RED_HOST_API_VERSION}"), "^0.6.0");
+            fs::write(&manifest_path, source).unwrap();
+
+            let error = PluginPackageManifest::load(package.path()).unwrap_err();
+
+            assert!(
+                error.to_string().contains("command scope introduced"),
+                "{label}: {error}"
+            );
+            assert!(error.to_string().contains(COMMAND_SCOPE_API_VERSION));
+        }
+    }
+
+    #[test]
+    fn package_manifest_accepts_current_api_command_scope() {
+        let package = tempfile::tempdir().unwrap();
+        write_package(package.path(), "current-scope", "1.0.0");
+        fs::write(
+            package.path().join("src/main.hk"),
+            r#"
+                #[red::command(name = "Test", scope = "global")]
+                pub fn test() {}
+            "#,
+        )
+        .unwrap();
+
+        PluginPackageManifest::load(package.path()).unwrap();
     }
 
     #[tokio::test]

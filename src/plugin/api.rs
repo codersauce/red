@@ -445,23 +445,32 @@ struct HostCallSite<'a> {
     arguments: &'a [Expr],
 }
 
-fn host_call_sites(file: &File) -> Vec<HostCallSite<'_>> {
+struct RedSourceSites<'a> {
+    host_calls: Vec<HostCallSite<'a>>,
+    uses_command_scope: bool,
+}
+
+fn red_source_sites(file: &File) -> RedSourceSites<'_> {
     let mut calls = Vec::new();
+    let mut uses_command_scope = false;
     for item in &file.items {
         match &item.kind {
-            ItemKind::Fn { body, .. } => visit_statements(body, &mut calls),
+            ItemKind::Fn { body, .. } => {
+                uses_command_scope |= command_attribute_uses_scope(&item.attributes);
+                visit_statements(body, &mut calls, &mut uses_command_scope);
+            }
             ItemKind::Trait(definition) => {
                 for item in &definition.items {
                     let husk_ast::TraitItemKind::Method(method) = &item.kind;
                     if let Some(body) = &method.default_body {
-                        visit_statements(body, &mut calls);
+                        visit_statements(body, &mut calls, &mut uses_command_scope);
                     }
                 }
             }
             ItemKind::Impl(block) => {
                 for item in &block.items {
                     if let ImplItemKind::Method(method) = &item.kind {
-                        visit_statements(&method.body, &mut calls);
+                        visit_statements(&method.body, &mut calls, &mut uses_command_scope);
                     }
                 }
             }
@@ -473,37 +482,70 @@ fn host_call_sites(file: &File) -> Vec<HostCallSite<'_>> {
             | ItemKind::Use { .. } => {}
         }
     }
-    calls
-}
-
-fn visit_statements<'a>(statements: &'a [Stmt], calls: &mut Vec<HostCallSite<'a>>) {
-    for statement in statements {
-        visit_statement(statement, calls);
+    RedSourceSites {
+        host_calls: calls,
+        uses_command_scope,
     }
 }
 
-fn visit_statement<'a>(statement: &'a Stmt, calls: &mut Vec<HostCallSite<'a>>) {
+fn command_attribute_uses_scope(attributes: &[Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        attribute.matches_path(&["red", "command"])
+            && attribute.arguments.as_ref().is_some_and(|arguments| {
+                arguments.iter().any(|argument| {
+                    matches!(
+                        &argument.kind,
+                        AttributeArgumentKind::Named { name, .. } if name.name == "scope"
+                    )
+                })
+            })
+    })
+}
+
+pub(crate) fn source_uses_command_scope(file: &File) -> bool {
+    red_source_sites(file).uses_command_scope
+}
+
+fn host_call_sites(file: &File) -> Vec<HostCallSite<'_>> {
+    red_source_sites(file).host_calls
+}
+
+fn visit_statements<'a>(
+    statements: &'a [Stmt],
+    calls: &mut Vec<HostCallSite<'a>>,
+    uses_command_scope: &mut bool,
+) {
+    for statement in statements {
+        visit_statement(statement, calls, uses_command_scope);
+    }
+}
+
+fn visit_statement<'a>(
+    statement: &'a Stmt,
+    calls: &mut Vec<HostCallSite<'a>>,
+    uses_command_scope: &mut bool,
+) {
     match &statement.kind {
         StmtKind::Let {
             value, else_block, ..
         } => {
             if let Some(value) = value {
-                visit_expression(value, calls);
+                visit_expression(value, calls, uses_command_scope);
             }
             if let Some(block) = else_block {
-                visit_statements(&block.stmts, calls);
+                visit_statements(&block.stmts, calls, uses_command_scope);
             }
         }
         StmtKind::Assign { target, value, .. } => {
-            visit_expression(target, calls);
-            visit_expression(value, calls);
+            visit_expression(target, calls, uses_command_scope);
+            visit_expression(value, calls, uses_command_scope);
         }
         StmtKind::Expr(expression) | StmtKind::Semi(expression) => {
-            visit_expression(expression, calls);
+            visit_expression(expression, calls, uses_command_scope);
         }
         StmtKind::Return { value } => {
             if let Some(value) = value {
-                visit_expression(value, calls);
+                visit_expression(value, calls, uses_command_scope);
             }
         }
         StmtKind::If {
@@ -511,20 +553,22 @@ fn visit_statement<'a>(statement: &'a Stmt, calls: &mut Vec<HostCallSite<'a>>) {
             then_branch,
             else_branch,
         } => {
-            visit_expression(cond, calls);
-            visit_statements(&then_branch.stmts, calls);
+            visit_expression(cond, calls, uses_command_scope);
+            visit_statements(&then_branch.stmts, calls, uses_command_scope);
             if let Some(branch) = else_branch {
-                visit_statement(branch, calls);
+                visit_statement(branch, calls, uses_command_scope);
             }
         }
         StmtKind::While { cond, body } => {
-            visit_expression(cond, calls);
-            visit_statements(&body.stmts, calls);
+            visit_expression(cond, calls, uses_command_scope);
+            visit_statements(&body.stmts, calls, uses_command_scope);
         }
-        StmtKind::Loop { body } | StmtKind::Block(body) => visit_statements(&body.stmts, calls),
+        StmtKind::Loop { body } | StmtKind::Block(body) => {
+            visit_statements(&body.stmts, calls, uses_command_scope);
+        }
         StmtKind::ForIn { iterable, body, .. } => {
-            visit_expression(iterable, calls);
-            visit_statements(&body.stmts, calls);
+            visit_expression(iterable, calls, uses_command_scope);
+            visit_statements(&body.stmts, calls, uses_command_scope);
         }
         StmtKind::IfLet {
             scrutinee,
@@ -532,20 +576,35 @@ fn visit_statement<'a>(statement: &'a Stmt, calls: &mut Vec<HostCallSite<'a>>) {
             else_branch,
             ..
         } => {
-            visit_expression(scrutinee, calls);
-            visit_statements(&then_branch.stmts, calls);
+            visit_expression(scrutinee, calls, uses_command_scope);
+            visit_statements(&then_branch.stmts, calls, uses_command_scope);
             if let Some(branch) = else_branch {
-                visit_statement(branch, calls);
+                visit_statement(branch, calls, uses_command_scope);
             }
         }
         StmtKind::Break | StmtKind::Continue => {}
     }
 }
 
-fn visit_expression<'a>(expression: &'a Expr, calls: &mut Vec<HostCallSite<'a>>) {
+fn visit_expression<'a>(
+    expression: &'a Expr,
+    calls: &mut Vec<HostCallSite<'a>>,
+    uses_command_scope: &mut bool,
+) {
     match &expression.kind {
         ExprKind::Call { callee, args, .. } => {
             if let ExprKind::Path { segments } = &callee.kind {
+                if matches!(segments.as_slice(), [module, method] if module.name == "red" && method.name == "add_command")
+                    && args.get(2).is_some_and(|metadata| {
+                        matches!(
+                            &metadata.kind,
+                            ExprKind::Struct { fields, .. }
+                                if fields.iter().any(|field| field.name.name == "scope")
+                        )
+                    })
+                {
+                    *uses_command_scope = true;
+                }
                 let kind = match segments.as_slice() {
                     [module, method] if module.name == "red" && method.name == "execute" => {
                         Some("execute")
@@ -569,46 +628,46 @@ fn visit_expression<'a>(expression: &'a Expr, calls: &mut Vec<HostCallSite<'a>>)
                     }
                 }
             }
-            visit_expression(callee, calls);
+            visit_expression(callee, calls, uses_command_scope);
             for argument in args {
-                visit_expression(argument, calls);
+                visit_expression(argument, calls, uses_command_scope);
             }
         }
         ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => {
-            visit_expression(base, calls);
+            visit_expression(base, calls, uses_command_scope);
         }
         ExprKind::MethodCall { receiver, args, .. } => {
-            visit_expression(receiver, calls);
+            visit_expression(receiver, calls, uses_command_scope);
             for argument in args {
-                visit_expression(argument, calls);
+                visit_expression(argument, calls, uses_command_scope);
             }
         }
         ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } | ExprKind::Try { expr } => {
-            visit_expression(expr, calls);
+            visit_expression(expr, calls, uses_command_scope);
         }
         ExprKind::Binary { left, right, .. } => {
-            visit_expression(left, calls);
-            visit_expression(right, calls);
+            visit_expression(left, calls, uses_command_scope);
+            visit_expression(right, calls, uses_command_scope);
         }
         ExprKind::If {
             cond,
             then_branch,
             else_branch,
         } => {
-            visit_expression(cond, calls);
-            visit_expression(then_branch, calls);
-            visit_expression(else_branch, calls);
+            visit_expression(cond, calls, uses_command_scope);
+            visit_expression(then_branch, calls, uses_command_scope);
+            visit_expression(else_branch, calls, uses_command_scope);
         }
         ExprKind::Match { scrutinee, arms } => {
-            visit_expression(scrutinee, calls);
+            visit_expression(scrutinee, calls, uses_command_scope);
             for arm in arms {
-                visit_expression(&arm.expr, calls);
+                visit_expression(&arm.expr, calls, uses_command_scope);
             }
         }
-        ExprKind::Block(block) => visit_statements(&block.stmts, calls),
+        ExprKind::Block(block) => visit_statements(&block.stmts, calls, uses_command_scope),
         ExprKind::Struct { fields, .. } => {
             for field in fields {
-                visit_expression(&field.value, calls);
+                visit_expression(&field.value, calls, uses_command_scope);
             }
         }
         ExprKind::FormatPrint { args, .. }
@@ -616,25 +675,25 @@ fn visit_expression<'a>(expression: &'a Expr, calls: &mut Vec<HostCallSite<'a>>)
         | ExprKind::Array { elements: args }
         | ExprKind::Tuple { elements: args } => {
             for argument in args {
-                visit_expression(argument, calls);
+                visit_expression(argument, calls, uses_command_scope);
             }
         }
-        ExprKind::Closure { body, .. } => visit_expression(body, calls),
+        ExprKind::Closure { body, .. } => visit_expression(body, calls, uses_command_scope),
         ExprKind::Index { base, index } => {
-            visit_expression(base, calls);
-            visit_expression(index, calls);
+            visit_expression(base, calls, uses_command_scope);
+            visit_expression(index, calls, uses_command_scope);
         }
         ExprKind::Range { start, end, .. } => {
             if let Some(start) = start {
-                visit_expression(start, calls);
+                visit_expression(start, calls, uses_command_scope);
             }
             if let Some(end) = end {
-                visit_expression(end, calls);
+                visit_expression(end, calls, uses_command_scope);
             }
         }
         ExprKind::Assign { target, value, .. } => {
-            visit_expression(target, calls);
-            visit_expression(value, calls);
+            visit_expression(target, calls, uses_command_scope);
+            visit_expression(value, calls, uses_command_scope);
         }
         ExprKind::Literal(_)
         | ExprKind::Ident(_)

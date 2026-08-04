@@ -927,6 +927,23 @@ pub(crate) fn host_api_requirement_is_supported(requirement: &VersionReq) -> any
         .any(|version| requirement.matches(&version)))
 }
 
+pub(crate) fn host_api_requirement_requires_at_least(
+    requirement: &VersionReq,
+    introduced: &str,
+) -> anyhow::Result<bool> {
+    let introduced = Version::parse(introduced)?;
+    let supported = SUPPORTED_HOST_API_VERSIONS
+        .iter()
+        .map(|version| Version::parse(version))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(supported
+        .iter()
+        .any(|version| version >= &introduced && requirement.matches(version))
+        && supported
+            .iter()
+            .all(|version| version >= &introduced || !requirement.matches(version)))
+}
+
 fn diagnostic_stage(error: &anyhow::Error) -> &'static str {
     if error.downcast_ref::<husk_diagnostics::Report>().is_some() {
         "compile"
