@@ -394,6 +394,18 @@ fn catalog_package_availability(
     (package.tier.label().to_string(), None)
 }
 
+fn confirmed_catalog_install_action(
+    catalog_url: &str,
+    package: &plugin::catalog::CatalogPackage,
+    trust_native_grammars: bool,
+) -> Action {
+    Action::PluginManagerCatalogInstall {
+        catalog_url: catalog_url.to_string(),
+        package: Box::new(package.clone()),
+        trust_native_grammars,
+    }
+}
+
 fn installed_from_catalog(
     installed: &plugin::package::InstalledPlugin,
     catalog_url: &str,
@@ -1800,7 +1812,8 @@ pub enum Action {
         error: Option<String>,
     },
     PluginManagerCatalogInstall {
-        id: String,
+        catalog_url: String,
+        package: Box<plugin::catalog::CatalogPackage>,
         trust_native_grammars: bool,
     },
     PluginManagerInstall(String),
@@ -15269,21 +15282,24 @@ impl Editor {
                             }),
                         });
                     }
-                    let raw_id = id.to_string();
+                    let confirmed_package = package.clone();
+                    let confirmed_catalog_url = self.plugin_catalog_url.clone();
                     let picker = Picker::builder()
                         .title(&format!("Install {}", package.name))
                         .structured_items(choices)
                         .id(PLUGIN_MANAGER_INSTALL_PICKER_ID)
                         .select_action(move |choice| match choice.as_str() {
                             "cancel" => Action::Refresh,
-                            "install-and-trust" => Action::PluginManagerCatalogInstall {
-                                id: raw_id.clone(),
-                                trust_native_grammars: true,
-                            },
-                            _ => Action::PluginManagerCatalogInstall {
-                                id: raw_id.clone(),
-                                trust_native_grammars: false,
-                            },
+                            "install-and-trust" => confirmed_catalog_install_action(
+                                &confirmed_catalog_url,
+                                &confirmed_package,
+                                true,
+                            ),
+                            _ => confirmed_catalog_install_action(
+                                &confirmed_catalog_url,
+                                &confirmed_package,
+                                false,
+                            ),
                         })
                         .build(self);
                     self.current_dialog = Some(Box::new(picker));
@@ -15291,21 +15307,19 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::PluginManagerCatalogInstall {
-                id,
+                catalog_url,
+                package,
                 trust_native_grammars,
             } => {
                 add_to_history = false;
-                let id = plugin::package::PluginId::parse(id)?;
                 let trust_native_grammars = *trust_native_grammars;
-                let package = self.plugin_catalog.get(&id).ok_or_else(|| {
-                    anyhow::anyhow!("language pack `{id}` is no longer in the catalog")
-                })?;
-                let catalog_url = self.plugin_catalog_url.clone();
+                let catalog_url = catalog_url.clone();
+                let package = (**package).clone();
                 self.last_error = Some(format!("Installing {}…", package.name));
                 tokio::spawn(async move {
                     let manager = plugin::package::PluginPackageManager::new(Config::config_dir());
                     let result = manager
-                        .install_catalog(&catalog_url, &id, trust_native_grammars)
+                        .install_catalog_package(&catalog_url, &package, trust_native_grammars)
                         .await;
                     let (message, reload_languages) = match result {
                         Ok(package)
@@ -22778,6 +22792,38 @@ mod test {
             &catalog[&plugin::package::PluginId::parse("go-language").unwrap()],
         );
         assert!(message.unwrap().contains(crate::language::host_target()));
+    }
+
+    #[test]
+    fn catalog_install_action_binds_the_artifact_shown_for_consent() {
+        let mut package = catalog_test_package();
+        let target = crate::language::host_target();
+        let shown_digest = package.artifacts[target].grammars["go"].clone();
+        let action = confirmed_catalog_install_action(
+            plugin::catalog::DEFAULT_PLUGIN_CATALOG_URL,
+            &package,
+            true,
+        );
+        package.artifacts.get_mut(target).unwrap().grammars.insert(
+            "go".to_string(),
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string(),
+        );
+
+        let Action::PluginManagerCatalogInstall {
+            catalog_url,
+            package: confirmed,
+            trust_native_grammars,
+        } = action
+        else {
+            panic!("expected catalog install action");
+        };
+        assert_eq!(catalog_url, plugin::catalog::DEFAULT_PLUGIN_CATALOG_URL);
+        assert!(trust_native_grammars);
+        assert_eq!(confirmed.artifacts[target].grammars["go"], shown_digest);
+        assert_ne!(
+            confirmed.artifacts[target].grammars["go"],
+            package.artifacts[target].grammars["go"]
+        );
     }
 
     #[test]
