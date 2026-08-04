@@ -10849,7 +10849,12 @@ impl Editor {
             KeyAction::Repeating(_, action) => {
                 Self::collect_pending_panel_plugin_commands(action, runtime, commands);
             }
-            KeyAction::None | KeyAction::Single(_) | KeyAction::Nested(_) => {}
+            KeyAction::Nested(actions) => {
+                for action in actions.values() {
+                    Self::collect_pending_panel_plugin_commands(action, runtime, commands);
+                }
+            }
+            KeyAction::None | KeyAction::Single(_) => {}
         }
     }
 
@@ -30643,7 +30648,7 @@ while True:
     }
 
     #[tokio::test]
-    async fn focused_panel_lazy_activates_plugin_commands_before_checking_scope() {
+    async fn focused_panel_resolves_nested_lazy_commands_before_exposing_prefixes() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let root = tempfile::tempdir().unwrap();
@@ -30701,12 +30706,18 @@ while True:
 
         let mut editor = test_editor(40, 10);
         editor.config.keys.normal.insert(
-            "Ctrl-v".to_string(),
-            KeyAction::Single(Action::PluginCommand("LazyGlobal".to_string())),
+            "F2".to_string(),
+            KeyAction::Nested(HashMap::from([(
+                "x".to_string(),
+                KeyAction::Single(Action::PluginCommand("LazyContextual".to_string())),
+            )])),
         );
         editor.config.keys.normal.insert(
-            "Ctrl-t".to_string(),
-            KeyAction::Single(Action::PluginCommand("LazyContextual".to_string())),
+            "F3".to_string(),
+            KeyAction::Nested(HashMap::from([(
+                "x".to_string(),
+                KeyAction::Single(Action::PluginCommand("LazyGlobal".to_string())),
+            )])),
         );
         editor.test_create_panel(
             "tree",
@@ -30735,7 +30746,7 @@ while True:
 
         editor
             .process_editor_event(
-                Event::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
+                Event::Key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)),
                 &mut render_buffer,
                 &mut runtime,
                 EventRenderMode::Immediate,
@@ -30747,11 +30758,23 @@ while True:
             editor.plugin_registry.statuses().get("lazy-panel-commands"),
             Some(&plugin::PluginStatus::Active)
         );
-        assert_eq!(collect_print_requests(), ["panel fallback"]);
+        assert!(editor.waiting_key_action.is_none());
+        assert!(collect_print_requests().is_empty());
 
         editor
             .process_editor_event(
-                Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+                Event::Key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+        assert!(editor.waiting_key_action.is_some());
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
                 &mut render_buffer,
                 &mut runtime,
                 EventRenderMode::Immediate,

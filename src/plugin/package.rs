@@ -1707,6 +1707,17 @@ symbol = "tree_sitter_buildspec"
     fn package_manifest_accepts_supported_prior_host_api() {
         let package = tempfile::tempdir().unwrap();
         write_package(package.path(), "compatible-package", "1.0.0");
+        fs::write(
+            package.path().join("src/main.hk"),
+            r#"
+                pub fn activate() {
+                    let metadata = Json { title: "Test" };
+                    red::add_command("Test", test, metadata);
+                }
+                fn test() {}
+            "#,
+        )
+        .unwrap();
         let manifest_path = package.path().join(PLUGIN_MANIFEST_FILE);
         let source = fs::read_to_string(&manifest_path)
             .unwrap()
@@ -1736,6 +1747,16 @@ symbol = "tree_sitter_buildspec"
                 r#"
                     pub fn activate() {
                         red::add_command("Test", test, Json { scope: "global" });
+                    }
+                    fn test() {}
+                "#,
+            ),
+            (
+                "imperative-variable",
+                r#"
+                    pub fn activate() {
+                        let metadata = Json { scope: "global" };
+                        red::add_command("Test", test, metadata);
                     }
                     fn test() {}
                 "#,
