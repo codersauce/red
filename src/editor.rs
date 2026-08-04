@@ -2905,6 +2905,8 @@ impl Editor {
         )?);
         let highlighter = Highlighter::with_registry(&self.theme, Arc::clone(&registry))?;
         let indentation = Self::configured_indentation(&loaded.config);
+        let previous_routing = crate::lsp::LspManager::new(self.config.lsp.clone());
+        let updated_routing = crate::lsp::LspManager::new(loaded.config.lsp.clone());
         let affected = self.lsp.reconfigure(loaded.config.lsp.clone()).await?;
         let affected = affected.into_iter().collect::<HashSet<_>>();
 
@@ -2918,7 +2920,9 @@ impl Editor {
             })
             .collect::<Vec<_>>();
         for (file, uri, contents) in documents {
-            if affected.contains(&file) {
+            let gained_route = previous_routing.resolve_document(&file).is_none()
+                && updated_routing.resolve_document(&file).is_some();
+            if affected.contains(&file) || gained_route {
                 self.lsp_coordinator.mark_document_closed(&uri);
                 self.diagnostics.remove(&uri);
             }

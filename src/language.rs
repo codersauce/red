@@ -237,6 +237,17 @@ impl GrammarTrustStore {
                 }
             }
         }
+        let (_, staged_digest) = inspect_native_grammar(&staged).with_context(|| {
+            format!(
+                "failed to verify cached native grammar {}",
+                staged.display()
+            )
+        })?;
+        anyhow::ensure!(
+            staged_digest == digest,
+            "cached native grammar {} does not match its approved digest",
+            staged.display()
+        );
         Ok(staged)
     }
 
@@ -268,22 +279,34 @@ impl GrammarTrustStore {
     fn persist(&self, trust: &GrammarTrustData) -> Result<()> {
         fs::create_dir_all(&self.config_dir)?;
         let target = self.config_dir.join(TRUST_STORE_FILENAME);
-        let temporary = self.config_dir.join(format!(
-            ".{TRUST_STORE_FILENAME}.{}.tmp",
-            std::process::id()
-        ));
-        fs::write(&temporary, serde_json::to_vec_pretty(trust)?)?;
+        let mut temporary = tempfile::Builder::new()
+            .prefix(&format!(".{TRUST_STORE_FILENAME}."))
+            .tempfile_in(&self.config_dir)
+            .with_context(|| {
+                format!(
+                    "failed to create native-grammar trust store replacement in {}",
+                    self.config_dir.display()
+                )
+            })?;
+        serde_json::to_writer_pretty(temporary.as_file_mut(), trust)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+            temporary
+                .as_file()
+                .set_permissions(fs::Permissions::from_mode(0o600))?;
         }
-        fs::rename(&temporary, &target).with_context(|| {
-            format!(
-                "failed to update native-grammar trust store {}",
-                target.display()
-            )
-        })
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(&target)
+            .map(|_| ())
+            .map_err(|error| error.error)
+            .with_context(|| {
+                format!(
+                    "failed to update native-grammar trust store {}",
+                    target.display()
+                )
+            })
     }
 }
 
@@ -350,5 +373,47 @@ mod tests {
 
         trust.trust_path(&grammar).unwrap();
         assert!(trust.approved_grammar_path(&grammar, true).is_ok());
+    }
+
+    #[test]
+    fn cached_grammar_bytes_must_match_the_approved_digest() {
+        let directory = tempfile::tempdir().unwrap();
+        let grammar = directory.path().join("example.so");
+        fs::write(&grammar, b"approved grammar").unwrap();
+        let config_dir = directory.path().join("config");
+        let trust = GrammarTrustStore::new(&config_dir);
+        let digest = trust.trust_path(&grammar).unwrap();
+        let cache_dir = config_dir.join("grammar-cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let staged = cache_dir.join(format!("{digest}.so"));
+        fs::write(&staged, b"unapproved grammar").unwrap();
+
+        let error = trust.approved_grammar_path(&grammar, false).unwrap_err();
+
+        assert!(error.to_string().contains("approved digest"));
+        assert_eq!(fs::read(&staged).unwrap(), b"unapproved grammar");
+    }
+
+    #[test]
+    fn trust_store_replaces_existing_approvals_and_revocations() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.so");
+        let second = directory.path().join("second.so");
+        fs::write(&first, b"first grammar").unwrap();
+        fs::write(&second, b"second grammar").unwrap();
+        let trust = GrammarTrustStore::new(directory.path().join("config"));
+
+        trust.trust_path(&first).unwrap();
+        trust.trust_path(&second).unwrap();
+        assert!(trust.approved_grammar_path(&first, false).is_ok());
+        assert!(trust.approved_grammar_path(&second, false).is_ok());
+
+        trust.revoke_path(&first).unwrap();
+        assert!(trust.approved_grammar_path(&first, false).is_err());
+        assert!(trust.approved_grammar_path(&second, false).is_ok());
+
+        fs::write(&second, b"renewed second grammar").unwrap();
+        trust.trust_path(&second).unwrap();
+        assert!(trust.approved_grammar_path(&second, false).is_ok());
     }
 }

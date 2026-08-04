@@ -34,6 +34,48 @@ use std::{
 static COMMAND_COMPLETION_CWD_LOCK: Mutex<()> = Mutex::new(());
 
 #[tokio::test]
+async fn language_reload_opens_previously_tracked_buffers_that_gain_a_route() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    let file = directory
+        .path()
+        .join("Buildfile")
+        .to_string_lossy()
+        .into_owned();
+    fs::write(&config_path, "").unwrap();
+    let lsp = RecordingLsp::default();
+    let events = lsp.events();
+    let mut editor = Editor::with_size(
+        Box::new(lsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        vec![Buffer::new(Some(file.clone()), "contents".to_string())],
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    editor.set_language_reload_source(config_path.clone(), Vec::new());
+    editor.reload_languages().await.unwrap();
+    events.lock().unwrap().clear();
+    fs::write(
+        &config_path,
+        r#"
+[languages.buildspec]
+filenames = ["Buildfile"]
+
+[languages.buildspec.lsp]
+command = "mock-lsp"
+"#,
+    )
+    .unwrap();
+
+    editor.reload_languages().await.unwrap();
+
+    assert_eq!(*events.lock().unwrap(), [LspEvent::DidOpen(file)]);
+}
+
+#[tokio::test]
 async fn agent_editor_tools_navigate_select_and_stage_unicode_edits_without_touching_disk() {
     let root = tempfile::tempdir().unwrap();
     let first = root.path().join("first.rs");
