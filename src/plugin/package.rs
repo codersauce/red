@@ -1345,8 +1345,15 @@ fn validate_catalog_manifest(
             .with_context(|| format!("failed to read catalog grammar {}", path.display()))?;
         actual_grammars.insert(language_id.clone(), format!("{:x}", Sha256::digest(bytes)));
     }
+    let grammar_digests_match = actual_grammars.len() == artifact.grammars.len()
+        && actual_grammars.iter().all(|(language, actual)| {
+            artifact
+                .grammars
+                .get(language)
+                .is_some_and(|expected| actual.eq_ignore_ascii_case(expected))
+        });
     anyhow::ensure!(
-        actual_grammars == artifact.grammars,
+        grammar_digests_match,
         "catalog grammar digests do not match the package manifest"
     );
     Ok(())
@@ -1727,6 +1734,34 @@ symbol = "tree_sitter_buildspec"
 
         assert!(error.to_string().contains("GitHub HTTPS"));
         assert!(manager.list().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn catalog_archive_accepts_uppercase_grammar_digests() {
+        let config = tempfile::tempdir().unwrap();
+        let manager = PluginPackageManager::new(config.path());
+        let (bytes, mut artifact) = catalog_archive();
+        for digest in artifact.grammars.values_mut() {
+            *digest = digest.to_ascii_uppercase();
+        }
+        let package = catalog_package(artifact.clone());
+
+        let installed = manager
+            .install_catalog_archive(
+                "https://raw.githubusercontent.com/codersauce/red-language-packs/main/catalog/v1.json",
+                &package,
+                &artifact,
+                &bytes,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(installed.id.as_str(), "build-languages");
+        assert!(installed
+            .package_root
+            .join("grammars/buildspec.so")
+            .is_file());
     }
 
     #[tokio::test]
