@@ -482,12 +482,24 @@ impl PluginPackageManager {
         self.install_companion_artifact(&manifest, &staging).await?;
         self.install_language_artifacts(&manifest, &staging, false)
             .await?;
-        atomic_replace_directory(&staging, &destination)?;
-        if trust_native_grammars {
-            self.approve_package_grammars(&manifest, &destination)?;
-        }
+        self.activate_github_package(&manifest, &staging, &destination, trust_native_grammars)?;
         self.installed(&id)?
             .ok_or_else(|| anyhow::anyhow!("installed plugin `{id}` could not be read"))
+    }
+
+    fn activate_github_package(
+        &self,
+        manifest: &PluginPackageManifest,
+        staging: &Path,
+        destination: &Path,
+        trust_native_grammars: bool,
+    ) -> Result<()> {
+        atomic_replace_directory_validated(staging, destination, |activated| {
+            if trust_native_grammars {
+                self.approve_package_grammars(manifest, activated)?;
+            }
+            Ok(())
+        })
     }
 
     /// Lists installed packages in stable identifier order.
@@ -748,12 +760,7 @@ impl PluginPackageManager {
             tokio::fs::create_dir_all(&directory).await?;
             let filename = grammar_filename(id);
             let path = directory.join(&filename);
-            let temporary = directory.join(format!(".{filename}.tmp"));
-            let mut file = tokio::fs::File::create(&temporary).await?;
-            file.write_all(&bytes).await?;
-            file.sync_all().await?;
-            drop(file);
-            tokio::fs::rename(&temporary, &path).await?;
+            publish_downloaded_grammar(&path, &bytes).await?;
         }
         if trust_native_grammars {
             self.approve_package_grammars(manifest, package_root)?;
@@ -767,12 +774,12 @@ impl PluginPackageManager {
         package_root: &Path,
     ) -> Result<()> {
         let trust = GrammarTrustStore::new(&self.config_dir);
-        for (id, language) in &manifest.languages {
-            if let Some(path) = manifest.grammar_path(package_root, id, language) {
-                trust.trust_path(&path)?;
-            }
-        }
-        Ok(())
+        let paths = manifest
+            .languages
+            .iter()
+            .filter_map(|(id, language)| manifest.grammar_path(package_root, id, language))
+            .collect::<Vec<_>>();
+        trust.trust_paths(&paths)
     }
 
     fn staging_dir(&self, label: &str) -> PathBuf {
@@ -886,6 +893,30 @@ fn grammar_filename(id: &str) -> String {
     format!("{id}.{extension}")
 }
 
+async fn publish_downloaded_grammar(path: &Path, bytes: &[u8]) -> Result<()> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("downloaded grammar path has no parent"))?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".red-grammar-")
+        .tempfile_in(directory)
+        .with_context(|| {
+            format!(
+                "failed to create downloaded grammar replacement in {}",
+                directory.display()
+            )
+        })?;
+    let mut file = tokio::fs::File::from_std(temporary.reopen()?);
+    file.write_all(bytes).await?;
+    file.sync_all().await?;
+    drop(file);
+    temporary
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to publish downloaded grammar {}", path.display()))
+}
+
 fn validate_github_repository(repository: &str) -> Result<()> {
     let parts = repository.split('/').collect::<Vec<_>>();
     anyhow::ensure!(
@@ -948,6 +979,14 @@ fn write_record_atomic(directory: &Path, record: &PluginInstallRecord) -> Result
 }
 
 fn atomic_replace_directory(staging: &Path, destination: &Path) -> Result<()> {
+    atomic_replace_directory_validated(staging, destination, |_| Ok(()))
+}
+
+fn atomic_replace_directory_validated(
+    staging: &Path,
+    destination: &Path,
+    validate: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     let parent = destination
         .parent()
         .ok_or_else(|| anyhow::anyhow!("plugin destination has no parent"))?;
@@ -978,6 +1017,25 @@ fn atomic_replace_directory(staging: &Path, destination: &Path) -> Result<()> {
                 destination.display()
             )
         });
+    }
+    if let Err(error) = validate(destination) {
+        if let Err(rollback_error) = remove_if_exists(destination).and_then(|()| {
+            if backup.exists() {
+                fs::rename(&backup, destination).with_context(|| {
+                    format!(
+                        "failed to restore previous plugin installation {}",
+                        destination.display()
+                    )
+                })?;
+            }
+            Ok(())
+        }) {
+            return Err(error).context(format!(
+                "failed to roll back plugin installation {}: {rollback_error:#}",
+                destination.display()
+            ));
+        }
+        return Err(error);
     }
     remove_if_exists(&backup)?;
     Ok(())
@@ -1099,6 +1157,99 @@ builtin = "rust"
             ),
         )
         .unwrap();
+    }
+
+    fn write_oversized_native_language_package(root: &Path, id: &str, version: &str) {
+        let grammar_dir = root.join("grammars");
+        fs::create_dir_all(&grammar_dir).unwrap();
+        fs::File::create(grammar_dir.join("buildspec.so"))
+            .unwrap()
+            .set_len(64 * 1024 * 1024 + 1)
+            .unwrap();
+        fs::write(
+            root.join(PLUGIN_MANIFEST_FILE),
+            format!(
+                r#"
+schema_version = 1
+
+[plugin]
+id = "{id}"
+name = "Native language package"
+version = "{version}"
+red_api = "^{RED_HOST_API_VERSION}"
+
+[languages.buildspec]
+extensions = ["build"]
+
+[languages.buildspec.grammar]
+path = "grammars/buildspec.so"
+symbol = "tree_sitter_buildspec"
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn downloaded_grammar_replaces_existing_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(grammar_filename("buildspec"));
+
+        publish_downloaded_grammar(&path, b"original grammar")
+            .await
+            .unwrap();
+        publish_downloaded_grammar(&path, b"replacement grammar")
+            .await
+            .unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"replacement grammar");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn github_update_restores_previous_installation_when_grammar_approval_fails() {
+        let config = tempfile::tempdir().unwrap();
+        let previous = tempfile::tempdir().unwrap();
+        write_language_package(previous.path(), "build-languages");
+        let manager = PluginPackageManager::new(config.path());
+        let original = manager.install_path(previous.path()).await.unwrap();
+        let destination = manager.packages_dir().join(original.id.as_str());
+        let staging = manager.staging_dir("github-test");
+        fs::create_dir_all(&staging).unwrap();
+        write_oversized_native_language_package(&staging, "build-languages", "2.0.0");
+        let manifest = PluginPackageManifest::load(&staging).unwrap();
+
+        let error = manager
+            .activate_github_package(&manifest, &staging, &destination, true)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("safety limit"));
+        let restored = manager.installed(&original.id).unwrap().unwrap();
+        assert_eq!(restored.version, Version::parse("1.0.0").unwrap());
+        assert_eq!(
+            restored.package_root,
+            previous.path().canonicalize().unwrap()
+        );
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn failed_github_grammar_approval_does_not_publish_new_installation() {
+        let config = tempfile::tempdir().unwrap();
+        let manager = PluginPackageManager::new(config.path());
+        let destination = manager.packages_dir().join("build-languages");
+        let staging = manager.staging_dir("github-test");
+        fs::create_dir_all(&staging).unwrap();
+        write_oversized_native_language_package(&staging, "build-languages", "1.0.0");
+        let manifest = PluginPackageManifest::load(&staging).unwrap();
+
+        let error = manager
+            .activate_github_package(&manifest, &staging, &destination, true)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("safety limit"));
+        assert!(!destination.exists());
+        assert!(manager.list().unwrap().is_empty());
     }
 
     #[tokio::test]

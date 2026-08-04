@@ -236,8 +236,19 @@ fn client_key(document: &DocumentInfo) -> String {
     )
 }
 
-fn client_source_from_key(key: &str) -> (&str, &str) {
-    key.split_once(':').unwrap_or((key, ""))
+fn client_source_from_key<'a>(key: &'a str, config: &LspConfig) -> (&'a str, &'a str) {
+    let server_name = config
+        .servers
+        .keys()
+        .filter(|server| {
+            key.strip_prefix(server.as_str())
+                .is_some_and(|workspace| workspace.starts_with(':'))
+        })
+        .max_by_key(|server| server.len());
+    match server_name {
+        Some(server) => (&key[..server.len()], &key[server.len() + 1..]),
+        None => key.split_once(':').unwrap_or((key, "")),
+    }
 }
 
 fn document_key(document: &DocumentInfo) -> String {
@@ -278,9 +289,7 @@ impl LspClient for LspManager {
             .iter()
             .filter(|(file, client)| {
                 disabled
-                    || client
-                        .split_once(':')
-                        .is_some_and(|(server, _)| changed.contains(server))
+                    || changed.contains(client_source_from_key(client, &self.config).0)
                     || self.resolve_document(file) != replacement.resolve_document(file)
             })
             .map(|(file, _)| file.clone())
@@ -295,12 +304,7 @@ impl LspClient for LspManager {
         let keys = self
             .clients
             .keys()
-            .filter(|key| {
-                disabled
-                    || key
-                        .split_once(':')
-                        .is_some_and(|(server, _)| changed.contains(server))
-            })
+            .filter(|key| disabled || changed.contains(client_source_from_key(key, &self.config).0))
             .cloned()
             .collect::<Vec<_>>();
         let replaced_clients = keys.iter().cloned().collect::<HashSet<_>>();
@@ -325,10 +329,7 @@ impl LspClient for LspManager {
             }
         }
         self.failed_clients.retain(|key| {
-            !disabled
-                && !key
-                    .split_once(':')
-                    .is_some_and(|(server, _)| changed.contains(server))
+            !disabled && !changed.contains(client_source_from_key(key, &self.config).0)
         });
         for file in &affected {
             self.document_clients.remove(file);
@@ -336,9 +337,7 @@ impl LspClient for LspManager {
         self.opened_documents.retain(|document| {
             !disabled
                 && !affected_documents.contains(document)
-                && !changed
-                    .iter()
-                    .any(|server| document.starts_with(&format!("{server}:")))
+                && !changed.contains(client_source_from_key(document, &self.config).0)
         });
         self.config = replacement.config;
         self.document_selectors = replacement.document_selectors;
@@ -699,7 +698,8 @@ impl LspClient for LspManager {
                 if let InboundMessage::Notification(ParsedNotification::Progress(progress)) =
                     &mut message
                 {
-                    let (server_name, workspace_root) = client_source_from_key(client_key);
+                    let (server_name, workspace_root) =
+                        client_source_from_key(client_key, &self.config);
                     progress.enrich(server_name, workspace_root);
                 }
                 if let InboundMessage::ServerRequest(request) = &mut message {
@@ -1148,6 +1148,70 @@ mod tests {
         assert!(!manager.clients.contains_key(&key));
         assert!(!manager.document_clients.contains_key(&file));
         assert!(!manager.opened_documents.contains(&document_key(&document)));
+    }
+
+    #[tokio::test]
+    async fn reconfigure_replaces_servers_whose_names_contain_colons() {
+        let root = std::env::current_dir().unwrap();
+        let typescript = server("typescript", &["ts"]);
+        let server_name = "typescript:eslint";
+        let mut manager = LspManager::new(LspConfig {
+            enabled: true,
+            format_on_save: false,
+            servers: HashMap::from([(server_name.to_string(), typescript.clone())]),
+        });
+        let file = root.join("example.ts").to_string_lossy().into_owned();
+        let document = manager.resolve_document(&file).unwrap();
+        let key = client_key(&document);
+        let (request_tx, request_rx) = tokio::sync::mpsc::channel(1);
+        drop(request_rx);
+        let (_response_tx, response_rx) = tokio::sync::mpsc::channel(1);
+        manager.clients.insert(
+            key.clone(),
+            RealLspClient::with_test_channels(request_tx, response_rx, typescript.clone(), root),
+        );
+        manager.document_clients.insert(file.clone(), key.clone());
+        manager.opened_documents.insert(document_key(&document));
+
+        let mut replacement = typescript;
+        replacement.command = "replacement-eslint".to_string();
+        let affected = manager
+            .reconfigure(LspConfig {
+                enabled: true,
+                format_on_save: false,
+                servers: HashMap::from([(server_name.to_string(), replacement)]),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(affected, std::slice::from_ref(&file));
+        assert!(!manager.clients.contains_key(&key));
+        assert!(!manager.document_clients.contains_key(&file));
+        assert!(!manager.opened_documents.contains(&document_key(&document)));
+    }
+
+    #[test]
+    fn client_source_preserves_colon_names_and_windows_workspace_roots() {
+        let config = LspConfig {
+            enabled: true,
+            format_on_save: false,
+            servers: HashMap::from([
+                ("typescript".to_string(), server("typescript", &["ts"])),
+                (
+                    "typescript:eslint".to_string(),
+                    server("typescript", &["tsx"]),
+                ),
+            ]),
+        };
+
+        assert_eq!(
+            client_source_from_key("typescript:eslint:C:\\workspace", &config),
+            ("typescript:eslint", "C:\\workspace")
+        );
+        assert_eq!(
+            client_source_from_key("typescript:/workspace", &config),
+            ("typescript", "/workspace")
+        );
     }
 
     #[test]

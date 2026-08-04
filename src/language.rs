@@ -168,6 +168,21 @@ impl GrammarTrustStore {
         Ok(digest)
     }
 
+    /// Approves a complete package grammar set in one durable trust-store update.
+    pub(crate) fn trust_paths(&self, paths: &[PathBuf]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut trust = self.load()?;
+        for path in paths {
+            let (canonical, digest) = inspect_native_grammar(path)?;
+            trust
+                .grammars
+                .insert(canonical.to_string_lossy().into_owned(), digest);
+        }
+        self.persist(&trust)
+    }
+
     /// Revokes every digest approval associated with one canonical grammar path.
     pub fn revoke_path(&self, path: &Path) -> Result<()> {
         let canonical = path
@@ -415,5 +430,23 @@ mod tests {
         fs::write(&second, b"renewed second grammar").unwrap();
         trust.trust_path(&second).unwrap();
         assert!(trust.approved_grammar_path(&second, false).is_ok());
+    }
+
+    #[test]
+    fn package_grammar_approval_is_atomic_when_one_grammar_is_invalid() {
+        let directory = tempfile::tempdir().unwrap();
+        let valid = directory.path().join("valid.so");
+        let oversized = directory.path().join("oversized.so");
+        fs::write(&valid, b"valid grammar").unwrap();
+        fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_NATIVE_GRAMMAR_BYTES + 1)
+            .unwrap();
+        let trust = GrammarTrustStore::new(directory.path().join("config"));
+
+        let error = trust.trust_paths(&[valid.clone(), oversized]).unwrap_err();
+
+        assert!(error.to_string().contains("safety limit"));
+        assert!(trust.approved_grammar_path(&valid, false).is_err());
     }
 }

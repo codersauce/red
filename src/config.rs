@@ -137,6 +137,9 @@ impl LoadedConfig {
     #[must_use]
     pub fn explicit_language_server_names(&self) -> HashSet<String> {
         self.explicit_names_at_path("lsp", "servers")
+            .into_iter()
+            .filter(|name| self.config.lsp.servers.contains_key(name))
+            .collect()
     }
 
     /// Returns legacy comment templates explicitly supplied by the user or CLI.
@@ -900,11 +903,11 @@ impl Config {
                     );
                 }
             }
-            let server = self
-                .lsp
-                .servers
-                .get_mut(server_name)
-                .expect("language server was validated or inserted");
+            let server = self.lsp.servers.get_mut(server_name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "language `{id}` language server `{server_name}` was not configured"
+                )
+            })?;
             if server.documents.is_empty() {
                 server.documents = server.documents();
             }
@@ -3692,6 +3695,43 @@ command = "generated-server"
         assert_eq!(server.documents().len(), 1);
         assert_eq!(server.documents()[0].file_extensions, ["new", "old"]);
         assert_eq!(server.documents()[0].filenames, ["Customfile"]);
+    }
+
+    #[test]
+    fn language_local_lsp_recovers_from_a_quarantined_explicit_server() {
+        let mut loaded = Config::load_user_toml(
+            r#"
+[lsp.servers.custom]
+command = ["invalid"]
+
+[languages.custom]
+extensions = ["custom"]
+
+[languages.custom.lsp]
+command = "generated-server"
+"#,
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+
+        assert!(!loaded.config.lsp.servers.contains_key("custom"));
+        let explicit_servers = loaded.explicit_language_server_names();
+        let explicit_comments = loaded.explicit_comment_language_names();
+        assert!(!explicit_servers.contains("custom"));
+        loaded
+            .config
+            .apply_language_definitions(&explicit_servers, &explicit_comments)
+            .unwrap();
+
+        assert_eq!(
+            loaded.config.lsp.servers["custom"].command,
+            "generated-server"
+        );
+        assert!(loaded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.path == r#"lsp.servers["custom"]"#));
     }
 
     #[test]
