@@ -76,6 +76,59 @@ command = "mock-lsp"
 }
 
 #[tokio::test]
+async fn failed_language_reload_restores_previous_lsp_routing_and_can_be_retried() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    let file = directory
+        .path()
+        .join("Buildfile")
+        .to_string_lossy()
+        .into_owned();
+    fs::write(
+        &config_path,
+        r#"
+[languages.buildspec]
+filenames = ["Buildfile"]
+
+[languages.buildspec.lsp]
+command = "mock-lsp"
+"#,
+    )
+    .unwrap();
+    let lsp = RecordingLsp::failing_next_did_open();
+    let events = lsp.events();
+    let reconfigurations = lsp.reconfigurations();
+    let mut editor = Editor::with_size(
+        Box::new(lsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        vec![Buffer::new(Some(file.clone()), "contents".to_string())],
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    editor.set_language_reload_source(config_path, Vec::new());
+
+    let error = editor.reload_languages().await.unwrap_err();
+
+    assert!(error.to_string().contains("injected didOpen failure"));
+    {
+        let configurations = reconfigurations.lock().unwrap();
+        assert_eq!(configurations.len(), 2);
+        assert!(configurations[0].servers.contains_key("buildspec"));
+        assert!(!configurations[1].servers.contains_key("buildspec"));
+    }
+
+    editor.reload_languages().await.unwrap();
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        [LspEvent::DidOpen(file.clone()), LspEvent::DidOpen(file)]
+    );
+}
+
+#[tokio::test]
 async fn agent_editor_tools_navigate_select_and_stage_unicode_edits_without_touching_disk() {
     let root = tempfile::tempdir().unwrap();
     let first = root.path().join("first.rs");

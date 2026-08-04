@@ -2919,17 +2919,47 @@ impl Editor {
                 Some((file, uri, buffer.contents()))
             })
             .collect::<Vec<_>>();
-        for (file, uri, contents) in documents {
-            let gained_route = previous_routing.resolve_document(&file).is_none()
-                && updated_routing.resolve_document(&file).is_some();
-            if affected.contains(&file) || gained_route {
+        let mut reopened = Vec::new();
+        for (file, uri, contents) in &documents {
+            let gained_route = previous_routing.resolve_document(file).is_none()
+                && updated_routing.resolve_document(file).is_some();
+            let route_changed = affected.contains(file) || gained_route;
+            if route_changed || !self.lsp_coordinator.is_document_opened(uri) {
+                if let Err(error) = self.lsp.did_open(file, contents).await {
+                    self.lsp
+                        .reconfigure(self.config.lsp.clone())
+                        .await
+                        .map_err(|rollback_error| {
+                            anyhow::anyhow!(
+                                "failed to reopen {file}: {error}; failed to restore previous LSP routing: {rollback_error}"
+                            )
+                        })?;
+                    for (previous_file, previous_uri, previous_contents) in &documents {
+                        if affected.contains(previous_file)
+                            && self.lsp_coordinator.is_document_opened(previous_uri)
+                            && previous_routing.resolve_document(previous_file).is_some()
+                        {
+                            self.lsp
+                                .did_open(previous_file, previous_contents)
+                                .await
+                                .map_err(|restore_error| {
+                                    anyhow::anyhow!(
+                                        "failed to reopen {file}: {error}; failed to restore {previous_file}: {restore_error}"
+                                    )
+                                })?;
+                        }
+                    }
+                    return Err(error.into());
+                }
+                reopened.push((uri.clone(), route_changed));
+            }
+        }
+        for (uri, route_changed) in reopened {
+            if route_changed {
                 self.lsp_coordinator.mark_document_closed(&uri);
                 self.diagnostics.remove(&uri);
             }
-            if !self.lsp_coordinator.is_document_opened(&uri) {
-                self.lsp.did_open(&file, &contents).await?;
-                self.lsp_coordinator.mark_document_opened(uri);
-            }
+            self.lsp_coordinator.mark_document_opened(uri);
         }
 
         let count = loaded.config.languages.len();

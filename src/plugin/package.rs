@@ -740,6 +740,7 @@ impl PluginPackageManager {
             let Some(url) = &artifact.url else {
                 continue;
             };
+            let directory = grammar_download_directory(package_root)?;
             let bytes = reqwest::get(url)
                 .await
                 .with_context(|| format!("failed to download grammar for `{id}` from {url}"))?
@@ -753,11 +754,6 @@ impl PluginPackageManager {
                 actual.eq_ignore_ascii_case(expected),
                 "grammar checksum mismatch for `{id}`: expected {expected}, got {actual}"
             );
-            let directory = package_root
-                .join(".red")
-                .join("grammars")
-                .join(host_target());
-            tokio::fs::create_dir_all(&directory).await?;
             let filename = grammar_filename(id);
             let path = directory.join(&filename);
             publish_downloaded_grammar(&path, &bytes).await?;
@@ -891,6 +887,44 @@ fn grammar_filename(id: &str) -> String {
         "so"
     };
     format!("{id}.{extension}")
+}
+
+fn grammar_download_directory(package_root: &Path) -> Result<PathBuf> {
+    let mut directory = package_root.to_path_buf();
+    for component in [".red", "grammars", host_target()] {
+        directory.push(component);
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) => {
+                anyhow::ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "grammar download directory contains a symbolic link: {}",
+                    directory.display()
+                );
+                anyhow::ensure!(
+                    metadata.is_dir(),
+                    "grammar download destination is not a directory: {}",
+                    directory.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&directory).with_context(|| {
+                    format!(
+                        "failed to create grammar download directory {}",
+                        directory.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect grammar download directory {}",
+                        directory.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(directory)
 }
 
 async fn publish_downloaded_grammar(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -1204,6 +1238,45 @@ symbol = "tree_sitter_buildspec"
 
         assert_eq!(fs::read(&path).unwrap(), b"replacement grammar");
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn grammar_download_directory_creates_real_package_directories() {
+        let package = tempfile::tempdir().unwrap();
+
+        let directory = grammar_download_directory(package.path()).unwrap();
+
+        assert_eq!(
+            directory,
+            package
+                .path()
+                .join(".red")
+                .join("grammars")
+                .join(host_target())
+        );
+        assert!(directory.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grammar_download_directory_rejects_every_symlinked_component() {
+        for depth in 0..3 {
+            let package = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let components = [".red", "grammars", host_target()];
+            let mut parent = package.path().to_path_buf();
+            for component in components.iter().take(depth) {
+                parent.push(component);
+                fs::create_dir(&parent).unwrap();
+            }
+            let symlink = parent.join(components[depth]);
+            std::os::unix::fs::symlink(outside.path(), &symlink).unwrap();
+
+            let error = grammar_download_directory(package.path()).unwrap_err();
+
+            assert!(error.to_string().contains("symbolic link"));
+            assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+        }
     }
 
     #[tokio::test]

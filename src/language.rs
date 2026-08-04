@@ -105,6 +105,13 @@ pub fn finalize_language_configuration(loaded: &mut LoadedConfig, config_dir: &P
             })
             .or_else(|| {
                 definition.lsp.as_ref().and_then(|lsp| {
+                    if lsp
+                        .command
+                        .as_ref()
+                        .is_some_and(|command| command.trim().is_empty())
+                    {
+                        return Some("LSP command must not be empty");
+                    }
                     let server = lsp.server.as_deref().unwrap_or(&id);
                     (lsp.command.is_none() && !loaded.config.lsp.servers.contains_key(server))
                         .then_some("LSP references an unknown server")
@@ -343,6 +350,37 @@ fn inspect_native_grammar(path: &Path) -> Result<(PathBuf, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_language_lsp_commands_are_quarantined_without_rejecting_valid_languages() {
+        for command in ["", "   "] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = format!(
+                r#"
+[languages.valid]
+extensions = ["valid"]
+
+[languages.invalid]
+extensions = ["invalid"]
+
+[languages.invalid.lsp]
+command = "{command}"
+"#
+            );
+            let mut loaded =
+                Config::load_user_toml(&source, &directory.path().join("config.toml"), &[])
+                    .unwrap();
+
+            finalize_language_configuration(&mut loaded, directory.path()).unwrap();
+
+            assert!(loaded.config.languages.contains_key("valid"));
+            assert!(!loaded.config.languages.contains_key("invalid"));
+            assert!(loaded.diagnostics.iter().any(|diagnostic| {
+                diagnostic.path == "languages.invalid"
+                    && diagnostic.message.contains("LSP command must not be empty")
+            }));
+        }
+    }
 
     #[test]
     fn trust_is_bound_to_path_and_current_digest() {
