@@ -10490,6 +10490,12 @@ impl Editor {
                     KeyCode::Char('c') if event.modifiers.contains(KeyModifiers::CONTROL) => {
                         "interrupt"
                     }
+                    KeyCode::Char('r')
+                        if self.panel_manager.focused_row_panel()
+                            && event.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        "Ctrl-r"
+                    }
                     KeyCode::Char('H') => "history",
                     KeyCode::Char('N') => "new",
                     KeyCode::Char('a') if !self.panel_manager.focused_row_panel() => {

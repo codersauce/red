@@ -5353,7 +5353,12 @@ async fn focused_panel_allows_explicitly_global_plugin_commands() {
 #[test]
 fn focused_row_panel_forwards_file_operation_keys_to_its_plugin() {
     let buffer = Buffer::new(None, "abcdef".to_string());
-    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    let mut config = default_key_config();
+    config
+        .keys
+        .normal
+        .insert("Ctrl-r".to_string(), KeyAction::Single(Action::FilePicker));
+    let mut harness = EditorHarness::with_config(buffer, config);
     add_tree_panel(&mut harness);
     assert!(harness.editor.test_focus_panel("tree"));
 
