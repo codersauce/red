@@ -12,20 +12,31 @@ use crate::{
 };
 
 use super::{
+    agent_composer::wrap_text,
     dialog::{BorderStyle, Dialog, SurfaceRole},
     Component, PickerItem,
 };
 
-const ACCEPT_LABEL: &str = "[ Accept ]";
-const CANCEL_LABEL: &str = "[ Cancel ]";
 const BUTTON_GAP: usize = 2;
 
-/// A two-line confirmation surface that defaults to the safe Cancel action.
+enum ConfirmationTarget {
+    Callback(PickerHandle),
+    Actions {
+        accept: Box<Action>,
+        cancel: Box<Action>,
+    },
+}
+
+/// A confirmation surface that defaults to the safe Cancel action.
 pub struct Confirmation {
     dialog: Dialog,
     message: String,
     accept_selected: bool,
-    callback_handle: PickerHandle,
+    target: ConfirmationTarget,
+    accept_label: String,
+    cancel_label: String,
+    multiline: bool,
+    scroll: usize,
     style: Style,
     theme: Theme,
 }
@@ -37,19 +48,73 @@ impl Confirmation {
         message: impl Into<String>,
         callback_handle: PickerHandle,
     ) -> Self {
-        let title = title.into();
-        let message = message.into();
+        Self::with_target(
+            editor,
+            title.into(),
+            message.into(),
+            "Accept",
+            "Cancel",
+            false,
+            ConfirmationTarget::Callback(callback_handle),
+        )
+    }
+
+    /// Creates an editor-owned, multiline confirmation with explicit terminal actions.
+    pub fn new_actions(
+        editor: &Editor,
+        title: impl Into<String>,
+        message: impl Into<String>,
+        accept_label: impl Into<String>,
+        cancel_label: impl Into<String>,
+        accept: Action,
+        cancel: Action,
+    ) -> Self {
+        let accept_label = accept_label.into();
+        let cancel_label = cancel_label.into();
+        Self::with_target(
+            editor,
+            title.into(),
+            message.into(),
+            &accept_label,
+            &cancel_label,
+            true,
+            ConfirmationTarget::Actions {
+                accept: Box::new(accept),
+                cancel: Box::new(cancel),
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_target(
+        editor: &Editor,
+        title: String,
+        message: String,
+        accept_label: &str,
+        cancel_label: &str,
+        multiline: bool,
+        target: ConfirmationTarget,
+    ) -> Self {
         let style = editor.theme.ui_style.dialog.clone();
-        let width = confirmation_width(editor.vwidth(), &message);
+        let accept_label = format!("[ {accept_label} ]");
+        let cancel_label = format!("[ {cancel_label} ]");
+        let (width, height) = confirmation_size(
+            editor.vwidth(),
+            editor.vheight(),
+            &message,
+            &accept_label,
+            &cancel_label,
+            multiline,
+        );
         let x = editor.vwidth().saturating_sub(width + 2) / 2;
-        let y = editor.vheight().saturating_sub(4) / 2;
+        let y = editor.vheight().saturating_sub(height + 2) / 2;
         Self {
             dialog: Dialog::new(
                 Some(title),
                 x,
                 y,
                 width,
-                2,
+                height,
                 &style,
                 BorderStyle::Single,
                 &editor.theme,
@@ -57,39 +122,74 @@ impl Confirmation {
             .with_surface_theme(&editor.theme, SurfaceRole::Dialog),
             message,
             accept_selected: false,
-            callback_handle,
+            target,
+            accept_label,
+            cancel_label,
+            multiline,
+            scroll: 0,
             style,
             theme: editor.theme.clone(),
         }
     }
 
     fn terminal_action(&self, accepted: bool) -> KeyAction {
-        let callback = if accepted {
-            PickerCallback::Selected(PickerItem {
-                id: "accept".to_string(),
-                icon: None,
-                label: "Accept".to_string(),
-                kind: Some("Proceed".to_string()),
-                annotation: None,
-                detail: None,
-                data: Value::Null,
-                matches: Vec::new(),
-                detail_matches: Vec::new(),
-                preview: None,
-            })
+        match &self.target {
+            ConfirmationTarget::Callback(handle) => {
+                let callback = if accepted {
+                    PickerCallback::Selected(PickerItem {
+                        id: "accept".to_string(),
+                        icon: None,
+                        label: "Accept".to_string(),
+                        kind: Some("Proceed".to_string()),
+                        annotation: None,
+                        detail: None,
+                        data: Value::Null,
+                        matches: Vec::new(),
+                        detail_matches: Vec::new(),
+                        preview: None,
+                    })
+                } else {
+                    PickerCallback::Cancelled
+                };
+                KeyAction::Multiple(vec![
+                    Action::NotifyPicker(*handle, Box::new(callback)),
+                    Action::CloseDialog,
+                ])
+            }
+            ConfirmationTarget::Actions { accept, cancel } => KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                if accepted {
+                    accept.as_ref().clone()
+                } else {
+                    cancel.as_ref().clone()
+                },
+            ]),
+        }
+    }
+
+    fn body_rows(&self) -> Vec<String> {
+        if self.multiline {
+            wrap_text(&self.message, self.dialog.width).rows
         } else {
-            PickerCallback::Cancelled
-        };
-        KeyAction::Multiple(vec![
-            Action::NotifyPicker(self.callback_handle, Box::new(callback)),
-            Action::CloseDialog,
-        ])
+            vec![truncate_display_width(&self.message, self.dialog.width)]
+        }
+    }
+
+    fn body_height(&self) -> usize {
+        self.dialog.height.saturating_sub(1)
+    }
+
+    fn max_scroll(&self) -> usize {
+        self.body_rows().len().saturating_sub(self.body_height())
     }
 }
 
 impl Component for Confirmation {
     fn picker_handle(&self) -> Option<PickerHandle> {
-        Some(self.callback_handle)
+        match &self.target {
+            ConfirmationTarget::Callback(handle) => Some(*handle),
+            ConfirmationTarget::Actions { .. } => None,
+        }
     }
 
     fn set_theme(&mut self, theme: &Theme) {
@@ -99,19 +199,41 @@ impl Component for Confirmation {
     }
 
     fn resize(&mut self, viewport_width: usize, viewport_height: usize) -> bool {
-        self.dialog.width = confirmation_width(viewport_width, &self.message);
+        (self.dialog.width, self.dialog.height) = confirmation_size(
+            viewport_width,
+            viewport_height,
+            &self.message,
+            &self.accept_label,
+            &self.cancel_label,
+            self.multiline,
+        );
         self.dialog.x = viewport_width.saturating_sub(self.dialog.width + 2) / 2;
-        self.dialog.y = viewport_height.saturating_sub(4) / 2;
+        self.dialog.y = viewport_height.saturating_sub(self.dialog.height + 2) / 2;
+        self.scroll = self.scroll.min(self.max_scroll());
         true
     }
 
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.dialog.draw(buffer)?;
-        let message = truncate_display_width(&self.message, self.dialog.width);
-        buffer.set_text(self.dialog.x + 1, self.dialog.y + 1, &message, &self.style);
+        let rows = self.body_rows();
+        for (offset, row) in rows
+            .iter()
+            .skip(self.scroll)
+            .take(self.body_height())
+            .enumerate()
+        {
+            buffer.set_text(
+                self.dialog.x + 1,
+                self.dialog.y + 1 + offset,
+                row,
+                &self.style,
+            );
+        }
 
-        let buttons_width = display_width(ACCEPT_LABEL) + BUTTON_GAP + display_width(CANCEL_LABEL);
+        let buttons_width =
+            display_width(&self.accept_label) + BUTTON_GAP + display_width(&self.cancel_label);
         let button_x = self.dialog.x + 1 + self.dialog.width.saturating_sub(buttons_width) / 2;
+        let button_y = self.dialog.y + self.dialog.height;
         let selected = self.theme.selected_style(
             &self.style,
             &self.theme.ui_style.picker_selected_item,
@@ -119,8 +241,8 @@ impl Component for Confirmation {
         );
         buffer.set_text(
             button_x,
-            self.dialog.y + 2,
-            ACCEPT_LABEL,
+            button_y,
+            &self.accept_label,
             if self.accept_selected {
                 &selected
             } else {
@@ -128,9 +250,9 @@ impl Component for Confirmation {
             },
         );
         buffer.set_text(
-            button_x + display_width(ACCEPT_LABEL) + BUTTON_GAP,
-            self.dialog.y + 2,
-            CANCEL_LABEL,
+            button_x + display_width(&self.accept_label) + BUTTON_GAP,
+            button_y,
+            &self.cancel_label,
             if self.accept_selected {
                 &self.style
             } else {
@@ -156,6 +278,14 @@ impl Component for Confirmation {
                 self.accept_selected = false;
                 Some(KeyAction::Single(Action::Refresh))
             }
+            (KeyCode::Up | KeyCode::Char('k'), _) if self.multiline => {
+                self.scroll = self.scroll.saturating_sub(1);
+                Some(KeyAction::Single(Action::Refresh))
+            }
+            (KeyCode::Down | KeyCode::Char('j'), _) if self.multiline => {
+                self.scroll = self.scroll.saturating_add(1).min(self.max_scroll());
+                Some(KeyAction::Single(Action::Refresh))
+            }
             (KeyCode::Char('y' | 'Y'), _) => Some(self.terminal_action(true)),
             (KeyCode::Char('n' | 'N'), _) => Some(self.terminal_action(false)),
             (KeyCode::Enter, _) => Some(self.terminal_action(self.accept_selected)),
@@ -164,10 +294,35 @@ impl Component for Confirmation {
     }
 }
 
-fn confirmation_width(viewport_width: usize, message: &str) -> usize {
-    let desired = display_width(message)
-        .max(display_width(ACCEPT_LABEL) + BUTTON_GAP + display_width(CANCEL_LABEL));
-    desired.min(60).min(viewport_width.saturating_sub(2)).max(1)
+fn confirmation_size(
+    viewport_width: usize,
+    viewport_height: usize,
+    message: &str,
+    accept_label: &str,
+    cancel_label: &str,
+    multiline: bool,
+) -> (usize, usize) {
+    let buttons_width = display_width(accept_label) + BUTTON_GAP + display_width(cancel_label);
+    let desired_width = message
+        .lines()
+        .map(display_width)
+        .max()
+        .unwrap_or_default()
+        .max(buttons_width);
+    let max_width = if multiline { 76 } else { 60 };
+    let width = desired_width
+        .min(max_width)
+        .min(viewport_width.saturating_sub(2))
+        .max(1);
+    if !multiline {
+        return (width, 2.min(viewport_height.saturating_sub(2)));
+    }
+    let body_rows = wrap_text(message, width).rows.len().max(1);
+    let height = body_rows
+        .saturating_add(1)
+        .min(viewport_height.saturating_sub(2))
+        .max(2.min(viewport_height.saturating_sub(2)));
+    (width, height)
 }
 
 #[cfg(test)]
@@ -239,5 +394,70 @@ mod tests {
 
         assert_eq!(confirmation.dialog.height, 2);
         assert!(confirmation.dialog.width <= 60);
+    }
+
+    #[test]
+    fn editor_confirmation_wraps_multiline_details_and_defaults_to_the_safe_action() {
+        let editor = editor();
+        let digest = "a".repeat(64);
+        let mut confirmation = Confirmation::new_actions(
+            &editor,
+            "Approve native grammar",
+            format!(
+                "Native grammars execute inside Red.\n\ngo: {digest}\n\nApproval is limited to these exact bytes."
+            ),
+            "Approve and install",
+            "Back",
+            Action::Print("approved".to_string()),
+            Action::Print("back".to_string()),
+        );
+        let mut buffer = RenderBuffer::new(80, 20, &Style::default());
+
+        confirmation.draw(&mut buffer).unwrap();
+
+        assert!(confirmation.dialog.height > 2);
+        assert!(confirmation.dialog.width <= 76);
+        assert_eq!(
+            confirmation.handle_event(&key(KeyCode::Enter)),
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::Print("back".to_string()),
+            ]))
+        );
+
+        confirmation.handle_event(&key(KeyCode::Left));
+        assert_eq!(
+            confirmation.handle_event(&key(KeyCode::Enter)),
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::Print("approved".to_string()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn multiline_confirmation_scrolls_inside_a_small_viewport() {
+        let editor = editor();
+        let mut confirmation = Confirmation::new_actions(
+            &editor,
+            "Approve native grammars",
+            (0..12)
+                .map(|index| format!("language-{index}: {}", "a".repeat(64)))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "Approve exact bytes",
+            "Back",
+            Action::Print("approved".to_string()),
+            Action::Print("back".to_string()),
+        );
+        confirmation.resize(44, 10);
+        let mut buffer = RenderBuffer::new(44, 10, &Style::default());
+
+        confirmation.draw(&mut buffer).unwrap();
+        assert!(confirmation.max_scroll() > 0);
+        assert_eq!(confirmation.scroll, 0);
+
+        confirmation.handle_event(&key(KeyCode::Down));
+        assert_eq!(confirmation.scroll, 1);
     }
 }

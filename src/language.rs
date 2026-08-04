@@ -190,6 +190,37 @@ impl GrammarTrustStore {
         self.persist(&trust)
     }
 
+    /// Returns the digest Red would bind to an approval without recording it.
+    pub(crate) fn path_digest(path: &Path) -> Result<String> {
+        inspect_native_grammar(path).map(|(_, digest)| digest)
+    }
+
+    /// Approves paths only when every current digest matches the bytes the user reviewed.
+    pub(crate) fn trust_paths_exact(&self, paths: &[(PathBuf, String)]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut inspected = Vec::with_capacity(paths.len());
+        for (path, expected_digest) in paths {
+            let (canonical, actual_digest) = inspect_native_grammar(path)?;
+            anyhow::ensure!(
+                actual_digest.eq_ignore_ascii_case(expected_digest),
+                "native grammar {} changed since confirmation: expected {}, got {actual_digest}",
+                canonical.display(),
+                expected_digest
+            );
+            inspected.push((canonical, actual_digest));
+        }
+
+        let mut trust = self.load()?;
+        for (canonical, digest) in inspected {
+            trust
+                .grammars
+                .insert(canonical.to_string_lossy().into_owned(), digest);
+        }
+        self.persist(&trust)
+    }
+
     /// Revokes every digest approval associated with one canonical grammar path.
     pub fn revoke_path(&self, path: &Path) -> Result<()> {
         let canonical = path

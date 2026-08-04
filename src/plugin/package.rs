@@ -729,6 +729,55 @@ impl PluginPackageManager {
         self.approve_package_grammars(&manifest, &installed.package_root)
     }
 
+    /// Returns the current native grammar digests keyed by package language id.
+    pub fn package_grammar_digests(&self, id: &PluginId) -> Result<BTreeMap<String, String>> {
+        let installed = self
+            .installed(id)?
+            .ok_or_else(|| anyhow::anyhow!("plugin `{id}` is not installed"))?;
+        let manifest = PluginPackageManifest::load(&installed.package_root)?;
+        let paths = package_grammar_paths(&manifest, &installed.package_root);
+        paths
+            .into_iter()
+            .map(|(language, path)| {
+                GrammarTrustStore::path_digest(&path)
+                    .with_context(|| {
+                        format!("failed to inspect native grammar `{language}` for plugin `{id}`")
+                    })
+                    .map(|digest| (language, digest))
+            })
+            .collect()
+    }
+
+    /// Approves only the exact installed grammar set and digests the user confirmed.
+    pub fn trust_package_grammars_exact(
+        &self,
+        id: &PluginId,
+        expected_digests: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let installed = self
+            .installed(id)?
+            .ok_or_else(|| anyhow::anyhow!("plugin `{id}` is not installed"))?;
+        let manifest = PluginPackageManifest::load(&installed.package_root)?;
+        let paths = package_grammar_paths(&manifest, &installed.package_root);
+        let current_languages = paths.keys().cloned().collect::<BTreeSet<_>>();
+        let confirmed_languages = expected_digests.keys().cloned().collect::<BTreeSet<_>>();
+        anyhow::ensure!(
+            current_languages == confirmed_languages,
+            "native grammar set for plugin `{id}` changed since confirmation"
+        );
+        let exact_paths = paths
+            .into_iter()
+            .map(|(language, path)| {
+                let digest = expected_digests
+                    .get(&language)
+                    .expect("confirmed grammar language was checked")
+                    .clone();
+                (path, digest)
+            })
+            .collect::<Vec<_>>();
+        GrammarTrustStore::new(&self.config_dir).trust_paths_exact(&exact_paths)
+    }
+
     /// Updates an installed package from its retained source.
     pub async fn update(&self, id: &PluginId) -> Result<InstalledPlugin> {
         self.update_with_trust(id, false).await
@@ -910,10 +959,8 @@ impl PluginPackageManager {
         package_root: &Path,
     ) -> Result<()> {
         let trust = GrammarTrustStore::new(&self.config_dir);
-        let paths = manifest
-            .languages
-            .iter()
-            .filter_map(|(id, language)| manifest.grammar_path(package_root, id, language))
+        let paths = package_grammar_paths(manifest, package_root)
+            .into_values()
             .collect::<Vec<_>>();
         trust.trust_paths(&paths)
     }
@@ -925,6 +972,27 @@ impl PluginPackageManager {
             now_ms()
         ))
     }
+}
+
+fn package_grammar_paths(
+    manifest: &PluginPackageManifest,
+    package_root: &Path,
+) -> BTreeMap<String, PathBuf> {
+    manifest
+        .languages
+        .iter()
+        .filter(|(_, language)| {
+            language
+                .grammar
+                .as_ref()
+                .is_some_and(|grammar| grammar.builtin.is_none())
+        })
+        .filter_map(|(id, language)| {
+            manifest
+                .grammar_path(package_root, id, language)
+                .map(|path| (id.clone(), path))
+        })
+        .collect()
 }
 
 async fn validate_husk_package(
@@ -1638,6 +1706,34 @@ builtin = "rust"
         .unwrap();
     }
 
+    fn write_native_language_package(root: &Path, id: &str, grammar: &[u8]) {
+        let grammar_dir = root.join("grammars");
+        fs::create_dir_all(&grammar_dir).unwrap();
+        fs::write(grammar_dir.join("buildspec.so"), grammar).unwrap();
+        fs::write(
+            root.join(PLUGIN_MANIFEST_FILE),
+            format!(
+                r#"
+schema_version = 1
+
+[plugin]
+id = "{id}"
+name = "Native language package"
+version = "1.0.0"
+red_api = "^{RED_HOST_API_VERSION}"
+
+[languages.buildspec]
+extensions = ["build"]
+
+[languages.buildspec.grammar]
+path = "grammars/buildspec.so"
+symbol = "tree_sitter_buildspec"
+"#
+            ),
+        )
+        .unwrap();
+    }
+
     fn write_oversized_native_language_package(root: &Path, id: &str, version: &str) {
         let grammar_dir = root.join("grammars");
         fs::create_dir_all(&grammar_dir).unwrap();
@@ -1900,6 +1996,37 @@ symbol = "tree_sitter_buildspec"
         assert!(!installed.has_companion);
         assert_eq!(manifest.languages["buildspec"].filenames, ["Buildfile"]);
         assert!(manifest.husk_entry(&installed.package_root).is_none());
+    }
+
+    #[tokio::test]
+    async fn installed_grammar_approval_is_bound_to_the_confirmed_digest() {
+        let config = tempfile::tempdir().unwrap();
+        let package = tempfile::tempdir().unwrap();
+        let original = b"original native grammar";
+        write_native_language_package(package.path(), "build-languages", original);
+        let manager = PluginPackageManager::new(config.path());
+        let installed = manager.install_path(package.path()).await.unwrap();
+        let digests = manager.package_grammar_digests(&installed.id).unwrap();
+
+        assert_eq!(
+            digests["buildspec"],
+            format!("{:x}", Sha256::digest(original))
+        );
+
+        let grammar = package.path().join("grammars/buildspec.so");
+        fs::write(&grammar, b"changed after confirmation").unwrap();
+        let error = manager
+            .trust_package_grammars_exact(&installed.id, &digests)
+            .unwrap_err();
+        assert!(error.to_string().contains("changed since confirmation"));
+
+        fs::write(&grammar, original).unwrap();
+        manager
+            .trust_package_grammars_exact(&installed.id, &digests)
+            .unwrap();
+        assert!(GrammarTrustStore::new(config.path())
+            .approved_grammar_path(&grammar, false)
+            .is_ok());
     }
 
     #[test]
