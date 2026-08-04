@@ -9,7 +9,10 @@ use anyhow::{Context, Result};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 
-use super::{package::PluginId, RED_HOST_API_VERSION};
+use super::{
+    package::PluginId,
+    registry::{host_api_requirement_is_supported, SUPPORTED_HOST_API_VERSIONS},
+};
 
 pub const PLUGIN_CATALOG_SCHEMA: u32 = 1;
 pub const DEFAULT_PLUGIN_CATALOG_URL: &str =
@@ -145,11 +148,11 @@ impl PluginCatalog {
             .iter()
             .find(|package| &package.id == id)
             .ok_or_else(|| anyhow::anyhow!("language pack `{id}` is not in the catalog"))?;
-        let host_api = Version::parse(RED_HOST_API_VERSION)?;
         anyhow::ensure!(
-            package.red_api.matches(&host_api),
-            "language pack `{id}` requires Red API `{}`, but this release provides `{host_api}`",
-            package.red_api
+            host_api_requirement_is_supported(&package.red_api)?,
+            "language pack `{id}` requires Red API `{}`, but this release supports {}",
+            package.red_api,
+            SUPPORTED_HOST_API_VERSIONS.join(", ")
         );
         anyhow::ensure!(
             package.artifacts.contains_key(target),
@@ -412,15 +415,7 @@ mod tests {
         let catalog = PluginCatalog::from_slice(&bytes).unwrap();
         let id = PluginId::parse("go-language").unwrap();
 
-        let result = catalog.installable(&id, "aarch64-apple-darwin");
-        if VersionReq::parse("^0.6.0")
-            .unwrap()
-            .matches(&Version::parse(RED_HOST_API_VERSION).unwrap())
-        {
-            assert!(result.is_ok());
-        } else {
-            assert!(result.unwrap_err().to_string().contains("requires Red API"));
-        }
+        assert!(catalog.installable(&id, "aarch64-apple-darwin").is_ok());
         assert!(catalog
             .installable(&id, "unsupported-target")
             .unwrap_err()
