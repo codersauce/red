@@ -54,6 +54,8 @@ const LOCATION_PREVIEW_CACHE_CAPACITY: usize = 8;
 const COMMAND_COLUMN_GAP: usize = 2;
 const PICKER_ICON_WIDTH: usize = 2;
 const PICKER_ITEM_PREFIX_WIDTH: usize = 2 + PICKER_ICON_WIDTH;
+const INTRINSIC_COLUMN_GAP: usize = 2;
+const INTRINSIC_FOOTER_GAP: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -178,6 +180,7 @@ pub enum PickerPresentation {
 pub enum PickerUpdate {
     Items(Vec<PickerItem>),
     Query(String),
+    Selection(String),
     Status(Option<String>),
     Busy(bool),
     Preview(Option<PickerPreview>),
@@ -316,6 +319,17 @@ pub struct Picker {
     input_position: PickerInputPosition,
     icons: PickerIconsConfig,
     presentation: PickerPresentation,
+    viewport_width: usize,
+    viewport_height: usize,
+    content_sizing: Option<PickerContentSizing>,
+    status_on_query_line: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PickerContentSizing {
+    min_width: Option<usize>,
+    max_width: usize,
+    max_rows: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -472,11 +486,41 @@ impl Picker {
             input_position: editor.picker_input_position(),
             icons: editor.picker_icons(),
             presentation,
+            viewport_width: editor.vwidth(),
+            viewport_height: editor.vheight(),
+            content_sizing: None,
+            status_on_query_line: false,
         }
     }
 
     fn resize_to_viewport(&mut self, total_width: usize, total_height: usize) {
-        let geometry = Self::geometry_for_viewport(total_width, total_height, self.presentation);
+        self.viewport_width = total_width;
+        self.viewport_height = total_height;
+        let geometry = self.content_sizing.map_or_else(
+            || Self::geometry_for_viewport(total_width, total_height, self.presentation),
+            |sizing| {
+                let available_width = total_width.saturating_sub(2);
+                let min_width = sizing.min_width.unwrap_or(48).min(available_width);
+                let desired_width = sizing.min_width.map_or(sizing.max_width, |_| {
+                    self.intrinsic_content_width()
+                        .clamp(min_width, sizing.max_width.max(min_width))
+                });
+                let width = desired_width.min(available_width).max(min_width);
+                let item_count = self
+                    .dynamic_items
+                    .as_ref()
+                    .map(Vec::len)
+                    .unwrap_or_else(|| self.items.len());
+                let rows = item_count.clamp(4, sizing.max_rows.max(4));
+                let height = rows.saturating_add(3).min(total_height.saturating_sub(1));
+                PickerRect {
+                    x: total_width.saturating_sub(width.saturating_add(2)) / 2,
+                    y: total_height.saturating_sub(height.saturating_add(1)) / 2,
+                    width,
+                    height,
+                }
+            },
+        );
         self.x = geometry.x;
         self.y = geometry.y;
         self.width = geometry.width;
@@ -486,6 +530,59 @@ impl Picker {
         self.dialog.width = geometry.width;
         self.dialog.height = geometry.height.saturating_sub(1);
         self.sync_list_bounds();
+    }
+
+    fn intrinsic_content_width(&self) -> usize {
+        let item_width = self.dynamic_items.as_ref().map_or_else(
+            || {
+                self.items
+                    .iter()
+                    .map(|item| PICKER_ITEM_PREFIX_WIDTH + display_width(item))
+                    .max()
+                    .unwrap_or_default()
+            },
+            |items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        let annotation_width = item
+                            .annotation
+                            .as_deref()
+                            .filter(|annotation| !annotation.is_empty())
+                            .map_or(0, |annotation| {
+                                INTRINSIC_COLUMN_GAP
+                                    + display_width(annotation)
+                                    + item
+                                        .data
+                                        .get("annotation_right_margin")
+                                        .and_then(Value::as_u64)
+                                        .and_then(|margin| usize::try_from(margin).ok())
+                                        .unwrap_or_default()
+                            });
+                        let detail_width = item
+                            .detail
+                            .as_deref()
+                            .filter(|detail| !detail.is_empty())
+                            .map_or(0, |detail| INTRINSIC_COLUMN_GAP + display_width(detail));
+                        PICKER_ITEM_PREFIX_WIDTH
+                            + display_width(&item.label)
+                            + annotation_width
+                            + detail_width
+                    })
+                    .max()
+                    .unwrap_or_default()
+            },
+        );
+        let prompt_width = 3 + self.placeholder.as_deref().map_or(0, display_width);
+        let status_width = self.status.as_deref().map_or(0, |status| {
+            display_width(status) + 2 + usize::from(self.busy_since.is_some()) * 2
+        });
+        let footer_width = if prompt_width > 3 && status_width > 0 {
+            prompt_width + INTRINSIC_FOOTER_GAP + status_width
+        } else {
+            prompt_width.max(status_width)
+        };
+        item_width.max(footer_width)
     }
 
     pub(crate) fn apply_theme(&mut self, theme: &Theme) {
@@ -695,6 +792,7 @@ impl Picker {
         self.dynamic_items = Some(items);
         let search = self.search.clone();
         self.filter(&search);
+        self.resize_to_viewport(self.viewport_width, self.viewport_height);
         self.reset_preview_scroll_if_selection_changed(previous);
     }
 
@@ -709,6 +807,7 @@ impl Picker {
                 self.dynamic_items = Some(items);
                 let query = self.search.clone();
                 self.filter(&query);
+                self.resize_to_viewport(self.viewport_width, self.viewport_height);
                 if let Some(selected_id) = selected_id {
                     self.select_dynamic_id(&selected_id);
                 }
@@ -722,6 +821,7 @@ impl Picker {
                 self.filter(&query);
                 self.reset_preview_scroll_if_selection_changed(previous);
             }
+            PickerUpdate::Selection(id) => self.select_dynamic_id(&id),
             PickerUpdate::Status(status) => self.status = status,
             PickerUpdate::Busy(busy) => self.set_busy(busy),
             PickerUpdate::Preview(preview) => self.preview = preview,
@@ -1392,9 +1492,63 @@ impl Picker {
         }
     }
 
+    fn prompt_status(&self) -> Option<String> {
+        let command_status = self
+            .selected_dynamic_item()
+            .filter(|item| item.kind.as_deref() == Some("Command"))
+            .map(|item| {
+                let description = item
+                    .data
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let total = self.dynamic_items.as_ref().map_or(0, Vec::len);
+                let visible = self.visible_dynamic_items.len();
+                if description.is_empty() {
+                    format!("{visible}/{total} commands")
+                } else {
+                    format!("{description} · {visible}/{total} commands")
+                }
+            });
+        let file_status = self
+            .selected_dynamic_item()
+            .filter(|item| item.kind.as_deref() == Some("FilePath"))
+            .map(|_| {
+                let total = self.dynamic_items.as_ref().map_or(0, Vec::len);
+                let visible = self.visible_dynamic_items.len();
+                format!("{visible}/{total}")
+            });
+        command_status
+            .as_deref()
+            .or(self.status.as_deref())
+            .or(file_status.as_deref())
+            .map(|status| {
+                if let Some(since) = self.busy_since {
+                    format!(
+                        "{} {status}",
+                        spinner_frame(since.elapsed().as_millis() as u64)
+                    )
+                } else {
+                    status.to_string()
+                }
+            })
+            .map(|status| truncate_display_width(&status, self.width.saturating_sub(4)))
+            .map(|status| format!(" {status} "))
+    }
+
+    fn prompt_query_width(&self, status: Option<&str>) -> usize {
+        let inline_status_width = status
+            .filter(|_| self.status_on_query_line)
+            .map_or(0, display_width);
+        self.width
+            .saturating_sub(2)
+            .saturating_sub(inline_status_width)
+    }
+
     fn draw_prompt(&self, buffer: &mut RenderBuffer, layout: PickerLayout) {
         self.draw_separator(buffer, layout.separator_y);
-        let query_width = self.width.saturating_sub(2);
+        let status = self.prompt_status();
+        let query_width = self.prompt_query_width(status.as_deref());
         buffer.set_text(
             self.x + 1,
             layout.query_y,
@@ -1422,50 +1576,15 @@ impl Picker {
             );
         }
 
-        let command_status = self
-            .selected_dynamic_item()
-            .filter(|item| item.kind.as_deref() == Some("Command"))
-            .map(|item| {
-                let description = item
-                    .data
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let total = self.dynamic_items.as_ref().map_or(0, Vec::len);
-                let visible = self.visible_dynamic_items.len();
-                if description.is_empty() {
-                    format!("{visible}/{total} commands")
-                } else {
-                    format!("{description} · {visible}/{total} commands")
-                }
-            });
-        let file_status = self
-            .selected_dynamic_item()
-            .filter(|item| item.kind.as_deref() == Some("FilePath"))
-            .map(|_| {
-                let total = self.dynamic_items.as_ref().map_or(0, Vec::len);
-                let visible = self.visible_dynamic_items.len();
-                format!("{visible}/{total}")
-            });
-        if let Some(status) = command_status
-            .as_deref()
-            .or(self.status.as_deref())
-            .or(file_status.as_deref())
-        {
-            let status = if let Some(since) = self.busy_since {
-                Cow::Owned(format!(
-                    "{} {status}",
-                    spinner_frame(since.elapsed().as_millis() as u64)
-                ))
-            } else {
-                Cow::Borrowed(status)
-            };
-            let status = truncate_display_width(&status, self.width.saturating_sub(4));
-            let status = format!(" {status} ");
+        if let Some(status) = status {
             let status_x = self.x + self.width + 1 - display_width(&status);
             buffer.set_text(
                 status_x,
-                layout.separator_y,
+                if self.status_on_query_line {
+                    layout.query_y
+                } else {
+                    layout.separator_y
+                },
                 &status,
                 &self.theme.ui_style.picker_prompt,
             );
@@ -1596,7 +1715,52 @@ impl Picker {
             let separator_width = usize::from(detail_width > 0) * detail_separator_width;
             let primary_width = content_width.saturating_sub(detail_width + separator_width);
             let label_x = x;
-            let label_width = display_width(&item.label).min(primary_width);
+            let right_aligned_annotation =
+                item.data.get("annotation_align").and_then(Value::as_str) == Some("right");
+            let full_annotation = item.annotation.as_deref().filter(|value| !value.is_empty());
+            let compact_annotation = item
+                .data
+                .get("compact_annotation")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty());
+            let annotation_right_margin = item
+                .data
+                .get("annotation_right_margin")
+                .and_then(Value::as_u64)
+                .and_then(|margin| usize::try_from(margin).ok())
+                .unwrap_or_default()
+                .min(primary_width);
+            let desired_label_width = display_width(&item.label).min(primary_width);
+            let annotation_capacity = primary_width.saturating_sub(
+                desired_label_width + INTRINSIC_COLUMN_GAP + annotation_right_margin,
+            );
+            let (annotation, using_compact_annotation) = if right_aligned_annotation {
+                match full_annotation {
+                    Some(annotation) if display_width(annotation) <= annotation_capacity => {
+                        (Some(annotation), false)
+                    }
+                    Some(annotation) => (
+                        compact_annotation.or(Some(annotation)),
+                        compact_annotation.is_some(),
+                    ),
+                    None => (None, false),
+                }
+            } else {
+                (full_annotation, false)
+            };
+            let annotation_width = annotation
+                .filter(|_| right_aligned_annotation)
+                .map_or(0, |annotation| {
+                    display_width(annotation).min(annotation_capacity)
+                });
+            let annotation_gap = usize::from(annotation_width > 0) * INTRINSIC_COLUMN_GAP;
+            let label_available = if annotation_width > 0 {
+                primary_width
+                    .saturating_sub(annotation_width + annotation_gap + annotation_right_margin)
+            } else {
+                primary_width
+            };
+            let label_width = display_width(&item.label).min(label_available);
             let label_style = self.result_label_style(&row_style);
             let match_style = if derived_label_matches.is_some() {
                 self.result_filter_match_style(&label_style)
@@ -1615,12 +1779,32 @@ impl Picker {
             );
             let annotation_remaining = primary_width.saturating_sub(used);
 
-            if annotation_remaining > 1 {
-                if let Some(annotation) =
-                    item.annotation.as_deref().filter(|value| !value.is_empty())
-                {
+            if let Some(annotation) = annotation {
+                if right_aligned_annotation && annotation_width > 0 {
                     let annotation_style = self.result_annotation_style(&row_style, is_selected);
-                    let annotation_x = label_x + used + 1;
+                    let annotation_match_style = self.result_filter_match_style(&annotation_style);
+                    let annotation_matches = if using_compact_annotation {
+                        &[]
+                    } else {
+                        filter_highlights
+                            .as_ref()
+                            .map(|highlights| highlights.annotation.as_slice())
+                            .unwrap_or_default()
+                    };
+                    self.draw_text_with_matches(
+                        buffer,
+                        label_x
+                            + primary_width
+                                .saturating_sub(annotation_width + annotation_right_margin),
+                        y,
+                        annotation,
+                        annotation_width,
+                        &annotation_style,
+                        &annotation_match_style,
+                        annotation_matches,
+                    );
+                } else if annotation_remaining > 1 {
+                    let annotation_style = self.result_annotation_style(&row_style, is_selected);
                     let annotation_match_style = self.result_filter_match_style(&annotation_style);
                     let annotation_matches = filter_highlights
                         .as_ref()
@@ -1628,7 +1812,7 @@ impl Picker {
                         .unwrap_or_default();
                     self.draw_text_with_matches(
                         buffer,
-                        annotation_x,
+                        label_x + used + 1,
                         y,
                         annotation,
                         annotation_remaining.saturating_sub(1),
@@ -2988,7 +3172,8 @@ impl Component for Picker {
     }
 
     fn cursor_position(&self) -> Option<(usize, usize)> {
-        let query_width = self.width.saturating_sub(2);
+        let status = self.prompt_status();
+        let query_width = self.prompt_query_width(status.as_deref());
         let visible_query = display_width_tail(&self.search, query_width);
         let cx = self.x + 3 + display_width(visible_query).min(query_width.saturating_sub(1));
         let cy = self.layout().query_y;
@@ -3079,6 +3264,8 @@ pub struct PickerBuilder {
     status: Option<String>,
     busy: bool,
     history_key: Option<String>,
+    content_sizing: Option<PickerContentSizing>,
+    status_on_query_line: bool,
 }
 
 impl Default for PickerBuilder {
@@ -3102,6 +3289,8 @@ impl PickerBuilder {
             status: None,
             busy: false,
             history_key: None,
+            content_sizing: None,
+            status_on_query_line: false,
         }
     }
 
@@ -3182,6 +3371,30 @@ impl PickerBuilder {
         self
     }
 
+    /// Fits an editor-owned picker to its rows while retaining a bounded, readable width.
+    pub(crate) fn content_sized(mut self, max_width: usize, max_rows: usize) -> Self {
+        self.content_sizing = Some(PickerContentSizing {
+            min_width: None,
+            max_width,
+            max_rows,
+        });
+        self
+    }
+
+    /// Derives picker width from its complete item set and footer without resizing on filters.
+    pub(crate) fn fit_content_width(mut self, min_width: usize) -> Self {
+        if let Some(sizing) = &mut self.content_sizing {
+            sizing.min_width = Some(min_width);
+        }
+        self
+    }
+
+    /// Places compact status text on the query row instead of cutting the separator line.
+    pub(crate) fn status_on_query_line(mut self) -> Self {
+        self.status_on_query_line = true;
+        self
+    }
+
     pub fn build(self, editor: &Editor) -> Picker {
         let title = self.title;
         let structured_items = self.structured_items;
@@ -3199,6 +3412,8 @@ impl PickerBuilder {
         let status = self.status;
         let busy = self.busy;
         let history_key = self.history_key;
+        let content_sizing = self.content_sizing;
+        let status_on_query_line = self.status_on_query_line;
 
         let mut picker = Picker::new(title, editor, &items, id);
         if let Some(structured_items) = structured_items {
@@ -3219,6 +3434,9 @@ impl PickerBuilder {
             let history = editor.picker_history(&history_key).to_vec();
             picker.set_history(history_key, history);
         }
+        picker.content_sizing = content_sizing;
+        picker.status_on_query_line = status_on_query_line;
+        picker.resize_to_viewport(editor.vwidth(), editor.vheight());
 
         picker
     }
@@ -5407,6 +5625,128 @@ mod tests {
             picker.selected_dynamic_item().map(|item| item.id.as_str()),
             Some("b")
         );
+    }
+
+    #[test]
+    fn dynamic_picker_selection_can_follow_an_async_item_update() {
+        let editor = test_editor();
+        let mut picker = Picker::new_dynamic(
+            None,
+            &editor,
+            vec![dynamic_item("custom", "Add custom source")],
+            13,
+            PickerOptions::default(),
+        );
+        picker.apply_update(
+            13,
+            PickerUpdate::Items(vec![
+                dynamic_item("go", "Go language support"),
+                dynamic_item("swift", "Swift language support"),
+                dynamic_item("custom", "Add custom source"),
+            ]),
+        );
+
+        picker.apply_update(13, PickerUpdate::Selection("go".to_string()));
+
+        assert_eq!(
+            picker.selected_dynamic_item().map(|item| item.id.as_str()),
+            Some("go")
+        );
+    }
+
+    #[test]
+    fn content_sized_picker_keeps_primary_rows_full_width_without_a_preview() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 180, 50);
+        let mut go = dynamic_item("go", "Go language support");
+        go.annotation = Some("Official · v0.1.0".to_string());
+        go.data = json!({
+            "annotation_align": "right",
+            "annotation_right_margin": 2,
+            "compact_annotation": "v0.1.0",
+        });
+        let mut picker = Picker::builder()
+            .title("Language packs")
+            .structured_items(vec![
+                go,
+                dynamic_item("swift", "Swift language support"),
+                dynamic_item("custom", "+ Add custom source…"),
+            ])
+            .placeholder("Search language packs")
+            .status("2 packs · Enter open")
+            .content_sized(88, 14)
+            .fit_content_width(56)
+            .status_on_query_line()
+            .build(&editor);
+        let mut buffer = RenderBuffer::new(180, 50, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        assert_eq!(picker.width, 56);
+        assert_eq!(picker.height, 7);
+        assert!(picker.layout().preview.is_none());
+        let result_row = render_row(&buffer, picker.layout().results.y);
+        assert!(result_row.contains("Go language support"));
+        assert!(result_row
+            .trim_end()
+            .trim_end_matches('│')
+            .trim_end()
+            .ends_with("Official · v0.1.0"));
+        assert!(result_row.contains("Official · v0.1.0  │"));
+        assert!(render_row(&buffer, picker.layout().results.y + 2).contains("+ Add custom source…"));
+        assert!(!render_row(&buffer, picker.layout().separator_y).contains("2 packs"));
+        assert!(render_row(&buffer, picker.layout().query_y).contains("2 packs · Enter open"));
+
+        picker.filter("go");
+        assert_eq!(picker.width, 56);
+    }
+
+    #[test]
+    fn content_sized_picker_stays_inside_a_small_viewport() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 42, 12);
+        let picker = Picker::builder()
+            .title("Language packs")
+            .structured_items(vec![
+                dynamic_item("go", "Go language support"),
+                dynamic_item("swift", "Swift language support"),
+                dynamic_item("custom", "+ Add custom source…"),
+            ])
+            .content_sized(88, 14)
+            .fit_content_width(56)
+            .build(&editor);
+        let mut buffer = RenderBuffer::new(42, 12, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        assert!(picker.width <= 40);
+        assert!(picker.height <= 10);
+        assert!(picker.dialog.x + picker.width + 2 <= 42);
+        assert!(picker.dialog.y + picker.dialog.height + 2 <= 12);
+    }
+
+    #[test]
+    fn narrow_intrinsic_picker_preserves_names_before_collapsing_metadata() {
+        let editor = test_editor_with_theme_and_size(Theme::default(), 42, 12);
+        let mut go = dynamic_item("go", "Go language support");
+        go.annotation = Some("Official · v0.1.0".to_string());
+        go.data = json!({
+            "annotation_align": "right",
+            "annotation_right_margin": 2,
+            "compact_annotation": "v0.1.0",
+        });
+        let picker = Picker::builder()
+            .title("Language packs")
+            .structured_items(vec![go])
+            .content_sized(88, 14)
+            .fit_content_width(56)
+            .build(&editor);
+        let mut buffer = RenderBuffer::new(42, 12, &Style::default());
+
+        picker.draw(&mut buffer).unwrap();
+
+        let row = render_row(&buffer, picker.layout().results.y);
+        assert!(row.contains("Go language support"));
+        assert!(row.contains("v0.1.0"));
+        assert!(!row.contains("Official"));
     }
 
     #[test]
