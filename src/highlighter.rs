@@ -110,99 +110,107 @@ impl LanguageRegistry {
         config_dir: &Path,
     ) -> anyhow::Result<Self> {
         let mut registry = Self::bundled();
-        let trust = GrammarTrustStore::new(config_dir);
         let mut languages = configured.iter().collect::<Vec<_>>();
         languages.sort_unstable_by_key(|(language, _)| *language);
         for (id, config) in languages {
-            anyhow::ensure!(
-                !id.trim().is_empty()
-                    && id.bytes().all(|byte| byte.is_ascii_lowercase()
-                        || byte.is_ascii_digit()
-                        || matches!(byte, b'-' | b'_')),
-                "invalid language identifier `{id}`"
-            );
-
-            let inherited = registry.languages.get(id).cloned();
-            let mut definition = inherited.unwrap_or_else(|| RuntimeLanguageDefinition {
-                id: id.clone(),
-                extensions: Vec::new(),
-                filenames: Vec::new(),
-                aliases: Vec::new(),
-                grammar: None,
-                highlight_queries: Vec::new(),
-                injection_query: None,
-            });
-            if !config.extensions.is_empty() {
-                definition.extensions = config
-                    .extensions
-                    .iter()
-                    .map(|extension| extension.trim_start_matches('.').to_ascii_lowercase())
-                    .collect();
-            }
-            if !config.filenames.is_empty() {
-                definition.filenames.clone_from(&config.filenames);
-            }
-            definition.aliases.extend(config.aliases.iter().cloned());
-
-            if let Some(grammar) = &config.grammar {
-                if let Some(builtin) = &grammar.builtin {
-                    let bundled = registry.languages.get(builtin).ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "language `{id}` refers to unknown bundled grammar `{builtin}`"
-                        )
-                    })?;
-                    definition.grammar.clone_from(&bundled.grammar);
-                    definition
-                        .highlight_queries
-                        .clone_from(&bundled.highlight_queries);
-                    definition
-                        .injection_query
-                        .clone_from(&bundled.injection_query);
-                }
-                if let Some(path) = grammar_path(grammar, config_dir)? {
-                    let symbol = grammar
-                        .symbol
-                        .clone()
-                        .unwrap_or_else(|| format!("tree_sitter_{}", id.replace('-', "_")));
-                    definition.grammar = Some(load_dynamic_grammar(
-                        &trust,
-                        &path,
-                        &symbol,
-                        grammar.trusted,
-                    )?);
-                }
-                if !grammar.highlights.is_empty() {
-                    definition.highlight_queries = grammar
-                        .highlights
-                        .iter()
-                        .map(|path| read_query(path, config_dir, "highlight"))
-                        .collect::<anyhow::Result<_>>()?;
-                }
-                if let Some(path) = &grammar.injections {
-                    definition.injection_query = Some(read_query(path, config_dir, "injection")?);
-                }
-            }
-
-            if let Some(source) = &definition.grammar {
-                let language = grammar_language(source);
-                let mut parser = Parser::new();
-                parser.set_language(&language).with_context(|| {
-                    format!("language `{id}` uses an incompatible Tree-sitter grammar")
-                })?;
-                if !definition.highlight_queries.is_empty() {
-                    Query::new(&language, &definition.highlight_queries.join("\n")).with_context(
-                        || format!("language `{id}` has an invalid highlight query"),
-                    )?;
-                }
-                if let Some(query) = &definition.injection_query {
-                    Query::new(&language, query).with_context(|| {
-                        format!("language `{id}` has an invalid injection query")
-                    })?;
-                }
-            }
-            registry.insert(definition);
+            registry.insert_configured(id, config, config_dir)?;
         }
         Ok(registry)
+    }
+
+    /// Validates one definition without rebuilding or reloading accepted grammars.
+    pub(crate) fn insert_configured(
+        &mut self,
+        id: &str,
+        config: &LanguageConfig,
+        config_dir: &Path,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !id.trim().is_empty()
+                && id.bytes().all(|byte| byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'-' | b'_')),
+            "invalid language identifier `{id}`"
+        );
+
+        let inherited = self.languages.get(id).cloned();
+        let mut definition = inherited.unwrap_or_else(|| RuntimeLanguageDefinition {
+            id: id.to_string(),
+            extensions: Vec::new(),
+            filenames: Vec::new(),
+            aliases: Vec::new(),
+            grammar: None,
+            highlight_queries: Vec::new(),
+            injection_query: None,
+        });
+        if !config.extensions.is_empty() {
+            definition.extensions = config
+                .extensions
+                .iter()
+                .map(|extension| extension.trim_start_matches('.').to_ascii_lowercase())
+                .collect();
+        }
+        if !config.filenames.is_empty() {
+            definition.filenames.clone_from(&config.filenames);
+        }
+        definition.aliases.extend(config.aliases.iter().cloned());
+
+        if let Some(grammar) = &config.grammar {
+            if let Some(builtin) = &grammar.builtin {
+                let bundled = self.languages.get(builtin).ok_or_else(|| {
+                    anyhow::anyhow!("language `{id}` refers to unknown bundled grammar `{builtin}`")
+                })?;
+                definition.grammar.clone_from(&bundled.grammar);
+                definition
+                    .highlight_queries
+                    .clone_from(&bundled.highlight_queries);
+                definition
+                    .injection_query
+                    .clone_from(&bundled.injection_query);
+            }
+            if let Some(path) = grammar_path(grammar, config_dir)? {
+                let trust = GrammarTrustStore::new(config_dir);
+                let symbol = grammar
+                    .symbol
+                    .clone()
+                    .unwrap_or_else(|| format!("tree_sitter_{}", id.replace('-', "_")));
+                definition.grammar = Some(load_dynamic_grammar(
+                    &trust,
+                    &path,
+                    &symbol,
+                    grammar.trusted,
+                )?);
+            }
+            if !grammar.highlights.is_empty() {
+                definition.highlight_queries = grammar
+                    .highlights
+                    .iter()
+                    .map(|path| read_query(path, config_dir, "highlight"))
+                    .collect::<anyhow::Result<_>>()?;
+            }
+            if let Some(path) = &grammar.injections {
+                definition.injection_query = Some(read_query(path, config_dir, "injection")?);
+            }
+        }
+
+        if let Some(source) = &definition.grammar {
+            let language = grammar_language(source);
+            let mut parser = Parser::new();
+            parser.set_language(&language).with_context(|| {
+                format!("language `{id}` uses an incompatible Tree-sitter grammar")
+            })?;
+            if !definition.highlight_queries.is_empty() {
+                Query::new(&language, &definition.highlight_queries.join("\n"))
+                    .with_context(|| format!("language `{id}` has an invalid highlight query"))?;
+            }
+            if let Some(query) = &definition.injection_query {
+                Query::new(&language, query)
+                    .with_context(|| format!("language `{id}` has an invalid injection query"))?;
+            }
+        }
+
+        self.insert(definition);
+        Ok(())
     }
 
     fn insert(&mut self, definition: RuntimeLanguageDefinition) {
@@ -650,14 +658,20 @@ fn collect_injections(
     let mut matches = cursor.matches(query, root_node, code.as_bytes());
 
     while let Some(mat) = matches.next() {
-        let mut language_name = None;
+        let mut language_name = query
+            .property_settings(mat.pattern_index)
+            .iter()
+            .find(|property| property.key.as_ref() == "injection.language")
+            .and_then(|property| property.value.as_deref());
         let mut content = None;
 
         for capture in mat.captures {
             let capture_name = query.capture_names()[capture.index as usize];
             match capture_name {
                 "injection.language" => {
-                    language_name = capture.node.utf8_text(code.as_bytes()).ok();
+                    if language_name.is_none() {
+                        language_name = capture.node.utf8_text(code.as_bytes()).ok();
+                    }
                 }
                 "injection.content" => {
                     content = Some((capture.node.start_byte(), capture.node.end_byte()));
@@ -1149,6 +1163,15 @@ mod tests {
             .next_back()
     }
 
+    fn markdown_injections(query_source: &str, code: &str) -> Vec<RawInjection> {
+        let language: Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        let query = Query::new(&language, query_source).unwrap();
+        collect_injections(&query, tree.root_node(), code)
+    }
+
     #[test]
     fn resolves_language_by_file_extension() {
         let highlighter = highlighter();
@@ -1261,6 +1284,48 @@ mod tests {
             .highlight_for_file(Some("Customfile"), "hello")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn failed_incremental_language_insertion_preserves_accepted_definitions() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut registry = LanguageRegistry::bundled();
+        registry
+            .insert_configured(
+                "accepted",
+                &LanguageConfig {
+                    extensions: vec!["accepted".to_string()],
+                    grammar: Some(LanguageGrammarConfig {
+                        builtin: Some("rust".to_string()),
+                        ..LanguageGrammarConfig::default()
+                    }),
+                    ..LanguageConfig::default()
+                },
+                directory.path(),
+            )
+            .unwrap();
+
+        let error = registry
+            .insert_configured(
+                "rejected",
+                &LanguageConfig {
+                    grammar: Some(LanguageGrammarConfig {
+                        builtin: Some("missing".to_string()),
+                        ..LanguageGrammarConfig::default()
+                    }),
+                    ..LanguageConfig::default()
+                },
+                directory.path(),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("unknown bundled grammar"));
+        assert!(registry.languages.contains_key("accepted"));
+        assert!(!registry.languages.contains_key("rejected"));
+        assert_eq!(
+            registry.extensions.get("accepted").map(String::as_str),
+            Some("accepted")
+        );
     }
 
     #[test]
@@ -1384,6 +1449,108 @@ mod tests {
         assert_eq!(highlighter.language_id_for_name("hk"), Some("husk"));
         assert_eq!(highlighter.language_id_for_name("husk"), Some("husk"));
         assert_eq!(highlighter.language_id_for_name("unknown"), None);
+    }
+
+    #[test]
+    fn static_tree_sitter_injection_properties_select_the_nested_language() {
+        let code = "```ignored\nconst answer = true;\n```\n";
+        let injections = markdown_injections(
+            r#"((fenced_code_block
+                  (code_fence_content) @injection.content)
+                 (#set! injection.language "javascript"))"#,
+            code,
+        );
+
+        assert_eq!(injections.len(), 1);
+        assert_eq!(injections[0].language_name, "javascript");
+        assert_eq!(
+            &code[injections[0].content_start..injections[0].content_end],
+            "const answer = true;\n"
+        );
+    }
+
+    #[test]
+    fn dynamic_tree_sitter_injection_captures_remain_supported() {
+        let injections =
+            markdown_injections(MARKDOWN_INJECTION_QUERY, "```rust\nfn main() {}\n```\n");
+
+        assert_eq!(injections.len(), 1);
+        assert_eq!(injections[0].language_name, "rust");
+    }
+
+    #[test]
+    fn explicit_static_injection_language_takes_precedence_over_dynamic_capture() {
+        let injections = markdown_injections(
+            r#"((fenced_code_block
+                  (info_string (language) @injection.language)
+                  (code_fence_content) @injection.content)
+                 (#set! injection.language "javascript"))"#,
+            "```rust\nconst answer = true;\n```\n",
+        );
+
+        assert_eq!(injections.len(), 1);
+        assert_eq!(injections[0].language_name, "javascript");
+    }
+
+    #[test]
+    fn unavailable_static_injection_language_degrades_without_loading_another_grammar() {
+        let directory = tempfile::tempdir().unwrap();
+        let query = directory.path().join("injections.scm");
+        fs::write(
+            &query,
+            r#"((fenced_code_block
+                  (code_fence_content) @injection.content)
+                 (#set! injection.language "not-installed"))"#,
+        )
+        .unwrap();
+        let languages = HashMap::from([(
+            "markdown".to_string(),
+            LanguageConfig {
+                grammar: Some(LanguageGrammarConfig {
+                    injections: Some(query),
+                    ..LanguageGrammarConfig::default()
+                }),
+                ..LanguageConfig::default()
+            },
+        )]);
+        let registry =
+            Arc::new(LanguageRegistry::from_config(&languages, directory.path()).unwrap());
+        let mut highlighter = Highlighter::with_registry(&Theme::default(), registry).unwrap();
+
+        assert!(highlighter
+            .highlight("markdown", "```unknown\nconst answer = true;\n```\n")
+            .is_ok());
+    }
+
+    #[test]
+    fn static_injection_properties_highlight_available_nested_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let query = directory.path().join("injections.scm");
+        fs::write(
+            &query,
+            r#"((fenced_code_block
+                  (code_fence_content) @injection.content)
+                 (#set! injection.language "javascript"))"#,
+        )
+        .unwrap();
+        let languages = HashMap::from([(
+            "markdown".to_string(),
+            LanguageConfig {
+                grammar: Some(LanguageGrammarConfig {
+                    injections: Some(query),
+                    ..LanguageGrammarConfig::default()
+                }),
+                ..LanguageConfig::default()
+            },
+        )]);
+        let registry =
+            Arc::new(LanguageRegistry::from_config(&languages, directory.path()).unwrap());
+        let mut highlighter =
+            Highlighter::with_registry(&theme_with_scopes(&["keyword"]), registry).unwrap();
+        let code = "```unknown\nconst answer = true;\n```\n";
+        let styles = highlighter.highlight("markdown", code).unwrap();
+
+        assert_token_highlighted(&styles, code, "const");
     }
 
     #[test]

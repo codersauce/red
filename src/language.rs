@@ -86,6 +86,7 @@ pub fn finalize_language_configuration(loaded: &mut LoadedConfig, config_dir: &P
     }
 
     let mut accepted = std::collections::HashMap::new();
+    let mut registry = LanguageRegistry::bundled();
     let mut language_ids = loaded.config.languages.keys().cloned().collect::<Vec<_>>();
     language_ids.sort_unstable();
     for id in language_ids {
@@ -128,9 +129,7 @@ pub fn finalize_language_configuration(loaded: &mut LoadedConfig, config_dir: &P
             continue;
         }
 
-        accepted.insert(id.clone(), definition);
-        if let Err(error) = LanguageRegistry::from_config(&accepted, config_dir) {
-            accepted.remove(&id);
+        if let Err(error) = registry.insert_configured(&id, &definition, config_dir) {
             loaded.add_runtime_diagnostic(
                 "CFG401",
                 ConfigDiagnosticSeverity::Error,
@@ -138,7 +137,9 @@ pub fn finalize_language_configuration(loaded: &mut LoadedConfig, config_dir: &P
                 format!("language definition could not be loaded: {error:#}"),
                 "quarantined only the affected language",
             );
+            continue;
         }
+        accepted.insert(id, definition);
     }
     loaded.config.languages = accepted;
     loaded
@@ -411,6 +412,39 @@ command = "{command}"
                     && diagnostic.message.contains("LSP command must not be empty")
             }));
         }
+    }
+
+    #[test]
+    fn invalid_language_does_not_remove_previously_or_subsequently_accepted_languages() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = r#"
+[languages.first]
+extensions = ["first"]
+
+[languages.first.grammar]
+builtin = "rust"
+
+[languages.invalid.grammar]
+builtin = "missing"
+
+[languages.last]
+extensions = ["last"]
+
+[languages.last.grammar]
+builtin = "rust"
+"#;
+        let mut loaded =
+            Config::load_user_toml(source, &directory.path().join("config.toml"), &[]).unwrap();
+
+        finalize_language_configuration(&mut loaded, directory.path()).unwrap();
+
+        assert!(loaded.config.languages.contains_key("first"));
+        assert!(loaded.config.languages.contains_key("last"));
+        assert!(!loaded.config.languages.contains_key("invalid"));
+        assert!(loaded.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == "languages.invalid"
+                && diagnostic.message.contains("unknown bundled grammar")
+        }));
     }
 
     #[test]
