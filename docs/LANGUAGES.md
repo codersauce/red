@@ -179,6 +179,20 @@ and catalog entry. For example, the Swift pack supplies its own Tree-sitter
 grammar, highlight queries, SwiftPM root detection, and SourceKit-LSP
 configuration without adding Swift-specific code to Red.
 
+Language packs can also supply an injection query through
+`languages.<id>.grammar.injections`. Both dynamic `@injection.language`
+captures and static Tree-sitter query properties are supported:
+
+```scheme
+((script_element
+  (raw_text) @injection.content)
+ (#set! injection.language "javascript"))
+```
+
+Injected languages are optional: Red highlights them only when their language
+is already available. Opening one pack never installs or approves another
+pack's native grammar.
+
 ## Reload without restarting
 
 After editing your configuration, installing a package, or approving a grammar,
