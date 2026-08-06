@@ -23,7 +23,7 @@ Plugin lifecycle and reload is the boundary between configured Husk plugin sourc
 
 Configured plugins enter the registry through `add(name, path)`. The registry records the source path, marks the plugin `Pending`, snapshots the source and adjacent metadata modification times, and loads `package.json` metadata when the plugin is filesystem-backed [@registry]. A metadata load failure quarantines that plugin immediately, but the registry still inserts minimal metadata so discovery of unrelated plugins can continue [@registry].
 
-Activation checks are staged before Husk code runs. Dependencies must exist, required dependency versions must satisfy the dependent's semver requirements, and an optional `red_api_version` range must match the current Red host API version [@registry]. The compatibility guide documents the same policy for plugin packages: malformed or incompatible ranges quarantine the owner while editor startup and unrelated plugins continue [@api-doc].
+Activation checks are staged before Husk code runs. Dependencies must exist, required dependency versions must satisfy the dependent's semver requirements, and an optional `red_api_version` range must match at least one Red host API version supported by this release [@registry]. The compatibility guide documents the same policy for plugin packages: malformed or incompatible ranges quarantine the owner while editor startup and unrelated plugins continue [@api-doc].
 
 ## Activation Order And States
 
