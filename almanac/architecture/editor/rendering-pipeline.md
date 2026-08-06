@@ -18,6 +18,15 @@ sources:
   - id: editor
     type: file
     path: src/editor.rs
+  - id: rio-hidden-cursor-trail
+    type: web
+    url: https://github.com/raphamorim/rio/issues/1511
+  - id: rio-effects-config
+    type: web
+    url: https://rioterm.com/pt-br/docs/config
+  - id: rio-cursor-session
+    type: conversation
+    path: /Users/fcoury/.codex/sessions/2026/08/06/rollout-2026-08-06T13-38-01-019fd7f0-5a30-7af2-b391-9e17d6eee593.jsonl
 ---
 
 The rendering pipeline composes Red's logical editor state into an in-memory terminal-cell frame before writing to the terminal. `rendering.rs` draws windows, gutters, text, separators, panels, workspace views, dialogs, plugin render commands, overlays, diagnostics, search highlights, matching brackets, cursor styling, and frame diffs [@rendering]. `RenderBuffer` is the frame model: it stores grapheme text, width, continuation cells, and style for each terminal cell so wide graphemes and styled spans can be diffed without treating a row as a byte string [@render-buffer].
@@ -45,6 +54,12 @@ Decorations are placed per visible line segment. The renderer supports column, e
 The pipeline avoids repainting the whole terminal when it can. `render_buffer_changes` compares the new frame against `previous_render_buffer`, forces a full diff when dimensions or theme-derived colors require it, and commits only changed cells back to the previous frame after flushing [@rendering]. `RenderBuffer::diff` first detects changed rows and then emits changed cells, while `diff_row_snapshots` compares only explicitly snapshotted rows for cursor-motion fast paths [@render-buffer].
 
 `render_motion_frame` redraws the active window and chrome when a full frame is unnecessary, and `render_cursor_motion_delta` snapshots the previous cursor row, new cursor row, matching-bracket rows, status row, and command row before re-rendering only those rows [@rendering]. That fast path is allowed only when terminal output is enabled, a synthetic block cursor is in use, no dialog, focused panel, visual selection, active search, visible overlay, or active diagnostics can affect unrelated rows [@rendering].
+
+## Terminal Cursor Compatibility
+
+Red's synthetic block cursor is a painted cell, not the native terminal cursor. The full render path updates terminal-cursor surface state, applies `render_cursor_cell`, diffs the frame, and then flushes changed cells [@rendering]. `render_diff` hides the native terminal cursor before writing changes, but it still moves that hidden cursor to each changed run's terminal position so text can be printed in place [@rendering]. After the flush, `draw_cursor_with_goal_refresh` keeps the native cursor hidden whenever `uses_synthetic_block_cursor` is true [@rendering].
+
+That sequence can expose terminal-emulator cursor animation bugs. In Rio, issue #1511 reports that the cursor trail animates while the native cursor is hidden in TUI applications, and the trail should be disabled when the cursor is not visible [@rio-hidden-cursor-trail]. If Red shows phantom cursor bars or trails under Rio while the Red cursor itself stays logically correct, first disable Rio's trail effect with `[effects] trail-cursor = false`; Rio documents `trail-cursor` under the effects configuration table [@rio-effects-config]. The August 2026 cursor-debugging session matched that symptom to Red's hidden-native-cursor diff flushing rather than to a Red cursor-positioning failure [@rio-cursor-session].
 
 ## Detached Frames
 
