@@ -32,6 +32,7 @@ struct BufferPickerHandlers {
     category = "Buffer",
     description = "Find and switch between open buffers",
     aliases = ["buffers"],
+    scope = "global",
 )]
 fn buffer_picker() {
     red::request("GetEditorInfo", editor_info_loaded);

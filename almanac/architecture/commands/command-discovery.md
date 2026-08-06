@@ -18,6 +18,12 @@ sources:
   - id: plugin-runtime
     type: file
     path: src/plugin/runtime.rs
+  - id: plugin-api
+    type: file
+    path: src/plugin/api.rs
+  - id: neotree-plugin
+    type: file
+    path: plugins/neotree.hk
 ---
 
 # Command Discovery
@@ -52,12 +58,14 @@ The same module produces delayed keymap hints for nested key prefixes. `keymap_h
 
 ## Panel-Focused Key Dispatch
 
-Configured normal-mode bindings are not automatically global when a plugin panel owns focus. After dialogs, workspace mode, command mode, and search mode have had a chance to handle input, `process_editor_event` gives focused panels their own event path and only falls back to `panel_global_key_action` for editor actions admitted by `key_action_runs_from_panel` [@editor-dispatch]. This lets panel-local keys such as row navigation, expansion, activation, toggles, and close stay local while selected editor-level commands still work from a focused panel [@editor-dispatch].
+Configured normal-mode bindings are not automatically global when a plugin panel owns focus. After dialogs, workspace mode, command mode, and search mode have had a chance to handle input, `process_editor_event` gives focused panels their own event path and only falls back to `panel_global_key_action` for actions admitted by `action_runs_from_panel` [@editor-dispatch]. This lets panel-local keys such as row navigation, expansion, activation, toggles, and close stay local while selected editor-level commands still work from a focused panel [@editor-dispatch].
 
-The panel-global allowlist currently admits command/search entry, plugin commands, the command palette, next/previous window focus, and nested mappings whose descendants include an admitted action; the `Ctrl-w` nested prefix is returned before that recursive check so window-prefix continuations can be collected while a panel is focused [@editor-dispatch]. The default normal map binds `Ctrl-p` to `FilePicker` and `Ctrl-z` to `Suspend`, but those built-in actions are not in the panel-global allowlist, while plugin launchers such as `Ctrl-j` buffer picker and `Ctrl-e` Neo-tree are admitted because all `Action::PluginCommand(_)` values pass the allowlist [@default-config] [@editor-dispatch]. A future binding that should work from panels therefore needs both a normal-mode keymap entry and an explicit panel-global dispatch decision unless it is a plugin command or already inside the admitted command/search, palette, or focus-navigation set [@editor-dispatch].
+Panel-local handling comes first. Row panels prefer unmodified character keys other than `:` and `;`, so a user mapping such as normal-mode `x = FilePicker` does not steal a row-panel `x` action [@editor-dispatch]. The editor also reserves explicit panel chords such as row-panel `Ctrl-r` before trying the global normal-mode map, which lets Neo-tree clear its clipboard even if the user maps `Ctrl-r` globally [@editor-dispatch] [@default-config] [@neotree-plugin]. Other modified keys can fall through to `panel_global_key_action`, so global defaults such as `Ctrl-p` for `FilePicker`, `Ctrl-z` for `Suspend`, and `F1` for the command palette still work from a focused panel [@default-config] [@editor-dispatch].
+
+The panel-global allowlist currently admits command/search entry, file picker, command palette, configuration diagnostics, suspend, logs, plugin listing, window and split management, and nested mappings whose descendants include an admitted action [@editor-dispatch]. Plugin commands are admitted only when the active runtime reports `CommandScope::Global` for that command; an unscoped or missing plugin command remains editor-scoped even if it has a normal-mode key binding [@editor-dispatch] [@plugin-runtime]. A future binding that should work from panels therefore needs both a normal-mode keymap entry and either an allowlisted editor action or plugin command metadata with `scope = "global"` [@editor-dispatch] [@plugin-runtime].
 
 ## Plugin Command Metadata
 
-Plugins register command discovery data through the runtime's `CommandMetadata`, which carries optional title, category, description, and alias fields [@plugin-runtime]. `Runtime::registered_commands` returns active command records with command name, owning plugin, callback, and metadata sorted by command name for stable discovery UI [@plugin-runtime]. Because palette entries retain the owning plugin in their ids, duplicate command names have deterministic runtime behavior before discovery surfaces display them [@plugin-runtime].
+Plugins register command discovery data through the runtime's `CommandMetadata`, which carries optional title, category, description, aliases, visibility, and panel key-dispatch scope [@plugin-runtime]. Declarative `#[red::command]` metadata accepts `scope = "editor"` or `scope = "global"` and defaults to editor scope, while imperative `red::add_command` metadata is deserialized into the same runtime structure [@plugin-api] [@plugin-runtime]. `Runtime::registered_commands` returns active command records with command name, owning plugin, callback, and metadata sorted by command name for stable discovery UI, and `Runtime::command_scope` is the editor's lookup path when deciding whether a plugin command may run from focused panels [@plugin-runtime] [@editor-dispatch]. Because palette entries retain the owning plugin in their ids, duplicate command names have deterministic runtime behavior before discovery surfaces display them [@plugin-runtime].
 
 This command system does not make colon syntax a general shell. Arguments are split simply, command names are case-sensitive where plugin names are involved, and plugin command execution stays behind the plugin host boundary [@command-parser] [@editor-dispatch]. The CLI-level command surface is documented in [Red Command](../../reference/cli/red-command), and exact default keymaps and plugin command bindings belong in [Default Config](../../reference/configuration/default-config).

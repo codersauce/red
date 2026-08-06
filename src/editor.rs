@@ -8682,11 +8682,29 @@ impl Editor {
         let mut drain_repeated_motion = false;
 
         let from_waiting_key_action = self.waiting_key_action.is_some();
+        let started_with_panel_focus = self.panel_manager.focused_panel_id().is_some();
         let started_in_normal = self.is_normal();
         let semantic_can_start = started_in_normal || self.is_visual();
         let was_recording_macro = self.macro_recording.is_some();
         let resolve_span = perf::PerfSpan::start("event:resolve_action");
-        let action = self.handle_event_with_runtime(&ev, Some(runtime))?;
+        let mut action = self.handle_event_with_runtime(&ev, Some(runtime))?;
+        if started_with_panel_focus {
+            let pending_commands = action.as_ref().map_or_else(Vec::new, |action| {
+                Self::pending_panel_plugin_commands(action, runtime)
+            });
+            if !pending_commands.is_empty() {
+                for command in pending_commands {
+                    self.plugin_registry
+                        .ensure_command_registered(runtime, &command)
+                        .await;
+                }
+                action = if from_waiting_key_action {
+                    action.and_then(|action| self.key_action_for_panel(&action, Some(runtime)))
+                } else {
+                    self.handle_event_with_runtime(&ev, Some(runtime))?
+                };
+            }
+        }
         if !sensitive_input {
             if was_recording_macro && self.macro_recording.is_some() {
                 self.record_macro_event(&ev);
@@ -10491,18 +10509,11 @@ impl Editor {
             if !self.panel_manager.focused_text_input_active() && self.handle_repeater(ev) {
                 return Ok(None);
             }
-            if self.panel_manager.focused_text_panel_has_composer()
-                && !self.panel_manager.focused_text_input_active()
-            {
-                if let Some(action) = self.panel_global_key_action(ev) {
-                    return Ok(Some(action));
-                }
-            }
-            if let Some(action) = self.handle_panel_event(ev) {
+            if let Some(action) = self.handle_panel_event(ev, runtime) {
                 return Ok(Some(action));
             }
 
-            if let Some(action) = self.panel_global_key_action(ev) {
+            if let Some(action) = self.panel_global_key_action(ev, runtime) {
                 return Ok(Some(action));
             }
 
@@ -10526,7 +10537,7 @@ impl Editor {
         }
 
         if matches!(ev, Event::Mouse(_)) {
-            if let Some(action) = self.handle_panel_event(ev) {
+            if let Some(action) = self.handle_panel_event(ev, runtime) {
                 return Ok(Some(action));
             }
         }
@@ -10660,7 +10671,11 @@ impl Editor {
         false
     }
 
-    fn handle_panel_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+    fn handle_panel_event(
+        &mut self,
+        ev: &event::Event,
+        runtime: Option<&Runtime>,
+    ) -> Option<KeyAction> {
         if let Some(event) = self
             .panel_manager
             .handle_focused_text_input(ev, usize::from(self.size.0))
@@ -10720,6 +10735,12 @@ impl Editor {
                     KeyCode::Char('c') if event.modifiers.contains(KeyModifiers::CONTROL) => {
                         "interrupt"
                     }
+                    KeyCode::Char('r')
+                        if self.panel_manager.focused_row_panel()
+                            && event.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        "Ctrl-r"
+                    }
                     KeyCode::Char('H') => "history",
                     KeyCode::Char('N') => "new",
                     KeyCode::Char('a') if !self.panel_manager.focused_row_panel() => {
@@ -10729,14 +10750,41 @@ impl Editor {
                     KeyCode::Left | KeyCode::Char('h') => "collapse",
                     KeyCode::Right | KeyCode::Char('l') => "expand",
                     KeyCode::Enter => "activate",
+                    KeyCode::Char(' ')
+                        if event.modifiers.is_empty()
+                            && self.panel_manager.focused_text_panel_has_composer()
+                            && !self.panel_manager.focused_text_input_active() =>
+                    {
+                        if let Some(action @ KeyAction::Nested(_)) =
+                            self.panel_global_key_action(ev, runtime)
+                        {
+                            return Some(action);
+                        }
+                        "toggle"
+                    }
                     KeyCode::Char(' ') => "toggle",
                     KeyCode::Char('q') => "close",
                     KeyCode::Char('R') => "refresh",
                     _ => {
-                        if let Some(action) = self.panel_global_key_action(ev) {
+                        let action = Self::key_string_for_event(ev)?;
+                        if self.panel_manager.focused_row_panel()
+                            && Self::row_panel_prefers_key(event)
+                        {
+                            let panel_height = usize::from(self.size.1.saturating_sub(2));
+                            let scrolloff = self.config.scrolloff.unwrap_or(0);
+                            return self
+                                .panel_manager
+                                .handle_focused_key(
+                                    &action,
+                                    panel_height,
+                                    usize::from(self.size.0),
+                                    scrolloff,
+                                )
+                                .and_then(Self::panel_event_key_action);
+                        }
+                        if let Some(action) = self.panel_global_key_action(ev, runtime) {
                             return Some(action);
                         }
-                        let action = Self::key_string_for_event(ev)?;
                         let panel_height = usize::from(self.size.1.saturating_sub(2));
                         let scrolloff = self.config.scrolloff.unwrap_or(0);
                         return self
@@ -10760,6 +10808,16 @@ impl Editor {
             Event::Mouse(event) => self.handle_panel_mouse_event(event),
             _ => None,
         }
+    }
+
+    fn row_panel_prefers_key(event: &KeyEvent) -> bool {
+        !event.modifiers.intersects(
+            KeyModifiers::CONTROL
+                | KeyModifiers::ALT
+                | KeyModifiers::SUPER
+                | KeyModifiers::HYPER
+                | KeyModifiers::META,
+        ) && matches!(event.code, KeyCode::Char(c) if !matches!(c, ':' | ';'))
     }
 
     fn handle_divider_mouse_event(&mut self, event: &MouseEvent) -> Option<KeyAction> {
@@ -10939,45 +10997,129 @@ impl Editor {
             .map(|buffer| buffer.name().to_string())
     }
 
-    fn panel_global_key_action(&self, ev: &event::Event) -> Option<KeyAction> {
+    fn panel_global_key_action(
+        &self,
+        ev: &event::Event,
+        runtime: Option<&Runtime>,
+    ) -> Option<KeyAction> {
         let key = Self::key_string_for_event(ev)?;
         let action = self
             .config
             .keys
             .normal
             .get(&key)
-            .cloned()
             .or_else(|| match key.as_str() {
-                "Space" => self.config.keys.normal.get(" ").cloned(),
-                "Tab" => self.config.keys.normal.get("Tab").cloned(),
+                "Space" => self.config.keys.normal.get(" "),
+                "Tab" => self.config.keys.normal.get("Tab"),
                 _ => None,
             })?;
 
-        if key == "Ctrl-w" && matches!(action, KeyAction::Nested(_)) {
-            return Some(action);
-        }
-
-        Self::key_action_runs_from_panel(&action).then_some(action)
+        self.key_action_for_panel(action, runtime)
     }
 
-    fn key_action_runs_from_panel(action: &KeyAction) -> bool {
+    fn key_action_for_panel(
+        &self,
+        action: &KeyAction,
+        runtime: Option<&Runtime>,
+    ) -> Option<KeyAction> {
         match action {
-            KeyAction::Single(
-                Action::EnterMode(Mode::Command | Mode::Search)
-                | Action::PluginCommand(_)
-                | Action::CommandPalette
-                | Action::NextWindow
-                | Action::PreviousWindow,
-            ) => true,
-            KeyAction::Multiple(actions) => actions.iter().any(|action| {
-                matches!(
-                    action,
-                    Action::EnterMode(Mode::Command | Mode::Search)
-                        | Action::PluginCommand(_)
-                        | Action::CommandPalette
+            KeyAction::Single(action) => self
+                .action_runs_from_panel(action, runtime)
+                .then(|| KeyAction::Single(action.clone())),
+            KeyAction::Multiple(actions) => actions
+                .iter()
+                .all(|action| self.action_runs_from_panel(action, runtime))
+                .then(|| KeyAction::Multiple(actions.clone())),
+            KeyAction::Nested(actions) => {
+                let actions = actions
+                    .iter()
+                    .filter_map(|(key, action)| {
+                        self.key_action_for_panel(action, runtime)
+                            .map(|action| (key.clone(), action))
+                    })
+                    .collect::<HashMap<_, _>>();
+                (!actions.is_empty()).then_some(KeyAction::Nested(actions))
+            }
+            KeyAction::Repeating(times, action) => self
+                .key_action_for_panel(action, runtime)
+                .map(|action| KeyAction::Repeating(*times, Box::new(action))),
+            KeyAction::None => None,
+        }
+    }
+
+    fn pending_panel_plugin_commands(action: &KeyAction, runtime: &Runtime) -> Vec<String> {
+        let mut commands = Vec::new();
+        Self::collect_pending_panel_plugin_commands(action, runtime, &mut commands);
+        commands
+    }
+
+    fn collect_pending_panel_plugin_commands(
+        action: &KeyAction,
+        runtime: &Runtime,
+        commands: &mut Vec<String>,
+    ) {
+        match action {
+            KeyAction::Single(Action::PluginCommand(command)) => {
+                if runtime.command_scope(command).is_none() && !commands.contains(command) {
+                    commands.push(command.clone());
+                }
+            }
+            KeyAction::Multiple(actions) => {
+                for action in actions {
+                    if let Action::PluginCommand(command) = action {
+                        if runtime.command_scope(command).is_none() && !commands.contains(command) {
+                            commands.push(command.clone());
+                        }
+                    }
+                }
+            }
+            KeyAction::Repeating(_, action) => {
+                Self::collect_pending_panel_plugin_commands(action, runtime, commands);
+            }
+            KeyAction::Nested(actions) => {
+                for action in actions.values() {
+                    Self::collect_pending_panel_plugin_commands(action, runtime, commands);
+                }
+            }
+            KeyAction::None | KeyAction::Single(_) => {}
+        }
+    }
+
+    fn action_runs_from_panel(&self, action: &Action, runtime: Option<&Runtime>) -> bool {
+        match action {
+            Action::EnterMode(Mode::Command | Mode::Search)
+            | Action::FilePicker
+            | Action::CommandPalette
+            | Action::ConfigDiagnostics
+            | Action::Suspend
+            | Action::ViewLogs
+            | Action::ListPlugins
+            | Action::SplitHorizontal
+            | Action::SplitVertical
+            | Action::CloseWindow
+            | Action::NextWindow
+            | Action::PreviousWindow
+            | Action::MoveWindowUp
+            | Action::MoveWindowDown
+            | Action::MoveWindowLeft
+            | Action::MoveWindowRight
+            | Action::MoveWindowToLeft
+            | Action::MoveWindowToBottom
+            | Action::MoveWindowToTop
+            | Action::MoveWindowToRight
+            | Action::ResizeWindowUp(_)
+            | Action::ResizeWindowDown(_)
+            | Action::ResizeWindowLeft(_)
+            | Action::ResizeWindowRight(_)
+            | Action::BalanceWindows
+            | Action::MaximizeWindow
+            | Action::OnlyWindow => true,
+            Action::PluginCommand(command) => runtime.is_some_and(|runtime| {
+                runtime.command_scope(command).map_or_else(
+                    || self.plugin_registry.has_pending_command(command),
+                    |scope| scope == plugin::CommandScope::Global,
                 )
             }),
-            KeyAction::Nested(actions) => actions.values().any(Self::key_action_runs_from_panel),
             _ => false,
         }
     }
@@ -23071,6 +23213,15 @@ impl Editor {
     pub fn test_handle_event(&mut self, event: event::Event) -> anyhow::Result<Option<KeyAction>> {
         self.handle_event(&event)
     }
+
+    #[doc(hidden)]
+    pub fn test_handle_event_with_runtime(
+        &mut self,
+        event: event::Event,
+        runtime: &Runtime,
+    ) -> anyhow::Result<Option<KeyAction>> {
+        self.handle_event_with_runtime(&event, Some(runtime))
+    }
 }
 
 #[cfg(test)]
@@ -30916,6 +31067,144 @@ while True:
             render_buffer.cells[cursor_index].style, focused_style,
             "focusing a panel should repaint the synthetic editor cursor away"
         );
+    }
+
+    #[tokio::test]
+    async fn focused_panel_resolves_nested_lazy_commands_before_exposing_prefixes() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_plugin_requests();
+        let root = tempfile::tempdir().unwrap();
+        let husk_root = root.path().join("husk");
+        std::fs::create_dir_all(husk_root.join("src")).unwrap();
+        std::fs::write(
+            root.path().join("red-plugin.toml"),
+            r#"
+                schema_version = 1
+
+                [plugin]
+                id = "lazy-panel-commands"
+                name = "Lazy Panel Commands"
+                version = "0.1.0"
+                red_api = "^0.7.0"
+                husk_manifest = "husk/Husk.toml"
+
+                [activation]
+                commands = ["LazyGlobal", "LazyContextual"]
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            husk_root.join("Husk.toml"),
+            r#"
+                schema_version = 1
+
+                [package]
+                name = "lazy-panel-commands"
+                version = "0.1.0"
+                entry = "src/main.hk"
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            husk_root.join("src/main.hk"),
+            r#"
+                pub fn activate() {
+                    red::add_command("LazyGlobal", run_global, Json { scope: "global" });
+                    red::add_command("LazyContextual", run_contextual);
+                    red::on("panel:event:tree", panel_event);
+                }
+
+                fn run_global() { red::execute("Print", "global command"); }
+                fn run_contextual() { red::execute("Print", "contextual command"); }
+
+                fn panel_event(event: Json) {
+                    if event.action == "Ctrl-t" {
+                        red::execute("Print", "panel fallback");
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+
+        let mut editor = test_editor(40, 10);
+        editor.config.keys.normal.insert(
+            "F2".to_string(),
+            KeyAction::Nested(HashMap::from([(
+                "x".to_string(),
+                KeyAction::Single(Action::PluginCommand("LazyContextual".to_string())),
+            )])),
+        );
+        editor.config.keys.normal.insert(
+            "F3".to_string(),
+            KeyAction::Nested(HashMap::from([(
+                "x".to_string(),
+                KeyAction::Single(Action::PluginCommand("LazyGlobal".to_string())),
+            )])),
+        );
+        editor.test_create_panel(
+            "tree",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Left,
+                width: 10,
+                ..plugin::PanelConfig::default()
+            },
+        );
+        assert!(editor.test_focus_panel("tree"));
+        editor.plugin_registry.add(
+            "lazy-panel-commands",
+            husk_root.join("Husk.toml").to_str().unwrap(),
+        );
+        let mut runtime = Runtime::new();
+        editor
+            .plugin_registry
+            .initialize(&mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(
+            editor.plugin_registry.statuses().get("lazy-panel-commands"),
+            Some(&plugin::PluginStatus::Pending)
+        );
+        let mut render_buffer = RenderBuffer::new(40, 10, &Style::default());
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            editor.plugin_registry.statuses().get("lazy-panel-commands"),
+            Some(&plugin::PluginStatus::Active)
+        );
+        assert!(editor.waiting_key_action.is_none());
+        assert!(collect_print_requests().is_empty());
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+        assert!(editor.waiting_key_action.is_some());
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(collect_print_requests(), ["global command"]);
     }
 
     #[test]

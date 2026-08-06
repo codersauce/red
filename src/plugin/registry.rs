@@ -33,8 +33,8 @@ pub struct PluginRegistry {
 }
 
 /// Host API version used for plugin compatibility checks.
-pub const RED_HOST_API_VERSION: &str = "0.6.0";
-const SUPPORTED_HOST_API_VERSIONS: &[&str] = &["0.4.0", RED_HOST_API_VERSION];
+pub const RED_HOST_API_VERSION: &str = "0.7.0";
+pub(crate) const SUPPORTED_HOST_API_VERSIONS: &[&str] = &["0.4.0", "0.6.0", RED_HOST_API_VERSION];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PluginModification {
@@ -290,24 +290,7 @@ impl PluginRegistry {
 
     /// Executes a plugin command and quarantines its owner on callback failure.
     pub async fn execute(&mut self, runtime: &mut Runtime, command: &str) -> anyhow::Result<()> {
-        if runtime.command_plugin(command).is_none() {
-            let candidate = self
-                .plugins
-                .iter()
-                .find(|(name, _)| {
-                    matches!(self.statuses.get(name), Some(PluginStatus::Pending))
-                        && self.metadata.get(name).is_some_and(|metadata| {
-                            metadata
-                                .activation_events
-                                .iter()
-                                .any(|event| event == &format!("onCommand:{command}"))
-                        })
-                })
-                .cloned();
-            if let Some((name, path)) = candidate {
-                self.activate_one(runtime, &name, &path).await;
-            }
-        }
+        self.ensure_command_registered(runtime, command).await;
         let owner = runtime.command_plugin(command);
         if let Err(error) = runtime.execute_command(command).await {
             crate::log!("Plugin command `{command}` failed: {error:?}");
@@ -322,6 +305,35 @@ impl PluginRegistry {
             }
         }
         Ok(())
+    }
+
+    /// Activates the pending plugin that declares `command`, if any.
+    pub(crate) async fn ensure_command_registered(&mut self, runtime: &mut Runtime, command: &str) {
+        if runtime.command_plugin(command).is_some() {
+            return;
+        }
+        if let Some((name, path)) = self.pending_command_plugin(command) {
+            self.activate_one(runtime, &name, &path).await;
+        }
+    }
+
+    pub(crate) fn has_pending_command(&self, command: &str) -> bool {
+        self.pending_command_plugin(command).is_some()
+    }
+
+    fn pending_command_plugin(&self, command: &str) -> Option<(String, String)> {
+        self.plugins
+            .iter()
+            .find(|(name, _)| {
+                matches!(self.statuses.get(name), Some(PluginStatus::Pending))
+                    && self.metadata.get(name).is_some_and(|metadata| {
+                        metadata
+                            .activation_events
+                            .iter()
+                            .any(|event| event == &format!("onCommand:{command}"))
+                    })
+            })
+            .cloned()
     }
 
     /// Broadcasts an event while isolating and quarantining per-plugin failures.
@@ -897,18 +909,39 @@ fn check_api_compatibility(metadata: &PluginMetadata) -> anyhow::Result<()> {
     };
     let requirement = VersionReq::parse(requirement)
         .map_err(|error| anyhow::anyhow!("invalid red_api_version `{requirement}`: {error}"))?;
-    let compatible = SUPPORTED_HOST_API_VERSIONS
-        .iter()
-        .map(|version| Version::parse(version))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .any(|version| requirement.matches(&version));
+    let compatible = host_api_requirement_is_supported(&requirement)?;
     anyhow::ensure!(
         compatible,
         "plugin requires Red host API `{requirement}`, but this release supports {}; see docs/PLUGIN_API.md",
         SUPPORTED_HOST_API_VERSIONS.join(", ")
     );
     Ok(())
+}
+
+pub(crate) fn host_api_requirement_is_supported(requirement: &VersionReq) -> anyhow::Result<bool> {
+    Ok(SUPPORTED_HOST_API_VERSIONS
+        .iter()
+        .map(|version| Version::parse(version))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .any(|version| requirement.matches(&version)))
+}
+
+pub(crate) fn host_api_requirement_requires_at_least(
+    requirement: &VersionReq,
+    introduced: &str,
+) -> anyhow::Result<bool> {
+    let introduced = Version::parse(introduced)?;
+    let supported = SUPPORTED_HOST_API_VERSIONS
+        .iter()
+        .map(|version| Version::parse(version))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(supported
+        .iter()
+        .any(|version| version >= &introduced && requirement.matches(version))
+        && supported
+            .iter()
+            .all(|version| version >= &introduced || !requirement.matches(version)))
 }
 
 fn diagnostic_stage(error: &anyhow::Error) -> &'static str {
@@ -1409,6 +1442,9 @@ mod tests {
     fn pre_one_minor_host_api_requirements_do_not_cross_minor_versions() {
         let mut metadata = PluginMetadata::minimal("composer-plugin".to_string());
         metadata.red_api_version = Some("^0.4.0".to_string());
+        check_api_compatibility(&metadata).unwrap();
+
+        metadata.red_api_version = Some("^0.6.0".to_string());
         check_api_compatibility(&metadata).unwrap();
 
         metadata.red_api_version = Some("^0.5.0".to_string());

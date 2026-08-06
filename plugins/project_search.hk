@@ -109,6 +109,7 @@ fn state() -> ProjectSearchState {
     category = "Search",
     description = "Find text across the workspace",
     aliases = ["ripgrep", "find text"],
+    scope = "global",
 )]
 fn project_search() {
     close_search_picker();

@@ -74,6 +74,7 @@ pub struct CommandMetadata {
     pub description: Option<String>,
     pub aliases: Vec<String>,
     pub visible: bool,
+    pub scope: CommandScope,
 }
 
 impl Default for CommandMetadata {
@@ -84,8 +85,20 @@ impl Default for CommandMetadata {
             description: None,
             aliases: Vec::new(),
             visible: true,
+            scope: CommandScope::Editor,
         }
     }
+}
+
+/// Surfaces from which a registered plugin command may be invoked by keymap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandScope {
+    /// Only dispatch the command through the keymap owned by the active editor surface.
+    #[default]
+    Editor,
+    /// Allow configured normal-mode bindings to invoke the command from focused panels too.
+    Global,
 }
 
 /// Opaque identifier for a one-shot request issued by a Red plugin.
@@ -145,6 +158,7 @@ struct CommandMetadata {
     description: String,
     aliases: [String],
     visible: bool,
+    scope: String,
 }
 struct Position {
     line: i32,
@@ -2788,6 +2802,7 @@ impl Host for RedHost {
                     description,
                     aliases,
                     visible,
+                    scope,
                 } => {
                     if let Some(existing) = self.policy().commands.get(&name) {
                         if existing.callback.plugin() == plugin {
@@ -2808,6 +2823,7 @@ impl Host for RedHost {
                                 description,
                                 aliases,
                                 visible,
+                                scope,
                             },
                         },
                     );
@@ -3557,6 +3573,19 @@ impl Runtime {
             .commands
             .get(command)
             .map(|command| command.callback.plugin().to_string())
+    }
+
+    /// Returns the key-dispatch scope declared by an active plugin command.
+    #[must_use]
+    pub fn command_scope(&self, command: &str) -> Option<CommandScope> {
+        self.inner
+            .lock()
+            .unwrap()
+            .host
+            .policy()
+            .commands
+            .get(command)
+            .map(|command| command.metadata.scope)
     }
 
     /// Returns the active plugin commands in a stable order for discovery UI.
@@ -4696,6 +4725,7 @@ mod tests {
                     title: "Search project",
                     category: "Search",
                     aliases: ["ripgrep"],
+                    scope: "global",
                 });
                 red::add_command("BufferPicker", buffers);
             }
@@ -4722,6 +4752,16 @@ mod tests {
         );
         assert_eq!(commands[1].metadata.category.as_deref(), Some("Search"));
         assert_eq!(commands[1].metadata.aliases, vec!["ripgrep"]);
+        assert_eq!(commands[0].metadata.scope, CommandScope::Editor);
+        assert_eq!(commands[1].metadata.scope, CommandScope::Global);
+        assert_eq!(
+            runtime.command_scope("BufferPicker"),
+            Some(CommandScope::Editor)
+        );
+        assert_eq!(
+            runtime.command_scope("ProjectSearch"),
+            Some(CommandScope::Global)
+        );
     }
 
     #[tokio::test]
@@ -4739,6 +4779,7 @@ mod tests {
                 category = "LSP",
                 description = "Browse document symbols",
                 aliases = ["outline", "symbols"],
+                scope = "global",
             )]
             fn open() {
                 red::execute("Print", "command");
@@ -4769,6 +4810,7 @@ mod tests {
             Some("Browse document symbols")
         );
         assert_eq!(command.metadata.aliases, ["outline", "symbols"]);
+        assert_eq!(command.metadata.scope, CommandScope::Global);
 
         runtime.execute_command("OpenSymbols").await.unwrap();
         assert!(matches!(
@@ -12852,6 +12894,9 @@ mod tests {
         assert_eq!(document.metadata.aliases, ["outline", "symbols"]);
         assert_eq!(commands[1].metadata.aliases, ["usages", "references"]);
         assert_eq!(commands[2].metadata.aliases, ["symbols"]);
+        assert_eq!(document.metadata.scope, CommandScope::Global);
+        assert_eq!(commands[1].metadata.scope, CommandScope::Editor);
+        assert_eq!(commands[2].metadata.scope, CommandScope::Global);
     }
 
     #[tokio::test]

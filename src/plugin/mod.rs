@@ -44,8 +44,8 @@ pub use panel::{
 };
 pub use registry::{PluginRegistry, PluginStatus, RED_HOST_API_VERSION};
 pub use runtime::{
-    poll_timer_callbacks, CommandMetadata, ComposerHandle, PickerHandle, RegisteredPluginCommand,
-    RequestId, Runtime,
+    poll_timer_callbacks, CommandMetadata, CommandScope, ComposerHandle, PickerHandle,
+    RegisteredPluginCommand, RequestId, Runtime,
 };
 
 pub(crate) fn husk_lsp_declarations() -> &'static str {

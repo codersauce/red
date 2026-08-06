@@ -80,11 +80,15 @@ Direct `:Name` invocation requires an exact, case-sensitive registered name and 
 currently pass arguments to the callback. Built-in commands and their abbreviations take
 precedence over plugin commands with the same name.
 
-The optional command metadata object accepts `title`, `category`, `description`,
-`aliases`, and `visible`. All fields are optional; `aliases` is an array of
+The optional command metadata accepts `title`, `category`, `description`,
+`aliases`, `visible`, and `scope`, whether declared with `#[red::command]` or
+passed to `red::add_command`. All fields are optional; `aliases` is an array of
 additional search terms, not alternate colon commands. `visible = false` hides
 a command from the palette and colon completion without disabling direct
-invocation. Existing two-argument registrations remain valid.
+invocation. `scope = "global"` allows a configured normal-mode binding to invoke
+a command while a plugin panel owns focus; the default `"editor"` scope keeps
+keymap dispatch local to the editor surface. Existing two-argument
+registrations remain valid.
 
 Use `red::request` for actions that return a value:
 

@@ -1,6 +1,12 @@
 {
-  "api_version": "0.6.0",
+  "api_version": "0.7.0",
   "changes": [
+    {
+      "version": "0.7.0",
+      "kind": "introduced",
+      "symbols": ["CommandMetadata.scope", "#[red::command(scope)]"],
+      "migration_note": "docs/PLUGIN_API.md#declarative-plugin-authoring"
+    },
     {
       "version": "0.6.0",
       "kind": "introduced",

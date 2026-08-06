@@ -300,6 +300,7 @@ fn state() -> AgentState {
     category = "Agent",
     description = "Start a new agent session",
     aliases = ["new chat"],
+    scope = "global",
 )]
 fn start() {
     red::request("GetConfig", cwd_loaded, "cwd");
@@ -348,6 +349,7 @@ fn session_created(event: AgentSessionEvent) {
     category = "Agent",
     description = "Open the agent prompt",
     aliases = ["ask ai", "chat"],
+    scope = "global",
 )]
 #[red::command(
     name = "AgentPrompt",
@@ -355,6 +357,7 @@ fn session_created(event: AgentSessionEvent) {
     category = "Agent",
     description = "Ask a question in the active agent session",
     aliases = ["ask ai", "chat"],
+    scope = "global",
 )]
 fn prompt() {
     if red::string(state().session_id, "") != "" {
@@ -369,6 +372,7 @@ fn prompt() {
     category = "Agent",
     description = "Show and focus the conversation pane without opening a prompt",
     aliases = ["show chat", "open chat"],
+    scope = "global",
 )]
 fn open_conversation() {
     let was_created = state().panel_created;
@@ -822,6 +826,7 @@ fn panel_event(event: AgentPanelEvent) {
     category = "Agent",
     description = "Clear the visible conversation while preserving context",
     aliases = ["clear chat"],
+    scope = "global",
 )]
 fn clear_conversation() {
     reset_stream_render();
@@ -852,6 +857,7 @@ fn reset_stream_render() {
     category = "Agent",
     description = "Hide the conversation pane without ending the session",
     aliases = ["hide chat"],
+    scope = "global",
 )]
 fn close_conversation() {
     if state().panel_open {
@@ -867,6 +873,7 @@ fn close_conversation() {
     category = "Agent",
     description = "Reset the session and start a new conversation",
     aliases = ["new conversation"],
+    scope = "global",
 )]
 fn new_conversation() {
     let session_id = red::string(state().session_id, "");
@@ -898,6 +905,7 @@ fn prompt_cancelled(event: ComposerCancelled) {}
     category = "Agent",
     description = "Cancel the active agent request",
     aliases = ["stop agent"],
+    scope = "global",
 )]
 fn cancel() {
     let session_id = state().session_id;
@@ -1377,6 +1385,7 @@ fn bounded_transcript_blocks(blocks: [AgentTextBlock], keep_id: String) -> Bound
     category = "Agent",
     description = "Review changes proposed by the agent",
     aliases = ["proposals"],
+    scope = "global",
 )]
 fn review() {
     red::state_patch(AgentState { review_open: true });
@@ -1588,6 +1597,7 @@ fn proposal_conflict(event: AgentProposalConflictEvent) {
     category = "Agent",
     description = "Inspect previous agent transactions",
     aliases = ["transactions"],
+    scope = "global",
 )]
 fn history() {
     red::state_patch(AgentState { history_open: true });

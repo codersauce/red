@@ -15,12 +15,14 @@ use std::{
 
 use husk_ast::{
     Attribute, AttributeArgumentKind, AttributeValueKind, Expr, ExprKind, ExternItemKind, File,
-    ImplItemKind, ItemKind, LiteralKind, ModItemKind, Param, Span, Stmt, StmtKind, TypeExpr,
-    TypeExprKind, UnaryOp,
+    ImplItemKind, ItemKind, LiteralKind, ModItemKind, Param, PatternKind, Span, Stmt, StmtKind,
+    TypeExpr, TypeExprKind, UnaryOp,
 };
 use husk_diagnostics::{Diagnostic, Report, SourceFile};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
+
+use super::runtime::CommandScope;
 
 #[derive(Debug, Deserialize)]
 pub struct HostApiSchema {
@@ -68,6 +70,7 @@ pub(crate) enum RedFunctionAnnotation {
         description: Option<String>,
         aliases: Vec<String>,
         visible: bool,
+        scope: CommandScope,
     },
     Event {
         name: String,
@@ -145,6 +148,7 @@ pub(crate) fn red_function_annotations(
             let mut description = None;
             let mut aliases = Vec::new();
             let mut visible = true;
+            let mut scope = CommandScope::Editor;
             for argument in arguments {
                 let AttributeArgumentKind::Named { name: key, value } = &argument.kind else {
                     return Err(annotation_value_error(
@@ -213,6 +217,24 @@ pub(crate) fn red_function_annotations(
                         };
                         visible = *visible_value;
                     }
+                    "scope" => {
+                        let Some(scope_value) = value.as_str() else {
+                            return Err(annotation_value_error(
+                                &value.span,
+                                "command metadata `scope` must be a string",
+                            ));
+                        };
+                        scope = match scope_value {
+                            "editor" => CommandScope::Editor,
+                            "global" => CommandScope::Global,
+                            _ => {
+                                return Err(annotation_value_error(
+                                    &value.span,
+                                    "command metadata `scope` must be `editor` or `global`",
+                                ));
+                            }
+                        };
+                    }
                     _ => {
                         return Err(annotation_value_error(
                             &key.span,
@@ -234,6 +256,7 @@ pub(crate) fn red_function_annotations(
                 description,
                 aliases,
                 visible,
+                scope,
             });
         } else if attribute.matches_path(&["red", "on"]) {
             if parameter_count != 1 {
@@ -422,23 +445,38 @@ struct HostCallSite<'a> {
     arguments: &'a [Expr],
 }
 
-fn host_call_sites(file: &File) -> Vec<HostCallSite<'_>> {
-    let mut calls = Vec::new();
+struct RedSourceSites<'a> {
+    host_calls: Vec<HostCallSite<'a>>,
+    uses_command_scope: bool,
+}
+
+#[derive(Default)]
+struct RedSourceVisitor<'a> {
+    host_calls: Vec<HostCallSite<'a>>,
+    uses_command_scope: bool,
+    command_metadata_bindings: HashMap<String, bool>,
+}
+
+fn red_source_sites(file: &File) -> RedSourceSites<'_> {
+    let mut visitor = RedSourceVisitor::default();
     for item in &file.items {
         match &item.kind {
-            ItemKind::Fn { body, .. } => visit_statements(body, &mut calls),
+            ItemKind::Fn { body, .. } => {
+                visitor.uses_command_scope |= command_attribute_uses_scope(&item.attributes);
+                visitor.visit_body(body);
+            }
             ItemKind::Trait(definition) => {
                 for item in &definition.items {
                     let husk_ast::TraitItemKind::Method(method) = &item.kind;
                     if let Some(body) = &method.default_body {
-                        visit_statements(body, &mut calls);
+                        visitor.visit_body(body);
                     }
                 }
             }
             ItemKind::Impl(block) => {
                 for item in &block.items {
                     if let ImplItemKind::Method(method) = &item.kind {
-                        visit_statements(&method.body, &mut calls);
+                        visitor.visit_body(&method.body);
                     }
                 }
             }
@@ -450,173 +488,248 @@ fn host_call_sites(file: &File) -> Vec<HostCallSite<'_>> {
             | ItemKind::Use { .. } => {}
         }
     }
-    calls
-}
-
-fn visit_statements<'a>(statements: &'a [Stmt], calls: &mut Vec<HostCallSite<'a>>) {
-    for statement in statements {
-        visit_statement(statement, calls);
+    RedSourceSites {
+        host_calls: visitor.host_calls,
+        uses_command_scope: visitor.uses_command_scope,
     }
 }
 
-fn visit_statement<'a>(statement: &'a Stmt, calls: &mut Vec<HostCallSite<'a>>) {
-    match &statement.kind {
-        StmtKind::Let {
-            value, else_block, ..
-        } => {
-            if let Some(value) = value {
-                visit_expression(value, calls);
-            }
-            if let Some(block) = else_block {
-                visit_statements(&block.stmts, calls);
-            }
-        }
-        StmtKind::Assign { target, value, .. } => {
-            visit_expression(target, calls);
-            visit_expression(value, calls);
-        }
-        StmtKind::Expr(expression) | StmtKind::Semi(expression) => {
-            visit_expression(expression, calls);
-        }
-        StmtKind::Return { value } => {
-            if let Some(value) = value {
-                visit_expression(value, calls);
-            }
-        }
-        StmtKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            visit_expression(cond, calls);
-            visit_statements(&then_branch.stmts, calls);
-            if let Some(branch) = else_branch {
-                visit_statement(branch, calls);
-            }
-        }
-        StmtKind::While { cond, body } => {
-            visit_expression(cond, calls);
-            visit_statements(&body.stmts, calls);
-        }
-        StmtKind::Loop { body } | StmtKind::Block(body) => visit_statements(&body.stmts, calls),
-        StmtKind::ForIn { iterable, body, .. } => {
-            visit_expression(iterable, calls);
-            visit_statements(&body.stmts, calls);
-        }
-        StmtKind::IfLet {
-            scrutinee,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            visit_expression(scrutinee, calls);
-            visit_statements(&then_branch.stmts, calls);
-            if let Some(branch) = else_branch {
-                visit_statement(branch, calls);
-            }
-        }
-        StmtKind::Break | StmtKind::Continue => {}
-    }
+fn command_attribute_uses_scope(attributes: &[Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        attribute.matches_path(&["red", "command"])
+            && attribute.arguments.as_ref().is_some_and(|arguments| {
+                arguments.iter().any(|argument| {
+                    matches!(
+                        &argument.kind,
+                        AttributeArgumentKind::Named { name, .. } if name.name == "scope"
+                    )
+                })
+            })
+    })
 }
 
-fn visit_expression<'a>(expression: &'a Expr, calls: &mut Vec<HostCallSite<'a>>) {
-    match &expression.kind {
-        ExprKind::Call { callee, args, .. } => {
-            if let ExprKind::Path { segments } = &callee.kind {
-                let kind = match segments.as_slice() {
-                    [module, method] if module.name == "red" && method.name == "execute" => {
-                        Some("execute")
+pub(crate) fn source_uses_command_scope(file: &File) -> bool {
+    red_source_sites(file).uses_command_scope
+}
+
+fn host_call_sites(file: &File) -> Vec<HostCallSite<'_>> {
+    red_source_sites(file).host_calls
+}
+
+impl<'a> RedSourceVisitor<'a> {
+    fn visit_body(&mut self, statements: &'a [Stmt]) {
+        self.command_metadata_bindings.clear();
+        self.visit_statements(statements);
+    }
+
+    fn visit_statements(&mut self, statements: &'a [Stmt]) {
+        for statement in statements {
+            self.visit_statement(statement);
+        }
+    }
+
+    fn visit_statement(&mut self, statement: &'a Stmt) {
+        match &statement.kind {
+            StmtKind::Let {
+                pattern,
+                value,
+                else_block,
+                ..
+            } => {
+                if let Some(value) = value {
+                    if let PatternKind::Binding(binding) = &pattern.kind {
+                        self.command_metadata_bindings.insert(
+                            binding.name.clone(),
+                            self.command_metadata_expression_uses_scope(value),
+                        );
                     }
-                    [module, method] if module.name == "red" && method.name == "request" => {
-                        Some("request")
+                    self.visit_expression(value);
+                }
+                if let Some(block) = else_block {
+                    self.visit_statements(&block.stmts);
+                }
+            }
+            StmtKind::Assign { target, value, .. } => {
+                self.update_command_metadata_binding(target, value);
+                self.visit_expression(target);
+                self.visit_expression(value);
+            }
+            StmtKind::Expr(expression) | StmtKind::Semi(expression) => {
+                self.visit_expression(expression);
+            }
+            StmtKind::Return { value } => {
+                if let Some(value) = value {
+                    self.visit_expression(value);
+                }
+            }
+            StmtKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                self.visit_expression(cond);
+                self.visit_statements(&then_branch.stmts);
+                if let Some(branch) = else_branch {
+                    self.visit_statement(branch);
+                }
+            }
+            StmtKind::While { cond, body } => {
+                self.visit_expression(cond);
+                self.visit_statements(&body.stmts);
+            }
+            StmtKind::Loop { body } | StmtKind::Block(body) => {
+                self.visit_statements(&body.stmts);
+            }
+            StmtKind::ForIn { iterable, body, .. } => {
+                self.visit_expression(iterable);
+                self.visit_statements(&body.stmts);
+            }
+            StmtKind::IfLet {
+                scrutinee,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.visit_expression(scrutinee);
+                self.visit_statements(&then_branch.stmts);
+                if let Some(branch) = else_branch {
+                    self.visit_statement(branch);
+                }
+            }
+            StmtKind::Break | StmtKind::Continue => {}
+        }
+    }
+
+    fn visit_expression(&mut self, expression: &'a Expr) {
+        match &expression.kind {
+            ExprKind::Call { callee, args, .. } => {
+                if let ExprKind::Path { segments } = &callee.kind {
+                    if matches!(segments.as_slice(), [module, method] if module.name == "red" && method.name == "add_command")
+                        && args.get(2).is_some_and(|metadata| {
+                            self.command_metadata_expression_uses_scope(metadata)
+                        })
+                    {
+                        self.uses_command_scope = true;
                     }
-                    _ => None,
-                };
-                if let (Some(kind), Some(action)) = (kind, args.first()) {
-                    if let ExprKind::Literal(literal) = &action.kind {
-                        if let LiteralKind::String(action) = &literal.kind {
-                            calls.push(HostCallSite {
-                                kind,
-                                action,
-                                action_span: literal.span.range.start + 1
-                                    ..literal.span.range.end.saturating_sub(1),
-                                arguments: &args[1..],
-                            });
+                    let kind = match segments.as_slice() {
+                        [module, method] if module.name == "red" && method.name == "execute" => {
+                            Some("execute")
+                        }
+                        [module, method] if module.name == "red" && method.name == "request" => {
+                            Some("request")
+                        }
+                        _ => None,
+                    };
+                    if let (Some(kind), Some(action)) = (kind, args.first()) {
+                        if let ExprKind::Literal(literal) = &action.kind {
+                            if let LiteralKind::String(action) = &literal.kind {
+                                self.host_calls.push(HostCallSite {
+                                    kind,
+                                    action,
+                                    action_span: literal.span.range.start + 1
+                                        ..literal.span.range.end.saturating_sub(1),
+                                    arguments: &args[1..],
+                                });
+                            }
                         }
                     }
                 }
+                self.visit_expression(callee);
+                for argument in args {
+                    self.visit_expression(argument);
+                }
             }
-            visit_expression(callee, calls);
-            for argument in args {
-                visit_expression(argument, calls);
+            ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => {
+                self.visit_expression(base);
             }
-        }
-        ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => {
-            visit_expression(base, calls);
-        }
-        ExprKind::MethodCall { receiver, args, .. } => {
-            visit_expression(receiver, calls);
-            for argument in args {
-                visit_expression(argument, calls);
+            ExprKind::MethodCall { receiver, args, .. } => {
+                self.visit_expression(receiver);
+                for argument in args {
+                    self.visit_expression(argument);
+                }
             }
-        }
-        ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } | ExprKind::Try { expr } => {
-            visit_expression(expr, calls);
-        }
-        ExprKind::Binary { left, right, .. } => {
-            visit_expression(left, calls);
-            visit_expression(right, calls);
-        }
-        ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            visit_expression(cond, calls);
-            visit_expression(then_branch, calls);
-            visit_expression(else_branch, calls);
-        }
-        ExprKind::Match { scrutinee, arms } => {
-            visit_expression(scrutinee, calls);
-            for arm in arms {
-                visit_expression(&arm.expr, calls);
+            ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } | ExprKind::Try { expr } => {
+                self.visit_expression(expr);
             }
-        }
-        ExprKind::Block(block) => visit_statements(&block.stmts, calls),
-        ExprKind::Struct { fields, .. } => {
-            for field in fields {
-                visit_expression(&field.value, calls);
+            ExprKind::Binary { left, right, .. } => {
+                self.visit_expression(left);
+                self.visit_expression(right);
             }
-        }
-        ExprKind::FormatPrint { args, .. }
-        | ExprKind::Format { args, .. }
-        | ExprKind::Array { elements: args }
-        | ExprKind::Tuple { elements: args } => {
-            for argument in args {
-                visit_expression(argument, calls);
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                self.visit_expression(cond);
+                self.visit_expression(then_branch);
+                self.visit_expression(else_branch);
             }
-        }
-        ExprKind::Closure { body, .. } => visit_expression(body, calls),
-        ExprKind::Index { base, index } => {
-            visit_expression(base, calls);
-            visit_expression(index, calls);
-        }
-        ExprKind::Range { start, end, .. } => {
-            if let Some(start) = start {
-                visit_expression(start, calls);
+            ExprKind::Match { scrutinee, arms } => {
+                self.visit_expression(scrutinee);
+                for arm in arms {
+                    self.visit_expression(&arm.expr);
+                }
             }
-            if let Some(end) = end {
-                visit_expression(end, calls);
+            ExprKind::Block(block) => self.visit_statements(&block.stmts),
+            ExprKind::Struct { fields, .. } => {
+                for field in fields {
+                    self.visit_expression(&field.value);
+                }
             }
+            ExprKind::FormatPrint { args, .. }
+            | ExprKind::Format { args, .. }
+            | ExprKind::Array { elements: args }
+            | ExprKind::Tuple { elements: args } => {
+                for argument in args {
+                    self.visit_expression(argument);
+                }
+            }
+            ExprKind::Closure { body, .. } => self.visit_expression(body),
+            ExprKind::Index { base, index } => {
+                self.visit_expression(base);
+                self.visit_expression(index);
+            }
+            ExprKind::Range { start, end, .. } => {
+                if let Some(start) = start {
+                    self.visit_expression(start);
+                }
+                if let Some(end) = end {
+                    self.visit_expression(end);
+                }
+            }
+            ExprKind::Assign { target, value, .. } => {
+                self.update_command_metadata_binding(target, value);
+                self.visit_expression(target);
+                self.visit_expression(value);
+            }
+            ExprKind::Literal(_)
+            | ExprKind::Ident(_)
+            | ExprKind::Path { .. }
+            | ExprKind::JsLiteral { .. } => {}
         }
-        ExprKind::Assign { target, value, .. } => {
-            visit_expression(target, calls);
-            visit_expression(value, calls);
+    }
+
+    fn update_command_metadata_binding(&mut self, target: &Expr, value: &Expr) {
+        if let ExprKind::Ident(binding) = &target.kind {
+            self.command_metadata_bindings.insert(
+                binding.name.clone(),
+                self.command_metadata_expression_uses_scope(value),
+            );
         }
-        ExprKind::Literal(_)
-        | ExprKind::Ident(_)
-        | ExprKind::Path { .. }
-        | ExprKind::JsLiteral { .. } => {}
+    }
+
+    fn command_metadata_expression_uses_scope(&self, expression: &Expr) -> bool {
+        match &expression.kind {
+            ExprKind::Struct { fields, .. } => {
+                fields.iter().any(|field| field.name.name == "scope")
+            }
+            ExprKind::Ident(binding) => self
+                .command_metadata_bindings
+                .get(&binding.name)
+                .copied()
+                .unwrap_or(true),
+            _ => true,
+        }
     }
 }
 
@@ -987,6 +1100,7 @@ mod tests {
                 category = "LSP",
                 description = "Browse symbols",
                 aliases = ["outline", "symbols"],
+                scope = "global",
             )]
             fn open_symbols() {}
 
@@ -1006,6 +1120,7 @@ mod tests {
                 description: Some("Browse symbols".to_string()),
                 aliases: vec!["outline".to_string(), "symbols".to_string()],
                 visible: true,
+                scope: CommandScope::Global,
             }]
         );
         assert_eq!(
@@ -1079,6 +1194,7 @@ mod tests {
                 description: None,
                 aliases: Vec::new(),
                 visible: false,
+                scope: CommandScope::Editor,
             }]
         );
         validate_source("valid", "plugins/valid.hk", source).unwrap();
@@ -1108,6 +1224,10 @@ mod tests {
             (
                 "#[red::command(name = \"Open\", visible = \"no\")] fn open() {}",
                 "`visible` must be a boolean",
+            ),
+            (
+                "#[red::command(name = \"Open\", scope = \"workspace\")] fn open() {}",
+                "`scope` must be `editor` or `global`",
             ),
             ("#[red::on(\"changed\")] fn changed() {}", "exactly one parameter"),
             (

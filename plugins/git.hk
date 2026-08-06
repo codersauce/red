@@ -416,6 +416,7 @@ fn empty_state() -> GitState {
     category = "Git",
     description = "Inspect and manage workspace changes",
     aliases = ["source control", "status"],
+    scope = "global",
 )]
 fn dashboard() {
     if plugin_state().dashboard_open {
