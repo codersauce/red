@@ -586,13 +586,14 @@ fn installed_grammar_consent_message(
 fn catalog_package_availability(
     package: &plugin::catalog::CatalogPackage,
 ) -> (String, Option<String>) {
-    let host_api = semver::Version::parse(plugin::RED_HOST_API_VERSION)
-        .expect("Red host API version is valid SemVer");
-    if !package.red_api.matches(&host_api) {
+    if !package
+        .supports_current_red_release()
+        .expect("supported Red API versions are valid SemVer")
+    {
         return (
             format!("Requires Red API {}", package.red_api),
             Some(format!(
-                "Language pack `{}` requires Red API `{}`, but this release provides `{host_api}`.",
+                "Language pack `{}` requires Red API `{}`, which this Red release does not support.",
                 package.id, package.red_api
             )),
         );
@@ -15656,10 +15657,9 @@ impl Editor {
                     let package = self.plugin_catalog.get(&id).ok_or_else(|| {
                         anyhow::anyhow!("language pack `{id}` is no longer in the catalog")
                     })?;
-                    let host_api = semver::Version::parse(plugin::RED_HOST_API_VERSION)?;
                     anyhow::ensure!(
-                        package.red_api.matches(&host_api),
-                        "language pack `{id}` requires Red API `{}`, but this release provides `{host_api}`",
+                        package.supports_current_red_release()?,
+                        "language pack `{id}` requires Red API `{}`, which this Red release does not support",
                         package.red_api
                     );
                     let artifact = package
@@ -23288,6 +23288,22 @@ mod test {
     }
 
     #[test]
+    fn language_pack_picker_accepts_a_supported_prior_host_api() {
+        let mut package = catalog_test_package();
+        package.red_api = semver::VersionReq::parse("^0.6.0").unwrap();
+        let catalog = BTreeMap::from([(package.id.clone(), package)]);
+
+        let items =
+            plugin_manager_items(&[], &catalog, plugin::catalog::DEFAULT_PLUGIN_CATALOG_URL);
+
+        assert_eq!(items[0].id, "catalog:go-language");
+        let (_, message) = catalog_package_availability(
+            &catalog[&plugin::package::PluginId::parse("go-language").unwrap()],
+        );
+        assert!(message.is_none());
+    }
+
+    #[test]
     fn language_pack_picker_keeps_api_incompatible_catalog_entries_recoverable() {
         let mut package = catalog_test_package();
         package.red_api = semver::VersionReq::parse(">=999.0.0").unwrap();
@@ -23305,7 +23321,7 @@ mod test {
         let (_, message) = catalog_package_availability(
             &catalog[&plugin::package::PluginId::parse("go-language").unwrap()],
         );
-        assert!(message.unwrap().contains("this release provides"));
+        assert!(message.unwrap().contains("does not support"));
     }
 
     #[test]

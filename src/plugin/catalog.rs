@@ -149,7 +149,7 @@ impl PluginCatalog {
             .find(|package| &package.id == id)
             .ok_or_else(|| anyhow::anyhow!("language pack `{id}` is not in the catalog"))?;
         anyhow::ensure!(
-            host_api_requirement_is_supported(&package.red_api)?,
+            package.supports_current_red_release()?,
             "language pack `{id}` requires Red API `{}`, but this release supports {}",
             package.red_api,
             SUPPORTED_HOST_API_VERSIONS.join(", ")
@@ -181,6 +181,11 @@ impl PluginCatalog {
 }
 
 impl CatalogPackage {
+    /// Whether this package targets any Red API version supported by this release.
+    pub fn supports_current_red_release(&self) -> Result<bool> {
+        host_api_requirement_is_supported(&self.red_api)
+    }
+
     #[must_use]
     pub fn artifact(&self, target: &str) -> Option<&CatalogArtifact> {
         self.artifacts.get(target)
@@ -415,6 +420,7 @@ mod tests {
         let catalog = PluginCatalog::from_slice(&bytes).unwrap();
         let id = PluginId::parse("go-language").unwrap();
 
+        assert!(catalog.packages[0].supports_current_red_release().unwrap());
         assert!(catalog.installable(&id, "aarch64-apple-darwin").is_ok());
         assert!(catalog
             .installable(&id, "unsupported-target")

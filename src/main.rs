@@ -338,9 +338,8 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
         PluginCommand::Catalog(arguments) => {
             let url = arguments.catalog_url.clone().unwrap_or_else(catalog_url);
             let catalog = PluginCatalog::fetch(&url).await?;
-            let host_api = semver::Version::parse(red::plugin::RED_HOST_API_VERSION)?;
             for package in catalog.packages {
-                let compatibility = if package.red_api.matches(&host_api) {
+                let compatibility = if package.supports_current_red_release()? {
                     "compatible"
                 } else {
                     "incompatible"
