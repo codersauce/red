@@ -24,7 +24,7 @@ For startup behavior, read [Runtime lifecycle](architecture/startup/runtime-life
 
 ## Editing, Runtime, And Plugins
 
-Read [Editor event loop](architecture/editor/event-loop) when changing input handling, editing actions, rendering, LSP polling, plugin dispatch, recovery snapshots, or agent event processing. For language-server work, start with [LSP architecture](architecture/lsp) before moving into transport, document sync, completion, workspace edits, or configuration. The current user documentation treats editing, selecting, searching, windows, command mode, Git, LSP, configuration, plugins, and troubleshooting as one day-to-day editor surface [@getting-started-doc].
+Read [Editor architecture](architecture/editor) when changing input handling, editing actions, rendering, LSP polling, plugin dispatch, recovery snapshots, or agent event processing. For language-server work, start with [LSP architecture](architecture/lsp) before moving into transport, document sync, completion, workspace edits, or configuration. The current user documentation treats editing, selecting, searching, windows, command mode, Git, LSP, configuration, plugins, and troubleshooting as one day-to-day editor surface [@getting-started-doc].
 
 Read [Plugin architecture](architecture/plugins) when changing bundled plugins or Husk host behavior, then use [Plugin lifecycle and reload](architecture/plugins/lifecycle-and-reload) for discovery, activation, quarantine, and reload details. Red ships embedded plugins and themes, lets users list visible runtime files with `red --runtime-files`, and can eject bundled assets into the user config directory where they shadow embedded copies [@readme].
 
@@ -34,7 +34,7 @@ Read [Reviewable agent edits](concepts/reviewable-agent-edits) before changing a
 
 ## Husk Work
 
-Read [Husk language](concepts/husk-language) before touching the scripting language or plugin runtime. The workspace includes Husk crates for the public facade, CLI, parser, runtime, package handling, LSP, semantic analysis, extension support, standard library, and WebAssembly support [@cargo]. The embedding architecture is covered by [Husk public embedding API](architecture/husk/public-embedding-api), and command behavior belongs in [Husk command](reference/cli/husk-command).
+Read [Husk language](concepts/husk-language) before touching the scripting language or plugin runtime. The workspace includes Husk crates for the public facade, CLI, parser, runtime, package handling, LSP, semantic analysis, extension support, standard library, and WebAssembly support [@cargo]. The deeper reading path starts at [Husk architecture](architecture/husk), continues through the embedding, package, extension, and language-server pages, and uses [Husk command](reference/cli/husk-command) for command behavior.
 
 ## Sessions And Recovery
 

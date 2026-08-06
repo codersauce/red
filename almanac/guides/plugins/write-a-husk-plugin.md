@@ -18,6 +18,9 @@ sources:
   - id: schema
     type: file
     path: src/plugin/host_api.json
+  - id: registry
+    type: file
+    path: src/plugin/registry.rs
 ---
 
 Use this guide when adding or revising a Red plugin written in Husk. A complete plugin has Husk source that registers commands or events, optional package metadata that declares compatibility, host calls that match the current Red API, and any process permissions needed by its runtime behavior [@system-doc] [@api-doc]. By the end, the plugin should load through Red's plugin lifecycle, expose only the resources it needs, and pass the same validation commands used for bundled plugin work.
@@ -32,7 +35,7 @@ Keep the first version small enough to prove the lifecycle. Register one command
 
 Add a `package.json` beside filesystem-backed plugin source when the plugin needs metadata. The example metadata includes `name`, `version`, `description`, `author`, `license`, `main`, `keywords`, repository information, Red engine information, `red_api_version`, capabilities, activation events, and a simple configuration schema [@example-package]. Red checks `red_api_version` before activation and quarantines malformed or incompatible packages while startup and unrelated plugins continue [@api-doc].
 
-For this codebase, target the current host API unless there is a clear compatibility reason not to. `src/plugin/host_api.json` declares version `0.4.0`, and the API guide recommends `"red_api_version": "^0.4.0"` for plugins targeting the current release [@schema] [@api-doc]. Use [Plugin host API](../../reference/plugins/host-api) for exact schema lookup and [Red host API](../../architecture/plugins/red-host-api) for how validation and dispatch work.
+For this codebase, target the current host API unless there is a clear compatibility reason not to. `src/plugin/host_api.json` declares version `0.6.0`, and the registry accepts both the current `0.6.0` version and `0.4.0` for existing packages [@schema] [@registry]. New plugins should use `"red_api_version": "^0.6.0"` unless they intentionally need to stay compatible with an older Red host API; keep `"^0.4.0"` only when the plugin avoids newer `0.6.0` calls such as `CompanionCall`, `DocumentSnapshot`, `DocumentApply`, `DocumentUndo`, and `UpdatePickerBusy` [@schema] [@registry]. Use [Plugin host API](../../reference/plugins/host-api) for exact schema lookup and [Red host API](../../architecture/plugins/red-host-api) for how validation and dispatch work.
 
 ## Choose Host Calls Deliberately
 

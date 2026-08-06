@@ -9,6 +9,9 @@ sources:
   - id: api
     type: file
     path: src/plugin/api.rs
+  - id: registry
+    type: file
+    path: src/plugin/registry.rs
   - id: runtime
     type: file
     path: src/plugin/runtime.rs
@@ -17,7 +20,7 @@ sources:
     path: docs/PLUGIN_API.md
 ---
 
-The Red host API is the versioned native module that Husk plugins call as `red::...`. Its machine-readable source of truth is `src/plugin/host_api.json`, which declares host API version `0.4.0` and lists each `execute` and `request` call with a name, kind, signature, and introduction version [@schema]. Red embeds that schema, validates literal host calls before activation, and dispatches accepted calls through the plugin runtime into editor-owned `PluginRequest` values or immediate helper functions [@api] [@runtime]. This boundary is why plugins can extend Red while the editor remains the owner of buffer mutation, UI resources, filesystem operations, and service state.
+The Red host API is the versioned native module that Husk plugins call as `red::...`. Its machine-readable source of truth is `src/plugin/host_api.json`, which declares host API version `0.6.0` and lists each `execute` and `request` call with a name, kind, signature, and introduction version [@schema]. Red embeds that schema, validates literal host calls before activation, and dispatches accepted calls through the plugin runtime into editor-owned `PluginRequest` values or immediate helper functions [@api] [@runtime]. This boundary is why plugins can extend Red while the editor remains the owner of buffer mutation, UI resources, filesystem operations, and service state.
 
 ## Canonical Contract
 
@@ -39,6 +42,6 @@ Many host actions translate directly into `PluginRequest` messages, such as pane
 
 ## Version And Compatibility Policy
 
-The current host API version is `0.4.0` in both the schema and registry constant [@schema] [@api]. Plugin metadata may declare a semver `red_api_version` range; the registry rejects malformed or incompatible ranges before activation [@api-doc]. While Red remains pre-1.0, the documented policy is that patch releases fix behavior without intentional signature changes, minor releases may add or deprecate calls and fields, and removals or incompatible call changes require a host-API minor bump, a change manifest entry, and a migration note [@api-doc].
+The current host API version is `0.6.0` in both the schema and registry constant [@schema] [@registry]. Plugin metadata may declare a semver `red_api_version` range; the registry rejects malformed or incompatible ranges before activation, and it currently accepts both `0.4.0` and `0.6.0` compatibility targets [@registry] [@api-doc]. While Red remains pre-1.0, the documented policy is that patch releases fix behavior without intentional signature changes, minor releases may add or deprecate calls and fields, and removals or incompatible call changes require a host-API minor bump, a change manifest entry, and a migration note [@api-doc].
 
-Callback-scoped pickers and composers illustrate this evolution. The schema records `OpenPicker` and `OpenComposer` as `0.3.0` calls and `OpenInput` and `OpenConfirm` as `0.4.0` calls [@schema]. The API guide keeps legacy numeric picker and composer calls available for compatibility while directing new plugins to handler-record APIs [@api-doc]. For lookup details, use [Plugin host API](../../reference/plugins/host-api); for lifecycle consequences of incompatible calls, use [Plugin lifecycle and reload](lifecycle-and-reload).
+Callback-scoped pickers and composers illustrate this evolution. The schema records `OpenPicker` and `OpenComposer` as `0.3.0` calls and `OpenInput` and `OpenConfirm` as `0.4.0` calls [@schema]. The `0.6.0` manifest adds external-package primitives and document operations: `CompanionCall`, `DocumentSnapshot`, `DocumentApply`, `DocumentUndo`, and `UpdatePickerBusy` [@schema]. The API guide keeps legacy numeric picker and composer calls available for compatibility while directing new plugins to handler-record APIs [@api-doc]. For lookup details, use [Plugin host API](../../reference/plugins/host-api); for lifecycle consequences of incompatible calls, use [Plugin lifecycle and reload](lifecycle-and-reload).
