@@ -1,7 +1,7 @@
 ---
 title: "Embedded Assets With User Ejection"
 summary: "Red embeds default runtime assets in the binary while allowing user and development overrides and explicit ejection into the user config directory."
-topics: [decisions, runtime, configuration]
+topics: [decisions, runtime, runtime-assets, configuration]
 sources:
   - id: assets
     type: file

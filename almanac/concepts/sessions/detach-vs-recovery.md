@@ -22,6 +22,8 @@ sources:
 
 Detach and recovery solve different Red session failures. Detach is a live Unix owner model: the editor, unsaved buffers, LSP servers, plugins, and running Codex app-server process can continue after the attached terminal or SSH connection disappears [@detach-doc]. Recovery is a persisted snapshot model: `red --resume` loads the newest valid snapshot with dirty buffers or pending proposals, restores editor state in memory, and does not claim that a Codex process or app-server thread survived a crash [@recovery-doc].
 
+For the implementation reading map across both mechanisms, start with [Sessions architecture](../../architecture/sessions) before choosing the detach or recovery path.
+
 ## Live Detach
 
 Detach starts a persistent owner and then attaches the current terminal to it. The documented commands are `red --detach=refactor ...`, `red --attach refactor`, and `red --stop refactor`; `red --detach` without a value uses the `default` session, and only one TUI may attach to a session at a time [@detach-doc]. In the implementation, `start_detached_owner` launches the current executable with the hidden `--core-session` flag, starts it in a new Unix session with `setsid`, waits for the socket, token, and PID files, and then calls the attach path [@main].

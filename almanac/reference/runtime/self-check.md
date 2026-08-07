@@ -1,7 +1,7 @@
 ---
 title: "Self Check"
 summary: "`red --self-check` is Red's hidden packaging diagnostic for bundled themes, default plugins, production plugin snapshots, and quarantine status."
-topics: [reference, runtime-assets, plugins, cli]
+topics: [reference, runtime-assets, plugins, cli, validation]
 sources:
   - id: self-check
     type: file

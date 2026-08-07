@@ -1,7 +1,7 @@
 ---
 title: "Runtime Assets"
 summary: "Red resolves plugins and themes from user files, RED_RUNTIME development files, and embedded assets, with listing and ejection paths for customization."
-topics: [architecture, runtime-assets, plugins, themes]
+topics: [architecture, runtime, runtime-assets, plugins, themes]
 sources:
   - id: asset-system
     type: file
