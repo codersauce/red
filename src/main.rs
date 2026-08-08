@@ -22,7 +22,7 @@ use std::{
 };
 
 use clap::Parser as _;
-use crossterm::{event, terminal, ExecutableCommand};
+use crossterm::{cursor, event, terminal, ExecutableCommand};
 #[cfg(any(unix, test))]
 use crossterm::{style, QueueableCommand};
 
@@ -277,6 +277,7 @@ async fn run() -> anyhow::Result<()> {
         _ = stdout.execute(event::DisableBracketedPaste);
         _ = stdout.execute(event::DisableFocusChange);
         _ = stdout.execute(terminal::LeaveAlternateScreen);
+        _ = stdout.execute(cursor::Show);
         _ = terminal::disable_raw_mode();
 
         eprintln!("{}", info);
@@ -669,6 +670,7 @@ impl Drop for DetachedTerminalGuard {
         _ = output.execute(terminal::EnableLineWrap);
         _ = output.execute(event::PopKeyboardEnhancementFlags);
         _ = output.execute(terminal::LeaveAlternateScreen);
+        _ = output.execute(cursor::Show);
         _ = terminal::disable_raw_mode();
     }
 }

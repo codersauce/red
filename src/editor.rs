@@ -44,6 +44,7 @@ use crate::unicode_utils::{
 };
 
 use crossterm::{
+    cursor,
     event::{
         self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
         MouseEventKind,
@@ -14058,15 +14059,22 @@ impl Editor {
     }
 
     pub fn cleanup(&mut self) -> anyhow::Result<()> {
-        write!(self.stdout, "\x1b]112\x1b\\")?;
+        Self::restore_terminal_output(&mut self.stdout)?;
+        terminal::disable_raw_mode()?;
+
+        Ok(())
+    }
+
+    fn restore_terminal_output(output: &mut impl std::io::Write) -> anyhow::Result<()> {
+        write!(output, "\x1b]112\x1b\\")?;
         #[cfg(unix)]
-        self.stdout.execute(event::PopKeyboardEnhancementFlags)?;
-        self.stdout
+        output.execute(event::PopKeyboardEnhancementFlags)?;
+        output
             .execute(terminal::LeaveAlternateScreen)?
+            .execute(cursor::Show)?
             .execute(event::DisableBracketedPaste)?
             .execute(event::DisableFocusChange)?
             .execute(event::DisableMouseCapture)?;
-        terminal::disable_raw_mode()?;
 
         Ok(())
     }
@@ -26403,6 +26411,18 @@ builtin = "rust"
         assert!(buffer.cells.iter().any(|cell| cell.text != " "));
         assert!(editor.last_rendered_cursor_position.is_some());
         assert!(!editor.force_full_redraw);
+    }
+
+    #[test]
+    fn terminal_cleanup_restores_cursor_after_leaving_alternate_screen() {
+        let mut output = Vec::new();
+
+        Editor::restore_terminal_output(&mut output).unwrap();
+
+        let restore_sequence = b"\x1b[?1049l\x1b[?25h";
+        assert!(output
+            .windows(restore_sequence.len())
+            .any(|window| window == restore_sequence));
     }
 
     #[test]
