@@ -11,7 +11,10 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     io::{self, Write as _},
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use crossterm::{
@@ -21,18 +24,20 @@ use crossterm::{
 use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::{
-    color::{blend_color, Color},
-    config::{CursorShape, KeyAction},
+    color::{blend_color, ensure_minimum_contrast, Color},
+    config::{CursorShape, KeyAction, PickerIconStyle, StatuslineSection},
     editor::RenderCommand,
     lsp::Diagnostic,
     plugin::DecorationAnchor,
     splash,
     theme::{SelectionForegroundPriority, Style},
+    ui::IconCatalog,
     undo::TextPosition,
     unicode_utils::{
         char_prefix, display_width, display_width_with_tabs, fit_display_width,
         grapheme_to_column_with_tabs, trim_line_ending, truncate_display_width,
     },
+    utils::expand_user_path,
 };
 
 use super::{
@@ -87,6 +92,318 @@ fn diagnostics_by_visible_line(
 
 fn statusline_file_name(name: &str) -> &str {
     name.strip_prefix("./").unwrap_or(name)
+}
+
+#[derive(Clone)]
+struct StatuslineSegment {
+    text: String,
+    style: Style,
+    icon: Option<StatuslineIcon>,
+}
+
+#[derive(Clone)]
+struct StatuslineIcon {
+    glyph: String,
+    color: Color,
+}
+
+struct StatuslineContext {
+    mode: String,
+    filename: String,
+    file_path: Option<String>,
+    position: String,
+    syntax: Option<String>,
+    git_branch: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn statusline_segment(
+    section: StatuslineSection,
+    context: &StatuslineContext,
+    base_style: &Style,
+    context_style: &Style,
+    prominent_style: &Style,
+    icon_style: PickerIconStyle,
+    color_icons: bool,
+) -> Option<StatuslineSegment> {
+    let (text, style, icon) = match section {
+        StatuslineSection::Mode => (format!(" {} ", context.mode), prominent_style.clone(), None),
+        StatuslineSection::GitBranch => {
+            let branch = context.git_branch.as_deref()?;
+            let glyph = match icon_style {
+                PickerIconStyle::NerdFont => "",
+                PickerIconStyle::Unicode => "⑂",
+                PickerIconStyle::Ascii => "git",
+                PickerIconStyle::None => "",
+            };
+            (
+                statusline_icon_label(glyph, branch),
+                context_style.clone(),
+                None,
+            )
+        }
+        StatuslineSection::Filename => {
+            (format!(" {} ", context.filename), base_style.clone(), None)
+        }
+        StatuslineSection::Syntax => {
+            let syntax = context.syntax.as_deref()?;
+            let icon = IconCatalog::file(
+                context.file_path.as_deref().unwrap_or(&context.filename),
+                icon_style,
+            );
+            let icon_override = (color_icons && !icon.glyph.is_empty())
+                .then_some(icon.color)
+                .flatten()
+                .map(|color| StatuslineIcon {
+                    glyph: icon.glyph.to_string(),
+                    color,
+                });
+            (
+                statusline_icon_label(icon.glyph, syntax),
+                context_style.clone(),
+                icon_override,
+            )
+        }
+        StatuslineSection::Position => (context.position.clone(), prominent_style.clone(), None),
+    };
+
+    Some(StatuslineSegment { text, style, icon })
+}
+
+fn statusline_icon_label(glyph: &str, label: &str) -> String {
+    if glyph.is_empty() {
+        format!(" {label} ")
+    } else {
+        format!(" {glyph} {label} ")
+    }
+}
+
+fn statusline_context_style(base: &Style, prominent: &Style) -> Style {
+    let (Some(base_bg), Some(accent)) = (base.bg, prominent.bg) else {
+        return base.clone();
+    };
+    let Color::Rgb { r, g, b } = blend_color(accent, base_bg) else {
+        unreachable!("blend_color always normalizes its result to RGB");
+    };
+    let bg = blend_color(Color::Rgba { r, g, b, a: 58 }, base_bg);
+    let fg = ensure_minimum_contrast(accent, bg, 3.0);
+    Style {
+        fg: Some(fg),
+        bg: Some(bg),
+        bold: true,
+        ..base.clone()
+    }
+}
+
+fn draw_statusline_left(
+    buffer: &mut RenderBuffer,
+    y: usize,
+    limit: usize,
+    segments: &[StatuslineSegment],
+    base_style: &Style,
+    separator: char,
+) {
+    let separator = separator.to_string();
+    let separator_width = display_width(&separator);
+    let mut x = 0;
+
+    for (index, segment) in segments.iter().enumerate() {
+        if x >= limit {
+            break;
+        }
+        let next_style = segments
+            .get(index + 1)
+            .map(|next| &next.style)
+            .unwrap_or(base_style);
+        let has_separator = segment.style.bg != next_style.bg;
+        let text_width = display_width(&segment.text);
+        let desired_width = text_width + if has_separator { separator_width } else { 0 };
+        let remaining = limit - x;
+        if desired_width > remaining {
+            let text = truncate_display_width(&segment.text, remaining);
+            let visible_width = display_width(&text);
+            draw_statusline_segment(buffer, x, y, &text, visible_width, segment);
+            break;
+        }
+
+        draw_statusline_segment(buffer, x, y, &segment.text, text_width, segment);
+        x += text_width;
+        if has_separator {
+            let transition = Style {
+                fg: segment.style.bg,
+                bg: next_style.bg,
+                ..Default::default()
+            };
+            buffer.set_text(x, y, &separator, &transition);
+            x += separator_width;
+        }
+    }
+}
+
+fn draw_statusline_right(
+    buffer: &mut RenderBuffer,
+    y: usize,
+    width: usize,
+    mut segments: Vec<StatuslineSegment>,
+    base_style: &Style,
+    separator: char,
+) -> usize {
+    let separator = separator.to_string();
+    let separator_width = display_width(&separator);
+    while segments.len() > 1
+        && statusline_right_width(&segments, base_style, separator_width) > width
+    {
+        segments.remove(0);
+    }
+    if let Some(segment) = segments.first_mut() {
+        let leading_width = if segment.style.bg != base_style.bg {
+            separator_width
+        } else {
+            0
+        };
+        let available_text = width.saturating_sub(leading_width);
+        if display_width(&segment.text) > available_text {
+            segment.text = truncate_display_width(&segment.text, available_text);
+        }
+    }
+
+    let total_width = statusline_right_width(&segments, base_style, separator_width).min(width);
+    let start = width - total_width;
+    let mut x = start;
+    let mut previous_style = base_style;
+    for segment in &segments {
+        if segment.style.bg != previous_style.bg {
+            let transition = Style {
+                fg: segment.style.bg,
+                bg: previous_style.bg,
+                ..Default::default()
+            };
+            buffer.set_text(x, y, &separator, &transition);
+            x += separator_width;
+        }
+        let text_width = display_width(&segment.text);
+        draw_statusline_segment(buffer, x, y, &segment.text, text_width, segment);
+        x += text_width;
+        previous_style = &segment.style;
+    }
+    start
+}
+
+fn statusline_right_width(
+    segments: &[StatuslineSegment],
+    base_style: &Style,
+    separator_width: usize,
+) -> usize {
+    let mut previous_style = base_style;
+    segments.iter().fold(0, |width, segment| {
+        let transition = if segment.style.bg != previous_style.bg {
+            separator_width
+        } else {
+            0
+        };
+        previous_style = &segment.style;
+        width + transition + display_width(&segment.text)
+    })
+}
+
+fn draw_statusline_segment(
+    buffer: &mut RenderBuffer,
+    x: usize,
+    y: usize,
+    text: &str,
+    visible_width: usize,
+    segment: &StatuslineSegment,
+) {
+    buffer.set_text(x, y, text, &segment.style);
+    let Some(icon) = &segment.icon else {
+        return;
+    };
+    let icon_x = x + 1;
+    if icon_x + display_width(&icon.glyph) > x + visible_width {
+        return;
+    }
+    let icon_style = Style {
+        fg: Some(icon.color),
+        ..segment.style.clone()
+    };
+    buffer.set_text(icon_x, y, &icon.glyph, &icon_style);
+}
+
+fn statusline_git_search_dir(file: Option<&str>) -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let Some(file) = file else {
+        return cwd;
+    };
+    let path = expand_user_path(file).unwrap_or_else(|_| PathBuf::from(file));
+    let path = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
+    let search_dir = if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or(&path).to_path_buf()
+    };
+    search_dir.canonicalize().unwrap_or(search_dir)
+}
+
+fn git_head_path(search_dir: &Path) -> Option<PathBuf> {
+    for ancestor in search_dir.ancestors() {
+        let dot_git = ancestor.join(".git");
+        if dot_git.is_dir() {
+            return Some(dot_git.join("HEAD"));
+        }
+        let Ok(contents) = fs::read_to_string(&dot_git) else {
+            continue;
+        };
+        let Some(git_dir) = contents.trim().strip_prefix("gitdir:") else {
+            continue;
+        };
+        let git_dir = PathBuf::from(git_dir.trim());
+        let git_dir = if git_dir.is_absolute() {
+            git_dir
+        } else {
+            ancestor.join(git_dir)
+        };
+        return Some(git_dir.join("HEAD"));
+    }
+    None
+}
+
+fn git_branch_from_head(search_dir: &Path) -> Option<String> {
+    let head = fs::read_to_string(git_head_path(search_dir)?).ok()?;
+    let head = head.trim();
+    let branch = head
+        .strip_prefix("ref: refs/heads/")
+        .or_else(|| head.strip_prefix("ref: "))
+        .unwrap_or_else(|| head.get(..head.len().min(8)).unwrap_or(head));
+    (!branch.is_empty()).then(|| compact_git_branch(branch))
+}
+
+fn compact_git_branch(branch: &str) -> String {
+    const MAX_WIDTH: usize = 25;
+    if display_width(branch) <= MAX_WIDTH {
+        return branch.to_string();
+    }
+    let parts = branch.split('/').collect::<Vec<_>>();
+    let compact = if parts.len() >= 3 {
+        parts[..parts.len() - 1]
+            .iter()
+            .map(|part| part.chars().next().unwrap_or('?').to_string())
+            .chain(std::iter::once(parts[parts.len() - 1].to_string()))
+            .collect::<Vec<_>>()
+            .join("/")
+    } else {
+        branch.to_string()
+    };
+    if display_width(&compact) <= MAX_WIDTH {
+        compact
+    } else {
+        let mut compact = truncate_display_width(&compact, MAX_WIDTH - 1);
+        compact.push('…');
+        compact
+    }
 }
 
 fn decoration_local_x(
@@ -1804,105 +2121,130 @@ impl Editor {
             return;
         }
 
-        let mode = format_mode_name(&self.mode);
-        let mode = format!(" {mode} ");
-
-        // Get information from the active window
-        let active_window = self.window_manager.active_window();
-        let (file, pos, window_indicator) = if let Some(window) = active_window {
-            let window_buffer = &self.buffer_manager[window.buffer_index];
-            let dirty = if window_buffer.is_dirty() {
-                " [+] "
-            } else {
-                ""
-            };
-            let file = format!(" {}{}", statusline_file_name(window_buffer.name()), dirty);
-            let pos = format!(" {}:{} ", window.vtop + window.cy + 1, window.cx + 1);
-
-            // Add window indicator if there are multiple windows
-            let window_count = self.window_manager.window_count();
-            let window_indicator = if window_count > 1 {
-                format!(
-                    " [{}/{}]",
-                    self.window_manager.active_window_id() + 1,
-                    window_count
+        let (filename, file_path, dirty, position, buffer_index) =
+            if let Some(window) = self.window_manager.active_window() {
+                let window_buffer = &self.buffer_manager[window.buffer_index];
+                let dirty = window_buffer.is_dirty();
+                let window_count = self.window_manager.window_count();
+                let window_indicator = if window_count > 1 {
+                    format!(
+                        " [{}/{}] ",
+                        self.window_manager.active_window_id() + 1,
+                        window_count
+                    )
+                } else {
+                    " ".to_string()
+                };
+                (
+                    statusline_file_name(window_buffer.name()).to_string(),
+                    window_buffer.file.clone(),
+                    dirty,
+                    format!(
+                        " {}:{}{}",
+                        window.vtop + window.cy + 1,
+                        window.cx + 1,
+                        window_indicator
+                    ),
+                    window.buffer_index,
                 )
             } else {
-                String::new()
+                let current = self.current_buffer();
+                (
+                    statusline_file_name(current.name()).to_string(),
+                    current.file.clone(),
+                    current.is_dirty(),
+                    format!(" {}:{} ", self.vtop + self.cy + 1, self.cx + 1),
+                    self.buffer_manager.active_index(),
+                )
             };
-
-            (file, pos, window_indicator)
-        } else {
-            // Fallback to global state if no active window
-            let dirty = if self.current_buffer().is_dirty() {
-                " [+] "
-            } else {
-                ""
-            };
-            let file = format!(
-                " {}{}",
-                statusline_file_name(self.current_buffer().name()),
-                dirty
-            );
-            let pos = format!(" {}:{} ", self.vtop + self.cy + 1, self.cx + 1);
-            (file, pos, String::new())
-        };
 
         let term_width = self.size.0 as usize;
         let y = self.size.1 as usize - 2;
-
-        let transition_style = Style {
-            fg: self.theme.statusline_style.outer_style.bg,
-            bg: self.theme.statusline_style.inner_style.bg,
-            ..Default::default()
-        };
-
         let clear_line = " ".repeat(term_width);
         buffer.set_text(0, y, &clear_line, &self.theme.statusline_style.inner_style);
 
-        let left_transition = self.theme.statusline_style.outer_chars[1].to_string();
-        let right_transition = self.theme.statusline_style.outer_chars[2].to_string();
-        let position = format!("{}{}", pos, window_indicator);
+        let left_sections = self.config.statusline.left.clone();
+        let right_sections = self.config.statusline.right.clone();
+        let wants_git = left_sections
+            .iter()
+            .chain(&right_sections)
+            .any(|section| *section == StatuslineSection::GitBranch);
+        let git_branch = wants_git
+            .then(|| self.statusline_git_branch(file_path.as_deref()))
+            .flatten();
+        let syntax = self.highlight_language_id_for_buffer_index(buffer_index);
+        let context = StatuslineContext {
+            mode: format_mode_name(&self.mode).to_string(),
+            filename: if dirty {
+                format!("{filename} [+]")
+            } else {
+                filename
+            },
+            file_path,
+            position,
+            syntax,
+            git_branch,
+        };
 
-        let mode_width = display_width(&mode);
-        let left_transition_width = display_width(&left_transition);
-        let right_transition_width = display_width(&right_transition);
-        let position_width = display_width(&position);
-        let position_start = term_width.saturating_sub(position_width);
-        let right_transition_start = position_start.saturating_sub(right_transition_width);
-        let file_start = mode_width + left_transition_width;
-        let file_width = right_transition_start.saturating_sub(file_start);
+        let base_style = self.theme.statusline_style.inner_style.clone();
+        let prominent_style = self.theme.statusline_style.outer_style.clone();
+        let context_style = statusline_context_style(&base_style, &prominent_style);
+        let icons = self.config.statusline.icons;
+        let left = left_sections
+            .into_iter()
+            .filter_map(|section| {
+                statusline_segment(
+                    section,
+                    &context,
+                    &base_style,
+                    &context_style,
+                    &prominent_style,
+                    icons.style,
+                    icons.color,
+                )
+            })
+            .collect::<Vec<_>>();
+        let right = right_sections
+            .into_iter()
+            .filter_map(|section| {
+                statusline_segment(
+                    section,
+                    &context,
+                    &base_style,
+                    &context_style,
+                    &prominent_style,
+                    icons.style,
+                    icons.color,
+                )
+            })
+            .collect::<Vec<_>>();
 
-        buffer.set_text(0, y, &mode, &self.theme.statusline_style.outer_style);
+        let left_separator = self.theme.statusline_style.outer_chars[1];
+        let right_separator = self.theme.statusline_style.outer_chars[2];
+        let right_start =
+            draw_statusline_right(buffer, y, term_width, right, &base_style, right_separator);
+        draw_statusline_left(buffer, y, right_start, &left, &base_style, left_separator);
+    }
 
-        buffer.set_text(mode_width, y, &left_transition, &transition_style);
+    fn statusline_git_branch(&mut self, file: Option<&str>) -> Option<String> {
+        const CACHE_TTL: Duration = Duration::from_secs(1);
 
-        if file_width > 0 {
-            buffer.set_text(
-                file_start,
-                y,
-                &format!("{:<width$}", file, width = file_width),
-                &self.theme.statusline_style.inner_style,
-            );
+        let search_dir = statusline_git_search_dir(file);
+        let now = Instant::now();
+        let cache_is_fresh = self.statusline_git_cache.search_dir.as_ref() == Some(&search_dir)
+            && self
+                .statusline_git_cache
+                .refreshed_at
+                .is_some_and(|refreshed| now.duration_since(refreshed) < CACHE_TTL);
+        if cache_is_fresh {
+            return self.statusline_git_cache.branch.clone();
         }
 
-        if right_transition_start < term_width {
-            buffer.set_text(
-                right_transition_start,
-                y,
-                &right_transition,
-                &transition_style,
-            );
-        }
-
-        if position_start < term_width {
-            buffer.set_text(
-                position_start,
-                y,
-                &position,
-                &self.theme.statusline_style.outer_style,
-            );
-        }
+        let branch = git_branch_from_head(&search_dir);
+        self.statusline_git_cache.search_dir = Some(search_dir);
+        self.statusline_git_cache.branch = branch.clone();
+        self.statusline_git_cache.refreshed_at = Some(now);
+        branch
     }
 
     pub fn draw_commandline(&mut self, buffer: &mut RenderBuffer) {
@@ -2371,6 +2713,123 @@ mod tests {
             "/Users/fcoury/code/red/src/color.rs"
         );
         assert_eq!(statusline_file_name("[No Name]"), "[No Name]");
+    }
+
+    #[test]
+    fn configurable_statusline_sections_render_in_the_requested_sides() {
+        let mut config = Config::default();
+        config.statusline.left = vec![StatuslineSection::Syntax, StatuslineSection::Mode];
+        config.statusline.right = vec![StatuslineSection::Filename, StatuslineSection::Position];
+        config.statusline.icons.style = PickerIconStyle::Ascii;
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let source = Buffer::new(
+            Some("config.toml".to_string()),
+            "theme = 'red'\n".to_string(),
+        );
+        let mut editor =
+            Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![source]).unwrap();
+        let row = editor.test_statusline_row();
+
+        let syntax = row.find("T toml").expect("syntax belongs on the left");
+        let mode = row.find("NORMAL").expect("mode belongs after syntax");
+        let filename = row
+            .find("config.toml")
+            .expect("filename belongs on the right");
+        let position = row.rfind("1:1").expect("position belongs at the edge");
+        assert!(syntax < mode);
+        assert!(mode < filename);
+        assert!(filename < position);
+    }
+
+    #[test]
+    fn contextual_statusline_color_is_between_base_and_prominent_bands() {
+        let base = Style {
+            fg: Some(Color::Rgb {
+                r: 220,
+                g: 220,
+                b: 220,
+            }),
+            bg: Some(Color::Rgb {
+                r: 20,
+                g: 30,
+                b: 40,
+            }),
+            ..Style::default()
+        };
+        let prominent = Style {
+            fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
+            bg: Some(Color::Rgb {
+                r: 80,
+                g: 180,
+                b: 220,
+            }),
+            ..Style::default()
+        };
+
+        let contextual = statusline_context_style(&base, &prominent);
+
+        assert_ne!(contextual.bg, base.bg);
+        assert_ne!(contextual.bg, prominent.bg);
+        assert!(contextual.bold);
+    }
+
+    #[test]
+    fn git_branch_reads_regular_and_worktree_head_files() {
+        let repository = tempfile::tempdir().unwrap();
+        fs::create_dir(repository.path().join(".git")).unwrap();
+        fs::write(
+            repository.path().join(".git/HEAD"),
+            "ref: refs/heads/feature/statusline\n",
+        )
+        .unwrap();
+        let nested = repository.path().join("src/editor");
+        fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(
+            git_branch_from_head(&nested).as_deref(),
+            Some("feature/statusline")
+        );
+
+        let worktree = tempfile::tempdir().unwrap();
+        let git_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}\n", git_dir.path().display()),
+        )
+        .unwrap();
+        fs::write(git_dir.path().join("HEAD"), "0123456789abcdef\n").unwrap();
+
+        assert_eq!(
+            git_branch_from_head(worktree.path()).as_deref(),
+            Some("01234567")
+        );
+    }
+
+    #[test]
+    fn long_git_branch_keeps_hierarchy_and_identity_compact() {
+        assert_eq!(
+            compact_git_branch("feature/frontend/configurable-statusline-with-icons"),
+            "f/f/configurable-statusl…"
+        );
+    }
+
+    #[test]
+    fn statusline_preserves_the_edge_position_on_a_narrow_terminal() {
+        let mut config = Config::default();
+        config.statusline.left = vec![StatuslineSection::Mode, StatuslineSection::Filename];
+        config.statusline.right = vec![StatuslineSection::Syntax, StatuslineSection::Position];
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let source = Buffer::new(
+            Some("config.toml".to_string()),
+            "value = true\n".to_string(),
+        );
+        let mut editor =
+            Editor::with_size(lsp, 8, 5, config, Theme::default(), vec![source]).unwrap();
+
+        let row = editor.test_statusline_row();
+
+        assert_eq!(display_width(&row), 8);
+        assert!(row.ends_with(" 1:1 "), "{row:?}");
     }
 
     #[test]

@@ -79,6 +79,20 @@ input_position = "bottom"
 style = "nerd_font"
 color = true
 
+# Status-line sections may be reordered, moved between sides, or omitted.
+# Available sections: mode, git_branch, filename, syntax, and position.
+# Context sections use a middle shade derived from the active theme, while
+# mode and position retain the stronger accent color.
+[statusline]
+left = ["mode", "git_branch", "filename"]
+right = ["syntax", "position"]
+
+# Nerd Font icons match nvim-web-devicons. "unicode" and "ascii" are
+# portable fallbacks; "none" keeps the labels while hiding their icons.
+[statusline.icons]
+style = "nerd_font"
+color = true
+
 # Show available continuations after a keymap prefix such as Space or Ctrl-w.
 # Fast key sequences complete before the guide appears.
 [key_hints]

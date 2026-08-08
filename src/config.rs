@@ -244,6 +244,9 @@ pub struct Config {
     /// Picker layout behavior.
     #[serde(default)]
     pub picker: PickerConfig,
+    /// Ordered status-line sections and icon presentation.
+    #[serde(default)]
+    pub statusline: StatuslineConfig,
     /// Delayed key-prefix guide behavior.
     #[serde(default)]
     pub key_hints: KeyHintsConfig,
@@ -365,6 +368,54 @@ impl Default for PickerConfig {
             icons: PickerIconsConfig::default(),
         }
     }
+}
+
+/// Configurable status-line layout.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StatuslineConfig {
+    /// Sections rendered from the left edge toward the center.
+    #[serde(default = "default_statusline_left")]
+    pub left: Vec<StatuslineSection>,
+    /// Sections rendered from the right edge toward the center.
+    #[serde(default = "default_statusline_right")]
+    pub right: Vec<StatuslineSection>,
+    /// Icon style shared by Git and syntax sections.
+    #[serde(default)]
+    pub icons: PickerIconsConfig,
+}
+
+impl Default for StatuslineConfig {
+    fn default() -> Self {
+        Self {
+            left: default_statusline_left(),
+            right: default_statusline_right(),
+            icons: PickerIconsConfig::default(),
+        }
+    }
+}
+
+fn default_statusline_left() -> Vec<StatuslineSection> {
+    vec![
+        StatuslineSection::Mode,
+        StatuslineSection::GitBranch,
+        StatuslineSection::Filename,
+    ]
+}
+
+fn default_statusline_right() -> Vec<StatuslineSection> {
+    vec![StatuslineSection::Syntax, StatuslineSection::Position]
+}
+
+/// A piece of editor context that can be placed on either status-line side.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StatuslineSection {
+    Mode,
+    GitBranch,
+    Filename,
+    Syntax,
+    Position,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
@@ -1515,6 +1566,7 @@ fn known_top_level_field(field: &str) -> bool {
             | "splash"
             | "search"
             | "picker"
+            | "statusline"
             | "key_hints"
             | "clipboard"
             | "lsp"
@@ -1663,6 +1715,9 @@ fn known_schema_path(path: &[String]) -> bool {
             "incsearch" | "hlsearch" | "wrapscan" | "ignorecase" | "smartcase"
         ),
         ["picker", "input_position"] => true,
+        ["picker", "icons", field] => matches!(*field, "style" | "color"),
+        ["statusline", field] => matches!(*field, "left" | "right" | "icons"),
+        ["statusline", "icons", field] => matches!(*field, "style" | "color"),
         ["key_hints", field] => matches!(*field, "enabled" | "delay_ms"),
         ["clipboard", field] => {
             matches!(*field, "enabled" | "sync_on_yank" | "sync_on_paste")
@@ -2928,6 +2983,77 @@ input_position = "top"
         .unwrap();
 
         assert_eq!(config.picker.input_position, PickerInputPosition::Top);
+    }
+
+    #[test]
+    fn statusline_defaults_match_the_bundled_neovim_inspired_layout() {
+        let config = Config::from_user_toml_with_overrides("", &[]).unwrap();
+
+        assert_eq!(
+            config.statusline.left,
+            [
+                StatuslineSection::Mode,
+                StatuslineSection::GitBranch,
+                StatuslineSection::Filename,
+            ]
+        );
+        assert_eq!(
+            config.statusline.right,
+            [StatuslineSection::Syntax, StatuslineSection::Position]
+        );
+        assert_eq!(config.statusline.icons.style, PickerIconStyle::NerdFont);
+        assert!(config.statusline.icons.color);
+    }
+
+    #[test]
+    fn statusline_sections_can_move_between_sides_and_change_icon_style() {
+        let config = Config::from_user_toml_with_overrides(
+            r#"
+[statusline]
+left = ["syntax", "filename"]
+right = ["mode", "git_branch", "position"]
+
+[statusline.icons]
+style = "ascii"
+color = false
+"#,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.statusline.left,
+            [StatuslineSection::Syntax, StatuslineSection::Filename]
+        );
+        assert_eq!(
+            config.statusline.right,
+            [
+                StatuslineSection::Mode,
+                StatuslineSection::GitBranch,
+                StatuslineSection::Position,
+            ]
+        );
+        assert_eq!(config.statusline.icons.style, PickerIconStyle::Ascii);
+        assert!(!config.statusline.icons.color);
+    }
+
+    #[test]
+    fn invalid_statusline_section_keeps_the_default_side() {
+        let loaded = Config::load_user_toml(
+            r#"
+[statusline]
+left = ["mode", "weather"]
+"#,
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(loaded.config.statusline.left, default_statusline_left());
+        assert!(loaded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.path == "statusline.left"));
     }
 
     #[test]

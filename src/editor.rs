@@ -2336,6 +2336,13 @@ enum TerminalCursorState {
     Visible((usize, usize)),
 }
 
+#[derive(Debug, Default)]
+struct StatuslineGitCache {
+    search_dir: Option<PathBuf>,
+    branch: Option<String>,
+    refreshed_at: Option<Instant>,
+}
+
 /// Single-task owner of Red's interactive application state.
 ///
 /// The editor coordinates buffers, windows, rendering, LSP, plugins,
@@ -2372,6 +2379,9 @@ pub struct Editor {
 
     /// Visual theme settings
     pub theme: Theme,
+
+    /// Short-lived Git metadata used by configurable status-line sections.
+    statusline_git_cache: StatuslineGitCache,
 
     /// Plugin system registry
     plugin_registry: PluginRegistry,
@@ -3697,6 +3707,7 @@ impl Editor {
             language_config_path: Config::path("config.toml"),
             language_config_overrides: Vec::new(),
             theme,
+            statusline_git_cache: StatuslineGitCache::default(),
             plugin_registry,
             plugin_catalog: BTreeMap::new(),
             plugin_catalog_url: plugin::catalog::catalog_url(),
