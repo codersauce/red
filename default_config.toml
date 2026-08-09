@@ -342,6 +342,7 @@ Esc = { EnterMode = "Normal" }
 "A" = { PluginCommand = "Agent" }
 "n" = "NextBuffer"
 "p" = "PreviousBuffer"
+"P" = "ListPlugins"
 "b" = { PluginCommand = "BufferPicker" }
 "g" = { PluginCommand = "ProjectSearch" }
 "t" = { PluginCommand = "ThemeBrowser" }
@@ -350,6 +351,7 @@ Esc = { EnterMode = "Normal" }
 "f" = "FormatDocument"
 "." = "CodeAction"
 "r" = "StartRename"
+"s" = "OpenStatuslineManager"
 "G" = { PluginCommand = "GitDashboard" }
 "?" = "CommandPalette"
 "h" = { "s" = { PluginCommand = "GitHunkStage" }, "u" = { PluginCommand = "GitHunkUnstage" }, "r" = { PluginCommand = "GitHunkReset" } }

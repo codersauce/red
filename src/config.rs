@@ -3637,6 +3637,14 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
             leader.get("?"),
             Some(&KeyAction::Single(Action::CommandPalette))
         );
+        assert_eq!(
+            leader.get("s"),
+            Some(&KeyAction::Single(Action::OpenStatuslineManager))
+        );
+        assert_eq!(
+            leader.get("P"),
+            Some(&KeyAction::Single(Action::ListPlugins))
+        );
         assert_eq!(config.key_hints, KeyHintsConfig::default());
         assert!(config.key_hints.enabled);
         assert_eq!(config.key_hints.delay_ms, 250);
