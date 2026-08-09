@@ -27,29 +27,29 @@ Use this guide to publish a Red release without mixing up release preparation, t
 
 ## Prerequisites
 
-Start only when CI is green on `master` and the release secrets are available. The release documentation requires `codersauce/homebrew-tap` with a `Formula/` directory, `HOMEBREW_TAP_TOKEN` that can push to that tap, and a `RELEASE_PR_TOKEN` with repository-scoped Contents and Pull requests read/write permissions [@releasing]. The release workflow uses the repository `GITHUB_TOKEN` to create a draft release, and `release.yml` grants `contents: write` only to the publishing job [@releasing] [@release].
+Start only when CI is green on `main` and the release secrets are available. The release documentation requires `codersauce/homebrew-tap` with a `Formula/` directory, `HOMEBREW_TAP_TOKEN` that can push to that tap, and a `RELEASE_PR_TOKEN` with repository-scoped Contents and Pull requests read/write permissions [@releasing]. The release workflow uses the repository `GITHUB_TOKEN` to create a draft release, and `release.yml` grants `contents: write` only to the publishing job [@releasing] [@release].
 
 Choose the next SemVer version without a leading `v`. The prepare workflow validates that the input matches SemVer, that `RELEASE_PR_TOKEN` is present, that the tag does not already exist, and that the requested version is newer than the current package version [@prepare-release].
 
 ## Prepare The Release PR
 
-Run the prepare workflow from `master`:
+Run the prepare workflow from `main`:
 
 ```shell
-gh workflow run prepare-release.yml --ref master -f version=0.2.0
+gh workflow run prepare-release.yml --ref main -f version=0.2.0
 ```
 
-The workflow checks out `master`, generates release notes from Conventional Commit subjects with git-cliff, updates `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, and README release references, then creates or updates `release/v<version>` [@prepare-release]. The README update is performed by `scripts/readme_release.py --set`, and the workflow immediately runs `scripts/readme_release.py --check` to verify the marker, release link, and installer pin match `Cargo.toml` [@prepare-release] [@readme-release].
+The workflow checks out `main`, generates release notes from Conventional Commit subjects with git-cliff, updates `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, and README release references, then creates or updates `release/v<version>` [@prepare-release]. The README update is performed by `scripts/readme_release.py --set`, and the workflow immediately runs `scripts/readme_release.py --check` to verify the marker, release link, and installer pin match `Cargo.toml` [@prepare-release] [@readme-release].
 
 Review the release PR as a normal ready-for-review PR. The release docs call out the generated changelog, package version, README release link, pinned installer example, Clippy, bundled-runtime self-check, README version check, and generated-versus-committed changelog comparison as required gates [@releasing]. For local equivalents, use [Build, Test, And Validate](../development/build-test-and-validate) and [CI And Validation](../../reference/validation/ci-and-validation).
 
 ## Tag The Merge Commit
 
-After merging the release PR, update local `master` and create an annotated tag from the merge commit:
+After merging the release PR, update local `main` and create an annotated tag from the merge commit:
 
 ```shell
-git checkout master
-git pull --ff-only origin master
+git checkout main
+git pull --ff-only origin main
 git tag -a v0.2.0 -m 'Release v0.2.0'
 git push origin v0.2.0
 ```

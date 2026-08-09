@@ -30,7 +30,7 @@ The local clippy command matches the CI clippy job. The workflow installs the st
 
 ## Main CI Workflow
 
-The main CI workflow runs on pushes and pull requests targeting `main`, `master`, or `develop`, and it can also be started manually with `workflow_dispatch` [@ci]. Its global environment enables colored Cargo output and `RUST_BACKTRACE=1` [@ci].
+The main CI workflow runs on pushes and pull requests targeting `main` or `develop`, and it can also be started manually with `workflow_dispatch` [@ci]. Its global environment enables colored Cargo output and `RUST_BACKTRACE=1` [@ci].
 
 | Job | Main checks |
 | --- | --- |

@@ -45,7 +45,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 ## Match The Main CI Gates
 
-When a change is broad, prepare for the main CI workflow rather than guessing at one command. The CI workflow runs on pushes and pull requests to `main`, `master`, and `develop`, and it can also be started manually [@ci].
+When a change is broad, prepare for the main CI workflow rather than guessing at one command. The CI workflow runs on pushes and pull requests to `main` and `develop`, and it can also be started manually [@ci].
 
 Run these local equivalents when the changed area warrants them:
 
