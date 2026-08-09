@@ -11,12 +11,15 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    ffi::OsStr,
     fs,
     io::{self, Write as _},
     path::{Path, PathBuf},
+    process::Command,
     time::{Duration, Instant},
 };
 
+use chrono::Local;
 use crossterm::{
     cursor::{self, MoveTo},
     style, terminal, QueueableCommand as _,
@@ -27,7 +30,7 @@ use crate::{
     color::{blend_color, ensure_minimum_contrast, Color},
     config::{CursorShape, KeyAction, PickerIconStyle, StatuslineSection},
     editor::RenderCommand,
-    lsp::Diagnostic,
+    lsp::{Diagnostic, DiagnosticSeverity},
     plugin::DecorationAnchor,
     splash,
     theme::{SelectionForegroundPriority, Style, Theme},
@@ -37,12 +40,13 @@ use crate::{
         char_prefix, display_width, display_width_with_tabs, fit_display_width,
         grapheme_to_column_with_tabs, trim_line_ending, truncate_display_width,
     },
-    utils::expand_user_path,
+    utils::{expand_user_path, get_workspace_path},
 };
 
 use super::{
     adjust_color_brightness, display_layout::DisplayLayout, render_buffer::Change, Editor, Mode,
-    Point, Rect, RenderBuffer, StyleCursor, GUTTER_SIGN_COLUMN_WIDTH, MAX_HIGHLIGHT_SLICE_BYTES,
+    Point, Rect, RenderBuffer, StatuslineGitChanges, StyleCursor, GUTTER_SIGN_COLUMN_WIDTH,
+    MAX_HIGHLIGHT_SLICE_BYTES,
 };
 
 fn diagnostic_row(diagnostics: &[&Diagnostic], available_width: usize) -> Option<String> {
@@ -114,6 +118,26 @@ struct StatuslineContext {
     position: String,
     syntax: Option<String>,
     git_branch: Option<String>,
+    diagnostics: Option<(usize, usize)>,
+    git_changes: Option<StatuslineGitChanges>,
+    lsp_status: Option<String>,
+    current_symbol: Option<String>,
+    selection: Option<String>,
+    recording: Option<char>,
+    search_matches: Option<(usize, usize)>,
+    indentation: String,
+    encoding: &'static str,
+    line_endings: &'static str,
+    read_only: bool,
+    modified: bool,
+    workspace: String,
+    relative_path: Option<String>,
+    buffer_index: String,
+    window_index: String,
+    file_size: String,
+    agent_activity: Option<String>,
+    formatter: Option<&'static str>,
+    clock: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -157,9 +181,275 @@ fn statusline_segment(
             )
         }
         StatuslineSection::Position => (context.position.clone(), style.clone(), None),
+        StatuslineSection::Diagnostics => {
+            let (errors, warnings) = context.diagnostics?;
+            let text = statusline_diagnostics_label(errors, warnings, icon_style);
+            (format!(" {text} "), style.clone(), None)
+        }
+        StatuslineSection::GitChanges => {
+            let changes = context.git_changes?;
+            let text = format!(
+                "+{} ~{} -{}",
+                changes.added, changes.modified, changes.deleted
+            );
+            (
+                statusline_icon_label(
+                    statusline_section_icon(StatuslineSection::GitChanges, icon_style),
+                    &text,
+                ),
+                style.clone(),
+                None,
+            )
+        }
+        StatuslineSection::LspStatus => (
+            statusline_icon_label(
+                statusline_section_icon(StatuslineSection::LspStatus, icon_style),
+                context.lsp_status.as_deref()?,
+            ),
+            style.clone(),
+            None,
+        ),
+        StatuslineSection::CurrentSymbol => (
+            statusline_icon_label(
+                statusline_section_icon(StatuslineSection::CurrentSymbol, icon_style),
+                context.current_symbol.as_deref()?,
+            ),
+            style.clone(),
+            None,
+        ),
+        StatuslineSection::Selection => (
+            statusline_icon_label(
+                statusline_section_icon(StatuslineSection::Selection, icon_style),
+                context.selection.as_deref()?,
+            ),
+            style.clone(),
+            None,
+        ),
+        StatuslineSection::Recording => {
+            let label = format!("recording @{}", context.recording?);
+            (
+                statusline_icon_label(
+                    statusline_section_icon(StatuslineSection::Recording, icon_style),
+                    &label,
+                ),
+                style.clone(),
+                None,
+            )
+        }
+        StatuslineSection::SearchMatches => {
+            let (current, total) = context.search_matches?;
+            let label = format!("{current}/{total}");
+            (
+                statusline_icon_label(
+                    statusline_section_icon(StatuslineSection::SearchMatches, icon_style),
+                    &label,
+                ),
+                style.clone(),
+                None,
+            )
+        }
+        StatuslineSection::Indentation => (
+            statusline_icon_label(
+                statusline_section_icon(StatuslineSection::Indentation, icon_style),
+                &context.indentation,
+            ),
+            style.clone(),
+            None,
+        ),
+        StatuslineSection::Encoding => (
+            statusline_icon_label(
+                statusline_section_icon(StatuslineSection::Encoding, icon_style),
+                context.encoding,
+            ),
+            style.clone(),
+            None,
+        ),
+        StatuslineSection::LineEndings => (
+            statusline_icon_label(
+                statusline_section_icon(StatuslineSection::LineEndings, icon_style),
+                context.line_endings,
+            ),
+            style.clone(),
+            None,
+        ),
+        StatuslineSection::ReadOnly => {
+            if !context.read_only {
+                return None;
+            }
+            (
+                statusline_icon_label(
+                    statusline_section_icon(StatuslineSection::ReadOnly, icon_style),
+                    "RO",
+                ),
+                style.clone(),
+                None,
+            )
+        }
+        StatuslineSection::Modified => {
+            if !context.modified {
+                return None;
+            }
+            (
+                statusline_icon_label(
+                    statusline_section_icon(StatuslineSection::Modified, icon_style),
+                    "modified",
+                ),
+                style.clone(),
+                None,
+            )
+        }
+        StatuslineSection::Workspace => (
+            statusline_icon_label(
+                statusline_section_icon(StatuslineSection::Workspace, icon_style),
+                &context.workspace,
+            ),
+            style.clone(),
+            None,
+        ),
+        StatuslineSection::RelativePath => (
+            statusline_icon_label(
+                statusline_section_icon(StatuslineSection::RelativePath, icon_style),
+                context.relative_path.as_deref()?,
+            ),
+            style.clone(),
+            None,
+        ),
+        StatuslineSection::BufferIndex => (
+            statusline_icon_label(
+                statusline_section_icon(StatuslineSection::BufferIndex, icon_style),
+                &context.buffer_index,
+            ),
+            style.clone(),
+            None,
+        ),
+        StatuslineSection::WindowIndex => (
+            statusline_icon_label(
+                statusline_section_icon(StatuslineSection::WindowIndex, icon_style),
+                &context.window_index,
+            ),
+            style.clone(),
+            None,
+        ),
+        StatuslineSection::FileSize => (
+            statusline_icon_label(
+                statusline_section_icon(StatuslineSection::FileSize, icon_style),
+                &context.file_size,
+            ),
+            style.clone(),
+            None,
+        ),
+        StatuslineSection::AgentActivity => (
+            statusline_icon_label(
+                statusline_section_icon(StatuslineSection::AgentActivity, icon_style),
+                context.agent_activity.as_deref()?,
+            ),
+            style.clone(),
+            None,
+        ),
+        StatuslineSection::Formatter => (
+            statusline_icon_label(
+                statusline_section_icon(StatuslineSection::Formatter, icon_style),
+                context.formatter?,
+            ),
+            style.clone(),
+            None,
+        ),
+        StatuslineSection::Clock => (
+            statusline_icon_label(
+                statusline_section_icon(StatuslineSection::Clock, icon_style),
+                &context.clock,
+            ),
+            style.clone(),
+            None,
+        ),
     };
 
     Some(StatuslineSegment { text, style, icon })
+}
+
+pub(crate) fn statusline_section_icon(
+    section: StatuslineSection,
+    style: PickerIconStyle,
+) -> &'static str {
+    if style == PickerIconStyle::None {
+        return "";
+    }
+    match (section, style) {
+        (StatuslineSection::Mode, _) => "N",
+        (StatuslineSection::GitBranch, PickerIconStyle::NerdFont) => "",
+        (StatuslineSection::GitBranch, PickerIconStyle::Unicode) => "⑂",
+        (StatuslineSection::GitBranch, PickerIconStyle::Ascii) => "git",
+        (StatuslineSection::Diagnostics, PickerIconStyle::NerdFont) => "󰒡",
+        (StatuslineSection::Diagnostics, PickerIconStyle::Unicode) => "⚠",
+        (StatuslineSection::Diagnostics, PickerIconStyle::Ascii) => "diag",
+        (StatuslineSection::GitChanges, PickerIconStyle::NerdFont) => "󰊢",
+        (StatuslineSection::GitChanges, PickerIconStyle::Unicode) => "Δ",
+        (StatuslineSection::GitChanges, PickerIconStyle::Ascii) => "git",
+        (StatuslineSection::LspStatus, PickerIconStyle::NerdFont) => "",
+        (StatuslineSection::LspStatus, PickerIconStyle::Unicode) => "⚙",
+        (StatuslineSection::LspStatus, PickerIconStyle::Ascii) => "lsp",
+        (StatuslineSection::CurrentSymbol, _) => "ƒ",
+        (StatuslineSection::Selection, PickerIconStyle::NerdFont) => "󰒉",
+        (StatuslineSection::Selection, PickerIconStyle::Unicode) => "↔",
+        (StatuslineSection::Selection, PickerIconStyle::Ascii) => "sel",
+        (StatuslineSection::Recording, PickerIconStyle::NerdFont) => "󰑊",
+        (StatuslineSection::Recording, PickerIconStyle::Unicode) => "●",
+        (StatuslineSection::Recording, PickerIconStyle::Ascii) => "rec",
+        (StatuslineSection::SearchMatches, PickerIconStyle::NerdFont) => "",
+        (StatuslineSection::SearchMatches, PickerIconStyle::Unicode) => "⌕",
+        (StatuslineSection::SearchMatches, PickerIconStyle::Ascii) => "find",
+        (StatuslineSection::Indentation, PickerIconStyle::NerdFont) => "󰌒",
+        (StatuslineSection::Indentation, PickerIconStyle::Unicode) => "⇥",
+        (StatuslineSection::Indentation, PickerIconStyle::Ascii) => "spc",
+        (StatuslineSection::Encoding, PickerIconStyle::NerdFont) => "󰅩",
+        (StatuslineSection::Encoding, PickerIconStyle::Unicode) => "文",
+        (StatuslineSection::Encoding, PickerIconStyle::Ascii) => "enc",
+        (StatuslineSection::LineEndings, PickerIconStyle::NerdFont) => "󰌑",
+        (StatuslineSection::LineEndings, PickerIconStyle::Unicode) => "↵",
+        (StatuslineSection::LineEndings, PickerIconStyle::Ascii) => "eol",
+        (StatuslineSection::ReadOnly, PickerIconStyle::NerdFont) => "",
+        (StatuslineSection::ReadOnly, PickerIconStyle::Unicode) => "🔒",
+        (StatuslineSection::ReadOnly, PickerIconStyle::Ascii) => "ro",
+        (StatuslineSection::Modified, PickerIconStyle::Ascii) => "+",
+        (StatuslineSection::Modified, _) => "●",
+        (StatuslineSection::Workspace, PickerIconStyle::NerdFont) => "󰉋",
+        (StatuslineSection::Workspace, PickerIconStyle::Unicode) => "▣",
+        (StatuslineSection::Workspace, PickerIconStyle::Ascii) => "ws",
+        (StatuslineSection::RelativePath, PickerIconStyle::NerdFont) => "󰈔",
+        (StatuslineSection::RelativePath, PickerIconStyle::Unicode) => "↳",
+        (StatuslineSection::RelativePath, PickerIconStyle::Ascii) => "path",
+        (StatuslineSection::BufferIndex, PickerIconStyle::NerdFont) => "󰓩",
+        (StatuslineSection::BufferIndex, PickerIconStyle::Unicode) => "▤",
+        (StatuslineSection::BufferIndex, PickerIconStyle::Ascii) => "buf",
+        (StatuslineSection::WindowIndex, PickerIconStyle::NerdFont) => "󰖲",
+        (StatuslineSection::WindowIndex, PickerIconStyle::Unicode) => "□",
+        (StatuslineSection::WindowIndex, PickerIconStyle::Ascii) => "win",
+        (StatuslineSection::FileSize, PickerIconStyle::NerdFont) => "󰉉",
+        (StatuslineSection::FileSize, PickerIconStyle::Unicode) => "≋",
+        (StatuslineSection::FileSize, PickerIconStyle::Ascii) => "size",
+        (StatuslineSection::AgentActivity, PickerIconStyle::NerdFont) => "󰚩",
+        (StatuslineSection::AgentActivity, PickerIconStyle::Unicode) => "✦",
+        (StatuslineSection::AgentActivity, PickerIconStyle::Ascii) => "agent",
+        (StatuslineSection::Formatter, PickerIconStyle::NerdFont) => "󰉼",
+        (StatuslineSection::Formatter, PickerIconStyle::Unicode) => "≡",
+        (StatuslineSection::Formatter, PickerIconStyle::Ascii) => "fmt",
+        (StatuslineSection::Clock, PickerIconStyle::NerdFont) => "",
+        (StatuslineSection::Clock, PickerIconStyle::Unicode) => "◷",
+        (StatuslineSection::Clock, PickerIconStyle::Ascii) => "time",
+        (StatuslineSection::Position, PickerIconStyle::NerdFont) => "󰆤",
+        (StatuslineSection::Position, PickerIconStyle::Unicode) => "⌖",
+        (StatuslineSection::Position, PickerIconStyle::Ascii) => "pos",
+        (StatuslineSection::Filename | StatuslineSection::Syntax, _) => "",
+        (_, PickerIconStyle::None) => "",
+    }
+}
+
+fn statusline_diagnostics_label(errors: usize, warnings: usize, style: PickerIconStyle) -> String {
+    match style {
+        PickerIconStyle::NerdFont => format!(" {errors}   {warnings}"),
+        PickerIconStyle::Unicode => format!("● {errors}  ▲ {warnings}"),
+        PickerIconStyle::Ascii | PickerIconStyle::None => format!("E{errors} W{warnings}"),
+    }
 }
 
 fn statusline_icon_label(glyph: &str, label: &str) -> String {
@@ -406,6 +696,171 @@ fn compact_git_branch(branch: &str) -> String {
         compact.push('…');
         compact
     }
+}
+
+fn git_repository_root(search_dir: &Path) -> Option<PathBuf> {
+    search_dir
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
+fn git_changes_from_status(repository_root: &Path) -> Option<StatuslineGitChanges> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository_root)
+        .args(["status", "--porcelain=v1", "--untracked-files=normal"])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| git_changes_from_porcelain(&String::from_utf8_lossy(&output.stdout)))
+        .flatten()
+}
+
+fn git_changes_from_porcelain(status: &str) -> Option<StatuslineGitChanges> {
+    let mut changes = StatuslineGitChanges::default();
+    for line in status.lines() {
+        let bytes = line.as_bytes();
+        if bytes.len() < 2 {
+            continue;
+        }
+        let (index, worktree) = (bytes[0], bytes[1]);
+        if (index == b'?' && worktree == b'?') || index == b'A' || worktree == b'A' {
+            changes.added += 1;
+        } else if index == b'D' || worktree == b'D' {
+            changes.deleted += 1;
+        } else {
+            changes.modified += 1;
+        }
+    }
+    (changes.added + changes.modified + changes.deleted > 0).then_some(changes)
+}
+
+fn statusline_relative_path(file: Option<&str>, workspace_root: &Path) -> Option<String> {
+    let file = file?;
+    let path = expand_user_path(file).ok()?;
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        get_workspace_path().join(path)
+    };
+    Some(
+        absolute
+            .strip_prefix(workspace_root)
+            .unwrap_or(&absolute)
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+fn statusline_workspace_name(workspace_root: &Path) -> String {
+    workspace_root
+        .file_name()
+        .and_then(OsStr::to_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("workspace")
+        .to_string()
+}
+
+fn statusline_file_is_read_only(file: Option<&str>) -> bool {
+    file.and_then(|file| expand_user_path(file).ok())
+        .and_then(|path| fs::metadata(path).ok())
+        .is_some_and(|metadata| metadata.permissions().readonly())
+}
+
+fn statusline_file_size(bytes: usize) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.1} GB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KB", bytes / KIB)
+    } else {
+        format!("{} B", bytes as usize)
+    }
+}
+
+fn statusline_symbol_at(buffer: &crate::buffer::Buffer, cursor_line: usize) -> Option<String> {
+    let first_line = cursor_line.saturating_sub(199);
+    (first_line..=cursor_line)
+        .rev()
+        .filter_map(|line| buffer.get(line))
+        .find_map(|line| statusline_symbol_from_declaration(trim_line_ending(&line)))
+}
+
+fn statusline_symbol_from_declaration(line: &str) -> Option<String> {
+    let mut declaration = line.trim_start();
+    if let Some(heading) = declaration.strip_prefix('#') {
+        let heading = heading.trim_start_matches('#').trim();
+        return (!heading.is_empty()).then(|| heading.to_string());
+    }
+    for prefix in ["pub(crate) ", "pub(super) ", "pub ", "export ", "default "] {
+        if let Some(rest) = declaration.strip_prefix(prefix) {
+            declaration = rest;
+            break;
+        }
+    }
+    if let Some(rest) = declaration.strip_prefix("const fn ") {
+        declaration = rest;
+        let name = declaration
+            .split(|character: char| {
+                !(character.is_alphanumeric() || matches!(character, '_' | ':' | '-'))
+            })
+            .next()
+            .unwrap_or_default();
+        return (!name.is_empty()).then(|| name.to_string());
+    }
+    for prefix in ["async ", "unsafe "] {
+        if let Some(rest) = declaration.strip_prefix(prefix) {
+            declaration = rest;
+        }
+    }
+    for keyword in [
+        "fn ",
+        "def ",
+        "function ",
+        "class ",
+        "struct ",
+        "enum ",
+        "trait ",
+        "interface ",
+        "type ",
+        "mod ",
+    ] {
+        if let Some(rest) = declaration.strip_prefix(keyword) {
+            let name = rest
+                .split(|character: char| {
+                    !(character.is_alphanumeric() || matches!(character, '_' | ':' | '-'))
+                })
+                .next()
+                .unwrap_or_default();
+            return (!name.is_empty()).then(|| name.to_string());
+        }
+    }
+    if let Some(rest) = declaration.strip_prefix("impl ") {
+        let name = rest
+            .split(|character: char| matches!(character, '{' | '<') || character.is_whitespace())
+            .next()
+            .unwrap_or_default();
+        return (!name.is_empty()).then(|| format!("impl {name}"));
+    }
+    for keyword in ["const ", "let ", "var "] {
+        let Some(rest) = declaration.strip_prefix(keyword) else {
+            continue;
+        };
+        let (name, value) = rest.split_once('=')?;
+        if value.contains("=>") || value.trim_start().starts_with("function") {
+            let name = name.trim();
+            return (!name.is_empty()).then(|| name.to_string());
+        }
+    }
+    None
 }
 
 fn decoration_local_x(
@@ -2123,12 +2578,30 @@ impl Editor {
             return;
         }
 
-        let (filename, file_path, dirty, position, buffer_index) =
-            if let Some(window) = self.window_manager.active_window() {
-                let window_buffer = &self.buffer_manager[window.buffer_index];
-                let dirty = window_buffer.is_dirty();
-                let window_count = self.window_manager.window_count();
-                let window_indicator = if window_count > 1 {
+        let left_sections = self.config.statusline.left.clone();
+        let right_sections = self.config.statusline.right.clone();
+        let configured = |candidate| {
+            left_sections
+                .iter()
+                .chain(&right_sections)
+                .any(|section| *section == candidate)
+        };
+
+        let (
+            filename,
+            file_path,
+            dirty,
+            position,
+            buffer_index,
+            cursor_line,
+            byte_len,
+            line_endings,
+        ) = if let Some(window) = self.window_manager.active_window() {
+            let window_buffer = &self.buffer_manager[window.buffer_index];
+            let dirty = window_buffer.is_dirty();
+            let window_count = self.window_manager.window_count();
+            let window_indicator =
+                if window_count > 1 && !configured(StatuslineSection::WindowIndex) {
                     format!(
                         " [{}/{}] ",
                         self.window_manager.active_window_id() + 1,
@@ -2137,47 +2610,114 @@ impl Editor {
                 } else {
                     " ".to_string()
                 };
-                (
-                    statusline_file_name(window_buffer.name()).to_string(),
-                    window_buffer.file.clone(),
-                    dirty,
-                    format!(
-                        " {}:{}{}",
-                        window.vtop + window.cy + 1,
-                        window.cx + 1,
-                        window_indicator
-                    ),
-                    window.buffer_index,
-                )
-            } else {
-                let current = self.current_buffer();
-                (
-                    statusline_file_name(current.name()).to_string(),
-                    current.file.clone(),
-                    current.is_dirty(),
-                    format!(" {}:{} ", self.vtop + self.cy + 1, self.cx + 1),
-                    self.buffer_manager.active_index(),
-                )
-            };
+            (
+                statusline_file_name(window_buffer.name()).to_string(),
+                window_buffer.file.clone(),
+                dirty,
+                format!(
+                    " {}:{}{}",
+                    window.vtop + window.cy + 1,
+                    window.cx + 1,
+                    window_indicator
+                ),
+                window.buffer_index,
+                window.vtop + window.cy,
+                window_buffer.byte_len(),
+                if window_buffer
+                    .get(0)
+                    .is_some_and(|line| line.ends_with("\r\n"))
+                {
+                    "CRLF"
+                } else {
+                    "LF"
+                },
+            )
+        } else {
+            let current = self.current_buffer();
+            (
+                statusline_file_name(current.name()).to_string(),
+                current.file.clone(),
+                current.is_dirty(),
+                format!(" {}:{} ", self.vtop + self.cy + 1, self.cx + 1),
+                self.buffer_manager.active_index(),
+                self.vtop + self.cy,
+                current.byte_len(),
+                if current.get(0).is_some_and(|line| line.ends_with("\r\n")) {
+                    "CRLF"
+                } else {
+                    "LF"
+                },
+            )
+        };
 
         let term_width = self.size.0 as usize;
         let y = self.size.1 as usize - 2;
         let clear_line = " ".repeat(term_width);
         buffer.set_text(0, y, &clear_line, &self.theme.statusline_style.inner_style);
 
-        let left_sections = self.config.statusline.left.clone();
-        let right_sections = self.config.statusline.right.clone();
-        let wants_git = left_sections
-            .iter()
-            .chain(&right_sections)
-            .any(|section| *section == StatuslineSection::GitBranch);
-        let git_branch = wants_git
-            .then(|| self.statusline_git_branch(file_path.as_deref()))
+        let wants_git = configured(StatuslineSection::GitBranch)
+            || configured(StatuslineSection::GitChanges)
+            || configured(StatuslineSection::Workspace)
+            || configured(StatuslineSection::RelativePath);
+        if wants_git {
+            self.refresh_statusline_git(
+                file_path.as_deref(),
+                configured(StatuslineSection::GitChanges),
+            );
+        }
+        let workspace_root = self
+            .statusline_git_cache
+            .repository_root
+            .clone()
+            .or_else(|| {
+                file_path
+                    .as_deref()
+                    .and_then(|file| self.lsp.workspace_root_for_file(file))
+            })
+            .unwrap_or_else(get_workspace_path);
+        let diagnostics = configured(StatuslineSection::Diagnostics)
+            .then(|| self.statusline_diagnostic_counts(buffer_index))
             .flatten();
-        let syntax = self.highlight_language_id_for_buffer_index(buffer_index);
+        let current_symbol = configured(StatuslineSection::CurrentSymbol)
+            .then(|| statusline_symbol_at(&self.buffer_manager[buffer_index], cursor_line))
+            .flatten();
+        let selection = configured(StatuslineSection::Selection)
+            .then(|| self.statusline_selection_label())
+            .flatten();
+        let search_matches = configured(StatuslineSection::SearchMatches)
+            .then(|| self.statusline_search_position())
+            .flatten();
+        let lsp_status = configured(StatuslineSection::LspStatus)
+            .then(|| {
+                file_path
+                    .as_deref()
+                    .and_then(|file| self.lsp.server_name_for_file(file))
+            })
+            .flatten();
+        let formatter = configured(StatuslineSection::Formatter)
+            .then(|| {
+                let file = file_path.as_deref()?;
+                self.lsp.server_capabilities_for_file(file).map(|_| {
+                    if self.lsp.supports_document_formatting(file) {
+                        "fmt"
+                    } else {
+                        "no fmt"
+                    }
+                })
+            })
+            .flatten();
+        let agent_activity = configured(StatuslineSection::AgentActivity)
+            .then(|| self.statusline_agent_activity())
+            .flatten();
+        let syntax = configured(StatuslineSection::Syntax)
+            .then(|| self.highlight_language_id_for_buffer_index(buffer_index))
+            .flatten();
+        let show_modified_separately = configured(StatuslineSection::Modified);
+        let read_only = statusline_file_is_read_only(file_path.as_deref());
+        let relative_path = statusline_relative_path(file_path.as_deref(), &workspace_root);
         let context = StatuslineContext {
             mode: format_mode_name(&self.mode).to_string(),
-            filename: if dirty {
+            filename: if dirty && !show_modified_separately {
                 format!("{filename} [+]")
             } else {
                 filename
@@ -2185,7 +2725,34 @@ impl Editor {
             file_path,
             position,
             syntax,
-            git_branch,
+            git_branch: self.statusline_git_cache.branch.clone(),
+            diagnostics,
+            git_changes: self.statusline_git_cache.changes,
+            lsp_status,
+            current_symbol,
+            selection,
+            recording: self
+                .macro_recording
+                .as_ref()
+                .map(|recording| recording.register),
+            search_matches,
+            indentation: format!("spaces:{}", self.indentation().shift_width),
+            encoding: "utf-8",
+            line_endings,
+            read_only,
+            modified: dirty,
+            workspace: statusline_workspace_name(&workspace_root),
+            relative_path,
+            buffer_index: format!("{}/{}", buffer_index + 1, self.buffer_manager.len().max(1)),
+            window_index: format!(
+                "{}/{}",
+                self.window_manager.active_window_id() + 1,
+                self.window_manager.window_count().max(1)
+            ),
+            file_size: statusline_file_size(byte_len),
+            agent_activity,
+            formatter,
+            clock: Local::now().format("%H:%M").to_string(),
         };
 
         let base_style = self.theme.statusline_style.inner_style.clone();
@@ -2215,8 +2782,8 @@ impl Editor {
         draw_statusline_left(buffer, y, right_start, &left, &base_style, left_separator);
     }
 
-    fn statusline_git_branch(&mut self, file: Option<&str>) -> Option<String> {
-        const CACHE_TTL: Duration = Duration::from_secs(1);
+    fn refresh_statusline_git(&mut self, file: Option<&str>, load_changes: bool) {
+        const CACHE_TTL: Duration = Duration::from_secs(2);
 
         let search_dir = statusline_git_search_dir(file);
         let now = Instant::now();
@@ -2224,16 +2791,92 @@ impl Editor {
             && self
                 .statusline_git_cache
                 .refreshed_at
-                .is_some_and(|refreshed| now.duration_since(refreshed) < CACHE_TTL);
+                .is_some_and(|refreshed| now.duration_since(refreshed) < CACHE_TTL)
+            && (!load_changes || self.statusline_git_cache.changes_loaded);
         if cache_is_fresh {
-            return self.statusline_git_cache.branch.clone();
+            return;
         }
 
+        let repository_root = git_repository_root(&search_dir);
         let branch = git_branch_from_head(&search_dir);
+        let changes = load_changes
+            .then(|| repository_root.as_deref().and_then(git_changes_from_status))
+            .flatten();
         self.statusline_git_cache.search_dir = Some(search_dir);
-        self.statusline_git_cache.branch = branch.clone();
+        self.statusline_git_cache.repository_root = repository_root;
+        self.statusline_git_cache.branch = branch;
+        self.statusline_git_cache.changes = changes;
+        self.statusline_git_cache.changes_loaded = load_changes;
         self.statusline_git_cache.refreshed_at = Some(now);
-        branch
+    }
+
+    fn statusline_diagnostic_counts(&self, buffer_index: usize) -> Option<(usize, usize)> {
+        let uri = self
+            .buffer_manager
+            .get(buffer_index)?
+            .uri()
+            .ok()
+            .flatten()?;
+        let diagnostics = self.diagnostics.get(&uri)?;
+        let (mut errors, mut warnings) = (0, 0);
+        for diagnostic in diagnostics {
+            match diagnostic.severity.as_ref() {
+                Some(DiagnosticSeverity::Error) => errors += 1,
+                Some(DiagnosticSeverity::Warning) => warnings += 1,
+                _ => {}
+            }
+        }
+        (errors + warnings > 0).then_some((errors, warnings))
+    }
+
+    fn statusline_selection_label(&self) -> Option<String> {
+        let selection = self.selection?;
+        let (_, y0, _, y1) = selection.into();
+        if self.mode == Mode::VisualLine || y0 != y1 {
+            return Some(format!("{} lines", y0.abs_diff(y1) + 1));
+        }
+        self.selected_text()
+            .map(|text| format!("{} chars", text.chars().count()))
+    }
+
+    fn statusline_search_position(&mut self) -> Option<(usize, usize)> {
+        let active_search = self.active_search.clone();
+        let pattern = active_search
+            .as_ref()
+            .map(|search| search.draft.as_str())
+            .filter(|pattern| !pattern.is_empty())
+            .or_else(|| (!self.search_term.is_empty()).then_some(self.search_term.as_str()))?
+            .to_string();
+        let matches = self.search_matches(&pattern).ok()?;
+        if matches.is_empty() {
+            return None;
+        }
+        let current = active_search
+            .and_then(|search| search.preview)
+            .map(|preview| (preview.start_y, preview.start_x))
+            .unwrap_or((
+                self.buffer_line(),
+                self.grapheme_to_char_on_line(self.cx, self.buffer_line()),
+            ));
+        let index = matches
+            .partition_point(|match_| (match_.start_y, match_.start_x) < current)
+            .min(matches.len().saturating_sub(1));
+        Some((index + 1, matches.len()))
+    }
+
+    fn statusline_agent_activity(&self) -> Option<String> {
+        if self.agent_manager.has_active_sessions() {
+            return Some("working".to_string());
+        }
+        if self
+            .agent_manager
+            .workspace()
+            .and_then(|workspace| workspace.try_lock().ok())
+            .is_some_and(|workspace| workspace.has_pending_files())
+        {
+            return Some("changes ready".to_string());
+        }
+        self.agent_manager.has_bridge().then(|| "idle".to_string())
     }
 
     pub fn draw_commandline(&mut self, buffer: &mut RenderBuffer) {
@@ -2593,6 +3236,51 @@ mod tests {
         assert_eq!(by_line[&4].len(), 2);
         assert_eq!(by_line[&4][0].message, "first visible");
         assert_eq!(by_line[&4][1].message, "second visible");
+    }
+
+    #[test]
+    fn git_porcelain_changes_are_grouped_for_the_statusline() {
+        let changes = git_changes_from_porcelain(
+            " M src/editor.rs\nA  src/new.rs\nD  src/old.rs\n?? notes.txt\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            changes,
+            StatuslineGitChanges {
+                added: 2,
+                modified: 1,
+                deleted: 1,
+            }
+        );
+        assert_eq!(git_changes_from_porcelain(""), None);
+    }
+
+    #[test]
+    fn current_symbol_recognizes_common_declarations() {
+        assert_eq!(
+            statusline_symbol_from_declaration("pub async fn render_frame() {"),
+            Some("render_frame".to_string())
+        );
+        assert_eq!(
+            statusline_symbol_from_declaration("const fn capacity() -> usize {"),
+            Some("capacity".to_string())
+        );
+        assert_eq!(
+            statusline_symbol_from_declaration("const openPanel = () => {}"),
+            Some("openPanel".to_string())
+        );
+        assert_eq!(
+            statusline_symbol_from_declaration("## Configuration"),
+            Some("Configuration".to_string())
+        );
+    }
+
+    #[test]
+    fn file_sizes_use_compact_binary_units() {
+        assert_eq!(statusline_file_size(42), "42 B");
+        assert_eq!(statusline_file_size(1536), "1.5 KB");
+        assert_eq!(statusline_file_size(2 * 1024 * 1024), "2.0 MB");
     }
 
     #[test]

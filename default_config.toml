@@ -80,8 +80,8 @@ style = "nerd_font"
 color = true
 
 # Sections are ordered from the outer edge toward the center on both sides.
-# Run :statusline to arrange them in a terminal panel with a live preview.
-# Available sections: mode, git_branch, filename, syntax, and position.
+# Run :statusline to browse editor, Git, LSP, file, and agent fields, then
+# arrange them in a terminal panel with a live preview.
 # The first three positions use the theme's accent, middle, and base shades.
 [statusline]
 left = ["mode", "git_branch", "filename"]

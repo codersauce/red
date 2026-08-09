@@ -416,15 +416,55 @@ pub enum StatuslineSection {
     Filename,
     Syntax,
     Position,
+    Diagnostics,
+    GitChanges,
+    LspStatus,
+    CurrentSymbol,
+    Selection,
+    Recording,
+    SearchMatches,
+    Indentation,
+    Encoding,
+    LineEndings,
+    ReadOnly,
+    Modified,
+    Workspace,
+    RelativePath,
+    BufferIndex,
+    WindowIndex,
+    FileSize,
+    AgentActivity,
+    Formatter,
+    Clock,
 }
 
 impl StatuslineSection {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 25] = [
         Self::Mode,
         Self::GitBranch,
         Self::Filename,
         Self::Syntax,
         Self::Position,
+        Self::Diagnostics,
+        Self::GitChanges,
+        Self::LspStatus,
+        Self::CurrentSymbol,
+        Self::Selection,
+        Self::Recording,
+        Self::SearchMatches,
+        Self::Indentation,
+        Self::Encoding,
+        Self::LineEndings,
+        Self::ReadOnly,
+        Self::Modified,
+        Self::Workspace,
+        Self::RelativePath,
+        Self::BufferIndex,
+        Self::WindowIndex,
+        Self::FileSize,
+        Self::AgentActivity,
+        Self::Formatter,
+        Self::Clock,
     ];
 
     #[must_use]
@@ -435,6 +475,26 @@ impl StatuslineSection {
             Self::Filename => "filename",
             Self::Syntax => "syntax",
             Self::Position => "position",
+            Self::Diagnostics => "diagnostics",
+            Self::GitChanges => "git_changes",
+            Self::LspStatus => "lsp_status",
+            Self::CurrentSymbol => "current_symbol",
+            Self::Selection => "selection",
+            Self::Recording => "recording",
+            Self::SearchMatches => "search_matches",
+            Self::Indentation => "indentation",
+            Self::Encoding => "encoding",
+            Self::LineEndings => "line_endings",
+            Self::ReadOnly => "read_only",
+            Self::Modified => "modified",
+            Self::Workspace => "workspace",
+            Self::RelativePath => "relative_path",
+            Self::BufferIndex => "buffer_index",
+            Self::WindowIndex => "window_index",
+            Self::FileSize => "file_size",
+            Self::AgentActivity => "agent_activity",
+            Self::Formatter => "formatter",
+            Self::Clock => "clock",
         }
     }
 
@@ -446,6 +506,26 @@ impl StatuslineSection {
             Self::Filename => "Filename",
             Self::Syntax => "Syntax",
             Self::Position => "Cursor position",
+            Self::Diagnostics => "Diagnostics",
+            Self::GitChanges => "Git changes",
+            Self::LspStatus => "LSP status",
+            Self::CurrentSymbol => "Current symbol",
+            Self::Selection => "Selection",
+            Self::Recording => "Macro recording",
+            Self::SearchMatches => "Search matches",
+            Self::Indentation => "Indentation",
+            Self::Encoding => "Encoding",
+            Self::LineEndings => "Line endings",
+            Self::ReadOnly => "Read-only",
+            Self::Modified => "Modified",
+            Self::Workspace => "Workspace",
+            Self::RelativePath => "Relative path",
+            Self::BufferIndex => "Buffer index",
+            Self::WindowIndex => "Window index",
+            Self::FileSize => "File size",
+            Self::AgentActivity => "Agent activity",
+            Self::Formatter => "Formatter",
+            Self::Clock => "Clock",
         }
     }
 }
@@ -3172,6 +3252,21 @@ color = false
         );
         assert_eq!(config.statusline.icons.style, PickerIconStyle::Ascii);
         assert!(!config.statusline.icons.color);
+    }
+
+    #[test]
+    fn every_statusline_section_round_trips_through_toml() {
+        let statusline = StatuslineConfig {
+            left: StatuslineSection::ALL.to_vec(),
+            right: Vec::new(),
+            icons: PickerIconsConfig::default(),
+        };
+
+        let serialized = toml::to_string(&statusline).unwrap();
+        let parsed = toml::from_str::<StatuslineConfig>(&serialized).unwrap();
+
+        assert_eq!(parsed.left, StatuslineSection::ALL);
+        assert!(parsed.right.is_empty());
     }
 
     #[test]

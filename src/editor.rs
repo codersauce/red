@@ -2346,8 +2346,18 @@ enum TerminalCursorState {
 #[derive(Debug, Default)]
 struct StatuslineGitCache {
     search_dir: Option<PathBuf>,
+    repository_root: Option<PathBuf>,
     branch: Option<String>,
+    changes: Option<StatuslineGitChanges>,
+    changes_loaded: bool,
     refreshed_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StatuslineGitChanges {
+    added: usize,
+    modified: usize,
+    deleted: usize,
 }
 
 /// Single-task owner of Red's interactive application state.

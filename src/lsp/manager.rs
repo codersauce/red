@@ -727,6 +727,15 @@ impl LspClient for LspManager {
             .get_server_capabilities()
     }
 
+    fn server_name_for_file(&self, file: &str) -> Option<String> {
+        let key = self.document_clients.get(file).cloned().or_else(|| {
+            self.resolve_document(file)
+                .map(|document| client_key(&document))
+        })?;
+        let (server_name, _) = client_source_from_key(&key, &self.config);
+        Some(server_name.to_string())
+    }
+
     fn supports_document_formatting(&self, file: &str) -> bool {
         if let Some(key) = self.document_clients.get(file) {
             return self

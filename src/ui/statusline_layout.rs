@@ -4,7 +4,10 @@ use crossterm::event::{Event, KeyCode, KeyModifiers};
 
 use crate::{
     config::{KeyAction, PickerIconStyle, StatuslineConfig, StatuslineSection},
-    editor::{rendering::statusline_slot_style, Action, Editor, RenderBuffer},
+    editor::{
+        rendering::{statusline_section_icon, statusline_slot_style},
+        Action, Editor, RenderBuffer,
+    },
     theme::{SelectionForegroundPriority, Style, Theme},
     unicode_utils::truncate_display_width,
 };
@@ -52,6 +55,7 @@ pub struct StatuslineLayoutPanel {
     draft: StatuslineConfig,
     focus: Bucket,
     selected: [usize; 3],
+    scroll: [usize; 3],
     theme: Theme,
 }
 
@@ -91,6 +95,7 @@ impl StatuslineLayoutPanel {
                 Bucket::Left
             },
             selected: [0; 3],
+            scroll: [0; 3],
             theme: editor.theme.clone(),
         }
     }
@@ -118,6 +123,24 @@ impl StatuslineLayoutPanel {
         let len = self.sections(bucket).len();
         let selected = &mut self.selected[bucket.index()];
         *selected = (*selected).min(len.saturating_sub(1));
+        self.ensure_selection_visible(bucket);
+    }
+
+    fn visible_rows(&self) -> usize {
+        self.dialog.height.saturating_sub(1).max(1)
+    }
+
+    fn ensure_selection_visible(&mut self, bucket: Bucket) {
+        let rows = self.visible_rows();
+        let index = bucket.index();
+        let selected = self.selected[index];
+        let len = self.sections(bucket).len();
+        if selected < self.scroll[index] {
+            self.scroll[index] = selected;
+        } else if selected >= self.scroll[index] + rows {
+            self.scroll[index] = selected + 1 - rows;
+        }
+        self.scroll[index] = self.scroll[index].min(len.saturating_sub(rows));
     }
 
     fn focus_by(&mut self, delta: isize) {
@@ -134,6 +157,7 @@ impl StatuslineLayoutPanel {
         }
         let current = self.selected[self.focus.index()] as isize;
         self.selected[self.focus.index()] = (current + delta).clamp(0, len as isize - 1) as usize;
+        self.ensure_selection_visible(self.focus);
     }
 
     fn move_to(&mut self, target: Bucket) -> bool {
@@ -173,6 +197,7 @@ impl StatuslineLayoutPanel {
         }
         list.swap(selected, next);
         self.selected[self.focus.index()] = next;
+        self.ensure_selection_visible(self.focus);
         true
     }
 
@@ -308,8 +333,15 @@ impl StatuslineLayoutPanel {
             return;
         }
 
-        for (index, section) in sections.into_iter().enumerate().take(rows) {
-            let row_y = y + index;
+        let scroll = self.scroll[bucket.index()];
+        for (display_index, (index, section)) in sections
+            .into_iter()
+            .enumerate()
+            .skip(scroll)
+            .take(rows)
+            .enumerate()
+        {
+            let row_y = y + display_index;
             let selected = bucket == self.focus && self.selected[bucket.index()] == index;
             let row_style = if selected {
                 self.theme.selected_style(
@@ -359,6 +391,9 @@ impl Component for StatuslineLayoutPanel {
         self.dialog.height = height;
         self.dialog.x = viewport_width.saturating_sub(width + 2) / 2;
         self.dialog.y = viewport_height.saturating_sub(height + 2) / 2;
+        for bucket in Bucket::ALL {
+            self.ensure_selection_visible(bucket);
+        }
         true
     }
 
@@ -450,21 +485,9 @@ fn panel_size(viewport_width: usize, viewport_height: usize) -> (usize, usize) {
 
 fn section_label(section: StatuslineSection, icon_style: PickerIconStyle) -> String {
     let icon = match section {
-        StatuslineSection::Mode => "N",
-        StatuslineSection::GitBranch => match icon_style {
-            PickerIconStyle::NerdFont => "",
-            PickerIconStyle::Unicode => "⑂",
-            PickerIconStyle::Ascii => "git",
-            PickerIconStyle::None => "",
-        },
         StatuslineSection::Filename => IconCatalog::file("src/editor.rs", icon_style).glyph,
         StatuslineSection::Syntax => IconCatalog::file("src/lib.rs", icon_style).glyph,
-        StatuslineSection::Position => match icon_style {
-            PickerIconStyle::NerdFont => "󰆤",
-            PickerIconStyle::Unicode => "⌖",
-            PickerIconStyle::Ascii => "pos",
-            PickerIconStyle::None => "",
-        },
+        _ => statusline_section_icon(section, icon_style),
     };
     if icon.is_empty() {
         section.label().to_string()
@@ -570,5 +593,23 @@ mod tests {
         assert!(narrow_text.contains("Left"));
         assert!(narrow_text.contains("Right"));
         assert!(narrow_text.contains("Cursor position"));
+    }
+
+    #[test]
+    fn repository_scrolls_to_keep_late_fields_visible() {
+        let editor = editor(100, 18);
+        let mut panel = StatuslineLayoutPanel::new(&editor);
+        assert_eq!(panel.focus, Bucket::Available);
+
+        for _ in 0..StatuslineSection::ALL.len() {
+            panel.handle_event(&key(KeyCode::Down));
+        }
+
+        let mut buffer = RenderBuffer::new(100, 18, &Style::default());
+        panel.draw(&mut buffer).unwrap();
+        let text = rendered_text(&buffer);
+
+        assert!(panel.scroll[Bucket::Available.index()] > 0);
+        assert!(text.contains("Clock"));
     }
 }
