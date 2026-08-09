@@ -26413,6 +26413,7 @@ builtin = "rust"
         assert!(!editor.force_full_redraw);
     }
 
+    #[cfg(unix)]
     #[test]
     fn terminal_cleanup_restores_cursor_after_leaving_alternate_screen() {
         let mut output = Vec::new();
