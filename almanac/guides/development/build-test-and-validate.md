@@ -15,6 +15,12 @@ sources:
   - id: plugin-check
     type: file
     path: .github/workflows/plugin-check.yml
+  - id: editor
+    type: file
+    path: src/editor.rs
+  - id: terminal-cleanup-session
+    type: conversation
+    path: /Users/fcoury/.codex/sessions/2026/08/08/rollout-2026-08-08T00-33-51-019fdf6f-2571-7d91-8f8d-8c7dc3fe8803.jsonl
 ---
 
 Use this guide when a Red change needs local confidence before review, push, or release preparation. A complete validation pass starts with the smallest command that matches the changed area, then finishes with the repository policy command for Rust changes, the relevant plugin or runtime self-checks, and any workflow-specific checks that CI will enforce [@agents] [@ci] [@plugin-check]. CI is the full contract, and the local commands here help catch the same classes of failure before waiting for GitHub Actions.
@@ -55,6 +61,17 @@ python3 -m unittest tests.test_discord_release
 ```
 
 The workflow lint job validates GitHub Actions, checks the README release version, and runs Discord announcement tests [@ci]. The CI `fmt`, `self-check`, and `perf` jobs respectively run rustfmt, `cargo run --locked -- --self-check`, and the release-mode Husk cursor benchmark with `--assert` [@ci]. For the details of the CI surface, see [CI And Validation](../../reference/validation/ci-and-validation); for the runtime diagnostic itself, see [Self Check](../../reference/runtime/self-check).
+
+## Handle Terminal Output Tests
+
+Tests that assert exact terminal escape bytes are platform-sensitive. The
+terminal cleanup regression writes `Editor::restore_terminal_output` into a byte
+buffer and searches for the alternate-screen exit plus cursor-show sequence,
+which matches the Unix ANSI writer path [@editor]. A Windows cleanup session
+found that crossterm uses Windows console APIs for those commands, so byte
+buffers do not exercise the same behavior there; guard byte-sequence assertions
+to Unix or split them into platform-specific checks, then let the Windows CI job
+execute the Windows backend [@terminal-cleanup-session] [@ci].
 
 ## Validate Bundled Husk And Plugin Changes
 
