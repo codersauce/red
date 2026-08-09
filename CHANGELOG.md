@@ -2,6 +2,64 @@
 
 All notable changes to Red are documented in this file.
 
+## [0.4.0](https://github.com/codersauce/red/compare/v0.3.0...v0.4.0)
+
+### Features
+
+- **keymap:** Add statusline and plugin shortcuts ([a1fb15c](https://github.com/codersauce/red/commit/a1fb15c815ef472049e6bb385a2edb11877d6657))
+- **statusline:** Add configurable layout and field catalog ([#178](https://github.com/codersauce/red/issues/178)) ([bf6f82f](https://github.com/codersauce/red/commit/bf6f82fea09617769830c43d56ca2fa63025a59b))
+- **editor:** Refresh splash screen copy ([dd3b1e4](https://github.com/codersauce/red/commit/dd3b1e4f19e210083b796b50bc33fe2eb90edc3e))
+- **languages:** Support static injections and incremental validation ([049cf21](https://github.com/codersauce/red/commit/049cf212c4235c860b7affec78386529420fb8d2))
+- **languages:** Redesign language pack manager ([#175](https://github.com/codersauce/red/issues/175)) ([b1baf5e](https://github.com/codersauce/red/commit/b1baf5e10bb010edb7425ce808329facba27d365))
+- **languages:** Add curated pack catalog ([#174](https://github.com/codersauce/red/issues/174)) ([6a40f85](https://github.com/codersauce/red/commit/6a40f8595849cae859e55a19cfeff643745df87c))
+- **languages:** Identify standalone language packages ([e9cd71f](https://github.com/codersauce/red/commit/e9cd71f26401b959c4cfdbff53e60d1aa1fe291d))
+- **languages:** Support extensible syntax and language servers ([3e66142](https://github.com/codersauce/red/commit/3e66142c09921164161e3388f75323559539878c))
+- **editor:** Match Neovim line number behavior ([#172](https://github.com/codersauce/red/issues/172)) ([37e0e40](https://github.com/codersauce/red/commit/37e0e409d486cb23dd3caef74f3d38be71515b5c))
+- **editor:** Add relative line numbers ([#171](https://github.com/codersauce/red/issues/171)) ([1d3637d](https://github.com/codersauce/red/commit/1d3637d69e79575fbacbac6c66682bebccba23c5))
+- **plugins:** Decode host payloads into native husk types ([dd05341](https://github.com/codersauce/red/commit/dd05341dc3b3fae758d82ae027a4ac88b1df3903))
+- **plugins:** Complete declarative plugin authoring ([e614f8d](https://github.com/codersauce/red/commit/e614f8d4ea3a61b5f5928927b3a60c55abe5680d))
+- **husk:** Add declarative plugin command and event attributes ([2eb4630](https://github.com/codersauce/red/commit/2eb4630262aab9fc96411a4ea66ee2f1921ae57f))
+- **fish:** Add syntax highlighting and language server support ([#170](https://github.com/codersauce/red/issues/170)) ([4328b5c](https://github.com/codersauce/red/commit/4328b5c73fb2909f0388267205a927da0e0a88e4))
+
+### Bug Fixes
+
+- **editor:** Restore terminal cursor visibility on exit ([56e4862](https://github.com/codersauce/red/commit/56e4862f27e1b14445257bbfd1b6975866d32217))
+- **language-packs:** Accept supported host API versions ([#177](https://github.com/codersauce/red/issues/177)) ([9c27f7c](https://github.com/codersauce/red/commit/9c27f7c52be4315e872d88653e5361b0ab89ffd9))
+- **editor:** Make global hotkeys work from panels ([#160](https://github.com/codersauce/red/issues/160)) ([931b7a0](https://github.com/codersauce/red/commit/931b7a02f5d864f5631da3cefc77aeacb1248c85))
+- **languages:** Harden downloads and make reload rollback safe ([9908565](https://github.com/codersauce/red/commit/9908565f1e42e5d107046c61b05350185411497c))
+- **languages:** Make package approval and server reloads robust ([4f20924](https://github.com/codersauce/red/commit/4f20924a9974c08f148e28736bee898c5f64d50b))
+- **languages:** Harden grammar trust and route reloads ([267a070](https://github.com/codersauce/red/commit/267a070a4084ea2643904e3ec82240f9b1980f10))
+- **languages:** Address trust and reload review feedback ([e273d93](https://github.com/codersauce/red/commit/e273d93a7bcbd7b8dfa9ab92f0a5b0ebf88d46e1))
+
+### Refactoring
+
+- **plugins:** Replace dynamic workspace and progress payloads ([4cc2b2a](https://github.com/codersauce/red/commit/4cc2b2ae04cacdd007d25b8576d693a1a8ffe6ab))
+- **plugins:** Migrate bundled plugins to typed state ([895e29c](https://github.com/codersauce/red/commit/895e29c1b1019e1df3d5d8d356c81e2cf0019d21))
+- **plugins:** Replace dynamic json with typed models ([7a16ec8](https://github.com/codersauce/red/commit/7a16ec81642ff2a6f4e02119113f48b8a37f03a4))
+
+### Testing
+
+- **editor:** Update global leader expectations ([e7feb7a](https://github.com/codersauce/red/commit/e7feb7aa776b1444bae0756110d1d3cd3c92afd4))
+- **editor:** Gate terminal cleanup bytes to Unix ([3952f58](https://github.com/codersauce/red/commit/3952f587ea14cd940e9d70933a93056792b041d8))
+
+### Maintenance
+
+- **repo:** Rename default branch references ([53338f0](https://github.com/codersauce/red/commit/53338f02743f12db3797805af55a7dfac3dfce48))
+
+### Other
+
+- Improve Git commit editor workflow ([#179](https://github.com/codersauce/red/issues/179)) ([8d1342b](https://github.com/codersauce/red/commit/8d1342bcc7f7299fa3be3262a6fd04e53f84fa1d))
+- Update main branch release guidance ([e31544e](https://github.com/codersauce/red/commit/e31544e8ed354a73b328ac02ed874b8ea2d2b9f0))
+- Document terminal output test portability ([ac17c39](https://github.com/codersauce/red/commit/ac17c391284f969857f420d2c9493e2ff460a573))
+- Improve wiki graph navigation ([de2d52d](https://github.com/codersauce/red/commit/de2d52dcd4796788ae840e23c571d97eaf48d7d2))
+- Document Rio cursor trail rendering gotcha ([e9d5512](https://github.com/codersauce/red/commit/e9d55120ec7149a0eb0d46afd40311a6452d09af))
+- Refresh host api compatibility ([577a01b](https://github.com/codersauce/red/commit/577a01bb4f2fe8d7c096317b1c321941d2f42788))
+- Improve wiki graph routing ([06f38ec](https://github.com/codersauce/red/commit/06f38ec5709f25eb0a363423862b43f44d88f4f8))
+- Document arborium language-pack source ([9bf51ee](https://github.com/codersauce/red/commit/9bf51eef57ba2850324161ecd8aba142d2bbea97))
+- Add agent architecture hub ([f2f4222](https://github.com/codersauce/red/commit/f2f422276fdc6dc0b4aeb30ad1e609dd646d14ea))
+- Capture language pack review constraints ([7d9a5dc](https://github.com/codersauce/red/commit/7d9a5dcdacb2f75801c94d88246d457eaf7d21d1))
+- Record language pack distribution decision ([a508437](https://github.com/codersauce/red/commit/a5084370e9031aa101dab13c86f72e50eba6ce2f))
+
 ## [0.3.0](https://github.com/codersauce/red/compare/v0.2.4...v0.3.0)
 
 ### Features
