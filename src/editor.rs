@@ -1287,6 +1287,8 @@ pub enum PluginRequest {
         request_id: RequestId,
         name: String,
         text: String,
+        submit_command: Option<String>,
+        cancel_command: Option<String>,
     },
     CloseScratchBuffer {
         buffer_index: usize,
@@ -2343,6 +2345,9 @@ pub struct Editor {
     /// Domain sub-controller managing open buffers and tab selection.
     buffer_manager: buffer_manager::BufferManager,
 
+    /// Plugin-owned scratch buffers and the commands that finish their workflows.
+    scratch_buffers: HashMap<BufferId, ScratchBufferCommands>,
+
     /// Domain sub-controller managing session recovery and snapshots
     session_manager: session_manager::SessionManager,
 
@@ -3116,6 +3121,12 @@ struct PendingLspFormatSave {
     previous_file: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ScratchBufferCommands {
+    submit: Option<String>,
+    cancel: Option<String>,
+}
+
 enum FormatOnSaveRequest {
     Pending,
     Save { warning: Option<String> },
@@ -3675,6 +3686,7 @@ impl Editor {
 
         Ok(Editor {
             buffer_manager,
+            scratch_buffers: HashMap::new(),
             session_manager,
             lsp_coordinator,
             agent_manager,
@@ -7779,9 +7791,18 @@ impl Editor {
                     request_id,
                     name,
                     text,
+                    submit_command,
+                    cancel_command,
                 } => {
-                    self.buffer_manager
-                        .push_buffer(Buffer::new(Some(name), text));
+                    let scratch_buffer = Buffer::new(Some(name), text);
+                    self.scratch_buffers.insert(
+                        scratch_buffer.id(),
+                        ScratchBufferCommands {
+                            submit: submit_command,
+                            cancel: cancel_command,
+                        },
+                    );
+                    self.buffer_manager.push_buffer(scratch_buffer);
                     let buffer_index = self.buffer_manager.len() - 1;
                     self.set_current_buffer(buffer, buffer_index).await?;
                     self.plugin_registry
@@ -11301,6 +11322,17 @@ impl Editor {
         self.repeater = None;
         self.last_error = None;
 
+        if let Some(commands) = self.scratch_buffers.get(&self.current_buffer().id()) {
+            let routed = match cmd.trim() {
+                "w" | "w!" | "write" | "write!" | "wq" | "wq!" => commands.submit.as_ref(),
+                "q" | "q!" | "quit" | "quit!" => commands.cancel.as_ref(),
+                _ => None,
+            };
+            if let Some(command) = routed {
+                return vec![Action::PluginCommand(command.clone())];
+            }
+        }
+
         if let Ok(line) = cmd.parse::<usize>() {
             return vec![Action::GoToLine(line)];
         }
@@ -14177,18 +14209,27 @@ impl Editor {
 
         match action {
             Action::Quit(force) => {
-                if *force {
-                    return Ok(true);
+                let scratch_command = self
+                    .scratch_buffers
+                    .get(&self.current_buffer().id())
+                    .and_then(|commands| commands.cancel.clone());
+                if let Some(command) = scratch_command {
+                    add_to_history = false;
+                    self.plugin_registry.execute(runtime, &command).await?;
+                } else {
+                    if *force {
+                        return Ok(true);
+                    }
+                    let modified_buffers = self.modified_buffers();
+                    if modified_buffers.is_empty() {
+                        return Ok(true);
+                    }
+                    self.last_error = Some(format!(
+                        "The following buffers have unwritten changes: {}",
+                        modified_buffers.join(", ")
+                    ));
+                    return Ok(false);
                 }
-                let modified_buffers = self.modified_buffers();
-                if modified_buffers.is_empty() {
-                    return Ok(true);
-                }
-                self.last_error = Some(format!(
-                    "The following buffers have unwritten changes: {}",
-                    modified_buffers.join(", ")
-                ));
-                return Ok(false);
             }
             Action::MoveUp => {
                 if self.cy == 0 {
@@ -16570,6 +16611,14 @@ impl Editor {
                 }
             }
             Action::Save => {
+                let scratch_command = self
+                    .scratch_buffers
+                    .get(&self.current_buffer().id())
+                    .and_then(|commands| commands.submit.clone());
+                if let Some(command) = scratch_command {
+                    self.plugin_registry.execute(runtime, &command).await?;
+                    return Ok(false);
+                }
                 let resume_insert_transaction = self.commit_active_transaction_before_save();
                 let format_warning = if self.config.lsp.format_on_save {
                     let request = self.request_format_on_save(None).await;
@@ -16619,6 +16668,15 @@ impl Editor {
                 }
             }
             Action::SaveAs(new_file_name) => {
+                if self
+                    .scratch_buffers
+                    .contains_key(&self.current_buffer().id())
+                {
+                    self.last_error = Some(
+                        "Scratch buffers cannot be written to disk; use :w to submit".to_string(),
+                    );
+                    return Ok(false);
+                }
                 let previous_uri = self.current_buffer().uri()?;
                 let previous_file = self.current_buffer().file.clone();
                 let resume_insert_transaction = self.commit_active_transaction_before_save();
@@ -18526,6 +18584,7 @@ impl Editor {
 
         self.sync_to_window();
         let removed_id = self.current_buffer().id();
+        self.scratch_buffers.remove(&removed_id);
         let removed_uri = self.current_buffer().uri()?;
         if let Some(uri) = removed_uri.as_deref() {
             let still_open = self
@@ -24067,6 +24126,32 @@ builtin = "rust"
         );
         assert!(editor.handle_command("plugins extra", &runtime).is_empty());
         assert_eq!(editor.last_error.as_deref(), Some("usage: plugins"));
+    }
+
+    #[test]
+    fn managed_scratch_buffers_route_write_and_quit_commands_to_their_owner() {
+        let mut editor = test_editor(40, 10);
+        let runtime = Runtime::new();
+        editor.scratch_buffers.insert(
+            editor.current_buffer().id(),
+            ScratchBufferCommands {
+                submit: Some("SubmitScratch".to_string()),
+                cancel: Some("CancelScratch".to_string()),
+            },
+        );
+
+        for command in ["w", "write", "wq", "wq!"] {
+            assert_eq!(
+                editor.handle_command(command, &runtime),
+                vec![Action::PluginCommand("SubmitScratch".to_string())]
+            );
+        }
+        for command in ["q", "q!", "quit"] {
+            assert_eq!(
+                editor.handle_command(command, &runtime),
+                vec![Action::PluginCommand("CancelScratch".to_string())]
+            );
+        }
     }
 
     #[tokio::test]

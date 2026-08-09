@@ -1,6 +1,12 @@
 {
-  "api_version": "0.7.0",
+  "api_version": "0.8.0",
   "changes": [
+    {
+      "version": "0.8.0",
+      "kind": "introduced",
+      "symbols": ["OpenScratchBuffer.commands"],
+      "migration_note": "docs/PLUGIN_API.md#scratch-buffer-workflows"
+    },
     {
       "version": "0.7.0",
       "kind": "introduced",

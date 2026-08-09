@@ -141,6 +141,11 @@ struct GitScratchOpenedEvent {
     buffer_index: i32,
 }
 
+struct ScratchBufferOptions {
+    submit: String,
+    cancel: String,
+}
+
 struct GitRestoreResult {
     restored: bool,
     warnings: [String],
@@ -248,6 +253,9 @@ struct GitPluginState {
     commit_snapshot: Json,
     commit_buffer: i32,
     commit_retry_text: String,
+    commit_draft_text: String,
+    commit_context_process: String,
+    commit_context_output: String,
     signs: [GitGutterSign],
     sign_jobs: [SignJob],
     prompt_kind: String,
@@ -335,6 +343,9 @@ fn initial_state() -> GitPluginState {
         commit_snapshot: red::null(),
         commit_buffer: -1,
         commit_retry_text: "",
+        commit_draft_text: "",
+        commit_context_process: "",
+        commit_context_output: "",
         signs: [],
         sign_jobs: [],
         prompt_kind: "",
@@ -2557,7 +2568,51 @@ fn commit_snapshot_loaded(snapshot: Json) {
     red::state_patch(GitPluginState { commit_snapshot: snapshot });
     let text = red::string(plugin_state().commit_retry_text, "");
     red::state_patch(GitPluginState { commit_retry_text: "" });
-    red::request("OpenScratchBuffer", commit_scratch_opened, "[Git Commit].gitcommit", text);
+    red::state_patch(GitPluginState { commit_draft_text: text });
+    red::state_patch(GitPluginState { commit_context_output: "" });
+    let process_id = red::execute("SpawnProcess", Process {
+        command: "git",
+        args: ["diff", "--cached", "--stat", "--patch", "--no-ext-diff", "--color=never"],
+        env: Json { GIT_PAGER: "cat", LC_ALL: "C" },
+        raw_output: true,
+        cwd: red::string(plugin_state().root, "."),
+    });
+    red::state_patch(GitPluginState { commit_context_process: process_id });
+    red::on("process:" + process_id, commit_context_event);
+}
+
+fn commit_context_event(event: ProcessEvent) {
+    match event {
+        ProcessEvent::Stdout { process_id, line, plugin_name } => {
+            if process_id == plugin_state().commit_context_process {
+                red::state_patch(GitPluginState {
+                    commit_context_output: plugin_state().commit_context_output + line,
+                });
+            }
+        }
+        ProcessEvent::Exit { process_id, code, plugin_name } => finish_commit_context(process_id),
+        ProcessEvent::Error { process_id, message, plugin_name } => finish_commit_context(process_id),
+        ProcessEvent::Stderr { process_id, line, plugin_name } => {}
+    }
+}
+
+fn finish_commit_context(process_id: String) {
+    if process_id != plugin_state().commit_context_process {
+        return;
+    }
+    red::state_patch(GitPluginState { commit_context_process: "" });
+    let text = commit_editor_text(
+        red::string(plugin_state().commit_draft_text, ""),
+        red::string(plugin_state().commit_context_output, "")
+    );
+    red::state_patch(GitPluginState { commit_draft_text: "" });
+    red::request(
+        "OpenScratchBuffer",
+        commit_scratch_opened,
+        "[Git Commit].gitcommit",
+        text,
+        ScratchBufferOptions { submit: "GitSubmitMessage", cancel: "GitCancelMessage" }
+    );
 }
 
 fn commit_scratch_opened(event: GitScratchOpenedEvent) {
@@ -2590,7 +2645,7 @@ fn finish_commit_scratch(submit: bool, text: String) {
     }
     red::state_patch(GitPluginState { commit_buffer: -1 });
     if submit {
-        let message = red::trim(text);
+        let message = commit_message(text);
         if message != "" {
             let mode = red::string(plugin_state().commit_mode, "");
             if mode == "amend" {
@@ -2600,6 +2655,78 @@ fn finish_commit_scratch(submit: bool, text: String) {
             }
         }
     }
+}
+
+fn commit_context_marker() -> String {
+    return "# --- Red commit context (not part of the commit message) ---";
+}
+
+fn commit_message(text: String) -> String {
+    let message_lines = [];
+    for line in red::split(text, "\n") {
+        if line == commit_context_marker() {
+            break;
+        }
+        message_lines = red::push(message_lines, line);
+    }
+    return red::trim(red::join(message_lines, "\n"));
+}
+
+fn commit_editor_text(message: String, staged_diff: String) -> String {
+    let text = message;
+    if text != "" && !red::ends_with(text, "\n") {
+        text = text + "\n";
+    }
+    text = text + "\n" + commit_context_marker() + "\n";
+    text = text + "# Write the commit message above. :w or :wq submits; :q cancels.\n#\n";
+
+    let state = plugin_state().state;
+    let branch = red::string(state.head, "");
+    if branch != "" {
+        text = text + "# On branch " + branch + "\n";
+    }
+    text = append_commit_status(text, "Changes to be committed", state.staged);
+    text = append_commit_status(text, "Changes not staged for commit", state.unstaged);
+    text = append_commit_status(text, "Unmerged paths", state.conflicted);
+    text = append_commit_status(text, "Untracked files", state.untracked);
+
+    if red::trim(staged_diff) != "" {
+        text = text + "#\n# Staged diff:\n#\n" + commented_diff(staged_diff);
+    }
+    return text;
+}
+
+fn append_commit_status(text: String, title: String, entries: [GitEntry]) -> String {
+    if red::len(entries) == 0 {
+        return text;
+    }
+    text = text + "#\n# " + title + ":\n#\n";
+    for entry in entries {
+        let status = red::string(entry.x, "?");
+        if status == " " || status == "?" {
+            status = red::string(entry.y, "?");
+        }
+        let path = entry.path;
+        if let Some(original) = entry.original_path {
+            path = original + " -> " + path;
+        }
+        text = text + "#   " + status + "  " + path + "\n";
+    }
+    return text;
+}
+
+fn commented_diff(diff: String) -> String {
+    let commented = [];
+    let lines = red::split(diff, "\n");
+    let index = 0;
+    while index < red::len(lines) && index < 2000 {
+        commented = red::push(commented, "# " + lines[index]);
+        index = index + 1;
+    }
+    if index < red::len(lines) {
+        commented = red::push(commented, "# … staged diff truncated after 2000 lines");
+    }
+    return red::join(commented, "\n") + "\n";
 }
 
 fn run_commit(mode: String, message: String) {
