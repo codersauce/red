@@ -19,7 +19,7 @@ sources:
 
 The sample/default file says user configuration is read from `$XDG_CONFIG_HOME/red/config.toml` or `$HOME/.config/red/config.toml` [@defaults]. The code computes the same config directory, preferring a non-empty `XDG_CONFIG_HOME` and otherwise using `$HOME/.config/red` [@config]. Runtime paths such as logs, preferences, sessions, plugins, and themes are resolved below that directory unless a setting explicitly uses an absolute or expanded path [@config].
 
-The top-level schema accepts keys for editor behavior, keymaps, theme, cursor, plugins, disabled plugins, plugin permissions, plugin config, logging, search, picker, key hints, clipboard, LSP, commenting, matchit, AI, diagnostics, and ASCII window borders [@config]. Unknown top-level fields are ignored with diagnostics during recoverable user loading rather than becoming part of the effective configuration [@config].
+The top-level schema accepts keys for editor behavior, keymaps, theme, cursor, plugins, disabled plugins, plugin permissions, plugin config, logging, search, picker, statusline, key hints, clipboard, LSP, commenting, matchit, AI, diagnostics, and ASCII window borders [@config]. Unknown top-level fields are ignored with diagnostics during recoverable user loading rather than becoming part of the effective configuration [@config].
 
 ## Top-Level Defaults
 
@@ -39,13 +39,15 @@ The top-level schema accepts keys for editor behavior, keymaps, theme, cursor, p
 
 `show_diagnostics` defaults to true in code, and `window_borders_ascii` defaults to false [@config]. These fields are accepted user-facing top-level fields even though the shipped default file leaves `show_diagnostics` commented [@defaults] [@config].
 
-## Search, Picker, Key Hints, Clipboard, And Cursor
+## Search, Picker, Statusline, Key Hints, Clipboard, And Cursor
 
 | Section | Defaults |
 | --- | --- |
 | `[search]` | `incsearch = true`, `hlsearch = true`, `wrapscan = true`, `ignorecase = false`, `smartcase = false` [@defaults] [@config]. |
 | `[picker]` | `input_position = "bottom"` [@defaults] [@config]. |
 | `[picker.icons]` | `style = "nerd_font"`, `color = true`; code also accepts `unicode`, `ascii`, and `none` icon styles [@defaults] [@config]. |
+| `[statusline]` | `left = ["mode", "git_branch", "filename"]`, `right = ["position", "syntax"]`; the configuration schema lets all 25 statusline sections move between sides [@defaults] [@config]. |
+| `[statusline.icons]` | `style = "nerd_font"`, `color = true`; the same `unicode`, `ascii`, and `none` icon styles are accepted for statusline icons [@defaults] [@config]. |
 | `[key_hints]` | `enabled = true`, `delay_ms = 250` [@defaults] [@config]. |
 | `[clipboard]` | Defaults are enabled, sync on yank, and sync on paste when omitted [@config]. |
 | `[cursor]` | normal, command, search, visual, visual-line, and visual-block use `default`; insert uses `steady_bar`; waiting uses `steady_underscore` [@defaults] [@config]. |
@@ -56,7 +58,7 @@ Supported cursor shapes are `default`, `blinking_block`, `steady_block`, `blinki
 
 Every editor mode has its own key table under `[keys.<mode>]` [@defaults]. A binding can be an action string, a list of actions, a nested chord table, or a plugin command such as `{ PluginCommand = "BufferPicker" }` [@defaults]. The default normal-mode map includes Vim-style motion and editing keys, command/search entry through `:` and `/`, file and command pickers through `Ctrl-p`, `Ctrl-Shift-p`, `Alt-x`, and `F1`, and plugin commands for buffers, project search, theme browser, Git, LSP symbols, and the agent [@defaults].
 
-The default Space and `Ctrl-w` prefixes are dense command neighborhoods. Space opens buffer, project search, theme, LSP, Git, hunk, code-action, rename, and agent workflows; `Ctrl-w` owns window focus, movement, splits, closing, balancing, maximizing, and only-window behavior [@defaults].
+The default Space and `Ctrl-w` prefixes are dense command neighborhoods. Space opens buffer, plugin listing, project search, theme, LSP, Git, hunk, statusline, code-action, rename, and agent workflows; `Ctrl-w` owns window focus, movement, splits, closing, balancing, maximizing, and only-window behavior [@defaults].
 
 ## Plugins, Plugin Config, And Permissions
 
