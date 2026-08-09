@@ -79,13 +79,13 @@ input_position = "bottom"
 style = "nerd_font"
 color = true
 
-# Status-line sections may be reordered, moved between sides, or omitted.
+# Sections are ordered from the outer edge toward the center on both sides.
+# Run :statusline to arrange them in a terminal panel with a live preview.
 # Available sections: mode, git_branch, filename, syntax, and position.
-# Context sections use a middle shade derived from the active theme, while
-# mode and position retain the stronger accent color.
+# The first three positions use the theme's accent, middle, and base shades.
 [statusline]
 left = ["mode", "git_branch", "filename"]
-right = ["syntax", "position"]
+right = ["position", "syntax"]
 
 # Nerd Font icons match nvim-web-devicons. "unicode" and "ascii" are
 # portable fallbacks; "none" keeps the labels while hiding their icons.

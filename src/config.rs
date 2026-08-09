@@ -404,7 +404,7 @@ fn default_statusline_left() -> Vec<StatuslineSection> {
 }
 
 fn default_statusline_right() -> Vec<StatuslineSection> {
-    vec![StatuslineSection::Syntax, StatuslineSection::Position]
+    vec![StatuslineSection::Position, StatuslineSection::Syntax]
 }
 
 /// A piece of editor context that can be placed on either status-line side.
@@ -416,6 +416,38 @@ pub enum StatuslineSection {
     Filename,
     Syntax,
     Position,
+}
+
+impl StatuslineSection {
+    pub const ALL: [Self; 5] = [
+        Self::Mode,
+        Self::GitBranch,
+        Self::Filename,
+        Self::Syntax,
+        Self::Position,
+    ];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mode => "mode",
+            Self::GitBranch => "git_branch",
+            Self::Filename => "filename",
+            Self::Syntax => "syntax",
+            Self::Position => "position",
+        }
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mode => "Mode",
+            Self::GitBranch => "Git branch",
+            Self::Filename => "Filename",
+            Self::Syntax => "Syntax",
+            Self::Position => "Cursor position",
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
@@ -1446,6 +1478,21 @@ impl Config {
         Ok(())
     }
 
+    /// Persists the status-line table without rewriting unrelated user configuration.
+    pub fn persist_statusline(statusline: &StatuslineConfig) -> anyhow::Result<()> {
+        let config_path = Self::path("config.toml");
+        let contents = match fs::read_to_string(&config_path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error.into()),
+        };
+        fs::write(
+            config_path,
+            update_statusline_config_contents(&contents, statusline)?,
+        )?;
+        Ok(())
+    }
+
     /// Resolves a plugin path or bundled-plugin specifier for runtime loading.
     pub fn resolve_plugin_path(configured_path: &str) -> String {
         let configured = PathBuf::from(configured_path);
@@ -2289,6 +2336,44 @@ fn update_theme_config_contents(contents: &str, theme_name: &str) -> anyhow::Res
     Ok(updated)
 }
 
+fn update_statusline_config_contents(
+    contents: &str,
+    statusline: &StatuslineConfig,
+) -> anyhow::Result<String> {
+    use toml_edit::{Array, DocumentMut, Item, Table, Value as EditValue};
+
+    let mut document = if contents.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        contents
+            .parse::<DocumentMut>()
+            .map_err(|error| anyhow::anyhow!("could not update config.toml: {error}"))?
+    };
+    let section_array = |sections: &[StatuslineSection]| {
+        let mut array = Array::new();
+        for section in sections {
+            array.push(section.as_str());
+        }
+        array
+    };
+
+    let mut table = Table::new();
+    table["left"] = Item::Value(EditValue::Array(section_array(&statusline.left)));
+    table["right"] = Item::Value(EditValue::Array(section_array(&statusline.right)));
+    let mut icons = Table::new();
+    icons["style"] = toml_edit::value(match statusline.icons.style {
+        PickerIconStyle::Unicode => "unicode",
+        PickerIconStyle::NerdFont => "nerd_font",
+        PickerIconStyle::Ascii => "ascii",
+        PickerIconStyle::None => "none",
+    });
+    icons["color"] = toml_edit::value(statusline.icons.color);
+    table["icons"] = Item::Table(icons);
+    document["statusline"] = Item::Table(table);
+
+    Ok(document.to_string())
+}
+
 fn is_theme_assignment(line: &str) -> bool {
     let line = line.trim_start();
     if line.starts_with('#') {
@@ -2718,6 +2803,58 @@ theme = "kanso-zen.json"
     }
 
     #[test]
+    fn update_statusline_config_preserves_unrelated_settings_and_comments() {
+        let contents = r#"# keep this comment
+theme = "mocha.json"
+
+[statusline]
+left = ["filename"]
+right = ["position"]
+
+[statusline.icons]
+style = "ascii"
+color = false
+
+[keys.normal]
+"x" = "DeleteChar"
+"#;
+        let statusline = StatuslineConfig {
+            left: vec![StatuslineSection::Mode, StatuslineSection::Filename],
+            right: vec![StatuslineSection::Syntax, StatuslineSection::Position],
+            icons: PickerIconsConfig {
+                style: PickerIconStyle::Unicode,
+                color: true,
+            },
+        };
+
+        let updated = update_statusline_config_contents(contents, &statusline).unwrap();
+        let value = updated.parse::<toml::Value>().unwrap();
+
+        assert!(updated.contains("# keep this comment"));
+        assert!(updated.contains("[keys.normal]"));
+        assert!(updated.contains(r#""x" = "DeleteChar""#));
+        assert_eq!(
+            value["statusline"]["left"].as_array().unwrap(),
+            &vec!["mode".into(), "filename".into()]
+        );
+        assert_eq!(
+            value["statusline"]["icons"]["style"].as_str(),
+            Some("unicode")
+        );
+        assert_eq!(value["statusline"]["icons"]["color"].as_bool(), Some(true));
+        assert_eq!(updated.matches("[statusline]").count(), 1);
+    }
+
+    #[test]
+    fn update_statusline_config_refuses_to_overwrite_malformed_toml() {
+        let error =
+            update_statusline_config_contents("[statusline\n", &StatuslineConfig::default())
+                .unwrap_err();
+
+        assert!(error.to_string().contains("could not update config.toml"));
+    }
+
+    #[test]
     fn test_lsp_config_defaults_to_rust() {
         let config: Config = toml::from_str(
             r#"
@@ -2999,7 +3136,7 @@ input_position = "top"
         );
         assert_eq!(
             config.statusline.right,
-            [StatuslineSection::Syntax, StatuslineSection::Position]
+            [StatuslineSection::Position, StatuslineSection::Syntax]
         );
         assert_eq!(config.statusline.icons.style, PickerIconStyle::NerdFont);
         assert!(config.statusline.icons.color);

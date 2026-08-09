@@ -79,7 +79,10 @@ use crate::{
     color::Color,
     command, command_palette,
     comment::CommentSyntax,
-    config::{Config, ConfigDiagnostic, ConfigDiagnosticSource, ConfigRecovery, KeyAction},
+    config::{
+        Config, ConfigDiagnostic, ConfigDiagnosticSource, ConfigRecovery, KeyAction,
+        StatuslineConfig,
+    },
     dispatcher::Dispatcher,
     highlighter::{Highlighter, LanguageRegistry},
     log,
@@ -106,7 +109,7 @@ use crate::{
     ui::{
         AgentComposer, CompletionUI, Component, Confirmation, FilePicker, HoverInfo,
         HoverInfoFormat, Info, InputPrompt, LegacyPickerOptions, Picker, PickerItem, PickerOptions,
-        PickerPreview, PickerUpdate,
+        PickerPreview, PickerUpdate, StatuslineLayoutPanel,
     },
     undo::{AppliedTextEdit, CursorSnapshot, EditOrigin, RevertEdit, TextPosition, TextRange},
     utils::{expand_user_path, get_workspace_path},
@@ -1931,6 +1934,10 @@ pub enum Action {
     CommandPalette,
     OpenSyntaxPicker,
     SetSyntax(String),
+    OpenStatuslineManager,
+    PreviewStatuslineLayout(StatuslineConfig),
+    SaveStatuslineLayout(StatuslineConfig),
+    CancelStatuslineLayout(StatuslineConfig),
     ConfigDiagnostics,
     ReloadLanguages,
     ShowDialog,
@@ -4493,6 +4500,10 @@ impl Editor {
 
     pub(crate) fn picker_icons(&self) -> crate::config::PickerIconsConfig {
         self.config.picker.icons
+    }
+
+    pub(crate) fn statusline_config(&self) -> &StatuslineConfig {
+        &self.config.statusline
     }
 
     /// Window-aware coordinate transformation methods
@@ -11124,6 +11135,7 @@ impl Editor {
             Action::EnterMode(Mode::Command | Mode::Search)
             | Action::FilePicker
             | Action::CommandPalette
+            | Action::OpenStatuslineManager
             | Action::ConfigDiagnostics
             | Action::Suspend
             | Action::ViewLogs
@@ -11580,6 +11592,10 @@ impl Editor {
 
             if cmd == "nowrap" {
                 actions.push(Action::SetWrap(false));
+            }
+
+            if cmd == "statusline" {
+                actions.push(Action::OpenStatuslineManager);
             }
         }
         actions
@@ -17045,6 +17061,41 @@ impl Editor {
                 self.bracket_match_cache = None;
                 self.force_full_redraw = true;
                 self.last_error = Some(format!("syntax: {label}"));
+                self.render(buffer)?;
+            }
+            Action::OpenStatuslineManager => {
+                self.release_current_dialog_callbacks(runtime);
+                self.current_dialog = Some(Box::new(StatuslineLayoutPanel::new(self)));
+                self.render(buffer)?;
+            }
+            Action::PreviewStatuslineLayout(statusline) => {
+                add_to_history = false;
+                self.config.statusline = statusline.clone();
+                self.force_full_redraw = true;
+                self.render(buffer)?;
+            }
+            Action::SaveStatuslineLayout(statusline) => {
+                add_to_history = false;
+                match Config::persist_statusline(statusline) {
+                    Ok(()) => {
+                        self.config.statusline = statusline.clone();
+                        self.current_dialog = None;
+                        self.last_error = Some("saved status-line layout".to_string());
+                    }
+                    Err(error) => {
+                        self.last_error =
+                            Some(format!("could not save status-line layout: {error}"));
+                    }
+                }
+                self.force_full_redraw = true;
+                self.render(buffer)?;
+            }
+            Action::CancelStatuslineLayout(statusline) => {
+                add_to_history = false;
+                self.config.statusline = statusline.clone();
+                self.current_dialog = None;
+                self.last_error = None;
+                self.force_full_redraw = true;
                 self.render(buffer)?;
             }
             Action::ConfigDiagnostics => {
@@ -24163,6 +24214,64 @@ builtin = "rust"
                 vec![Action::PluginCommand("CancelScratch".to_string())]
             );
         }
+    }
+
+    #[test]
+    fn statusline_colon_command_opens_the_manager() {
+        let mut editor = test_editor(40, 10);
+        let runtime = Runtime::new();
+
+        assert_eq!(
+            editor.handle_command("statusline", &runtime),
+            vec![Action::OpenStatuslineManager]
+        );
+    }
+
+    #[tokio::test]
+    async fn statusline_layout_panel_opens_previews_and_cancels_without_quitting() {
+        let mut editor = test_editor(80, 16);
+        let mut runtime = Runtime::new();
+        let mut buffer = RenderBuffer::new(80, 16, &Style::default());
+        let original = editor.config.statusline.clone();
+
+        let quit = editor
+            .execute(&Action::OpenStatuslineManager, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert!(!quit);
+        assert!(editor.current_dialog.is_some());
+        let frame = render_text_rows(&buffer).join("\n");
+        assert!(frame.contains("Statusline Layout"));
+        assert!(frame.contains("Available"));
+        assert!(frame.contains("Git branch"));
+
+        let mut preview = original.clone();
+        preview.left.swap(0, 1);
+
+        let quit = editor
+            .execute(
+                &Action::PreviewStatuslineLayout(preview.clone()),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        assert!(!quit);
+        assert_eq!(editor.config.statusline, preview);
+        assert!(editor.current_dialog.is_some());
+
+        editor
+            .execute(
+                &Action::CancelStatuslineLayout(original.clone()),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        assert_eq!(editor.config.statusline, original);
+        assert!(editor.current_dialog.is_none());
     }
 
     #[tokio::test]

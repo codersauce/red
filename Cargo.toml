@@ -93,6 +93,7 @@ tempfile = "3.15.0"
 thiserror = "1.0"
 tokio = { version = "1.41.0", features = ["full"] }
 toml = "0.8.23"
+toml_edit = "0.22.27"
 trash = "5.2.2"
 tree-sitter = "0.25"
 tree-sitter-language = "0.1.7"

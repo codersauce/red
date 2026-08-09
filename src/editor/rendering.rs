@@ -30,7 +30,7 @@ use crate::{
     lsp::Diagnostic,
     plugin::DecorationAnchor,
     splash,
-    theme::{SelectionForegroundPriority, Style},
+    theme::{SelectionForegroundPriority, Style, Theme},
     ui::IconCatalog,
     undo::TextPosition,
     unicode_utils::{
@@ -120,14 +120,12 @@ struct StatuslineContext {
 fn statusline_segment(
     section: StatuslineSection,
     context: &StatuslineContext,
-    base_style: &Style,
-    context_style: &Style,
-    prominent_style: &Style,
+    style: &Style,
     icon_style: PickerIconStyle,
     color_icons: bool,
 ) -> Option<StatuslineSegment> {
     let (text, style, icon) = match section {
-        StatuslineSection::Mode => (format!(" {} ", context.mode), prominent_style.clone(), None),
+        StatuslineSection::Mode => (format!(" {} ", context.mode), style.clone(), None),
         StatuslineSection::GitBranch => {
             let branch = context.git_branch.as_deref()?;
             let glyph = match icon_style {
@@ -136,15 +134,9 @@ fn statusline_segment(
                 PickerIconStyle::Ascii => "git",
                 PickerIconStyle::None => "",
             };
-            (
-                statusline_icon_label(glyph, branch),
-                context_style.clone(),
-                None,
-            )
+            (statusline_icon_label(glyph, branch), style.clone(), None)
         }
-        StatuslineSection::Filename => {
-            (format!(" {} ", context.filename), base_style.clone(), None)
-        }
+        StatuslineSection::Filename => (format!(" {} ", context.filename), style.clone(), None),
         StatuslineSection::Syntax => {
             let syntax = context.syntax.as_deref()?;
             let icon = IconCatalog::file(
@@ -160,11 +152,11 @@ fn statusline_segment(
                 });
             (
                 statusline_icon_label(icon.glyph, syntax),
-                context_style.clone(),
+                style.clone(),
                 icon_override,
             )
         }
-        StatuslineSection::Position => (context.position.clone(), prominent_style.clone(), None),
+        StatuslineSection::Position => (context.position.clone(), style.clone(), None),
     };
 
     Some(StatuslineSegment { text, style, icon })
@@ -175,6 +167,16 @@ fn statusline_icon_label(glyph: &str, label: &str) -> String {
         format!(" {label} ")
     } else {
         format!(" {glyph} {label} ")
+    }
+}
+
+pub(crate) fn statusline_slot_style(theme: &Theme, index: usize) -> Style {
+    let base = &theme.statusline_style.inner_style;
+    let prominent = &theme.statusline_style.outer_style;
+    match index {
+        0 => prominent.clone(),
+        1 => statusline_context_style(base, prominent),
+        _ => base.clone(),
     }
 }
 
@@ -2187,37 +2189,24 @@ impl Editor {
         };
 
         let base_style = self.theme.statusline_style.inner_style.clone();
-        let prominent_style = self.theme.statusline_style.outer_style.clone();
-        let context_style = statusline_context_style(&base_style, &prominent_style);
         let icons = self.config.statusline.icons;
         let left = left_sections
             .into_iter()
-            .filter_map(|section| {
-                statusline_segment(
-                    section,
-                    &context,
-                    &base_style,
-                    &context_style,
-                    &prominent_style,
-                    icons.style,
-                    icons.color,
-                )
+            .enumerate()
+            .filter_map(|(index, section)| {
+                let style = statusline_slot_style(&self.theme, index);
+                statusline_segment(section, &context, &style, icons.style, icons.color)
             })
             .collect::<Vec<_>>();
-        let right = right_sections
+        let mut right = right_sections
             .into_iter()
-            .filter_map(|section| {
-                statusline_segment(
-                    section,
-                    &context,
-                    &base_style,
-                    &context_style,
-                    &prominent_style,
-                    icons.style,
-                    icons.color,
-                )
+            .enumerate()
+            .filter_map(|(index, section)| {
+                let style = statusline_slot_style(&self.theme, index);
+                statusline_segment(section, &context, &style, icons.style, icons.color)
             })
             .collect::<Vec<_>>();
+        right.reverse();
 
         let left_separator = self.theme.statusline_style.outer_chars[1];
         let right_separator = self.theme.statusline_style.outer_chars[2];
@@ -2719,7 +2708,7 @@ mod tests {
     fn configurable_statusline_sections_render_in_the_requested_sides() {
         let mut config = Config::default();
         config.statusline.left = vec![StatuslineSection::Syntax, StatuslineSection::Mode];
-        config.statusline.right = vec![StatuslineSection::Filename, StatuslineSection::Position];
+        config.statusline.right = vec![StatuslineSection::Position, StatuslineSection::Filename];
         config.statusline.icons.style = PickerIconStyle::Ascii;
         let lsp = Box::new(LspManager::new(config.lsp.clone()));
         let source = Buffer::new(
@@ -2774,6 +2763,44 @@ mod tests {
     }
 
     #[test]
+    fn statusline_colors_are_assigned_by_edge_position() {
+        let mut theme = Theme::default();
+        theme.statusline_style.inner_style = Style {
+            fg: Some(Color::Rgb {
+                r: 220,
+                g: 220,
+                b: 220,
+            }),
+            bg: Some(Color::Rgb {
+                r: 20,
+                g: 30,
+                b: 40,
+            }),
+            ..Style::default()
+        };
+        theme.statusline_style.outer_style = Style {
+            fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
+            bg: Some(Color::Rgb {
+                r: 80,
+                g: 180,
+                b: 220,
+            }),
+            ..Style::default()
+        };
+
+        let edge = statusline_slot_style(&theme, 0);
+        let second = statusline_slot_style(&theme, 1);
+        let third = statusline_slot_style(&theme, 2);
+        let fourth = statusline_slot_style(&theme, 3);
+
+        assert_eq!(edge, theme.statusline_style.outer_style);
+        assert_ne!(second.bg, edge.bg);
+        assert_ne!(second.bg, third.bg);
+        assert_eq!(third, theme.statusline_style.inner_style);
+        assert_eq!(fourth, theme.statusline_style.inner_style);
+    }
+
+    #[test]
     fn git_branch_reads_regular_and_worktree_head_files() {
         let repository = tempfile::tempdir().unwrap();
         fs::create_dir(repository.path().join(".git")).unwrap();
@@ -2817,7 +2844,7 @@ mod tests {
     fn statusline_preserves_the_edge_position_on_a_narrow_terminal() {
         let mut config = Config::default();
         config.statusline.left = vec![StatuslineSection::Mode, StatuslineSection::Filename];
-        config.statusline.right = vec![StatuslineSection::Syntax, StatuslineSection::Position];
+        config.statusline.right = vec![StatuslineSection::Position, StatuslineSection::Syntax];
         let lsp = Box::new(LspManager::new(config.lsp.clone()));
         let source = Buffer::new(
             Some("config.toml".to_string()),
