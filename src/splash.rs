@@ -30,7 +30,7 @@ pub enum Role {
     Text,
     /// Horizontal rules.
     Rule,
-    /// The closing trust-model epigraph.
+    /// The closing product epigraph.
     Epigraph,
 }
 
@@ -118,7 +118,7 @@ fn full_block(version: &str) -> Vec<Line> {
     lines.push(Line::blank());
     lines.push(centered(&format!("red v{version}"), Role::Muted, width));
     lines.push(centered(
-        "the modal editor for the agent era",
+        "the editor that respects your muscle memory",
         Role::Muted,
         width,
     ));
@@ -135,12 +135,12 @@ fn full_block(version: &str) -> Vec<Line> {
     lines.push(Line::new(vec![span("─".repeat(width), Role::Rule)]));
     lines.push(Line::blank());
     lines.push(centered(
-        "every agent edit is a proposal —",
+        "everything your fingers expect —",
         Role::Epigraph,
         width,
     ));
     lines.push(centered(
-        "nothing touches your files until you accept it",
+        "everything else included",
         Role::Epigraph,
         width,
     ));
@@ -290,7 +290,7 @@ mod tests {
         let text = block_text(&lines);
         assert!(text.contains("red v0.1.1"));
         assert!(text.contains(":AgentReview<Enter>"));
-        assert!(text.contains("every agent edit is a proposal"));
+        assert!(text.contains("everything your fingers expect"));
     }
 
     #[test]

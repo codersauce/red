@@ -7,7 +7,7 @@ Date: 2026-07-19
 The intro screen shown when red starts with no file arguments — the same slot
 Neovim's `:intro` occupies, carrying red's own identity: a rounded lowercase
 wordmark, a single point of color (the dot, always the theme's red), six
-verified keystrokes, and the trust-model epigraph.
+verified keystrokes, and a batteries-included epigraph.
 
 ## Layout
 
@@ -22,7 +22,7 @@ stays at 1:1, line number 1 renders normally.
                    ╵      ╰──╴   ╰──╯  ●
 
                          red v0.1.1
-              the modal editor for the agent era
+        the editor that respects your muscle memory
                  github.com/codersauce/red
 
 ────────────────────────────────────────────────────────────
@@ -34,8 +34,8 @@ press  Space t               to change the theme
 type   :q<Enter>             to exit
 ────────────────────────────────────────────────────────────
 
-              every agent edit is a proposal —
-       nothing touches your files until you accept it
+             everything your fingers expect —
+                  everything else included
 ```
 
 The version string comes from `CARGO_PKG_VERSION`. Every keystroke above is
@@ -50,9 +50,9 @@ the command palette is the discovery surface, so it leads the list.
   temperament of nvim's thin, doubled, angular N.
 - **The dot is the brand.** The wordmark reads "red●"; the dot is the only
   saturated element on screen.
-- **The epigraph is the differentiator** (see `docs/DIFFERENTIATION.md`): the
-  proposal-based agent trust model, stated in one sentence, in the slot where
-  nvim puts its sponsor line.
+- **The epigraph completes the promise.** The tagline establishes familiarity;
+  the closing line pairs it with red's batteries-included philosophy in the
+  slot where nvim puts its sponsor line.
 
 ## Colors — theme tokens only, never hardcoded
 

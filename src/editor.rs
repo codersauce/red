@@ -26381,7 +26381,7 @@ builtin = "rust"
         assert!(dump.contains("red v"));
         assert!(dump.contains("╭──╮   ╭──╮   ╭──┤"));
         assert!(dump.contains(":AgentReview<Enter>"));
-        assert!(dump.contains("every agent edit is a proposal"));
+        assert!(dump.contains("everything your fingers expect"));
     }
 
     #[test]
