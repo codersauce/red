@@ -1,5 +1,5 @@
 {
-  "version": "0.7.0",
+  "version": "0.8.0",
   "calls": [
     { "name": "Print", "kind": "execute", "signature": "(message: String)", "introduced": "0.1.0" },
     { "name": "FilePicker", "kind": "execute", "signature": "()", "introduced": "0.1.0" },
@@ -87,7 +87,7 @@
     { "name": "GetBufferText", "kind": "request", "signature": "(callback: fn(Json), start_line?: i32, end_line?: i32)", "introduced": "0.1.0" },
     { "name": "GetSelection", "kind": "request", "signature": "(callback: fn(Json))", "introduced": "0.1.0" },
     { "name": "GetAgentContext", "kind": "request", "signature": "(callback: fn(Json))", "introduced": "0.2.0" },
-    { "name": "OpenScratchBuffer", "kind": "request", "signature": "(callback: fn(Json), name: String, text: String)", "introduced": "0.1.0" },
+    { "name": "OpenScratchBuffer", "kind": "request", "signature": "(callback: fn(Json), name: String, text: String, commands?: Json)", "introduced": "0.1.0" },
     { "name": "GetConfig", "kind": "request", "signature": "(callback: fn(Json), key?: String)", "introduced": "0.1.0" },
     { "name": "GetStorage", "kind": "request", "signature": "(callback: fn(Json), key: String)", "introduced": "0.1.0" },
     { "name": "GetEditorState", "kind": "request", "signature": "(callback: fn(Json))", "introduced": "0.1.0" },

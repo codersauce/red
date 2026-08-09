@@ -33,8 +33,9 @@ pub struct PluginRegistry {
 }
 
 /// Host API version used for plugin compatibility checks.
-pub const RED_HOST_API_VERSION: &str = "0.7.0";
-pub(crate) const SUPPORTED_HOST_API_VERSIONS: &[&str] = &["0.4.0", "0.6.0", RED_HOST_API_VERSION];
+pub const RED_HOST_API_VERSION: &str = "0.8.0";
+pub(crate) const SUPPORTED_HOST_API_VERSIONS: &[&str] =
+    &["0.4.0", "0.6.0", "0.7.0", RED_HOST_API_VERSION];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PluginModification {

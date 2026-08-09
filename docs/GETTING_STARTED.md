@@ -186,6 +186,8 @@ workspace. Open it with `Space G`.
 - `[h` and `]h` move between hunks.
 - `Space h s`, `Space h u`, and `Space h r` stage, unstage, or reset a hunk.
 - `Space c c` submits a commit message; `Space c q` cancels it.
+- The commit editor shows branch and working-tree status followed by the staged diff.
+  `:w` or `:wq` submits the message and returns to the workspace; `:q` cancels.
 
 The workspace covers staged, unstaged, untracked, and conflicted files with an
 adaptive diff pane. It also exposes synchronization, branch, remote, tag,

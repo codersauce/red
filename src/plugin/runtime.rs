@@ -1916,11 +1916,25 @@ impl RedHost {
             }
             "GetSelection" => PluginRequest::GetSelection { request_id },
             "GetAgentContext" => PluginRequest::GetAgentContext { request_id },
-            "OpenScratchBuffer" => PluginRequest::OpenScratchBuffer {
-                request_id,
-                name: args.first().map(value_to_string).unwrap_or_default(),
-                text: args.get(1).map(value_to_string).unwrap_or_default(),
-            },
+            "OpenScratchBuffer" => {
+                let commands = args
+                    .get(2)
+                    .map(value_to_json)
+                    .unwrap_or(serde_json::Value::Null);
+                PluginRequest::OpenScratchBuffer {
+                    request_id,
+                    name: args.first().map(value_to_string).unwrap_or_default(),
+                    text: args.get(1).map(value_to_string).unwrap_or_default(),
+                    submit_command: commands
+                        .get("submit")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    cancel_command: commands
+                        .get("cancel")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                }
+            }
             "GetConfig" => PluginRequest::GetConfig {
                 request_id,
                 key: args.first().and_then(Value::as_str).map(str::to_string),
@@ -4038,6 +4052,48 @@ mod tests {
 
     fn drain_requests() {
         while ACTION_DISPATCHER.try_recv_request().is_some() {}
+    }
+
+    #[tokio::test]
+    async fn scratch_buffer_requests_preserve_submit_and_cancel_commands() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "scratch_owner",
+                r#"
+                    struct ScratchCommands { submit: String, cancel: String }
+                    pub fn activate() {
+                        red::request(
+                            "OpenScratchBuffer",
+                            opened,
+                            "[Prompt].txt",
+                            "draft",
+                            ScratchCommands { submit: "SubmitPrompt", cancel: "CancelPrompt" }
+                        );
+                    }
+                    fn opened(event: Json) {}
+                "#,
+            )
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenScratchBuffer {
+                name,
+                text,
+                submit_command,
+                cancel_command,
+                ..
+            } => {
+                assert_eq!(name, "[Prompt].txt");
+                assert_eq!(text, "draft");
+                assert_eq!(submit_command.as_deref(), Some("SubmitPrompt"));
+                assert_eq!(cancel_command.as_deref(), Some("CancelPrompt"));
+            }
+            _ => panic!("expected a managed scratch-buffer request"),
+        }
     }
 
     fn recv_agent_composer() -> (ComposerHandle, Option<String>, String, Vec<String>) {
@@ -10719,6 +10775,118 @@ mod tests {
                     .any(|item| item.label == "git switch -c feature/readable-pickers"));
             }
             _ => panic!("expected callback-backed command log"),
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn git_commit_scratch_includes_status_diff_and_managed_commands() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.join("staged.txt"), "hello\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "staged.txt"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+
+        let mut runtime = load_git_runtime(root).await;
+        runtime.execute_command("GitDashboard").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            let mut staged_visible = false;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                if let PluginRequest::UpdateWorkspace { model, .. } = request {
+                    staged_visible = model.rows.iter().any(|row| row.id == "staged:staged.txt");
+                }
+            }
+            if staged_visible {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "staged Git status did not render"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        runtime
+            .notify(
+                "workspace:event:git-dashboard",
+                serde_json::json!({ "action": "c", "row": null }),
+            )
+            .await
+            .unwrap();
+        let (picker, create) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                handle,
+                title,
+                items,
+                ..
+            } => {
+                assert_eq!(title.as_deref(), Some("Commit"));
+                let create = items
+                    .into_iter()
+                    .find(|item| item.id == "create")
+                    .expect("commit picker should contain Create commit");
+                (handle, create)
+            }
+            _ => panic!("expected the commit picker"),
+        };
+        runtime
+            .notify_picker(picker, PickerCallback::Selected(create))
+            .unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetEditorState { request_id } => request_id,
+            _ => panic!("expected an editor snapshot request"),
+        };
+        runtime
+            .resolve_request(request_id, serde_json::json!({ "version": 1 }))
+            .await
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            let mut scratch = None;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                if let PluginRequest::OpenScratchBuffer {
+                    name,
+                    text,
+                    submit_command,
+                    cancel_command,
+                    ..
+                } = request
+                {
+                    scratch = Some((name, text, submit_command, cancel_command));
+                }
+            }
+            if let Some((name, text, submit, cancel)) = scratch {
+                assert_eq!(name, "[Git Commit].gitcommit");
+                assert_eq!(submit.as_deref(), Some("GitSubmitMessage"));
+                assert_eq!(cancel.as_deref(), Some("GitCancelMessage"));
+                assert!(text.contains("# --- Red commit context"));
+                assert!(text.contains("# Changes to be committed:"));
+                assert!(text.contains("staged.txt"));
+                assert!(text.contains("# Staged diff:"));
+                assert!(text.contains("# +hello"));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "commit scratch buffer did not open"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 

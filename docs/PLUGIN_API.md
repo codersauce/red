@@ -1,6 +1,6 @@
 # Husk plugin compatibility
 
-Red host API version `0.7.0` is defined by
+Red host API version `0.8.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -24,9 +24,18 @@ required/optional arity (`HUSK-A0002`) and obvious literal argument types
 annotations use `HUSK-A0004`. `--no-typecheck` is an unsupported development
 escape hatch; compatibility guarantees do not apply while it is enabled.
 
-Red `0.7.0` retains the complete `0.4.0` and `0.6.0` contracts, so existing
-packages that declare either minor continue to load. New packages should target
-`"red_api_version": "^0.7.0"` to use global command scope.
+Red `0.8.0` retains the complete `0.4.0`, `0.6.0`, and `0.7.0` contracts, so existing
+packages that declare those minors continue to load. New packages should target
+`"red_api_version": "^0.8.0"`.
+
+## Scratch-buffer workflows
+
+`OpenScratchBuffer(callback, name, text, commands?)` accepts optional `submit` and
+`cancel` plugin command names. In a managed scratch buffer, `:w` and `:wq` invoke the
+submit command without writing the display name to disk, while `:q` and `:q!` invoke
+the cancel command without quitting Red. `Save`, `Quit`, and configured key bindings
+follow the same routing. The options were added in host API `0.8.0`; calls using the
+original three required arguments remain compatible.
 
 ## External package primitives
 
