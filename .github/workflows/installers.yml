@@ -2,13 +2,13 @@ name: Installers
 
 on:
   push:
-    branches: [main, master, develop]
+    branches: [main, develop]
     paths:
       - "install/**"
       - "tests/installers/**"
       - ".github/workflows/installers.yml"
   pull_request:
-    branches: [main, master, develop]
+    branches: [main, develop]
     paths:
       - "install/**"
       - "tests/installers/**"

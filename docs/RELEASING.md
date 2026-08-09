@@ -4,7 +4,7 @@ This document describes how to publish a Red release.
 
 ## Prerequisites
 
-- CI is green on `master`.
+- CI is green on `main`.
 - `codersauce/homebrew-tap` exists and contains a `Formula/` directory.
 - The `codersauce/red` repository has an Actions secret named `HOMEBREW_TAP_TOKEN`.
 - `HOMEBREW_TAP_TOKEN` can push to `codersauce/homebrew-tap`.
@@ -22,7 +22,7 @@ the release publishing job.
 2. Run the **Prepare Release** workflow with the version and no `v` prefix:
 
    ```shell
-   gh workflow run prepare-release.yml --ref master -f version=0.2.0
+   gh workflow run prepare-release.yml --ref main -f version=0.2.0
    ```
 
    The workflow generates the release changelog from Conventional Commit
@@ -34,11 +34,11 @@ the release publishing job.
    pinned installer example, then wait for every release-PR gate to pass. In
    particular, Clippy, the bundled-runtime self-check, README version check, and
    generated-versus-committed changelog comparison must be green.
-4. Merge the release pull request and update the local `master` branch:
+4. Merge the release pull request and update the local `main` branch:
 
    ```shell
-   git checkout master
-   git pull --ff-only origin master
+   git checkout main
+   git pull --ff-only origin main
    ```
 
 5. Create and push an annotated tag from the release merge commit:

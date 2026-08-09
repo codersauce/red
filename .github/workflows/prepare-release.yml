@@ -37,10 +37,10 @@ jobs:
             exit 1
           fi
 
-      - name: Checkout master
+      - name: Checkout main
         uses: actions/checkout@v4
         with:
-          ref: master
+          ref: main
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PR_TOKEN }}
 
@@ -133,7 +133,7 @@ jobs:
               --body-file "$RUNNER_TEMP/release-pr-body.md"
           else
             gh pr create \
-              --base master \
+              --base main \
               --head "$BRANCH" \
               --title "chore(release): prepare v$VERSION" \
               --body-file "$RUNNER_TEMP/release-pr-body.md"
