@@ -58,6 +58,7 @@ arboard = "3.4.1"
 async-recursion = "1.0.5"
 async-trait = "0.1.77"
 bon = "3.3.2"
+chrono = "0.4.45"
 clap = { version = "4.5.26", features = ["derive", "env"] }
 crossterm = { version = "0.27.0", features = ["event-stream", "serde"] }
 futures = "0.3.30"
@@ -93,6 +94,7 @@ tempfile = "3.15.0"
 thiserror = "1.0"
 tokio = { version = "1.41.0", features = ["full"] }
 toml = "0.8.23"
+toml_edit = "0.22.27"
 trash = "5.2.2"
 tree-sitter = "0.25"
 tree-sitter-language = "0.1.7"

@@ -79,6 +79,20 @@ input_position = "bottom"
 style = "nerd_font"
 color = true
 
+# Sections are ordered from the outer edge toward the center on both sides.
+# Run :statusline to browse editor, Git, LSP, file, and agent fields, then
+# arrange them in a terminal panel with a live preview.
+# The first three positions use the theme's accent, middle, and base shades.
+[statusline]
+left = ["mode", "git_branch", "filename"]
+right = ["position", "syntax"]
+
+# Nerd Font icons match nvim-web-devicons. "unicode" and "ascii" are
+# portable fallbacks; "none" keeps the labels while hiding their icons.
+[statusline.icons]
+style = "nerd_font"
+color = true
+
 # Show available continuations after a keymap prefix such as Space or Ctrl-w.
 # Fast key sequences complete before the guide appears.
 [key_hints]

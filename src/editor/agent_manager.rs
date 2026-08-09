@@ -102,6 +102,10 @@ impl AgentManager {
         self.active_sessions.contains(session_id)
     }
 
+    pub fn has_active_sessions(&self) -> bool {
+        !self.active_sessions.is_empty()
+    }
+
     pub fn clear_active_sessions(&mut self) {
         self.active_sessions.clear();
     }

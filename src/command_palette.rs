@@ -41,6 +41,7 @@ pub(crate) const BUILTIN_COLON_COMMANDS: &[&str] = &[
     "ft",
     "languages",
     "plugins",
+    "statusline",
     "config-diagnostics",
 ];
 
@@ -370,6 +371,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Some(":config-diagnostics"),
             &[],
             Action::ConfigDiagnostics,
+        ),
+        builtin(
+            "editor.statusline_manager",
+            "Configure status line",
+            "Editor",
+            "Arrange available fields on the left and right with a live preview",
+            Some(":statusline"),
+            &["status bar", "branch", "syntax", "layout"],
+            Action::OpenStatuslineManager,
         ),
         builtin(
             "editor.reload_languages",
@@ -984,6 +994,7 @@ fn action_label(action: &Action) -> String {
     match action {
         Action::CommandPalette => "All commands".to_string(),
         Action::ConfigDiagnostics => "Configuration diagnostics".to_string(),
+        Action::OpenStatuslineManager => "Configure status line".to_string(),
         Action::PluginCommand(name) => humanize_identifier(name),
         Action::Save => "Save file".to_string(),
         Action::Quit(_) => "Quit".to_string(),
@@ -1145,6 +1156,13 @@ mod tests {
             .unwrap();
         assert_eq!(save.colon.as_deref(), Some(":w"));
         assert!(save.aliases.iter().any(|alias| alias == ":write"));
+
+        let statusline = entries
+            .iter()
+            .find(|entry| entry.id == "editor.statusline_manager")
+            .unwrap();
+        assert_eq!(statusline.colon.as_deref(), Some(":statusline"));
+        assert_eq!(statusline.action, Action::OpenStatuslineManager);
     }
 
     #[test]

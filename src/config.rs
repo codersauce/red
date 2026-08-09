@@ -244,6 +244,9 @@ pub struct Config {
     /// Picker layout behavior.
     #[serde(default)]
     pub picker: PickerConfig,
+    /// Ordered status-line sections and icon presentation.
+    #[serde(default)]
+    pub statusline: StatuslineConfig,
     /// Delayed key-prefix guide behavior.
     #[serde(default)]
     pub key_hints: KeyHintsConfig,
@@ -363,6 +366,166 @@ impl Default for PickerConfig {
         Self {
             input_position: PickerInputPosition::Bottom,
             icons: PickerIconsConfig::default(),
+        }
+    }
+}
+
+/// Configurable status-line layout.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StatuslineConfig {
+    /// Sections rendered from the left edge toward the center.
+    #[serde(default = "default_statusline_left")]
+    pub left: Vec<StatuslineSection>,
+    /// Sections rendered from the right edge toward the center.
+    #[serde(default = "default_statusline_right")]
+    pub right: Vec<StatuslineSection>,
+    /// Icon style shared by Git and syntax sections.
+    #[serde(default)]
+    pub icons: PickerIconsConfig,
+}
+
+impl Default for StatuslineConfig {
+    fn default() -> Self {
+        Self {
+            left: default_statusline_left(),
+            right: default_statusline_right(),
+            icons: PickerIconsConfig::default(),
+        }
+    }
+}
+
+fn default_statusline_left() -> Vec<StatuslineSection> {
+    vec![
+        StatuslineSection::Mode,
+        StatuslineSection::GitBranch,
+        StatuslineSection::Filename,
+    ]
+}
+
+fn default_statusline_right() -> Vec<StatuslineSection> {
+    vec![StatuslineSection::Position, StatuslineSection::Syntax]
+}
+
+/// A piece of editor context that can be placed on either status-line side.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StatuslineSection {
+    Mode,
+    GitBranch,
+    Filename,
+    Syntax,
+    Position,
+    Diagnostics,
+    GitChanges,
+    LspStatus,
+    CurrentSymbol,
+    Selection,
+    Recording,
+    SearchMatches,
+    Indentation,
+    Encoding,
+    LineEndings,
+    ReadOnly,
+    Modified,
+    Workspace,
+    RelativePath,
+    BufferIndex,
+    WindowIndex,
+    FileSize,
+    AgentActivity,
+    Formatter,
+    Clock,
+}
+
+impl StatuslineSection {
+    pub const ALL: [Self; 25] = [
+        Self::Mode,
+        Self::GitBranch,
+        Self::Filename,
+        Self::Syntax,
+        Self::Position,
+        Self::Diagnostics,
+        Self::GitChanges,
+        Self::LspStatus,
+        Self::CurrentSymbol,
+        Self::Selection,
+        Self::Recording,
+        Self::SearchMatches,
+        Self::Indentation,
+        Self::Encoding,
+        Self::LineEndings,
+        Self::ReadOnly,
+        Self::Modified,
+        Self::Workspace,
+        Self::RelativePath,
+        Self::BufferIndex,
+        Self::WindowIndex,
+        Self::FileSize,
+        Self::AgentActivity,
+        Self::Formatter,
+        Self::Clock,
+    ];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mode => "mode",
+            Self::GitBranch => "git_branch",
+            Self::Filename => "filename",
+            Self::Syntax => "syntax",
+            Self::Position => "position",
+            Self::Diagnostics => "diagnostics",
+            Self::GitChanges => "git_changes",
+            Self::LspStatus => "lsp_status",
+            Self::CurrentSymbol => "current_symbol",
+            Self::Selection => "selection",
+            Self::Recording => "recording",
+            Self::SearchMatches => "search_matches",
+            Self::Indentation => "indentation",
+            Self::Encoding => "encoding",
+            Self::LineEndings => "line_endings",
+            Self::ReadOnly => "read_only",
+            Self::Modified => "modified",
+            Self::Workspace => "workspace",
+            Self::RelativePath => "relative_path",
+            Self::BufferIndex => "buffer_index",
+            Self::WindowIndex => "window_index",
+            Self::FileSize => "file_size",
+            Self::AgentActivity => "agent_activity",
+            Self::Formatter => "formatter",
+            Self::Clock => "clock",
+        }
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mode => "Mode",
+            Self::GitBranch => "Git branch",
+            Self::Filename => "Filename",
+            Self::Syntax => "Syntax",
+            Self::Position => "Cursor position",
+            Self::Diagnostics => "Diagnostics",
+            Self::GitChanges => "Git changes",
+            Self::LspStatus => "LSP status",
+            Self::CurrentSymbol => "Current symbol",
+            Self::Selection => "Selection",
+            Self::Recording => "Macro recording",
+            Self::SearchMatches => "Search matches",
+            Self::Indentation => "Indentation",
+            Self::Encoding => "Encoding",
+            Self::LineEndings => "Line endings",
+            Self::ReadOnly => "Read-only",
+            Self::Modified => "Modified",
+            Self::Workspace => "Workspace",
+            Self::RelativePath => "Relative path",
+            Self::BufferIndex => "Buffer index",
+            Self::WindowIndex => "Window index",
+            Self::FileSize => "File size",
+            Self::AgentActivity => "Agent activity",
+            Self::Formatter => "Formatter",
+            Self::Clock => "Clock",
         }
     }
 }
@@ -1395,6 +1558,21 @@ impl Config {
         Ok(())
     }
 
+    /// Persists the status-line table without rewriting unrelated user configuration.
+    pub fn persist_statusline(statusline: &StatuslineConfig) -> anyhow::Result<()> {
+        let config_path = Self::path("config.toml");
+        let contents = match fs::read_to_string(&config_path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error.into()),
+        };
+        fs::write(
+            config_path,
+            update_statusline_config_contents(&contents, statusline)?,
+        )?;
+        Ok(())
+    }
+
     /// Resolves a plugin path or bundled-plugin specifier for runtime loading.
     pub fn resolve_plugin_path(configured_path: &str) -> String {
         let configured = PathBuf::from(configured_path);
@@ -1515,6 +1693,7 @@ fn known_top_level_field(field: &str) -> bool {
             | "splash"
             | "search"
             | "picker"
+            | "statusline"
             | "key_hints"
             | "clipboard"
             | "lsp"
@@ -1663,6 +1842,9 @@ fn known_schema_path(path: &[String]) -> bool {
             "incsearch" | "hlsearch" | "wrapscan" | "ignorecase" | "smartcase"
         ),
         ["picker", "input_position"] => true,
+        ["picker", "icons", field] => matches!(*field, "style" | "color"),
+        ["statusline", field] => matches!(*field, "left" | "right" | "icons"),
+        ["statusline", "icons", field] => matches!(*field, "style" | "color"),
         ["key_hints", field] => matches!(*field, "enabled" | "delay_ms"),
         ["clipboard", field] => {
             matches!(*field, "enabled" | "sync_on_yank" | "sync_on_paste")
@@ -2234,6 +2416,44 @@ fn update_theme_config_contents(contents: &str, theme_name: &str) -> anyhow::Res
     Ok(updated)
 }
 
+fn update_statusline_config_contents(
+    contents: &str,
+    statusline: &StatuslineConfig,
+) -> anyhow::Result<String> {
+    use toml_edit::{Array, DocumentMut, Item, Table, Value as EditValue};
+
+    let mut document = if contents.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        contents
+            .parse::<DocumentMut>()
+            .map_err(|error| anyhow::anyhow!("could not update config.toml: {error}"))?
+    };
+    let section_array = |sections: &[StatuslineSection]| {
+        let mut array = Array::new();
+        for section in sections {
+            array.push(section.as_str());
+        }
+        array
+    };
+
+    let mut table = Table::new();
+    table["left"] = Item::Value(EditValue::Array(section_array(&statusline.left)));
+    table["right"] = Item::Value(EditValue::Array(section_array(&statusline.right)));
+    let mut icons = Table::new();
+    icons["style"] = toml_edit::value(match statusline.icons.style {
+        PickerIconStyle::Unicode => "unicode",
+        PickerIconStyle::NerdFont => "nerd_font",
+        PickerIconStyle::Ascii => "ascii",
+        PickerIconStyle::None => "none",
+    });
+    icons["color"] = toml_edit::value(statusline.icons.color);
+    table["icons"] = Item::Table(icons);
+    document["statusline"] = Item::Table(table);
+
+    Ok(document.to_string())
+}
+
 fn is_theme_assignment(line: &str) -> bool {
     let line = line.trim_start();
     if line.starts_with('#') {
@@ -2663,6 +2883,58 @@ theme = "kanso-zen.json"
     }
 
     #[test]
+    fn update_statusline_config_preserves_unrelated_settings_and_comments() {
+        let contents = r#"# keep this comment
+theme = "mocha.json"
+
+[statusline]
+left = ["filename"]
+right = ["position"]
+
+[statusline.icons]
+style = "ascii"
+color = false
+
+[keys.normal]
+"x" = "DeleteChar"
+"#;
+        let statusline = StatuslineConfig {
+            left: vec![StatuslineSection::Mode, StatuslineSection::Filename],
+            right: vec![StatuslineSection::Syntax, StatuslineSection::Position],
+            icons: PickerIconsConfig {
+                style: PickerIconStyle::Unicode,
+                color: true,
+            },
+        };
+
+        let updated = update_statusline_config_contents(contents, &statusline).unwrap();
+        let value = updated.parse::<toml::Value>().unwrap();
+
+        assert!(updated.contains("# keep this comment"));
+        assert!(updated.contains("[keys.normal]"));
+        assert!(updated.contains(r#""x" = "DeleteChar""#));
+        assert_eq!(
+            value["statusline"]["left"].as_array().unwrap(),
+            &vec!["mode".into(), "filename".into()]
+        );
+        assert_eq!(
+            value["statusline"]["icons"]["style"].as_str(),
+            Some("unicode")
+        );
+        assert_eq!(value["statusline"]["icons"]["color"].as_bool(), Some(true));
+        assert_eq!(updated.matches("[statusline]").count(), 1);
+    }
+
+    #[test]
+    fn update_statusline_config_refuses_to_overwrite_malformed_toml() {
+        let error =
+            update_statusline_config_contents("[statusline\n", &StatuslineConfig::default())
+                .unwrap_err();
+
+        assert!(error.to_string().contains("could not update config.toml"));
+    }
+
+    #[test]
     fn test_lsp_config_defaults_to_rust() {
         let config: Config = toml::from_str(
             r#"
@@ -2928,6 +3200,92 @@ input_position = "top"
         .unwrap();
 
         assert_eq!(config.picker.input_position, PickerInputPosition::Top);
+    }
+
+    #[test]
+    fn statusline_defaults_match_the_bundled_neovim_inspired_layout() {
+        let config = Config::from_user_toml_with_overrides("", &[]).unwrap();
+
+        assert_eq!(
+            config.statusline.left,
+            [
+                StatuslineSection::Mode,
+                StatuslineSection::GitBranch,
+                StatuslineSection::Filename,
+            ]
+        );
+        assert_eq!(
+            config.statusline.right,
+            [StatuslineSection::Position, StatuslineSection::Syntax]
+        );
+        assert_eq!(config.statusline.icons.style, PickerIconStyle::NerdFont);
+        assert!(config.statusline.icons.color);
+    }
+
+    #[test]
+    fn statusline_sections_can_move_between_sides_and_change_icon_style() {
+        let config = Config::from_user_toml_with_overrides(
+            r#"
+[statusline]
+left = ["syntax", "filename"]
+right = ["mode", "git_branch", "position"]
+
+[statusline.icons]
+style = "ascii"
+color = false
+"#,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.statusline.left,
+            [StatuslineSection::Syntax, StatuslineSection::Filename]
+        );
+        assert_eq!(
+            config.statusline.right,
+            [
+                StatuslineSection::Mode,
+                StatuslineSection::GitBranch,
+                StatuslineSection::Position,
+            ]
+        );
+        assert_eq!(config.statusline.icons.style, PickerIconStyle::Ascii);
+        assert!(!config.statusline.icons.color);
+    }
+
+    #[test]
+    fn every_statusline_section_round_trips_through_toml() {
+        let statusline = StatuslineConfig {
+            left: StatuslineSection::ALL.to_vec(),
+            right: Vec::new(),
+            icons: PickerIconsConfig::default(),
+        };
+
+        let serialized = toml::to_string(&statusline).unwrap();
+        let parsed = toml::from_str::<StatuslineConfig>(&serialized).unwrap();
+
+        assert_eq!(parsed.left, StatuslineSection::ALL);
+        assert!(parsed.right.is_empty());
+    }
+
+    #[test]
+    fn invalid_statusline_section_keeps_the_default_side() {
+        let loaded = Config::load_user_toml(
+            r#"
+[statusline]
+left = ["mode", "weather"]
+"#,
+            Path::new("/tmp/config.toml"),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(loaded.config.statusline.left, default_statusline_left());
+        assert!(loaded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.path == "statusline.left"));
     }
 
     #[test]

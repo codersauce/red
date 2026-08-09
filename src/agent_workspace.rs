@@ -198,6 +198,16 @@ impl ProposalWorkspace {
     }
 
     #[must_use]
+    pub fn has_pending_files(&self) -> bool {
+        self.sessions.values().any(|session| {
+            session
+                .files
+                .values()
+                .any(|proposal| proposal.base_contents != proposal.proposed_contents)
+        })
+    }
+
+    #[must_use]
     /// Captures visible files, session proposals, and ownership metadata.
     pub fn snapshot(&self) -> ProposalWorkspaceSnapshot {
         ProposalWorkspaceSnapshot {

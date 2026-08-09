@@ -476,6 +476,11 @@ pub trait LspClient: std::any::Any + Send {
         self.get_server_capabilities()
     }
 
+    /// Returns the configured server name associated with `file`.
+    fn server_name_for_file(&self, _file: &str) -> Option<String> {
+        None
+    }
+
     /// Reports whether the server associated with `file` supports formatting.
     fn supports_document_formatting(&self, _file: &str) -> bool {
         true

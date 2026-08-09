@@ -139,11 +139,7 @@ fn full_block(version: &str) -> Vec<Line> {
         Role::Epigraph,
         width,
     ));
-    lines.push(centered(
-        "everything else included",
-        Role::Epigraph,
-        width,
-    ));
+    lines.push(centered("everything else included", Role::Epigraph, width));
     lines
 }
 
