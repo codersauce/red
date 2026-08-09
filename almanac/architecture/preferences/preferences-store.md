@@ -1,7 +1,7 @@
 ---
 title: "Preferences Store"
 summary: "Red's preferences store persists convenience state such as command history, picker history, and plugin-owned JSON without becoming recovery state."
-topics: [architecture, preferences, plugins, history]
+topics: [architecture, persistence, preferences, plugins, history]
 sources:
   - id: preferences
     type: file
@@ -42,4 +42,4 @@ Preferences are not startup-critical. A missing file loads as empty preferences,
 
 On Unix, reads and writes use `O_NOFOLLOW` and `O_NONBLOCK`, require the target to be a regular file, and set permissions to `0600` [@preferences]. Writes create parent directories, serialize pretty JSON, open with `0600`, truncate through `set_len(0)`, and write the new contents [@preferences]. The tests cover owner-only agent transcript writes, permission tightening for existing files, and refusal to follow a symlink that points outside the preferences path [@preferences].
 
-This store is adjacent to [Runtime Lifecycle](../startup/runtime-lifecycle), which loads it during startup, and to plugin host request handling, which uses it for plugin-owned values.
+This store is adjacent to [Runtime Lifecycle](../startup/runtime-lifecycle), which loads it during startup, and to [Plugin Host Requests](../editor/plugin-host-requests), which uses it for plugin-owned values.

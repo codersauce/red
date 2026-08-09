@@ -28,6 +28,8 @@ Red's editor core is the single-owner runtime for interactive state. `Editor` ow
 
 Start with [Editor Event Loop](event-loop) when work touches startup, terminal input, background service ticks, rendering cadence, session persistence, detached core ticking, or shutdown. That page explains why LSP, plugins, sessions, and Codex return to the editor before mutating interactive state [@editor].
 
+Use [Command Discovery](../commands/command-discovery) when changing colon commands, command-palette rows, effective keymap shortcuts, nested key hints, or whether a command can run while plugin panels have focus.
+
 Read [Text Mutation Boundary](text-mutation-boundary) before adding any user, plugin, LSP, or agent path that changes buffer text. `Buffer` owns Ropey text, revision, dirty state, cursor fallback, and undo history, but raw buffer replacement does not perform the editor-owned undo, mark, dirty-state, LSP, plugin, and render updates required by production edits [@buffer].
 
 Use [Buffers And Windows](buffers-and-windows) for the split between editable text identity and visible split-tree presentation. Buffers own process-local text identity, while windows own stable window ids, viewport offsets, wrapping state, cursor position, active state, and split layout [@buffer] [@window].

@@ -17,7 +17,7 @@ sources:
     path: src/fixtures/lsp-completion-response.json
 ---
 
-LSP completion in Red spans the transport, editor, and terminal UI. The editor issues completion only from insert mode, records a buffer id, revision, and URI snapshot for the request, sends UTF-16 line and character positions to the language server, and later accepts a response only if the buffer identity and revision are still current [@editor]. The completion UI owns display state and filtering, while accepting an item returns to the editor for validated buffer mutation and optional command execution [@completion-ui] [@editor].
+LSP completion in Red spans the [transport](transport), editor, and terminal UI. The editor issues completion only from insert mode, records a buffer id, revision, and URI snapshot for the request, sends UTF-16 line and character positions to the language server, and later accepts a response only if the buffer identity and revision are still current [@editor]. The completion UI owns display state and filtering, while accepting an item returns to the editor for validated buffer mutation and optional command execution [@completion-ui] [@editor].
 
 ## Request Context
 
@@ -37,7 +37,6 @@ Filtering scores prefix matches ahead of contains matches across `filterText`, l
 
 ## Atomic Application
 
-Accepting an item first checks that the saved completion snapshot still matches an open buffer and revision; stale items are rejected before mutation [@editor]. The editor validates the main text edit and all additional text edits together with `apply_text_edits`, so invalid UTF-16 positions or overlapping edits leave the buffer unchanged [@editor]. Tests cover one-undo-step application, UTF-16 and CRLF conversion, invalid split-surrogate edits, and overlapping additional edits [@completion-tests].
+Accepting an item first checks that the saved completion snapshot still matches an open buffer and revision; stale items are rejected before mutation [@editor]. The editor validates the main text edit and all additional text edits together with `apply_text_edits`, so invalid UTF-16 positions or overlapping edits leave the buffer unchanged [@editor]. That validation uses the same conversion rules described in [LSP Workspace Edits](workspace-edits), then enters the editor-owned [Text Mutation Boundary](../editor/text-mutation-boundary) for the actual buffer change. Tests cover one-undo-step application, UTF-16 and CRLF conversion, invalid split-surrogate edits, and overlapping additional edits [@completion-tests].
 
 Application is one editor transaction. Red converts the main LSP text edit or label/insert text into an editor range, strips basic snippet markers for snippet insert text, converts additional edits, sorts edits in descending position order, applies them, computes the final cursor position from the main edit, inserts any commit character, notifies LSP of the change, and commits the transaction [@editor]. If the completion item carries an LSP command, Red sends `workspace/executeCommand` after the edits have been applied [@editor]. Tests enforce snippet marker stripping and command execution after completion [@completion-tests].
-

@@ -17,7 +17,7 @@ sources:
     path: tests/lsp_lazy.rs
 ---
 
-LSP workspace edits are a two-stage boundary in Red. The LSP parser converts protocol JSON into ordered document and resource operations, while the workspace-edit preparer validates the whole edit against open buffers, disk snapshots, revisions, versions, workspace confinement, protected paths, and size budgets before any mutation occurs [@edit] [@workspace-edit]. The editor then applies prepared buffer contents and resource operations, responds to `workspace/applyEdit`, and sends follow-up LSP document notifications [@editor].
+LSP workspace edits are a two-stage boundary in Red. The LSP parser converts protocol JSON into ordered document and resource operations, while the workspace-edit preparer validates the whole edit against open buffers, disk snapshots, revisions, versions, workspace confinement, protected paths, and size budgets before any mutation occurs [@edit] [@workspace-edit]. The editor then applies resource operations, routes prepared buffer contents through the [Text Mutation Boundary](../editor/text-mutation-boundary), responds to `workspace/applyEdit`, and sends follow-up [LSP Document Sync](../editor/lsp-document-sync) notifications [@editor].
 
 ## Parsing And Text Conversion
 
@@ -39,7 +39,6 @@ If a resource operation fails after preparation, Red verifies that targets have 
 
 ## Editor-Owned Application
 
-The editor gathers touched open buffers, checks their total byte budget, builds `OpenWorkspaceDocument` records with buffer revisions and LSP document versions, and calls `prepare_workspace_edit` before any resource operation or buffer replacement [@editor]. Resource operations are applied before buffer text replacement. Prepared documents then update existing buffers or open new buffers, whole-buffer replacements are recorded as LSP-origin undo transactions, renamed documents close the old LSP identity and open the new one, changed buffers send `didChange`, and server-initiated requests receive success or failure responses [@editor].
+The editor gathers touched open buffers, checks their total byte budget, builds `OpenWorkspaceDocument` records with buffer revisions and LSP document versions, and calls `prepare_workspace_edit` before any resource operation or buffer replacement [@editor]. Resource operations are applied before buffer text replacement. Prepared documents then update existing buffers or open new buffers, whole-buffer replacements are recorded as LSP-origin undo transactions, renamed documents close the old LSP identity and open the new one, changed buffers send `didChange`, and server-initiated requests receive success or failure responses [@editor]. This is the multi-file counterpart to [LSP Completion](completion), which reuses the text-edit conversion path for a single accepted item.
 
 The lazy LSP tests cover the important behavior: dirty open buffers are updated without writing disk, unopened documents can be opened and synced after a valid server edit, invalid edits fail without opening or mutating targets, resource-only rename updates LSP document identity while preserving unsaved buffer text, and unsupported no-follow resource operations fail closed on non-Unix platforms [@lazy-tests].
-

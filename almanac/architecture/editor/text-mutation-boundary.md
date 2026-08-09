@@ -21,7 +21,7 @@ The text mutation boundary is Red's canonical path for changing buffer contents.
 
 ## Canonical Coordinates
 
-Text edits enter the boundary as `TextRange` values. `TextPosition::character` is a Unicode scalar index within a logical line, not a UTF-8 byte offset, grapheme index, terminal column, or LSP UTF-16 code-unit offset [@undo]. The editor converts between cursor grapheme coordinates and canonical text coordinates before calling the boundary; for example, visual selections and comment operations convert grapheme positions on a line into scalar positions before building ranges [@editor].
+Text edits enter the boundary as `TextRange` values. `TextPosition::character` is a Unicode scalar index within a logical line, not a UTF-8 byte offset, grapheme index, terminal column, or LSP UTF-16 code-unit offset [@undo]. The editor converts between cursor grapheme coordinates and canonical text coordinates before calling the boundary; for example, visual selections and comment operations convert grapheme positions on a line into scalar positions before building ranges [@editor]. See [Coordinate Systems](../../concepts/editor/coordinate-systems) for the broader model behind those conversions.
 
 The coordinate rule matters because surrounding systems use different units. The editor stores cursor `x` as a grapheme index, rendering uses terminal display columns, syntax highlighting spans use bytes, and LSP positions use UTF-16 code units [@editor]. Centralizing text mutation at `TextRange` keeps those conversions explicit and prevents a plugin, LSP response, or command handler from mixing coordinate systems inside raw buffer mutation.
 
@@ -29,7 +29,7 @@ The coordinate rule matters because surrounding systems use different units. The
 
 `begin_transaction` and `begin_transaction_with_origin` capture the current cursor snapshot and open a buffer-local undo transaction, optionally with an attributed origin such as user, plugin, agent, or LSP [@editor]. `replace_range` first reads the old text, returns early for no-op replacements, asserts that a transaction is active, computes the absolute character range, applies `Buffer::replace_range_raw`, updates marks, writes the special `.` mark, and records the old and new text in undo history [@editor]. `commit_transaction` delegates to `UndoHistory::commit_transaction` and refreshes the buffer dirty flag from history state [@editor].
 
-`UndoHistory` makes this a logical edit boundary rather than a raw diff list. A transaction stores ordered replacements, cursor state before and after, attribution, and revisions; commit advances the history revision once for the complete logical change and preserves sibling branches when editing after an undo [@undo]. Empty transactions are discarded, and equal old/new replacement records are ignored [@undo].
+`UndoHistory` makes this a logical edit boundary rather than a raw diff list. A transaction stores ordered replacements, cursor state before and after, attribution, and revisions; commit advances the history revision once for the complete logical change and preserves sibling branches when editing after an undo [@undo]. Empty transactions are discarded, and equal old/new replacement records are ignored [@undo]. The user-facing model is covered by [Undo Tree](../../concepts/editor/undo-tree).
 
 ## Subsystems Updated By A Change
 
@@ -39,7 +39,7 @@ Notification is explicit. `notify_change` opens the current file in LSP if neede
 
 ## Entry Points
 
-User actions call the boundary through editing helpers such as comment toggling, selection transformations, joins, deletes, inserts, and replacements [@editor]. Plugin text requests also route through the same path: `BufferInsert`, `BufferDelete`, and `BufferReplace` open plugin-labeled transactions, call `replace_range`, commit, notify change consumers, and request render [@editor]. Agent proposal acceptance uses an attributed transaction before applying the proposed replacement and notifying plugins about proposal application [@editor].
+User actions call the boundary through editing helpers such as comment toggling, selection transformations, joins, deletes, inserts, and replacements [@editor]. Plugin text requests also route through the same path: `BufferInsert`, `BufferDelete`, and `BufferReplace` open plugin-labeled transactions, call `replace_range`, commit, notify change consumers, and request render [@editor]. Agent proposal acceptance uses an attributed transaction before applying the proposed replacement and notifying plugins about proposal application [@editor]; [Proposal Workspace](../agent/proposal-workspace) explains the staged state that reaches this boundary only after review.
 
 Tests exercise this boundary from higher-level workflows rather than only from helper functions. Agent editor tools stage Unicode edits in a proposal workspace without touching the live buffer or disk, reject stale revisions and workspace escapes, and preserve focused conversation UI while navigating files [@editing-tests]. Those tests confirm that agent-side edit preparation is separate from direct buffer mutation and that accepted editor changes still need to enter the editor-owned mutation path.
 

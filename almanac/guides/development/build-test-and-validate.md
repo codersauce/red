@@ -60,7 +60,7 @@ python3 scripts/readme_release.py --check
 python3 -m unittest tests.test_discord_release
 ```
 
-The workflow lint job validates GitHub Actions, checks the README release version, and runs Discord announcement tests [@ci]. The CI `fmt`, `self-check`, and `perf` jobs respectively run rustfmt, `cargo run --locked -- --self-check`, and the release-mode Husk cursor benchmark with `--assert` [@ci]. For the details of the CI surface, see [CI And Validation](../../reference/validation/ci-and-validation); for the runtime diagnostic itself, see [Self Check](../../reference/runtime/self-check).
+The workflow lint job validates GitHub Actions, checks the README release version, and runs Discord announcement tests [@ci]. The CI `fmt`, `self-check`, and `perf` jobs respectively run rustfmt, `cargo run --locked -- --self-check`, and the release-mode Husk cursor benchmark with `--assert` [@ci]. For the details of the CI surface, see [CI And Validation](../../reference/validation/ci-and-validation); for benchmark thresholds and workstation baselines, see [Performance Checks](../performance/performance-checks); for the runtime diagnostic itself, see [Self Check](../../reference/runtime/self-check).
 
 ## Handle Terminal Output Tests
 

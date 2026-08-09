@@ -30,6 +30,8 @@ Start with [Plugin Lifecycle And Reload](lifecycle-and-reload) for discovery, ac
 
 Use [Resource Ownership](resource-ownership) when plugin work touches panels, workspaces, window bars, overlays, decorations, gutter signs, pickers, or composers. Use [Process And Filesystem Boundaries](process-and-filesystem-boundaries) when plugin code starts child processes or reads and writes workspace files.
 
+[Command Discovery](../commands/command-discovery) covers plugin command metadata, palette rows, colon command collisions, keymap shortcuts, and panel-global command scope.
+
 [Bundled Husk Plugins](../../concepts/plugins/bundled-husk-plugins) explains how shipped plugins relate to embedded runtime assets and pure Husk packages. [Callback-Scoped Dialogs](../../concepts/plugins/callback-scoped-dialogs) explains the handle-based picker and composer model used by plugin callbacks.
 
 Use [Official Language Pack Distribution](../../decisions/plugins/language-pack-distribution) when external plugin work touches first-party language-pack cataloging, release artifact boundaries, or native grammar approval.

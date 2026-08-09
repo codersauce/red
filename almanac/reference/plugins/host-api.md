@@ -20,7 +20,7 @@ sources:
     path: docs/plugin_api_changes.json
 ---
 
-The Plugin Host API reference identifies the files that define Red's Husk plugin contract and the rules for changing it. The canonical schema is `src/plugin/host_api.json`; it declares version `0.7.0` and lists host calls by `name`, `kind`, `signature`, and `introduced` [@schema]. The implementation embeds that schema in `src/plugin/api.rs`, validates literal plugin calls against it, and tests that runtime dispatch remains covered by the schema [@api]. This page does not copy the full schema; open the schema when exact call names or signatures are needed.
+The Plugin Host API reference identifies the files that define Red's Husk plugin contract and the rules for changing it. The canonical schema is `src/plugin/host_api.json`; it declares version `0.8.0` and lists host calls by `name`, `kind`, `signature`, and `introduced` [@schema]. The implementation embeds that schema in `src/plugin/api.rs`, validates literal plugin calls against it, and tests that runtime dispatch remains covered by the schema [@api]. This page does not copy the full schema; open the schema when exact call names or signatures are needed.
 
 ## Source Of Truth
 
@@ -28,7 +28,7 @@ The Plugin Host API reference identifies the files that define Red's Husk plugin
 | --- | --- |
 | `src/plugin/host_api.json` | Canonical machine-readable list of host `execute` and `request` calls, signatures, and introduction versions [@schema]. |
 | `src/plugin/api.rs` | Embedded schema loader, static validator, diagnostic families, and schema coverage tests [@api]. |
-| `src/plugin/registry.rs` | Runtime compatibility gate; `RED_HOST_API_VERSION` is `0.7.0`, and `0.4.0` plus `0.6.0` remain accepted for existing packages [@registry]. |
+| `src/plugin/registry.rs` | Runtime compatibility gate; `RED_HOST_API_VERSION` is `0.8.0`, and `0.4.0`, `0.6.0`, and `0.7.0` remain accepted for existing packages [@registry]. |
 | `docs/PLUGIN_API.md` | Human compatibility guide, migration notes, and behavioral descriptions for plugin authors [@api-doc]. |
 | `docs/plugin_api_changes.json` | Versioned change manifest that records introduced symbols and migration note anchors [@changes]. |
 
@@ -49,13 +49,13 @@ The validator treats literal `red::execute("...")` and `red::request("...")` cal
 
 ## Current Version And Notable Introductions
 
-The current host API version is `0.7.0` [@schema] [@registry]. The change manifest records command metadata scope as introduced in `0.7.0`; `CompanionCall`, `DocumentSnapshot`, `DocumentApply`, `DocumentUndo`, and `UpdatePickerBusy` as introduced in `0.6.0`; `FileOperation`, `OpenInput`, and `OpenConfirm` as introduced in `0.4.0`; callback-scoped picker and composer symbols as introduced in `0.3.0`; legacy agent composer and text panel surfaces as introduced in `0.2.0`; and the original `red::execute`, `red::request`, `red::on`, and `red::state` surface as introduced in `0.1.0` [@changes].
+The current host API version is `0.8.0` [@schema] [@registry]. The change manifest records `OpenScratchBuffer.commands` as introduced in `0.8.0`; command metadata scope as introduced in `0.7.0`; `CompanionCall`, `DocumentSnapshot`, `DocumentApply`, `DocumentUndo`, and `UpdatePickerBusy` as introduced in `0.6.0`; `FileOperation`, `OpenInput`, and `OpenConfirm` as introduced in `0.4.0`; callback-scoped picker and composer symbols as introduced in `0.3.0`; legacy agent composer and text panel surfaces as introduced in `0.2.0`; and the original `red::execute`, `red::request`, `red::on`, and `red::state` surface as introduced in `0.1.0` [@changes].
 
 The schema's call list is the exact lookup source for current signatures. Examples include `OpenPicker(title: String, items: [PickerItem], options: PickerOptions, handlers: PickerHandlers)`, `OpenComposer(title: String, query: String, history: [String], handlers: ComposerHandlers)`, `OpenInput(title: String, initial: String, handlers: ComposerHandlers)`, and `OpenConfirm(title: String, message: String, handlers: PickerHandlers)` [@schema].
 
 ## Compatibility Rules
 
-Plugin packages may declare a semver range in `red_api_version`; Red checks that range before activation and quarantines malformed or incompatible packages without stopping unrelated plugins [@api-doc]. The registry accepts `0.4.0`, `0.6.0`, and the current `0.7.0` host API version, so existing packages can remain on earlier supported minors while new packages should target `^0.7.0` unless they intentionally avoid newer host calls [@registry]. Because pre-1.0 caret ranges do not cross minor versions, compatibility checks test the declared range against every supported host API version instead of only the current version [@registry]. The documented pre-1.0 policy is:
+Plugin packages may declare a semver range in `red_api_version`; Red checks that range before activation and quarantines malformed or incompatible packages without stopping unrelated plugins [@api-doc]. The registry accepts `0.4.0`, `0.6.0`, `0.7.0`, and the current `0.8.0` host API version, so existing packages can remain on earlier supported minors while new packages should target `^0.8.0` unless they intentionally avoid newer host calls [@registry] [@api-doc]. Because pre-1.0 caret ranges do not cross minor versions, compatibility checks test the declared range against every supported host API version instead of only the current version [@registry]. The documented pre-1.0 policy is:
 
 | Release kind | Compatibility rule |
 | --- | --- |
