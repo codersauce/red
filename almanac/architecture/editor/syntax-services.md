@@ -31,7 +31,7 @@ The highlighter owns the parser and query cache for tree-sitter languages. It bu
 
 Husk is a special path. The `husk` language id maps `.hk` and `.husk` files, but `highlight_with_depth` bypasses tree-sitter and calls the Husk lexer, assigning theme scopes to comments, keywords, numeric and string literals, builtin types, builtin constants, builtin variables, and operators [@highlighter]. This keeps plugin-language highlighting available even though Husk syntax is not represented by a tree-sitter grammar in this module [@highlighter].
 
-Markdown supports language injections. The markdown definition has an injection query, `collect_injections` extracts `injection.language` and `injection.content`, and nested calls to `highlight_with_depth` add injected spans back into the parent byte range until `MAX_INJECTION_DEPTH` is reached [@highlighter]. YAML takes the opposite special case: `requires_document_prefix` returns true because parsing an arbitrary indented viewport can lose mapping and scalar context [@highlighter].
+Markdown supports language injections. The markdown definition has an injection query, `collect_injections` accepts a static `#set! injection.language "..."` query property or a dynamic `@injection.language` capture, requires `@injection.content`, and nested calls to `highlight_with_depth` add injected spans back into the parent byte range until `MAX_INJECTION_DEPTH` is reached [@highlighter]. YAML takes the opposite special case: `requires_document_prefix` returns true because parsing an arbitrary indented viewport can lose mapping and scalar context [@highlighter].
 
 ## Viewport Cache And Rendering
 

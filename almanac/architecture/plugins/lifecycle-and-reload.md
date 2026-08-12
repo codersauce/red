@@ -21,13 +21,13 @@ Plugin lifecycle and reload is the boundary between configured Husk plugin sourc
 
 ## Discovery And Compatibility
 
-Configured plugins enter the registry through `add(name, path)`. The registry records the source path, marks the plugin `Pending`, snapshots the source and adjacent metadata modification times, and loads `package.json` metadata when the plugin is filesystem-backed [@registry]. A metadata load failure quarantines that plugin immediately, but the registry still inserts minimal metadata so discovery of unrelated plugins can continue [@registry].
+Configured plugins enter the registry through `add(name, path)`. The registry records the source path, marks the plugin `Pending`, snapshots source and metadata modification times, and then discovers metadata from the nearest matching external `red-plugin.toml` package before falling back to legacy adjacent `package.json` metadata or minimal single-file metadata [@registry]. A metadata load failure quarantines that plugin immediately, but the registry still inserts minimal metadata so discovery of unrelated plugins can continue [@registry].
 
 Activation checks are staged before Husk code runs. Dependencies must exist, required dependency versions must satisfy the dependent's semver requirements, and an optional `red_api_version` range must match at least one Red host API version supported by this release [@registry]. The compatibility guide documents the same policy for plugin packages: malformed or incompatible ranges quarantine the owner while editor startup and unrelated plugins continue [@api-doc].
 
 ## Activation Order And States
 
-Initialization sorts pending plugins by name and path, then defers a plugin until its declared dependencies are no longer pending [@registry]. If no progress is possible, the remaining dependency cycle is quarantined [@registry]. A plugin that passes metadata and dependency checks is read from embedded contents or the filesystem and loaded through `runtime.load_plugin_at`; success marks it `Active`, while source, compile, or activation failures produce a diagnostic `Quarantined` status [@registry].
+Initialization sorts pending plugins by name and path, then defers a plugin until its declared dependencies are no longer pending [@registry]. If no progress is possible, the remaining dependency cycle is quarantined [@registry]. A plugin that passes metadata and dependency checks but declares lazy activation events or commands remains `Pending` until that trigger asks the registry to load it [@registry]. Eager plugins are read from embedded contents or the filesystem and loaded through `runtime.load_plugin_at`; success marks them `Active`, while source, compile, or activation failures produce a diagnostic `Quarantined` status [@registry].
 
 The observable lifecycle states are `Pending`, `Active`, `ActiveWithReloadError`, `Disabled`, and `Quarantined` [@registry]. `ActiveWithReloadError` is used only when an already active plugin rejects a hot reload; the old VM, callbacks, commands, metadata, and state remain authoritative while the status records the failed replacement path and diagnostic [@registry].
 

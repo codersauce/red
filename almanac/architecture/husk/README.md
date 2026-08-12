@@ -37,7 +37,7 @@ Read [Husk Extensions](extensions) when changing static native modules, `.huskex
 
 Use [Husk Language Server](language-server) for editor-facing analysis, JSON-RPC handling, dependency stubs, diagnostics, completion, semantic tokens, rename, formatting, and Red's default `.hk` and `.husk` server configuration. The server initializes one workspace, rejects requests before initialization, handles LSP text and workspace methods, and publishes capabilities for the Husk editing surface [@lsp-server].
 
-For exact command lookup, use [Husk Command](../../reference/cli/husk-command). For Red's default LSP launch configuration, use [LSP Configuration](../../reference/lsp/configuration). For why scripts, modules, native profiles, value semantics, engine ownership, and extension tiers have their current shape, use the Husk decision pages under `decisions/husk`.
+For exact command lookup, use [Husk Command](../../reference/cli/husk-command). For Red's default LSP launch configuration, use [LSP Configuration](../../reference/lsp/configuration). For why scripts, modules, native profiles, value semantics, engine ownership, and extension tiers have their current shape, use the [Decisions](../../decisions) hub or the specific Husk decisions for [Scripts and modules](../../decisions/husk/scripts-and-modules), [Semantic profiles](../../decisions/husk/semantic-profiles), [Value semantics](../../decisions/husk/value-semantics), [Engine instance ownership](../../decisions/husk/engine-instance-ownership), and [Extension tiers](../../decisions/husk/extension-tiers).
 
 ## Runtime Boundaries
 
