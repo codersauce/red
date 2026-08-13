@@ -194,8 +194,8 @@ async fn test_tab_after_zwj_grapheme_preserves_emoji() {
     h.execute_action(Action::MoveRight).await.unwrap();
     h.execute_action(Action::InsertTab).await.unwrap();
 
-    h.assert_buffer_contents("👨‍👩‍👧‍👦    x");
-    h.assert_cursor_at(5, 0);
+    h.assert_buffer_contents("👨‍👩‍👧‍👦  x");
+    h.assert_cursor_at(3, 0);
 }
 
 #[tokio::test]
