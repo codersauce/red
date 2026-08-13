@@ -2,6 +2,39 @@
 
 All notable changes to Red are documented in this file.
 
+## [0.5.0](https://github.com/codersauce/red/compare/v0.4.0...v0.5.0)
+
+### Features
+
+- **completion:** Add compact async completion menu ([#188](https://github.com/codersauce/red/issues/188)) ([21d16ba](https://github.com/codersauce/red/commit/21d16ba889cc44b97d3ba9ca41412fc280f03c60))
+- **editor:** Add language-aware autoindent ([#184](https://github.com/codersauce/red/issues/184)) ([e72f7d2](https://github.com/codersauce/red/commit/e72f7d2db37d75fd564bc4d52c02edc458139afc))
+- **completion:** Add buffer and automatic suggestions ([f987558](https://github.com/codersauce/red/commit/f987558706604314ab2f8ba9ce4be229bf77b67e))
+
+### Bug Fixes
+
+- **completion:** Exit insert mode on escape ([#187](https://github.com/codersauce/red/issues/187)) ([e10465a](https://github.com/codersauce/red/commit/e10465ae1b6ca40688b0858e31df5bac21ccf0f7))
+- **completion:** Keep autocomplete valid while typing ([#186](https://github.com/codersauce/red/issues/186)) ([9d89583](https://github.com/codersauce/red/commit/9d89583e69afcb34810c9418725d1c926b3d295b))
+- **completion:** Filter by existing identifier prefix ([1a15171](https://github.com/codersauce/red/commit/1a151719a82630600bbb28423970821345ca833e))
+- **completion:** Insert newline when no matches remain ([#182](https://github.com/codersauce/red/issues/182)) ([b2cabfe](https://github.com/codersauce/red/commit/b2cabfe5e1bee01f6893604d724ba95a11b974cb))
+- **editor:** Refresh cursor after inserting tab ([7fa7fcd](https://github.com/codersauce/red/commit/7fa7fcda312849b3d4c3a63a028a25436135fca7))
+
+### Refactoring
+
+- **languages:** Move Python support to official pack ([#185](https://github.com/codersauce/red/issues/185)) ([a152c33](https://github.com/codersauce/red/commit/a152c33db75472b6c63ddb6a6a379cee63c8b1e5))
+
+### Continuous Integration
+
+- **windows:** Pin ripgrep release archive ([96795fe](https://github.com/codersauce/red/commit/96795fe0e63f2582e51294578e010ff1b224d591))
+- **windows:** Retry ripgrep installation ([11912e0](https://github.com/codersauce/red/commit/11912e060c47b64e0cf6d337d503e2c8d445ec9e))
+
+### Other
+
+- Update completion and CI validation ([59334f2](https://github.com/codersauce/red/commit/59334f2f59b57ea5693a0b74cea1eebb17c93824))
+- Improve guide and cli navigation ([e2f2371](https://github.com/codersauce/red/commit/e2f2371110bf0da0d5327322778077b16d04bead))
+- Improve wiki navigation and stale claims ([334c507](https://github.com/codersauce/red/commit/334c507bf3fefa2d2f06b97a79665c2b37615ef0))
+- Refresh plugin api and graph links ([04b7e79](https://github.com/codersauce/red/commit/04b7e796a8515a4d84d60964b3216b95642de691))
+- Document statusline defaults ([b080dbd](https://github.com/codersauce/red/commit/b080dbd5d470bf9358eb5c67b772668f8fafd32c))
+
 ## [0.4.0](https://github.com/codersauce/red/compare/v0.3.0...v0.4.0)
 
 ### Features
