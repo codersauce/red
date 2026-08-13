@@ -334,11 +334,14 @@ impl CompletionUI {
 
     fn push_filter_char(&mut self, c: char) {
         self.filter.push(c);
+        self.anchor_x = self.anchor_x.saturating_add(display_width(&c.to_string()));
         self.refilter_items(None);
     }
 
     fn pop_filter_char(&mut self) {
-        self.filter.pop();
+        if let Some(c) = self.filter.pop() {
+            self.anchor_x = self.anchor_x.saturating_sub(display_width(&c.to_string()));
+        }
         self.refilter_items(None);
     }
 
@@ -812,6 +815,37 @@ mod tests {
         assert!(ui.width < initial_width);
         assert_eq!(ui.x + 1 + LEFT_PADDING + ICON_COLUMN_WIDTH, 40 - 4);
         assert_eq!(ui.width, MIN_INNER_WIDTH + 2);
+    }
+
+    #[test]
+    fn completion_label_anchor_stays_fixed_as_filter_grows_and_shrinks() {
+        let mut ui = CompletionUI::new();
+        ui.show_with_bounds(
+            vec![item("manual_seed", Some(CompletionItemKind::Function))],
+            40,
+            5,
+            80,
+            24,
+        );
+        ui.set_filter("m");
+        let label_x = ui.x + 1 + LEFT_PADDING + ICON_COLUMN_WIDTH;
+
+        assert_eq!(
+            ui.handle_event(&key(KeyCode::Char('a'), KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(ui.x + 1 + LEFT_PADDING + ICON_COLUMN_WIDTH, label_x);
+        assert_eq!(
+            ui.handle_event(&key(KeyCode::Char('n'), KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(ui.x + 1 + LEFT_PADDING + ICON_COLUMN_WIDTH, label_x);
+
+        assert_eq!(
+            ui.handle_event(&key(KeyCode::Backspace, KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(ui.x + 1 + LEFT_PADDING + ICON_COLUMN_WIDTH, label_x);
     }
 
     #[test]

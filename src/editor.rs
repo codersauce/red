@@ -21822,12 +21822,23 @@ impl Editor {
             .completion_prefix()
             .map(|(filter, _)| filter)
             .unwrap_or_default();
+        let active_snapshot = self
+            .completion_snapshot
+            .as_ref()
+            .filter(|active| self.completion_snapshot_is_current(active))
+            .cloned();
         if self
             .current_dialog
             .as_mut()
             .is_some_and(|dialog| dialog.update_completion(items.clone(), &filter))
         {
-            self.completion_snapshot = Some(snapshot);
+            self.completion_snapshot = Some(if snapshot.original_range.is_some() {
+                snapshot
+            } else if let Some(active_snapshot) = active_snapshot {
+                active_snapshot
+            } else {
+                self.activate_completion_snapshot(snapshot)
+            });
             return true;
         }
 
@@ -29191,6 +29202,50 @@ builtin = "rust"
         let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
         let mut runtime = Runtime::new();
 
+        type_completion_suffix(&mut editor, "ual", &mut render_buffer, &mut runtime).await;
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), "torch.manual_seed");
+        assert!(editor.current_dialog.is_none());
+    }
+
+    #[tokio::test]
+    async fn refreshing_open_completion_preserves_ranges_for_typing_and_acceptance() {
+        let mut editor = completion_typing_editor();
+        let initial_snapshot = editor.completion_snapshot();
+        assert!(
+            editor.show_completion_items(vec![completion_item("manual_seed")], initial_snapshot)
+        );
+        let active_range = editor
+            .completion_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.original_range.clone())
+            .expect("visible completion should activate its replacement range");
+
+        let refresh_snapshot = editor.completion_snapshot();
+        assert!(refresh_snapshot.original_range.is_none());
+        assert!(editor.show_completion_items(
+            vec![completion_item("manual_seed"), completion_item("many")],
+            refresh_snapshot
+        ));
+        assert_eq!(
+            editor
+                .completion_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.original_range.as_ref()),
+            Some(&active_range)
+        );
+
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
         type_completion_suffix(&mut editor, "ual", &mut render_buffer, &mut runtime).await;
         editor
             .process_editor_event(
