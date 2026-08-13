@@ -9625,9 +9625,11 @@ impl Editor {
         }
 
         let line = self.current_buffer().get(request_line)?;
+        let line = line.trim_end_matches(['\r', '\n']);
+        let characters = line.chars().collect::<Vec<_>>();
         let mut units = 0usize;
         let mut request_char_index = None;
-        for (index, character) in line.trim_end_matches(['\r', '\n']).chars().enumerate() {
+        for (index, character) in characters.iter().enumerate() {
             if units == request_character {
                 request_char_index = Some(index);
                 break;
@@ -9637,21 +9639,19 @@ impl Editor {
                 return None;
             }
         }
-        let request_character = request_char_index.or_else(|| {
-            (units == request_character)
-                .then(|| line.trim_end_matches(['\r', '\n']).chars().count())
-        })?;
+        let request_character = request_char_index
+            .or_else(|| (units == request_character).then_some(characters.len()))?;
         let current_character = self.grapheme_to_char_on_line(self.cx, self.buffer_line());
-        if current_character < request_character {
+        if current_character < request_character || current_character > characters.len() {
             return None;
         }
 
-        Some(
-            line.chars()
-                .skip(request_character)
-                .take(current_character - request_character)
-                .collect(),
-        )
+        let mut filter_start = request_character;
+        while filter_start > 0 && is_keyword_char(characters[filter_start - 1]) {
+            filter_start -= 1;
+        }
+
+        Some(characters[filter_start..current_character].iter().collect())
     }
 
     fn take_pending_plugin_request(&mut self, method: &str, id: i64) -> Option<RequestId> {
@@ -21513,6 +21513,9 @@ impl Editor {
             self.size.0 as usize,
             self.size.1 as usize,
         );
+        if let Some((filter, _)) = self.completion_prefix() {
+            completion.set_filter(&filter);
+        }
         self.current_dialog = Some(Box::new(completion));
         self.completion_snapshot = Some(snapshot);
         true
@@ -28774,6 +28777,71 @@ builtin = "rust"
             editor.completion_filter_for_response(&response).as_deref(),
             Some("as")
         );
+    }
+
+    #[test]
+    fn completion_response_filter_includes_identifier_before_request_position() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "print(\"x shape:\", xb".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![buffer]).unwrap();
+        editor.cx = "print(\"x shape:\", xb".chars().count();
+        let response = ResponseMessage {
+            id: 1,
+            result: serde_json::Value::Null,
+            request: Some(crate::lsp::Request::new(
+                "textDocument/completion",
+                serde_json::json!({
+                    "position": {
+                        "line": 0,
+                        "character": "print(\"x shape:\", xb".chars().count()
+                    }
+                }),
+            )),
+        };
+
+        assert_eq!(
+            editor.completion_filter_for_response(&response).as_deref(),
+            Some("xb")
+        );
+    }
+
+    #[test]
+    fn completion_response_selects_existing_identifier_over_broad_lsp_items() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "xb".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![buffer]).unwrap();
+        editor.mode = Mode::Insert;
+        editor.cx = 2;
+        let response = InboundMessage::Message(ResponseMessage {
+            id: 1,
+            result: serde_json::json!([
+                { "label": "BaseException", "sortText": "1" },
+                { "label": "BaseExceptionGroup", "sortText": "2" },
+                { "label": "xb", "sortText": "3" }
+            ]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/completion",
+                serde_json::json!({ "position": { "line": 0, "character": 2 } }),
+            )),
+        });
+
+        assert!(matches!(
+            editor.handle_lsp_message(&response, Some("textDocument/completion".to_string())),
+            Some(Action::ShowDialog)
+        ));
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let action = editor.handle_event(&enter).unwrap().unwrap();
+        let KeyAction::Multiple(actions) = action else {
+            panic!("expected completion application action");
+        };
+        assert!(matches!(
+            actions.first(),
+            Some(Action::ApplyCompletion { item, .. }) if item.label == "xb"
+        ));
     }
 
     #[test]
