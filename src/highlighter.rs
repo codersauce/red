@@ -372,8 +372,6 @@ const LANGUAGE_NAMES: &[(&str, &str)] = &[
     ("toml", "toml"),
     ("yaml", "yaml"),
     ("yml", "yaml"),
-    ("py", "python"),
-    ("python", "python"),
     ("md", "markdown"),
     ("markdown", "markdown"),
     ("bash", "bash"),
@@ -767,13 +765,6 @@ fn language_definitions() -> Vec<BundledLanguageDefinition> {
                 tree_sitter_yaml::HIGHLIGHTS_QUERY,
                 YAML_ADDITIONAL_HIGHLIGHTS_QUERY,
             ],
-            injection_query: None,
-        },
-        BundledLanguageDefinition {
-            id: "python",
-            extensions: &["py", "pyw"],
-            language: || tree_sitter_python::LANGUAGE.into(),
-            highlight_queries: &[tree_sitter_python::HIGHLIGHTS_QUERY],
             injection_query: None,
         },
         BundledLanguageDefinition {
@@ -1216,6 +1207,7 @@ mod tests {
             highlighter.language_id_for_file(Some("plugin.hk")),
             Some("husk")
         );
+        assert_eq!(highlighter.language_id_for_file(Some("main.py")), None);
         assert_eq!(highlighter.language_id_for_file(Some("LICENSE")), None);
     }
 
@@ -1402,7 +1394,6 @@ mod tests {
             ("json", r#"{"value": true}"#),
             ("toml", "value = true\n"),
             ("yaml", "value: true\n"),
-            ("python", "def main():\n    return True\n"),
             ("bash", "if [ -f Cargo.toml ]; then\n  echo yes\nfi\n"),
             (
                 "fish",
@@ -1437,7 +1428,7 @@ mod tests {
         let highlighter = highlighter();
 
         assert_eq!(highlighter.language_id_for_name("rs"), Some("rust"));
-        assert_eq!(highlighter.language_id_for_name("py"), Some("python"));
+        assert_eq!(highlighter.language_id_for_name("py"), None);
         assert_eq!(highlighter.language_id_for_name("yml"), Some("yaml"));
         assert_eq!(highlighter.language_id_for_name("ts"), Some("typescript"));
         assert_eq!(highlighter.language_id_for_name("jsx"), Some("jsx"));
@@ -1569,7 +1560,6 @@ mod tests {
                 "lua",
                 "markdown",
                 "powershell",
-                "python",
                 "rust",
                 "toml",
                 "tsx",

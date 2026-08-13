@@ -96,6 +96,7 @@ The same catalog is available from the CLI:
 ```shell
 red plugin catalog
 red plugin install --catalog go-language
+red plugin install --catalog python-language --trust-native-grammars
 ```
 
 Catalog entries resolve to immutable, target-specific release archives. Red

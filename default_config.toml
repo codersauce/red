@@ -129,7 +129,7 @@ waiting = "steady_underscore"
 #show_diagnostics = false 
 
 # Language servers are selected by file extension. The built-in defaults cover
-# Rust, Fish, Markdown, JavaScript/TypeScript, JSON, TOML, YAML, Python, and Lua.
+# Rust, Fish, Markdown, JavaScript/TypeScript, JSON, TOML, YAML, and Lua.
 # Fish LSP features require fish-lsp to be installed; Red runs fish-lsp start.
 # You can override or add servers here. Existing single-language configs still work:
 #
@@ -209,7 +209,6 @@ jsx = "// %s"
 lua = "-- %s"
 markdown = "<!-- %s -->"
 powershell = "# %s"
-python = "# %s"
 rust = "// %s"
 scss = "/* %s */"
 sql = "-- %s"
