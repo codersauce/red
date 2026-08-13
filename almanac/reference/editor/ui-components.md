@@ -50,7 +50,7 @@ Red's modal UI components implement a common `Component` trait above the editor 
 
 ## Completion UI
 
-`CompletionUI` is the completion menu for LSP items. It draws rows produced by its internal renderer, moves selection with arrow keys, `Tab`, `BackTab`, `Ctrl-J`, `Ctrl-K`, and page keys, applies the selected completion on `Enter`, and can apply a completion with an LSP commit character [@completion]. It returns `allows_event_passthrough() == true`, so normal typed characters and backspace can continue into editor input while the completion menu updates its filter [@completion].
+`CompletionUI` is the completion menu for LSP items. It draws rows produced by its internal renderer, moves selection with arrow keys, `Tab`, `BackTab`, `Ctrl-J`, `Ctrl-K`, and page keys, applies the selected completion on `Enter`, and can apply a completion with an LSP commit character [@completion]. When filtering leaves no selected item, `Enter` closes the dialog and inserts a newline, while `Esc` closes the dialog and enters Normal mode whether or not candidates are visible [@completion]. It returns `allows_event_passthrough() == true`, so normal typed characters and backspace can continue into editor input while the completion menu updates its filter [@completion].
 
 ## Composer And Prompt Components
 

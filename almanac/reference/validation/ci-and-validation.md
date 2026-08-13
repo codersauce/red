@@ -42,6 +42,8 @@ The main CI workflow runs on pushes and pull requests targeting `main` or `devel
 | `self-check` | Runs `cargo run --locked -- --self-check` to initialize and validate bundled runtime state [@ci]. |
 | `changelog` | Validates `cliff.toml`, and on `release/v*` PRs regenerates and diffs release changelog content against `CHANGELOG.md` [@ci]. |
 
+The Windows ripgrep install path in the `test` job downloads the official `ripgrep-15.2.0-x86_64-pc-windows-msvc.zip` release archive, verifies SHA-256 `71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5`, extracts it under `RUNNER_TEMP`, adds the extracted directory to `GITHUB_PATH`, and runs `rg.exe --version` [@ci]. This avoids depending on Chocolatey availability for Windows tests that exercise project search and other `rg`-backed paths [@ci].
+
 ## Plugin Check Workflow
 
 The Husk Plugin Check workflow is path-filtered to plugin, Husk, asset, configuration, self-check, and example changes [@plugin-check]. It runs on push and pull request events when those paths change [@plugin-check].

@@ -1,6 +1,6 @@
 ---
 title: "Default Config"
-summary: "Red's default configuration defines the embedded baseline for editor behavior, keymaps, bundled plugins, LSP routing, search, picker UI, cursor shapes, AI, and permissions."
+summary: "Red's default configuration defines the embedded baseline for editor behavior, keymaps, bundled plugins, LSP routing, completion, search, picker UI, cursor shapes, AI, and permissions."
 topics: [reference, configuration, defaults]
 sources:
   - id: defaults
@@ -19,7 +19,7 @@ sources:
 
 The sample/default file says user configuration is read from `$XDG_CONFIG_HOME/red/config.toml` or `$HOME/.config/red/config.toml` [@defaults]. The code computes the same config directory, preferring a non-empty `XDG_CONFIG_HOME` and otherwise using `$HOME/.config/red` [@config]. Runtime paths such as logs, preferences, sessions, plugins, and themes are resolved below that directory unless a setting explicitly uses an absolute or expanded path [@config].
 
-The top-level schema accepts keys for editor behavior, keymaps, theme, cursor, plugins, disabled plugins, plugin permissions, plugin config, logging, search, picker, statusline, key hints, clipboard, LSP, commenting, matchit, AI, diagnostics, and ASCII window borders [@config]. Unknown top-level fields are ignored with diagnostics during recoverable user loading rather than becoming part of the effective configuration [@config].
+The top-level schema accepts keys for editor behavior, keymaps, theme, cursor, plugins, disabled plugins, plugin permissions, plugin config, logging, search, completion, picker, statusline, key hints, clipboard, LSP, commenting, matchit, AI, diagnostics, and ASCII window borders [@config]. Unknown top-level fields are ignored with diagnostics during recoverable user loading rather than becoming part of the effective configuration [@config].
 
 ## Top-Level Defaults
 
@@ -39,11 +39,12 @@ The top-level schema accepts keys for editor behavior, keymaps, theme, cursor, p
 
 `show_diagnostics` defaults to true in code, and `window_borders_ascii` defaults to false [@config]. These fields are accepted user-facing top-level fields even though the shipped default file leaves `show_diagnostics` commented [@defaults] [@config].
 
-## Search, Picker, Statusline, Key Hints, Clipboard, And Cursor
+## Search, Completion, Picker, Statusline, Key Hints, Clipboard, And Cursor
 
 | Section | Defaults |
 | --- | --- |
 | `[search]` | `incsearch = true`, `hlsearch = true`, `wrapscan = true`, `ignorecase = false`, `smartcase = false` [@defaults] [@config]. |
+| `[completion]` | `auto_trigger = true`, `min_prefix_length = 1`, `debounce_ms = 120`, `buffer_words = true`, `max_buffer_words = 100` [@defaults] [@config]. |
 | `[picker]` | `input_position = "bottom"` [@defaults] [@config]. |
 | `[picker.icons]` | `style = "nerd_font"`, `color = true`; code also accepts `unicode`, `ascii`, and `none` icon styles [@defaults] [@config]. |
 | `[statusline]` | `left = ["mode", "git_branch", "filename"]`, `right = ["position", "syntax"]`; the configuration schema lets all 25 statusline sections move between sides [@defaults] [@config]. |
