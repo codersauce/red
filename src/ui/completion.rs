@@ -83,11 +83,17 @@ impl CompletionUI {
             .collect();
         self.commit_chars.sort_unstable();
         self.commit_chars.dedup();
-        // Sort items by preselect and label
+        // Keep server-provided relevance ordering while still honoring preselection.
         items.sort_by(|a, b| {
             b.preselect
                 .unwrap_or(false)
                 .cmp(&a.preselect.unwrap_or(false))
+                .then_with(|| {
+                    a.sort_text
+                        .as_deref()
+                        .unwrap_or(&a.label)
+                        .cmp(b.sort_text.as_deref().unwrap_or(&b.label))
+                })
                 .then(a.label.cmp(&b.label))
         });
 
@@ -181,29 +187,22 @@ impl CompletionUI {
         }
 
         let filter = filter.as_bytes();
-        let mut contains = false;
-        for candidate in [
-            item.filter_text.as_deref(),
-            Some(item.label.as_str()),
-            item.sort_text.as_deref(),
-            item.insert_text.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
+        let candidate = item
+            .filter_text
+            .as_deref()
+            .unwrap_or(&item.label)
+            .as_bytes();
+        if candidate
+            .get(..filter.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(filter))
         {
-            let candidate = candidate.as_bytes();
-            if candidate
-                .get(..filter.len())
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(filter))
-            {
-                return Some(0);
-            }
-            contains |= candidate
-                .windows(filter.len())
-                .any(|window| window.eq_ignore_ascii_case(filter));
+            return Some(0);
         }
 
-        contains.then_some(1)
+        candidate
+            .windows(filter.len())
+            .any(|window| window.eq_ignore_ascii_case(filter))
+            .then_some(1)
     }
 
     fn refilter_items(&mut self) {
@@ -669,6 +668,19 @@ mod tests {
     }
 
     #[test]
+    fn completion_respects_server_sort_text() {
+        let mut later_label = item("alpha", Some(CompletionItemKind::Variable));
+        later_label.sort_text = Some("20".to_string());
+        let mut earlier_label = item("zeta", Some(CompletionItemKind::Variable));
+        earlier_label.sort_text = Some("10".to_string());
+
+        let mut ui = CompletionUI::new();
+        ui.show(vec![later_label, earlier_label], 0, 0);
+
+        assert_eq!(ui.selected_item().unwrap().label, "zeta");
+    }
+
+    #[test]
     fn completion_rows_fit_display_width_with_wide_labels() {
         let mut ui = CompletionUI::new();
         ui.show(
@@ -994,5 +1006,22 @@ mod tests {
         assert_eq!(ui.items, vec![1]);
         assert_eq!(ui.selected_item().unwrap().label, "target");
         assert_eq!(ui.all_items[1].detail.as_ref().unwrap().as_ptr(), payload);
+    }
+
+    #[test]
+    fn filtering_uses_filter_text_or_label_but_not_sort_or_insert_text() {
+        let mut sort_only = item("BaseException", Some(CompletionItemKind::Class));
+        sort_only.sort_text = Some("xb".to_string());
+        sort_only.insert_text = Some("xb".to_string());
+        let mut overridden_label = item("xb_alias", Some(CompletionItemKind::Variable));
+        overridden_label.filter_text = Some("alias".to_string());
+        let exact = item("xb", Some(CompletionItemKind::Variable));
+        let mut ui = CompletionUI::new();
+        ui.show(vec![sort_only, overridden_label, exact], 0, 0);
+
+        ui.set_filter("xb");
+
+        assert_eq!(ui.items.len(), 1);
+        assert_eq!(ui.selected_item().unwrap().label, "xb");
     }
 }

@@ -114,6 +114,29 @@ and available on `PATH`. Servers start only after a matching file is opened.
 See the [Husk language-server guide](HUSK_LSP.md) for its complete feature and
 external-crate contract.
 
+Completion combines two sources. Matching words from all open buffers provide
+fast text completion even when no language server is installed. When a server
+is available, its type-aware candidates are merged in and ranked ahead of
+buffer words. `Ctrl-Space` requests both sources explicitly; typing an
+identifier prefix requests them automatically after a short quiet period.
+Language-server trigger characters such as `.` still request completion
+immediately.
+
+Tune or disable either behavior in `config.toml`:
+
+```toml
+[completion]
+auto_trigger = true
+min_prefix_length = 1
+debounce_ms = 120
+buffer_words = true
+max_buffer_words = 100
+```
+
+For example, Python's type-aware names, attributes, signatures, and import
+suggestions require its configured `pyright-langserver` executable to be on
+`PATH`. Buffer-word completion remains available if that executable is absent.
+
 Add or override a server in `config.toml`:
 
 ```toml

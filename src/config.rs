@@ -241,6 +241,9 @@ pub struct Config {
     /// Interactive search behavior.
     #[serde(default)]
     pub search: SearchConfig,
+    /// Insert-mode completion sources and automatic triggering.
+    #[serde(default)]
+    pub completion: CompletionConfig,
     /// Picker layout behavior.
     #[serde(default)]
     pub picker: PickerConfig,
@@ -699,6 +702,51 @@ impl Default for SearchConfig {
             smartcase: false,
         }
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+/// Insert-mode completion behavior shared by buffer and language-server sources.
+pub struct CompletionConfig {
+    /// Request completion after an identifier prefix is typed.
+    #[serde(default = "default_true")]
+    pub auto_trigger: bool,
+    /// Minimum identifier prefix length required for automatic completion.
+    #[serde(default = "default_completion_min_prefix_length")]
+    pub min_prefix_length: usize,
+    /// Quiet period after typing before automatic completion is requested.
+    #[serde(default = "default_completion_debounce_ms")]
+    pub debounce_ms: u64,
+    /// Include matching words from open buffers alongside LSP candidates.
+    #[serde(default = "default_true")]
+    pub buffer_words: bool,
+    /// Maximum number of buffer-word candidates collected for one request.
+    #[serde(default = "default_completion_max_buffer_words")]
+    pub max_buffer_words: usize,
+}
+
+impl Default for CompletionConfig {
+    fn default() -> Self {
+        Self {
+            auto_trigger: true,
+            min_prefix_length: default_completion_min_prefix_length(),
+            debounce_ms: default_completion_debounce_ms(),
+            buffer_words: true,
+            max_buffer_words: default_completion_max_buffer_words(),
+        }
+    }
+}
+
+fn default_completion_min_prefix_length() -> usize {
+    1
+}
+
+fn default_completion_debounce_ms() -> u64 {
+    120
+}
+
+fn default_completion_max_buffer_words() -> usize {
+    100
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
@@ -1692,6 +1740,7 @@ fn known_top_level_field(field: &str) -> bool {
             | "sidescrolloff"
             | "splash"
             | "search"
+            | "completion"
             | "picker"
             | "statusline"
             | "key_hints"
@@ -1840,6 +1889,14 @@ fn known_schema_path(path: &[String]) -> bool {
         ["search", field] => matches!(
             *field,
             "incsearch" | "hlsearch" | "wrapscan" | "ignorecase" | "smartcase"
+        ),
+        ["completion", field] => matches!(
+            *field,
+            "auto_trigger"
+                | "min_prefix_length"
+                | "debounce_ms"
+                | "buffer_words"
+                | "max_buffer_words"
         ),
         ["picker", "input_position"] => true,
         ["picker", "icons", field] => matches!(*field, "style" | "color"),
@@ -3660,6 +3717,28 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
 
         assert!(!config.key_hints.enabled);
         assert_eq!(config.key_hints.delay_ms, 750);
+    }
+
+    #[test]
+    fn user_config_controls_completion_sources_and_triggering() {
+        let config = Config::from_user_toml_with_overrides(
+            r#"
+[completion]
+auto_trigger = false
+min_prefix_length = 3
+debounce_ms = 250
+buffer_words = false
+max_buffer_words = 20
+"#,
+            &[],
+        )
+        .unwrap();
+
+        assert!(!config.completion.auto_trigger);
+        assert_eq!(config.completion.min_prefix_length, 3);
+        assert_eq!(config.completion.debounce_ms, 250);
+        assert!(!config.completion.buffer_words);
+        assert_eq!(config.completion.max_buffer_words, 20);
     }
 
     #[test]

@@ -89,11 +89,11 @@ use crate::{
     lsp::{
         apply_workspace_resource_operations, file_path as lsp_file_path, get_client_capabilities,
         normalized_file_path as lsp_normalized_file_path, prepare_workspace_edit,
-        text_edit_char_range, workspace_edit_operations, Command as LspCommand, CompletionResponse,
-        CompletionResponseItem, Diagnostic, DocumentEdit as LspDocumentEdit, Hover as LspHover,
-        HoverContents, InboundMessage, InlayHint, InsertTextFormat, Location, LspClient,
-        MarkedString, MarkupKind, OpenWorkspaceDocument, ParsedNotification, ProgressParams,
-        ProgressToken, Range, ResponseMessage, ServerCapabilities,
+        text_edit_char_range, workspace_edit_operations, Command as LspCommand, CompletionItemKind,
+        CompletionResponse, CompletionResponseItem, Diagnostic, DocumentEdit as LspDocumentEdit,
+        Hover as LspHover, HoverContents, InboundMessage, InlayHint, InsertTextFormat, Location,
+        LspClient, MarkedString, MarkupKind, OpenWorkspaceDocument, ParsedNotification,
+        ProgressParams, ProgressToken, Range, ResponseMessage, ServerCapabilities,
         ServerRequest as LspServerRequest, TextEdit as LspTextEdit,
         WorkspaceEditOperation as LspWorkspaceEditOperation, MAX_WORKSPACE_EDIT_TOTAL_BYTES,
     },
@@ -2687,7 +2687,9 @@ pub struct Editor {
     pending_lsp_edit_requests: HashMap<i64, PendingLspEdit>,
     pending_lsp_format_saves: HashMap<i64, PendingLspFormatSave>,
     pending_lsp_revision_snapshots: HashMap<i64, Vec<(String, u64)>>,
-    completion_snapshot: Option<PendingLspEdit>,
+    pending_buffer_completions: HashMap<i64, Vec<CompletionResponseItem>>,
+    scheduled_completion: Option<ScheduledCompletion>,
+    completion_snapshot: Option<CompletionSnapshot>,
 }
 
 /// Terminal-independent owner used by the local detach protocol. It keeps the real
@@ -3133,6 +3135,33 @@ struct PendingLspEdit {
     revision: u64,
     uri: String,
 }
+
+#[derive(Debug, Clone)]
+struct CompletionSnapshot {
+    buffer_id: BufferId,
+    revision: u64,
+    uri: Option<String>,
+}
+
+impl From<PendingLspEdit> for CompletionSnapshot {
+    fn from(pending: PendingLspEdit) -> Self {
+        Self {
+            buffer_id: pending.buffer_id,
+            revision: pending.revision,
+            uri: Some(pending.uri),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScheduledCompletion {
+    deadline: Instant,
+    buffer_id: BufferId,
+    revision: u64,
+    cursor: TextPosition,
+}
+
+const MAX_BUFFER_COMPLETION_SCAN_CHARS: usize = 1_000_000;
 
 struct PluginDocumentTransaction {
     owner: String,
@@ -3833,6 +3862,8 @@ impl Editor {
             pending_lsp_edit_requests: HashMap::new(),
             pending_lsp_format_saves: HashMap::new(),
             pending_lsp_revision_snapshots: HashMap::new(),
+            pending_buffer_completions: HashMap::new(),
+            scheduled_completion: None,
             completion_snapshot: None,
         })
     }
@@ -7062,6 +7093,28 @@ impl Editor {
                 .await?;
         }
 
+        let completion_changed = if self
+            .scheduled_completion
+            .is_some_and(|scheduled| Instant::now() >= scheduled.deadline)
+        {
+            let scheduled = self
+                .scheduled_completion
+                .take()
+                .expect("elapsed completion schedule must exist");
+            let still_current = self.is_insert()
+                && self.current_dialog.is_none()
+                && self.current_buffer().id() == scheduled.buffer_id
+                && self.current_buffer().revision() == scheduled.revision
+                && self.cursor_text_position() == scheduled.cursor;
+            if still_current {
+                self.request_completion(None).await?
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         let dialog_changed = if let Some(current_dialog) = &mut self.current_dialog {
             current_dialog.tick()?
         } else {
@@ -7075,7 +7128,7 @@ impl Editor {
             self.keymap_hints_visible = true;
         }
         let panel_animation_changed = self.panel_manager.poll_animation();
-        if dialog_changed || keymap_hints_changed || panel_animation_changed {
+        if completion_changed || dialog_changed || keymap_hints_changed || panel_animation_changed {
             self.render(buffer)?;
         }
 
@@ -9572,9 +9625,11 @@ impl Editor {
         }
 
         let line = self.current_buffer().get(request_line)?;
+        let line = line.trim_end_matches(['\r', '\n']);
+        let characters = line.chars().collect::<Vec<_>>();
         let mut units = 0usize;
         let mut request_char_index = None;
-        for (index, character) in line.trim_end_matches(['\r', '\n']).chars().enumerate() {
+        for (index, character) in characters.iter().enumerate() {
             if units == request_character {
                 request_char_index = Some(index);
                 break;
@@ -9584,21 +9639,19 @@ impl Editor {
                 return None;
             }
         }
-        let request_character = request_char_index.or_else(|| {
-            (units == request_character)
-                .then(|| line.trim_end_matches(['\r', '\n']).chars().count())
-        })?;
+        let request_character = request_char_index
+            .or_else(|| (units == request_character).then_some(characters.len()))?;
         let current_character = self.grapheme_to_char_on_line(self.cx, self.buffer_line());
-        if current_character < request_character {
+        if current_character < request_character || current_character > characters.len() {
             return None;
         }
 
-        Some(
-            line.chars()
-                .skip(request_character)
-                .take(current_character - request_character)
-                .collect(),
-        )
+        let mut filter_start = request_character;
+        while filter_start > 0 && is_keyword_char(characters[filter_start - 1]) {
+            filter_start -= 1;
+        }
+
+        Some(characters[filter_start..current_character].iter().collect())
     }
 
     fn take_pending_plugin_request(&mut self, method: &str, id: i64) -> Option<RequestId> {
@@ -9626,6 +9679,15 @@ impl Editor {
                     .as_deref()
                     .is_some_and(|uri| uri == pending.uri)
         })
+    }
+
+    fn completion_snapshot_is_current(&self, snapshot: &CompletionSnapshot) -> bool {
+        let buffer = self.current_buffer();
+        buffer.id() == snapshot.buffer_id
+            && buffer.revision() == snapshot.revision
+            && snapshot.uri.as_ref().is_none_or(|expected_uri| {
+                buffer.uri().ok().flatten().as_ref() == Some(expected_uri)
+            })
     }
 
     fn formatting_action(&mut self, response: &ResponseMessage) -> Option<Action> {
@@ -10232,6 +10294,10 @@ impl Editor {
 
                     if method == "textDocument/completion" {
                         let pending = self.pending_lsp_edit_requests.remove(&msg.id);
+                        let buffer_items = self
+                            .pending_buffer_completions
+                            .remove(&msg.id)
+                            .unwrap_or_default();
                         if pending
                             .as_ref()
                             .is_some_and(|pending| !self.pending_lsp_edit_is_current(pending))
@@ -10240,9 +10306,19 @@ impl Editor {
                                 Some("completion response is stale; buffer changed".to_string());
                             return None;
                         }
-                        if msg.result.is_null() {
-                            // TODO: retry?
+                        let snapshot = pending
+                            .map(CompletionSnapshot::from)
+                            .unwrap_or_else(|| self.completion_snapshot());
+                        if !self.completion_snapshot_is_current(&snapshot) {
+                            self.last_error = Some(
+                                "completion response is stale; active buffer changed".to_string(),
+                            );
                             return None;
+                        }
+                        if msg.result.is_null() {
+                            return self
+                                .show_completion_items(buffer_items, snapshot)
+                                .then_some(Action::ShowDialog);
                         }
 
                         if let Some(request_uri) = response_text_document_uri(msg) {
@@ -10257,7 +10333,10 @@ impl Editor {
 
                         match serde_json::from_value::<CompletionResponse>(msg.result.clone()) {
                             Ok(completion_response) => {
-                                let items = completion_response.items();
+                                let items = Self::merge_completion_items(
+                                    completion_response.items(),
+                                    buffer_items,
+                                );
                                 if items.is_empty() || self.mode != Mode::Insert {
                                     return None;
                                 }
@@ -10275,13 +10354,7 @@ impl Editor {
                                     completion.set_filter(&filter);
                                 }
                                 self.current_dialog = Some(Box::new(completion));
-                                self.completion_snapshot = pending.or_else(|| {
-                                    Some(PendingLspEdit {
-                                        buffer_id: self.current_buffer().id(),
-                                        revision: self.current_buffer().revision(),
-                                        uri: self.current_buffer().uri().ok().flatten()?,
-                                    })
-                                });
+                                self.completion_snapshot = Some(snapshot);
                                 return Some(Action::ShowDialog);
                             }
                             Err(err) => {
@@ -10351,8 +10424,24 @@ impl Editor {
                     ));
                 }
                 let pending = self.pending_lsp_edit_requests.remove(&id);
+                let buffer_items = self
+                    .pending_buffer_completions
+                    .remove(&id)
+                    .unwrap_or_default();
                 let save = self.pending_lsp_format_saves.remove(&id);
                 self.pending_lsp_revision_snapshots.remove(&id);
+                if method.as_deref() == Some("textDocument/completion") {
+                    if let Some(snapshot) = pending
+                        .as_ref()
+                        .filter(|pending| self.pending_lsp_edit_is_current(pending))
+                        .cloned()
+                        .map(CompletionSnapshot::from)
+                    {
+                        if self.show_completion_items(buffer_items, snapshot) {
+                            return Some(Action::ShowDialog);
+                        }
+                    }
+                }
                 self.last_error = Some(error_msg.message.clone());
                 let save_as = save.as_ref().is_some_and(|save| save.save_as.is_some());
                 if (error_msg.code == -32601 || save_as)
@@ -10410,8 +10499,24 @@ impl Editor {
                     ))
                 } else {
                     let pending = self.pending_lsp_edit_requests.remove(id);
+                    let buffer_items = self
+                        .pending_buffer_completions
+                        .remove(id)
+                        .unwrap_or_default();
                     let save = self.pending_lsp_format_saves.remove(id);
                     self.pending_lsp_revision_snapshots.remove(id);
+                    if method.as_deref() == Some("textDocument/completion") {
+                        if let Some(snapshot) = pending
+                            .as_ref()
+                            .filter(|pending| self.pending_lsp_edit_is_current(pending))
+                            .cloned()
+                            .map(CompletionSnapshot::from)
+                        {
+                            if self.show_completion_items(buffer_items, snapshot) {
+                                return Some(Action::ShowDialog);
+                            }
+                        }
+                    }
                     self.last_error = Some(error.to_string());
                     let save_as = save.as_ref().is_some_and(|save| save.save_as.is_some());
                     if (matches!(
@@ -14573,6 +14678,10 @@ impl Editor {
                 self.draw_statusline(buffer);
             }
             Action::InsertCharAtCursorPos(c) => {
+                let completion_dialog_open = self
+                    .current_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.allows_event_passthrough());
                 let replace_span = perf::PerfSpan::start("edit:replace_char");
                 let started_transaction = !self.transaction_active();
                 if started_transaction {
@@ -14594,6 +14703,14 @@ impl Editor {
                 self.refresh_cursor_goal();
                 if started_transaction {
                     self.commit_transaction(self.cursor_snapshot());
+                }
+
+                if completion_dialog_open {
+                    self.scheduled_completion = None;
+                } else if is_keyword_char(*c) {
+                    self.schedule_automatic_completion();
+                } else {
+                    self.scheduled_completion = None;
                 }
 
                 if self
@@ -17356,10 +17473,14 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::RequestCompletion => {
-                self.request_completion(None).await?;
+                if self.request_completion(None).await? {
+                    self.render(buffer)?;
+                }
             }
             Action::RequestCompletionWithTrigger(trigger_character) => {
-                self.request_completion(Some(*trigger_character)).await?;
+                if self.request_completion(Some(*trigger_character)).await? {
+                    self.render(buffer)?;
+                }
             }
             Action::ApplyCompletion {
                 item,
@@ -21222,6 +21343,25 @@ impl Editor {
         }
     }
 
+    fn schedule_automatic_completion(&mut self) {
+        let Some((prefix, _)) = self.completion_prefix() else {
+            self.scheduled_completion = None;
+            return;
+        };
+        if !self.config.completion.auto_trigger
+            || prefix.chars().count() < self.config.completion.min_prefix_length
+        {
+            self.scheduled_completion = None;
+            return;
+        }
+        self.scheduled_completion = Some(ScheduledCompletion {
+            deadline: Instant::now() + Duration::from_millis(self.config.completion.debounce_ms),
+            buffer_id: self.current_buffer().id(),
+            revision: self.current_buffer().revision(),
+            cursor: self.cursor_text_position(),
+        });
+    }
+
     fn handle_trigger_char(&mut self, c: char) -> anyhow::Result<Option<KeyAction>> {
         let Some(file) = self.current_buffer().file.as_deref() else {
             return Ok(None);
@@ -21240,29 +21380,214 @@ impl Editor {
         ])))
     }
 
-    async fn request_completion(&mut self, trigger_character: Option<char>) -> anyhow::Result<()> {
-        if !self.is_insert() {
-            return Ok(());
+    fn completion_prefix(&self) -> Option<(String, Range)> {
+        let line_index = self.buffer_line();
+        let line = self.current_buffer().get(line_index)?;
+        let line = line.trim_end_matches(['\r', '\n']);
+        let characters = line.chars().collect::<Vec<_>>();
+        let end = self
+            .grapheme_to_char_on_line(self.cx, line_index)
+            .min(characters.len());
+        let mut start = end;
+        while start > 0 && is_keyword_char(characters[start - 1]) {
+            start -= 1;
+        }
+        if start == end {
+            return None;
         }
 
-        if let Some(uri) = self.current_buffer().uri()? {
-            self.ensure_current_buffer_lsp_opened().await?;
+        let prefix = characters[start..end].iter().collect::<String>();
+        let start_utf16 = characters[..start]
+            .iter()
+            .map(|character| character.len_utf16())
+            .sum();
+        let end_utf16 = characters[..end]
+            .iter()
+            .map(|character| character.len_utf16())
+            .sum();
+        Some((
+            prefix,
+            Range {
+                start: crate::lsp::Position {
+                    line: line_index,
+                    character: start_utf16,
+                },
+                end: crate::lsp::Position {
+                    line: line_index,
+                    character: end_utf16,
+                },
+            },
+        ))
+    }
+
+    fn buffer_completion_items(&self) -> Vec<CompletionResponseItem> {
+        if !self.config.completion.buffer_words || self.config.completion.max_buffer_words == 0 {
+            return Vec::new();
+        }
+        let Some((prefix, replacement_range)) = self.completion_prefix() else {
+            return Vec::new();
+        };
+        let prefix_lower = prefix.to_lowercase();
+        let prefix_char_len = prefix.chars().count();
+        let active_buffer_id = self.current_buffer().id();
+        let mut buffers = self.buffer_manager.iter().collect::<Vec<_>>();
+        buffers.sort_by_key(|buffer| buffer.id() != active_buffer_id);
+
+        let mut seen = HashSet::new();
+        let mut items = Vec::new();
+        let mut remaining_scan_chars = MAX_BUFFER_COMPLETION_SCAN_CHARS;
+        for buffer in buffers {
+            let contents = buffer.contents_snapshot();
+            let scan_chars = contents.len_chars().min(remaining_scan_chars);
+            let mut word = String::new();
+            for character in contents
+                .chars()
+                .take(scan_chars)
+                .chain(std::iter::once(' '))
+            {
+                if is_keyword_char(character) {
+                    word.push(character);
+                    continue;
+                }
+                if word.chars().count() > prefix_char_len {
+                    let normalized = word.to_lowercase();
+                    if normalized.starts_with(&prefix_lower) && seen.insert(normalized) {
+                        items.push(CompletionResponseItem {
+                            label: word.clone(),
+                            kind: Some(CompletionItemKind::Text),
+                            detail: Some("Buffer word".to_string()),
+                            documentation: None,
+                            deprecated: None,
+                            preselect: None,
+                            sort_text: Some(format!("~buffer:{word}")),
+                            filter_text: Some(word.clone()),
+                            insert_text: None,
+                            insert_text_format: None,
+                            text_edit: Some(LspTextEdit {
+                                range: replacement_range.clone(),
+                                new_text: word.clone(),
+                            }),
+                            additional_text_edits: None,
+                            command: None,
+                            data: None,
+                            commit_characters: None,
+                        });
+                        if items.len() >= self.config.completion.max_buffer_words {
+                            return items;
+                        }
+                    }
+                }
+                word.clear();
+            }
+            remaining_scan_chars -= scan_chars;
+            if remaining_scan_chars == 0 {
+                break;
+            }
+        }
+        items
+    }
+
+    fn completion_snapshot(&self) -> CompletionSnapshot {
+        CompletionSnapshot {
+            buffer_id: self.current_buffer().id(),
+            revision: self.current_buffer().revision(),
+            uri: self.current_buffer().uri().ok().flatten(),
+        }
+    }
+
+    fn show_completion_items(
+        &mut self,
+        items: Vec<CompletionResponseItem>,
+        snapshot: CompletionSnapshot,
+    ) -> bool {
+        if items.is_empty() || !self.is_insert() || !self.completion_snapshot_is_current(&snapshot)
+        {
+            return false;
+        }
+        let (completion_x, completion_y) =
+            self.render_cursor_position().unwrap_or((self.cx, self.cy));
+        let mut completion = CompletionUI::with_theme(&self.theme);
+        completion.show_with_bounds(
+            items,
+            completion_x,
+            completion_y,
+            self.size.0 as usize,
+            self.size.1 as usize,
+        );
+        if let Some((filter, _)) = self.completion_prefix() {
+            completion.set_filter(&filter);
+        }
+        self.current_dialog = Some(Box::new(completion));
+        self.completion_snapshot = Some(snapshot);
+        true
+    }
+
+    fn merge_completion_items(
+        mut lsp_items: Vec<CompletionResponseItem>,
+        buffer_items: Vec<CompletionResponseItem>,
+    ) -> Vec<CompletionResponseItem> {
+        let mut labels = lsp_items
+            .iter()
+            .map(|item| item.label.to_lowercase())
+            .collect::<HashSet<_>>();
+        lsp_items.extend(
+            buffer_items
+                .into_iter()
+                .filter(|item| labels.insert(item.label.to_lowercase())),
+        );
+        lsp_items
+    }
+
+    async fn request_completion(
+        &mut self,
+        trigger_character: Option<char>,
+    ) -> anyhow::Result<bool> {
+        if !self.is_insert() {
+            return Ok(false);
+        }
+
+        self.scheduled_completion = None;
+        let buffer_items = self.buffer_completion_items();
+        let snapshot = self.completion_snapshot();
+
+        let uri = match self.current_buffer().uri() {
+            Ok(uri) => uri,
+            Err(error) => {
+                self.last_error = Some(format!("could not resolve completion document: {error}"));
+                return Ok(self.show_completion_items(buffer_items, snapshot));
+            }
+        };
+        if let Some(uri) = uri {
+            if let Err(error) = self.ensure_current_buffer_lsp_opened().await {
+                self.last_error = Some(format!("could not open LSP completion document: {error}"));
+                return Ok(self.show_completion_items(buffer_items, snapshot));
+            }
             let position = self.cursor_lsp_position();
             let pending = PendingLspEdit {
                 buffer_id: self.current_buffer().id(),
                 revision: self.current_buffer().revision(),
                 uri: uri.clone(),
             };
-            let request_id = self
+            let request_id = match self
                 .lsp
                 .request_completion(&uri, position.line, position.character, trigger_character)
-                .await?;
+                .await
+            {
+                Ok(request_id) => request_id,
+                Err(error) => {
+                    self.last_error = Some(format!("LSP completion request failed: {error}"));
+                    return Ok(self.show_completion_items(buffer_items, snapshot));
+                }
+            };
             if request_id > 0 {
                 self.pending_lsp_edit_requests.insert(request_id, pending);
+                self.pending_buffer_completions
+                    .insert(request_id, buffer_items);
+                return Ok(false);
             }
         }
 
-        Ok(())
+        Ok(self.show_completion_items(buffer_items, snapshot))
     }
 
     async fn apply_completion(
@@ -21274,7 +21599,7 @@ impl Editor {
         if self
             .completion_snapshot
             .take()
-            .is_some_and(|pending| !self.pending_lsp_edit_is_current(&pending))
+            .is_some_and(|snapshot| !self.completion_snapshot_is_current(&snapshot))
         {
             self.last_error = Some("completion item is stale; buffer changed".to_string());
             return Ok(());
@@ -28154,6 +28479,182 @@ builtin = "rust"
         }
     }
 
+    #[test]
+    fn buffer_completion_items_replace_the_typed_prefix() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(
+            None,
+            "vocab_size = 65\nprint(\"vocab_size:\", v".to_string(),
+        );
+        let mut editor =
+            Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![buffer]).unwrap();
+        editor.mode = Mode::Insert;
+        editor.cy = 1;
+        editor.cx = "print(\"vocab_size:\", v".chars().count();
+
+        let items = editor.buffer_completion_items();
+        let item = items
+            .iter()
+            .find(|item| item.label == "vocab_size")
+            .expect("buffer word completion");
+        let edit = item.text_edit.as_ref().expect("replacement edit");
+
+        assert_eq!(edit.range.start.line, 1);
+        assert_eq!(edit.range.start.character + 1, edit.range.end.character);
+        assert_eq!(edit.new_text, "vocab_size");
+    }
+
+    #[test]
+    fn buffer_completion_items_include_other_open_buffers() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffers = vec![
+            Buffer::new(None, "vec".to_string()),
+            Buffer::new(None, "vector_size = 3".to_string()),
+        ];
+        let mut editor = Editor::with_size(lsp, 60, 12, config, Theme::default(), buffers).unwrap();
+        editor.mode = Mode::Insert;
+        editor.cx = 3;
+
+        let items = editor.buffer_completion_items();
+
+        assert!(items.iter().any(|item| item.label == "vector_size"));
+    }
+
+    #[test]
+    fn buffer_completion_edit_uses_lsp_utf16_columns() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "vocab_size = 65\n🙂 vo".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![buffer]).unwrap();
+        editor.mode = Mode::Insert;
+        editor.cy = 1;
+        editor.cx = "🙂 vo".chars().count();
+
+        let items = editor.buffer_completion_items();
+        let edit = items
+            .iter()
+            .find(|item| item.label == "vocab_size")
+            .and_then(|item| item.text_edit.as_ref())
+            .expect("UTF-16 replacement edit");
+
+        assert_eq!(edit.range.start.character, 3);
+        assert_eq!(edit.range.end.character, 5);
+    }
+
+    #[test]
+    fn completion_response_is_not_shown_after_switching_buffers() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffers = vec![
+            Buffer::new(
+                Some("/tmp/red-completion-source.rs".to_string()),
+                "val".to_string(),
+            ),
+            Buffer::new(
+                Some("/tmp/red-completion-target.rs".to_string()),
+                "other".to_string(),
+            ),
+        ];
+        let mut editor = Editor::with_size(lsp, 60, 12, config, Theme::default(), buffers).unwrap();
+        editor.mode = Mode::Insert;
+        let source_uri = editor.current_buffer().uri().unwrap().unwrap();
+        editor.pending_lsp_edit_requests.insert(
+            41,
+            PendingLspEdit {
+                buffer_id: editor.current_buffer().id(),
+                revision: editor.current_buffer().revision(),
+                uri: source_uri.clone(),
+            },
+        );
+        editor.buffer_manager.set_active_index(1);
+        let response = InboundMessage::Message(ResponseMessage {
+            id: 41,
+            result: serde_json::json!([{ "label": "value" }]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/completion",
+                serde_json::json!({ "textDocument": { "uri": source_uri } }),
+            )),
+        });
+
+        assert!(editor
+            .handle_lsp_message(&response, Some("textDocument/completion".to_string()))
+            .is_none());
+        assert!(editor.current_dialog.is_none());
+    }
+
+    #[test]
+    fn buffer_completion_merging_prefers_lsp_items() {
+        let mut lsp_item = completion_item("vocab_size");
+        lsp_item.detail = Some("int".to_string());
+        let mut duplicate = completion_item("vocab_size");
+        duplicate.detail = Some("Buffer word".to_string());
+        let fallback = completion_item("vector_size");
+
+        let items = Editor::merge_completion_items(vec![lsp_item], vec![duplicate, fallback]);
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].detail.as_deref(), Some("int"));
+        assert!(items.iter().any(|item| item.label == "vector_size"));
+    }
+
+    #[tokio::test]
+    async fn automatic_completion_uses_buffer_words_when_lsp_is_unavailable() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".red-root"), "").unwrap();
+        let path = root.path().join("tokenizer.rs");
+        let mut editor = workspace_lsp_test_editor(root.path(), &path, "vocab_size = 65\nprint(");
+        editor.config.completion.debounce_ms = 1;
+        let mut render_buffer = RenderBuffer::new(60, 12, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .execute(
+                &Action::EnterMode(Mode::Insert),
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        editor
+            .execute(
+                &Action::SetCursor("print(".chars().count(), 1),
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        editor
+            .execute(
+                &Action::InsertCharAtCursorPos('v'),
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        editor.scheduled_completion.as_mut().unwrap().deadline =
+            Instant::now() - Duration::from_millis(1);
+
+        editor
+            .service_background(&mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert!(editor.current_dialog.is_some());
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let action = editor.handle_event(&enter).unwrap().unwrap();
+        editor
+            .handle_key_action(&enter, &action, &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(
+            editor.current_buffer().contents(),
+            "vocab_size = 65\nprint(vocab_size"
+        );
+    }
+
     #[tokio::test]
     async fn completion_dialog_allows_typing_to_continue() {
         let mut editor = test_editor(40, 10);
@@ -28325,6 +28826,71 @@ builtin = "rust"
             editor.completion_filter_for_response(&response).as_deref(),
             Some("as")
         );
+    }
+
+    #[test]
+    fn completion_response_filter_includes_identifier_before_request_position() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "print(\"x shape:\", xb".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![buffer]).unwrap();
+        editor.cx = "print(\"x shape:\", xb".chars().count();
+        let response = ResponseMessage {
+            id: 1,
+            result: serde_json::Value::Null,
+            request: Some(crate::lsp::Request::new(
+                "textDocument/completion",
+                serde_json::json!({
+                    "position": {
+                        "line": 0,
+                        "character": "print(\"x shape:\", xb".chars().count()
+                    }
+                }),
+            )),
+        };
+
+        assert_eq!(
+            editor.completion_filter_for_response(&response).as_deref(),
+            Some("xb")
+        );
+    }
+
+    #[test]
+    fn completion_response_selects_existing_identifier_over_broad_lsp_items() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "xb".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![buffer]).unwrap();
+        editor.mode = Mode::Insert;
+        editor.cx = 2;
+        let response = InboundMessage::Message(ResponseMessage {
+            id: 1,
+            result: serde_json::json!([
+                { "label": "BaseException", "sortText": "1" },
+                { "label": "BaseExceptionGroup", "sortText": "2" },
+                { "label": "xb", "sortText": "3" }
+            ]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/completion",
+                serde_json::json!({ "position": { "line": 0, "character": 2 } }),
+            )),
+        });
+
+        assert!(matches!(
+            editor.handle_lsp_message(&response, Some("textDocument/completion".to_string())),
+            Some(Action::ShowDialog)
+        ));
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let action = editor.handle_event(&enter).unwrap().unwrap();
+        let KeyAction::Multiple(actions) = action else {
+            panic!("expected completion application action");
+        };
+        assert!(matches!(
+            actions.first(),
+            Some(Action::ApplyCompletion { item, .. }) if item.label == "xb"
+        ));
     }
 
     #[test]
