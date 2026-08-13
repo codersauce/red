@@ -67,6 +67,17 @@ wrapscan = true
 ignorecase = false
 smartcase = false
 
+[completion]
+# Request completion after an identifier prefix is typed. Requests wait for a
+# short quiet period so fast typing produces one completion request.
+auto_trigger = true
+min_prefix_length = 1
+debounce_ms = 120
+# Mix matching words from open buffers with language-server candidates. This
+# also provides useful completion when a language server is not installed.
+buffer_words = true
+max_buffer_words = 100
+
 [picker]
 # Query input position in picker dialogs. Supported values are "bottom" and
 # "top". Bottom matches the default command-line-oriented picker layout.

@@ -83,11 +83,17 @@ impl CompletionUI {
             .collect();
         self.commit_chars.sort_unstable();
         self.commit_chars.dedup();
-        // Sort items by preselect and label
+        // Keep server-provided relevance ordering while still honoring preselection.
         items.sort_by(|a, b| {
             b.preselect
                 .unwrap_or(false)
                 .cmp(&a.preselect.unwrap_or(false))
+                .then_with(|| {
+                    a.sort_text
+                        .as_deref()
+                        .unwrap_or(&a.label)
+                        .cmp(b.sort_text.as_deref().unwrap_or(&b.label))
+                })
                 .then(a.label.cmp(&b.label))
         });
 
@@ -663,6 +669,19 @@ mod tests {
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
         Event::Key(KeyEvent::new(code, modifiers))
+    }
+
+    #[test]
+    fn completion_respects_server_sort_text() {
+        let mut later_label = item("alpha", Some(CompletionItemKind::Variable));
+        later_label.sort_text = Some("20".to_string());
+        let mut earlier_label = item("zeta", Some(CompletionItemKind::Variable));
+        earlier_label.sort_text = Some("10".to_string());
+
+        let mut ui = CompletionUI::new();
+        ui.show(vec![later_label, earlier_label], 0, 0);
+
+        assert_eq!(ui.selected_item().unwrap().label, "zeta");
     }
 
     #[test]
