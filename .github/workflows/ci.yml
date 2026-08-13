@@ -78,7 +78,24 @@ jobs:
 
       - name: Install ripgrep (Windows)
         if: runner.os == 'Windows'
-        run: choco install ripgrep --yes --no-progress
+        shell: pwsh
+        run: |
+          $maxAttempts = 3
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            Write-Host "Installing ripgrep (attempt $attempt of $maxAttempts)"
+            choco install ripgrep --yes --no-progress
+
+            if (Get-Command rg -ErrorAction SilentlyContinue) {
+              rg --version
+              exit 0
+            }
+
+            if ($attempt -lt $maxAttempts) {
+              Start-Sleep -Seconds (15 * $attempt)
+            }
+          }
+
+          throw "ripgrep was not available after $maxAttempts installation attempts"
 
       - name: Cache cargo registry
         uses: actions/cache@v4
