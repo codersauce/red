@@ -581,7 +581,10 @@ impl Component for CompletionUI {
                         Action::CloseDialog,
                     ]))
                 } else {
-                    Some(KeyAction::Single(Action::CloseDialog))
+                    Some(KeyAction::Multiple(vec![
+                        Action::CloseDialog,
+                        Action::InsertNewLine,
+                    ]))
                 }
             }
             Event::Key(KeyEvent {
