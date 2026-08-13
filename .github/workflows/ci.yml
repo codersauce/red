@@ -78,7 +78,29 @@ jobs:
 
       - name: Install ripgrep (Windows)
         if: runner.os == 'Windows'
-        run: choco install ripgrep --yes --no-progress
+        shell: pwsh
+        run: |
+          $version = "15.2.0"
+          $archive = Join-Path $env:RUNNER_TEMP "ripgrep.zip"
+          $extractRoot = Join-Path $env:RUNNER_TEMP "ripgrep"
+          $url = "https://github.com/BurntSushi/ripgrep/releases/download/$version/ripgrep-$version-x86_64-pc-windows-msvc.zip"
+          $expectedSha256 = "71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5"
+
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $actualSha256 = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "ripgrep archive checksum mismatch: expected $expectedSha256, got $actualSha256"
+          }
+
+          Expand-Archive -Path $archive -DestinationPath $extractRoot -Force
+          $installDir = Join-Path $extractRoot "ripgrep-$version-x86_64-pc-windows-msvc"
+          $executable = Join-Path $installDir "rg.exe"
+          if (-not (Test-Path $executable)) {
+            throw "ripgrep executable was not found at $executable"
+          }
+
+          $installDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & $executable --version
 
       - name: Cache cargo registry
         uses: actions/cache@v4
