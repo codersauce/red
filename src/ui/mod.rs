@@ -58,6 +58,7 @@ pub use statusline_layout::StatuslineLayoutPanel;
 use crate::{
     config::KeyAction,
     editor::{Action, RenderBuffer},
+    lsp::types::CompletionResponseItem,
     plugin::{ComposerHandle, PickerHandle},
     theme::Theme,
 };
@@ -70,6 +71,10 @@ pub trait Component: Send {
     }
 
     fn update_picker(&mut self, _id: i32, _update: PickerUpdate) -> bool {
+        false
+    }
+
+    fn update_completion(&mut self, _items: Vec<CompletionResponseItem>, _filter: &str) -> bool {
         false
     }
 

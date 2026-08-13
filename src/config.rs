@@ -741,7 +741,7 @@ fn default_completion_min_prefix_length() -> usize {
 }
 
 fn default_completion_debounce_ms() -> u64 {
-    120
+    0
 }
 
 fn default_completion_max_buffer_words() -> usize {

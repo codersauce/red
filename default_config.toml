@@ -68,11 +68,11 @@ ignorecase = false
 smartcase = false
 
 [completion]
-# Request completion after an identifier prefix is typed. Requests wait for a
-# short quiet period so fast typing produces one completion request.
+# Request completion after an identifier prefix is typed. Increase debounce_ms
+# if the language server should wait for a quiet period before each request.
 auto_trigger = true
 min_prefix_length = 1
-debounce_ms = 120
+debounce_ms = 0
 # Mix matching words from open buffers with language-server candidates. This
 # also provides useful completion when a language server is not installed.
 buffer_words = true

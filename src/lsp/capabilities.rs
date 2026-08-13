@@ -56,7 +56,7 @@ pub fn get_client_capabilities_with_options(
                                 ])
                                 .build(),
                         )
-                        .label_details_support(false)
+                        .label_details_support(true)
                         .build(),
                 )
                 .insert_text_mode(InsertTextMode::AsIs)
@@ -501,6 +501,17 @@ mod tests {
         );
         assert_eq!(
             params["capabilities"]["experimental"]["hoverActions"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn advertises_completion_label_details_for_compact_annotations() {
+        let params = serde_json::to_value(get_client_capabilities("file:///tmp")).unwrap();
+
+        assert_eq!(
+            params["capabilities"]["textDocument"]["completion"]["completionItem"]
+                ["labelDetailsSupport"],
             json!(true)
         );
     }

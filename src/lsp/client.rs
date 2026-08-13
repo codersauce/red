@@ -3175,13 +3175,25 @@ mod test {
         let json = serde_json::json!([
             {
                 "label": "alpha",
+                "labelDetails": {
+                    "detail": "()",
+                    "description": "typing"
+                },
                 "kind": 1
             }
         ]);
         let response = serde_json::from_value::<CompletionResponse>(json).unwrap();
 
         assert!(!response.is_incomplete());
-        assert_eq!(response.items().len(), 1);
+        let items = response.items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0]
+                .label_details
+                .as_ref()
+                .and_then(|details| details.description.as_deref()),
+            Some("typing")
+        );
     }
 
     #[test]
