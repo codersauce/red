@@ -4475,8 +4475,6 @@ impl Editor {
                 ("bash", 2),
                 ("zsh", 2),
                 ("fish", 4),
-                ("py", 4),
-                ("pyw", 4),
             ]
             .map(|(file_type, shift_width)| {
                 (
@@ -27671,7 +27669,6 @@ builtin = "rust"
             ("fixture.js", 2),
             ("fixture.json", 2),
             ("fixture.yaml", 2),
-            ("fixture.py", 4),
             ("fixture.rs", 4),
         ] {
             let config = Config::default();

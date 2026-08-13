@@ -13,7 +13,7 @@ use red::{
     buffer::{Buffer, SyntaxSelection},
     clipboard::MemoryClipboardProvider,
     color::Color,
-    config::{Config, KeyAction, MatchitLanguageConfig},
+    config::{Config, KeyAction, LanguageConfig, MatchitLanguageConfig},
     editor::{Action, Content, Editor, Mode, SearchDirection},
     lsp::LspClient,
     plugin::{
@@ -425,9 +425,23 @@ fn comment_harness(file: &str, contents: &str) -> EditorHarness {
     EditorHarness::with_config(buffer, default_key_config())
 }
 
+fn python_pack_config() -> Config {
+    let mut config = default_key_config();
+    config.languages.insert(
+        "python".to_string(),
+        LanguageConfig {
+            extensions: vec!["py".to_string(), "pyw".to_string(), "pyi".to_string()],
+            aliases: vec!["py".to_string(), "py3".to_string(), "python3".to_string()],
+            indent_width: Some(4),
+            ..LanguageConfig::default()
+        },
+    );
+    config
+}
+
 fn python_harness(contents: &str) -> EditorHarness {
     let buffer = Buffer::new(Some("sample.py".to_string()), contents.to_string());
-    EditorHarness::with_config(buffer, default_key_config())
+    EditorHarness::with_config(buffer, python_pack_config())
 }
 
 #[tokio::test]
@@ -2543,6 +2557,23 @@ async fn test_enter_on_opened_indented_blank_line_moves_generated_indentation() 
 }
 
 #[tokio::test]
+async fn python_autoindent_requires_the_language_pack() {
+    let buffer = Buffer::new(
+        Some("sample.py".to_string()),
+        "def something(x):".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    harness
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(0, 1);
+    harness.assert_buffer_contents("def something(x):\n");
+}
+
+#[tokio::test]
 async fn python_enter_indents_a_suite_and_dedents_after_return() {
     let mut harness = python_harness("");
     harness
@@ -2716,7 +2747,7 @@ async fn python_open_above_and_forced_syntax_use_the_same_provider() {
         Some("notes.txt".to_string()),
         "def something(x):".to_string(),
     );
-    let mut forced = EditorHarness::with_config(buffer, default_key_config());
+    let mut forced = EditorHarness::with_config(buffer, python_pack_config());
     forced
         .execute_action(Action::SetSyntax("python".to_string()))
         .await
