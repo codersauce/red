@@ -32,7 +32,7 @@ Reference pages are exact lookup material for commands, configuration, schemas, 
 
 ## Commands And Configuration
 
-Use [Red command](cli/red-command) for Red's public and hidden CLI flags, argument conflicts, lifecycle branches, utility modes, detach and resume options, and runtime asset commands [@red-command]. Use [Husk command](cli/husk-command) for the standalone Husk CLI surface: `run`, `check`, `fmt`, `repl`, package commands, extension commands, `lsp --stdio`, and examples [@husk-command].
+Use [Red command](cli/red-command) for Red's public and hidden CLI flags, argument conflicts, lifecycle branches, utility modes, external plugin package management, native grammar trust commands, detach and resume options, and runtime asset commands [@red-command]. Use [Husk command](cli/husk-command) for the standalone Husk CLI surface: `run`, `check`, `fmt`, `repl`, package commands, extension commands, `lsp --stdio`, and examples [@husk-command].
 
 Use [Default config](configuration/default-config) for the top-level config schema, default plugin permissions, bundled plugin mapping, keymaps, LSP defaults, language definitions, comments, cursor shapes, statusline sections, picker settings, and failure behavior [@default-config]. Use [LSP configuration](lsp/configuration) when the lookup is specifically language-server defaults or per-server selector fields.
 

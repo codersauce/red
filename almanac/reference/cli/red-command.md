@@ -1,7 +1,7 @@
 ---
 title: "Red Command"
-summary: "The `red` command exposes editor startup, utility checks, runtime asset operations, detach control, config overrides, and internal hidden boundaries."
-topics: [reference, cli, startup]
+summary: "The `red` command exposes editor startup, utility checks, plugin and language package management, runtime asset operations, detach control, config overrides, and internal hidden boundaries."
+topics: [reference, cli, startup, plugins]
 sources:
   - id: cli
     type: file
@@ -19,7 +19,7 @@ sources:
 
 # Red Command
 
-The `red` command is the public entrypoint for opening the editor, forwarding Husk subcommands, running non-interactive diagnostics, managing Unix detachable sessions, and copying runtime assets into user configuration [@cli] [@main]. Its argument parser is defined in `src/cli.rs`, while `src/main.rs` selects the lifecycle branch for each parsed mode before editor state is constructed [@cli] [@main].
+The `red` command is the public entrypoint for opening the editor, forwarding Husk subcommands, running non-interactive diagnostics, managing external plugins and native grammar trust, managing Unix detachable sessions, and copying runtime assets into user configuration [@cli] [@main]. Its argument parser is defined in `src/cli.rs`, while `src/main.rs` selects the lifecycle branch for each parsed mode before editor state is constructed [@cli] [@main].
 
 ## Invocation Forms
 
@@ -27,6 +27,8 @@ The `red` command is the public entrypoint for opening the editor, forwarding Hu
 | --- | --- |
 | `red [OPTIONS] [FILES]...` | Starts the interactive editor unless a utility or detach-control flag exits earlier [@cli] [@main]. |
 | `red husk ...` | Forwards arguments to the bundled Husk CLI by rewriting the program name to `red husk` and returning through `husk_cli::run_from` [@main]. |
+| `red plugin ...` | Runs non-interactive external plugin package management without starting the editor [@cli] [@main]. |
+| `red language ...` | Approves or revokes native grammar trust for configured or package-provided languages without starting the editor [@cli] [@main]. |
 | `red --version` | Uses Clap's generated version output [@cli]. |
 
 The README and getting-started guide present `red path/to/file`, multiple files, and `red -r path/to/project src/main.rs` as ordinary editor startup examples [@readme] [@getting-started].
@@ -55,6 +57,30 @@ The README and getting-started guide present `red path/to/file`, multiple files,
 | `--eject-force <ASSET>` | Copies the asset and allows overwrite of an existing user file [@cli] [@main]. |
 
 `Args::utility_requested` includes `--runtime-files`, `--check-config`, `--agent-check`, hidden `--self-check`, `--eject`, `--eject-force`, and hidden process-editor replacement [@cli]. `Args::validate_utility_args` rejects utility modes combined with files to edit, except the hidden process-editor replacement mode, which requires exactly one target file [@cli].
+
+## Plugin And Language Subcommands
+
+| Command | Behavior |
+| --- | --- |
+| `red plugin install OWNER/REPO` or `OWNER/REPO@REF` | Installs an external plugin package from a GitHub repository, optionally pinned with a suffix after `@` [@cli] [@main]. |
+| `red plugin install --path <DIRECTORY>` | Installs a local package checkout for development [@cli] [@main]. |
+| `red plugin install --catalog <ID> [--catalog-url <URL>]` | Installs a curated language-pack catalog entry, using the official catalog URL unless an override is supplied [@cli] [@main]. |
+| `red plugin catalog [--catalog-url <URL>]` | Prints catalog package id, version, tier, compatibility, and host-target availability [@cli] [@main]. |
+| `red plugin list` | Prints installed external plugins as id, version, enabled state, compatibility, and package kind; with no external plugins it prints `No external plugins installed.` [@cli] [@main]. |
+| `red plugin update <ID>` | Updates one installed plugin from its retained source [@cli] [@main]. |
+| `red plugin update --all` | Updates every enabled external plugin and reports each success or failure independently [@cli] [@main]. |
+| `red plugin disable <ID>` | Disables an installed plugin without deleting its saved state [@cli] [@main]. |
+| `red plugin enable <ID>` | Re-enables a disabled installed plugin [@cli] [@main]. |
+| `red plugin remove <ID> [--purge]` | Removes an installed plugin, preserving saved data by default and deleting it only with `--purge` [@cli] [@main]. |
+
+Install and update forms accept `--trust-native-grammars` when the package includes native grammars whose verified bytes should be approved during the operation [@cli] [@main]. The package lifecycle and catalog boundary are covered by [Plugin Lifecycle And Reload](../../architecture/plugins/lifecycle-and-reload) and [Official Language Pack Distribution](../../decisions/plugins/language-pack-distribution).
+
+| Command | Behavior |
+| --- | --- |
+| `red language trust <LANGUAGE_OR_PATH>` | Resolves a configured language id, enabled compatible package language id, or explicit path, then records trust for the current native grammar bytes [@cli] [@main]. |
+| `red language untrust <LANGUAGE_OR_PATH>` | Resolves the same language-or-path forms and revokes the grammar approval for that path [@cli] [@main]. |
+
+Language trust commands load the effective user config with any `-c` overrides, resolve relative configured grammar paths under the Red config directory, and then fall back to treating the argument as a filesystem path [@main].
 
 ## Detach And Attach
 

@@ -33,7 +33,7 @@ The rendering pipeline composes Red's logical editor state into an in-memory ter
 
 ## Layout Before Paint
 
-Window text rendering starts with display layout. `DisplayLayout` maps buffer lines to visible screen-row segments using grapheme boundaries and terminal-cell widths, and it owns wrapping, horizontal offsets, continuation indentation, and cursor hit-testing for a specific viewport configuration [@display-layout]. Its cache key must include layout-affecting inputs such as buffer revision, viewport width, wrap mode, and indentation because reusing a layout across those changes would yield wrong cursor or hit-test positions [@display-layout].
+Window text rendering starts with [display layout](../../concepts/editor/display-layout). `DisplayLayout` maps buffer lines to visible screen-row segments using grapheme boundaries and terminal-cell widths, and it owns wrapping, horizontal offsets, continuation indentation, and cursor hit-testing for a specific viewport configuration [@display-layout]. Its cache key must include layout-affecting inputs such as buffer revision, viewport width, wrap mode, and indentation because reusing a layout across those changes would yield wrong cursor or hit-test positions [@display-layout].
 
 The renderer asks for a layout per window, fills each visible content row, then walks graphemes from the segment's byte range while tracking display columns, tab expansion, visual offsets, and syntax highlight spans [@rendering]. This is the point where the editor's coordinate systems converge: buffer text is sliced by byte offsets from the layout, graphemes become terminal cells, tabs expand to spaces using indentation width, and styles come from a forward-only syntax style cursor [@rendering].
 

@@ -70,7 +70,7 @@ The default `[plugins]` table enables bundled Husk plugins: `agent`, `barbecue`,
 
 ## LSP And Commenting
 
-`[lsp]` defaults to enabled, with `format_on_save = false` and built-in server definitions for Rust, Husk, TypeScript/JavaScript, Python, Markdown, JSON, TOML, YAML, and Lua [@config]. The default file documents both legacy single-language server configuration and preferred multi-document selectors [@defaults]. User server tables merge into the built-in server map rather than replacing the entire map [@config].
+`[lsp]` defaults to enabled, with `format_on_save = false` and built-in server definitions for Rust, Husk, TypeScript/JavaScript, Python, Markdown, JSON, TOML, YAML, Lua, and Fish [@config]. The default file documents both legacy single-language server configuration and preferred multi-document selectors [@defaults]. User server tables merge into the built-in server map rather than replacing the entire map [@config]. Use [LSP Configuration](../lsp/configuration) for the exact built-in server table and per-server fields.
 
 Comment templates are keyed by language or extension and use a single `%s` placeholder [@defaults] [@config]. The shipped defaults cover Bash, C-family extensions, CSS/SCSS, Go, HTML/XML, Husk, Java, JavaScript/TypeScript/JSX/TSX, JSONC, Lua, Markdown, PowerShell, Python, Rust, SQL, TOML, and YAML [@defaults] [@config].
 

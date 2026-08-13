@@ -16,6 +16,8 @@ sources:
 
 Red is a modal terminal editor with a self-contained Rust binary, embedded runtime assets, optional Codex agent integration, Husk plugins, language tooling, crash recovery, and Unix detachable sessions. The quickest path through this wiki is to start with the [Red editor concept](concepts/red-editor), then follow the architecture page for the subsystem you need to change. The repository README describes Red as "the modal editor for the agent era" and highlights its bundled defaults, safer agent workflow, Husk runtime, recovery, and detach support [@readme].
 
+For page-type browsing, use [Architecture](architecture) for subsystem maps, [Guides](guides) for task procedures, [Decisions](decisions) for accepted constraints, and [Reference](reference) for exact command, configuration, API, and protocol lookup.
+
 ## Start With The Product Model
 
 Use [Red editor](concepts/red-editor) to understand the basic mental model before reading subsystem pages. Red combines Vim-inspired modes and motions with tree-sitter highlighting, language servers, command discovery, file and buffer pickers, Git tooling, embedded Husk plugins, and optional Codex support [@readme]. The user guide shows the everyday workflow: launch with `red path/to/file`, use Normal, Insert, Visual, Visual Line, Visual Block, and Command modes, and discover commands with `Space ?`, `F1`, `Alt-x`, or `Ctrl-Shift-p` [@getting-started-doc].
