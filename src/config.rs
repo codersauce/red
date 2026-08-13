@@ -606,7 +606,6 @@ fn default_comment_templates() -> HashMap<String, String> {
         ("lua", "-- %s"),
         ("markdown", "<!-- %s -->"),
         ("powershell", "# %s"),
-        ("python", "# %s"),
         ("rust", "// %s"),
         ("scss", "/* %s */"),
         ("sql", "-- %s"),
@@ -1207,15 +1206,6 @@ pub fn default_language_servers() -> HashMap<String, LanguageServerConfig> {
                     document("javascriptreact", &["jsx"]),
                 ],
                 &["package.json", "tsconfig.json", "jsconfig.json", ".git"],
-            ),
-        ),
-        (
-            "python".to_string(),
-            server(
-                "pyright-langserver",
-                &["--stdio"],
-                &[document("python", &["py", "pyw"])],
-                &["pyproject.toml", "setup.py", "requirements.txt", ".git"],
             ),
         ),
         (
@@ -3043,7 +3033,7 @@ theme = "theme/nightfox.json"
                     .is_some_and(|source| source.contains("mod global red")))
             ));
         assert!(config.lsp.servers.contains_key("markdown"));
-        assert!(config.lsp.servers.contains_key("python"));
+        assert!(!config.lsp.servers.contains_key("python"));
         assert!(config.lsp.servers.contains_key("json"));
         assert!(config.lsp.servers.contains_key("toml"));
         assert!(config.lsp.servers.contains_key("yaml"));
@@ -3470,7 +3460,7 @@ input_position = "left"
 
         assert_eq!(config.commenting.languages["fish"], "# %s");
         assert_eq!(config.commenting.languages["rust"], "// %s");
-        assert_eq!(config.commenting.languages["python"], "# %s");
+        assert!(!config.commenting.languages.contains_key("python"));
         assert_eq!(config.commenting.languages["lua"], "-- %s");
         assert_eq!(config.commenting.languages["html"], "<!-- %s -->");
         assert_eq!(config.commenting.languages["css"], "/* %s */");
@@ -3488,7 +3478,7 @@ input_position = "left"
 
         assert_eq!(loaded.config.commenting.languages["rust"], "/* %s */");
         assert_eq!(loaded.config.commenting.languages["custom"], "; %s");
-        assert_eq!(loaded.config.commenting.languages["python"], "# %s");
+        assert!(!loaded.config.commenting.languages.contains_key("python"));
     }
 
     #[test]

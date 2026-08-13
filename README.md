@@ -145,9 +145,9 @@ The current release includes:
 - Normal, Insert, Visual, Visual Line, Visual Block, and Command modes with
   expanding Vim motion and editing compatibility
 - tree-sitter highlighting for Rust, Markdown, JavaScript, TypeScript/TSX,
-  JSON, TOML, YAML, Python, Bash, PowerShell, Lua, and Husk
+  JSON, TOML, YAML, Bash, PowerShell, Lua, and Husk
 - a first-party Husk language server plus built-in LSP defaults for Rust,
-  TypeScript/JavaScript, Python, Markdown, JSON, TOML, YAML, and Lua
+  TypeScript/JavaScript, Markdown, JSON, TOML, YAML, and Lua
 - command and keymap discovery, fuzzy files, buffer navigation, symbols,
   references, project search, and diagnostics
 - native Git gutter signs, hunk actions, and a full-screen workspace for

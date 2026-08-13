@@ -108,11 +108,18 @@ Patterns use Rust regular-expression syntax. `incsearch`, `hlsearch`,
 | `Space r` | Rename the current symbol |
 
 Husk's first-party server is included and starts for `.hk` and `.husk` files.
-Built-in defaults also cover Rust, TypeScript/JavaScript, Python, Markdown,
-JSON, TOML, YAML, and Lua; those external servers must be installed separately
-and available on `PATH`. Servers start only after a matching file is opened.
+Built-in defaults also cover Rust, TypeScript/JavaScript, Markdown, JSON, TOML,
+YAML, and Lua; those external servers must be installed separately and
+available on `PATH`. Servers start only after a matching file is opened.
 See the [Husk language-server guide](HUSK_LSP.md) for its complete feature and
 external-crate contract.
+
+Python highlighting, commenting, and Pyright configuration are available from
+the official language-pack catalog:
+
+```shell
+red plugin install --catalog python-language --trust-native-grammars
+```
 
 Completion combines two sources. Matching words from all open buffers provide
 fast text completion even when no language server is installed. When a server
@@ -133,9 +140,10 @@ buffer_words = true
 max_buffer_words = 100
 ```
 
-For example, Python's type-aware names, attributes, signatures, and import
-suggestions require its configured `pyright-langserver` executable to be on
-`PATH`. Buffer-word completion remains available if that executable is absent.
+For example, after installing the Python pack, its type-aware names,
+attributes, signatures, and import suggestions require the configured
+`pyright-langserver` executable to be on `PATH`. Buffer-word completion remains
+available if that executable is absent.
 
 Add or override a server in `config.toml`:
 
