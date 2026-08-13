@@ -10,7 +10,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{
     config::KeyAction,
-    editor::{Action, RenderBuffer},
+    editor::{Action, Mode, RenderBuffer},
     lsp::types::{CompletionItemKind, CompletionResponseItem, Documentation},
     theme::{SelectionForegroundPriority, Style, Theme, UiStyle},
     unicode_utils::{
@@ -588,7 +588,10 @@ impl Component for CompletionUI {
             }
             Event::Key(KeyEvent {
                 code: KeyCode::Esc, ..
-            }) => Some(KeyAction::Single(Action::CloseDialog)),
+            }) => Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::EnterMode(Mode::Normal),
+            ])),
             Event::Key(KeyEvent {
                 code: KeyCode::Char(c),
                 ..
@@ -923,6 +926,34 @@ mod tests {
         assert_eq!(
             ui.handle_event(&key(KeyCode::Backspace, KeyModifiers::NONE)),
             None
+        );
+    }
+
+    #[test]
+    fn escape_closes_completion_and_leaves_insert_mode() {
+        let mut ui = CompletionUI::new();
+        ui.show(
+            vec![item("manual_seed", Some(CompletionItemKind::Text))],
+            0,
+            0,
+        );
+
+        assert_eq!(
+            ui.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::EnterMode(Mode::Normal),
+            ]))
+        );
+
+        ui.set_filter("manual_seed(1337)");
+        assert!(ui.selected_item().is_none());
+        assert_eq!(
+            ui.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::EnterMode(Mode::Normal),
+            ]))
         );
     }
 
