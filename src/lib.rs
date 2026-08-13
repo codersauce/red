@@ -30,6 +30,7 @@ pub mod dispatcher;
 pub mod editor;
 pub mod headless;
 pub mod highlighter;
+mod indent;
 pub mod language;
 pub mod logger;
 pub mod lsp;

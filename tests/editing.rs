@@ -425,6 +425,11 @@ fn comment_harness(file: &str, contents: &str) -> EditorHarness {
     EditorHarness::with_config(buffer, default_key_config())
 }
 
+fn python_harness(contents: &str) -> EditorHarness {
+    let buffer = Buffer::new(Some("sample.py".to_string()), contents.to_string());
+    EditorHarness::with_config(buffer, default_key_config())
+}
+
 #[tokio::test]
 async fn comment_gcc_toggles_the_current_line() {
     let mut harness = comment_harness("main.rs", "    let value = 1;");
@@ -2522,7 +2527,7 @@ async fn test_open_line_below() {
 }
 
 #[tokio::test]
-async fn test_enter_on_opened_indented_blank_line_preserves_indentation() {
+async fn test_enter_on_opened_indented_blank_line_moves_generated_indentation() {
     let mut harness = EditorHarness::with_content("fn name() {\n    let a = 1;\n}");
 
     harness.execute_action(Action::MoveDown).await.unwrap();
@@ -2535,7 +2540,226 @@ async fn test_enter_on_opened_indented_blank_line_preserves_indentation() {
     harness.execute_action(Action::InsertNewLine).await.unwrap();
 
     harness.assert_cursor_at(4, 3);
-    harness.assert_buffer_contents("fn name() {\n    let a = 1;\n    \n    \n}");
+    harness.assert_buffer_contents("fn name() {\n    let a = 1;\n\n    \n}");
+}
+
+#[tokio::test]
+async fn python_enter_indents_a_suite_and_dedents_after_return() {
+    let mut harness = python_harness("");
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness.type_text("def something(x):").await.unwrap();
+    harness.execute_action(Action::InsertNewLine).await.unwrap();
+    harness.assert_cursor_at(4, 1);
+    harness.type_text("return x").await.unwrap();
+    harness.execute_action(Action::InsertNewLine).await.unwrap();
+
+    harness.assert_cursor_at(0, 2);
+    harness.assert_buffer_contents("def something(x):\n    return x\n");
+}
+
+#[tokio::test]
+async fn python_ignores_colons_in_comments_and_strings() {
+    for source in ["value = 1  # note:", "value = \"note:\""] {
+        let mut harness = python_harness(source);
+        harness
+            .execute_action(Action::EnterMode(Mode::Insert))
+            .await
+            .unwrap();
+        harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+        harness.execute_action(Action::MoveRight).await.unwrap();
+        harness.execute_action(Action::InsertNewLine).await.unwrap();
+        harness.assert_cursor_at(0, 1);
+    }
+}
+
+#[tokio::test]
+async fn python_continuations_align_and_use_hanging_indent() {
+    let mut aligned = python_harness("call(first,");
+    aligned
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    aligned.assert_cursor_at(5, 1);
+    aligned.type_text("second").await.unwrap();
+    aligned.assert_buffer_contents("call(first,\n     second");
+
+    let mut hanging = python_harness("values = [");
+    hanging
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    hanging.assert_cursor_at(8, 1);
+}
+
+#[tokio::test]
+async fn python_typing_else_and_except_reindents_the_current_line() {
+    let mut else_harness = python_harness("if ready:\n    work()\n    ");
+    else_harness
+        .execute_action(Action::MoveToBottom)
+        .await
+        .unwrap();
+    else_harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    else_harness
+        .execute_action(Action::MoveToLineEnd)
+        .await
+        .unwrap();
+    else_harness
+        .execute_action(Action::MoveRight)
+        .await
+        .unwrap();
+    else_harness.type_text("else:").await.unwrap();
+    else_harness.assert_buffer_contents("if ready:\n    work()\nelse:");
+    else_harness.assert_cursor_at(5, 2);
+
+    let mut except_harness = python_harness("try:\n    work()\n    ");
+    except_harness
+        .execute_action(Action::MoveToBottom)
+        .await
+        .unwrap();
+    except_harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    except_harness
+        .execute_action(Action::MoveToLineEnd)
+        .await
+        .unwrap();
+    except_harness
+        .execute_action(Action::MoveRight)
+        .await
+        .unwrap();
+    except_harness.type_text("except:").await.unwrap();
+    except_harness.assert_buffer_contents("try:\n    work()\nexcept:");
+}
+
+#[tokio::test]
+async fn backspace_uses_soft_tab_stops_inside_leading_indentation() {
+    let mut harness = python_harness("values = [");
+    harness
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(8, 1);
+
+    harness
+        .execute_action(Action::DeletePreviousChar)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(4, 1);
+    harness
+        .execute_action(Action::DeletePreviousChar)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 1);
+    harness.type_text("value").await.unwrap();
+    harness.assert_buffer_contents("values = [\nvalue");
+}
+
+#[tokio::test]
+async fn tab_advances_to_the_next_soft_tab_stop() {
+    let mut harness = python_harness("  value");
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::SetCursor(2, 0))
+        .await
+        .unwrap();
+    harness.execute_action(Action::InsertTab).await.unwrap();
+
+    harness.assert_cursor_at(4, 0);
+    harness.assert_buffer_contents("    value");
+}
+
+#[tokio::test]
+async fn untouched_generated_indent_is_removed_on_escape_and_carried_across_enter() {
+    let mut escaped = python_harness("def something(x):");
+    escaped
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    escaped
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    escaped.assert_buffer_contents("def something(x):\n");
+
+    let mut carried = python_harness("def something(x):");
+    carried
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    carried.execute_action(Action::InsertNewLine).await.unwrap();
+    carried.type_text("value").await.unwrap();
+    carried.assert_buffer_contents("def something(x):\n\n    value");
+}
+
+#[tokio::test]
+async fn python_open_above_and_forced_syntax_use_the_same_provider() {
+    let mut above = python_harness("def something(x):\n    value");
+    above.execute_action(Action::MoveDown).await.unwrap();
+    above
+        .execute_action(Action::InsertLineAtCursor)
+        .await
+        .unwrap();
+    above.assert_cursor_at(4, 1);
+    above.type_text("other").await.unwrap();
+    above.assert_buffer_contents("def something(x):\n    other\n    value");
+
+    let buffer = Buffer::new(
+        Some("notes.txt".to_string()),
+        "def something(x):".to_string(),
+    );
+    let mut forced = EditorHarness::with_config(buffer, default_key_config());
+    forced
+        .execute_action(Action::SetSyntax("python".to_string()))
+        .await
+        .unwrap();
+    forced
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    forced.assert_cursor_at(4, 1);
+}
+
+#[tokio::test]
+async fn generated_indent_cleans_up_when_insert_mode_moves_to_another_line() {
+    let mut harness = python_harness("def something(x):\nnext");
+    harness
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("def something(x):\n    \nnext");
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.assert_buffer_contents("def something(x):\n\nnext");
+}
+
+#[tokio::test]
+async fn python_autoindent_and_inserted_text_undo_as_one_change() {
+    let mut harness = python_harness("def something(x):\nnext");
+    harness
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    harness.type_text("value").await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("def something(x):\n    value\nnext");
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("def something(x):\nnext");
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("def something(x):\n    value\nnext");
 }
 
 #[tokio::test]

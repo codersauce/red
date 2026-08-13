@@ -85,6 +85,7 @@ use crate::{
     },
     dispatcher::Dispatcher,
     highlighter::{Highlighter, LanguageRegistry},
+    indent::{self, IndentDecision},
     log,
     lsp::{
         apply_workspace_resource_operations, file_path as lsp_file_path, get_client_capabilities,
@@ -2536,6 +2537,9 @@ pub struct Editor {
     /// Cursor position where the current insert session began.
     insert_entry_cursor: Option<CursorSnapshot>,
 
+    /// Whitespace created by auto-indent that is still removable as a blank line.
+    generated_indent: Option<GeneratedIndent>,
+
     /// Partial command being entered
     waiting_command: Option<String>,
 
@@ -3177,19 +3181,37 @@ impl HistoryEntry {
 #[derive(Debug, Clone, Copy)]
 struct Indentation {
     shift_width: usize,
-    // TODO: use fields
-    // soft_tab_stop: usize,
-    // expand_tab: bool,
+    soft_tab_stop: usize,
+    tab_width: usize,
+    expand_tab: bool,
 }
 
 impl Indentation {
-    fn new(shift_width: usize, _soft_tab_stop: usize, _expand_tab: bool) -> Self {
+    fn new(shift_width: usize, soft_tab_stop: usize, expand_tab: bool) -> Self {
         Self {
             shift_width,
-            // soft_tab_stop,
-            // expand_tab,
+            soft_tab_stop,
+            tab_width: shift_width,
+            expand_tab,
         }
     }
+
+    fn whitespace_for_columns(self, columns: usize) -> String {
+        if self.expand_tab {
+            return " ".repeat(columns);
+        }
+
+        let tab_width = self.tab_width.max(1);
+        let tabs = columns / tab_width;
+        let spaces = columns % tab_width;
+        format!("{}{}", "\t".repeat(tabs), " ".repeat(spaces))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GeneratedIndent {
+    buffer_id: BufferId,
+    line: usize,
 }
 
 impl ServerCapabilities {
@@ -3771,6 +3793,7 @@ impl Editor {
             vx,
             mode: Mode::Normal,
             insert_entry_cursor: None,
+            generated_indent: None,
             waiting_command: None,
             waiting_key_action: None,
             keymap_hint_prefix: Vec::new(),
@@ -4466,7 +4489,7 @@ impl Editor {
 
     fn tab_width_for_buffer_index(&self, buffer_index: usize) -> usize {
         self.indentation_for_buffer_index(buffer_index)
-            .shift_width
+            .tab_width
             .max(1)
     }
 
@@ -4483,7 +4506,7 @@ impl Editor {
             enabled: self.config.breakindent.unwrap_or(true),
             tab_width: self
                 .indentation_for_buffer_index(buffer_index)
-                .shift_width
+                .tab_width
                 .max(1),
         }
     }
@@ -4665,7 +4688,7 @@ impl Editor {
                 };
                 let text = text.trim_end_matches(['\r', '\n']);
                 let indent_width =
-                    leading_whitespace_display_width(text, indentation.shift_width.max(1));
+                    leading_whitespace_display_width(text, indentation.tab_width.max(1));
                 json!({
                     "screen_row": segment.row,
                     "line": segment.line,
@@ -4701,7 +4724,7 @@ impl Editor {
             },
             "indentation": {
                 "shift_width": indentation.shift_width,
-                "tab_width": indentation.shift_width,
+                "tab_width": indentation.tab_width,
             },
             "line_count": buffer.navigable_line_count(),
             "revision": buffer.revision(),
@@ -14152,24 +14175,108 @@ impl Editor {
         self.current_buffer().get(self.buffer_line())
     }
 
-    fn leading_indentation(line: &str) -> usize {
-        line.trim_end_matches(&['\r', '\n'][..])
-            .chars()
-            .take_while(|c| c.is_whitespace())
-            .count()
+    fn leading_indentation_text(line: &str) -> &str {
+        let line = line.trim_end_matches(&['\r', '\n'][..]);
+        let end = line
+            .char_indices()
+            .find(|(_, character)| !character.is_whitespace())
+            .map_or(line.len(), |(index, _)| index);
+        &line[..end]
     }
 
-    fn previous_line_indentation(&self) -> usize {
-        if self.buffer_line() > 0 {
-            Self::leading_indentation(
-                &self
-                    .current_buffer()
-                    .get(self.buffer_line() - 1)
-                    .unwrap_or_default(),
+    fn leading_indentation(line: &str) -> usize {
+        Self::leading_indentation_text(line).chars().count()
+    }
+
+    fn indentation_columns_for_line(&self, line: usize) -> usize {
+        let indentation = self.indentation();
+        self.current_buffer().get(line).map_or(0, |contents| {
+            display_width_with_tabs(
+                Self::leading_indentation_text(&contents),
+                indentation.tab_width.max(1),
             )
-        } else {
-            0
+        })
+    }
+
+    fn indentation_decision_for_line(&self, line: usize) -> IndentDecision {
+        let indentation = self.indentation();
+        let language =
+            self.highlight_language_id_for_buffer_index(self.buffer_manager.active_index());
+        indent::indent_for_line(
+            language.as_deref(),
+            &self.current_buffer().contents(),
+            line,
+            indentation.shift_width,
+            indentation.tab_width,
+        )
+    }
+
+    /// Applies a display-column indentation target and preserves the cursor's
+    /// offset into non-whitespace content when the target is the active line.
+    fn apply_indentation_to_line(&mut self, line: usize, decision: IndentDecision) -> usize {
+        let IndentDecision::Columns(columns) = decision else {
+            return self.indentation_columns_for_line(line);
+        };
+        let Some(contents) = self.current_buffer().get(line) else {
+            return 0;
+        };
+        let old_indentation = Self::leading_indentation_text(&contents).to_string();
+        let new_indentation = self.indentation().whitespace_for_columns(columns);
+        let old_graphemes = grapheme_len(&old_indentation);
+        let cursor_offset =
+            (self.buffer_line() == line).then(|| self.cx.saturating_sub(old_graphemes));
+
+        if old_indentation != new_indentation {
+            self.replace_range(
+                TextRange::new(
+                    TextPosition::new(line, 0),
+                    TextPosition::new(line, old_indentation.chars().count()),
+                ),
+                &new_indentation,
+            );
         }
+
+        if let Some(cursor_offset) = cursor_offset {
+            self.cx = grapheme_len(&new_indentation) + cursor_offset;
+        }
+        columns
+    }
+
+    fn mark_generated_indent(&mut self, line: usize, columns: usize) {
+        self.generated_indent = (columns > 0).then(|| GeneratedIndent {
+            buffer_id: self.current_buffer().id(),
+            line,
+        });
+    }
+
+    /// Removes untouched auto-indent whitespace. Callers must already own the
+    /// active insert transaction so cleanup remains part of the user's change.
+    fn cleanup_generated_indent(&mut self) -> bool {
+        let Some(generated) = self.generated_indent.take() else {
+            return false;
+        };
+        if generated.buffer_id != self.current_buffer().id() {
+            return false;
+        }
+        let Some(contents) = self.current_buffer().get(generated.line) else {
+            return false;
+        };
+        let line = contents.trim_end_matches(&['\r', '\n'][..]);
+        if line.is_empty() || !line.chars().all(char::is_whitespace) {
+            return false;
+        }
+
+        self.replace_range(
+            TextRange::new(
+                TextPosition::new(generated.line, 0),
+                TextPosition::new(generated.line, line.chars().count()),
+            ),
+            "",
+        );
+        if self.buffer_line() == generated.line {
+            self.cx = 0;
+        }
+        true
     }
 
     fn current_line_indentation(&self) -> usize {
@@ -14527,6 +14634,7 @@ impl Editor {
                 }
 
                 if matches!(old_mode, Mode::Insert) && matches!(new_mode, Mode::Normal) {
+                    let cleaned_generated_indent = self.cleanup_generated_indent();
                     if self.insert_entry_cursor.is_some_and(|entry| {
                         let y = self.buffer_line();
                         y > entry.y || (y == entry.y && self.cx > entry.x)
@@ -14540,6 +14648,9 @@ impl Editor {
                     let after_cursor = self.cursor_snapshot();
                     self.commit_transaction(after_cursor);
                     self.cancel_transaction_if_empty();
+                    if cleaned_generated_indent {
+                        self.notify_change(runtime).await?;
+                    }
                 }
 
                 if matches!(new_mode, Mode::Search) {
@@ -14581,16 +14692,30 @@ impl Editor {
                 let line = self.buffer_line();
                 let cx = self.cx;
                 let char_cx = self.grapheme_to_char_on_line(cx, line);
+                self.generated_indent = None;
 
                 self.replace_range(
                     TextRange::insertion(TextPosition::new(line, char_cx)),
                     &c.to_string(),
                 );
                 drop(replace_span);
-                self.notify_change(runtime).await?;
 
                 // Move cursor by one character position (not display width)
                 self.cx += grapheme_len(&c.to_string());
+                let language =
+                    self.highlight_language_id_for_buffer_index(self.buffer_manager.active_index());
+                let should_reindent = self.current_line_contents().is_some_and(|contents| {
+                    indent::should_reindent_after(
+                        language.as_deref(),
+                        *c,
+                        contents.trim_end_matches(&['\r', '\n'][..]),
+                    )
+                });
+                if should_reindent {
+                    let decision = self.indentation_decision_for_line(line);
+                    self.apply_indentation_to_line(line, decision);
+                }
+                self.notify_change(runtime).await?;
                 self.refresh_cursor_goal();
                 if started_transaction {
                     self.commit_transaction(self.cursor_snapshot());
@@ -14942,7 +15067,9 @@ impl Editor {
                 if started_transaction {
                     self.begin_transaction("insert newline");
                 }
-                let spaces = self.current_line_indentation();
+                let source_line = self.buffer_line();
+                let fallback_columns = self.indentation_columns_for_line(source_line);
+                self.cleanup_generated_indent();
 
                 let current_line = self.current_line_contents().unwrap_or_default();
                 let current_line_without_ending = current_line.trim_end_matches(&['\r', '\n'][..]);
@@ -14961,17 +15088,23 @@ impl Editor {
                 let after_cursor = char_suffix(current_line_for_split, cursor_char).to_string();
 
                 let line = self.buffer_line();
+                let fallback_indent = self.indentation().whitespace_for_columns(fallback_columns);
                 self.replace_range(
                     TextRange::new(
                         TextPosition::new(line, 0),
                         TextPosition::new(line, current_line_without_ending.chars().count()),
                     ),
-                    &format!("{}\n{}{}", before_cursor, " ".repeat(spaces), after_cursor),
+                    &format!("{}\n{}{}", before_cursor, fallback_indent, after_cursor),
                 );
-                self.notify_change(runtime).await?;
 
-                self.cx = spaces;
+                self.cx = grapheme_len(&fallback_indent);
                 self.cy += 1;
+
+                let target_line = line + 1;
+                let decision = self.indentation_decision_for_line(target_line);
+                let target_columns = self.apply_indentation_to_line(target_line, decision);
+                self.mark_generated_indent(target_line, target_columns);
+                self.notify_change(runtime).await?;
 
                 if self.cy >= self.vheight() {
                     self.vtop += 1;
@@ -15286,13 +15419,14 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::InsertLineBelowCursor => {
-                let leading_spaces = self.current_line_indentation();
+                let leading_columns = self.indentation_columns_for_line(self.buffer_line());
                 let line = self.buffer_line();
+                let fallback_indent = self.indentation().whitespace_for_columns(leading_columns);
 
                 log!(
-                    "InsertLineBelowCursor - line: {}, leading_spaces: {}, current cx: {}, cy: {}",
+                    "InsertLineBelowCursor - line: {}, leading_columns: {}, current cx: {}, cy: {}",
                     line,
-                    leading_spaces,
+                    leading_columns,
                     self.cx,
                     self.cy
                 );
@@ -15303,13 +15437,17 @@ impl Editor {
                 }
                 self.replace_range(
                     TextRange::insertion(TextPosition::new(line + 1, 0)),
-                    &format!("{}\n", " ".repeat(leading_spaces)),
+                    &format!("{fallback_indent}\n"),
                 );
-                self.notify_change(runtime).await?;
                 self.cy += 1;
-                self.cx = leading_spaces;
+                self.cx = grapheme_len(&fallback_indent);
                 self.mode = Mode::Insert;
                 self.insert_entry_cursor = Some(self.cursor_snapshot());
+                let target_line = line + 1;
+                let decision = self.indentation_decision_for_line(target_line);
+                let target_columns = self.apply_indentation_to_line(target_line, decision);
+                self.mark_generated_indent(target_line, target_columns);
+                self.notify_change(runtime).await?;
                 self.refresh_cursor_goal();
 
                 if self.cy >= self.vheight() {
@@ -15321,29 +15459,35 @@ impl Editor {
             }
             Action::InsertLineAtCursor => {
                 // if the current line is empty, let's use the indentation from the line above
-                let leading_spaces = if let Some(line) = self.current_line_contents() {
-                    if line.is_empty() {
-                        self.previous_line_indentation()
+                let leading_columns = if let Some(contents) = self.current_line_contents() {
+                    if contents.is_empty() {
+                        let previous_line = self.buffer_line().saturating_sub(1);
+                        self.indentation_columns_for_line(previous_line)
                     } else {
-                        self.current_line_indentation()
+                        self.indentation_columns_for_line(self.buffer_line())
                     }
                 } else {
-                    self.previous_line_indentation()
+                    let previous_line = self.buffer_line().saturating_sub(1);
+                    self.indentation_columns_for_line(previous_line)
                 };
 
                 let line = self.buffer_line();
+                let fallback_indent = self.indentation().whitespace_for_columns(leading_columns);
                 let started_transaction = !self.transaction_active();
                 if started_transaction {
                     self.begin_transaction("insert line above");
                 }
                 self.replace_range(
                     TextRange::insertion(TextPosition::new(line, 0)),
-                    &format!("{}\n", " ".repeat(leading_spaces)),
+                    &format!("{fallback_indent}\n"),
                 );
-                self.notify_change(runtime).await?;
-                self.cx = leading_spaces;
+                self.cx = grapheme_len(&fallback_indent);
                 self.mode = Mode::Insert;
                 self.insert_entry_cursor = Some(self.cursor_snapshot());
+                let decision = self.indentation_decision_for_line(line);
+                let target_columns = self.apply_indentation_to_line(line, decision);
+                self.mark_generated_indent(line, target_columns);
+                self.notify_change(runtime).await?;
                 self.refresh_cursor_goal();
                 self.render(buffer)?;
             }
@@ -15388,27 +15532,43 @@ impl Editor {
                 }
 
                 if self.cx > 0 {
-                    // Get the current line to find the previous grapheme boundary
                     if let Some(line) = self.current_line_contents() {
                         let line = line.trim_end_matches('\n');
-                        let prev_grapheme_idx = self.cx - 1;
-
-                        if let Some((start_char, end_char)) =
-                            grapheme_char_range(line, prev_grapheme_idx)
-                        {
-                            let line_num = self.buffer_line();
+                        let prefix = line.graphemes(true).take(self.cx).collect::<String>();
+                        let line_num = self.buffer_line();
+                        if prefix.chars().all(char::is_whitespace) {
+                            let indentation = self.indentation();
+                            let current_column =
+                                display_width_with_tabs(&prefix, indentation.tab_width.max(1));
+                            let stop = indentation.soft_tab_stop.max(1);
+                            let target_column = current_column.saturating_sub(1) / stop * stop;
+                            let replacement = indentation.whitespace_for_columns(target_column);
                             self.replace_range(
                                 TextRange::new(
-                                    TextPosition::new(line_num, start_char),
-                                    TextPosition::new(line_num, end_char),
+                                    TextPosition::new(line_num, 0),
+                                    TextPosition::new(line_num, prefix.chars().count()),
                                 ),
-                                "",
+                                &replacement,
                             );
-                            self.cx = prev_grapheme_idx;
-
-                            self.notify_change(runtime).await?;
-                            self.render_edited_window_rows(buffer)?;
+                            self.cx = grapheme_len(&replacement);
+                        } else {
+                            let prev_grapheme_idx = self.cx - 1;
+                            if let Some((start_char, end_char)) =
+                                grapheme_char_range(line, prev_grapheme_idx)
+                            {
+                                self.replace_range(
+                                    TextRange::new(
+                                        TextPosition::new(line_num, start_char),
+                                        TextPosition::new(line_num, end_char),
+                                    ),
+                                    "",
+                                );
+                                self.cx = prev_grapheme_idx;
+                            }
                         }
+
+                        self.notify_change(runtime).await?;
+                        self.render_edited_window_rows(buffer)?;
                     }
                 } else if self.buffer_line() > 0 {
                     let line_num = self.buffer_line();
@@ -16098,7 +16258,11 @@ impl Editor {
                     let indentation = self.indentation();
                     let request_id = self
                         .lsp
-                        .format_document_with_options(&file, indentation.shift_width, true)
+                        .format_document_with_options(
+                            &file,
+                            indentation.tab_width,
+                            indentation.expand_tab,
+                        )
                         .await?;
                     if request_id > 0 {
                         self.pending_lsp_edit_requests.insert(request_id, pending);
@@ -16618,10 +16782,21 @@ impl Editor {
                 }
             }
             Action::InsertTab => {
-                // TODO: Tab configuration
-                let tabsize = 4;
+                let indentation = self.indentation();
                 let cx = self.cx;
                 let line = self.buffer_line();
+                let contents = self.current_line_contents().unwrap_or_default();
+                let contents = contents.trim_end_matches(&['\r', '\n'][..]);
+                let current_column =
+                    grapheme_to_column_with_tabs(contents, cx, indentation.tab_width.max(1));
+                let stop = indentation.soft_tab_stop.max(1);
+                let target_column = (current_column / stop + 1) * stop;
+                let inserted_columns = target_column - current_column;
+                let inserted = if indentation.expand_tab {
+                    " ".repeat(inserted_columns)
+                } else {
+                    "\t".to_string()
+                };
                 let char_cx = self.grapheme_to_char_on_line(cx, line);
                 let started_transaction = !self.transaction_active();
                 if started_transaction {
@@ -16629,10 +16804,11 @@ impl Editor {
                 }
                 self.replace_range(
                     TextRange::insertion(TextPosition::new(line, char_cx)),
-                    &" ".repeat(tabsize),
+                    &inserted,
                 );
+                self.generated_indent = None;
                 self.notify_change(runtime).await?;
-                self.cx += tabsize;
+                self.cx += grapheme_len(&inserted);
                 self.refresh_cursor_goal();
                 if started_transaction {
                     self.commit_transaction(self.cursor_snapshot());
@@ -17638,6 +17814,19 @@ impl Editor {
                     self.sync_with_window();
                     self.render(buffer)?;
                 }
+            }
+        }
+
+        if let Some(generated) = self.generated_indent {
+            if generated.buffer_id != self.current_buffer().id() {
+                self.generated_indent = None;
+            } else if self.is_insert()
+                && self.buffer_line() != generated.line
+                && self.transaction_active()
+                && self.cleanup_generated_indent()
+            {
+                self.notify_change(runtime).await?;
+                self.render(buffer)?;
             }
         }
 
@@ -21944,7 +22133,7 @@ impl Editor {
         let indentation = self.indentation();
         let request = self
             .lsp
-            .format_document_with_options(&file, indentation.shift_width, true)
+            .format_document_with_options(&file, indentation.tab_width, indentation.expand_tab)
             .await;
         let request_id = match request {
             Ok(request_id) => request_id,
@@ -26399,8 +26588,8 @@ builtin = "rust"
             ('I', "    hello", (8, 0), (4, 0)),
             ('a', "hello", (2, 0), (2, 0)),
             ('A', "hello", (2, 0), (4, 0)),
-            ('o', "    one\nnext", (2, 0), (3, 1)),
-            ('O', "one\n    two", (2, 1), (3, 1)),
+            ('o', "    one\nnext", (2, 0), (0, 1)),
+            ('O', "one\n    two", (2, 1), (0, 1)),
         ];
 
         for (key, contents, start, expected) in cases {
