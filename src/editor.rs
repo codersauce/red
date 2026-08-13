@@ -16633,6 +16633,7 @@ impl Editor {
                 );
                 self.notify_change(runtime).await?;
                 self.cx += tabsize;
+                self.refresh_cursor_goal();
                 if started_transaction {
                     self.commit_transaction(self.cursor_snapshot());
                 }
@@ -31639,6 +31640,40 @@ while True:
                 "insert {inserted:?} in {contents:?} left the terminal cursor movement queued"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn tab_key_renders_cursor_at_its_new_display_column() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, String::new());
+        let mut editor =
+            Editor::with_size(lsp, 20, 5, config, Theme::default(), vec![buffer]).unwrap();
+        editor.mode = Mode::Insert;
+        editor.refresh_cursor_goal();
+        editor.sync_to_window();
+        let (initial_screen_x, expected_screen_y) = editor.render_cursor_position().unwrap();
+        let mut render_buffer = RenderBuffer::new(20, 5, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        let expected_position = (initial_screen_x + 4, expected_screen_y);
+        assert_eq!(editor.current_buffer().contents(), "    \n");
+        assert_eq!(editor.cx, 4);
+        assert_eq!(editor.render_cursor_position(), Some(expected_position));
+        assert_eq!(
+            editor.last_rendered_cursor_position,
+            Some(expected_position)
+        );
     }
 
     #[tokio::test]
