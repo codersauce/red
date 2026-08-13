@@ -125,9 +125,11 @@ Completion combines two sources. Matching words from all open buffers provide
 fast text completion even when no language server is installed. When a server
 is available, its type-aware candidates are merged in and ranked ahead of
 buffer words. `Ctrl-Space` requests both sources explicitly; typing an
-identifier prefix requests them automatically after a short quiet period.
-Language-server trigger characters such as `.` still request completion
-immediately.
+identifier prefix requests them automatically. Language-server trigger
+characters such as `.` also request completion immediately. While the menu is
+open, use `Ctrl-n`/`Ctrl-p` or the arrow keys to select a candidate, `Tab` to
+accept it, and `Ctrl-e` to dismiss the menu. `Enter` continues to insert a
+newline.
 
 Tune or disable either behavior in `config.toml`:
 
@@ -135,7 +137,7 @@ Tune or disable either behavior in `config.toml`:
 [completion]
 auto_trigger = true
 min_prefix_length = 1
-debounce_ms = 120
+debounce_ms = 0
 buffer_words = true
 max_buffer_words = 100
 ```

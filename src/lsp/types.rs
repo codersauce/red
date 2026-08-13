@@ -1696,6 +1696,7 @@ pub struct InlayHintLabelPart {
 #[serde(rename_all = "camelCase")]
 pub struct CompletionResponseItem {
     pub label: String,
+    pub label_details: Option<CompletionItemLabelDetails>,
     pub kind: Option<CompletionItemKind>,
     pub detail: Option<String>,
     pub documentation: Option<Documentation>,
@@ -1710,6 +1711,13 @@ pub struct CompletionResponseItem {
     pub command: Option<Command>,
     pub data: Option<Value>,
     pub commit_characters: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletionItemLabelDetails {
+    pub detail: Option<String>,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -91,11 +91,12 @@ use crate::{
         apply_workspace_resource_operations, file_path as lsp_file_path, get_client_capabilities,
         normalized_file_path as lsp_normalized_file_path, prepare_workspace_edit,
         text_edit_char_range, workspace_edit_operations, Command as LspCommand, CompletionItemKind,
-        CompletionResponse, CompletionResponseItem, Diagnostic, DocumentEdit as LspDocumentEdit,
-        Hover as LspHover, HoverContents, InboundMessage, InlayHint, InsertTextFormat, Location,
-        LspClient, MarkedString, MarkupKind, OpenWorkspaceDocument, ParsedNotification,
-        Position as LspPosition, ProgressParams, ProgressToken, Range, ResponseMessage,
-        ServerCapabilities, ServerRequest as LspServerRequest, TextEdit as LspTextEdit,
+        CompletionItemLabelDetails, CompletionResponse, CompletionResponseItem, Diagnostic,
+        DocumentEdit as LspDocumentEdit, Hover as LspHover, HoverContents, InboundMessage,
+        InlayHint, InsertTextFormat, Location, LspClient, MarkedString, MarkupKind,
+        OpenWorkspaceDocument, ParsedNotification, Position as LspPosition, ProgressParams,
+        ProgressToken, Range, ResponseMessage, ServerCapabilities,
+        ServerRequest as LspServerRequest, TextEdit as LspTextEdit,
         WorkspaceEditOperation as LspWorkspaceEditOperation, MAX_WORKSPACE_EDIT_TOTAL_BYTES,
     },
     matchit::{self, MatchDirection, MatchMotion},
@@ -2691,7 +2692,7 @@ pub struct Editor {
     pending_lsp_edit_requests: HashMap<i64, PendingLspEdit>,
     pending_lsp_format_saves: HashMap<i64, PendingLspFormatSave>,
     pending_lsp_revision_snapshots: HashMap<i64, Vec<(String, u64)>>,
-    pending_buffer_completions: HashMap<i64, Vec<CompletionResponseItem>>,
+    pending_completions: HashMap<i64, PendingCompletion>,
     scheduled_completion: Option<ScheduledCompletion>,
     completion_snapshot: Option<CompletionSnapshot>,
 }
@@ -3149,6 +3150,13 @@ struct CompletionSnapshot {
     cursor: Option<TextPosition>,
     original_range: Option<Range>,
     current_range: Option<Range>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingCompletion {
+    buffer_items: Vec<CompletionResponseItem>,
+    snapshot: CompletionSnapshot,
+    displayed_immediately: bool,
 }
 
 impl From<PendingLspEdit> for CompletionSnapshot {
@@ -3893,7 +3901,7 @@ impl Editor {
             pending_lsp_edit_requests: HashMap::new(),
             pending_lsp_format_saves: HashMap::new(),
             pending_lsp_revision_snapshots: HashMap::new(),
-            pending_buffer_completions: HashMap::new(),
+            pending_completions: HashMap::new(),
             scheduled_completion: None,
             completion_snapshot: None,
         })
@@ -9722,6 +9730,33 @@ impl Editor {
             })
     }
 
+    fn snapshot_for_completion_response(
+        &self,
+        pending: &PendingCompletion,
+    ) -> Option<CompletionSnapshot> {
+        if pending.displayed_immediately {
+            let active = self.completion_snapshot.as_ref()?;
+            let same_session = active.buffer_id == pending.snapshot.buffer_id
+                && active.initial_revision == pending.snapshot.initial_revision
+                && active.uri == pending.snapshot.uri;
+            return (same_session && self.completion_snapshot_is_current(active))
+                .then(|| active.clone());
+        }
+
+        self.completion_snapshot_is_current(&pending.snapshot)
+            .then(|| pending.snapshot.clone())
+    }
+
+    fn show_completion_fallback(&mut self, pending: PendingCompletion) -> bool {
+        if pending.displayed_immediately {
+            return false;
+        }
+        let Some(snapshot) = self.snapshot_for_completion_response(&pending) else {
+            return false;
+        };
+        self.show_completion_items(pending.buffer_items, snapshot)
+    }
+
     fn formatting_action(&mut self, response: &ResponseMessage) -> Option<Action> {
         let pending = self.pending_lsp_edit_requests.remove(&response.id)?;
         let save = self.pending_lsp_format_saves.remove(&response.id);
@@ -10325,31 +10360,38 @@ impl Editor {
                     }
 
                     if method == "textDocument/completion" {
-                        let pending = self.pending_lsp_edit_requests.remove(&msg.id);
-                        let buffer_items = self
-                            .pending_buffer_completions
-                            .remove(&msg.id)
-                            .unwrap_or_default();
-                        if pending
-                            .as_ref()
-                            .is_some_and(|pending| !self.pending_lsp_edit_is_current(pending))
-                        {
-                            self.last_error =
-                                Some("completion response is stale; buffer changed".to_string());
+                        let pending_edit = self.pending_lsp_edit_requests.remove(&msg.id);
+                        let pending =
+                            self.pending_completions.remove(&msg.id).unwrap_or_else(|| {
+                                PendingCompletion {
+                                    buffer_items: Vec::new(),
+                                    snapshot: pending_edit
+                                        .map(CompletionSnapshot::from)
+                                        .unwrap_or_else(|| self.completion_snapshot()),
+                                    displayed_immediately: false,
+                                }
+                            });
+                        if pending.displayed_immediately && self.completion_snapshot.is_none() {
                             return None;
                         }
-                        let snapshot = pending
-                            .map(CompletionSnapshot::from)
-                            .unwrap_or_else(|| self.completion_snapshot());
-                        if !self.completion_snapshot_is_current(&snapshot) {
+                        if msg.request.is_some()
+                            && self.completion_filter_for_response(msg).is_none()
+                        {
+                            self.last_error = Some(
+                                "completion response is stale; cursor moved before the request position"
+                                    .to_string(),
+                            );
+                            return None;
+                        }
+                        let Some(snapshot) = self.snapshot_for_completion_response(&pending) else {
                             self.last_error = Some(
                                 "completion response is stale; active buffer changed".to_string(),
                             );
                             return None;
-                        }
+                        };
                         if msg.result.is_null() {
                             return self
-                                .show_completion_items(buffer_items, snapshot)
+                                .show_completion_items(pending.buffer_items, snapshot)
                                 .then_some(Action::ShowDialog);
                         }
 
@@ -10367,28 +10409,11 @@ impl Editor {
                             Ok(completion_response) => {
                                 let items = Self::merge_completion_items(
                                     completion_response.items(),
-                                    buffer_items,
+                                    pending.buffer_items,
                                 );
-                                if items.is_empty() || self.mode != Mode::Insert {
-                                    return None;
-                                }
-                                let (completion_x, completion_y) =
-                                    self.render_cursor_position().unwrap_or((self.cx, self.cy));
-                                let mut completion = CompletionUI::with_theme(&self.theme);
-                                completion.show_with_bounds(
-                                    items,
-                                    completion_x,
-                                    completion_y,
-                                    self.size.0 as usize,
-                                    self.size.1 as usize,
-                                );
-                                if let Some(filter) = self.completion_filter_for_response(msg) {
-                                    completion.set_filter(&filter);
-                                }
-                                self.current_dialog = Some(Box::new(completion));
-                                self.completion_snapshot =
-                                    Some(self.activate_completion_snapshot(snapshot));
-                                return Some(Action::ShowDialog);
+                                return self
+                                    .show_completion_items(items, snapshot)
+                                    .then_some(Action::ShowDialog);
                             }
                             Err(err) => {
                                 log!("ERROR: error parsing completion response: {err}");
@@ -10457,23 +10482,14 @@ impl Editor {
                     ));
                 }
                 let pending = self.pending_lsp_edit_requests.remove(&id);
-                let buffer_items = self
-                    .pending_buffer_completions
-                    .remove(&id)
-                    .unwrap_or_default();
+                let pending_completion = self.pending_completions.remove(&id);
                 let save = self.pending_lsp_format_saves.remove(&id);
                 self.pending_lsp_revision_snapshots.remove(&id);
-                if method.as_deref() == Some("textDocument/completion") {
-                    if let Some(snapshot) = pending
-                        .as_ref()
-                        .filter(|pending| self.pending_lsp_edit_is_current(pending))
-                        .cloned()
-                        .map(CompletionSnapshot::from)
-                    {
-                        if self.show_completion_items(buffer_items, snapshot) {
-                            return Some(Action::ShowDialog);
-                        }
-                    }
+                if method.as_deref() == Some("textDocument/completion")
+                    && pending_completion
+                        .is_some_and(|pending| self.show_completion_fallback(pending))
+                {
+                    return Some(Action::ShowDialog);
                 }
                 self.last_error = Some(error_msg.message.clone());
                 let save_as = save.as_ref().is_some_and(|save| save.save_as.is_some());
@@ -10532,23 +10548,14 @@ impl Editor {
                     ))
                 } else {
                     let pending = self.pending_lsp_edit_requests.remove(id);
-                    let buffer_items = self
-                        .pending_buffer_completions
-                        .remove(id)
-                        .unwrap_or_default();
+                    let pending_completion = self.pending_completions.remove(id);
                     let save = self.pending_lsp_format_saves.remove(id);
                     self.pending_lsp_revision_snapshots.remove(id);
-                    if method.as_deref() == Some("textDocument/completion") {
-                        if let Some(snapshot) = pending
-                            .as_ref()
-                            .filter(|pending| self.pending_lsp_edit_is_current(pending))
-                            .cloned()
-                            .map(CompletionSnapshot::from)
-                        {
-                            if self.show_completion_items(buffer_items, snapshot) {
-                                return Some(Action::ShowDialog);
-                            }
-                        }
+                    if method.as_deref() == Some("textDocument/completion")
+                        && pending_completion
+                            .is_some_and(|pending| self.show_completion_fallback(pending))
+                    {
+                        return Some(Action::ShowDialog);
                     }
                     self.last_error = Some(error.to_string());
                     let save_as = save.as_ref().is_some_and(|save| save.save_as.is_some());
@@ -10675,7 +10682,20 @@ impl Editor {
 
         if let Some(current_dialog) = &mut self.current_dialog {
             let action = current_dialog.handle_event(ev);
-            if action.is_some() || !current_dialog.allows_event_passthrough() {
+            let allows_passthrough = current_dialog.allows_event_passthrough();
+            if action.is_some() || !allows_passthrough {
+                let action = match (action, ev) {
+                    (
+                        Some(action),
+                        Event::Key(KeyEvent {
+                            code: KeyCode::Char(c),
+                            ..
+                        }),
+                    ) if allows_passthrough && self.is_completion_trigger_char(*c) => {
+                        Some(Self::retrigger_after_completion_commit(action, *c))
+                    }
+                    (action, _) => action,
+                };
                 return Ok(action);
             }
         }
@@ -21570,22 +21590,56 @@ impl Editor {
         });
     }
 
-    fn handle_trigger_char(&mut self, c: char) -> anyhow::Result<Option<KeyAction>> {
+    fn is_completion_trigger_char(&self, c: char) -> bool {
         let Some(file) = self.current_buffer().file.as_deref() else {
-            return Ok(None);
+            return false;
         };
         let Some(capabilities) = self.lsp.server_capabilities_for_file(file) else {
-            return Ok(None);
+            return false;
         };
 
-        if !capabilities.is_trigger_char(c) {
+        capabilities.is_trigger_char(c)
+    }
+
+    fn completion_trigger_actions(&self, c: char) -> KeyAction {
+        let mut actions = Vec::with_capacity(3);
+        if self
+            .current_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.allows_event_passthrough())
+        {
+            actions.push(Action::CloseDialog);
+        }
+        actions.push(Action::InsertCharAtCursorPos(c));
+        actions.push(Action::RequestCompletionWithTrigger(c));
+        KeyAction::Multiple(actions)
+    }
+
+    fn retrigger_after_completion_commit(action: KeyAction, c: char) -> KeyAction {
+        let KeyAction::Multiple(mut actions) = action else {
+            return action;
+        };
+        let committed = actions.iter().any(|action| {
+            matches!(
+                action,
+                Action::ApplyCompletion {
+                    commit_character: Some(character),
+                    ..
+                } if *character == c
+            )
+        });
+        if committed {
+            actions.push(Action::RequestCompletionWithTrigger(c));
+        }
+        KeyAction::Multiple(actions)
+    }
+
+    fn handle_trigger_char(&mut self, c: char) -> anyhow::Result<Option<KeyAction>> {
+        if !self.is_completion_trigger_char(c) {
             return Ok(None);
         }
 
-        Ok(Some(KeyAction::Multiple(vec![
-            Action::InsertCharAtCursorPos(c),
-            Action::RequestCompletionWithTrigger(c),
-        ])))
+        Ok(Some(self.completion_trigger_actions(c)))
     }
 
     fn completion_prefix(&self) -> Option<(String, Range)> {
@@ -21662,6 +21716,10 @@ impl Editor {
                     if normalized.starts_with(&prefix_lower) && seen.insert(normalized) {
                         items.push(CompletionResponseItem {
                             label: word.clone(),
+                            label_details: Some(CompletionItemLabelDetails {
+                                detail: None,
+                                description: Some("buffer".to_string()),
+                            }),
                             kind: Some(CompletionItemKind::Text),
                             detail: Some("Buffer word".to_string()),
                             documentation: None,
@@ -21760,6 +21818,19 @@ impl Editor {
         {
             return false;
         }
+        let filter = self
+            .completion_prefix()
+            .map(|(filter, _)| filter)
+            .unwrap_or_default();
+        if self
+            .current_dialog
+            .as_mut()
+            .is_some_and(|dialog| dialog.update_completion(items.clone(), &filter))
+        {
+            self.completion_snapshot = Some(snapshot);
+            return true;
+        }
+
         let (completion_x, completion_y) =
             self.render_cursor_position().unwrap_or((self.cx, self.cy));
         let mut completion = CompletionUI::with_theme(&self.theme);
@@ -21770,11 +21841,13 @@ impl Editor {
             self.size.0 as usize,
             self.size.1 as usize,
         );
-        if let Some((filter, _)) = self.completion_prefix() {
-            completion.set_filter(&filter);
-        }
+        completion.set_filter(&filter);
         self.current_dialog = Some(Box::new(completion));
-        self.completion_snapshot = Some(self.activate_completion_snapshot(snapshot));
+        self.completion_snapshot = Some(if snapshot.original_range.is_some() {
+            snapshot
+        } else {
+            self.activate_completion_snapshot(snapshot)
+        });
         true
     }
 
@@ -21805,18 +21878,24 @@ impl Editor {
         self.scheduled_completion = None;
         let buffer_items = self.buffer_completion_items();
         let snapshot = self.completion_snapshot();
+        let displayed_immediately = !buffer_items.is_empty()
+            && self.show_completion_items(buffer_items.clone(), snapshot.clone());
+        let pending_snapshot = self
+            .completion_snapshot
+            .clone()
+            .unwrap_or_else(|| snapshot.clone());
 
         let uri = match self.current_buffer().uri() {
             Ok(uri) => uri,
             Err(error) => {
                 self.last_error = Some(format!("could not resolve completion document: {error}"));
-                return Ok(self.show_completion_items(buffer_items, snapshot));
+                return Ok(displayed_immediately);
             }
         };
         if let Some(uri) = uri {
             if let Err(error) = self.ensure_current_buffer_lsp_opened().await {
                 self.last_error = Some(format!("could not open LSP completion document: {error}"));
-                return Ok(self.show_completion_items(buffer_items, snapshot));
+                return Ok(displayed_immediately);
             }
             let position = self.cursor_lsp_position();
             let pending = PendingLspEdit {
@@ -21832,18 +21911,24 @@ impl Editor {
                 Ok(request_id) => request_id,
                 Err(error) => {
                     self.last_error = Some(format!("LSP completion request failed: {error}"));
-                    return Ok(self.show_completion_items(buffer_items, snapshot));
+                    return Ok(displayed_immediately);
                 }
             };
             if request_id > 0 {
                 self.pending_lsp_edit_requests.insert(request_id, pending);
-                self.pending_buffer_completions
-                    .insert(request_id, buffer_items);
-                return Ok(false);
+                self.pending_completions.insert(
+                    request_id,
+                    PendingCompletion {
+                        buffer_items,
+                        snapshot: pending_snapshot,
+                        displayed_immediately,
+                    },
+                );
+                return Ok(displayed_immediately);
             }
         }
 
-        Ok(self.show_completion_items(buffer_items, snapshot))
+        Ok(displayed_immediately)
     }
 
     async fn apply_completion(
@@ -28824,6 +28909,7 @@ builtin = "rust"
     fn completion_item(label: &str) -> CompletionResponseItem {
         CompletionResponseItem {
             label: label.to_string(),
+            label_details: None,
             kind: None,
             detail: None,
             documentation: None,
@@ -29005,10 +29091,10 @@ builtin = "rust"
             .unwrap();
 
         assert!(editor.current_dialog.is_some());
-        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let action = editor.handle_event(&enter).unwrap().unwrap();
+        let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let action = editor.handle_event(&tab).unwrap().unwrap();
         editor
-            .handle_key_action(&enter, &action, &mut render_buffer, &mut runtime)
+            .handle_key_action(&tab, &action, &mut render_buffer, &mut runtime)
             .await
             .unwrap();
         assert_eq!(
@@ -29108,7 +29194,7 @@ builtin = "rust"
         type_completion_suffix(&mut editor, "ual", &mut render_buffer, &mut runtime).await;
         editor
             .process_editor_event(
-                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
                 &mut render_buffer,
                 &mut runtime,
                 EventRenderMode::Immediate,
@@ -29117,6 +29203,140 @@ builtin = "rust"
             .unwrap();
 
         assert_eq!(editor.current_buffer().contents(), "torch.manual_seed");
+        assert!(editor.current_dialog.is_none());
+    }
+
+    #[test]
+    fn trigger_character_starts_a_fresh_completion_session() {
+        let mut editor = completion_typing_editor();
+        let snapshot = editor.completion_snapshot();
+        assert!(editor.show_completion_items(vec![completion_item("torch")], snapshot));
+
+        let KeyAction::Multiple(actions) = editor.completion_trigger_actions('.') else {
+            panic!("expected ordered trigger-character actions");
+        };
+        assert!(matches!(actions.first(), Some(Action::CloseDialog)));
+        assert!(matches!(
+            actions.get(1),
+            Some(Action::InsertCharAtCursorPos('.'))
+        ));
+        assert!(matches!(
+            actions.get(2),
+            Some(Action::RequestCompletionWithTrigger('.'))
+        ));
+    }
+
+    #[test]
+    fn committed_trigger_character_requests_member_completion() {
+        let action = KeyAction::Multiple(vec![
+            Action::ApplyCompletion {
+                item: Box::new(completion_item("torch")),
+                commit_character: Some('.'),
+            },
+            Action::CloseDialog,
+        ]);
+
+        let KeyAction::Multiple(actions) = Editor::retrigger_after_completion_commit(action, '.')
+        else {
+            panic!("expected ordered completion actions");
+        };
+        assert!(matches!(
+            actions.last(),
+            Some(Action::RequestCompletionWithTrigger('.'))
+        ));
+    }
+
+    #[tokio::test]
+    async fn completion_merges_lsp_results_into_the_visible_menu_after_typing() {
+        let mut editor = completion_typing_editor();
+        let request_snapshot = editor.completion_snapshot();
+        let buffer_items = vec![completion_item("manual_seed"), completion_item("many")];
+        assert!(editor.show_completion_items(buffer_items.clone(), request_snapshot));
+        let pending_snapshot = editor.completion_snapshot.clone().unwrap();
+        editor.pending_completions.insert(
+            42,
+            PendingCompletion {
+                buffer_items,
+                snapshot: pending_snapshot,
+                displayed_immediately: true,
+            },
+        );
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        type_completion_suffix(&mut editor, "u", &mut render_buffer, &mut runtime).await;
+        let response = InboundMessage::Message(ResponseMessage {
+            id: 42,
+            result: serde_json::json!([
+                { "label": "match", "sortText": "00" },
+                { "label": "manual_seed", "sortText": "01" }
+            ]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/completion",
+                serde_json::json!({ "position": { "line": 0, "character": 9 } }),
+            )),
+        });
+
+        assert!(matches!(
+            editor.handle_lsp_message(&response, Some("textDocument/completion".to_string())),
+            Some(Action::ShowDialog)
+        ));
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), "torch.manual_seed");
+        assert!(editor.current_dialog.is_none());
+    }
+
+    #[tokio::test]
+    async fn dismissed_completion_is_not_reopened_by_a_late_lsp_response() {
+        let mut editor = completion_typing_editor();
+        let request_snapshot = editor.completion_snapshot();
+        let buffer_items = vec![completion_item("manual_seed"), completion_item("many")];
+        assert!(editor.show_completion_items(buffer_items.clone(), request_snapshot));
+        let pending_snapshot = editor.completion_snapshot.clone().unwrap();
+        editor.pending_completions.insert(
+            42,
+            PendingCompletion {
+                buffer_items,
+                snapshot: pending_snapshot,
+                displayed_immediately: true,
+            },
+        );
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+        assert!(editor.current_dialog.is_none());
+        assert!(editor.completion_snapshot.is_none());
+
+        let response = InboundMessage::Message(ResponseMessage {
+            id: 42,
+            result: serde_json::json!([{ "label": "manual_seed" }]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/completion",
+                serde_json::json!({ "position": { "line": 0, "character": 9 } }),
+            )),
+        });
+
+        assert!(editor
+            .handle_lsp_message(&response, Some("textDocument/completion".to_string()))
+            .is_none());
         assert!(editor.current_dialog.is_none());
     }
 
@@ -29149,7 +29369,7 @@ builtin = "rust"
         type_completion_suffix(&mut editor, "ual", &mut render_buffer, &mut runtime).await;
         editor
             .process_editor_event(
-                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
                 &mut render_buffer,
                 &mut runtime,
                 EventRenderMode::Immediate,
@@ -29182,7 +29402,7 @@ builtin = "rust"
             .unwrap();
         editor
             .process_editor_event(
-                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
                 &mut render_buffer,
                 &mut runtime,
                 EventRenderMode::Immediate,
@@ -29239,8 +29459,8 @@ builtin = "rust"
             .await
             .unwrap();
 
-        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let KeyAction::Multiple(actions) = editor.handle_event(&enter).unwrap().unwrap() else {
+        let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let KeyAction::Multiple(actions) = editor.handle_event(&tab).unwrap().unwrap() else {
             panic!("expected completion application and close actions");
         };
         editor
@@ -29500,8 +29720,8 @@ builtin = "rust"
             editor.handle_lsp_message(&response, Some("textDocument/completion".to_string())),
             Some(Action::ShowDialog)
         ));
-        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let action = editor.handle_event(&enter).unwrap().unwrap();
+        let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let action = editor.handle_event(&tab).unwrap().unwrap();
         let KeyAction::Multiple(actions) = action else {
             panic!("expected completion application action");
         };

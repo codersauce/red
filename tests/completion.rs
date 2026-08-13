@@ -33,6 +33,7 @@ fn recorded(events: &Arc<Mutex<Vec<LspEvent>>>) -> Vec<LspEvent> {
 fn item(label: &str) -> CompletionResponseItem {
     CompletionResponseItem {
         label: label.to_string(),
+        label_details: None,
         kind: None,
         detail: None,
         documentation: None,

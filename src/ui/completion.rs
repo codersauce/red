@@ -1,17 +1,16 @@
-//! Completion-menu state, filtering, selection, documentation, and terminal rendering.
+//! Compact completion-menu state, filtering, selection, and terminal rendering.
 //!
 //! [`CompletionUI`] owns a snapshot of LSP completion items and the selection derived
 //! from the current query. It produces actions for the editor to apply; accepting an
 //! item does not itself mutate a buffer.
 
-use std::cmp::min;
-
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 
 use crate::{
     config::KeyAction,
     editor::{Action, Mode, RenderBuffer},
-    lsp::types::{CompletionItemKind, CompletionResponseItem, Documentation},
+    lsp::types::{CompletionItemKind, CompletionResponseItem},
     theme::{SelectionForegroundPriority, Style, Theme, UiStyle},
     unicode_utils::{
         display_width, fit_display_width, truncate_display_width_with_marker, TruncationSide,
@@ -20,22 +19,52 @@ use crate::{
 
 use super::{dialog::BorderStyle, Component, IconCatalog, SelectionViewport};
 
-const MAX_WIDTH: usize = 80;
+const MIN_INNER_WIDTH: usize = 15;
+const MAX_INNER_WIDTH: usize = 78;
 const PAGE_SIZE: usize = 10;
-const PREVIEW_MAX_ROWS: usize = 7;
+const LEFT_PADDING: usize = 1;
+const RIGHT_PADDING: usize = 1;
+const ICON_COLUMN_WIDTH: usize = 2;
+
+#[derive(Clone)]
+struct CompletionSelectionIdentity {
+    label: String,
+    sort_text: Option<String>,
+    insert_text: Option<String>,
+}
+
+impl CompletionSelectionIdentity {
+    fn from_item(item: &CompletionResponseItem) -> Self {
+        Self {
+            label: item.label.clone(),
+            sort_text: item.sort_text.clone(),
+            insert_text: item.insert_text.clone(),
+        }
+    }
+
+    fn matches(&self, item: &CompletionResponseItem) -> bool {
+        self.label == item.label
+            && self.sort_text == item.sort_text
+            && self.insert_text == item.insert_text
+    }
+}
 
 #[derive(Default, Clone)]
 pub struct CompletionUI {
     all_items: Vec<CompletionResponseItem>,
     items: Vec<usize>,
+    matched_label_indices: Vec<Vec<usize>>,
     filter: String,
     viewport: SelectionViewport,
     visible: bool,
+    anchor_x: usize,
+    anchor_y: usize,
+    bounds_width: usize,
+    bounds_height: usize,
     x: usize,
     y: usize,
-    max_height: usize,
     width: usize,
-    max_rows: usize,
+    visible_rows: usize,
     commit_chars: Vec<char>,
     styles: UiStyle,
 }
@@ -68,13 +97,35 @@ impl CompletionUI {
 
     pub fn show_with_bounds(
         &mut self,
-        mut items: Vec<CompletionResponseItem>,
-        mut x: usize,
-        mut y: usize,
+        items: Vec<CompletionResponseItem>,
+        x: usize,
+        y: usize,
         bounds_width: usize,
         bounds_height: usize,
     ) {
-        // Collect commit characters from all items
+        self.anchor_x = x;
+        self.anchor_y = y;
+        self.bounds_width = bounds_width;
+        self.bounds_height = bounds_height;
+        self.visible = true;
+        self.filter.clear();
+        self.replace_items(items, None);
+    }
+
+    pub fn update_items(&mut self, items: Vec<CompletionResponseItem>, filter: &str) {
+        let selected = self
+            .selected_item()
+            .map(CompletionSelectionIdentity::from_item);
+        self.filter.clear();
+        self.filter.push_str(filter);
+        self.replace_items(items, selected.as_ref());
+    }
+
+    fn replace_items(
+        &mut self,
+        mut items: Vec<CompletionResponseItem>,
+        selected: Option<&CompletionSelectionIdentity>,
+    ) {
         self.commit_chars = items
             .iter()
             .filter_map(|item| item.commit_characters.as_ref())
@@ -83,7 +134,6 @@ impl CompletionUI {
             .collect();
         self.commit_chars.sort_unstable();
         self.commit_chars.dedup();
-        // Keep server-provided relevance ordering while still honoring preselection.
         items.sort_by(|a, b| {
             b.preselect
                 .unwrap_or(false)
@@ -96,58 +146,15 @@ impl CompletionUI {
                 })
                 .then(a.label.cmp(&b.label))
         });
-
-        // Find first preselected item or default to 0
-        let selected = items
-            .iter()
-            .position(|item| item.preselect.unwrap_or(false))
-            .unwrap_or(0);
-
-        let width = Self::calculate_width_for(&items)
-            .min(bounds_width.max(2))
-            .max(2);
-        let unbounded_height = bounds_height == usize::MAX;
-        let max_rows = if unbounded_height {
-            y = y.saturating_add(1);
-            usize::MAX
-        } else {
-            let desired_rows = min(items.len(), PAGE_SIZE).saturating_add(2);
-            let rows_below = bounds_height.saturating_sub(y.saturating_add(1));
-            let rows_above = y;
-            if rows_below < desired_rows && rows_above > rows_below {
-                let max_rows = desired_rows.min(rows_above);
-                y = y.saturating_sub(max_rows);
-                max_rows
-            } else {
-                y = y.saturating_add(1);
-                desired_rows.min(rows_below)
-            }
-        };
-
-        if bounds_width > width {
-            x = x.min(bounds_width - width);
-        } else {
-            x = 0;
-        }
-
-        self.items.clear();
-        self.items.extend(0..items.len());
         self.all_items = items;
-        self.filter.clear();
-        self.visible = true;
-        self.x = x;
-        self.y = y;
-        self.width = width;
-        self.max_rows = max_rows;
-        self.max_height = min(min(self.items.len(), PAGE_SIZE), max_rows.saturating_sub(2));
-        self.viewport = SelectionViewport::new(self.items.len(), self.max_height);
-        self.viewport.select(selected);
+        self.refilter_items(selected);
     }
 
     pub fn hide(&mut self) {
         self.visible = false;
         self.all_items.clear();
         self.items.clear();
+        self.matched_label_indices.clear();
         self.filter.clear();
     }
 
@@ -164,87 +171,179 @@ impl CompletionUI {
     pub fn set_filter(&mut self, filter: &str) {
         self.filter.clear();
         self.filter.push_str(filter);
-        self.refilter_items();
+        self.refilter_items(None);
     }
 
-    fn calculate_width_for(items: &[CompletionResponseItem]) -> usize {
-        let max_item_width = items
+    fn calculate_inner_width(&self) -> usize {
+        let max_item_width = self
+            .items
             .iter()
+            .filter_map(|index| self.all_items.get(*index))
             .map(|item| {
-                let kind_width = item
-                    .kind
+                let label_width = display_width(&item.label)
+                    + item
+                        .label_details
+                        .as_ref()
+                        .and_then(|details| details.detail.as_deref())
+                        .map_or(0, display_width);
+                let description_width = item
+                    .label_details
                     .as_ref()
-                    .map_or(0, |kind| display_width(Self::kind_to_icon(kind)) + 1);
-                display_width(&item.label) + kind_width + 4 // +4 for prefix and padding
+                    .and_then(|details| details.description.as_deref())
+                    .map_or(0, |description| display_width(description) + 1);
+                LEFT_PADDING + ICON_COLUMN_WIDTH + label_width + description_width + RIGHT_PADDING
             })
             .max()
-            .unwrap_or(20);
+            .unwrap_or(MIN_INNER_WIDTH);
 
-        max_item_width.clamp(40, MAX_WIDTH)
+        max_item_width.clamp(MIN_INNER_WIDTH, MAX_INNER_WIDTH)
     }
 
-    fn item_filter_score(item: &CompletionResponseItem, filter: &str) -> Option<usize> {
+    fn item_filter_match(
+        matcher: &SkimMatcherV2,
+        item: &CompletionResponseItem,
+        filter: &str,
+    ) -> Option<(u8, i64, Vec<usize>)> {
         if filter.is_empty() {
-            return Some(0);
+            return Some((0, 0, Vec::new()));
         }
 
-        let filter = filter.as_bytes();
-        let candidate = item
-            .filter_text
-            .as_deref()
-            .unwrap_or(&item.label)
-            .as_bytes();
-        if candidate
-            .get(..filter.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(filter))
-        {
-            return Some(0);
-        }
-
-        candidate
-            .windows(filter.len())
-            .any(|window| window.eq_ignore_ascii_case(filter))
-            .then_some(1)
+        let candidate = item.filter_text.as_deref().unwrap_or(&item.label);
+        let (score, _) = matcher.fuzzy_indices(candidate, filter)?;
+        let normalized_candidate = candidate.to_lowercase();
+        let normalized_filter = filter.to_lowercase();
+        let match_class = if normalized_candidate == normalized_filter {
+            3
+        } else if normalized_candidate.starts_with(&normalized_filter) {
+            2
+        } else {
+            1
+        };
+        let label_indices = matcher
+            .fuzzy_indices(&item.label, filter)
+            .map(|(_, indices)| indices)
+            .unwrap_or_default();
+        Some((match_class, score, label_indices))
     }
 
-    fn refilter_items(&mut self) {
+    fn refilter_items(&mut self, selected: Option<&CompletionSelectionIdentity>) {
+        let matcher = SkimMatcherV2::default().ignore_case();
         if self.filter.is_empty() {
             self.items.clear();
             self.items.extend(0..self.all_items.len());
+            self.matched_label_indices = vec![Vec::new(); self.items.len()];
         } else {
             let mut matches = self
                 .all_items
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, item)| {
-                    Self::item_filter_score(item, &self.filter).map(|score| (score, idx))
+                    Self::item_filter_match(&matcher, item, &self.filter)
+                        .map(|(class, score, indices)| (class, score, idx, indices))
                 })
                 .collect::<Vec<_>>();
-            matches.sort_unstable();
+            matches.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| b.1.cmp(&a.1))
+                    .then_with(|| a.2.cmp(&b.2))
+            });
             self.items.clear();
-            self.items.extend(matches.into_iter().map(|(_, idx)| idx));
+            self.matched_label_indices.clear();
+            for (_, _, index, indices) in matches {
+                self.items.push(index);
+                self.matched_label_indices.push(indices);
+            }
         }
 
-        self.max_height = min(
-            min(self.items.len(), PAGE_SIZE),
-            self.max_rows.saturating_sub(2),
-        );
-        self.viewport.reset(self.items.len());
-        self.viewport.set_height(self.max_height);
+        self.recalculate_layout();
+        self.viewport = SelectionViewport::new(self.items.len(), self.visible_rows);
+        let exact_selection = selected.and_then(|selected| {
+            self.items.iter().position(|index| {
+                self.all_items
+                    .get(*index)
+                    .is_some_and(|item| selected.matches(item))
+            })
+        });
+        let matching_label = selected.and_then(|selected| {
+            self.items.iter().position(|index| {
+                self.all_items
+                    .get(*index)
+                    .is_some_and(|item| item.label == selected.label)
+            })
+        });
+        if let Some(selection) = exact_selection.or(matching_label) {
+            self.viewport.select(selection);
+        } else if let Some(preselected) = self.items.iter().position(|index| {
+            self.all_items
+                .get(*index)
+                .and_then(|item| item.preselect)
+                .unwrap_or(false)
+        }) {
+            self.viewport.select(preselected);
+        }
+    }
+
+    fn recalculate_layout(&mut self) {
+        let available_width = if self.bounds_width == usize::MAX {
+            MAX_INNER_WIDTH.saturating_add(2)
+        } else {
+            self.bounds_width
+        };
+        self.width = self
+            .calculate_inner_width()
+            .saturating_add(2)
+            .min(available_width)
+            .max(2);
+
+        let label_offset = 1 + LEFT_PADDING + ICON_COLUMN_WIDTH;
+        let desired_x = self
+            .anchor_x
+            .saturating_sub(display_width(&self.filter))
+            .saturating_sub(label_offset);
+        self.x = if available_width > self.width {
+            desired_x.min(available_width - self.width)
+        } else {
+            0
+        };
+
+        if self.bounds_height == usize::MAX {
+            self.visible_rows = self.items.len().min(PAGE_SIZE);
+            self.y = self.anchor_y.saturating_add(1);
+            return;
+        }
+
+        let desired_height = self.items.len().min(PAGE_SIZE).saturating_add(2);
+        let rows_below = self
+            .bounds_height
+            .saturating_sub(self.anchor_y.saturating_add(1));
+        let rows_above = self.anchor_y;
+        let available_height = if rows_below < desired_height && rows_above > rows_below {
+            let height = desired_height.min(rows_above);
+            self.y = self.anchor_y.saturating_sub(height);
+            height
+        } else {
+            self.y = self.anchor_y.saturating_add(1);
+            desired_height.min(rows_below)
+        };
+        self.visible_rows = self
+            .items
+            .len()
+            .min(PAGE_SIZE)
+            .min(available_height.saturating_sub(2));
     }
 
     fn push_filter_char(&mut self, c: char) {
         self.filter.push(c);
-        self.refilter_items();
+        self.refilter_items(None);
     }
 
     fn pop_filter_char(&mut self) {
         self.filter.pop();
-        self.refilter_items();
+        self.refilter_items(None);
     }
 
     pub fn move_selection(&mut self, delta: isize) {
-        if self.items.is_empty() || self.max_height == 0 {
+        if self.items.is_empty() || self.visible_rows == 0 {
             return;
         }
 
@@ -264,108 +363,107 @@ impl CompletionUI {
         IconCatalog::completion(kind).glyph
     }
 
-    fn row_segments(
-        &self,
-        y_offset: usize,
-        content: &str,
-        content_style: Style,
-    ) -> Vec<(usize, usize, String, Style)> {
-        let y = self.y + y_offset;
-        let inner_width = self.width.saturating_sub(2);
-
-        vec![
-            (self.x, y, "│".to_string(), self.styles.popup_border.clone()),
-            (
-                self.x + 1,
-                y,
-                fit_display_width(content, inner_width),
-                content_style,
-            ),
-            (
-                self.x + self.width.saturating_sub(1),
-                y,
-                "│".to_string(),
-                self.styles.popup_border.clone(),
-            ),
-        ]
-    }
-
-    fn separator_segments(&self, y_offset: usize) -> Vec<(usize, usize, String, Style)> {
-        let y = self.y + y_offset;
-        vec![
-            (self.x, y, "├".to_string(), self.styles.popup_border.clone()),
-            (
-                self.x + 1,
-                y,
-                "─".repeat(self.width.saturating_sub(2)),
-                self.styles.popup_border.clone(),
-            ),
-            (
-                self.x + self.width.saturating_sub(1),
-                y,
-                "┤".to_string(),
-                self.styles.popup_border.clone(),
-            ),
-        ]
-    }
-
     fn ellipsize(content: &str, width: usize) -> String {
-        fit_display_width(
-            &truncate_display_width_with_marker(content, width, "…", TruncationSide::Right),
-            width,
-        )
+        truncate_display_width_with_marker(content, width, "…", TruncationSide::Right)
+    }
+
+    fn item_description(item: &CompletionResponseItem) -> Option<&str> {
+        item.label_details
+            .as_ref()
+            .and_then(|details| details.description.as_deref())
+    }
+
+    fn item_label(item: &CompletionResponseItem) -> String {
+        let mut label = item.label.clone();
+        if let Some(detail) = item
+            .label_details
+            .as_ref()
+            .and_then(|details| details.detail.as_deref())
+        {
+            label.push_str(detail);
+        }
+        label
+    }
+
+    fn row_style(&self, selected: bool, deprecated: bool) -> Style {
+        if selected {
+            self.styles.picker_selected_item.clone()
+        } else if deprecated {
+            self.styles.deprecated.clone()
+        } else {
+            self.styles.picker_item.clone()
+        }
+    }
+
+    fn label_segments(
+        &self,
+        x: usize,
+        y: usize,
+        label: &str,
+        matched_indices: &[usize],
+        base_style: &Style,
+    ) -> Vec<(usize, usize, String, Style)> {
+        let mut output = Vec::new();
+        let mut cell_x = x;
+        let mut chunk = String::new();
+        let mut chunk_matched = None;
+
+        let flush = |output: &mut Vec<(usize, usize, String, Style)>,
+                     cell_x: &mut usize,
+                     chunk: &mut String,
+                     matched: bool| {
+            if chunk.is_empty() {
+                return;
+            }
+            let mut style = base_style.clone();
+            if matched {
+                style.bold = true;
+            }
+            let width = display_width(chunk);
+            output.push((*cell_x, y, std::mem::take(chunk), style));
+            *cell_x += width;
+        };
+
+        for (index, character) in label.chars().enumerate() {
+            let matched = matched_indices.binary_search(&index).is_ok();
+            if chunk_matched.is_some_and(|current| current != matched) {
+                flush(
+                    &mut output,
+                    &mut cell_x,
+                    &mut chunk,
+                    chunk_matched.unwrap_or(false),
+                );
+            }
+            chunk_matched = Some(matched);
+            chunk.push(character);
+        }
+        flush(
+            &mut output,
+            &mut cell_x,
+            &mut chunk,
+            chunk_matched.unwrap_or(false),
+        );
+        output
     }
 
     fn render_completion(&self) -> Vec<(usize, usize, String, Style)> {
-        if !self.visible || self.items.is_empty() || self.width < 2 || self.max_rows < 2 {
+        if !self.visible || self.items.is_empty() || self.width < 2 || self.visible_rows == 0 {
             return Vec::new();
         }
 
         let mut output = Vec::new();
-        let mut y_offset = 0;
-        let last_row_offset = self.max_rows.saturating_sub(1);
         let [horizontal, _, top_left, top_right, bottom_left, bottom_right] = BorderStyle::Rounded
             .glyphs()
             .expect("rounded completion borders have frame glyphs");
         let horizontal = horizontal.to_string().repeat(self.width.saturating_sub(2));
-
-        // Draw top border
         output.push((
             self.x,
-            self.y + y_offset,
+            self.y,
             format!("{top_left}{horizontal}{top_right}"),
             self.styles.popup_border.clone(),
         ));
-        y_offset += 1;
 
-        let selected_preview_rows = self
-            .selected_item()
-            .map(|item| self.preview_rows(item, PREVIEW_MAX_ROWS))
-            .unwrap_or_default();
-        let has_preview = !selected_preview_rows.is_empty();
-        let available_content_rows = last_row_offset.saturating_sub(y_offset);
-        let min_list_rows = self
-            .items
-            .len()
-            .min(self.max_height)
-            .min(5)
-            .min(available_content_rows);
-        let available_preview_rows = available_content_rows.saturating_sub(min_list_rows);
-        let preview_row_count = if has_preview && available_preview_rows >= 2 {
-            1 + selected_preview_rows
-                .len()
-                .min(PREVIEW_MAX_ROWS)
-                .min(available_preview_rows - 1)
-        } else {
-            0
-        };
-        let list_capacity = last_row_offset
-            .saturating_sub(y_offset)
-            .saturating_sub(preview_row_count);
-        let visible_count = self.max_height.min(list_capacity);
-        if visible_count == 0 {
-            return Vec::new();
-        }
+        let visible_count = self.visible_rows;
         let max_scroll_offset = self.items.len().saturating_sub(visible_count);
         let offset = if self.viewport.selected() < self.viewport.top() {
             self.viewport.selected()
@@ -377,72 +475,82 @@ impl CompletionUI {
             self.viewport.top()
         };
         let scroll_offset = offset.min(max_scroll_offset);
-        let visible_items = self
-            .items
-            .iter()
-            .skip(scroll_offset)
+
+        for (visible_index, item_position) in (scroll_offset..self.items.len())
             .take(visible_count)
-            .filter_map(|index| self.all_items.get(*index));
-
-        // Render completion items.
-        for (idx, item) in visible_items.enumerate() {
-            let is_selected = idx + scroll_offset == self.viewport.selected();
-            let marker = if is_selected { ">" } else { " " };
-            // Format item with icon and handle deprecated items
-            let is_deprecated = item.deprecated.unwrap_or(false);
-
-            let display = if let Some(kind) = &item.kind {
-                format!(
-                    "{} {} {}{}",
-                    marker,
-                    Self::kind_to_icon(kind),
-                    if is_deprecated { "⚠ " } else { "" },
-                    item.label
-                )
-            } else {
-                format!(
-                    "{}   {}{}",
-                    marker,
-                    if is_deprecated { "⚠ " } else { "" },
-                    item.label
-                )
+            .enumerate()
+        {
+            let Some(item) = self
+                .items
+                .get(item_position)
+                .and_then(|index| self.all_items.get(*index))
+            else {
+                continue;
             };
+            let y = self.y + visible_index + 1;
+            let selected = item_position == self.viewport.selected();
+            let base_style = self.row_style(selected, item.deprecated.unwrap_or(false));
+            let inner_width = self.width.saturating_sub(2);
+            output.push((self.x, y, "│".to_string(), self.styles.popup_border.clone()));
+            output.push((self.x + 1, y, " ".repeat(inner_width), base_style.clone()));
+            output.push((
+                self.x + self.width.saturating_sub(1),
+                y,
+                "│".to_string(),
+                self.styles.popup_border.clone(),
+            ));
 
-            let display = Self::ellipsize(&display, self.width.saturating_sub(2));
+            let icon = item.kind.as_ref().map(Self::kind_to_icon).unwrap_or(" ");
+            output.push((
+                self.x + 1,
+                y,
+                fit_display_width(&format!(" {icon} "), LEFT_PADDING + ICON_COLUMN_WIDTH),
+                base_style.clone(),
+            ));
 
-            let style = if is_deprecated {
-                self.styles.deprecated.clone()
-            } else if is_selected {
-                self.styles.picker_selected_item.clone()
-            } else {
-                self.styles.picker_item.clone()
-            };
-            output.extend(self.row_segments(y_offset, &display, style));
-            y_offset += 1;
-        }
+            let description = Self::ellipsize(
+                Self::item_description(item).unwrap_or(""),
+                inner_width.saturating_sub(LEFT_PADDING + ICON_COLUMN_WIDTH + RIGHT_PADDING + 2),
+            );
+            let description_width = display_width(&description);
+            let description_space = (!description.is_empty()).then_some(description_width + 1);
+            let label_width = inner_width
+                .saturating_sub(LEFT_PADDING + ICON_COLUMN_WIDTH + RIGHT_PADDING)
+                .saturating_sub(description_space.unwrap_or(0));
+            let label = Self::ellipsize(&Self::item_label(item), label_width);
+            let matched_indices = self
+                .matched_label_indices
+                .get(item_position)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            output.extend(self.label_segments(
+                self.x + 1 + LEFT_PADDING + ICON_COLUMN_WIDTH,
+                y,
+                &label,
+                matched_indices,
+                &base_style,
+            ));
 
-        if has_preview && y_offset < last_row_offset {
-            output.extend(self.separator_segments(y_offset));
-            y_offset += 1;
-
-            for row in selected_preview_rows.into_iter().take(PREVIEW_MAX_ROWS) {
-                if y_offset >= last_row_offset {
-                    break;
-                }
-                output.extend(self.row_segments(y_offset, &row, self.styles.muted.clone()));
-                y_offset += 1;
+            if let Some(description_space) = description_space {
+                let mut description_style = self.styles.muted.clone();
+                description_style.bg = base_style.bg;
+                output.push((
+                    self.x + 1 + inner_width.saturating_sub(description_space),
+                    y,
+                    format!(" {description}"),
+                    description_style,
+                ));
             }
         }
 
-        // Draw bottom border
+        let bottom_y = self.y + visible_count + 1;
         output.push((
             self.x,
-            self.y + y_offset,
+            bottom_y,
             format!("{bottom_left}{horizontal}{bottom_right}"),
             self.styles.popup_border.clone(),
         ));
 
-        // Show scroll indicators
         if scroll_offset > 0 {
             output.push((
                 self.x + 1,
@@ -454,50 +562,13 @@ impl CompletionUI {
         if scroll_offset + visible_count < self.items.len() {
             output.push((
                 self.x + 1,
-                self.y + y_offset,
+                bottom_y,
                 "↓".to_string(),
                 self.styles.muted.clone(),
             ));
         }
 
         output
-    }
-
-    fn preview_rows(&self, item: &CompletionResponseItem, max_rows: usize) -> Vec<String> {
-        let mut rows = Vec::new();
-        let width = self.width.saturating_sub(4).max(1);
-
-        if let Some(detail) = &item.detail {
-            rows.push(format!("  {}", Self::ellipsize(detail, width)));
-        }
-
-        if let Some(chars) = &item.commit_characters {
-            let commit_text = format!(
-                "Complete with: {}",
-                chars
-                    .iter()
-                    .map(|c| format!("'{}'", c))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            rows.push(format!("  {}", Self::ellipsize(&commit_text, width)));
-        }
-
-        if let Some(doc) = &item.documentation {
-            let doc_text = match doc {
-                Documentation::String(s) => s,
-                Documentation::MarkupContent(content) => &content.value,
-            };
-
-            for line in textwrap::wrap(doc_text, width) {
-                if rows.len() >= max_rows {
-                    break;
-                }
-                rows.push(format!("  {line}"));
-            }
-        }
-
-        rows
     }
 }
 
@@ -513,26 +584,19 @@ impl Component for CompletionUI {
         Ok(())
     }
 
+    fn update_completion(&mut self, items: Vec<CompletionResponseItem>, filter: &str) -> bool {
+        self.update_items(items, filter);
+        true
+    }
+
     fn handle_event(&mut self, ev: &Event) -> Option<KeyAction> {
         match ev {
             Event::Key(KeyEvent {
                 code: KeyCode::Up, ..
             })
             | Event::Key(KeyEvent {
-                code: KeyCode::Char('k'),
+                code: KeyCode::Char('p'),
                 modifiers: KeyModifiers::CONTROL,
-                ..
-            }) => {
-                self.move_selection(-1);
-                Some(KeyAction::None)
-            }
-            Event::Key(KeyEvent {
-                code: KeyCode::BackTab,
-                ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Tab,
-                modifiers: KeyModifiers::SHIFT,
                 ..
             }) => {
                 self.move_selection(-1);
@@ -543,12 +607,9 @@ impl Component for CompletionUI {
                 ..
             })
             | Event::Key(KeyEvent {
-                code: KeyCode::Char('j'),
+                code: KeyCode::Char('n'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Tab, ..
             }) => {
                 self.move_selection(1);
                 Some(KeyAction::None)
@@ -568,24 +629,30 @@ impl Component for CompletionUI {
                 Some(KeyAction::None)
             }
             Event::Key(KeyEvent {
+                code: KeyCode::Tab,
+                modifiers: KeyModifiers::NONE,
+                ..
+            }) => self.selected_item().map(|item| {
+                KeyAction::Multiple(vec![
+                    Action::ApplyCompletion {
+                        item: Box::new(item.clone()),
+                        commit_character: None,
+                    },
+                    Action::CloseDialog,
+                ])
+            }),
+            Event::Key(KeyEvent {
                 code: KeyCode::Enter,
                 ..
-            }) => {
-                if let Some(item) = self.selected_item() {
-                    Some(KeyAction::Multiple(vec![
-                        Action::ApplyCompletion {
-                            item: Box::new(item.clone()),
-                            commit_character: None,
-                        },
-                        Action::CloseDialog,
-                    ]))
-                } else {
-                    Some(KeyAction::Multiple(vec![
-                        Action::CloseDialog,
-                        Action::InsertNewLine,
-                    ]))
-                }
-            }
+            }) => Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::InsertNewLine,
+            ])),
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('e'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }) => Some(KeyAction::Single(Action::CloseDialog)),
             Event::Key(KeyEvent {
                 code: KeyCode::Esc, ..
             }) => Some(KeyAction::Multiple(vec![
@@ -649,6 +716,7 @@ mod tests {
     fn item(label: &str, kind: Option<CompletionItemKind>) -> CompletionResponseItem {
         CompletionResponseItem {
             label: label.to_string(),
+            label_details: None,
             kind,
             detail: None,
             documentation: None,
@@ -701,19 +769,100 @@ mod tests {
     }
 
     #[test]
-    fn completion_rows_pad_detail_by_display_width() {
+    fn completion_renders_label_description_without_automatic_documentation() {
         let mut completion = item("hello", Some(CompletionItemKind::Text));
-        completion.detail = Some("returns 👋 世界".to_string());
+        completion.label_details = Some(crate::lsp::types::CompletionItemLabelDetails {
+            detail: None,
+            description: Some("typing 👋".to_string()),
+        });
+        completion.detail = Some("returns 世界".to_string());
 
         let mut ui = CompletionUI::new();
         ui.show(vec![completion], 0, 0);
 
         let rows = ui.render_completion();
 
-        assert!(rows
+        assert!(rows.iter().any(|(_, _, row, _)| row.contains("typing 👋")));
+        assert!(!rows
             .iter()
-            .any(|(_, _, row, _)| row.contains("returns 👋 世界")));
+            .any(|(_, _, row, _)| row.contains("returns 世界")));
         assert_segments_within_popup(&ui, &rows);
+    }
+
+    #[test]
+    fn completion_width_tracks_filtered_content_and_aligns_the_label_to_the_prefix() {
+        let mut ui = CompletionUI::new();
+        ui.show_with_bounds(
+            vec![
+                item(
+                    "a_very_long_completion_candidate",
+                    Some(CompletionItemKind::Text),
+                ),
+                item("many", Some(CompletionItemKind::Function)),
+            ],
+            40,
+            5,
+            80,
+            24,
+        );
+        let initial_width = ui.width;
+
+        ui.set_filter("many");
+
+        assert!(ui.width < initial_width);
+        assert_eq!(ui.x + 1 + LEFT_PADDING + ICON_COLUMN_WIDTH, 40 - 4);
+        assert_eq!(ui.width, MIN_INNER_WIDTH + 2);
+    }
+
+    #[test]
+    fn completion_bolds_fuzzy_matched_label_characters() {
+        let mut ui = CompletionUI::new();
+        ui.show(
+            vec![item("manual_seed", Some(CompletionItemKind::Function))],
+            20,
+            0,
+        );
+        ui.set_filter("mns");
+
+        let rows = ui.render_completion();
+        let bold_text = rows
+            .iter()
+            .filter(|(_, _, _, style)| style.bold)
+            .map(|(_, _, text, _)| text.as_str())
+            .collect::<String>();
+
+        assert_eq!(bold_text, "mns");
+    }
+
+    #[test]
+    fn asynchronous_item_updates_preserve_the_selected_label() {
+        let mut ui = CompletionUI::new();
+        ui.show(
+            vec![
+                item("manual_seed", Some(CompletionItemKind::Text)),
+                item("many", Some(CompletionItemKind::Text)),
+            ],
+            20,
+            0,
+        );
+        ui.set_filter("man");
+        if ui.selected_item().unwrap().label != "manual_seed" {
+            ui.move_selection(1);
+        }
+        assert_eq!(ui.selected_item().unwrap().label, "manual_seed");
+
+        let mut lsp_manual_seed = item("manual_seed", Some(CompletionItemKind::Function));
+        lsp_manual_seed.sort_text = Some("00".to_string());
+        ui.update_items(
+            vec![
+                item("match", Some(CompletionItemKind::Snippet)),
+                lsp_manual_seed,
+                item("many", Some(CompletionItemKind::Text)),
+            ],
+            "man",
+        );
+
+        assert_eq!(ui.selected_item().unwrap().label, "manual_seed");
     }
 
     #[test]
@@ -742,19 +891,21 @@ mod tests {
 
     #[test]
     fn completion_popup_trims_extra_rows_to_height_bound() {
-        let mut completion = item("hello", Some(CompletionItemKind::Text));
-        completion.detail = Some("returns value".to_string());
-        completion.documentation = Some(Documentation::String(
-            "long documentation that would normally add several rows".to_string(),
-        ));
-
         let mut ui = CompletionUI::new();
-        ui.show_with_bounds(vec![completion], 0, 0, 20, 4);
+        ui.show_with_bounds(
+            (0..12)
+                .map(|index| item(&format!("item_{index}"), Some(CompletionItemKind::Text)))
+                .collect(),
+            0,
+            0,
+            20,
+            4,
+        );
 
         let rows = ui.render_completion();
 
         assert!(rows.iter().all(|(_, y, _, _)| *y < 4));
-        assert!(rows.iter().any(|(_, _, row, _)| row.contains("hello")));
+        assert!(rows.iter().any(|(_, _, row, _)| row.contains("item_0")));
     }
 
     #[test]
@@ -845,42 +996,32 @@ mod tests {
     }
 
     #[test]
-    fn completion_preview_renders_below_visible_list() {
+    fn completion_does_not_render_an_automatic_preview() {
         let mut completion = item("alpha", Some(CompletionItemKind::Function));
         completion.detail = Some("fn alpha()".to_string());
-        let mut items = vec![completion];
-        items
-            .extend((0..8).map(|idx| item(&format!("item_{idx}"), Some(CompletionItemKind::Text))));
 
         let mut ui = CompletionUI::new();
-        ui.show_with_bounds(items, 0, 0, 80, 16);
+        ui.show_with_bounds(vec![completion], 0, 0, 80, 16);
 
         let rows = ui.render_completion();
-        let detail_y = rows
-            .iter()
-            .find_map(|(_, y, row, _)| row.contains("fn alpha()").then_some(*y))
-            .expect("selected item detail should render");
-        let last_item_y = rows
-            .iter()
-            .filter_map(|(_, y, row, _)| row.contains("item_").then_some(*y))
-            .max()
-            .expect("list items should render");
-
-        assert!(detail_y > last_item_y);
+        assert!(rows.iter().any(|(_, _, row, _)| row.contains("alpha")));
+        assert!(!rows.iter().any(|(_, _, row, _)| row.contains("fn alpha()")));
+        assert_eq!(rows.iter().map(|(_, y, _, _)| *y).max(), Some(3));
     }
 
     #[test]
-    fn completion_selected_item_stays_visible_when_preview_reduces_list_rows() {
+    fn completion_caps_the_menu_at_ten_rows_and_keeps_selection_visible() {
         let mut items = Vec::new();
         for idx in 0..12 {
-            let mut completion = item(&format!("item_{idx}"), Some(CompletionItemKind::Text));
-            completion.detail = Some(format!("detail {idx}"));
-            items.push(completion);
+            items.push(item(
+                &format!("item_{idx:02}"),
+                Some(CompletionItemKind::Text),
+            ));
         }
 
         let mut ui = CompletionUI::new();
         ui.show_with_bounds(items, 0, 0, 80, 16);
-        for _ in 0..8 {
+        for _ in 0..11 {
             ui.move_selection(1);
         }
         let selected_label = ui.selected_item().unwrap().label.clone();
@@ -890,10 +1031,12 @@ mod tests {
         assert!(rows
             .iter()
             .any(|(_, _, row, _)| row.contains(&selected_label)));
+        let content_rows = rows.iter().filter(|(_, _, row, _)| row == "│").count() / 2;
+        assert_eq!(content_rows, PAGE_SIZE);
     }
 
     #[test]
-    fn tab_and_backtab_move_completion_selection() {
+    fn tab_accepts_the_selected_completion() {
         let mut ui = CompletionUI::new();
         ui.show(
             vec![
@@ -905,15 +1048,21 @@ mod tests {
             0,
         );
 
-        ui.handle_event(&Event::Key(KeyEvent::from(KeyCode::Tab)));
-        assert_eq!(ui.selected_item().unwrap().label, "beta");
-
-        ui.handle_event(&Event::Key(KeyEvent::from(KeyCode::BackTab)));
-        assert_eq!(ui.selected_item().unwrap().label, "alpha");
+        let selected = ui.selected_item().unwrap().clone();
+        assert_eq!(
+            ui.handle_event(&Event::Key(KeyEvent::from(KeyCode::Tab))),
+            Some(KeyAction::Multiple(vec![
+                Action::ApplyCompletion {
+                    item: Box::new(selected),
+                    commit_character: None,
+                },
+                Action::CloseDialog,
+            ]))
+        );
     }
 
     #[test]
-    fn ctrl_j_and_ctrl_k_move_completion_selection() {
+    fn ctrl_n_and_ctrl_p_move_completion_selection() {
         let mut ui = CompletionUI::new();
         ui.show(
             vec![
@@ -925,11 +1074,29 @@ mod tests {
             0,
         );
 
-        ui.handle_event(&key(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        ui.handle_event(&key(KeyCode::Char('n'), KeyModifiers::CONTROL));
         assert_eq!(ui.selected_item().unwrap().label, "beta");
 
-        ui.handle_event(&key(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        ui.handle_event(&key(KeyCode::Char('p'), KeyModifiers::CONTROL));
         assert_eq!(ui.selected_item().unwrap().label, "alpha");
+    }
+
+    #[test]
+    fn enter_inserts_a_newline_and_ctrl_e_only_dismisses_completion() {
+        let mut ui = CompletionUI::new();
+        ui.show(vec![item("alpha", Some(CompletionItemKind::Text))], 0, 0);
+
+        assert_eq!(
+            ui.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::InsertNewLine,
+            ]))
+        );
+        assert_eq!(
+            ui.handle_event(&key(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+            Some(KeyAction::Single(Action::CloseDialog))
+        );
     }
 
     #[test]
@@ -1005,8 +1172,9 @@ mod tests {
             .iter()
             .map(|index| ui.all_items[*index].label.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(labels, vec!["as_mut_os_str", "as_os_str"]);
-        assert_eq!(ui.selected_item().unwrap().label, "as_mut_os_str");
+        assert_eq!(labels.len(), 3);
+        assert!(labels[..2].contains(&"as_mut_os_str"));
+        assert!(labels[..2].contains(&"as_os_str"));
     }
 
     #[test]
