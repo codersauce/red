@@ -29309,6 +29309,48 @@ builtin = "rust"
     }
 
     #[tokio::test]
+    async fn escape_after_completion_filters_out_exits_insert_mode() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(
+            Some("bigram.py".to_string()),
+            "torch.manual_seed(1337".to_string(),
+        );
+        let mut editor =
+            Editor::with_size(lsp, 40, 10, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        editor.mode = Mode::Insert;
+        editor.cx = "torch.manual_seed(1337".chars().count();
+        editor.refresh_cursor_goal();
+        editor.sync_to_window();
+
+        let mut completion = CompletionUI::new();
+        completion.show(vec![completion_item("manual_seed")], 0, 0);
+        editor.current_dialog = Some(Box::new(completion));
+
+        let mut render_buffer = RenderBuffer::new(40, 10, &Style::default());
+        let mut runtime = Runtime::new();
+        for code in [KeyCode::Char(')'), KeyCode::Esc] {
+            editor
+                .process_editor_event(
+                    Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+                    &mut render_buffer,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            editor.current_buffer().contents(),
+            "torch.manual_seed(1337)"
+        );
+        assert_eq!(editor.mode, Mode::Normal);
+        assert!(editor.current_dialog.is_none());
+    }
+
+    #[tokio::test]
     async fn completion_dialog_redraws_typed_text_in_active_window() {
         let config = Config::default();
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
