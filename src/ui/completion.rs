@@ -108,6 +108,7 @@ impl CompletionUI {
             .max(2);
         let unbounded_height = bounds_height == usize::MAX;
         let max_rows = if unbounded_height {
+            y = y.saturating_add(1);
             usize::MAX
         } else {
             let desired_rows = min(items.len(), PAGE_SIZE).saturating_add(2);
@@ -118,6 +119,7 @@ impl CompletionUI {
                 y = y.saturating_sub(max_rows);
                 max_rows
             } else {
+                y = y.saturating_add(1);
                 desired_rows.min(rows_below)
             }
         };
@@ -320,7 +322,7 @@ impl CompletionUI {
         }
 
         let mut output = Vec::new();
-        let mut y_offset = 1;
+        let mut y_offset = 0;
         let last_row_offset = self.max_rows.saturating_sub(1);
         let [horizontal, _, top_left, top_right, bottom_left, bottom_right] = BorderStyle::Rounded
             .glyphs()
@@ -361,22 +363,20 @@ impl CompletionUI {
             .saturating_sub(y_offset)
             .saturating_sub(preview_row_count);
         let visible_count = self.max_height.min(list_capacity);
-        let scroll_offset = if visible_count == 0 {
-            self.viewport.top()
+        if visible_count == 0 {
+            return Vec::new();
+        }
+        let max_scroll_offset = self.items.len().saturating_sub(visible_count);
+        let offset = if self.viewport.selected() < self.viewport.top() {
+            self.viewport.selected()
+        } else if self.viewport.selected() >= self.viewport.top().saturating_add(visible_count) {
+            self.viewport
+                .selected()
+                .saturating_sub(visible_count.saturating_sub(1))
         } else {
-            let max_scroll_offset = self.items.len().saturating_sub(visible_count);
-            let offset = if self.viewport.selected() < self.viewport.top() {
-                self.viewport.selected()
-            } else if self.viewport.selected() >= self.viewport.top().saturating_add(visible_count)
-            {
-                self.viewport
-                    .selected()
-                    .saturating_sub(visible_count.saturating_sub(1))
-            } else {
-                self.viewport.top()
-            };
-            offset.min(max_scroll_offset)
+            self.viewport.top()
         };
+        let scroll_offset = offset.min(max_scroll_offset);
         let visible_items = self
             .items
             .iter()
@@ -446,15 +446,15 @@ impl CompletionUI {
         if scroll_offset > 0 {
             output.push((
                 self.x + 1,
-                self.y + 1,
+                self.y,
                 "↑".to_string(),
                 self.styles.muted.clone(),
             ));
         }
-        if scroll_offset + visible_count < self.items.len() && y_offset > 1 {
+        if scroll_offset + visible_count < self.items.len() {
             output.push((
                 self.x + 1,
-                self.y + y_offset - 1,
+                self.y + y_offset,
                 "↓".to_string(),
                 self.styles.muted.clone(),
             ));
@@ -751,7 +751,26 @@ mod tests {
         let rows = ui.render_completion();
 
         assert!(rows.iter().all(|(_, y, _, _)| *y < 4));
-        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|(_, _, row, _)| row.contains("hello")));
+    }
+
+    #[test]
+    fn bounded_single_item_completion_keeps_its_candidate_visible() {
+        let mut ui = CompletionUI::new();
+        ui.show_with_bounds(
+            vec![item("manual_seed", Some(CompletionItemKind::Function))],
+            0,
+            0,
+            80,
+            24,
+        );
+
+        let rows = ui.render_completion();
+
+        assert!(rows
+            .iter()
+            .any(|(_, _, row, _)| row.contains("manual_seed")));
+        assert!(!rows.iter().any(|(_, _, row, _)| row == "↓"));
     }
 
     #[test]

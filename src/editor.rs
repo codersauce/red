@@ -94,8 +94,8 @@ use crate::{
         CompletionResponse, CompletionResponseItem, Diagnostic, DocumentEdit as LspDocumentEdit,
         Hover as LspHover, HoverContents, InboundMessage, InlayHint, InsertTextFormat, Location,
         LspClient, MarkedString, MarkupKind, OpenWorkspaceDocument, ParsedNotification,
-        ProgressParams, ProgressToken, Range, ResponseMessage, ServerCapabilities,
-        ServerRequest as LspServerRequest, TextEdit as LspTextEdit,
+        Position as LspPosition, ProgressParams, ProgressToken, Range, ResponseMessage,
+        ServerCapabilities, ServerRequest as LspServerRequest, TextEdit as LspTextEdit,
         WorkspaceEditOperation as LspWorkspaceEditOperation, MAX_WORKSPACE_EDIT_TOTAL_BYTES,
     },
     matchit::{self, MatchDirection, MatchMotion},
@@ -3143,16 +3143,24 @@ struct PendingLspEdit {
 #[derive(Debug, Clone)]
 struct CompletionSnapshot {
     buffer_id: BufferId,
+    initial_revision: u64,
     revision: u64,
     uri: Option<String>,
+    cursor: Option<TextPosition>,
+    original_range: Option<Range>,
+    current_range: Option<Range>,
 }
 
 impl From<PendingLspEdit> for CompletionSnapshot {
     fn from(pending: PendingLspEdit) -> Self {
         Self {
             buffer_id: pending.buffer_id,
+            initial_revision: pending.revision,
             revision: pending.revision,
             uri: Some(pending.uri),
+            cursor: None,
+            original_range: None,
+            current_range: None,
         }
     }
 }
@@ -9706,6 +9714,9 @@ impl Editor {
         let buffer = self.current_buffer();
         buffer.id() == snapshot.buffer_id
             && buffer.revision() == snapshot.revision
+            && snapshot
+                .cursor
+                .is_none_or(|cursor| self.cursor_text_position() == cursor)
             && snapshot.uri.as_ref().is_none_or(|expected_uri| {
                 buffer.uri().ok().flatten().as_ref() == Some(expected_uri)
             })
@@ -10375,7 +10386,8 @@ impl Editor {
                                     completion.set_filter(&filter);
                                 }
                                 self.current_dialog = Some(Box::new(completion));
-                                self.completion_snapshot = Some(snapshot);
+                                self.completion_snapshot =
+                                    Some(self.activate_completion_snapshot(snapshot));
                                 return Some(Action::ShowDialog);
                             }
                             Err(err) => {
@@ -14830,6 +14842,7 @@ impl Editor {
 
                 if completion_dialog_open {
                     self.scheduled_completion = None;
+                    self.refresh_completion_snapshot_after_passthrough();
                 } else if is_keyword_char(*c) {
                     self.schedule_automatic_completion();
                 } else {
@@ -15637,6 +15650,10 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::DeletePreviousChar => {
+                let completion_dialog_open = self
+                    .current_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.allows_event_passthrough());
                 if self.cx == 0 && self.buffer_line() == 0 {
                     return Ok(false);
                 }
@@ -15712,6 +15729,9 @@ impl Editor {
 
                 if started_transaction {
                     self.commit_transaction(self.cursor_snapshot());
+                }
+                if completion_dialog_open {
+                    self.refresh_completion_snapshot_after_passthrough();
                 }
             }
             Action::DumpHistory => {
@@ -17425,6 +17445,7 @@ impl Editor {
             Action::CloseDialog => {
                 self.release_current_dialog_callbacks(runtime);
                 self.current_dialog = None;
+                self.completion_snapshot = None;
                 self.render(buffer)?;
             }
             Action::RefreshDiagnostics => {
@@ -21677,8 +21698,56 @@ impl Editor {
     fn completion_snapshot(&self) -> CompletionSnapshot {
         CompletionSnapshot {
             buffer_id: self.current_buffer().id(),
+            initial_revision: self.current_buffer().revision(),
             revision: self.current_buffer().revision(),
             uri: self.current_buffer().uri().ok().flatten(),
+            cursor: None,
+            original_range: None,
+            current_range: None,
+        }
+    }
+
+    fn completion_default_range(&self) -> Range {
+        self.completion_prefix()
+            .map(|(_, range)| range)
+            .unwrap_or_else(|| {
+                let position = self.cursor_lsp_position();
+                Range {
+                    start: position,
+                    end: position,
+                }
+            })
+    }
+
+    fn activate_completion_snapshot(&self, mut snapshot: CompletionSnapshot) -> CompletionSnapshot {
+        let range = self.completion_default_range();
+        snapshot.cursor = Some(self.cursor_text_position());
+        snapshot.original_range = Some(range.clone());
+        snapshot.current_range = Some(range);
+        snapshot
+    }
+
+    fn refresh_completion_snapshot_after_passthrough(&mut self) {
+        let buffer_id = self.current_buffer().id();
+        let revision = self.current_buffer().revision();
+        let uri = self.current_buffer().uri().ok().flatten();
+        let cursor = self.cursor_text_position();
+        let range = self.completion_default_range();
+        let Some(snapshot) = self.completion_snapshot.as_mut() else {
+            return;
+        };
+        let same_document = snapshot.buffer_id == buffer_id
+            && snapshot
+                .uri
+                .as_ref()
+                .is_none_or(|expected| uri.as_ref() == Some(expected));
+        let same_prefix = snapshot.current_range.as_ref().is_some_and(|current| {
+            current.start == range.start && current.end.line == range.end.line
+        });
+        if same_document && same_prefix {
+            snapshot.revision = revision;
+            snapshot.cursor = Some(cursor);
+            snapshot.current_range = Some(range);
         }
     }
 
@@ -21705,7 +21774,7 @@ impl Editor {
             completion.set_filter(&filter);
         }
         self.current_dialog = Some(Box::new(completion));
-        self.completion_snapshot = Some(snapshot);
+        self.completion_snapshot = Some(self.activate_completion_snapshot(snapshot));
         true
     }
 
@@ -21783,20 +21852,59 @@ impl Editor {
         commit_character: Option<char>,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
-        if self
-            .completion_snapshot
-            .take()
-            .is_some_and(|snapshot| !self.completion_snapshot_is_current(&snapshot))
+        let snapshot = self.completion_snapshot.take();
+        if snapshot
+            .as_ref()
+            .is_some_and(|snapshot| !self.completion_snapshot_is_current(snapshot))
         {
             self.last_error = Some("completion item is stale; buffer changed".to_string());
             return Ok(());
         }
 
         let contents = self.current_buffer().contents();
-        let validation_edits = item
-            .text_edit
+        let session_ranges = snapshot.as_ref().and_then(|snapshot| {
+            Some((
+                snapshot.original_range.as_ref()?,
+                snapshot.current_range.as_ref()?,
+            ))
+        });
+        let session_changed = snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.initial_revision != snapshot.revision);
+        let rebase_edit = |edit: &LspTextEdit, is_main: bool| {
+            if !session_changed {
+                return Some(edit.clone());
+            }
+            let (original, current) = session_ranges?;
+            Some(LspTextEdit {
+                range: rebase_completion_range(&edit.range, original, current, is_main)?,
+                new_text: edit.new_text.clone(),
+            })
+        };
+        let main_text_edit = match item.text_edit.as_ref() {
+            Some(edit) => match rebase_edit(edit, true) {
+                Some(edit) => Some(edit),
+                None => {
+                    self.last_error =
+                        Some("completion edit could not be rebased after typing".to_string());
+                    return Ok(());
+                }
+            },
+            None => None,
+        };
+        let mut additional_text_edits = Vec::new();
+        for edit in item.additional_text_edits.iter().flatten() {
+            let Some(edit) = rebase_edit(edit, false) else {
+                self.last_error = Some(
+                    "additional completion edit could not be rebased after typing".to_string(),
+                );
+                return Ok(());
+            };
+            additional_text_edits.push(edit);
+        }
+        let validation_edits = main_text_edit
             .iter()
-            .chain(item.additional_text_edits.iter().flatten())
+            .chain(additional_text_edits.iter())
             .cloned()
             .collect::<Vec<_>>();
         if let Err(error) = crate::lsp::apply_text_edits(&contents, &validation_edits) {
@@ -21811,7 +21919,7 @@ impl Editor {
         self.begin_transaction("apply completion");
 
         let mut edits = Vec::new();
-        if let Some(text_edit) = &item.text_edit {
+        if let Some(text_edit) = &main_text_edit {
             edits.push(completion_edit_from_lsp(
                 &contents,
                 text_edit,
@@ -21820,19 +21928,22 @@ impl Editor {
             )?);
         } else {
             let text = item.insert_text.as_deref().unwrap_or(&item.label);
-            let line = self.buffer_line();
-            let character = self.grapheme_to_char_on_line(self.cx, line);
-            edits.push(completion_edit(
-                TextRange::insertion(TextPosition::new(line, character)),
-                text,
+            let range = snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.current_range.clone())
+                .unwrap_or_else(|| self.completion_default_range());
+            edits.push(completion_edit_from_lsp(
+                &contents,
+                &LspTextEdit {
+                    range,
+                    new_text: text.to_string(),
+                },
                 item.insert_text_format.as_ref(),
                 true,
-            ));
+            )?);
         }
-        if let Some(additional_text_edits) = &item.additional_text_edits {
-            for text_edit in additional_text_edits {
-                edits.push(completion_edit_from_lsp(&contents, text_edit, None, false)?);
-            }
+        for text_edit in &additional_text_edits {
+            edits.push(completion_edit_from_lsp(&contents, text_edit, None, false)?);
         }
 
         edits.sort_by(|a, b| compare_text_positions_desc(a.range.start, b.range.start));
@@ -22508,6 +22619,71 @@ struct CompletionEdit {
     new_text: String,
     cursor_offset: Option<usize>,
     is_main: bool,
+}
+
+fn lsp_position_cmp(left: LspPosition, right: LspPosition) -> Ordering {
+    (left.line, left.character).cmp(&(right.line, right.character))
+}
+
+fn shift_lsp_position_after_prefix_change(
+    position: LspPosition,
+    original: &Range,
+    current: &Range,
+) -> Option<LspPosition> {
+    if position.line != original.end.line {
+        return Some(position);
+    }
+    let character = if current.end.character >= original.end.character {
+        position
+            .character
+            .checked_add(current.end.character - original.end.character)?
+    } else {
+        position
+            .character
+            .checked_sub(original.end.character - current.end.character)?
+    };
+    Some(LspPosition {
+        line: position.line,
+        character,
+    })
+}
+
+fn rebase_completion_range(
+    range: &Range,
+    original: &Range,
+    current: &Range,
+    is_main: bool,
+) -> Option<Range> {
+    if original == current {
+        return Some(range.clone());
+    }
+    if original.start.line != original.end.line
+        || current.start.line != current.end.line
+        || original.start != current.start
+    {
+        return None;
+    }
+
+    let starts_before_prefix = lsp_position_cmp(range.start, original.start) != Ordering::Greater;
+    let ends_after_prefix = lsp_position_cmp(range.end, original.end) != Ordering::Less;
+    if is_main && starts_before_prefix && ends_after_prefix {
+        return Some(Range {
+            start: range.start,
+            end: shift_lsp_position_after_prefix_change(range.end, original, current)?,
+        });
+    }
+
+    if lsp_position_cmp(range.end, original.start) != Ordering::Greater {
+        return Some(range.clone());
+    }
+    if lsp_position_cmp(range.start, original.end) != Ordering::Less {
+        return Some(Range {
+            start: shift_lsp_position_after_prefix_change(range.start, original, current)?,
+            end: shift_lsp_position_after_prefix_change(range.end, original, current)?,
+        });
+    }
+
+    None
 }
 
 fn completion_edit_from_lsp(
@@ -28868,6 +29044,220 @@ builtin = "rust"
         }
 
         assert_eq!(editor.current_buffer().contents(), "zhello");
+    }
+
+    fn completion_response(label: &str, text_edit: Option<LspTextEdit>) -> InboundMessage {
+        let mut item = serde_json::json!({ "label": label });
+        if let Some(text_edit) = text_edit {
+            item["textEdit"] = serde_json::to_value(text_edit).unwrap();
+        }
+        InboundMessage::Message(ResponseMessage {
+            id: 1,
+            result: serde_json::json!([item]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/completion",
+                serde_json::json!({ "position": { "line": 0, "character": 9 } }),
+            )),
+        })
+    }
+
+    fn completion_typing_editor() -> Editor {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(None, "torch.man".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 80, 24, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        editor.mode = Mode::Insert;
+        editor.cx = "torch.man".chars().count();
+        editor.refresh_cursor_goal();
+        editor.sync_to_window();
+        editor
+    }
+
+    async fn type_completion_suffix(
+        editor: &mut Editor,
+        suffix: &str,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) {
+        for character in suffix.chars() {
+            editor
+                .process_editor_event(
+                    Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+                    render_buffer,
+                    runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_accepts_after_typing_and_replaces_prefix_without_text_edit() {
+        let mut editor = completion_typing_editor();
+        let response = completion_response("manual_seed", None);
+        assert!(matches!(
+            editor.handle_lsp_message(&response, Some("textDocument/completion".to_string())),
+            Some(Action::ShowDialog)
+        ));
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        type_completion_suffix(&mut editor, "ual", &mut render_buffer, &mut runtime).await;
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), "torch.manual_seed");
+        assert!(editor.current_dialog.is_none());
+    }
+
+    #[tokio::test]
+    async fn completion_rebases_server_text_edit_after_typing() {
+        let mut editor = completion_typing_editor();
+        let response = completion_response(
+            "manual_seed",
+            Some(LspTextEdit {
+                range: Range {
+                    start: crate::lsp::Position {
+                        line: 0,
+                        character: 6,
+                    },
+                    end: crate::lsp::Position {
+                        line: 0,
+                        character: 9,
+                    },
+                },
+                new_text: "manual_seed".to_string(),
+            }),
+        );
+        assert!(matches!(
+            editor.handle_lsp_message(&response, Some("textDocument/completion".to_string())),
+            Some(Action::ShowDialog)
+        ));
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        type_completion_suffix(&mut editor, "ual", &mut render_buffer, &mut runtime).await;
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), "torch.manual_seed");
+    }
+
+    #[tokio::test]
+    async fn completion_accepts_after_backspacing_with_popup_open() {
+        let mut editor = completion_typing_editor();
+        let response = completion_response("manual_seed", None);
+        assert!(matches!(
+            editor.handle_lsp_message(&response, Some("textDocument/completion".to_string())),
+            Some(Action::ShowDialog)
+        ));
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), "torch.manual_seed");
+    }
+
+    #[tokio::test]
+    async fn completion_commit_character_survives_typing_after_popup_opened() {
+        let mut editor = completion_typing_editor();
+        let response = InboundMessage::Message(ResponseMessage {
+            id: 1,
+            result: serde_json::json!([{
+                "label": "manual_seed",
+                "commitCharacters": ["("]
+            }]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/completion",
+                serde_json::json!({ "position": { "line": 0, "character": 9 } }),
+            )),
+        });
+        assert!(matches!(
+            editor.handle_lsp_message(&response, Some("textDocument/completion".to_string())),
+            Some(Action::ShowDialog)
+        ));
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        type_completion_suffix(&mut editor, "ual(", &mut render_buffer, &mut runtime).await;
+
+        assert_eq!(editor.current_buffer().contents(), "torch.manual_seed(");
+        assert!(editor.current_dialog.is_none());
+    }
+
+    #[tokio::test]
+    async fn completion_still_rejects_untracked_buffer_changes() {
+        let mut editor = completion_typing_editor();
+        let response = completion_response("manual_seed", None);
+        assert!(matches!(
+            editor.handle_lsp_message(&response, Some("textDocument/completion".to_string())),
+            Some(Action::ShowDialog)
+        ));
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+        editor
+            .execute(
+                &Action::InsertString("x".to_string()),
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let KeyAction::Multiple(actions) = editor.handle_event(&enter).unwrap().unwrap() else {
+            panic!("expected completion application and close actions");
+        };
+        editor
+            .execute(&actions[0], &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), "torch.manx");
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("stale")));
+        editor
+            .execute(&actions[1], &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(editor.current_dialog.is_none());
     }
 
     #[tokio::test]
