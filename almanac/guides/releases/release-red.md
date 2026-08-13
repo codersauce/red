@@ -15,6 +15,12 @@ sources:
   - id: announce-discord
     type: file
     path: .github/workflows/announce-discord.yml
+  - id: ci
+    type: file
+    path: .github/workflows/ci.yml
+  - id: plugin-check
+    type: file
+    path: .github/workflows/plugin-check.yml
   - id: readme-release
     type: file
     path: scripts/readme_release.py
@@ -45,7 +51,7 @@ Review the release PR as a normal ready-for-review PR. The release docs call out
 
 ## Tag The Merge Commit
 
-After merging the release PR, update local `main` and create an annotated tag from the merge commit:
+After merging the release PR, update local `main`, verify the merge commit, and then create an annotated tag from that commit. Before tagging, confirm that `main` contains the release merge commit and that the post-merge CI surface has completed for that exact commit. The main-branch CI run covers workflow lint, README release-version validation, Discord announcement tests, cross-platform tests, Clippy, formatting, bundled runtime self-check, changelog checks, performance, release binary builds, documentation, and security audit jobs; the separate Husk plugin check covers Red and Husk package tests plus bundled plugin tests [@ci] [@plugin-check]. This matters because the tag push immediately starts archive creation, and the draft release should be built from the same commit whose merge validation passed [@release].
 
 ```shell
 git checkout main
@@ -68,7 +74,7 @@ The publish job verifies package version and committed release changelog, regene
 
 Before publishing, confirm the draft release contains all four archives, `SHA256SUMS.txt`, `install.sh`, and `install.ps1`, and that install instructions match the release tag [@releasing]. Do not publish if the package version, changelog section, checksums, or assets do not match the intended tag. If a tag was pushed with the wrong version, the release docs require deleting the draft release and tag, fixing the version, and pushing a new tag before anything is published [@releasing].
 
-Publishing the GitHub release triggers the `homebrew` job in `release.yml` [@release]. That job requires `HOMEBREW_TAP_TOKEN`, downloads release tarballs and checksums, writes `Formula/red.rb` with OS-specific URLs and SHA-256 values, and pushes the formula update if it changed [@release].
+Publishing the GitHub release triggers a second `Release` workflow run for the `release.published` event; its build, smoke, and draft-publish jobs are skipped, and only the `homebrew` job is eligible [@release]. That job requires `HOMEBREW_TAP_TOKEN`, downloads release tarballs and checksums, writes `Formula/red.rb` with OS-specific URLs and SHA-256 values, and pushes the formula update if it changed [@release]. Use `gh run list --event release` when checking publication automation, because the release-event `Release` run and the tag-push `Release` run have the same workflow name [@release].
 
 ## Verify Installers And Announcement
 
