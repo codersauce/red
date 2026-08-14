@@ -44,9 +44,9 @@ use crate::{
 };
 
 use super::{
-    adjust_color_brightness, display_layout::DisplayLayout, render_buffer::Change, Editor, Mode,
-    Point, Rect, RenderBuffer, StatuslineGitChanges, StyleCursor, GUTTER_SIGN_COLUMN_WIDTH,
-    MAX_HIGHLIGHT_SLICE_BYTES,
+    adjust_color_brightness, diagnostic_foreground, diagnostic_priority,
+    display_layout::DisplayLayout, render_buffer::Change, Editor, Mode, Point, Rect, RenderBuffer,
+    StatuslineGitChanges, StyleCursor, GUTTER_SIGN_COLUMN_WIDTH, MAX_HIGHLIGHT_SLICE_BYTES,
 };
 
 fn diagnostic_row(diagnostics: &[&Diagnostic], available_width: usize) -> Option<String> {
@@ -82,7 +82,7 @@ fn diagnostics_by_visible_line(
     visible_start: usize,
     visible_end: usize,
 ) -> HashMap<usize, Vec<&Diagnostic>> {
-    diagnostics
+    let mut by_line: HashMap<usize, Vec<&Diagnostic>> = diagnostics
         .iter()
         .filter(|diagnostic| (visible_start..=visible_end).contains(&diagnostic.range.start.line))
         .fold(HashMap::new(), |mut by_line, diagnostic| {
@@ -91,7 +91,14 @@ fn diagnostics_by_visible_line(
                 .or_default()
                 .push(diagnostic);
             by_line
-        })
+        });
+    for diagnostics in by_line.values_mut() {
+        diagnostics.sort_by(|left, right| {
+            diagnostic_priority(right.severity.as_ref())
+                .cmp(&diagnostic_priority(left.severity.as_ref()))
+        });
+    }
+    by_line
 }
 
 fn statusline_file_name(name: &str) -> &str {
@@ -2414,14 +2421,6 @@ impl Editor {
             return Ok(());
         };
 
-        // Style for diagnostic messages
-        let diagnostic_style = self.theme.error_style.clone().unwrap_or(Style {
-            fg: adjust_color_brightness(self.theme.style.fg, -20), // Slightly dimmer than normal text
-            bg: adjust_color_brightness(self.theme.style.bg, 10),  // Slightly brighter background
-            italic: true,
-            ..Default::default()
-        });
-
         let layout = self.layout_for_window(window);
         let Some(visible_start) = layout.rows.first().map(|segment| segment.line) else {
             return Ok(());
@@ -2434,6 +2433,15 @@ impl Editor {
 
         // Render diagnostics for visible lines in this window
         for (line_num, diagnostics) in diagnostics_by_line {
+            let severity = diagnostics
+                .first()
+                .and_then(|diagnostic| diagnostic.severity.as_ref());
+            let diagnostic_style = Style {
+                fg: diagnostic_foreground(&self.theme, severity),
+                bg: adjust_color_brightness(self.theme.style.bg, 10),
+                italic: true,
+                ..Style::default()
+            };
             let Some(segment) = layout
                 .rows
                 .iter()

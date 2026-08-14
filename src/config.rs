@@ -277,6 +277,9 @@ pub struct Config {
     /// Codex adapter launch configuration.
     #[serde(default)]
     pub agent: AgentConfig,
+    /// Diagnostic presentation in the editor gutter.
+    #[serde(default)]
+    pub diagnostics: DiagnosticsConfig,
     /// Whether diagnostics appear in editor UI.
     #[serde(default = "default_true")]
     pub show_diagnostics: bool,
@@ -300,6 +303,27 @@ pub struct AgentConfig {
     /// Environment additions supplied only to the Codex child process.
     #[serde(default)]
     pub env: HashMap<String, String>,
+}
+
+/// Diagnostic presentation layered on top of the master `show_diagnostics` switch.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnosticsConfig {
+    /// Show one severity-aware sign for each line that has diagnostics.
+    #[serde(default = "default_true")]
+    pub gutter_signs: bool,
+    /// Glyph family used for diagnostic gutter signs.
+    #[serde(default)]
+    pub icon_style: PickerIconStyle,
+}
+
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        Self {
+            gutter_signs: true,
+            icon_style: PickerIconStyle::NerdFont,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -1742,6 +1766,7 @@ fn known_top_level_field(field: &str) -> bool {
             | "matchit"
             | "disable_ai"
             | "agent"
+            | "diagnostics"
             | "show_diagnostics"
             | "window_borders_ascii"
     )
@@ -1866,6 +1891,7 @@ fn known_schema_path(path: &[String]) -> bool {
         ["plugin_permissions", _] | ["plugin_permissions", _, "process"] => true,
         ["agent", field] => matches!(*field, "adapter" | "command" | "args" | "env"),
         ["agent", "env", _] => true,
+        ["diagnostics", field] => matches!(*field, "gutter_signs" | "icon_style"),
         ["cursor", field] => matches!(
             *field,
             "normal"
@@ -3258,6 +3284,46 @@ input_position = "top"
         .unwrap();
 
         assert_eq!(config.picker.input_position, PickerInputPosition::Top);
+    }
+
+    #[test]
+    fn diagnostic_gutter_signs_default_to_nerd_font_icons() {
+        let config: Config = toml::from_str(
+            r#"
+theme = "mocha.json"
+
+[keys]
+"#,
+        )
+        .unwrap();
+
+        assert!(config.diagnostics.gutter_signs);
+        assert_eq!(config.diagnostics.icon_style, PickerIconStyle::NerdFont);
+    }
+
+    #[test]
+    fn diagnostic_gutter_sign_configuration_parses_all_icon_styles() {
+        for (value, expected) in [
+            ("unicode", PickerIconStyle::Unicode),
+            ("nerd_font", PickerIconStyle::NerdFont),
+            ("ascii", PickerIconStyle::Ascii),
+            ("none", PickerIconStyle::None),
+        ] {
+            let config = Config::from_user_toml_with_overrides(
+                &format!(
+                    r#"
+[diagnostics]
+gutter_signs = false
+icon_style = "{value}"
+"#
+                ),
+                &[],
+            )
+            .unwrap();
+
+            assert!(!config.diagnostics.gutter_signs);
+            assert_eq!(config.diagnostics.icon_style, expected);
+        }
     }
 
     #[test]
