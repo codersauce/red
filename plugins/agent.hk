@@ -102,11 +102,6 @@ struct AgentTextBlock {
     text: String,
 }
 
-struct BoundedAgentBlocks {
-    blocks: [AgentTextBlock],
-    trimmed: bool,
-}
-
 struct TextPanelComposerConfig {
     placeholder: String,
     rows: i32,
@@ -488,8 +483,7 @@ fn submit_prompt(text: String) {
             format: "plain",
             text: text,
         });
-        let bounded = bounded_transcript_blocks(queued_blocks, block_id);
-        red::state_patch(AgentState { queued_prompt_blocks: bounded.blocks });
+        red::state_patch(AgentState { queued_prompt_blocks: queued_blocks });
         if state().streaming {
             red::state_patch(AgentState { stream_trimmed: true });
         }
@@ -781,9 +775,6 @@ fn collapse_activity(elapsed_ms: i64) {
             transcript = transcript + "\n";
         }
         transcript = transcript + "Activity: " + summary + "\n";
-        if red::len(transcript) > 20000 {
-            transcript = red::slice(transcript, red::len(transcript) - 20000);
-        }
         red::state_patch(AgentState { transcript: transcript });
     }
     red::state_patch(AgentState { transcript_blocks: updated });
@@ -968,9 +959,6 @@ fn update(event: AgentTextEvent) {
     }
 
     transcript = transcript + delta;
-    if red::len(transcript) > 20000 {
-        transcript = red::slice(transcript, red::len(transcript) - 20000);
-    }
     red::state_patch(AgentState { transcript: transcript });
 
     let blocks = state().transcript_blocks;
@@ -981,11 +969,7 @@ fn update(event: AgentTextEvent) {
         }
         updated = red::push(updated, block);
     }
-    let bounded = bounded_transcript_blocks(updated, block_id);
-    red::state_patch(AgentState { transcript_blocks: bounded.blocks });
-    if bounded.trimmed {
-        red::state_patch(AgentState { stream_trimmed: true });
-    }
+    red::state_patch(AgentState { transcript_blocks: updated });
     red::state_patch(AgentState { stream_delta: red::string(state().stream_delta, "") + delta });
 
     let timer = red::string(state().stream_timer, "");
@@ -1177,9 +1161,6 @@ fn finish_agent_turn() {
     if !red::ends_with(transcript, "\n") {
         transcript = transcript + "\n";
     }
-    if red::len(transcript) > 20000 {
-        transcript = red::slice(transcript, red::len(transcript) - 20000);
-    }
     red::state_patch(AgentState { transcript: transcript });
     red::state_patch(AgentState { streaming: false });
     let block_id = red::string(state().stream_block_id, "");
@@ -1215,9 +1196,6 @@ fn append_transcript_block(role: String, text: String, block_id: String) {
         red::state_patch(AgentState { stream_trimmed: false });
     }
     transcript = transcript + role + ": " + text + "\n";
-    if red::len(transcript) > 20000 {
-        transcript = red::slice(transcript, red::len(transcript) - 20000);
-    }
     red::state_patch(AgentState { transcript: transcript });
 
     let kind = "text";
@@ -1238,8 +1216,7 @@ fn append_transcript_block(role: String, text: String, block_id: String) {
         format: "plain",
         text: text,
     });
-    let bounded = bounded_transcript_blocks(blocks, "");
-    red::state_patch(AgentState { transcript_blocks: bounded.blocks });
+    red::state_patch(AgentState { transcript_blocks: blocks });
     render_conversation();
 }
 
@@ -1270,9 +1247,8 @@ fn transcript_restored(event: AgentTranscriptEvent) {
     let transcript = red::string(event.transcript, "");
     let blocks = legacy_transcript_blocks(transcript);
     let generation = red::len(blocks);
-    let bounded = bounded_transcript_blocks(blocks, "");
     red::state_patch(AgentState { transcript: transcript });
-    red::state_patch(AgentState { transcript_blocks: bounded.blocks });
+    red::state_patch(AgentState { transcript_blocks: blocks });
     red::state_patch(AgentState { block_generation: generation });
     red::state_patch(AgentState { streaming: false });
     red::state_patch(AgentState { stream_block_id: "" });
@@ -1284,15 +1260,9 @@ fn transcript_restored(event: AgentTranscriptEvent) {
 fn render_conversation() {
     let blocks = normalize_transcript_blocks(state().transcript_blocks);
     red::state_patch(AgentState { transcript_blocks: blocks });
-    let keep_id = red::string(state().stream_block_id, "");
     for block in state().queued_prompt_blocks {
         blocks = red::push(blocks, block);
-        if keep_id == "" {
-            keep_id = block.id;
-        }
     }
-    let bounded = bounded_transcript_blocks(blocks, keep_id);
-    blocks = bounded.blocks;
     if red::len(blocks) == 0 {
         blocks = [AgentTextBlock {
             id: "empty",
@@ -1331,6 +1301,29 @@ fn legacy_transcript_blocks(transcript: String) -> [AgentTextBlock] {
     let text = "";
     let lines = red::split(transcript, "\n");
     let line_index = 0;
+    // Older flat transcripts were capped by slicing their first characters. If
+    // that removed the leading role marker, infer the truncated fragment from
+    // the next intact turn: a following user turn means the fragment was the
+    // preceding agent response, while a following agent turn means it was the
+    // preceding user prompt. Agent is the safer fallback for a lone fragment
+    // because responses are normally much larger than prompts.
+    let leading_kind = "agent";
+    let leading_format = "markdown";
+    for line in lines {
+        if red::starts_with(line, "You: ") {
+            break;
+        }
+        if red::starts_with(line, "Agent: ") {
+            leading_kind = "user";
+            leading_format = "plain";
+            break;
+        }
+        if red::starts_with(line, "Error: ")
+            || red::starts_with(line, "Activity: ")
+            || red::starts_with(line, "System: ") {
+            break;
+        }
+    }
 
     for line in lines {
         line_index = line_index + 1;
@@ -1378,8 +1371,8 @@ fn legacy_transcript_blocks(transcript: String) -> [AgentTextBlock] {
         } else {
             if kind == "" {
                 index = index + 1;
-                kind = "text";
-                format = "plain";
+                kind = leading_kind;
+                format = leading_format;
             } else {
                 text = text + "\n";
             }
@@ -1396,39 +1389,6 @@ fn legacy_transcript_blocks(transcript: String) -> [AgentTextBlock] {
         });
     }
     return blocks;
-}
-
-fn bounded_transcript_blocks(blocks: [AgentTextBlock], keep_id: String) -> BoundedAgentBlocks {
-    let total = 0;
-    for block in blocks {
-        total = total + red::len(red::string(block.text, ""));
-    }
-    if total <= 20000 {
-        return BoundedAgentBlocks { blocks: blocks, trimmed: false };
-    }
-
-    let excess = total - 20000;
-    let bounded: [AgentTextBlock] = [];
-    let block_index = 0;
-    for block in blocks {
-        block_index = block_index + 1;
-        let text = red::string(block.text, "");
-        let length = red::len(text);
-        if excess >= length && block.id != keep_id && block_index < red::len(blocks) {
-            excess = excess - length;
-            continue;
-        }
-        if excess > 0 {
-            let cut = excess;
-            if cut > length {
-                cut = length;
-            }
-            block.text = red::slice(text, cut);
-            excess = excess - cut;
-        }
-        bounded = red::push(bounded, block);
-    }
-    return BoundedAgentBlocks { blocks: bounded, trimmed: true };
 }
 
 #[red::command(

@@ -6212,6 +6212,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_preserves_conversations_larger_than_the_legacy_limit() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-long" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        submit_agent_prompt(&mut runtime, "keep the complete answer").await;
+        drain_requests();
+
+        let response = format!("# Complete response\n\n{}\n\nEND", "a".repeat(21_000));
+        runtime
+            .notify(
+                "agent:update",
+                serde_json::json!({
+                    "session_id": "session-long",
+                    "text": response,
+                }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        runtime
+            .notify(
+                "agent:completed",
+                serde_json::json!({
+                    "session_id": "session-long",
+                    "stop_reason": "completed",
+                    "elapsed_ms": 1_000,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let mut saw_complete_blocks = false;
+        let mut saw_complete_storage = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            match request {
+                PluginRequest::UpdateTextPanel { id, blocks } => {
+                    saw_complete_blocks |= id == "agent-conversation"
+                        && blocks.iter().any(|block| {
+                            block.kind == crate::plugin::TextPanelBlockKind::Agent
+                                && block.text.starts_with("# Complete response")
+                                && block.text.ends_with("END")
+                                && block.text.len() > 20_000
+                        });
+                }
+                PluginRequest::SetPluginStorage { plugin, key, value } => {
+                    saw_complete_storage |= plugin == "agent"
+                        && key == "transcript"
+                        && value.as_str().is_some_and(|text| {
+                            text.starts_with(
+                                "You: keep the complete answer\nAgent: # Complete response",
+                            ) && text.contains("\n\nEND\n")
+                                && text.len() > 20_000
+                        });
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_complete_blocks,
+            "the panel must retain the full response"
+        );
+        assert!(
+            saw_complete_storage,
+            "persistent history must retain the full response"
+        );
+    }
+
+    #[tokio::test]
     async fn bundled_agent_plugin_creates_prompts_streams_and_cancels() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -6457,18 +6537,16 @@ mod tests {
             PluginRequest::SetPluginStorage { plugin, key, value }
                 if plugin == "agent"
                     && key == "transcript"
-                    && value.as_str().is_some_and(|text| text.len() <= 20_000)
+                    && value.as_str().is_some_and(|text| {
+                        text.len() > 20_000 && text.ends_with(large_delta.as_str())
+                    })
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdateTextPanel { id, blocks }
+            PluginRequest::AppendTextPanel { id, block_id, delta }
                 if id == "agent-conversation"
-                    && blocks.iter().map(|block| block.text.len()).sum::<usize>() <= 20_000
-                    && blocks.iter().any(|block| {
-                        block.id == "agent:2"
-                            && block.kind == crate::plugin::TextPanelBlockKind::Agent
-                            && block.format == crate::plugin::TextPanelBlockFormat::Markdown
-                    })
+                    && block_id == "agent:2"
+                    && delta == large_delta
         ));
 
         runtime
@@ -8740,6 +8818,55 @@ mod tests {
                 assert_eq!(blocks[1].text, markdown);
                 assert_eq!(blocks[2].kind, crate::plugin::TextPanelBlockKind::Activity);
                 assert_eq!(blocks[2].text, "Worked for 13s");
+            }
+            _ => panic!("expected restored text panel update"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_plugin_restores_a_truncated_leading_response_as_markdown() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        let truncated_response = concat!(
+            "nd raylib. This keeps the program small.\n\n",
+            "### 2. Application entry point\n\n",
+            "All behavior is implemented inside `main()`."
+        );
+        runtime
+            .notify(
+                "agent:transcript_restored",
+                serde_json::json!({
+                    "transcript": format!(
+                        "{truncated_response}\nYou: review it again\nAgent: # Updated review\n"
+                    )
+                }),
+            )
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdateTextPanel { id, blocks } => {
+                assert_eq!(id, "agent-conversation");
+                assert_eq!(blocks.len(), 3);
+                assert_eq!(blocks[0].kind, crate::plugin::TextPanelBlockKind::Agent);
+                assert_eq!(
+                    blocks[0].format,
+                    crate::plugin::TextPanelBlockFormat::Markdown
+                );
+                assert_eq!(blocks[0].text, truncated_response);
+                assert_eq!(blocks[1].kind, crate::plugin::TextPanelBlockKind::User);
+                assert_eq!(blocks[1].text, "review it again");
+                assert_eq!(blocks[2].kind, crate::plugin::TextPanelBlockKind::Agent);
+                assert_eq!(
+                    blocks[2].format,
+                    crate::plugin::TextPanelBlockFormat::Markdown
+                );
             }
             _ => panic!("expected restored text panel update"),
         }
