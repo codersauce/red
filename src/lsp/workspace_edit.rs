@@ -1055,6 +1055,26 @@ fn atomic_write_with_permissions(
     result
 }
 
+/// Writes one workspace file through the same pinned, no-follow boundary used
+/// by filesystem-bearing LSP edits.
+#[cfg(unix)]
+pub(crate) fn secure_write_workspace_file(
+    root: &Path,
+    path: &Path,
+    contents: &[u8],
+) -> Result<(), LspError> {
+    if contents.len() as u64 > MAX_WORKSPACE_FILE_BYTES {
+        return Err(protocol_error(format!(
+            "workspace file exceeds {MAX_WORKSPACE_FILE_BYTES} bytes: {}",
+            path.display()
+        )));
+    }
+    let root = pin_workspace_root(root)?;
+    verify_logical_workspace_root(&root)?;
+    let snapshot = secure_snapshot_file(&root, path)?;
+    atomic_write_with_permissions(&root, path, contents, snapshot.permissions.as_ref())
+}
+
 #[cfg(not(unix))]
 fn secure_snapshot_file(
     _root: &PinnedWorkspaceRoot,

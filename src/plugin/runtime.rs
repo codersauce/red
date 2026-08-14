@@ -1152,36 +1152,6 @@ impl RedHost {
                     .to_string();
                 self.send_request(PluginRequest::AgentArchiveSession { session_id });
             }
-            "AgentAcceptProposal" | "AgentRejectProposal" => {
-                let session_id = args
-                    .first()
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("agent proposal action requires a session id"))?
-                    .to_string();
-                let path = args
-                    .get(/*index*/ 1)
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("agent proposal action requires a path"))?;
-                let hunk_id = args
-                    .get(/*index*/ 2)
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string);
-                let request = if action == "AgentAcceptProposal" {
-                    PluginRequest::AgentAcceptProposal {
-                        session_id,
-                        path: PathBuf::from(path),
-                        hunk_id,
-                    }
-                } else {
-                    PluginRequest::AgentRejectProposal {
-                        session_id,
-                        path: PathBuf::from(path),
-                        hunk_id,
-                    }
-                };
-                self.send_request(request);
-            }
             "AgentPermissionResponse" => {
                 let request_id = args
                     .first()
@@ -1900,14 +1870,6 @@ impl RedHost {
             }
             "GetEditorInfo" => PluginRequest::EditorInfo(request_id),
             "EditHistory" => PluginRequest::EditHistory { request_id },
-            "AgentProposals" => PluginRequest::AgentProposals {
-                session_id: args
-                    .first()
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("AgentProposals requires a session id"))?
-                    .to_string(),
-                request_id,
-            },
             "GetCursorPosition" => PluginRequest::GetCursorPosition { request_id },
             "GetCursorDisplayColumn" => PluginRequest::GetCursorDisplayColumn { request_id },
             "GetBufferText" => {
@@ -6658,30 +6620,6 @@ mod tests {
             PluginRequest::AgentCancel { session_id } if session_id == "session-1"
         ));
 
-        runtime.execute_command("AgentReview").await.unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenWorkspace { id, .. } if id == "agent-review"
-        ));
-        let request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::AgentProposals {
-                session_id,
-                request_id,
-            } => {
-                assert_eq!(session_id, "session-1");
-                request_id
-            }
-            _ => panic!("expected proposal review request"),
-        };
-        runtime
-            .resolve_request(request_id, serde_json::json!({ "files": [] }))
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdateWorkspace { id, .. } if id == "agent-review"
-        ));
-
         runtime
             .notify(
                 "agent:permission_requested",
@@ -7532,10 +7470,7 @@ mod tests {
                 PluginRequest::AgentCloseSession { session_id } if session_id == "session-1"
             );
         }
-        assert!(
-            closed,
-            "cancelled session must be closed so proposals are archived"
-        );
+        assert!(closed, "cancelled session must be closed cleanly");
 
         submit_agent_prompt(&mut runtime, "next prompt").await;
         let mut config_request = None;
@@ -8140,185 +8075,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bundled_agent_review_can_accept_an_archived_proposal_before_starting_a_session() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
-        drain_requests();
-        let mut runtime = Runtime::new();
-        runtime
-            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
-            .await
-            .unwrap();
-
-        runtime.execute_command("AgentReview").await.unwrap();
-
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenWorkspace { id, .. } if id == "agent-review"
-        ));
-        let request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::AgentProposals {
-                session_id,
-                request_id,
-            } => {
-                assert!(session_id.is_empty());
-                request_id
-            }
-            _ => panic!("expected archived proposal request"),
-        };
-        runtime
-            .resolve_request(
-                request_id,
-                serde_json::json!({
-                    "files": [{
-                        "session_id": "archived-session",
-                        "path": "/workspace/recovered.rs",
-                        "conflict": false,
-                        "hunks": [{
-                            "id": "hunk-1",
-                            "old_start": 0,
-                            "old_end": 4,
-                            "old_text": "base",
-                            "new_text": "agent"
-                        }]
-                    }]
-                }),
-            )
-            .await
-            .unwrap();
-        let model = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::UpdateWorkspace { id, model } => {
-                assert_eq!(id, "agent-review");
-                model
-            }
-            _ => panic!("expected archived proposal workspace update"),
-        };
-        assert_eq!(model.rows[0].data["session_id"], "archived-session");
-        assert_eq!(model.rows[1].data["session_id"], "archived-session");
-
-        runtime
-            .notify(
-                "workspace:event:agent-review",
-                serde_json::json!({
-                    "action": "A",
-                    "row": {
-                        "data": {
-                            "session_id": "archived-session",
-                            "path": "/workspace/recovered.rs",
-                            "hunk_id": ""
-                        }
-                    }
-                }),
-            )
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::AgentAcceptProposal {
-                session_id,
-                path,
-                hunk_id: None,
-            } if session_id == "archived-session" && path == Path::new("/workspace/recovered.rs")
-        ));
-        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
-    }
-
-    #[tokio::test]
-    async fn bundled_agent_review_surfaces_a_safe_proposal_read_error() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
-        drain_requests();
-        let mut runtime = Runtime::new();
-        runtime
-            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
-            .await
-            .unwrap();
-
-        runtime.execute_command("AgentReview").await.unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenWorkspace { id, .. } if id == "agent-review"
-        ));
-        let request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::AgentProposals { request_id, .. } => request_id,
-            _ => panic!("expected proposal review request"),
-        };
-
-        runtime
-            .resolve_request(
-                request_id,
-                serde_json::json!({
-                    "files": [],
-                    "error": "Unable to review agent proposals safely; pending changes were left intact"
-                }),
-            )
-            .await
-            .unwrap();
-
-        let model = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::UpdateWorkspace { id, model } => {
-                assert_eq!(id, "agent-review");
-                model
-            }
-            _ => panic!("expected proposal workspace update"),
-        };
-        assert_eq!(model.rows.len(), 1);
-        assert_eq!(model.rows[0].id, "error");
-        assert!(!model.rows[0].selectable);
-        assert_eq!(
-            model.rows[0].segments[0].text,
-            "Unable to review agent proposals safely; pending changes were left intact"
-        );
-        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
-    }
-
-    #[tokio::test]
-    async fn bundled_agent_review_bounds_pathological_proposal_lists() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
-        drain_requests();
-        let mut runtime = Runtime::new();
-        runtime
-            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
-            .await
-            .unwrap();
-
-        runtime.execute_command("AgentReview").await.unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::OpenWorkspace { id, .. } if id == "agent-review"
-        ));
-        let request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::AgentProposals { request_id, .. } => request_id,
-            _ => panic!("expected proposal review request"),
-        };
-        let files = (0..600)
-            .map(|index| {
-                serde_json::json!({
-                    "session_id": "session-1",
-                    "path": format!("/workspace/file_{index}.rs"),
-                    "conflict": false,
-                    "hunks": []
-                })
-            })
-            .collect::<Vec<_>>();
-
-        runtime
-            .resolve_request(request_id, serde_json::json!({ "files": files }))
-            .await
-            .unwrap();
-
-        let model = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::UpdateWorkspace { id, model } => {
-                assert_eq!(id, "agent-review");
-                model
-            }
-            _ => panic!("expected bounded proposal workspace update"),
-        };
-        assert_eq!(model.rows.len(), 500);
-        assert_eq!(model.rows.last().unwrap().id, "proposals-truncated");
-        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
-    }
-
-    #[tokio::test]
     async fn bundled_agent_ignores_late_events_from_a_replaced_session() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -8360,10 +8116,6 @@ mod tests {
             (
                 "agent:error",
                 serde_json::json!({ "session_id": "session-1", "message": "stale error" }),
-            ),
-            (
-                "agent:proposals_changed",
-                serde_json::json!({ "session_id": "session-1" }),
             ),
             (
                 "agent:permission_requested",
@@ -8523,7 +8275,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bundled_agent_plugin_lazily_starts_preserves_prompt_and_announces_proposals() {
+    async fn bundled_agent_plugin_lazily_starts_and_preserves_prompt() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
@@ -8706,40 +8458,7 @@ mod tests {
                 if session_id == "session-lazy" && text == "inspect unsaved changes"
         ));
 
-        runtime
-            .notify(
-                "agent:proposals_changed",
-                serde_json::json!({ "session_id": "session-lazy" }),
-            )
-            .await
-            .unwrap();
-        let proposals_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::AgentProposals {
-                session_id,
-                request_id,
-            } => {
-                assert_eq!(session_id, "session-lazy");
-                request_id
-            }
-            _ => panic!("expected pending-proposals request"),
-        };
-        runtime
-            .resolve_request(
-                proposals_request_id,
-                serde_json::json!({
-                    "files": [
-                        { "hunks": [{}, {}] },
-                        { "hunks": [{}] },
-                    ]
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::Action(Action::Print(message))
-                if message == "Agent changes ready: 2 files, 3 hunks. Use :AgentReview to review before applying"
-        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
     #[tokio::test]

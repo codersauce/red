@@ -20,11 +20,11 @@ use crate::buffer::Buffer;
 pub enum EditOrigin {
     /// A change initiated directly by editor input or an explicit user command.
     User,
-    /// An accepted agent proposal attributed to its Codex session and turn.
+    /// An agent edit attributed to its Codex session and turn.
     Agent {
-        /// Codex conversation that produced the proposal.
+        /// Codex conversation that produced the edit.
         session_id: String,
-        /// Turn within the conversation that produced the proposal.
+        /// Turn within the conversation that produced the edit.
         turn_id: String,
     },
     /// A change requested by a named Husk plugin.

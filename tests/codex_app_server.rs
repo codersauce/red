@@ -24,7 +24,13 @@ impl CodexToolHost for RecordingHost {
         Ok(json!({"content": format!("unsaved:{path}")}))
     }
 
-    async fn write_file(&mut self, _: &str, path: &str, content: String) -> anyhow::Result<Value> {
+    async fn write_file(
+        &mut self,
+        _: &str,
+        path: &str,
+        _expected_revision: u64,
+        content: String,
+    ) -> anyhow::Result<Value> {
         self.writes
             .lock()
             .unwrap()
@@ -84,7 +90,7 @@ for line in sys.stdin:
         send({"id": "tool-write", "method": "item/tool/call", "params": {
             "threadId": "thread-red", "turnId": "turn-red",
             "tool": "write_file",
-            "arguments": {"path": "src/main.rs", "content": "proposed\n"}
+            "arguments": {"path": "src/main.rs", "expected_revision": 0, "content": "updated\n"}
         }})
     elif ident == "tool-write":
         assert message["result"]["success"] is True
@@ -133,7 +139,7 @@ async fn direct_app_server_streams_and_routes_writes_to_the_host() {
     bridge
         .send(CodexCommand::PromptWithContext {
             session_id,
-            text: "make a proposal".to_string(),
+            text: "update the file".to_string(),
             uri: "red-buffer://active".to_string(),
             context: "unsaved editor text".to_string(),
         })
@@ -154,7 +160,7 @@ async fn direct_app_server_streams_and_routes_writes_to_the_host() {
     assert_eq!(streamed, "working");
     assert_eq!(
         *writes.lock().unwrap(),
-        vec![("src/main.rs".to_string(), "proposed\n".to_string())]
+        vec![("src/main.rs".to_string(), "updated\n".to_string())]
     );
 
     drop(bridge);

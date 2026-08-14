@@ -29,7 +29,7 @@ stays at 1:1, line number 1 renders normally.
 press  Space ?               to discover every command
 press  Ctrl-p                to find a file
 press  Space A               to ask the agent
-type   :AgentReview<Enter>   to review the agent's proposals
+type   :AgentHistory<Enter>  to inspect agent edits
 press  Space t               to change the theme
 type   :q<Enter>             to exit
 ────────────────────────────────────────────────────────────

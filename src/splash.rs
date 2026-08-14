@@ -82,11 +82,7 @@ const HINTS: [(&str, &str, &str); 6] = [
     ("press", "Space ?", "to discover every command"),
     ("press", "Ctrl-p", "to find a file"),
     ("press", "Space A", "to ask the agent"),
-    (
-        "type",
-        ":AgentReview<Enter>",
-        "to review the agent's proposals",
-    ),
+    ("type", ":AgentHistory<Enter>", "to inspect agent edits"),
     ("press", "Space t", "to change the theme"),
     ("type", ":q<Enter>", "to exit"),
 ];
@@ -285,7 +281,7 @@ mod tests {
         assert!(lines.iter().all(|line| line.width() <= FULL_MIN_WIDTH));
         let text = block_text(&lines);
         assert!(text.contains("red v0.1.1"));
-        assert!(text.contains(":AgentReview<Enter>"));
+        assert!(text.contains(":AgentHistory<Enter>"));
         assert!(text.contains("everything your fingers expect"));
     }
 

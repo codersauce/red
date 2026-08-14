@@ -53,8 +53,8 @@ center, move, or otherwise change this placement.
   interaction policies even when they share viewport primitives.
 - Workspace access remains descriptor-relative, root-anchored, and symlink-safe.
   Geometry or preview reuse must not weaken filesystem confinement.
-- Preferences, project configuration, agent approval, and staged file proposals retain
-  their existing independent ownership and persistence lifecycles.
+- Preferences, project configuration, agent permission prompts, and live agent edits
+  retain their existing independent ownership and persistence lifecycles.
 
 ## Boundary-sensitive follow-up work
 

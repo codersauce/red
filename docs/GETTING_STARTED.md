@@ -245,8 +245,8 @@ confirmation-gated.
 
 Install and authenticate Codex separately, then press `Space A` from Normal or
 Visual mode. Red sends a bounded source excerpt, unsaved contents, and relevant
-diagnostics. Suggested writes remain isolated until you review them with
-`:AgentReview`.
+diagnostics. Red reveals each file operation as it happens, applies
+revision-checked edits through the editor, and saves them with agent attribution.
 
 Run `red --agent-check` for an offline prerequisite report or
 `red --agent-check --strict` for a non-zero exit when setup is incomplete.

@@ -2974,15 +2974,7 @@ impl Editor {
 
     fn statusline_agent_activity(&self) -> Option<String> {
         if self.agent_manager.has_active_sessions() {
-            return Some("working".to_string());
-        }
-        if self
-            .agent_manager
-            .workspace()
-            .and_then(|workspace| workspace.try_lock().ok())
-            .is_some_and(|workspace| workspace.has_pending_files())
-        {
-            return Some("changes ready".to_string());
+            return Some("following".to_string());
         }
         self.agent_manager.has_bridge().then(|| "idle".to_string())
     }

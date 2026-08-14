@@ -16,7 +16,6 @@ use std::path::Component;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    agent_workspace::ProposalWorkspaceSnapshot,
     editor::Content,
     undo::{TextPosition, UndoHistory},
     window::WindowManagerSnapshot,
@@ -109,9 +108,9 @@ pub struct SessionSnapshot {
     /// Human-readable agent transcript retained across recovery.
     #[serde(default)]
     pub agent_transcript: Option<String>,
-    /// Pending agent proposal state, including review dispositions.
-    #[serde(default)]
-    pub agent_workspace: Option<ProposalWorkspaceSnapshot>,
+    /// Legacy proposal payload accepted for backward-compatible loading and discarded.
+    #[serde(default, rename = "agent_workspace", skip_serializing)]
+    pub legacy_agent_workspace: Option<serde_json::Value>,
     /// False means the transcript is archived context after recovery. Red never
     /// invents Codex thread resume support that the adapter did not negotiate.
     #[serde(default)]
@@ -134,7 +133,7 @@ pub struct SessionSnapshot {
 /// records the trusted disk base used for recovery divergence detection; it is
 /// intentionally distinct from the possibly dirty in-memory `contents`.
 pub struct SessionBufferSnapshot {
-    /// Stable buffer index referenced by windows, marks, and proposals.
+    /// Stable buffer index referenced by windows and marks.
     pub index: usize,
     /// Canonical file path, or `None` for an unnamed buffer.
     pub path: Option<String>,
@@ -285,8 +284,8 @@ impl SessionStore {
 
     /// Loads the preferred recoverable snapshot from the root and owner stores.
     ///
-    /// Recoverable dirty or pending-proposal snapshots rank ahead of clean
-    /// snapshots, then capture time and generation break ties.
+    /// Recoverable dirty snapshots rank ahead of clean snapshots, then capture
+    /// time and generation break ties.
     pub fn load_latest(directory: impl AsRef<Path>) -> anyhow::Result<SessionSnapshot> {
         Self::load_latest_with_store(directory).map(|(_, snapshot)| snapshot)
     }
@@ -331,11 +330,7 @@ impl SessionStore {
         for store in stores {
             match store.load() {
                 Ok(snapshot) => {
-                    let recoverable = snapshot.buffers.iter().any(|buffer| buffer.dirty)
-                        || snapshot
-                            .agent_workspace
-                            .as_ref()
-                            .is_some_and(ProposalWorkspaceSnapshot::has_pending_files);
+                    let recoverable = snapshot.buffers.iter().any(|buffer| buffer.dirty);
                     let newer = latest.as_ref().is_none_or(
                         |(_, current, current_recoverable): &(Self, SessionSnapshot, bool)| {
                             (recoverable, snapshot.saved_at_ms, snapshot.generation)
@@ -2248,7 +2243,6 @@ fn read_snapshot_file(file: File) -> io::Result<SessionSnapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_workspace::ProposalWorkspace;
     use crate::window::{SplitSnapshot, WindowManagerSnapshot};
 
     fn snapshot(contents: &str) -> SessionSnapshot {
@@ -2291,7 +2285,7 @@ mod tests {
             special_marks: Vec::new(),
             last_visual_selections: Vec::new(),
             agent_transcript: None,
-            agent_workspace: None,
+            legacy_agent_workspace: None,
             agent_session_resumable: false,
             plugin_extensions: HashMap::new(),
             legacy_extensions: std::collections::BTreeMap::new(),
@@ -3429,38 +3423,6 @@ mod tests {
         let repeated = SessionStore::load_latest(directory.path()).unwrap();
         assert_eq!(repeated.buffers[0].contents, "saved work");
         assert!(!repeated.buffers[0].dirty);
-    }
-
-    #[test]
-    fn resume_prefers_older_pending_proposals_over_a_newer_clean_session() {
-        let directory = tempfile::tempdir().unwrap();
-        let crashed = SessionStore::for_owner(directory.path(), "editor-crashed").unwrap();
-        let newer = SessionStore::for_owner(directory.path(), "editor-newer").unwrap();
-        let path = directory.path().join("proposal.txt");
-        fs::write(&path, "base\n").unwrap();
-        let mut workspace = ProposalWorkspace::new(directory.path()).unwrap();
-        workspace
-            .sync_visible_file(&path, 0, "base\n".to_string())
-            .unwrap();
-        workspace.begin_turn("archived", "turn-1".to_string());
-        workspace
-            .write("archived", &path, "proposed\n".to_string())
-            .unwrap();
-        let mut pending = snapshot("pending proposal");
-        pending.saved_at_ms = 10;
-        pending.buffers[0].dirty = false;
-        pending.agent_workspace = Some(workspace.snapshot());
-        let mut clean = snapshot("newer clean");
-        clean.saved_at_ms = 20;
-        clean.buffers[0].dirty = false;
-
-        crashed.write(&mut pending).unwrap();
-        newer.write(&mut clean).unwrap();
-
-        assert_eq!(
-            SessionStore::load_latest(directory.path()).unwrap().buffers[0].contents,
-            "pending proposal"
-        );
     }
 
     #[test]

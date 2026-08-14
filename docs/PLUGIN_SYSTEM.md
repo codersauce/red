@@ -195,7 +195,7 @@ They include editor-state and theme consumers (`buffer_picker`, `theme_browser`,
 `barbecue`), event-driven decorations (`cool_search`, `fidget`, `indent_guides`,
 `inlay_hints`), LSP pickers (`lsp_symbols`), watched panels and permitted processes
 (`neotree`, `project_search`, `git`), core-backed recovery (`session_restore`), and
-the Codex/proposal UI (`agent`). The
+the Codex conversation and follow UI (`agent`). The
 [README plugin overview](../README.md#plugins-and-themes) is the concise
 capability inventory; the bundled `.hk` sources are working examples.
 

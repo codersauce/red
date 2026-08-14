@@ -44,7 +44,7 @@ impl AgentCheckReport {
             format!("minimum Codex version: {}", self.minimum_version),
             format!("authentication: {}", self.authentication),
             format!(
-                "reviewable-edit readiness: {}",
+                "agent-edit readiness: {}",
                 if self.production_ready {
                     "ready"
                 } else {
