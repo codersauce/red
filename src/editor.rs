@@ -85,6 +85,10 @@ use crate::{
         PickerIconStyle, StatuslineConfig,
     },
     dispatcher::Dispatcher,
+    editing::{
+        apply_transactional_replacement, text_object_kind_for_key,
+        CharacterMotion as ForwardCharacterMotion, MotionResolver, TextObjectKind, TextObjectScope,
+    },
     highlighter::{Highlighter, LanguageRegistry},
     indent::{self, IndentDecision},
     log,
@@ -3477,14 +3481,6 @@ struct PendingOperator {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ForwardCharacterMotion {
-    Find,
-    Till,
-    FindBackward,
-    TillBackward,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingCharacterMotion {
     kind: ForwardCharacterMotion,
     count: u16,
@@ -3520,82 +3516,8 @@ impl EditOperator {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TextObjectScope {
-    Inner,
-    Around,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TextObjectKind {
-    Word,
-    BigWord,
-    Paragraph,
-    Delimited { open: char, close: char },
-    Quote(char),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TextUnitKind {
-    Keyword,
-    Punctuation,
-    Symbol,
-}
-
 fn is_keyword_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
-}
-
-fn text_object_kind_for_key(c: char) -> Option<TextObjectKind> {
-    match c {
-        'w' => Some(TextObjectKind::Word),
-        'W' => Some(TextObjectKind::BigWord),
-        'p' => Some(TextObjectKind::Paragraph),
-        '(' | ')' | 'b' => Some(TextObjectKind::Delimited {
-            open: '(',
-            close: ')',
-        }),
-        '[' | ']' => Some(TextObjectKind::Delimited {
-            open: '[',
-            close: ']',
-        }),
-        '{' | '}' | 'B' => Some(TextObjectKind::Delimited {
-            open: '{',
-            close: '}',
-        }),
-        '<' | '>' => Some(TextObjectKind::Delimited {
-            open: '<',
-            close: '>',
-        }),
-        '"' | 'q' => Some(TextObjectKind::Quote('"')),
-        '\'' | '`' => Some(TextObjectKind::Quote(c)),
-        _ => None,
-    }
-}
-
-fn text_unit_kind(c: char) -> Option<TextUnitKind> {
-    if c.is_whitespace() {
-        None
-    } else if is_keyword_char(c) {
-        Some(TextUnitKind::Keyword)
-    } else if c.is_ascii_punctuation() {
-        Some(TextUnitKind::Punctuation)
-    } else {
-        Some(TextUnitKind::Symbol)
-    }
-}
-
-fn is_escaped_quote(chars: &[char], idx: usize) -> bool {
-    let mut slash_count = 0;
-    let mut prev = idx;
-    while prev > 0 {
-        prev -= 1;
-        if chars[prev] != '\\' {
-            break;
-        }
-        slash_count += 1;
-    }
-    slash_count % 2 == 1
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -14222,92 +14144,11 @@ impl Editor {
         change_word: bool,
         big_word: bool,
     ) -> Option<TextRange> {
-        let start = self.cursor_text_position();
-        let buffer = self.current_buffer();
-        let contents = buffer.contents();
-        let characters = contents.chars().collect::<Vec<_>>();
-        let mut end = buffer.position_to_char_idx(start);
-        characters.get(end)?;
-        let word_kind = |character: char| {
-            if character.is_whitespace() {
-                0
-            } else if big_word || character.is_alphanumeric() || character == '_' {
-                1
-            } else {
-                2
-            }
-        };
-        let word_kinds = contents
-            .graphemes(true)
-            .flat_map(|grapheme| {
-                let kind = word_kind(grapheme.chars().next().unwrap_or_default());
-                grapheme.chars().map(move |_| kind)
-            })
-            .collect::<Vec<_>>();
-        let preserve_trailing_whitespace = change_word
-            && characters
-                .get(end)
-                .is_some_and(|character| !character.is_whitespace());
-        for index in 0..count {
-            let Some(&character) = characters.get(end) else {
-                break;
-            };
-            let final_motion = index + 1 == count;
-            if matches!(character, '\r' | '\n') {
-                if final_motion && (change_word || (!big_word && index > 0)) {
-                    break;
-                }
-                end += 1;
-                if character == '\r' && characters.get(end) == Some(&'\n') {
-                    end += 1;
-                }
-                if !final_motion {
-                    while characters
-                        .get(end)
-                        .is_some_and(|next| next.is_whitespace() && !matches!(next, '\r' | '\n'))
-                    {
-                        end += 1;
-                    }
-                }
-                continue;
-            }
-
-            let kind = word_kinds[end];
-            while word_kinds.get(end) == Some(&kind)
-                && characters
-                    .get(end)
-                    .is_some_and(|next| !matches!(next, '\r' | '\n'))
-            {
-                end += 1;
-            }
-            if !preserve_trailing_whitespace || index + 1 < count {
-                while characters
-                    .get(end)
-                    .is_some_and(|&next| next.is_whitespace() && !matches!(next, '\r' | '\n'))
-                {
-                    end += 1;
-                }
-                if !final_motion {
-                    if change_word {
-                        while characters.get(end).is_some_and(|next| next.is_whitespace()) {
-                            end += 1;
-                        }
-                    } else if let Some(&line_ending @ ('\r' | '\n')) = characters.get(end) {
-                        end += 1;
-                        if line_ending == '\r' && characters.get(end) == Some(&'\n') {
-                            end += 1;
-                        }
-                        while characters.get(end).is_some_and(|next| {
-                            next.is_whitespace() && !matches!(next, '\r' | '\n')
-                        }) {
-                            end += 1;
-                        }
-                    }
-                }
-            }
-        }
-        let end = buffer.char_idx_to_position(end);
-        (start != end || change_word).then(|| TextRange::new(start, end))
+        MotionResolver::new(self.current_buffer(), self.cursor_text_position()).word_range(
+            count,
+            change_word,
+            big_word,
+        )
     }
 
     fn word_motion_target(
@@ -14317,90 +14158,8 @@ impl Editor {
         end: bool,
         big_word: bool,
     ) -> Option<TextPosition> {
-        let contents = self.current_buffer().contents();
-        let characters = contents.chars().collect::<Vec<_>>();
-        if characters.is_empty() {
-            return None;
-        }
-
-        let word_kind = |character: char| {
-            if character.is_whitespace() {
-                0
-            } else if big_word || character.is_alphanumeric() || character == '_' {
-                1
-            } else {
-                2
-            }
-        };
-        let mut cursor = self
-            .current_buffer()
-            .position_to_char_idx(self.cursor_text_position())
-            .min(characters.len().saturating_sub(1));
-        let mut target = None;
-
-        for _ in 0..count {
-            if backward {
-                if end && !characters[cursor].is_whitespace() {
-                    let kind = word_kind(characters[cursor]);
-                    while cursor > 0 && word_kind(characters[cursor - 1]) == kind {
-                        cursor -= 1;
-                    }
-                }
-                if cursor == 0 {
-                    break;
-                }
-                cursor -= 1;
-                while cursor > 0 && characters[cursor].is_whitespace() {
-                    cursor -= 1;
-                }
-                if characters[cursor].is_whitespace() {
-                    break;
-                }
-                let found_end = cursor;
-                let kind = word_kind(characters[cursor]);
-                while cursor > 0 && word_kind(characters[cursor - 1]) == kind {
-                    cursor -= 1;
-                }
-                target = Some(if end { found_end } else { cursor });
-            } else {
-                if characters[cursor].is_whitespace() {
-                    while cursor < characters.len() && characters[cursor].is_whitespace() {
-                        cursor += 1;
-                    }
-                } else {
-                    let kind = word_kind(characters[cursor]);
-                    let mut group_end = cursor;
-                    while group_end + 1 < characters.len()
-                        && word_kind(characters[group_end + 1]) == kind
-                    {
-                        group_end += 1;
-                    }
-                    if end && cursor < group_end {
-                        cursor = group_end;
-                        target = Some(cursor);
-                        continue;
-                    }
-                    cursor = group_end.saturating_add(1);
-                    while cursor < characters.len() && characters[cursor].is_whitespace() {
-                        cursor += 1;
-                    }
-                }
-
-                if cursor >= characters.len() {
-                    break;
-                }
-                if end {
-                    let kind = word_kind(characters[cursor]);
-                    while cursor + 1 < characters.len() && word_kind(characters[cursor + 1]) == kind
-                    {
-                        cursor += 1;
-                    }
-                }
-                target = Some(cursor);
-            }
-        }
-
-        target.map(|index| self.current_buffer().char_idx_to_position(index))
+        MotionResolver::new(self.current_buffer(), self.cursor_text_position())
+            .word_target(count, backward, end, big_word)
     }
 
     fn previous_word_motion_range(&self, count: u16, big_word: bool) -> Option<TextRange> {
@@ -14564,30 +14323,13 @@ impl Editor {
     }
 
     fn forward_character_match(&self, target: char, count: u16) -> Option<TextPosition> {
-        let start = self.cursor_text_position();
-        let line = self.current_buffer().get(start.line)?;
-        let line = trim_line_ending(&line);
-        let search_start = start.character.saturating_add(1);
-        let target_offset = char_suffix(line, search_start)
-            .chars()
-            .enumerate()
-            .filter_map(|(offset, candidate)| (candidate == target).then_some(offset))
-            .nth(usize::from(count.saturating_sub(1)))?;
-        Some(TextPosition::new(start.line, search_start + target_offset))
+        MotionResolver::new(self.current_buffer(), self.cursor_text_position())
+            .character_match(target, count, false)
     }
 
     fn backward_character_match(&self, target: char, count: u16) -> Option<TextPosition> {
-        let start = self.cursor_text_position();
-        let line = self.current_buffer().get(start.line)?;
-        let line = trim_line_ending(&line);
-        let prefix = char_prefix(line, start.character);
-        let target_byte = prefix
-            .match_indices(target)
-            .rev()
-            .nth(usize::from(count.saturating_sub(1)))?
-            .0;
-        let target_index = prefix[..target_byte].chars().count();
-        Some(TextPosition::new(start.line, target_index))
+        MotionResolver::new(self.current_buffer(), self.cursor_text_position())
+            .character_match(target, count, true)
     }
 
     fn find_forward_motion_range(&self, target: char, count: u16) -> Option<TextRange> {
@@ -14680,139 +14422,8 @@ impl Editor {
     }
 
     fn text_object_range(&self, scope: TextObjectScope, kind: TextObjectKind) -> Option<TextRange> {
-        match kind {
-            TextObjectKind::Word => self.word_text_object_range(scope, false),
-            TextObjectKind::BigWord => self.word_text_object_range(scope, true),
-            TextObjectKind::Paragraph => self.paragraph_text_object_range(scope),
-            TextObjectKind::Delimited { open, close } => {
-                self.delimited_text_object_range(scope, open, close)
-            }
-            TextObjectKind::Quote(quote) => self.quote_text_object_range(scope, quote),
-        }
-    }
-
-    fn word_text_object_range(&self, scope: TextObjectScope, big_word: bool) -> Option<TextRange> {
-        let line_index = self.buffer_line();
-        let line = self.current_buffer().get(line_index)?;
-        let line = trim_line_ending(&line);
-        let chars = line.chars().collect::<Vec<_>>();
-        if chars.is_empty() {
-            return None;
-        }
-
-        let unit_kind = |character: char| {
-            if big_word && !character.is_whitespace() {
-                Some(TextUnitKind::Keyword)
-            } else {
-                text_unit_kind(character)
-            }
-        };
-        let cursor = self
-            .grapheme_to_char_on_line(self.cx, line_index)
-            .min(chars.len().saturating_sub(1));
-        let target = if unit_kind(chars[cursor]).is_some() {
-            cursor
-        } else {
-            (cursor..chars.len())
-                .find(|idx| unit_kind(chars[*idx]).is_some())
-                .or_else(|| {
-                    (0..=cursor)
-                        .rev()
-                        .find(|idx| unit_kind(chars[*idx]).is_some())
-                })?
-        };
-
-        let kind = unit_kind(chars[target])?;
-        let mut start = target;
-        while start > 0 && unit_kind(chars[start - 1]) == Some(kind) {
-            start -= 1;
-        }
-
-        let mut end = target + 1;
-        while end < chars.len() && unit_kind(chars[end]) == Some(kind) {
-            end += 1;
-        }
-
-        if scope == TextObjectScope::Around {
-            if end < chars.len() && chars[end].is_whitespace() {
-                while end < chars.len() && chars[end].is_whitespace() {
-                    end += 1;
-                }
-            } else {
-                while start > 0 && chars[start - 1].is_whitespace() {
-                    start -= 1;
-                }
-            }
-        }
-
-        Some(TextRange::new(
-            TextPosition::new(line_index, start),
-            TextPosition::new(line_index, end),
-        ))
-    }
-
-    fn paragraph_text_object_range(&self, scope: TextObjectScope) -> Option<TextRange> {
-        let buffer = self.current_buffer();
-        if buffer.is_empty() {
-            return None;
-        }
-
-        let last_line = self.last_navigable_line();
-        let cursor_line = self.buffer_line().min(last_line);
-        let is_blank = |line: usize| {
-            buffer
-                .get(line)
-                .is_some_and(|text| trim_line_ending(&text).trim().is_empty())
-        };
-
-        let mut first_line = cursor_line;
-        let mut last_exclusive = cursor_line + 1;
-        let cursor_is_blank = is_blank(cursor_line);
-
-        while first_line > 0 && is_blank(first_line - 1) == cursor_is_blank {
-            first_line -= 1;
-        }
-        while last_exclusive <= last_line && is_blank(last_exclusive) == cursor_is_blank {
-            last_exclusive += 1;
-        }
-
-        if scope == TextObjectScope::Around {
-            if cursor_is_blank {
-                while last_exclusive <= last_line && !is_blank(last_exclusive) {
-                    last_exclusive += 1;
-                }
-            } else {
-                while last_exclusive <= last_line && is_blank(last_exclusive) {
-                    last_exclusive += 1;
-                }
-            }
-        }
-
-        let ends_at_eof = last_exclusive > last_line;
-        let start = if ends_at_eof && first_line > 0 {
-            if scope == TextObjectScope::Around {
-                while first_line > 0 && is_blank(first_line - 1) {
-                    first_line -= 1;
-                }
-                if first_line > 0 {
-                    let previous_line = first_line - 1;
-                    TextPosition::new(previous_line, self.line_character_len(previous_line))
-                } else {
-                    TextPosition::new(0, 0)
-                }
-            } else {
-                TextPosition::new(first_line - 1, self.line_character_len(first_line - 1))
-            }
-        } else {
-            TextPosition::new(first_line, 0)
-        };
-        let end = if ends_at_eof {
-            TextPosition::new(last_line, self.line_character_len(last_line))
-        } else {
-            TextPosition::new(last_exclusive, 0)
-        };
-
-        (start != end).then(|| TextRange::new(start, end))
+        MotionResolver::new(self.current_buffer(), self.cursor_text_position())
+            .text_object(scope, kind)
     }
 
     fn word_under_cursor(&self) -> Option<String> {
@@ -14842,83 +14453,6 @@ impl Editor {
         }
 
         Some(chars[start..end].iter().collect())
-    }
-
-    fn delimited_text_object_range(
-        &self,
-        scope: TextObjectScope,
-        open: char,
-        close: char,
-    ) -> Option<TextRange> {
-        let contents = self.current_buffer().contents();
-        let chars = contents.chars().collect::<Vec<_>>();
-        let cursor = self
-            .current_buffer()
-            .position_to_char_idx(self.cursor_text_position());
-
-        let mut stack = Vec::new();
-        let mut best_pair = None;
-
-        for (idx, c) in chars.iter().copied().enumerate() {
-            if c == open {
-                stack.push(idx);
-            } else if c == close {
-                let Some(open_idx) = stack.pop() else {
-                    continue;
-                };
-                if open_idx <= cursor
-                    && cursor <= idx
-                    && best_pair.is_none_or(|(best_open_idx, _)| open_idx > best_open_idx)
-                {
-                    best_pair = Some((open_idx, idx));
-                }
-            }
-        }
-
-        let (open_idx, close_idx) = best_pair?;
-        let (start_idx, end_idx) = match scope {
-            TextObjectScope::Inner => (open_idx + 1, close_idx),
-            TextObjectScope::Around => (open_idx, close_idx + 1),
-        };
-
-        Some(TextRange::new(
-            self.position_for_char_idx(start_idx),
-            self.position_for_char_idx(end_idx),
-        ))
-    }
-
-    fn quote_text_object_range(&self, scope: TextObjectScope, quote: char) -> Option<TextRange> {
-        let line_index = self.buffer_line();
-        let line = self.current_buffer().get(line_index)?;
-        let line = line.trim_end_matches('\n');
-        let chars = line.chars().collect::<Vec<_>>();
-        let cursor = self.grapheme_to_char_on_line(self.cx, line_index);
-
-        let quote_positions = chars
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, c)| (*c == quote && !is_escaped_quote(&chars, idx)).then_some(idx))
-            .collect::<Vec<_>>();
-
-        for pair in quote_positions.chunks(2) {
-            if pair.len() != 2 {
-                continue;
-            }
-            let start = pair[0];
-            let end = pair[1];
-            if start <= cursor && cursor <= end {
-                let (range_start, range_end) = match scope {
-                    TextObjectScope::Inner => (start + 1, end),
-                    TextObjectScope::Around => (start, end + 1),
-                };
-                return Some(TextRange::new(
-                    TextPosition::new(line_index, range_start),
-                    TextPosition::new(line_index, range_end),
-                ));
-            }
-        }
-
-        None
     }
 
     fn position_for_char_idx(&self, char_idx: usize) -> TextPosition {
@@ -20881,28 +20415,13 @@ impl Editor {
     }
 
     fn replace_range(&mut self, range: TextRange, new_text: &str) {
-        let old_text = self.current_buffer().text_in_range(range);
-        if old_text == new_text {
+        let Some(edit) =
+            apply_transactional_replacement(self.current_buffer_mut(), range, new_text)
+        else {
             return;
-        }
-        assert!(
-            self.transaction_active(),
-            "editor content mutations must occur inside an edit transaction"
-        );
-        let edit = AppliedTextEdit {
-            start_char: self.current_buffer().position_to_char_idx(range.start),
-            end_char: self.current_buffer().position_to_char_idx(range.end),
-            new_char_len: new_text.chars().count(),
         };
-        self.current_buffer_mut().replace_range_raw(range, new_text);
         self.update_anchors_for_edit(edit);
         self.set_special_mark_at_char('.', edit.start_char, AnchorAffinity::Left);
-        self.current_buffer_mut().undo_history.record_replace(
-            range,
-            edit.start_char,
-            old_text,
-            new_text.to_string(),
-        );
     }
 
     fn delete_text_range(&mut self, range: TextRange, label: &str) -> bool {

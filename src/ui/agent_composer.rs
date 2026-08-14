@@ -245,7 +245,8 @@ impl Component for AgentComposer {
 
         if self.dialog.height > body_height {
             let status_y = content_y + body_height;
-            let normal_mode = self.prompt.mode() == Mode::Normal;
+            let prompt_mode = self.prompt.mode();
+            let normal_mode = prompt_mode == Mode::Normal;
             let (send_key, compact_send_key, escape_label) = if normal_mode {
                 ("Enter", "↵", "Cancel")
             } else {
@@ -270,10 +271,11 @@ impl Component for AgentComposer {
                 &actions[..]
             };
             ActionBar::new(visible_actions)
-                .with_mode(if normal_mode {
-                    ActionMode::Normal
-                } else {
-                    ActionMode::Insert
+                .with_mode(match prompt_mode {
+                    Mode::Normal => ActionMode::Normal,
+                    Mode::Visual | Mode::VisualLine | Mode::VisualBlock => ActionMode::Visual,
+                    Mode::Search => ActionMode::Read,
+                    Mode::Insert | Mode::Command => ActionMode::Insert,
                 })
                 .with_status(self.validation_status)
                 .render(

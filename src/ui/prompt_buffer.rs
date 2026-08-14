@@ -1,20 +1,17 @@
-//! Ephemeral, Vim-native prompt editing shared by agent surfaces.
+//! Prompt history and submission policy around the reusable modal text area.
 //!
-//! Prompt buffers use Red's real rope-backed [`Buffer`] and branching
-//! [`UndoHistory`](crate::undo::UndoHistory), but never have a file path or enter
-//! the editor's ordinary file-buffer collection.
+//! Plugin composers and agent dialogs own independent [`TextArea`] values. Their
+//! documents never enter the editor's file-buffer list; this wrapper adds bounded
+//! prompt history plus surface-specific submit and cancellation shortcuts.
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     buffer::Buffer,
+    editing::{TextArea, TextAreaOutcome},
     editor::Mode,
-    undo::{CursorSnapshot, TextPosition, TextRange},
-    unicode_utils::{char_to_grapheme, grapheme_len, grapheme_to_byte},
+    unicode_utils::grapheme_len,
 };
-
-use super::wrap_text;
 
 /// Largest prompt accepted by the direct Codex app-server integration.
 pub(crate) const PROMPT_MAX_BYTES: usize = 128 * 1024;
@@ -22,27 +19,23 @@ pub(crate) const PROMPT_MAX_BYTES: usize = 128 * 1024;
 /// Outcome of applying one terminal input event to an ephemeral prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptInput {
-    /// The draft, cursor, history selection, or editor mode changed.
+    /// The draft, cursor, history selection, editor mode, or pending motion changed.
     Changed,
     /// The current complete prompt should be validated and submitted.
     Submit,
-    /// The containing floating surface should be cancelled.
+    /// The containing surface should be cancelled or blurred.
     Cancel,
     /// The event is not a prompt-editing action.
     Unhandled,
 }
 
-/// Fileless editor buffer, cursor, Vim mode, and thread-local prompt history.
+/// Fileless modal text area with thread-local prompt history and submission policy.
 #[derive(Debug)]
 pub(crate) struct PromptBuffer {
-    buffer: Buffer,
-    cursor: usize,
-    mode: Mode,
-    preferred_column: Option<usize>,
+    area: TextArea,
     history: Vec<String>,
     history_position: Option<usize>,
     history_draft: Option<String>,
-    pending_delete: bool,
 }
 
 impl PromptBuffer {
@@ -53,18 +46,8 @@ impl PromptBuffer {
 
     /// Creates an unnamed prompt while preserving only bounded history entries.
     pub(crate) fn with_history(text: impl AsRef<str>, history: Vec<String>) -> Self {
-        let normalized = normalize_prompt_newlines(text.as_ref());
-        let text = if normalized.len() <= PROMPT_MAX_BYTES {
-            normalized
-        } else {
-            String::new()
-        };
-        let cursor = grapheme_len(&text);
-        let mut prompt = Self {
-            buffer: scratch_buffer(&text),
-            cursor,
-            mode: Mode::Insert,
-            preferred_column: None,
+        Self {
+            area: TextArea::with_max_bytes(text, PROMPT_MAX_BYTES),
             history: history
                 .into_iter()
                 .filter(|entry| entry.len() <= PROMPT_MAX_BYTES)
@@ -72,42 +55,36 @@ impl PromptBuffer {
                 .collect(),
             history_position: None,
             history_draft: None,
-            pending_delete: false,
-        };
-        prompt.sync_buffer_cursor();
-        prompt
+        }
     }
 
     /// Returns the underlying unnamed editor buffer.
     #[must_use]
     pub(crate) fn buffer(&self) -> &Buffer {
-        &self.buffer
+        self.area.buffer()
     }
 
     /// Returns the exact UTF-8 draft without adding a synthetic newline.
     #[must_use]
     pub(crate) fn text(&self) -> String {
-        self.buffer.contents()
+        self.area.text()
     }
 
     /// Returns the cursor as an absolute extended-grapheme index.
     #[must_use]
     pub(crate) const fn cursor(&self) -> usize {
-        self.cursor
+        self.area.cursor()
     }
 
-    /// Returns the prompt's actual Normal or Insert editor mode.
+    /// Returns the prompt's independent editor mode.
     #[must_use]
     pub(crate) const fn mode(&self) -> Mode {
-        self.mode
+        self.area.mode()
     }
 
     /// Changes the local prompt mode without mutating the global editor.
     pub(crate) fn set_mode(&mut self, mode: Mode) {
-        if matches!(mode, Mode::Normal | Mode::Insert) {
-            self.mode = mode;
-            self.pending_delete = false;
-        }
+        self.area.set_mode(mode);
     }
 
     /// Returns thread-local prompt history, newest submission first.
@@ -118,84 +95,40 @@ impl PromptBuffer {
 
     /// Moves the cursor to a bounded absolute grapheme position.
     pub(crate) fn set_cursor(&mut self, cursor: usize) {
-        self.cursor = cursor.min(grapheme_len(&self.text()));
-        self.preferred_column = None;
-        self.sync_buffer_cursor();
+        self.area.set_cursor(cursor);
     }
 
-    /// Replaces the complete draft through the real undo transaction boundary.
+    /// Replaces the complete draft through the shared transaction boundary.
     pub(crate) fn set_text(&mut self, text: &str) -> bool {
-        let text = normalize_prompt_newlines(text);
-        if text.len() > PROMPT_MAX_BYTES {
-            return false;
-        }
-        let previous = self.text();
-        let end = grapheme_len(&previous);
-        self.replace_graphemes(0, end, &text, grapheme_len(&text), "replace prompt")
+        self.area.set_text(text)
     }
 
-    /// Inserts exact normalized text as one undoable prompt transaction.
+    /// Inserts normalized text as one undoable prompt transaction.
     pub(crate) fn insert(&mut self, text: &str) -> bool {
-        let text = normalize_prompt_newlines(text);
-        if text.is_empty() {
-            return false;
-        }
-        let cursor = self.cursor;
-        let mut resulting_prefix = self.text();
-        let insertion_byte = grapheme_to_byte(&resulting_prefix, cursor);
-        resulting_prefix.truncate(insertion_byte);
-        resulting_prefix.push_str(&text);
-        let resulting_cursor = grapheme_len(&resulting_prefix);
-        self.replace_user_graphemes(
-            cursor,
-            cursor,
-            &text,
-            resulting_cursor,
-            "insert into prompt",
-        )
+        let changed = self.area.insert(text);
+        self.detach_history_after_edit(changed);
+        changed
     }
 
     /// Removes the previous complete extended grapheme.
     pub(crate) fn backspace(&mut self) -> bool {
-        if self.cursor == 0 {
-            return false;
-        }
-        let start = self.cursor - 1;
-        self.replace_user_graphemes(start, self.cursor, "", start, "delete prompt grapheme")
+        let changed = self.area.backspace();
+        self.detach_history_after_edit(changed);
+        changed
     }
 
     /// Removes the complete extended grapheme under the cursor.
     pub(crate) fn delete(&mut self) -> bool {
-        if self.cursor >= grapheme_len(&self.text()) {
-            return false;
-        }
-        self.replace_user_graphemes(
-            self.cursor,
-            self.cursor + 1,
-            "",
-            self.cursor,
-            "delete prompt grapheme",
-        )
+        let changed = self.area.delete();
+        self.detach_history_after_edit(changed);
+        changed
     }
 
-    /// Removes the whitespace and word immediately preceding the cursor.
+    /// Removes whitespace and the word immediately preceding the cursor.
     pub(crate) fn delete_previous_word(&mut self) -> bool {
-        if self.cursor == 0 {
-            return false;
-        }
-        let text = self.text();
-        let end = grapheme_to_byte(&text, self.cursor);
-        let mut start = self.cursor;
-        let mut seen_word = false;
-        for grapheme in text[..end].graphemes(true).rev() {
-            let whitespace = grapheme.chars().all(char::is_whitespace);
-            if seen_word && whitespace {
-                break;
-            }
-            seen_word |= !whitespace;
-            start -= 1;
-        }
-        self.replace_user_graphemes(start, self.cursor, "", start, "delete prompt word")
+        let changed = self.area.delete_previous_word();
+        self.detach_history_after_edit(changed);
+        changed
     }
 
     /// Selects the previous submitted prompt while preserving the current draft.
@@ -232,38 +165,19 @@ impl PromptBuffer {
 
     /// Undoes one real, branch-preserving prompt edit.
     pub(crate) fn undo(&mut self) -> bool {
-        let mut history = std::mem::take(&mut self.buffer.undo_history);
-        let restored = history.undo(&mut self.buffer);
-        self.buffer.undo_history = history;
-        let Some((cursor, _)) = restored else {
-            return false;
-        };
-        self.restore_cursor(cursor);
-        self.buffer.refresh_dirty_from_history();
-        true
+        self.area.undo()
     }
 
     /// Redoes one real prompt transaction on the selected undo branch.
     pub(crate) fn redo(&mut self) -> bool {
-        let mut history = std::mem::take(&mut self.buffer.undo_history);
-        let restored = history.redo(&mut self.buffer);
-        self.buffer.undo_history = history;
-        let Some((cursor, _)) = restored else {
-            return false;
-        };
-        self.restore_cursor(cursor);
-        self.buffer.refresh_dirty_from_history();
-        true
+        self.area.redo()
     }
 
     /// Clears the draft without associating it with a file or losing history.
     pub(crate) fn clear(&mut self) {
-        self.buffer = scratch_buffer("");
-        self.cursor = 0;
-        self.preferred_column = None;
+        self.area.clear();
         self.history_position = None;
         self.history_draft = None;
-        self.pending_delete = false;
     }
 
     /// Takes a nonblank draft and adds it to bounded, deduplicated history.
@@ -280,354 +194,79 @@ impl PromptBuffer {
         Some(text)
     }
 
-    /// Applies terminal input while preserving Vim mode and modified-Enter semantics.
+    /// Applies local prompt policy before delegating modal editing to the shared engine.
     pub(crate) fn handle_event(&mut self, event: &Event, wrap_width: usize) -> PromptInput {
-        match event {
-            Event::Paste(text) => {
-                if self.insert(text) {
-                    PromptInput::Changed
-                } else {
-                    PromptInput::Unhandled
-                }
+        let Event::Key(key) = event else {
+            return self.apply_area_event(event, wrap_width);
+        };
+        let modifiers = key.modifiers;
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('\n')
+                if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                PromptInput::Submit
             }
-            Event::Key(key) => {
-                let modifiers = key.modifiers;
-                match key.code {
-                    KeyCode::Enter | KeyCode::Char('\n')
-                        if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                    {
-                        PromptInput::Submit
-                    }
-                    KeyCode::Char('c' | 'C') if modifiers.contains(KeyModifiers::CONTROL) => {
-                        PromptInput::Cancel
-                    }
-                    KeyCode::Esc if self.mode == Mode::Insert => {
-                        let cursor = self.cursor.saturating_sub(1).max(self.current_line_start());
-                        self.set_cursor(cursor);
-                        self.set_mode(Mode::Normal);
-                        PromptInput::Changed
-                    }
-                    KeyCode::Esc => PromptInput::Cancel,
-                    KeyCode::Enter if self.mode == Mode::Normal => PromptInput::Submit,
-                    KeyCode::Enter | KeyCode::Char('\n') => {
-                        self.insert("\n");
-                        PromptInput::Changed
-                    }
-                    KeyCode::Char('j' | 'J') if modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.insert("\n");
-                        PromptInput::Changed
-                    }
-                    KeyCode::Char('p' | 'P') if modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.history_previous();
-                        PromptInput::Changed
-                    }
-                    KeyCode::Char('n' | 'N') if modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.history_next();
-                        PromptInput::Changed
-                    }
-                    KeyCode::Char('w' | 'W') if modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.delete_previous_word();
-                        PromptInput::Changed
-                    }
-                    KeyCode::Char('r' | 'R') if modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.redo();
-                        PromptInput::Changed
-                    }
-                    KeyCode::Char('z' | 'Z') if modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.undo();
-                        PromptInput::Changed
-                    }
-                    KeyCode::Char('a' | 'A') if modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.set_cursor(0);
-                        PromptInput::Changed
-                    }
-                    KeyCode::Char('e' | 'E') if modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.set_cursor(grapheme_len(&self.text()));
-                        PromptInput::Changed
-                    }
-                    KeyCode::Left => {
-                        self.move_horizontal(-1);
-                        PromptInput::Changed
-                    }
-                    KeyCode::Right => {
-                        self.move_horizontal(1);
-                        PromptInput::Changed
-                    }
-                    KeyCode::Up => {
-                        self.move_vertical(-1, wrap_width);
-                        PromptInput::Changed
-                    }
-                    KeyCode::Down => {
-                        self.move_vertical(1, wrap_width);
-                        PromptInput::Changed
-                    }
-                    KeyCode::Home => {
-                        self.set_cursor(0);
-                        PromptInput::Changed
-                    }
-                    KeyCode::End => {
-                        self.set_cursor(grapheme_len(&self.text()));
-                        PromptInput::Changed
-                    }
-                    KeyCode::Backspace => {
-                        self.backspace();
-                        PromptInput::Changed
-                    }
-                    KeyCode::Delete => {
-                        self.delete();
-                        PromptInput::Changed
-                    }
-                    KeyCode::Tab if self.mode == Mode::Insert => {
-                        self.insert("\t");
-                        PromptInput::Changed
-                    }
-                    KeyCode::Char(character)
-                        if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                    {
-                        self.handle_character(character, wrap_width)
-                    }
-                    _ => PromptInput::Unhandled,
-                }
+            KeyCode::Char('c' | 'C') if modifiers.contains(KeyModifiers::CONTROL) => {
+                PromptInput::Cancel
             }
-            _ => PromptInput::Unhandled,
-        }
-    }
-
-    fn handle_character(&mut self, character: char, wrap_width: usize) -> PromptInput {
-        if self.mode == Mode::Insert {
-            return if self.insert(&character.to_string()) {
-                PromptInput::Changed
-            } else {
-                PromptInput::Unhandled
-            };
-        }
-
-        if self.pending_delete {
-            self.pending_delete = false;
-            return match character {
-                'w' => {
-                    let target = self.next_word_boundary();
-                    self.replace_user_graphemes(
-                        self.cursor,
-                        target,
-                        "",
-                        self.cursor,
-                        "delete prompt word",
-                    );
-                    PromptInput::Changed
-                }
-                _ => PromptInput::Unhandled,
-            };
-        }
-
-        match character {
-            'i' => self.set_mode(Mode::Insert),
-            'a' => {
-                self.set_cursor(self.cursor.saturating_add(1).min(self.current_line_end()));
-                self.set_mode(Mode::Insert);
+            KeyCode::Esc
+                if self.mode() == Mode::Normal && !self.area.state().has_pending_input() =>
+            {
+                PromptInput::Cancel
             }
-            'A' => {
-                self.set_cursor(self.current_line_end());
-                self.set_mode(Mode::Insert);
-            }
-            'h' => self.move_horizontal(-1),
-            'j' => self.move_vertical(1, wrap_width),
-            'k' => self.move_vertical(-1, wrap_width),
-            'l' => self.move_horizontal(1),
-            '0' => self.set_cursor(self.current_line_start()),
-            '$' => self.set_cursor(self.current_line_last_grapheme()),
-            'w' => self.set_cursor(self.next_word_boundary()),
-            'o' => {
-                self.set_cursor(self.current_line_end());
+            KeyCode::Enter if self.mode() == Mode::Normal => PromptInput::Submit,
+            KeyCode::Char('j' | 'J') if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.insert("\n");
-                self.set_mode(Mode::Insert);
+                PromptInput::Changed
             }
-            'x' => {
-                if self.cursor < self.current_line_end() {
-                    self.delete();
-                }
+            KeyCode::Char('p' | 'P') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.history_previous();
+                PromptInput::Changed
             }
-            'u' => {
+            KeyCode::Char('n' | 'N') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.history_next();
+                PromptInput::Changed
+            }
+            KeyCode::Char('w' | 'W') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_previous_word();
+                PromptInput::Changed
+            }
+            KeyCode::Char('r' | 'R') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.redo();
+                PromptInput::Changed
+            }
+            KeyCode::Char('z' | 'Z') if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.undo();
+                PromptInput::Changed
             }
-            'd' => self.pending_delete = true,
-            _ => return PromptInput::Unhandled,
+            KeyCode::Char('a' | 'A') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.set_cursor(0);
+                PromptInput::Changed
+            }
+            KeyCode::Char('e' | 'E') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.set_cursor(grapheme_len(&self.text()));
+                PromptInput::Changed
+            }
+            _ => self.apply_area_event(event, wrap_width),
         }
-        PromptInput::Changed
     }
 
-    fn replace_user_graphemes(
-        &mut self,
-        start: usize,
-        end: usize,
-        replacement: &str,
-        cursor: usize,
-        label: &str,
-    ) -> bool {
-        let changed = self.replace_graphemes(start, end, replacement, cursor, label);
+    fn apply_area_event(&mut self, event: &Event, wrap_width: usize) -> PromptInput {
+        let previous_revision = self.buffer().revision();
+        let result = self.area.handle_event(event, wrap_width);
+        self.detach_history_after_edit(self.buffer().revision() != previous_revision);
+        match result {
+            TextAreaOutcome::Changed => PromptInput::Changed,
+            TextAreaOutcome::Unhandled => PromptInput::Unhandled,
+        }
+    }
+
+    fn detach_history_after_edit(&mut self, changed: bool) {
         if changed {
             self.history_position = None;
             self.history_draft = None;
         }
-        changed
     }
-
-    fn replace_graphemes(
-        &mut self,
-        start: usize,
-        end: usize,
-        replacement: &str,
-        cursor: usize,
-        label: &str,
-    ) -> bool {
-        let contents = self.text();
-        let start_byte = grapheme_to_byte(&contents, start);
-        let end_byte = grapheme_to_byte(&contents, end);
-        let old_text = &contents[start_byte..end_byte];
-        if old_text == replacement
-            || contents
-                .len()
-                .saturating_sub(old_text.len())
-                .saturating_add(replacement.len())
-                > PROMPT_MAX_BYTES
-        {
-            return false;
-        }
-        let start_char = contents[..start_byte].chars().count();
-        let end_char = contents[..end_byte].chars().count();
-        let range = TextRange::new(
-            self.buffer.char_idx_to_position(start_char),
-            self.buffer.char_idx_to_position(end_char),
-        );
-        let before = self.cursor_snapshot();
-        self.buffer.undo_history.begin_transaction(label, before);
-        self.buffer.undo_history.record_replace(
-            range,
-            start_char,
-            old_text.to_string(),
-            replacement.to_string(),
-        );
-        self.buffer.replace_range_raw(range, replacement);
-        self.cursor = cursor.min(grapheme_len(&self.text()));
-        self.preferred_column = None;
-        self.sync_buffer_cursor();
-        let after = self.cursor_snapshot();
-        self.buffer.undo_history.commit_transaction(after);
-        self.buffer.refresh_dirty_from_history();
-        true
-    }
-
-    fn move_horizontal(&mut self, direction: isize) {
-        let cursor = self.cursor.saturating_add_signed(direction);
-        let cursor = if self.mode == Mode::Normal {
-            cursor.clamp(self.current_line_start(), self.current_line_last_grapheme())
-        } else {
-            cursor
-        };
-        self.set_cursor(cursor);
-    }
-
-    fn move_vertical(&mut self, direction: isize, width: usize) {
-        let wrapped = wrap_text(&self.text(), width.max(1));
-        let Some(&(row, column)) = wrapped.positions.get(self.cursor) else {
-            return;
-        };
-        let target = row.saturating_add_signed(direction);
-        if target >= wrapped.rows.len() || target == row {
-            return;
-        }
-        let preferred = *self.preferred_column.get_or_insert(column);
-        if let Some((index, _)) = wrapped
-            .positions
-            .iter()
-            .enumerate()
-            .filter(|(_, position)| position.0 == target)
-            .min_by_key(|(_, position)| position.1.abs_diff(preferred))
-        {
-            self.cursor = index;
-            self.sync_buffer_cursor();
-        }
-    }
-
-    fn current_line_start(&self) -> usize {
-        let text = self.text();
-        let byte = grapheme_to_byte(&text, self.cursor);
-        text[..byte]
-            .rfind('\n')
-            .map_or(0, |index| grapheme_len(&text[..index + 1]))
-    }
-
-    fn current_line_end(&self) -> usize {
-        let text = self.text();
-        let byte = grapheme_to_byte(&text, self.cursor);
-        text[byte..].find('\n').map_or_else(
-            || grapheme_len(&text),
-            |index| grapheme_len(&text[..byte + index]),
-        )
-    }
-
-    fn current_line_last_grapheme(&self) -> usize {
-        self.current_line_end()
-            .saturating_sub(1)
-            .max(self.current_line_start())
-    }
-
-    fn next_word_boundary(&self) -> usize {
-        let text = self.text();
-        let byte = grapheme_to_byte(&text, self.cursor);
-        let mut index = self.cursor;
-        let mut passed_word = false;
-        for grapheme in text[byte..].graphemes(true) {
-            let whitespace = grapheme.chars().all(char::is_whitespace);
-            if passed_word && !whitespace {
-                break;
-            }
-            passed_word |= whitespace;
-            index += 1;
-        }
-        index.min(grapheme_len(&text))
-    }
-
-    fn cursor_snapshot(&self) -> CursorSnapshot {
-        let text = self.text();
-        let byte = grapheme_to_byte(&text, self.cursor);
-        let character = text[..byte].chars().count();
-        let position = self.buffer.char_idx_to_position(character);
-        let line = self.buffer.get(position.line).unwrap_or_default();
-        CursorSnapshot::new(
-            char_to_grapheme(&line, position.character),
-            position.line,
-            0,
-        )
-    }
-
-    fn sync_buffer_cursor(&mut self) {
-        let snapshot = self.cursor_snapshot();
-        self.buffer.pos = (snapshot.x, snapshot.y);
-    }
-
-    fn restore_cursor(&mut self, snapshot: CursorSnapshot) {
-        let prefix = self.buffer.line_range_contents(0, snapshot.y);
-        let line = self.buffer.get(snapshot.y).unwrap_or_default();
-        self.cursor = grapheme_len(&prefix)
-            .saturating_add(snapshot.x.min(grapheme_len(&line)))
-            .min(grapheme_len(&self.text()));
-        self.preferred_column = None;
-        self.sync_buffer_cursor();
-    }
-}
-
-fn scratch_buffer(text: &str) -> Buffer {
-    if !text.is_empty() {
-        return Buffer::new(None, text.to_string());
-    }
-    let mut buffer = Buffer::new(None, "\n".to_string());
-    buffer.replace_range_raw(
-        TextRange::new(TextPosition::new(0, 0), TextPosition::new(1, 0)),
-        "",
-    );
-    buffer.dirty = false;
-    buffer
 }
 
 /// Normalizes terminal and clipboard line endings before prompt editing.
