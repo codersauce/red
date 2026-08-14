@@ -95,7 +95,7 @@ color = true
 # arrange them in a terminal panel with a live preview.
 # The first three positions use the theme's accent, middle, and base shades.
 [statusline]
-left = ["mode", "git_branch", "filename"]
+left = ["mode", "diagnostics", "git_branch", "filename"]
 right = ["position", "syntax"]
 
 # Nerd Font icons match nvim-web-devicons. "unicode" and "ascii" are

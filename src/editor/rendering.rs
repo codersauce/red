@@ -102,13 +102,15 @@ fn statusline_file_name(name: &str) -> &str {
 struct StatuslineSegment {
     text: String,
     style: Style,
-    icon: Option<StatuslineIcon>,
+    accents: Vec<StatuslineAccent>,
 }
 
 #[derive(Clone)]
-struct StatuslineIcon {
-    glyph: String,
+struct StatuslineAccent {
+    column: usize,
+    text: String,
     color: Color,
+    minimum_contrast: Option<f32>,
 }
 
 struct StatuslineContext {
@@ -140,16 +142,15 @@ struct StatuslineContext {
     clock: String,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn statusline_segment(
     section: StatuslineSection,
     context: &StatuslineContext,
-    style: &Style,
+    theme: &Theme,
     icon_style: PickerIconStyle,
     color_icons: bool,
 ) -> Option<StatuslineSegment> {
-    let (text, style, icon) = match section {
-        StatuslineSection::Mode => (format!(" {} ", context.mode), style.clone(), None),
+    let (text, accents) = match section {
+        StatuslineSection::Mode => (format!(" {} ", context.mode), Vec::new()),
         StatuslineSection::GitBranch => {
             let branch = context.git_branch.as_deref()?;
             let glyph = match icon_style {
@@ -158,33 +159,32 @@ fn statusline_segment(
                 PickerIconStyle::Ascii => "git",
                 PickerIconStyle::None => "",
             };
-            (statusline_icon_label(glyph, branch), style.clone(), None)
+            (statusline_icon_label(glyph, branch), Vec::new())
         }
-        StatuslineSection::Filename => (format!(" {} ", context.filename), style.clone(), None),
+        StatuslineSection::Filename => (format!(" {} ", context.filename), Vec::new()),
         StatuslineSection::Syntax => {
             let syntax = context.syntax.as_deref()?;
             let icon = IconCatalog::file(
                 context.file_path.as_deref().unwrap_or(&context.filename),
                 icon_style,
             );
-            let icon_override = (color_icons && !icon.glyph.is_empty())
+            let accents = (color_icons && !icon.glyph.is_empty())
                 .then_some(icon.color)
                 .flatten()
-                .map(|color| StatuslineIcon {
-                    glyph: icon.glyph.to_string(),
+                .map(|color| StatuslineAccent {
+                    column: 1,
+                    text: icon.glyph.to_string(),
                     color,
-                });
-            (
-                statusline_icon_label(icon.glyph, syntax),
-                style.clone(),
-                icon_override,
-            )
+                    minimum_contrast: None,
+                })
+                .into_iter()
+                .collect();
+            (statusline_icon_label(icon.glyph, syntax), accents)
         }
-        StatuslineSection::Position => (context.position.clone(), style.clone(), None),
+        StatuslineSection::Position => (context.position.clone(), Vec::new()),
         StatuslineSection::Diagnostics => {
             let (errors, warnings) = context.diagnostics?;
-            let text = statusline_diagnostics_label(errors, warnings, icon_style);
-            (format!(" {text} "), style.clone(), None)
+            statusline_diagnostics_label(errors, warnings, icon_style, color_icons, theme)?
         }
         StatuslineSection::GitChanges => {
             let changes = context.git_changes?;
@@ -197,8 +197,7 @@ fn statusline_segment(
                     statusline_section_icon(StatuslineSection::GitChanges, icon_style),
                     &text,
                 ),
-                style.clone(),
-                None,
+                Vec::new(),
             )
         }
         StatuslineSection::LspStatus => (
@@ -206,24 +205,21 @@ fn statusline_segment(
                 statusline_section_icon(StatuslineSection::LspStatus, icon_style),
                 context.lsp_status.as_deref()?,
             ),
-            style.clone(),
-            None,
+            Vec::new(),
         ),
         StatuslineSection::CurrentSymbol => (
             statusline_icon_label(
                 statusline_section_icon(StatuslineSection::CurrentSymbol, icon_style),
                 context.current_symbol.as_deref()?,
             ),
-            style.clone(),
-            None,
+            Vec::new(),
         ),
         StatuslineSection::Selection => (
             statusline_icon_label(
                 statusline_section_icon(StatuslineSection::Selection, icon_style),
                 context.selection.as_deref()?,
             ),
-            style.clone(),
-            None,
+            Vec::new(),
         ),
         StatuslineSection::Recording => {
             let label = format!("recording @{}", context.recording?);
@@ -232,8 +228,7 @@ fn statusline_segment(
                     statusline_section_icon(StatuslineSection::Recording, icon_style),
                     &label,
                 ),
-                style.clone(),
-                None,
+                Vec::new(),
             )
         }
         StatuslineSection::SearchMatches => {
@@ -244,8 +239,7 @@ fn statusline_segment(
                     statusline_section_icon(StatuslineSection::SearchMatches, icon_style),
                     &label,
                 ),
-                style.clone(),
-                None,
+                Vec::new(),
             )
         }
         StatuslineSection::Indentation => (
@@ -253,24 +247,21 @@ fn statusline_segment(
                 statusline_section_icon(StatuslineSection::Indentation, icon_style),
                 &context.indentation,
             ),
-            style.clone(),
-            None,
+            Vec::new(),
         ),
         StatuslineSection::Encoding => (
             statusline_icon_label(
                 statusline_section_icon(StatuslineSection::Encoding, icon_style),
                 context.encoding,
             ),
-            style.clone(),
-            None,
+            Vec::new(),
         ),
         StatuslineSection::LineEndings => (
             statusline_icon_label(
                 statusline_section_icon(StatuslineSection::LineEndings, icon_style),
                 context.line_endings,
             ),
-            style.clone(),
-            None,
+            Vec::new(),
         ),
         StatuslineSection::ReadOnly => {
             if !context.read_only {
@@ -281,8 +272,7 @@ fn statusline_segment(
                     statusline_section_icon(StatuslineSection::ReadOnly, icon_style),
                     "RO",
                 ),
-                style.clone(),
-                None,
+                Vec::new(),
             )
         }
         StatuslineSection::Modified => {
@@ -294,8 +284,7 @@ fn statusline_segment(
                     statusline_section_icon(StatuslineSection::Modified, icon_style),
                     "modified",
                 ),
-                style.clone(),
-                None,
+                Vec::new(),
             )
         }
         StatuslineSection::Workspace => (
@@ -303,68 +292,64 @@ fn statusline_segment(
                 statusline_section_icon(StatuslineSection::Workspace, icon_style),
                 &context.workspace,
             ),
-            style.clone(),
-            None,
+            Vec::new(),
         ),
         StatuslineSection::RelativePath => (
             statusline_icon_label(
                 statusline_section_icon(StatuslineSection::RelativePath, icon_style),
                 context.relative_path.as_deref()?,
             ),
-            style.clone(),
-            None,
+            Vec::new(),
         ),
         StatuslineSection::BufferIndex => (
             statusline_icon_label(
                 statusline_section_icon(StatuslineSection::BufferIndex, icon_style),
                 &context.buffer_index,
             ),
-            style.clone(),
-            None,
+            Vec::new(),
         ),
         StatuslineSection::WindowIndex => (
             statusline_icon_label(
                 statusline_section_icon(StatuslineSection::WindowIndex, icon_style),
                 &context.window_index,
             ),
-            style.clone(),
-            None,
+            Vec::new(),
         ),
         StatuslineSection::FileSize => (
             statusline_icon_label(
                 statusline_section_icon(StatuslineSection::FileSize, icon_style),
                 &context.file_size,
             ),
-            style.clone(),
-            None,
+            Vec::new(),
         ),
         StatuslineSection::AgentActivity => (
             statusline_icon_label(
                 statusline_section_icon(StatuslineSection::AgentActivity, icon_style),
                 context.agent_activity.as_deref()?,
             ),
-            style.clone(),
-            None,
+            Vec::new(),
         ),
         StatuslineSection::Formatter => (
             statusline_icon_label(
                 statusline_section_icon(StatuslineSection::Formatter, icon_style),
                 context.formatter?,
             ),
-            style.clone(),
-            None,
+            Vec::new(),
         ),
         StatuslineSection::Clock => (
             statusline_icon_label(
                 statusline_section_icon(StatuslineSection::Clock, icon_style),
                 &context.clock,
             ),
-            style.clone(),
-            None,
+            Vec::new(),
         ),
     };
 
-    Some(StatuslineSegment { text, style, icon })
+    Some(StatuslineSegment {
+        text,
+        style: Style::default(),
+        accents,
+    })
 }
 
 pub(crate) fn statusline_section_icon(
@@ -444,12 +429,72 @@ pub(crate) fn statusline_section_icon(
     }
 }
 
-fn statusline_diagnostics_label(errors: usize, warnings: usize, style: PickerIconStyle) -> String {
-    match style {
-        PickerIconStyle::NerdFont => format!(" {errors}   {warnings}"),
-        PickerIconStyle::Unicode => format!("● {errors}  ▲ {warnings}"),
-        PickerIconStyle::Ascii | PickerIconStyle::None => format!("E{errors} W{warnings}"),
+fn statusline_diagnostics_label(
+    errors: usize,
+    warnings: usize,
+    style: PickerIconStyle,
+    color_icons: bool,
+    theme: &Theme,
+) -> Option<(String, Vec<StatuslineAccent>)> {
+    if errors == 0 && warnings == 0 {
+        return None;
     }
+
+    let error_color = theme
+        .colors
+        .get("editorError.foreground")
+        .copied()
+        .or_else(|| theme.error_style.as_ref().and_then(|style| style.fg))
+        .unwrap_or(Color::Rgb {
+            r: 242,
+            g: 85,
+            b: 90,
+        });
+    let warning_color = theme
+        .colors
+        .get("editorWarning.foreground")
+        .copied()
+        .unwrap_or(Color::Rgb {
+            r: 213,
+            g: 164,
+            b: 88,
+        });
+    let (error_marker, warning_marker, marker_gap, count_gap) = match style {
+        PickerIconStyle::NerdFont => ("", "", "  ", " "),
+        PickerIconStyle::Unicode => ("●", "▲", "  ", " "),
+        PickerIconStyle::Ascii | PickerIconStyle::None => ("E", "W", " ", ""),
+    };
+
+    let mut text = String::from(" ");
+    let mut accents = Vec::with_capacity(2);
+    let mut has_badge = false;
+    for (marker, count, color) in [
+        (error_marker, errors, error_color),
+        (warning_marker, warnings, warning_color),
+    ] {
+        if count == 0 {
+            continue;
+        }
+        if has_badge {
+            text.push_str(marker_gap);
+        }
+        let column = display_width(&text);
+        text.push_str(marker);
+        if color_icons && style != PickerIconStyle::None {
+            accents.push(StatuslineAccent {
+                column,
+                text: marker.to_string(),
+                color,
+                minimum_contrast: Some(3.0),
+            });
+        }
+        text.push_str(count_gap);
+        text.push_str(&count.to_string());
+        has_badge = true;
+    }
+    text.push(' ');
+
+    Some((text, accents))
 }
 
 fn statusline_icon_label(glyph: &str, label: &str) -> String {
@@ -468,6 +513,24 @@ pub(crate) fn statusline_slot_style(theme: &Theme, index: usize) -> Style {
         1 => statusline_context_style(base, prominent),
         _ => base.clone(),
     }
+}
+
+fn statusline_segments(
+    sections: impl IntoIterator<Item = StatuslineSection>,
+    context: &StatuslineContext,
+    theme: &Theme,
+    icon_style: PickerIconStyle,
+    color_icons: bool,
+) -> Vec<StatuslineSegment> {
+    sections
+        .into_iter()
+        .filter_map(|section| statusline_segment(section, context, theme, icon_style, color_icons))
+        .enumerate()
+        .map(|(index, mut segment)| {
+            segment.style = statusline_slot_style(theme, index);
+            segment
+        })
+        .collect()
 }
 
 fn statusline_context_style(base: &Style, prominent: &Style) -> Style {
@@ -607,18 +670,23 @@ fn draw_statusline_segment(
     segment: &StatuslineSegment,
 ) {
     buffer.set_text(x, y, text, &segment.style);
-    let Some(icon) = &segment.icon else {
-        return;
-    };
-    let icon_x = x + 1;
-    if icon_x + display_width(&icon.glyph) > x + visible_width {
-        return;
+    for accent in &segment.accents {
+        let accent_width = display_width(&accent.text);
+        if accent.column.saturating_add(accent_width) > visible_width {
+            continue;
+        }
+        let color = match (accent.minimum_contrast, segment.style.bg) {
+            (Some(minimum_contrast), Some(background)) => {
+                ensure_minimum_contrast(accent.color, background, minimum_contrast)
+            }
+            _ => accent.color,
+        };
+        let accent_style = Style {
+            fg: Some(color),
+            ..segment.style.clone()
+        };
+        buffer.set_text(x + accent.column, y, &accent.text, &accent_style);
     }
-    let icon_style = Style {
-        fg: Some(icon.color),
-        ..segment.style.clone()
-    };
-    buffer.set_text(icon_x, y, &icon.glyph, &icon_style);
 }
 
 fn statusline_git_search_dir(file: Option<&str>) -> PathBuf {
@@ -2757,22 +2825,20 @@ impl Editor {
 
         let base_style = self.theme.statusline_style.inner_style.clone();
         let icons = self.config.statusline.icons;
-        let left = left_sections
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, section)| {
-                let style = statusline_slot_style(&self.theme, index);
-                statusline_segment(section, &context, &style, icons.style, icons.color)
-            })
-            .collect::<Vec<_>>();
-        let mut right = right_sections
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, section)| {
-                let style = statusline_slot_style(&self.theme, index);
-                statusline_segment(section, &context, &style, icons.style, icons.color)
-            })
-            .collect::<Vec<_>>();
+        let left = statusline_segments(
+            left_sections,
+            &context,
+            &self.theme,
+            icons.style,
+            icons.color,
+        );
+        let mut right = statusline_segments(
+            right_sections,
+            &context,
+            &self.theme,
+            icons.style,
+            icons.color,
+        );
         right.reverse();
 
         let left_separator = self.theme.statusline_style.outer_chars[1];
@@ -3170,6 +3236,72 @@ mod tests {
         }
     }
 
+    fn diagnostic_with_severity(message: &str, severity: DiagnosticSeverity) -> Diagnostic {
+        let mut diagnostic = diagnostic(message);
+        diagnostic.severity = Some(severity);
+        diagnostic
+    }
+
+    fn statusline_test_theme() -> Theme {
+        let mut theme = Theme::default();
+        theme.statusline_style.inner_style = Style {
+            fg: Some(Color::Rgb {
+                r: 220,
+                g: 220,
+                b: 220,
+            }),
+            bg: Some(Color::Rgb {
+                r: 20,
+                g: 30,
+                b: 40,
+            }),
+            ..Style::default()
+        };
+        theme.statusline_style.outer_style = Style {
+            fg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
+            bg: Some(Color::Rgb {
+                r: 80,
+                g: 180,
+                b: 220,
+            }),
+            ..Style::default()
+        };
+        theme.colors.insert(
+            "editorError.foreground".to_string(),
+            Color::Rgb {
+                r: 242,
+                g: 85,
+                b: 90,
+            },
+        );
+        theme.colors.insert(
+            "editorWarning.foreground".to_string(),
+            Color::Rgb {
+                r: 213,
+                g: 164,
+                b: 88,
+            },
+        );
+        theme
+    }
+
+    fn rendered_statusline(editor: &mut Editor, width: usize, height: usize) -> RenderBuffer {
+        let mut buffer = RenderBuffer::new(width, height, &Style::default());
+        editor.draw_statusline(&mut buffer);
+        buffer
+    }
+
+    fn statusline_cell<'a>(
+        buffer: &'a RenderBuffer,
+        height: usize,
+        text: &str,
+    ) -> &'a super::super::render_buffer::Cell {
+        buffer.cells[(height - 2) * buffer.width..(height - 1) * buffer.width]
+            .iter()
+            .find(|cell| cell.text == text)
+            .unwrap_or_else(|| panic!("statusline cell {text:?} was not rendered"))
+    }
+
     fn segment(start_col: usize, end_col: usize, first_segment: bool) -> LineSegment {
         LineSegment {
             line: 0,
@@ -3486,6 +3618,161 @@ mod tests {
         assert_ne!(second.bg, third.bg);
         assert_eq!(third, theme.statusline_style.inner_style);
         assert_eq!(fourth, theme.statusline_style.inner_style);
+    }
+
+    #[test]
+    fn statusline_diagnostics_hide_empty_severities_and_color_visible_markers() {
+        let theme = statusline_test_theme();
+
+        let (text, accents) =
+            statusline_diagnostics_label(1, 2, PickerIconStyle::NerdFont, true, &theme)
+                .expect("nonzero diagnostics should render");
+        assert_eq!(text, "  1   2 ");
+        assert_eq!(accents.len(), 2);
+        assert_eq!(accents[0].text, "");
+        assert_eq!(accents[1].text, "");
+
+        let (errors_only, accents) =
+            statusline_diagnostics_label(3, 0, PickerIconStyle::Unicode, true, &theme)
+                .expect("errors should render without an empty warning badge");
+        assert_eq!(errors_only, " ● 3 ");
+        assert_eq!(accents.len(), 1);
+
+        let (warnings_only, accents) =
+            statusline_diagnostics_label(0, 4, PickerIconStyle::Ascii, false, &theme)
+                .expect("warnings should render without an empty error badge");
+        assert_eq!(warnings_only, " W4 ");
+        assert!(accents.is_empty());
+
+        let (icon_free, accents) =
+            statusline_diagnostics_label(2, 1, PickerIconStyle::None, true, &theme)
+                .expect("icon-free diagnostics should retain portable labels");
+        assert_eq!(icon_free, " E2 W1 ");
+        assert!(accents.is_empty());
+
+        assert!(
+            statusline_diagnostics_label(0, 0, PickerIconStyle::NerdFont, true, &theme).is_none()
+        );
+    }
+
+    #[test]
+    fn statusline_diagnostic_accents_respect_segment_truncation() {
+        let theme = statusline_test_theme();
+        let (text, accents) =
+            statusline_diagnostics_label(1, 2, PickerIconStyle::NerdFont, true, &theme).unwrap();
+        let segment = StatuslineSegment {
+            text: text.clone(),
+            style: statusline_slot_style(&theme, 1),
+            accents,
+        };
+        let truncated = truncate_display_width(&text, 5);
+        let mut buffer = RenderBuffer::new(5, 1, &Style::default());
+
+        draw_statusline_segment(&mut buffer, 0, 0, &truncated, 5, &segment);
+
+        assert!(buffer.cells.iter().any(|cell| cell.text == ""));
+        assert!(buffer.cells.iter().all(|cell| cell.text != ""));
+    }
+
+    #[test]
+    fn hidden_left_statusline_sections_reassign_visible_slot_styles() {
+        const WIDTH: usize = 80;
+        const HEIGHT: usize = 12;
+
+        let mut config = Config::default();
+        config.statusline.left = vec![
+            StatuslineSection::Mode,
+            StatuslineSection::Diagnostics,
+            StatuslineSection::Filename,
+        ];
+        config.statusline.right.clear();
+        let theme = statusline_test_theme();
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let source = Buffer::new(Some("zeta.py".to_string()), "value = 1\n".to_string());
+        let mut editor =
+            Editor::with_size(lsp, WIDTH, HEIGHT, config, theme.clone(), vec![source]).unwrap();
+        let uri = editor.current_buffer().uri().unwrap().unwrap();
+
+        let clean = rendered_statusline(&mut editor, WIDTH, HEIGHT);
+        assert_eq!(
+            statusline_cell(&clean, HEIGHT, "z").style,
+            statusline_slot_style(&theme, 1),
+            "filename should occupy the second visible slot when diagnostics are absent"
+        );
+
+        editor.diagnostics.insert(
+            uri,
+            vec![
+                diagnostic_with_severity("error", DiagnosticSeverity::Error),
+                diagnostic_with_severity("warning", DiagnosticSeverity::Warning),
+            ],
+        );
+        let diagnosed = rendered_statusline(&mut editor, WIDTH, HEIGHT);
+        assert_eq!(
+            statusline_cell(&diagnosed, HEIGHT, "z").style,
+            statusline_slot_style(&theme, 2),
+            "filename should occupy the third visible slot when diagnostics are present"
+        );
+
+        let diagnostic_style = statusline_slot_style(&theme, 1);
+        let diagnostic_background = diagnostic_style.bg.unwrap();
+        let expected_error = ensure_minimum_contrast(
+            theme.colors["editorError.foreground"],
+            diagnostic_background,
+            3.0,
+        );
+        let expected_warning = ensure_minimum_contrast(
+            theme.colors["editorWarning.foreground"],
+            diagnostic_background,
+            3.0,
+        );
+        assert_eq!(
+            statusline_cell(&diagnosed, HEIGHT, "").style.fg,
+            Some(expected_error)
+        );
+        assert_eq!(
+            statusline_cell(&diagnosed, HEIGHT, "").style.fg,
+            Some(expected_warning)
+        );
+    }
+
+    #[test]
+    fn hidden_right_statusline_sections_reassign_visible_slot_styles() {
+        const WIDTH: usize = 80;
+        const HEIGHT: usize = 12;
+
+        let mut config = Config::default();
+        config.statusline.left.clear();
+        config.statusline.right = vec![
+            StatuslineSection::Position,
+            StatuslineSection::Diagnostics,
+            StatuslineSection::Filename,
+        ];
+        let theme = statusline_test_theme();
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let source = Buffer::new(Some("zeta.py".to_string()), "value = 1\n".to_string());
+        let mut editor =
+            Editor::with_size(lsp, WIDTH, HEIGHT, config, theme.clone(), vec![source]).unwrap();
+        let uri = editor.current_buffer().uri().unwrap().unwrap();
+
+        let clean = rendered_statusline(&mut editor, WIDTH, HEIGHT);
+        assert_eq!(
+            statusline_cell(&clean, HEIGHT, "z").style,
+            statusline_slot_style(&theme, 1)
+        );
+
+        editor.diagnostics.insert(
+            uri,
+            vec![diagnostic_with_severity(
+                "warning",
+                DiagnosticSeverity::Warning,
+            )],
+        );
+        let diagnosed = rendered_statusline(&mut editor, WIDTH, HEIGHT);
+        assert_eq!(
+            statusline_cell(&diagnosed, HEIGHT, "z").style,
+            statusline_slot_style(&theme, 2)
+        );
     }
 
     #[test]

@@ -557,13 +557,13 @@ mod tests {
         let mut panel = StatuslineLayoutPanel::new(&editor);
         let original = panel.original.clone();
         panel.focus = Bucket::Left;
-        panel.selected[Bucket::Left.index()] = 1;
+        panel.selected[Bucket::Left.index()] = 2;
 
         assert!(matches!(
             panel.handle_event(&key(KeyCode::Char('K'))),
             Some(KeyAction::Single(Action::PreviewStatuslineLayout(_)))
         ));
-        assert_eq!(panel.draft.left[0], StatuslineSection::GitBranch);
+        assert_eq!(panel.draft.left[1], StatuslineSection::GitBranch);
         assert!(matches!(
             panel.handle_event(&key(KeyCode::Char('x'))),
             Some(KeyAction::Single(Action::PreviewStatuslineLayout(_)))
