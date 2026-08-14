@@ -90,19 +90,25 @@ pub enum PickerIcon {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role: Option<String>,
     },
+    Symbol {
+        kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+    },
 }
 
 impl PickerIcon {
-    fn text(&self) -> &str {
+    fn text(&self, style: PickerIconStyle) -> &str {
         match self {
             Self::Text(text) | Self::Styled { text, .. } => text,
+            Self::Symbol { kind, .. } => IconCatalog::symbol(kind, style).glyph,
         }
     }
 
     fn role(&self) -> Option<&str> {
         match self {
             Self::Text(_) => None,
-            Self::Styled { role, .. } => role.as_deref(),
+            Self::Styled { role, .. } | Self::Symbol { role, .. } => role.as_deref(),
         }
     }
 }
@@ -1218,12 +1224,15 @@ impl Picker {
                 return IconCatalog::file(path, self.icons.style).glyph;
             }
         }
-        item.icon.as_ref().map(PickerIcon::text).unwrap_or_else(|| {
-            item.kind
-                .as_deref()
-                .map(|kind| IconCatalog::symbol(kind, self.icons.style).glyph)
-                .unwrap_or_default()
-        })
+        item.icon
+            .as_ref()
+            .map(|icon| icon.text(self.icons.style))
+            .unwrap_or_else(|| {
+                item.kind
+                    .as_deref()
+                    .map(|kind| IconCatalog::symbol(kind, self.icons.style).glyph)
+                    .unwrap_or_default()
+            })
     }
 
     fn draw_item_prefix(
@@ -2580,6 +2589,19 @@ fn unicode_picker_kind_icon(kind: &str) -> &'static str {
         "Variable" => "𝑥",
         "Buffer" => "▣",
         "Command" => "⌘",
+        "CommandAgent" => "✦",
+        "CommandBuffer" => "▣",
+        "CommandDebug" => "⚙",
+        "CommandEdit" => "✎",
+        "CommandEditor" => "⌘",
+        "CommandExtensions" => "▦",
+        "CommandFile" => "▤",
+        "CommandGit" => "⑂",
+        "CommandLsp" => "λ",
+        "CommandPanel" => "▥",
+        "CommandSearch" => "⌕",
+        "CommandView" => "◉",
+        "CommandWindow" => "□",
         "Theme" => "◐",
         "Match" | "Search" => "⌕",
         "CodeAction" | "Action" => "◇",
@@ -2633,6 +2655,19 @@ fn nerd_font_picker_kind_icon(kind: &str) -> &'static str {
         "Variable" => "󰀫",
         "Buffer" => "󰓩",
         "Command" => "",
+        "CommandAgent" => "󰚩",
+        "CommandBuffer" => "󰓩",
+        "CommandDebug" => "",
+        "CommandEdit" => "",
+        "CommandEditor" => "",
+        "CommandExtensions" => "",
+        "CommandFile" => "",
+        "CommandGit" => "",
+        "CommandLsp" => "",
+        "CommandPanel" => "",
+        "CommandSearch" => "",
+        "CommandView" => "",
+        "CommandWindow" => "",
         "Theme" => "",
         "Match" | "Search" => "",
         "CodeAction" | "Action" => "",
@@ -2661,6 +2696,19 @@ fn ascii_picker_kind_icon(kind: &str) -> &'static str {
         "Folder" => "D",
         "Buffer" => "B",
         "Command" => ">",
+        "CommandAgent" => "A",
+        "CommandBuffer" => "B",
+        "CommandDebug" => "D",
+        "CommandEdit" => "E",
+        "CommandEditor" => ":",
+        "CommandExtensions" => "X",
+        "CommandFile" => "F",
+        "CommandGit" => "G",
+        "CommandLsp" => "L",
+        "CommandPanel" => "P",
+        "CommandSearch" => "/",
+        "CommandView" => "V",
+        "CommandWindow" => "W",
         "Theme" => "T",
         "Match" | "Search" => "/",
         "Reference" => "->",
@@ -3566,6 +3614,7 @@ mod tests {
 
     use super::{
         picker_file_icon, picker_file_icon_color, picker_kind_icon, PickerFilterHighlights,
+        PICKER_ICON_WIDTH,
     };
     use crate::{
         buffer::Buffer,
@@ -4696,6 +4745,90 @@ mod tests {
         assert_eq!(picker_kind_icon("Hint", PickerIconStyle::NerdFont), "");
         assert_eq!(picker_kind_icon("Diagnostic", PickerIconStyle::Ascii), "d");
         assert_eq!(picker_kind_icon("Error", PickerIconStyle::None), "");
+    }
+
+    #[test]
+    fn command_area_kinds_have_icons_in_every_visible_icon_style() {
+        for (kind, nerd_font, unicode, ascii) in [
+            ("CommandAgent", "󰚩", "✦", "A"),
+            ("CommandBuffer", "󰓩", "▣", "B"),
+            ("CommandDebug", "", "⚙", "D"),
+            ("CommandEdit", "", "✎", "E"),
+            ("CommandEditor", "", "⌘", ":"),
+            ("CommandExtensions", "", "▦", "X"),
+            ("CommandFile", "", "▤", "F"),
+            ("CommandGit", "", "⑂", "G"),
+            ("CommandLsp", "", "λ", "L"),
+            ("CommandPanel", "", "▥", "P"),
+            ("CommandSearch", "", "⌕", "/"),
+            ("CommandView", "", "◉", "V"),
+            ("CommandWindow", "", "□", "W"),
+        ] {
+            for (style, expected) in [
+                (PickerIconStyle::NerdFont, nerd_font),
+                (PickerIconStyle::Unicode, unicode),
+                (PickerIconStyle::Ascii, ascii),
+            ] {
+                let actual = picker_kind_icon(kind, style);
+                assert_eq!(actual, expected, "{kind} in {style:?}");
+                assert!(display_width(actual) <= PICKER_ICON_WIDTH);
+            }
+            assert_eq!(picker_kind_icon(kind, PickerIconStyle::None), "");
+        }
+    }
+
+    #[test]
+    fn semantic_picker_icon_round_trips_through_json() {
+        let icon = PickerIcon::Symbol {
+            kind: "CommandGit".to_string(),
+            role: Some("Command".to_string()),
+        };
+        let encoded = serde_json::to_value(&icon).unwrap();
+
+        assert_eq!(
+            encoded,
+            json!({
+                "kind": "CommandGit",
+                "role": "Command",
+            })
+        );
+        assert_eq!(serde_json::from_value::<PickerIcon>(encoded).unwrap(), icon);
+    }
+
+    #[test]
+    fn semantic_picker_icon_follows_the_configured_icon_style() {
+        for (style, expected) in [
+            (PickerIconStyle::NerdFont, ""),
+            (PickerIconStyle::Unicode, "⑂"),
+            (PickerIconStyle::Ascii, "G"),
+        ] {
+            let mut config = Config::default();
+            config.picker.icons.style = style;
+            let editor = test_editor_with_config_and_size(config, Theme::default(), 80, 24);
+            let mut item = dynamic_item("git", "Open Git dashboard");
+            item.kind = Some("Command".to_string());
+            item.icon = Some(PickerIcon::Symbol {
+                kind: "CommandGit".to_string(),
+                role: Some("Command".to_string()),
+            });
+            let picker = Picker::new_dynamic(
+                Some("Commands".to_string()),
+                &editor,
+                vec![item],
+                18,
+                PickerOptions::default(),
+            );
+            let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+
+            picker.draw(&mut buffer).unwrap();
+
+            let row = render_row(&buffer, picker.y + 1);
+            assert!(row.contains(expected), "{style:?}: {row:?}");
+            assert!(row.contains("Open Git dashboard"), "{style:?}: {row:?}");
+            assert!(picker
+                .prompt_status()
+                .is_some_and(|status| status.contains("1/1 commands")));
+        }
     }
 
     #[test]
