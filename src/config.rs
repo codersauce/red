@@ -401,6 +401,7 @@ impl Default for StatuslineConfig {
 fn default_statusline_left() -> Vec<StatuslineSection> {
     vec![
         StatuslineSection::Mode,
+        StatuslineSection::Diagnostics,
         StatuslineSection::GitBranch,
         StatuslineSection::Filename,
     ]
@@ -3257,6 +3258,7 @@ input_position = "top"
             config.statusline.left,
             [
                 StatuslineSection::Mode,
+                StatuslineSection::Diagnostics,
                 StatuslineSection::GitBranch,
                 StatuslineSection::Filename,
             ]
