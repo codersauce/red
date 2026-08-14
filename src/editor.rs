@@ -2021,6 +2021,8 @@ pub enum Action {
     RefreshDiagnostics,
     Refresh,
     ShowLineDiagnostics,
+    NextDiagnostic,
+    PreviousDiagnostic,
     Hover,
     ExecuteLspCommand(Box<LspCommand>),
     FormatDocument,
@@ -5881,6 +5883,8 @@ impl Editor {
                 | Action::RefreshDiagnostics
                 | Action::Refresh
                 | Action::ShowLineDiagnostics
+                | Action::NextDiagnostic
+                | Action::PreviousDiagnostic
                 | Action::Hover
                 | Action::FormatDocument
                 | Action::CodeAction
@@ -9887,6 +9891,46 @@ impl Editor {
             .cloned()
             .collect::<Vec<_>>();
         (!diagnostics.is_empty()).then_some(diagnostics)
+    }
+
+    fn diagnostic_navigation_target(&self, forward: bool) -> Option<TextPosition> {
+        let uri = self.current_buffer().uri().ok().flatten()?;
+        let cursor = self.cursor_lsp_position();
+        let cursor = (cursor.line, cursor.character);
+        let positions = self
+            .diagnostics
+            .get(&uri)?
+            .iter()
+            .map(|diagnostic| {
+                (
+                    diagnostic.range.start.line,
+                    diagnostic.range.start.character,
+                )
+            })
+            .filter(|(line, _)| self.current_buffer().get(*line).is_some())
+            .collect::<Vec<_>>();
+
+        let target = if forward {
+            positions
+                .iter()
+                .copied()
+                .filter(|position| *position > cursor)
+                .min()
+                .or_else(|| positions.iter().copied().min())
+        } else {
+            positions
+                .iter()
+                .copied()
+                .filter(|position| *position < cursor)
+                .max()
+                .or_else(|| positions.iter().copied().max())
+        }?;
+        let line = self.current_buffer().get(target.0)?;
+        let line = line.trim_end_matches(['\r', '\n']);
+        Some(TextPosition::new(
+            target.0,
+            utf16_to_grapheme(line, target.1),
+        ))
     }
 
     fn process_progress(&mut self, progress_params: &ProgressParams) -> Option<Action> {
@@ -16652,6 +16696,18 @@ impl Editor {
                     self.render(buffer)?;
                 }
             }
+            Action::NextDiagnostic | Action::PreviousDiagnostic => {
+                let forward = matches!(action, Action::NextDiagnostic);
+                if let Some(target) = self.diagnostic_navigation_target(forward) {
+                    self.execute_with_tracking(
+                        &Action::MoveTo(target.character, target.line + 1),
+                        buffer,
+                        runtime,
+                        false,
+                    )
+                    .await?;
+                }
+            }
             Action::ExecuteLspCommand(command) => {
                 self.execute_lsp_command(command, None).await?;
             }
@@ -18403,6 +18459,8 @@ impl Editor {
                 | Action::MatchitBackward
                 | Action::MatchitPreviousUnmatched
                 | Action::MatchitNextUnmatched
+                | Action::NextDiagnostic
+                | Action::PreviousDiagnostic
                 | Action::MoveTo(_, _)
                 | Action::MoveToFilePos(_, _, _)
                 | Action::JumpToMark { .. }
@@ -30847,6 +30905,99 @@ builtin = "rust"
 
         assert!(editor.current_dialog.is_none());
         assert_eq!(editor.current_buffer().contents(), original);
+    }
+
+    #[tokio::test]
+    async fn diagnostic_navigation_orders_utf16_positions_and_wraps() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("main.rs");
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(file.to_string_lossy().into_owned()),
+            "zero\n😀 alpha beta\ntwo\nthree".to_string(),
+        )]);
+        let uri = crate::lsp::file_uri(&file).unwrap();
+        editor.add_diagnostics(
+            Some(&uri),
+            &[
+                line_diagnostic((3, 0), (3, 1), DiagnosticSeverity::Hint, "last", None),
+                line_diagnostic(
+                    (1, 8),
+                    (1, 9),
+                    DiagnosticSeverity::Warning,
+                    "same line later",
+                    None,
+                ),
+                line_diagnostic(
+                    (99, 0),
+                    (99, 1),
+                    DiagnosticSeverity::Error,
+                    "outside the buffer",
+                    None,
+                ),
+                line_diagnostic((0, 0), (0, 1), DiagnosticSeverity::Error, "first", None),
+                line_diagnostic(
+                    (1, 2),
+                    (1, 3),
+                    DiagnosticSeverity::Information,
+                    "after emoji",
+                    None,
+                ),
+            ],
+        );
+        let mut buffer = RenderBuffer::new(60, 12, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .execute(&Action::NextDiagnostic, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!((editor.cx, editor.buffer_line()), (1, 1));
+
+        editor
+            .execute(&Action::NextDiagnostic, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!((editor.cx, editor.buffer_line()), (7, 1));
+
+        editor
+            .execute(&Action::NextDiagnostic, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!((editor.cx, editor.buffer_line()), (0, 3));
+
+        editor
+            .execute(&Action::NextDiagnostic, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!((editor.cx, editor.buffer_line()), (0, 0));
+
+        editor
+            .execute(&Action::PreviousDiagnostic, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!((editor.cx, editor.buffer_line()), (0, 3));
+    }
+
+    #[tokio::test]
+    async fn diagnostic_navigation_is_a_safe_noop_without_diagnostics() {
+        let mut editor =
+            lsp_test_editor(vec![Buffer::new(None, "first\nsecond\nthird".to_string())]);
+        editor.cy = 1;
+        editor.cx = 2;
+        let mut buffer = RenderBuffer::new(60, 12, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .execute(&Action::NextDiagnostic, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        editor
+            .execute(&Action::PreviousDiagnostic, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert_eq!((editor.cx, editor.buffer_line()), (2, 1));
+        assert!(editor.last_error.is_none());
     }
 
     fn diagnostic_at(

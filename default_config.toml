@@ -323,10 +323,12 @@ Esc = { EnterMode = "Normal" }
 
 [keys.normal."["]
 "%" = "MatchitPreviousUnmatched"
+"d" = "PreviousDiagnostic"
 "h" = { PluginCommand = "GitHunkPrevious" }
 
 [keys.normal."]"]
 "%" = "MatchitNextUnmatched"
+"d" = "NextDiagnostic"
 "h" = { PluginCommand = "GitHunkNext" }
 
 [keys.normal."Ctrl-w"]

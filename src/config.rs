@@ -3237,6 +3237,27 @@ env = { NO_BROWSER = "1" }
     }
 
     #[test]
+    fn default_config_maps_diagnostic_navigation() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+
+        let Some(KeyAction::Nested(previous)) = config.keys.normal.get("[") else {
+            panic!("expected [ prefix");
+        };
+        assert_eq!(
+            previous.get("d"),
+            Some(&KeyAction::Single(Action::PreviousDiagnostic))
+        );
+
+        let Some(KeyAction::Nested(next)) = config.keys.normal.get("]") else {
+            panic!("expected ] prefix");
+        };
+        assert_eq!(
+            next.get("d"),
+            Some(&KeyAction::Single(Action::NextDiagnostic))
+        );
+    }
+
+    #[test]
     fn default_config_maps_neovim_style_search_keys() {
         let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
 

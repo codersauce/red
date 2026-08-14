@@ -807,6 +807,24 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Action::ShowLineDiagnostics,
         ),
         builtin(
+            "lsp.next_diagnostic",
+            "Go to next diagnostic",
+            "LSP",
+            "Move to the next diagnostic in the current buffer",
+            None,
+            &["next error", "next warning"],
+            Action::NextDiagnostic,
+        ),
+        builtin(
+            "lsp.previous_diagnostic",
+            "Go to previous diagnostic",
+            "LSP",
+            "Move to the previous diagnostic in the current buffer",
+            None,
+            &["previous error", "previous warning"],
+            Action::PreviousDiagnostic,
+        ),
+        builtin(
             "lsp.format",
             "Format document",
             "LSP",
@@ -1055,6 +1073,8 @@ fn action_label(action: &Action) -> String {
         Action::StartRename => "Rename symbol".to_string(),
         Action::Hover => "Show hover documentation".to_string(),
         Action::ShowLineDiagnostics => "Show line diagnostics".to_string(),
+        Action::NextDiagnostic => "Go to next diagnostic".to_string(),
+        Action::PreviousDiagnostic => "Go to previous diagnostic".to_string(),
         Action::SignatureHelp => "Show signature help".to_string(),
         Action::ClearSearchHighlight => "Clear search highlights".to_string(),
         Action::ToggleWrap => "Toggle line wrapping".to_string(),
@@ -1527,6 +1547,24 @@ mod tests {
 
         assert_eq!(diagnostics.action, Action::ShowLineDiagnostics);
         assert_eq!(diagnostics.shortcuts, vec!["D"]);
+    }
+
+    #[test]
+    fn diagnostic_navigation_commands_expose_default_shortcuts() {
+        let commands = entries(&default_keys(), &[]);
+        let next = commands
+            .iter()
+            .find(|entry| entry.id == "lsp.next_diagnostic")
+            .expect("next diagnostic command");
+        let previous = commands
+            .iter()
+            .find(|entry| entry.id == "lsp.previous_diagnostic")
+            .expect("previous diagnostic command");
+
+        assert_eq!(next.action, Action::NextDiagnostic);
+        assert_eq!(next.shortcuts, vec!["] d"]);
+        assert_eq!(previous.action, Action::PreviousDiagnostic);
+        assert_eq!(previous.shortcuts, vec!["[ d"]);
     }
 
     #[test]
