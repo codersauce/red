@@ -3539,6 +3539,10 @@ input_position = "left"
             config.keys.visual.get(">"),
             Some(&KeyAction::Single(Action::IndentSelection(1)))
         );
+        assert_eq!(
+            config.keys.visual.get("<"),
+            Some(&KeyAction::Single(Action::UnindentSelection(1)))
+        );
     }
 
     #[test]

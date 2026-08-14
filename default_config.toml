@@ -402,6 +402,7 @@ Esc = { EnterMode = "Normal" }
 "P" = [ "PasteBefore", { EnterMode = "Normal" } ]
 "I" = "InsertBlock"
 ">" = { IndentSelection = 1 }
+"<" = { UnindentSelection = 1 }
 "J" = [ { JoinLines = 2 }, { EnterMode = "Normal" } ]
 "g" = { "c" = [ "ToggleCommentSelection", { EnterMode = "Normal" } ], "J" = [ { JoinLinesKeepSpaces = 2 }, { EnterMode = "Normal" } ], "v" = "RestoreLastVisualSelection" }
 "u" = [ { TransformSelection = "Lower" }, { EnterMode = "Normal" } ]

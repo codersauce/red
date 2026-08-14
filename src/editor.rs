@@ -2033,6 +2033,7 @@ pub enum Action {
     IndentLine,
     IndentSelection(u16),
     UnindentLine,
+    UnindentSelection(u16),
 
     GoToLine(usize),
     GoToDefinition,
@@ -14664,6 +14665,44 @@ impl Editor {
         self.commit_transaction(self.cursor_snapshot())
     }
 
+    fn unindent_selection(&mut self, count: u16) -> bool {
+        let Some(selection) = self.selection else {
+            return false;
+        };
+        let first_line = selection.y0.min(selection.y1);
+        let last_line = selection.y0.max(selection.y1);
+        let indentation = self.indentation();
+        let columns = indentation
+            .shift_width
+            .saturating_mul(usize::from(count.max(1)));
+
+        self.begin_transaction("unindent selection");
+        for line in first_line..=last_line {
+            let Some(contents) = self.current_buffer().get(line) else {
+                continue;
+            };
+            let old_indentation = Self::leading_indentation_text(&contents).to_string();
+            if old_indentation.is_empty() {
+                continue;
+            }
+            let old_columns =
+                display_width_with_tabs(&old_indentation, indentation.tab_width.max(1));
+            let new_indentation =
+                indentation.whitespace_for_columns(old_columns.saturating_sub(columns));
+            self.replace_range(
+                TextRange::new(
+                    TextPosition::new(line, 0),
+                    TextPosition::new(line, old_indentation.chars().count()),
+                ),
+                &new_indentation,
+            );
+        }
+        self.move_to_text_position(TextPosition::new(first_line, 0));
+        self.selection = None;
+        self.selection_start = None;
+        self.commit_transaction(self.cursor_snapshot())
+    }
+
     /// Executes a single editor action
     ///
     /// This is the core action dispatcher that:
@@ -18046,6 +18085,15 @@ impl Editor {
                 self.notify_change(runtime).await?;
                 self.render(buffer)?;
             }
+            Action::UnindentSelection(count) => {
+                self.capture_last_visual_selection();
+                let changed = self.unindent_selection(*count);
+                if changed {
+                    self.notify_change(runtime).await?;
+                }
+                self.execute(&Action::EnterMode(Mode::Normal), buffer, runtime)
+                    .await?;
+            }
             Action::JumpBack => {
                 add_to_history = false;
                 if let Some(entry) = self.jump_back_entry() {
@@ -20249,6 +20297,9 @@ impl Editor {
                     }
                     KeyAction::Single(Action::IndentSelection(_)) => {
                         KeyAction::Single(Action::IndentSelection(count))
+                    }
+                    KeyAction::Single(Action::UnindentSelection(_)) => {
+                        KeyAction::Single(Action::UnindentSelection(count))
                     }
                     KeyAction::Single(Action::StartUppercaseOperator(_)) => {
                         KeyAction::Single(Action::StartUppercaseOperator(count))

@@ -4663,6 +4663,43 @@ async fn visual_indent_supports_character_block_and_counted_selections() {
 }
 
 #[tokio::test]
+async fn visual_unindent_shifts_all_selected_lines_as_one_change() {
+    let buffer = Buffer::new(None, "    one\n\n      two\n       ".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "Vjjj<").await;
+
+    harness.assert_mode(Mode::Normal);
+    harness.assert_buffer_contents("one\n\n  two\n   ");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("    one\n\n      two\n       ");
+}
+
+#[tokio::test]
+async fn visual_unindent_supports_character_block_and_counted_selections() {
+    for mode in [Mode::Visual, Mode::VisualBlock] {
+        let buffer = Buffer::new(None, "    one\n    two".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness
+            .execute_action(Action::EnterMode(mode))
+            .await
+            .unwrap();
+        harness.execute_action(Action::MoveDown).await.unwrap();
+        type_normal_keys(&mut harness, "<").await;
+
+        harness.assert_mode(Mode::Normal);
+        harness.assert_buffer_contents("one\ntwo");
+    }
+
+    let buffer = Buffer::new(None, "        one\n    two".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "Vj2<").await;
+    harness.assert_buffer_contents("one\ntwo");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("        one\n    two");
+}
+
+#[tokio::test]
 async fn gv_reselects_lines_after_visual_indent() {
     let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
     let mut harness = EditorHarness::with_config(buffer, default_key_config());
@@ -4675,6 +4712,21 @@ async fn gv_reselects_lines_after_visual_indent() {
         Some((0, 1))
     );
     harness.assert_buffer_contents("    one\n    two\nthree");
+}
+
+#[tokio::test]
+async fn gv_reselects_lines_after_visual_unindent() {
+    let buffer = Buffer::new(None, "    one\n    two\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "Vj<gv").await;
+
+    harness.assert_mode(Mode::VisualLine);
+    assert_eq!(
+        harness.selection().map(|(_, y0, _, y1)| (y0, y1)),
+        Some((0, 1))
+    );
+    harness.assert_buffer_contents("one\ntwo\nthree");
 }
 
 #[tokio::test]
