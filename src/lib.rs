@@ -27,6 +27,7 @@ pub mod command_palette;
 mod comment;
 pub mod config;
 pub mod dispatcher;
+pub mod editing;
 pub mod editor;
 pub mod headless;
 pub mod highlighter;

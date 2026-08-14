@@ -3355,6 +3355,38 @@ const COMPOSER_NORMAL_HINTS: &[TextPanelShortcutHint] = &[
         keys: "j/k ↑/↓",
         action: "scroll",
     },
+    TextPanelShortcutHint {
+        keys: "v",
+        action: "select",
+    },
+    TextPanelShortcutHint {
+        keys: "u",
+        action: "undo",
+    },
+];
+const COMPOSER_VISUAL_HINTS: &[TextPanelShortcutHint] = &[
+    TextPanelShortcutHint {
+        keys: "d/c",
+        action: "edit",
+    },
+    TextPanelShortcutHint {
+        keys: "y",
+        action: "yank",
+    },
+    TextPanelShortcutHint {
+        keys: "Esc",
+        action: "normal",
+    },
+];
+const COMPOSER_SEARCH_HINTS: &[TextPanelShortcutHint] = &[
+    TextPanelShortcutHint {
+        keys: "Enter",
+        action: "find",
+    },
+    TextPanelShortcutHint {
+        keys: "Esc",
+        action: "cancel",
+    },
 ];
 const COMPOSER_INSERT_HINTS: &[TextPanelShortcutHint] = &[
     TextPanelShortcutHint {
@@ -3431,12 +3463,17 @@ fn text_panel_composer_hints(
             }
         };
     }
-    if composer.focused && composer.prompt.mode() == crate::editor::Mode::Normal {
-        ("NORMAL", COMPOSER_NORMAL_HINTS)
-    } else if composer.focused {
-        ("INSERT", COMPOSER_INSERT_HINTS)
-    } else {
-        ("NAV", PANEL_NAVIGATION_HINTS)
+    match (composer.focused, composer.prompt.mode()) {
+        (true, crate::editor::Mode::Normal) => ("NORMAL", COMPOSER_NORMAL_HINTS),
+        (
+            true,
+            crate::editor::Mode::Visual
+            | crate::editor::Mode::VisualLine
+            | crate::editor::Mode::VisualBlock,
+        ) => ("VISUAL", COMPOSER_VISUAL_HINTS),
+        (true, crate::editor::Mode::Search) => ("SEARCH", COMPOSER_SEARCH_HINTS),
+        (true, _) => ("INSERT", COMPOSER_INSERT_HINTS),
+        (false, _) => ("NAV", PANEL_NAVIGATION_HINTS),
     }
 }
 
@@ -4430,6 +4467,65 @@ mod tests {
         assert_eq!(buffer.cells[right].style.fg, Some(accent));
         assert!(buffer.cells[left].style.bold);
         assert!(buffer.cells[right].style.bold);
+    }
+
+    #[test]
+    fn text_panel_composer_reuses_modal_operators_objects_and_visual_undo() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "modal".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 36,
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Edit".to_string(),
+                    rows: 3,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        assert!(manager.focus_text_panel_composer("modal"));
+        manager
+            .handle_focused_text_input(&Event::Paste("first (second word) tail".to_string()), 80);
+        manager.handle_focused_text_input(
+            &Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )),
+            80,
+        );
+
+        for character in "0f(ci(".chars() {
+            let event = manager
+                .handle_focused_text_input(
+                    &Event::Key(crossterm::event::KeyEvent::new(
+                        KeyCode::Char(character),
+                        KeyModifiers::NONE,
+                    )),
+                    80,
+                )
+                .expect("modal key is consumed by composer");
+            assert_eq!(event.action, "composer_input");
+        }
+        let composer = manager.text_panels["modal"].composer.as_ref().unwrap();
+        assert_eq!(composer.prompt.text(), "first () tail");
+        assert_eq!(composer.prompt.mode(), crate::editor::Mode::Insert);
+
+        for code in [KeyCode::Esc, KeyCode::Char('u')] {
+            manager.handle_focused_text_input(
+                &Event::Key(crossterm::event::KeyEvent::new(code, KeyModifiers::NONE)),
+                80,
+            );
+        }
+        assert_eq!(
+            manager.text_panels["modal"]
+                .composer
+                .as_ref()
+                .unwrap()
+                .prompt
+                .text(),
+            "first (second word) tail"
+        );
     }
 
     #[test]
