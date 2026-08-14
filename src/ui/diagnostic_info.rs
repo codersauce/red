@@ -440,6 +440,7 @@ mod tests {
             },
             severity: Some(severity),
             code,
+            source: None,
             message: message.to_string(),
             related_information: None,
             data: None,
