@@ -348,6 +348,7 @@ Esc = { EnterMode = "Normal" }
 "c" = "CloseWindow"
 "q" = "CloseWindow"
 "Ctrl-w" = "NextWindow"
+"r" = "EnterPaneResizeMode"
 "+" = { ResizeWindowDown = 1 }
 "-" = { ResizeWindowUp = 1 }
 "<" = { ResizeWindowLeft = 1 }

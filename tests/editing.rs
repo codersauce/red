@@ -398,6 +398,13 @@ async fn execute_window_chord(harness: &mut EditorHarness, key: char) {
         .unwrap();
 }
 
+async fn execute_unmodified_key(harness: &mut EditorHarness, key: KeyCode) {
+    harness
+        .execute_event(Event::Key(KeyEvent::new(key, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+}
+
 async fn drag_window_divider(harness: &mut EditorHarness, start: (u16, u16), end: (u16, u16)) {
     for (kind, (column, row)) in [
         (MouseEventKind::Down(MouseButton::Left), start),
@@ -6000,6 +6007,131 @@ async fn focused_horizontal_panels_resize_with_vim_height_chords() {
             "width commands must not resize a horizontal pane or the hidden editor window",
         );
     }
+}
+
+#[tokio::test]
+async fn pane_resize_mode_resizes_editor_splits_with_hjkl_and_arrows() {
+    for (split_action, grow_keys, shrink_keys, vertical) in [
+        (
+            Action::SplitVertical,
+            [KeyCode::Char('l'), KeyCode::Right],
+            [KeyCode::Char('h'), KeyCode::Left],
+            true,
+        ),
+        (
+            Action::SplitHorizontal,
+            [KeyCode::Char('j'), KeyCode::Down],
+            [KeyCode::Char('k'), KeyCode::Up],
+            false,
+        ),
+    ] {
+        let buffer = Buffer::new(None, "first\nsecond\nthird\n".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness.execute_action(split_action).await.unwrap();
+        let (_, initial_size) = harness.editor.test_active_window_bounds().unwrap();
+        let initial_dimension = if vertical {
+            initial_size.0
+        } else {
+            initial_size.1
+        };
+
+        execute_window_chord(&mut harness, 'r').await;
+        assert!(harness.statusline_row().contains("RESIZE"));
+
+        for key in grow_keys {
+            execute_unmodified_key(&mut harness, key).await;
+        }
+        let (_, grown_size) = harness.editor.test_active_window_bounds().unwrap();
+        let grown_dimension = if vertical { grown_size.0 } else { grown_size.1 };
+        assert_eq!(grown_dimension, initial_dimension + 2);
+
+        for key in shrink_keys {
+            execute_unmodified_key(&mut harness, key).await;
+        }
+        assert_eq!(
+            harness.editor.test_active_window_bounds().unwrap().1,
+            initial_size
+        );
+
+        execute_unmodified_key(&mut harness, KeyCode::Enter).await;
+        let statusline = harness.statusline_row();
+        assert!(!statusline.contains("RESIZE"), "{statusline:?}");
+        assert!(statusline.contains("NORMAL"), "{statusline:?}");
+    }
+}
+
+#[tokio::test]
+async fn focused_agent_composer_can_enter_and_exit_pane_resize_mode() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 20,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+            ..PanelConfig::default()
+        },
+    );
+    assert!(harness.editor.test_focus_text_panel_composer("agent"));
+
+    execute_window_chord(&mut harness, 'r').await;
+    assert!(harness.statusline_row().contains("RESIZE"));
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("agent"));
+
+    for key in [KeyCode::Char('l'), KeyCode::Right] {
+        execute_unmodified_key(&mut harness, key).await;
+    }
+    assert_eq!(
+        harness.editor.test_panel_layout("agent"),
+        Some((PanelSide::Right, 22))
+    );
+
+    for key in [KeyCode::Char('j'), KeyCode::Down, KeyCode::Char('x')] {
+        execute_unmodified_key(&mut harness, key).await;
+    }
+    assert_eq!(
+        harness.editor.test_panel_layout("agent"),
+        Some((PanelSide::Right, 22)),
+        "orthogonal and unsupported keys should leave the pane unchanged",
+    );
+    assert!(harness.statusline_row().contains("RESIZE"));
+
+    for key in [KeyCode::Char('h'), KeyCode::Left] {
+        execute_unmodified_key(&mut harness, key).await;
+    }
+    assert_eq!(
+        harness.editor.test_panel_layout("agent"),
+        Some((PanelSide::Right, 20))
+    );
+
+    execute_unmodified_key(&mut harness, KeyCode::Esc).await;
+    assert!(!harness.statusline_row().contains("RESIZE"));
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("agent"));
+
+    execute_unmodified_key(&mut harness, KeyCode::Char('l')).await;
+    assert_eq!(
+        harness.editor.test_panel_layout("agent"),
+        Some((PanelSide::Right, 20)),
+        "keys should return to the focused composer after leaving resize mode",
+    );
+}
+
+#[tokio::test]
+async fn pane_resize_mode_cancels_when_terminal_focus_is_lost() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+
+    execute_window_chord(&mut harness, 'r').await;
+    assert!(harness.statusline_row().contains("RESIZE"));
+
+    harness.execute_event(Event::FocusLost).await.unwrap();
+    assert!(!harness.statusline_row().contains("RESIZE"));
 }
 
 #[tokio::test]

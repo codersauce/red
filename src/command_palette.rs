@@ -744,6 +744,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Action::MoveWindowToRight,
         ),
         builtin(
+            "window.resize_mode",
+            "Resize pane",
+            "Window",
+            "Resize the focused pane with h, j, k, l, or the arrow keys",
+            None,
+            &["resize mode"],
+            Action::EnterPaneResizeMode,
+        ),
+        builtin(
             "window.balance",
             "Balance windows",
             "Window",
@@ -1074,6 +1083,8 @@ fn action_label(action: &Action) -> String {
         Action::MoveWindowToBottom => "Move window to bottom edge".to_string(),
         Action::MoveWindowToTop => "Move window to top edge".to_string(),
         Action::MoveWindowToRight => "Move window to right edge".to_string(),
+        Action::EnterPaneResizeMode => "Resize pane".to_string(),
+        Action::ExitPaneResizeMode => "Exit pane resize mode".to_string(),
         Action::ViewLogs => "View logs".to_string(),
         Action::ListPlugins => "Language packs".to_string(),
         Action::DumpBuffer => "Dump buffer".to_string(),
@@ -1228,6 +1239,17 @@ mod tests {
         assert_eq!(whats_new.colon.as_deref(), Some(":whats-new"));
         assert!(whats_new.aliases.iter().any(|alias| alias == ":changelog"));
         assert_eq!(whats_new.action, Action::OpenWhatsNew);
+
+        let resize = entries
+            .iter()
+            .find(|entry| entry.id == "window.resize_mode")
+            .unwrap();
+        assert_eq!(resize.title, "Resize pane");
+        assert_eq!(resize.action, Action::EnterPaneResizeMode);
+        assert!(resize
+            .shortcuts
+            .iter()
+            .any(|shortcut| shortcut == "Ctrl-w r"));
     }
 
     #[test]
@@ -1576,6 +1598,9 @@ mod tests {
                 .iter()
                 .any(|hint| hint.key == key && hint.label == label && !hint.is_group));
         }
+        assert!(hints
+            .iter()
+            .any(|hint| hint.key == "r" && hint.label == "Resize pane" && !hint.is_group));
     }
 
     #[test]

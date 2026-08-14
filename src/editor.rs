@@ -2154,6 +2154,8 @@ pub enum Action {
     MoveWindowToBottom,
     MoveWindowToTop,
     MoveWindowToRight,
+    EnterPaneResizeMode,
+    ExitPaneResizeMode,
     ResizeWindowUp(usize),
     ResizeWindowDown(usize),
     ResizeWindowLeft(usize),
@@ -2608,6 +2610,9 @@ pub struct Editor {
 
     /// Current editor mode (normal, insert, visual, etc)
     mode: Mode,
+
+    /// Whether directional keys temporarily resize the focused pane.
+    pane_resize_mode: bool,
 
     /// Cursor position where the current insert session began.
     insert_entry_cursor: Option<CursorSnapshot>,
@@ -3939,6 +3944,7 @@ impl Editor {
             prev_highlight_y: None,
             vx,
             mode: Mode::Normal,
+            pane_resize_mode: false,
             insert_entry_cursor: None,
             generated_indent: None,
             waiting_command: None,
@@ -10923,6 +10929,10 @@ impl Editor {
 
         self.clear_keymap_hints();
 
+        if self.pane_resize_mode {
+            return Ok(self.handle_pane_resize_event(ev));
+        }
+
         if let Some(current_dialog) = &mut self.current_dialog {
             let action = current_dialog.handle_event(ev);
             let allows_passthrough = current_dialog.allows_event_passthrough();
@@ -11071,6 +11081,27 @@ impl Editor {
         })
     }
 
+    /// Routes one-cell pane resizing ahead of editor and focused-panel input.
+    fn handle_pane_resize_event(&self, ev: &event::Event) -> Option<KeyAction> {
+        let Event::Key(key) = ev else {
+            return matches!(ev, Event::Mouse(_))
+                .then_some(KeyAction::Single(Action::ExitPaneResizeMode));
+        };
+        if !key.modifiers.is_empty() {
+            return None;
+        }
+
+        let action = match key.code {
+            KeyCode::Char('h') | KeyCode::Left => Action::ResizeWindowLeft(1),
+            KeyCode::Char('j') | KeyCode::Down => Action::ResizeWindowDown(1),
+            KeyCode::Char('k') | KeyCode::Up => Action::ResizeWindowUp(1),
+            KeyCode::Char('l') | KeyCode::Right => Action::ResizeWindowRight(1),
+            KeyCode::Esc | KeyCode::Enter => Action::ExitPaneResizeMode,
+            _ => return None,
+        };
+        Some(KeyAction::Single(action))
+    }
+
     fn handle_focus_event(
         &mut self,
         ev: &event::Event,
@@ -11079,11 +11110,12 @@ impl Editor {
         match ev {
             Event::FocusLost => {
                 let divider_was_active = self.divider_drag.take().is_some();
+                let resize_mode_was_active = std::mem::take(&mut self.pane_resize_mode);
                 self.suppress_reactivation_click = false;
                 if self.is_focused {
                     self.is_focused = false;
                     self.render(buffer)?;
-                } else if divider_was_active {
+                } else if divider_was_active || resize_mode_was_active {
                     self.render(buffer)?;
                 } else {
                     self.draw_cursor()?;
@@ -11572,6 +11604,8 @@ impl Editor {
             | Action::MoveWindowToBottom
             | Action::MoveWindowToTop
             | Action::MoveWindowToRight
+            | Action::EnterPaneResizeMode
+            | Action::ExitPaneResizeMode
             | Action::ResizeWindowUp(_)
             | Action::ResizeWindowDown(_)
             | Action::ResizeWindowLeft(_)
@@ -18203,6 +18237,16 @@ impl Editor {
             }
             Action::MoveWindowToRight => {
                 self.move_focused_window_to_edge(crate::window::Direction::Right, buffer)?;
+            }
+            Action::EnterPaneResizeMode => {
+                add_to_history = false;
+                self.pane_resize_mode = true;
+                self.render(buffer)?;
+            }
+            Action::ExitPaneResizeMode => {
+                add_to_history = false;
+                self.pane_resize_mode = false;
+                self.render(buffer)?;
             }
             Action::ResizeWindowUp(amount) => {
                 if self.resize_window_or_panel(crate::window::Direction::Up, *amount) {
