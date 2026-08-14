@@ -11,6 +11,7 @@
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
+use ropey::{Rope, RopeSlice};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -48,7 +49,7 @@ type FilterTieBreaker = Box<dyn Fn(&PickerItem) -> usize + Send>;
 type FilterHighlightAction = Box<dyn Fn(&PickerItem, &str) -> PickerFilterHighlights + Send>;
 const MIN_HORIZONTAL_PREVIEW_PANE_WIDTH: usize = 40;
 const MAX_PREVIEW_HIGHLIGHT_BYTES: usize = 64 * 1024;
-const MAX_UNFOCUSED_PREVIEW_BYTES: u64 = 256 * 1024;
+pub(crate) const MAX_UNFOCUSED_PREVIEW_BYTES: u64 = 256 * 1024;
 const MAX_LOCATION_PREVIEW_SCAN_BYTES: usize = 8 * 1024 * 1024;
 const LOCATION_PREVIEW_CACHE_CAPACITY: usize = 8;
 const COMMAND_COLUMN_GAP: usize = 2;
@@ -313,7 +314,7 @@ pub struct Picker {
     preview_scroll: isize,
     preview_highlighter: PreviewHighlighter,
     preview_text_cache: RefCell<VecDeque<Arc<CachedLocationPreview>>>,
-    location_preview_overrides: HashMap<String, Arc<CachedLocationPreview>>,
+    location_preview_overrides: HashMap<String, Rope>,
     history_key: Option<String>,
     history: Vec<String>,
     history_navigation: Option<PickerHistoryNavigation>,
@@ -2106,19 +2107,23 @@ impl Picker {
         preview_scroll: isize,
         preview_height: usize,
     ) -> Arc<CachedLocationPreview> {
-        if let Some(preview) = self.location_preview_overrides.get(path) {
-            return Arc::clone(preview);
-        }
-        let metadata = std::fs::metadata(path).ok();
+        let override_contents = self.location_preview_overrides.get(path);
+        let metadata = override_contents
+            .is_none()
+            .then(|| std::fs::metadata(path).ok())
+            .flatten();
         let modified = metadata
             .as_ref()
             .and_then(|metadata| metadata.modified().ok());
-        let len = metadata.as_ref().map_or(0, std::fs::Metadata::len);
+        let len = override_contents.map_or_else(
+            || metadata.as_ref().map_or(0, std::fs::Metadata::len),
+            |contents| u64::try_from(contents.len_bytes()).unwrap_or(u64::MAX),
+        );
         let requested_start = location_preview_start(
             focus_line,
             preview_scroll,
             preview_height,
-            /*line_count*/ None,
+            override_contents.map(rope_preview_line_count),
         );
         let mut cache = self.preview_text_cache.borrow_mut();
         let cached_index = cache.iter().position(|cached| {
@@ -2136,33 +2141,48 @@ impl Picker {
         }
 
         let complete = len <= MAX_UNFOCUSED_PREVIEW_BYTES;
-        let checkpoint = cache
-            .iter()
-            .filter(|cached| {
-                modified.is_some()
-                    && cached.path == path
-                    && cached.modified == modified
-                    && cached.len == len
-                    && cached.first_line <= requested_start
-                    && (cached.first_line == 0 || cached.source_offset > 0)
-            })
-            .max_by_key(|cached| cached.first_line)
-            .map(|cached| (cached.first_line, cached.source_offset));
-        let (text, first_line, source_offset) = read_location_preview(
-            path,
-            complete,
-            focus_line,
-            preview_scroll,
-            preview_height,
-            checkpoint,
-        )
-        .unwrap_or_else(|error| {
-            (
-                format!("Unable to preview {path}: {error}"),
-                requested_start,
-                0,
-            )
+        let checkpoint = override_contents.is_none().then(|| {
+            cache
+                .iter()
+                .filter(|cached| {
+                    modified.is_some()
+                        && cached.path == path
+                        && cached.modified == modified
+                        && cached.len == len
+                        && cached.first_line <= requested_start
+                        && (cached.first_line == 0 || cached.source_offset > 0)
+                })
+                .max_by_key(|cached| cached.first_line)
+                .map(|cached| (cached.first_line, cached.source_offset))
         });
+        let (text, first_line, source_offset) = override_contents.map_or_else(
+            || {
+                read_location_preview(
+                    path,
+                    complete,
+                    focus_line,
+                    preview_scroll,
+                    preview_height,
+                    checkpoint.flatten(),
+                )
+                .unwrap_or_else(|error| {
+                    (
+                        format!("Unable to preview {path}: {error}"),
+                        requested_start,
+                        0,
+                    )
+                })
+            },
+            |contents| {
+                read_rope_location_preview(
+                    contents,
+                    complete,
+                    focus_line,
+                    preview_scroll,
+                    preview_height,
+                )
+            },
+        );
         let text = Arc::<str>::from(text);
         let line_starts = preview_line_starts(&text);
         let preview = Arc::new(CachedLocationPreview {
@@ -2177,7 +2197,7 @@ impl Picker {
             requested_height: preview_height,
             complete,
         });
-        if metadata.is_some() {
+        if override_contents.is_some() || metadata.is_some() {
             cache.retain(|cached| {
                 cached.path != path || (cached.modified == modified && cached.len == len)
             });
@@ -2744,6 +2764,63 @@ fn location_preview_start(
     max_start.map_or(start, |max_start| start.min(max_start))
 }
 
+fn rope_preview_line_count(contents: &Rope) -> usize {
+    if contents.len_chars() == 0 {
+        return 0;
+    }
+    contents
+        .len_lines()
+        .saturating_sub(usize::from(contents.char(contents.len_chars() - 1) == '\n'))
+}
+
+fn read_rope_location_preview(
+    contents: &Rope,
+    complete: bool,
+    focus_line: Option<usize>,
+    preview_scroll: isize,
+    preview_height: usize,
+) -> (String, usize, u64) {
+    if complete {
+        return (contents.to_string(), 0, 0);
+    }
+
+    let line_count = rope_preview_line_count(contents);
+    let start_line =
+        location_preview_start(focus_line, preview_scroll, preview_height, Some(line_count));
+    let max_lines = preview_height
+        .max(1)
+        .min(MAX_UNFOCUSED_PREVIEW_BYTES as usize);
+    let max_line_bytes = (MAX_UNFOCUSED_PREVIEW_BYTES as usize / max_lines).saturating_sub(1);
+    let mut text = String::new();
+    for line_index in start_line..start_line.saturating_add(max_lines).min(line_count) {
+        push_bounded_rope_line(&mut text, contents.line(line_index), max_line_bytes);
+    }
+    let source_offset = if start_line < contents.len_lines() {
+        u64::try_from(contents.line_to_byte(start_line)).unwrap_or(u64::MAX)
+    } else {
+        u64::try_from(contents.len_bytes()).unwrap_or(u64::MAX)
+    };
+    (text, start_line, source_offset)
+}
+
+fn push_bounded_rope_line(text: &mut String, line: RopeSlice<'_>, max_line_bytes: usize) {
+    let has_line_ending = line
+        .get_char(line.len_chars().saturating_sub(1))
+        .is_some_and(|character| character == '\n');
+    let mut copied: usize = 0;
+    for character in line.chars().take_while(|character| *character != '\n') {
+        let character_bytes = character.len_utf8();
+        if copied.saturating_add(character_bytes) > max_line_bytes {
+            break;
+        }
+        text.push(character);
+        copied += character_bytes;
+    }
+    if has_line_ending {
+        text.push('\n');
+    }
+}
+
 fn read_location_preview(
     path: &str,
     complete: bool,
@@ -3285,7 +3362,7 @@ pub struct PickerBuilder {
     status: Option<String>,
     busy: bool,
     history_key: Option<String>,
-    location_preview_contents: HashMap<String, String>,
+    location_preview_contents: HashMap<String, Rope>,
     content_sizing: Option<PickerContentSizing>,
     status_on_query_line: bool,
 }
@@ -3394,8 +3471,8 @@ impl PickerBuilder {
         self
     }
 
-    /// Uses editor snapshots instead of disk contents for matching location previews.
-    pub(crate) fn location_preview_contents(mut self, contents: HashMap<String, String>) -> Self {
+    /// Uses structurally shared editor snapshots instead of disk contents for location previews.
+    pub(crate) fn location_preview_contents(mut self, contents: HashMap<String, Rope>) -> Self {
         self.location_preview_contents = contents;
         self
     }
@@ -3464,25 +3541,7 @@ impl PickerBuilder {
             let history = editor.picker_history(&history_key).to_vec();
             picker.set_history(history_key, history);
         }
-        picker.location_preview_overrides = location_preview_contents
-            .into_iter()
-            .map(|(path, contents)| {
-                let text = Arc::<str>::from(contents);
-                let preview = Arc::new(CachedLocationPreview {
-                    path: path.clone(),
-                    modified: None,
-                    len: u64::try_from(text.len()).unwrap_or(u64::MAX),
-                    line_starts: preview_line_starts(&text),
-                    text,
-                    first_line: 0,
-                    source_offset: 0,
-                    requested_start: 0,
-                    requested_height: 0,
-                    complete: true,
-                });
-                (path, preview)
-            })
-            .collect();
+        picker.location_preview_overrides = location_preview_contents;
         picker.content_sizing = content_sizing;
         picker.status_on_query_line = status_on_query_line;
         picker.resize_to_viewport(editor.vwidth(), editor.vheight());
@@ -3502,6 +3561,7 @@ mod tests {
     };
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use ropey::Rope;
     use serde_json::json;
 
     use super::{
@@ -4592,7 +4652,7 @@ mod tests {
         let contents = "value = 'unsaved'\n".to_string();
         let picker = Picker::builder()
             .structured_items(vec![dynamic_item("diagnostic", "diagnostic")])
-            .location_preview_contents(HashMap::from([(path.clone(), contents.clone())]))
+            .location_preview_contents(HashMap::from([(path.clone(), Rope::from_str(&contents))]))
             .build(&editor);
 
         let preview = picker.location_preview(&path, Some(0), 0, 10);
@@ -4600,6 +4660,34 @@ mod tests {
         assert_eq!(preview.text.as_ref(), contents);
         assert!(preview.complete);
         assert_eq!(preview.first_line, 0);
+    }
+
+    #[test]
+    fn unsaved_buffer_snapshot_keeps_large_location_preview_bounded() {
+        const FOCUS_LINE: usize = 4_000;
+
+        let editor = test_editor();
+        let path = "/tmp/red-large-unsaved-preview.py".to_string();
+        let mut contents = String::new();
+        for line in 0..5_000 {
+            if line == FOCUS_LINE {
+                contents.push_str("unsaved diagnostic location\n");
+            } else {
+                contents.push_str(&format!("line {line:04} {}\n", "x".repeat(64)));
+            }
+        }
+        assert!(contents.len() > super::MAX_UNFOCUSED_PREVIEW_BYTES as usize);
+        let picker = Picker::builder()
+            .structured_items(vec![dynamic_item("diagnostic", "diagnostic")])
+            .location_preview_contents(HashMap::from([(path.clone(), Rope::from_str(&contents))]))
+            .build(&editor);
+
+        let preview = picker.location_preview(&path, Some(FOCUS_LINE), 0, 10);
+
+        assert!(!preview.complete);
+        assert!(preview.text.len() <= super::MAX_UNFOCUSED_PREVIEW_BYTES as usize);
+        assert!(preview.text.contains("unsaved diagnostic location"));
+        assert_eq!(preview.first_line, FOCUS_LINE - 5);
     }
 
     #[test]

@@ -1,17 +1,19 @@
 //! Editor-owned diagnostics picker built from the latest URI-keyed LSP snapshot.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
+use ropey::Rope;
 use serde_json::json;
 
 use crate::{
+    buffer::Buffer,
     lsp::{normalized_file_path, Diagnostic, DiagnosticSeverity},
     plugin::{LocationColumnEncoding, OpenLocationTarget, PluginLocation},
-    ui::{Picker, PickerItem, PickerPreview},
+    ui::{Picker, PickerItem, PickerPreview, MAX_UNFOCUSED_PREVIEW_BYTES},
     unicode_utils::grapheme_to_byte,
     utils::get_workspace_path,
 };
@@ -71,15 +73,8 @@ struct DiagnosticPickerModel {
 
 impl Editor {
     pub(super) fn open_diagnostics_picker(&mut self, filter: DiagnosticFilter) {
-        let preview_contents = self
-            .buffer_manager
-            .iter()
-            .filter_map(|buffer| {
-                let uri = buffer.uri().ok().flatten()?;
-                let path = normalized_file_path(&uri).ok()?;
-                Some((path, buffer.contents()))
-            })
-            .collect::<HashMap<_, _>>();
+        let diagnostic_paths = filtered_diagnostic_paths(&self.diagnostics, filter);
+        let preview_contents = diagnostic_preview_contents(&self.buffer_manager, &diagnostic_paths);
         let model = diagnostic_picker_model(
             &self.diagnostics,
             filter,
@@ -108,11 +103,42 @@ impl Editor {
     }
 }
 
+fn filtered_diagnostic_paths(
+    diagnostics_by_uri: &HashMap<String, Vec<Diagnostic>>,
+    filter: DiagnosticFilter,
+) -> HashSet<String> {
+    diagnostics_by_uri
+        .iter()
+        .filter(|(_, diagnostics)| {
+            diagnostics
+                .iter()
+                .any(|diagnostic| filter.includes(diagnostic))
+        })
+        .filter_map(|(uri, _)| normalized_file_path(uri).ok())
+        .collect()
+}
+
+fn diagnostic_preview_contents(
+    buffers: &[Buffer],
+    diagnostic_paths: &HashSet<String>,
+) -> HashMap<String, Rope> {
+    buffers
+        .iter()
+        .filter_map(|buffer| {
+            let uri = buffer.uri().ok().flatten()?;
+            let path = normalized_file_path(&uri).ok()?;
+            diagnostic_paths
+                .contains(&path)
+                .then(|| (path, buffer.contents_snapshot()))
+        })
+        .collect()
+}
+
 fn diagnostic_picker_model(
     diagnostics_by_uri: &HashMap<String, Vec<Diagnostic>>,
     filter: DiagnosticFilter,
     workspace: &Path,
-    preview_contents: &HashMap<String, String>,
+    preview_contents: &HashMap<String, Rope>,
 ) -> DiagnosticPickerModel {
     let mut entries = diagnostics_by_uri
         .iter()
@@ -168,9 +194,12 @@ fn diagnostic_picker_model(
         let column = entry.diagnostic.range.start.character;
         let severity = severity_label(entry.diagnostic.severity.as_ref());
         let origin = diagnostic_origin(&entry.diagnostic);
-        let display_column = preview_contents
+        let preview_line = preview_contents
             .get(&path)
-            .and_then(|contents| diagnostic_display_column(contents, &entry.diagnostic))
+            .and_then(|contents| diagnostic_preview_line(contents, &entry.diagnostic));
+        let display_column = preview_line
+            .as_deref()
+            .and_then(|line| diagnostic_display_column(line, &entry.diagnostic))
             .unwrap_or(column);
         let location = format!("{}:{}:{}", entry.display_path, line + 1, display_column + 1);
         let annotation = origin.as_ref().map_or_else(
@@ -185,9 +214,9 @@ fn diagnostic_picker_model(
             origin.as_deref().unwrap_or_default(),
             severity
         );
-        let matches = preview_contents
-            .get(&path)
-            .map(|contents| diagnostic_preview_matches(contents, &entry.diagnostic))
+        let matches = preview_line
+            .as_deref()
+            .map(|line| diagnostic_preview_matches(line, &entry.diagnostic))
             .unwrap_or_default();
 
         items.push(PickerItem {
@@ -250,11 +279,23 @@ fn diagnostic_filter_score(item: &PickerItem, query: &str) -> Option<i64> {
     })
 }
 
-fn diagnostic_preview_matches(contents: &str, diagnostic: &Diagnostic) -> Vec<[usize; 2]> {
+fn diagnostic_preview_line(contents: &Rope, diagnostic: &Diagnostic) -> Option<String> {
+    let line = contents.get_line(diagnostic.range.start.line)?;
+    if u64::try_from(line.len_bytes()).unwrap_or(u64::MAX) > MAX_UNFOCUSED_PREVIEW_BYTES {
+        return None;
+    }
+    let mut line = line.to_string();
+    if line.ends_with('\n') {
+        line.pop();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+    }
+    Some(line)
+}
+
+fn diagnostic_preview_matches(line: &str, diagnostic: &Diagnostic) -> Vec<[usize; 2]> {
     let range = &diagnostic.range;
-    let Some(line) = contents.split('\n').nth(range.start.line) else {
-        return Vec::new();
-    };
     let start = grapheme_to_byte(line, utf16_to_grapheme(line, range.start.character));
     let end = if range.end.line == range.start.line {
         grapheme_to_byte(line, utf16_to_grapheme(line, range.end.character))
@@ -264,9 +305,8 @@ fn diagnostic_preview_matches(contents: &str, diagnostic: &Diagnostic) -> Vec<[u
     (start < end).then_some([start, end]).into_iter().collect()
 }
 
-fn diagnostic_display_column(contents: &str, diagnostic: &Diagnostic) -> Option<usize> {
+fn diagnostic_display_column(line: &str, diagnostic: &Diagnostic) -> Option<usize> {
     let start = &diagnostic.range.start;
-    let line = contents.split('\n').nth(start.line)?;
     Some(utf16_to_grapheme(line, start.character))
 }
 
@@ -428,7 +468,65 @@ mod tests {
     fn preview_matches_convert_utf16_offsets_to_utf8_bytes() {
         let diagnostic = diagnostic("emoji", Some(DiagnosticSeverity::Error), 0, 1, 3);
 
-        assert_eq!(diagnostic_preview_matches("a😀z\n", &diagnostic), [[1, 5]]);
-        assert_eq!(diagnostic_display_column("a😀z\n", &diagnostic), Some(1));
+        assert_eq!(diagnostic_preview_matches("a😀z", &diagnostic), [[1, 5]]);
+        assert_eq!(diagnostic_display_column("a😀z", &diagnostic), Some(1));
+    }
+
+    #[test]
+    fn preview_snapshots_only_include_buffers_with_filtered_diagnostics() {
+        let workspace = tempfile::tempdir().unwrap();
+        let error_path = workspace.path().join("error.py");
+        let warning_path = workspace.path().join("warning.py");
+        let unrelated_path = workspace.path().join("unrelated.py");
+        let diagnostics = HashMap::from([
+            (
+                file_uri(&error_path).unwrap(),
+                vec![diagnostic(
+                    "error",
+                    Some(DiagnosticSeverity::Error),
+                    0,
+                    0,
+                    1,
+                )],
+            ),
+            (
+                file_uri(&warning_path).unwrap(),
+                vec![diagnostic(
+                    "warning",
+                    Some(DiagnosticSeverity::Warning),
+                    0,
+                    0,
+                    1,
+                )],
+            ),
+        ]);
+        let buffers = vec![
+            Buffer::new(
+                Some(error_path.to_string_lossy().into_owned()),
+                "unsaved error\n".to_string(),
+            ),
+            Buffer::new(
+                Some(warning_path.to_string_lossy().into_owned()),
+                "unsaved warning\n".to_string(),
+            ),
+            Buffer::new(
+                Some(unrelated_path.to_string_lossy().into_owned()),
+                "x".repeat(MAX_UNFOCUSED_PREVIEW_BYTES as usize * 2),
+            ),
+        ];
+
+        let paths = filtered_diagnostic_paths(&diagnostics, DiagnosticFilter::Errors);
+        let snapshots = diagnostic_preview_contents(&buffers, &paths);
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            snapshots
+                .get(&error_path.to_string_lossy().into_owned())
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("unsaved error\n")
+        );
+        assert!(!snapshots.contains_key(&warning_path.to_string_lossy().into_owned()));
+        assert!(!snapshots.contains_key(&unrelated_path.to_string_lossy().into_owned()));
     }
 }

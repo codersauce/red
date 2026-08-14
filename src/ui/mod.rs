@@ -43,6 +43,7 @@ pub use info::Info;
 pub use input_prompt::InputPrompt;
 pub(crate) use keymap_hints::draw_keymap_hints;
 use list::List;
+pub(crate) use picker::MAX_UNFOCUSED_PREVIEW_BYTES;
 pub use picker::{
     LegacyPickerOptions, Picker, PickerIcon, PickerItem, PickerOptions, PickerPresentation,
     PickerPreview, PickerUpdate,
