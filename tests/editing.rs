@@ -5803,6 +5803,24 @@ async fn focused_agent_panel_keeps_global_leader_until_the_composer_is_focused()
             ))
     ));
     assert!(harness.render_cursor_position().is_some());
+
+    let action = harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )))
+        .unwrap();
+    assert!(matches!(
+        action,
+        Some(KeyAction::Multiple(actions))
+            if actions.iter().any(|action| matches!(
+                action,
+                Action::NotifyPlugins(name, payload)
+                    if name == "panel:event:agent" && payload["action"] == "interrupt"
+            ))
+    ));
+    assert!(harness.render_cursor_position().is_some());
 }
 
 #[tokio::test]

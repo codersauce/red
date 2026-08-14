@@ -1266,6 +1266,16 @@ impl PanelManager {
         if !composer.focused || !composer.enabled {
             return None;
         }
+        if matches!(
+            event,
+            Event::Key(key)
+                if matches!(key.code, KeyCode::Char('c' | 'C'))
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+        ) {
+            // Ctrl-C is a pane-level interrupt. Let the editor route it without
+            // changing the focused composer's mode, draft, or cursor.
+            return None;
+        }
 
         let previous_bytes = composer.prompt.text().len();
         let inserted_bytes = match event {
@@ -3005,6 +3015,22 @@ mod tests {
         );
         assert!(manager.focus_text_panel_composer("agent"));
         manager.handle_focused_text_input(&Event::Paste("first second".to_string()), 80);
+        assert!(manager
+            .handle_focused_text_input(
+                &Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                80,
+            )
+            .is_none());
+        assert!(manager.focused_text_input_active());
+        assert_eq!(
+            manager.text_panels["agent"]
+                .composer
+                .as_ref()
+                .unwrap()
+                .prompt
+                .text(),
+            "first second"
+        );
         assert_eq!(
             manager.focused_text_panel_cursor_mode(),
             Some(crate::editor::Mode::Insert)
