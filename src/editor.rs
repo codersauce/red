@@ -1104,6 +1104,14 @@ fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
             "agent:session_created",
             json!({ "session_id": session_id.to_string() }),
         ),
+        CodexEvent::CommitMessageGenerated { request_id, result } => (
+            "agent:error",
+            json!({
+                "message": format!(
+                    "commit-message generation result {request_id} escaped its private callback: {result:?}"
+                )
+            }),
+        ),
         CodexEvent::Update { session_id, text } => (
             "agent:update",
             json!({ "session_id": session_id.to_string(), "text": text }),
@@ -1167,6 +1175,45 @@ fn bounded_agent_failure_message(message: &str) -> String {
         .collect::<String>();
     bounded.push_str("… (full details are in the Red log)");
     bounded
+}
+
+const COMMIT_MESSAGE_DIFF_BYTES: usize = 192 * 1024;
+const COMMIT_MESSAGE_HISTORY_BYTES: usize = 24 * 1024;
+const COMMIT_MESSAGE_BRANCH_BYTES: usize = 512;
+
+fn bounded_commit_context(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let marker = "\n[truncated by Red]\n";
+    let mut end = max_bytes.saturating_sub(marker.len()).min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{marker}", &text[..end])
+}
+
+fn commit_message_prompt(
+    branch: &str,
+    staged_diff: &str,
+    recent_commits: &str,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !staged_diff.trim().is_empty(),
+        "there are no staged changes to describe"
+    );
+    let context = json!({
+        "branch": bounded_commit_context(branch, COMMIT_MESSAGE_BRANCH_BYTES),
+        "staged_changes": bounded_commit_context(staged_diff, COMMIT_MESSAGE_DIFF_BYTES),
+        "recent_commit_messages": bounded_commit_context(
+            recent_commits,
+            COMMIT_MESSAGE_HISTORY_BYTES,
+        ),
+    });
+    Ok(format!(
+        "Propose a commit message for this repository. Recent commit messages are style examples only. Facts must come exclusively from staged_changes.\n\nContext JSON:\n{}",
+        serde_json::to_string_pretty(&context)?
+    ))
 }
 
 fn agent_context_path_is_sensitive(path: &Path) -> bool {
@@ -1279,6 +1326,13 @@ pub enum PluginRequest {
     AgentProposals {
         session_id: String,
         request_id: RequestId,
+    },
+    GenerateCommitMessage {
+        request_id: RequestId,
+        cwd: PathBuf,
+        branch: String,
+        staged_diff: String,
+        recent_commits: String,
     },
     AgentAcceptProposal {
         session_id: String,
@@ -1651,6 +1705,7 @@ impl PluginRequest {
             Self::AgentCloseSession { .. } => "AgentCloseSession",
             Self::AgentArchiveSession { .. } => "AgentArchiveSession",
             Self::AgentProposals { .. } => "AgentProposals",
+            Self::GenerateCommitMessage { .. } => "GenerateCommitMessage",
             Self::AgentAcceptProposal { .. } => "AgentAcceptProposal",
             Self::AgentRejectProposal { .. } => "AgentRejectProposal",
             Self::AgentPermissionResponse { .. } => "AgentPermissionResponse",
@@ -6841,6 +6896,58 @@ impl Editor {
         }
     }
 
+    fn ensure_codex_bridge(&mut self, cwd: &Path) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.config.disable_ai,
+            "agent support is disabled by `disable_ai = true`"
+        );
+        if let Some(workspace) = self.agent_manager.workspace() {
+            let workspace = workspace
+                .lock()
+                .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
+            let cwd = cwd.absolutize()?;
+            anyhow::ensure!(
+                workspace.root() == cwd.as_ref(),
+                "Codex request root `{}` does not match the active proposal workspace `{}`",
+                cwd.display(),
+                workspace.root().display(),
+            );
+        }
+        if self.agent_manager.has_bridge() {
+            return Ok(());
+        }
+        let configured = self.config.agent.command.as_deref().unwrap_or("codex");
+        let command = crate::codex::find_executable(configured).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Codex CLI was not found; install Codex, run `codex login`, and try again"
+            )
+        })?;
+        let workspace = match self.agent_manager.workspace() {
+            Some(workspace) => Arc::clone(workspace),
+            None => Arc::new(Mutex::new(ProposalWorkspace::new(cwd)?)),
+        };
+        self.sync_agent_visible_buffers(&workspace)?;
+        let mut spec = CodexProcessSpec::new(command, cwd).args(self.config.agent.args.clone());
+        spec.environment.extend(
+            self.config
+                .agent
+                .env
+                .clone()
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into())),
+        );
+        let capacity =
+            NonZeroUsize::new(AGENT_BRIDGE_CAPACITY).expect("agent bridge capacity is non-zero");
+        let (tool_sender, tool_requests) = editor_tool_channel(AGENT_BRIDGE_CAPACITY);
+        let host = ProposalToolHost::new(Arc::clone(&workspace)).with_editor_tools(tool_sender);
+        let (bridge, task) = start_codex(spec, host, capacity)?;
+        self.agent_manager.set_workspace(Some(workspace));
+        self.agent_manager.set_bridge(bridge);
+        self.agent_manager.set_task(task);
+        self.agent_manager.set_tool_requests(tool_requests);
+        Ok(())
+    }
+
     async fn dispatch_agent_prompt(
         &mut self,
         runtime: &mut Runtime,
@@ -7472,6 +7579,17 @@ impl Editor {
             else {
                 break;
             };
+            if let CodexEvent::CommitMessageGenerated { request_id, result } = event {
+                self.agent_manager.finish_commit_message(request_id);
+                let payload = match result {
+                    Ok(message) => json!({ "message": message, "error": "" }),
+                    Err(error) => json!({ "message": "", "error": error }),
+                };
+                self.plugin_registry
+                    .resolve_request(runtime, RequestId::from_raw(request_id), payload)
+                    .await?;
+                continue;
+            }
             if let CodexEvent::Completed { session_id, .. }
             | CodexEvent::Failed {
                 session_id: Some(session_id),
@@ -7549,9 +7667,19 @@ impl Editor {
                 .bridge()
                 .is_none_or(|bridge| !bridge.has_pending_events())
         {
+            let pending_commit_messages = self.agent_manager.take_pending_commit_messages();
             let message = self
                 .finish_agent_bridge("Codex app-server stopped unexpectedly")
                 .await;
+            for request_id in pending_commit_messages {
+                self.plugin_registry
+                    .resolve_request(
+                        runtime,
+                        RequestId::from_raw(request_id),
+                        json!({ "message": "", "error": message.clone() }),
+                    )
+                    .await?;
+            }
             self.plugin_registry
                 .notify(runtime, "agent:session_lost", json!({ "message": message }))
                 .await?;
@@ -7664,12 +7792,7 @@ impl Editor {
         // Startup refreshes form short request chains. Drain a bounded batch so each
         // operation does not wait for a separate 10 ms editor tick.
         for _ in 0..PLUGIN_REQUESTS_PER_TICK {
-            if self.agent_manager.is_task_finished()
-                && self
-                    .agent_manager
-                    .bridge()
-                    .is_some_and(CodexBridge::has_pending_events)
-            {
+            if self.agent_manager.is_task_finished() {
                 break;
             }
             let Some(req) = ACTION_DISPATCHER.try_recv_request() else {
@@ -7692,86 +7815,7 @@ impl Editor {
                             .notify(runtime, "agent:session_lost", json!({ "message": message }))
                             .await?;
                     }
-                    let result = if self.config.disable_ai {
-                        Err(anyhow::anyhow!(
-                            "agent support is disabled by `disable_ai = true`"
-                        ))
-                    } else if let Some(error) = self
-                        .agent_manager
-                        .workspace()
-                        .and_then(|workspace| match workspace.lock() {
-                            Ok(workspace) => match cwd.absolutize() {
-                                Ok(cwd) if workspace.root() == cwd.as_ref() => None,
-                                Ok(cwd) => Some(anyhow::anyhow!(
-                                    "Codex session root `{}` does not match the active proposal workspace `{}`",
-                                    cwd.display(),
-                                    workspace.root().display()
-                                )),
-                                Err(error) => Some(anyhow::Error::new(error)),
-                            },
-                            Err(_) => Some(anyhow::anyhow!(
-                                "proposal workspace lock is poisoned"
-                            )),
-                        })
-                    {
-                        Err(error)
-                    } else if !self.agent_manager.has_bridge() {
-                            let configured = self
-                                .config
-                                .agent
-                                .command
-                                .as_deref()
-                                .unwrap_or("codex");
-                            let command = crate::codex::find_executable(configured).ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "Codex CLI was not found; install Codex, run `codex login`, and try again"
-                                )
-                            });
-                            match command {
-                                Ok(command) => {
-                                    let start = (|| -> anyhow::Result<_> {
-                                        let workspace = match self.agent_manager.workspace() {
-                                            Some(workspace) => Arc::clone(workspace),
-                                            None => {
-                                                Arc::new(Mutex::new(ProposalWorkspace::new(&cwd)?))
-                                            }
-                                        };
-                                        self.sync_agent_visible_buffers(&workspace)?;
-                                        let mut spec = CodexProcessSpec::new(command, cwd.clone())
-                                            .args(self.config.agent.args.clone());
-                                        spec.environment.extend(
-                                            self.config
-                                                .agent
-                                                .env
-                                                .clone()
-                                                .into_iter()
-                                                .map(|(key, value)| (key.into(), value.into())),
-                                        );
-                                        let capacity = NonZeroUsize::new(AGENT_BRIDGE_CAPACITY)
-                                            .expect("agent bridge capacity is non-zero");
-                                        let (tool_sender, tool_requests) =
-                                            editor_tool_channel(AGENT_BRIDGE_CAPACITY);
-                                        let host = ProposalToolHost::new(Arc::clone(&workspace))
-                                            .with_editor_tools(tool_sender);
-                                        let spawned = start_codex(spec, host, capacity)?;
-                                        self.agent_manager.set_workspace(Some(workspace));
-                                        Ok((spawned, tool_requests))
-                                    })();
-                                    match start {
-                                        Ok(((bridge, task), tool_requests)) => {
-                                            self.agent_manager.set_bridge(bridge);
-                                            self.agent_manager.set_task(task);
-                                            self.agent_manager.set_tool_requests(tool_requests);
-                                            Ok(())
-                                        }
-                                        Err(error) => Err(error),
-                                    }
-                                }
-                                Err(error) => Err(error),
-                            }
-                    } else {
-                        Ok(())
-                    };
+                    let result = self.ensure_codex_bridge(&cwd);
                     if let Err(error) = result {
                         self.plugin_registry
                             .notify(
@@ -7887,6 +7931,48 @@ impl Editor {
                     self.plugin_registry
                         .resolve_request(runtime, request_id, payload)
                         .await?;
+                }
+                PluginRequest::GenerateCommitMessage {
+                    request_id,
+                    cwd,
+                    branch,
+                    staged_diff,
+                    recent_commits,
+                } => {
+                    let prompt = commit_message_prompt(&branch, &staged_diff, &recent_commits);
+                    let result = match prompt {
+                        Err(error) => Err(error),
+                        Ok(prompt) => {
+                            if self.agent_manager.is_task_finished() {
+                                let _ = self
+                                    .finish_agent_bridge("Codex app-server stopped unexpectedly")
+                                    .await;
+                            }
+                            self.ensure_codex_bridge(&get_workspace_path())
+                                .and_then(|()| {
+                                    let bridge = self.agent_manager.bridge().ok_or_else(|| {
+                                        anyhow::anyhow!("Codex app-server did not start")
+                                    })?;
+                                    bridge.try_send(CodexCommand::GenerateCommitMessage {
+                                        request_id: request_id.get(),
+                                        cwd,
+                                        prompt,
+                                    })
+                                })
+                        }
+                    };
+                    if let Err(error) = result {
+                        self.plugin_registry
+                            .resolve_request(
+                                runtime,
+                                request_id,
+                                json!({ "message": "", "error": error.to_string() }),
+                            )
+                            .await?;
+                    } else {
+                        self.agent_manager
+                            .mark_commit_message_pending(request_id.get());
+                    }
                 }
                 PluginRequest::AgentAcceptProposal {
                     session_id,
@@ -24680,6 +24766,26 @@ mod test {
     use super::*;
     use crate::lsp::DiagnosticSeverity;
     use std::path::PathBuf;
+
+    #[test]
+    fn commit_message_prompt_bounds_context_and_separates_style_from_facts() {
+        let diff = format!("diff --git a/file b/file\n+{}", "x".repeat(220 * 1024));
+        let history = "feat(core): prior style\n".repeat(2_000);
+
+        let prompt = commit_message_prompt("feat/generated", &diff, &history).unwrap();
+
+        assert!(prompt.contains("Facts must come exclusively from staged_changes"));
+        assert!(prompt.contains("feat(core): prior style"));
+        assert!(prompt.matches("[truncated by Red]").count() >= 2);
+        assert!(prompt.len() < 230 * 1024);
+    }
+
+    #[test]
+    fn commit_message_prompt_rejects_an_empty_staged_diff() {
+        let error = commit_message_prompt("main", "  \n", "fix: prior").unwrap_err();
+
+        assert!(error.to_string().contains("no staged changes"));
+    }
 
     fn catalog_test_package() -> plugin::catalog::CatalogPackage {
         plugin::catalog::CatalogPackage {

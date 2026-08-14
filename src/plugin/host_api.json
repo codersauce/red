@@ -84,6 +84,7 @@
     { "name": "GetEditorInfo", "kind": "request", "signature": "(callback: fn(Json))", "introduced": "0.1.0" },
     { "name": "EditHistory", "kind": "request", "signature": "(callback: fn(Json))", "introduced": "0.1.0" },
     { "name": "AgentProposals", "kind": "request", "signature": "(callback: fn(Json), session_id: String)", "introduced": "0.1.0" },
+    { "name": "GenerateCommitMessage", "kind": "request", "signature": "(callback: fn(Json), cwd: String, context: Json)", "introduced": "0.8.0" },
     { "name": "GetCursorPosition", "kind": "request", "signature": "(callback: fn(Json))", "introduced": "0.1.0" },
     { "name": "GetCursorDisplayColumn", "kind": "request", "signature": "(callback: fn(Json))", "introduced": "0.1.0" },
     { "name": "GetBufferText", "kind": "request", "signature": "(callback: fn(Json), start_line?: i32, end_line?: i32)", "introduced": "0.1.0" },

@@ -1908,6 +1908,23 @@ impl RedHost {
                     .to_string(),
                 request_id,
             },
+            "GenerateCommitMessage" => {
+                let cwd = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("GenerateCommitMessage requires a cwd"))?;
+                let context = args
+                    .get(1)
+                    .map(value_to_json)
+                    .ok_or_else(|| anyhow::anyhow!("GenerateCommitMessage requires context"))?;
+                PluginRequest::GenerateCommitMessage {
+                    request_id,
+                    cwd: PathBuf::from(cwd),
+                    branch: json_str(&context, "branch").to_string(),
+                    staged_diff: json_str(&context, "staged_diff").to_string(),
+                    recent_commits: json_str(&context, "recent_commits").to_string(),
+                }
+            }
             "GetCursorPosition" => PluginRequest::GetCursorPosition { request_id },
             "GetCursorDisplayColumn" => PluginRequest::GetCursorDisplayColumn { request_id },
             "GetBufferText" => {
