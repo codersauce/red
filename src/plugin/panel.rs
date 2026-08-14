@@ -9,7 +9,7 @@
 //! manager-owned UI state. A plugin may replace content but must use the same panel ID to
 //! preserve that lifecycle intentionally.
 
-use std::{collections::HashMap, time::Instant};
+use std::{cell::RefCell, collections::HashMap, sync::Arc, time::Instant};
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use serde::{Deserialize, Serialize};
@@ -224,6 +224,7 @@ pub struct TextPanel {
     busy_since: Option<Instant>,
     selected_link: Option<u64>,
     scrollback: TextPanelScrollback,
+    layout_cache: RefCell<Option<(usize, Arc<TextPanelLayout>)>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -395,10 +396,16 @@ impl TextPanel {
             busy_since: None,
             selected_link: None,
             scrollback: TextPanelScrollback::default(),
+            layout_cache: RefCell::new(None),
         }
     }
 
     fn set_status(&mut self, status: Option<TextPanelStatus>) {
+        let stream_changed = self.status.as_ref().is_some_and(|status| status.stream)
+            != status.as_ref().is_some_and(|status| status.stream);
+        if stream_changed {
+            self.invalidate_layout();
+        }
         self.busy_since = if status.as_ref().is_some_and(|status| status.busy) {
             self.busy_since.or_else(|| Some(Instant::now()))
         } else {
@@ -423,6 +430,7 @@ impl TextPanel {
             self.follow_tail = self.viewport.is_following();
         }
         self.blocks = blocks;
+        self.invalidate_layout();
         if self.follow_tail {
             self.scroll_to_bottom(panel_height, panel_width);
         } else {
@@ -452,6 +460,7 @@ impl TextPanel {
                 text: delta.to_string(),
             });
         }
+        self.invalidate_layout();
 
         if self.follow_tail {
             self.scroll_to_bottom(panel_height, panel_width);
@@ -497,7 +506,8 @@ impl TextPanel {
     }
 
     fn max_scroll(&self, panel_height: usize, panel_width: usize) -> usize {
-        self.rendered_lines(panel_width.max(1))
+        self.layout(panel_width)
+            .rendered
             .len()
             .saturating_sub(self.visible_rows(panel_height))
     }
@@ -537,9 +547,10 @@ impl TextPanel {
 
     fn links(&self, width: usize) -> Vec<(TextPanelLink, usize)> {
         let mut links = Vec::new();
-        for (line_index, line) in self.rendered_lines(width).into_iter().enumerate() {
-            for span in line.spans {
-                let Some(link) = span.link else {
+        let layout = self.layout(width);
+        for (line_index, line) in layout.rendered.iter().enumerate() {
+            for span in &line.spans {
+                let Some(link) = span.link.clone() else {
                     continue;
                 };
                 if links
@@ -593,7 +604,7 @@ impl TextPanel {
             .map(|(link, _)| link.target)
     }
 
-    fn rendered_lines(&self, width: usize) -> Vec<RenderedTextLine> {
+    fn build_rendered_lines(&self, width: usize) -> Vec<RenderedTextLine> {
         let mut lines: Vec<RenderedTextLine> = Vec::new();
         for (block_index, block) in self.blocks.iter().enumerate() {
             if block.kind == TextPanelBlockKind::User {
@@ -907,8 +918,19 @@ impl TextPanelLayout {
 }
 
 impl TextPanel {
-    fn layout(&self, width: usize) -> TextPanelLayout {
-        let mut layout = TextPanelLayout::new(self.rendered_lines(width.max(1)));
+    fn invalidate_layout(&self) {
+        self.layout_cache.borrow_mut().take();
+    }
+
+    fn layout(&self, width: usize) -> Arc<TextPanelLayout> {
+        let width = width.max(1);
+        if let Some((cached_width, layout)) = self.layout_cache.borrow().as_ref() {
+            if *cached_width == width {
+                return Arc::clone(layout);
+            }
+        }
+
+        let mut layout = TextPanelLayout::new(self.build_rendered_lines(width));
         if self.status.as_ref().is_some_and(|status| status.stream) {
             if let Some(line) = layout.lines.last_mut() {
                 if line.cells.last().is_some_and(|cell| cell.text == "▌") {
@@ -917,6 +939,8 @@ impl TextPanel {
                 }
             }
         }
+        let layout = Arc::new(layout);
+        *self.layout_cache.borrow_mut() = Some((width, Arc::clone(&layout)));
         layout
     }
 
@@ -2130,7 +2154,8 @@ impl PanelManager {
             return None;
         }
 
-        let lines = panel.rendered_lines(placement.width);
+        let layout = panel.layout(placement.width);
+        let lines = &layout.rendered;
         let visible_rows = content_height.saturating_sub(title_rows);
         let max_scroll = lines.len().saturating_sub(visible_rows);
         let scroll = if panel.follow_tail {
@@ -5578,6 +5603,43 @@ mod tests {
         render_panel(&mut buffer, &panel, Point::new(0, 0), 6, &theme);
 
         assert_eq!(row_text(&buffer, 0), "abc M ");
+    }
+
+    #[test]
+    fn text_panel_reuses_layout_until_content_or_stream_state_changes() {
+        let mut panel = TextPanel::new("agent".to_string(), PanelConfig::default());
+        panel.update_blocks(
+            vec![TextPanelBlock {
+                id: "answer".to_string(),
+                kind: TextPanelBlockKind::Agent,
+                format: TextPanelBlockFormat::Markdown,
+                text: "# Answer\n\nSome **formatted** text.".to_string(),
+            }],
+            20,
+            40,
+        );
+
+        let initial = panel.layout(40);
+        assert!(Arc::ptr_eq(&initial, &panel.layout(40)));
+
+        panel.append_delta("answer", "\n\nMore text.", 20, 40);
+        let appended = panel.layout(40);
+        assert!(!Arc::ptr_eq(&initial, &appended));
+        assert!(Arc::ptr_eq(&appended, &panel.layout(40)));
+
+        panel.set_status(Some(TextPanelStatus {
+            busy: true,
+            label: "Working".to_string(),
+            stream: false,
+        }));
+        assert!(Arc::ptr_eq(&appended, &panel.layout(40)));
+
+        panel.set_status(Some(TextPanelStatus {
+            busy: true,
+            label: "Writing".to_string(),
+            stream: true,
+        }));
+        assert!(!Arc::ptr_eq(&appended, &panel.layout(40)));
     }
 
     #[test]
