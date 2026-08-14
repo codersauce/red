@@ -21,8 +21,12 @@ use super::markdown::{
 };
 use super::text_link::{TextPanelLink, TextPanelLinkTarget};
 use crate::{
+    color::{blend_color, ensure_minimum_contrast, Color},
     editor::{render_buffer::RenderBuffer, Point},
-    theme::{SelectionForegroundPriority, Style, Theme, ThemeStyleSpec},
+    theme::{
+        SelectionForegroundPriority, Style, Theme, ThemeStyleSpec,
+        MINIMUM_SELECTION_STATE_CONTRAST, MINIMUM_SELECTION_TEXT_CONTRAST,
+    },
     ui::{
         normalize_prompt_newlines, wrap_text, FollowTailViewport, PromptBuffer, PromptInput,
         PROMPT_MAX_BYTES,
@@ -210,6 +214,95 @@ pub struct TextPanelStatus {
     pub label: String,
     #[serde(default)]
     pub stream: bool,
+}
+
+/// Foreground-first visual roles for a source-backed text panel.
+///
+/// Popup, input, and dialog styles may carry different backgrounds. Text panels are
+/// persistent surfaces, so every role is normalized onto the configured panel surface;
+/// selection and explicitly themed syntax spans are the only background exceptions.
+#[derive(Debug, Clone)]
+struct TextPanelPalette {
+    surface: Style,
+    primary: Style,
+    secondary: Style,
+    muted: Style,
+    accent: Style,
+    error: Style,
+    divider: Style,
+}
+
+impl TextPanelPalette {
+    fn new(theme: &Theme, config: &PanelConfig) -> Self {
+        let surface = panel_style(theme, config.surface.as_ref());
+        let surface_background = surface.bg.or(theme.style.bg);
+        let contrast_background = blend_color(
+            surface_background.unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
+            Color::Rgb { r: 0, g: 0, b: 0 },
+        );
+        let primary_foreground = surface.fg.or(theme.style.fg).unwrap_or(Color::Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        });
+        let secondary_foreground = theme_color(
+            theme,
+            &["descriptionForeground", "editorLineNumber.foreground"],
+        )
+        .or(theme.ui_style.muted.fg)
+        .unwrap_or(primary_foreground);
+        let muted_foreground = theme_color(
+            theme,
+            &["editorLineNumber.foreground", "descriptionForeground"],
+        )
+        .or(theme.ui_style.muted.fg)
+        .unwrap_or(secondary_foreground);
+        let accent_foreground = theme_color(
+            theme,
+            &[
+                "textLink.foreground",
+                "editorInfo.foreground",
+                "focusBorder",
+            ],
+        )
+        .or(theme.ui_style.dialog_border.fg)
+        .or(theme.ui_style.popup_border.fg)
+        .unwrap_or(primary_foreground);
+        let error_foreground =
+            theme_color(theme, &["editorError.foreground", "list.errorForeground"])
+                .or(theme.error_style.as_ref().and_then(|style| style.fg))
+                .or(theme.ui_style.deprecated.fg)
+                .unwrap_or(primary_foreground);
+        let role = |foreground, minimum_contrast, bold| Style {
+            fg: Some(ensure_minimum_contrast(
+                foreground,
+                contrast_background,
+                minimum_contrast,
+            )),
+            bg: surface_background,
+            bold,
+            italic: false,
+        };
+
+        Self {
+            surface: Style {
+                bg: surface_background,
+                ..surface
+            },
+            primary: role(primary_foreground, MINIMUM_SELECTION_TEXT_CONTRAST, false),
+            secondary: role(secondary_foreground, MINIMUM_SELECTION_TEXT_CONTRAST, false),
+            muted: role(muted_foreground, MINIMUM_SELECTION_STATE_CONTRAST, false),
+            accent: role(accent_foreground, MINIMUM_SELECTION_TEXT_CONTRAST, true),
+            error: role(error_foreground, MINIMUM_SELECTION_TEXT_CONTRAST, false),
+            divider: role(muted_foreground, MINIMUM_SELECTION_STATE_CONTRAST, false),
+        }
+    }
+}
+
+fn theme_color(theme: &Theme, candidates: &[&str]) -> Option<Color> {
+    candidates
+        .iter()
+        .find_map(|candidate| theme.colors.get(*candidate).copied())
 }
 
 pub struct TextPanel {
@@ -2975,13 +3068,14 @@ fn render_text_panel(
     if width == 0 || height == 0 {
         return;
     }
+    let palette = TextPanelPalette::new(theme, &panel.config);
 
     for y in 0..height {
         buffer.set_text(
             position.x,
             position.y.saturating_add(y),
             &" ".repeat(width),
-            &theme.style,
+            &palette.surface,
         );
     }
 
@@ -2993,7 +3087,7 @@ fn render_text_panel(
     if let Some(title) = &panel.config.title {
         let title_style = Style {
             bold: true,
-            ..theme.style.clone()
+            ..palette.primary.clone()
         };
         buffer.set_text(
             position.x,
@@ -3004,13 +3098,13 @@ fn render_text_panel(
     }
     for (start, _, label) in header_actions {
         let x = position.x + start;
-        buffer.set_text(x, position.y, "[", &theme.ui_style.muted);
-        buffer.set_text(x + 1, position.y, label, &theme.ui_style.picker_prompt);
+        buffer.set_text(x, position.y, "[", &palette.divider);
+        buffer.set_text(x + 1, position.y, label, &palette.accent);
         buffer.set_text(
             x + 1 + display_width(label),
             position.y,
             "]",
-            &theme.ui_style.muted,
+            &palette.divider,
         );
     }
 
@@ -3047,6 +3141,7 @@ fn render_text_panel(
                 .flatten(),
             panel.selected_link,
             theme,
+            &palette,
         );
     }
 
@@ -3058,7 +3153,7 @@ fn render_text_panel(
             position,
             width,
             content_height,
-            theme,
+            &palette,
         );
     }
 
@@ -3077,7 +3172,7 @@ fn render_text_panel(
             width,
             content_height + status_height,
             overflow,
-            theme,
+            &palette,
         );
     }
 }
@@ -3090,6 +3185,253 @@ enum TextPanelOverflow {
     Both,
 }
 
+#[derive(Clone, Copy)]
+struct TextPanelShortcutHint {
+    keys: &'static str,
+    action: &'static str,
+}
+
+const SCROLLBACK_NORMAL_HINTS: &[TextPanelShortcutHint] = &[
+    TextPanelShortcutHint {
+        keys: "hjkl/arrows",
+        action: "move",
+    },
+    TextPanelShortcutHint {
+        keys: "a",
+        action: "edit",
+    },
+    TextPanelShortcutHint {
+        keys: "y",
+        action: "copy",
+    },
+    TextPanelShortcutHint {
+        keys: "v/V",
+        action: "select",
+    },
+];
+const SCROLLBACK_VISUAL_HINTS: &[TextPanelShortcutHint] = &[
+    TextPanelShortcutHint {
+        keys: "motions",
+        action: "extend",
+    },
+    TextPanelShortcutHint {
+        keys: "y",
+        action: "copy",
+    },
+    TextPanelShortcutHint {
+        keys: "Esc",
+        action: "cancel",
+    },
+];
+const COMPOSER_NORMAL_HINTS: &[TextPanelShortcutHint] = &[
+    TextPanelShortcutHint {
+        keys: "Enter",
+        action: "send",
+    },
+    TextPanelShortcutHint {
+        keys: "i/a",
+        action: "edit",
+    },
+    TextPanelShortcutHint {
+        keys: "Esc",
+        action: "nav",
+    },
+    TextPanelShortcutHint {
+        keys: "j/k ↑/↓",
+        action: "scroll",
+    },
+];
+const COMPOSER_INSERT_HINTS: &[TextPanelShortcutHint] = &[
+    TextPanelShortcutHint {
+        keys: "Ctrl+Enter",
+        action: "send",
+    },
+    TextPanelShortcutHint {
+        keys: "Esc",
+        action: "normal",
+    },
+    TextPanelShortcutHint {
+        keys: "^J/^K",
+        action: "scroll",
+    },
+    TextPanelShortcutHint {
+        keys: "^g/^G",
+        action: "ends",
+    },
+];
+const PANEL_NAVIGATION_HINTS: &[TextPanelShortcutHint] = &[
+    TextPanelShortcutHint {
+        keys: "a",
+        action: "edit",
+    },
+    TextPanelShortcutHint {
+        keys: "j/k",
+        action: "scroll",
+    },
+    TextPanelShortcutHint {
+        keys: "q",
+        action: "close",
+    },
+    TextPanelShortcutHint {
+        keys: "^C",
+        action: "stop",
+    },
+    TextPanelShortcutHint {
+        keys: "g/G",
+        action: "ends",
+    },
+];
+
+fn append_text_panel_piece(
+    buffer: &mut RenderBuffer,
+    position: Point,
+    y: usize,
+    width: usize,
+    used: &mut usize,
+    text: &str,
+    style: &Style,
+) {
+    let remaining = width.saturating_sub(*used);
+    if remaining == 0 || text.is_empty() {
+        return;
+    }
+    let text = truncate_display_width(text, remaining);
+    if text.is_empty() {
+        return;
+    }
+    buffer.set_text(position.x.saturating_add(*used), y, &text, style);
+    *used = used.saturating_add(display_width(&text));
+}
+
+fn text_panel_composer_hints(
+    composer: &TextPanelComposer,
+    scrollback: &TextPanelScrollback,
+) -> (&'static str, &'static [TextPanelShortcutHint]) {
+    if scrollback.focused {
+        return match scrollback.mode {
+            TextPanelScrollbackMode::Normal => ("SCROLLBACK NORMAL", SCROLLBACK_NORMAL_HINTS),
+            TextPanelScrollbackMode::Visual => ("SCROLLBACK VISUAL", SCROLLBACK_VISUAL_HINTS),
+            TextPanelScrollbackMode::VisualLine => {
+                ("SCROLLBACK VISUAL LINE", SCROLLBACK_VISUAL_HINTS)
+            }
+        };
+    }
+    if composer.focused && composer.prompt.mode() == crate::editor::Mode::Normal {
+        ("NORMAL", COMPOSER_NORMAL_HINTS)
+    } else if composer.focused {
+        ("INSERT", COMPOSER_INSERT_HINTS)
+    } else {
+        ("NAV", PANEL_NAVIGATION_HINTS)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_text_panel_composer_footer(
+    buffer: &mut RenderBuffer,
+    composer: &TextPanelComposer,
+    scrollback: &TextPanelScrollback,
+    position: Point,
+    y: usize,
+    width: usize,
+    overflow: TextPanelOverflow,
+    palette: &TextPanelPalette,
+) {
+    let mut used = 0usize;
+    if let Some(validation) = composer.validation {
+        append_text_panel_piece(
+            buffer,
+            position,
+            y,
+            width,
+            &mut used,
+            validation,
+            &palette.error,
+        );
+    } else if let Some(status) = composer.status.as_deref() {
+        append_text_panel_piece(
+            buffer,
+            position,
+            y,
+            width,
+            &mut used,
+            status,
+            &palette.secondary,
+        );
+    }
+
+    let (mode, hints) = text_panel_composer_hints(composer, scrollback);
+    if used > 0 {
+        if used.saturating_add(3 + display_width(mode)) > width {
+            return;
+        }
+        append_text_panel_piece(
+            buffer,
+            position,
+            y,
+            width,
+            &mut used,
+            " · ",
+            &palette.divider,
+        );
+    }
+    append_text_panel_piece(buffer, position, y, width, &mut used, mode, &palette.accent);
+
+    for hint in hints {
+        render_text_panel_shortcut_hint(buffer, position, y, width, &mut used, *hint, palette);
+    }
+
+    if !scrollback.focused {
+        let overflow_hint = match overflow {
+            TextPanelOverflow::Both => Some(TextPanelShortcutHint {
+                keys: "↑↓",
+                action: "more",
+            }),
+            TextPanelOverflow::Below => Some(TextPanelShortcutHint {
+                keys: "↓",
+                action: "more",
+            }),
+            TextPanelOverflow::Above => Some(TextPanelShortcutHint {
+                keys: "↑",
+                action: "history",
+            }),
+            TextPanelOverflow::None => None,
+        };
+        if let Some(hint) = overflow_hint {
+            render_text_panel_shortcut_hint(buffer, position, y, width, &mut used, hint, palette);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_text_panel_shortcut_hint(
+    buffer: &mut RenderBuffer,
+    position: Point,
+    y: usize,
+    width: usize,
+    used: &mut usize,
+    hint: TextPanelShortcutHint,
+    palette: &TextPanelPalette,
+) {
+    let group_width = 3 + display_width(hint.keys) + 1 + display_width(hint.action);
+    if used.saturating_add(group_width) > width {
+        return;
+    }
+    append_text_panel_piece(buffer, position, y, width, used, " · ", &palette.divider);
+    let mut keys = palette.secondary.clone();
+    keys.bold = true;
+    append_text_panel_piece(buffer, position, y, width, used, hint.keys, &keys);
+    append_text_panel_piece(buffer, position, y, width, used, " ", &palette.surface);
+    append_text_panel_piece(
+        buffer,
+        position,
+        y,
+        width,
+        used,
+        hint.action,
+        &palette.muted,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_text_panel_composer(
     buffer: &mut RenderBuffer,
@@ -3099,7 +3441,7 @@ fn render_text_panel_composer(
     width: usize,
     top: usize,
     overflow: TextPanelOverflow,
-    theme: &Theme,
+    palette: &TextPanelPalette,
 ) {
     if width == 0 {
         return;
@@ -3110,7 +3452,11 @@ fn render_text_panel_composer(
         position.x,
         top,
         &fit_display_width(&divider, width),
-        &theme.ui_style.muted,
+        if composer.focused {
+            &palette.accent
+        } else {
+            &palette.divider
+        },
     );
 
     let rows = composer.config.rows.max(1);
@@ -3121,68 +3467,48 @@ fn render_text_panel_composer(
         .get(composer.prompt.cursor())
         .map_or(0, |position| position.0);
     let first = cursor_row.saturating_sub(rows.saturating_sub(1));
+    let active_row = cursor_row.saturating_sub(first).min(rows.saturating_sub(1));
     for row in 0..rows {
         let y = top + 1 + row;
-        let line = wrapped
-            .rows
-            .get(first + row)
-            .map(String::as_str)
-            .unwrap_or("");
-        let text = if line.is_empty() && composer.prompt.text().is_empty() && row == 0 {
+        let line = wrapped.rows.get(first + row).map(String::as_str);
+        let placeholder =
+            line.is_some_and(str::is_empty) && composer.prompt.text().is_empty() && row == 0;
+        let text = if placeholder {
             composer.config.placeholder.as_str()
         } else {
-            line
+            line.unwrap_or("")
         };
-        let style = if composer.enabled && composer.focused {
-            &theme.ui_style.dialog
+        let text_style = if placeholder || !composer.enabled {
+            &palette.muted
         } else {
-            &theme.ui_style.muted
+            &palette.primary
         };
-        buffer.set_text(position.x, y, "›", &theme.ui_style.picker_prompt);
+        let (marker, marker_style) = if composer.focused && row == active_row {
+            ("›", &palette.accent)
+        } else if placeholder {
+            ("›", &palette.muted)
+        } else if line.is_some() {
+            ("│", &palette.divider)
+        } else {
+            (" ", &palette.surface)
+        };
+        buffer.set_text(position.x, y, marker, marker_style);
         buffer.set_text(
             position.x + 2,
             y,
             &fit_display_width(text, content_width),
-            style,
+            text_style,
         );
     }
-    let hints = if scrollback.focused {
-        match scrollback.mode {
-            TextPanelScrollbackMode::Normal => {
-                "SCROLLBACK NORMAL · hjkl/arrows move · v/V select · y copy · a edit"
-            }
-            TextPanelScrollbackMode::Visual => {
-                "SCROLLBACK VISUAL · motions extend · y copy · Esc cancel"
-            }
-            TextPanelScrollbackMode::VisualLine => {
-                "SCROLLBACK VISUAL LINE · motions extend · y copy · Esc cancel"
-            }
-        }
-    } else if composer.focused && composer.prompt.mode() == crate::editor::Mode::Normal {
-        "NORMAL · j/k ↑/↓ scroll · i/a edit · Enter send · Esc nav"
-    } else if composer.focused {
-        "INSERT · ^J/^K scroll · ^g/^G ends · Ctrl+Enter send · Esc normal"
-    } else {
-        match overflow {
-            TextPanelOverflow::Both => {
-                "↑↓ more · j/k scroll · g/G ends · a edit · q close · ^C stop"
-            }
-            TextPanelOverflow::Below => {
-                "↓ more · j/k scroll · G latest · a edit · q close · ^C stop"
-            }
-            TextPanelOverflow::Above => {
-                "↑ history · j/k scroll · g oldest · a edit · q close · ^C stop"
-            }
-            TextPanelOverflow::None => "a edit · x clear · N new · q close · ^C stop",
-        }
-    };
-    let status = composer.validation.or(composer.status.as_deref());
-    let status = status.map_or_else(|| hints.to_string(), |status| format!("{status} · {hints}"));
-    buffer.set_text(
-        position.x,
+    render_text_panel_composer_footer(
+        buffer,
+        composer,
+        scrollback,
+        position,
         top + rows + 1,
-        &fit_display_width(&status, width),
-        &theme.ui_style.muted,
+        width,
+        overflow,
+        palette,
     );
 }
 
@@ -3193,33 +3519,65 @@ fn render_text_panel_status(
     position: Point,
     width: usize,
     y: usize,
-    theme: &Theme,
+    palette: &TextPanelPalette,
 ) {
     if width == 0 {
         return;
     }
-    let (text, style) = if status.busy {
+    let y = position.y.saturating_add(y);
+    let mut used = 0usize;
+    if status.busy {
         let elapsed_ms = panel
             .busy_since
             .map_or(0, |since| since.elapsed().as_millis() as u64);
-        (
-            format!(
-                "{} {} · {}",
-                spinner_frame(elapsed_ms),
-                status.label,
-                format_elapsed(elapsed_ms / 1000)
-            ),
-            &theme.ui_style.picker_prompt,
-        )
+        append_text_panel_piece(
+            buffer,
+            position,
+            y,
+            width,
+            &mut used,
+            spinner_frame(elapsed_ms),
+            &palette.accent,
+        );
+        append_text_panel_piece(buffer, position, y, width, &mut used, " ", &palette.surface);
+        append_text_panel_piece(
+            buffer,
+            position,
+            y,
+            width,
+            &mut used,
+            &status.label,
+            &palette.primary,
+        );
+        append_text_panel_piece(
+            buffer,
+            position,
+            y,
+            width,
+            &mut used,
+            " · ",
+            &palette.divider,
+        );
+        append_text_panel_piece(
+            buffer,
+            position,
+            y,
+            width,
+            &mut used,
+            &format_elapsed(elapsed_ms / 1000),
+            &palette.muted,
+        );
     } else {
-        (status.label.clone(), &theme.ui_style.muted)
-    };
-    buffer.set_text(
-        position.x,
-        position.y.saturating_add(y),
-        &fit_display_width(&text, width),
-        style,
-    );
+        append_text_panel_piece(
+            buffer,
+            position,
+            y,
+            width,
+            &mut used,
+            &status.label,
+            &palette.secondary,
+        );
+    }
 }
 
 fn text_panel_header_actions(config: &PanelConfig, width: usize) -> Vec<(usize, &str, &str)> {
@@ -3286,15 +3644,16 @@ fn render_text_spans(
     selection: Option<(usize, usize)>,
     selected_link: Option<u64>,
     theme: &Theme,
+    palette: &TextPanelPalette,
 ) {
     let mut column = 0usize;
     let mut offset = line_first;
     for span in &line.spans {
-        let base_style = text_panel_span_style(span.style, theme);
+        let base_style = text_panel_span_style(span.style, theme, palette);
         let mut style = if let Some(syntax_style) = &span.syntax_style {
             Style {
                 fg: syntax_style.fg.or(base_style.fg),
-                bg: syntax_style.bg.or(base_style.bg).or(theme.style.bg),
+                bg: syntax_style.bg.or(base_style.bg).or(palette.surface.bg),
                 bold: syntax_style.bold || base_style.bold,
                 italic: syntax_style.italic || base_style.italic,
             }
@@ -3334,35 +3693,52 @@ fn render_text_spans(
     }
 }
 
-fn text_panel_span_style(style: TextPanelSpanStyle, theme: &Theme) -> Style {
-    let scoped = |scope: &str| {
-        theme
-            .get_style(scope)
-            .unwrap_or_else(|| theme.style.clone())
+fn text_panel_span_style(
+    style: TextPanelSpanStyle,
+    theme: &Theme,
+    palette: &TextPanelPalette,
+) -> Style {
+    let scoped = |scope: &str, fallback: &Style, preserve_background: bool| {
+        let scoped = theme.get_style(scope).unwrap_or_default();
+        Style {
+            fg: scoped.fg.or(fallback.fg),
+            bg: if preserve_background {
+                scoped.bg.or(palette.surface.bg)
+            } else {
+                palette.surface.bg
+            },
+            bold: scoped.bold || fallback.bold,
+            italic: scoped.italic || fallback.italic,
+        }
     };
     match style {
-        TextPanelSpanStyle::User => theme.ui_style.picker_prompt.clone(),
-        TextPanelSpanStyle::Agent | TextPanelSpanStyle::Text => theme.style.clone(),
-        TextPanelSpanStyle::Error => theme.ui_style.deprecated.clone(),
+        TextPanelSpanStyle::User => palette.accent.clone(),
+        TextPanelSpanStyle::Agent | TextPanelSpanStyle::Text => palette.primary.clone(),
+        TextPanelSpanStyle::Error => palette.error.clone(),
         TextPanelSpanStyle::Heading => {
-            let mut style = scoped("heading.1.markdown");
+            let mut style = scoped("heading.1.markdown", &palette.primary, false);
             style.bold = true;
             style
         }
         TextPanelSpanStyle::Strong => Style {
             bold: true,
-            ..theme.style.clone()
+            ..palette.primary.clone()
         },
         TextPanelSpanStyle::Emphasis => Style {
             italic: true,
-            ..theme.style.clone()
+            ..palette.primary.clone()
         },
-        TextPanelSpanStyle::Strikethrough => scoped("markup.strikethrough.markdown"),
-        TextPanelSpanStyle::InlineCode | TextPanelSpanStyle::Code => {
-            scoped("markup.raw.block.markdown")
+        TextPanelSpanStyle::Strikethrough => {
+            scoped("markup.strikethrough.markdown", &palette.secondary, false)
         }
-        TextPanelSpanStyle::Link => scoped("markup.underline.link.markdown"),
-        TextPanelSpanStyle::Quote | TextPanelSpanStyle::Muted => theme.ui_style.muted.clone(),
+        TextPanelSpanStyle::InlineCode | TextPanelSpanStyle::Code => {
+            scoped("markup.raw.block.markdown", &palette.primary, true)
+        }
+        TextPanelSpanStyle::Link => {
+            scoped("markup.underline.link.markdown", &palette.accent, false)
+        }
+        TextPanelSpanStyle::Quote => palette.secondary.clone(),
+        TextPanelSpanStyle::Muted => palette.muted.clone(),
     }
 }
 
@@ -3592,6 +3968,30 @@ mod tests {
         (0..buffer.width)
             .map(|x| buffer.cells[y * buffer.width + x].text.as_str())
             .collect()
+    }
+
+    fn text_position(buffer: &RenderBuffer, needle: &str) -> Option<Point> {
+        for y in 0..buffer.height {
+            for x in 0..buffer.width {
+                let mut candidate = String::new();
+                for cell in &buffer.cells[y * buffer.width + x..(y + 1) * buffer.width] {
+                    candidate.push_str(&cell.text);
+                    if candidate == needle {
+                        return Some(Point::new(x, y));
+                    }
+                    if !needle.starts_with(&candidate) {
+                        break;
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn text_style<'a>(buffer: &'a RenderBuffer, needle: &str) -> &'a Style {
+        let position = text_position(buffer, needle)
+            .unwrap_or_else(|| panic!("missing rendered text {needle:?}"));
+        &buffer.cells[position.y * buffer.width + position.x].style
     }
 
     #[test]
@@ -4233,8 +4633,9 @@ mod tests {
             selection: TextPanelLineSelection::Semantic,
         };
         let mut buffer = RenderBuffer::new(2, 1, &theme.style);
+        let palette = TextPanelPalette::new(&theme, &PanelConfig::default());
 
-        render_text_spans(&mut buffer, 0, 0, 2, &line, 0, None, None, &theme);
+        render_text_spans(&mut buffer, 0, 0, 2, &line, 0, None, None, &theme, &palette);
 
         assert_eq!(
             buffer.cells[0].style,
@@ -4281,9 +4682,21 @@ mod tests {
         };
         let mut normal = RenderBuffer::new(3, 1, &theme.style);
         let mut selected = RenderBuffer::new(3, 1, &theme.style);
+        let palette = TextPanelPalette::new(&theme, &PanelConfig::default());
 
-        render_text_spans(&mut normal, 0, 0, 3, &line, 0, None, None, &theme);
-        render_text_spans(&mut selected, 0, 0, 3, &line, 0, Some((0, 0)), None, &theme);
+        render_text_spans(&mut normal, 0, 0, 3, &line, 0, None, None, &theme, &palette);
+        render_text_spans(
+            &mut selected,
+            0,
+            0,
+            3,
+            &line,
+            0,
+            Some((0, 0)),
+            None,
+            &theme,
+            &palette,
+        );
 
         assert_eq!(normal.cells[0].style, selected.cells[0].style);
         assert_eq!(normal.cells[1].style, selected.cells[1].style);
@@ -4961,6 +5374,252 @@ mod tests {
         assert!(!row_text(&buffer, 8).contains("Reading demo.txt"));
         assert!((1..9).any(|row| row_text(&buffer, row).contains("partial answer")));
         assert!(!(1..9).any(|row| row_text(&buffer, row).contains("partial answer▌")));
+    }
+
+    #[test]
+    fn text_panel_states_share_one_surface_and_use_foreground_hierarchy() {
+        let surface_foreground = Color::Rgb {
+            r: 225,
+            g: 230,
+            b: 235,
+        };
+        let surface_background = Color::Rgb {
+            r: 18,
+            g: 20,
+            b: 24,
+        };
+        let accent = Color::Rgb {
+            r: 80,
+            g: 190,
+            b: 240,
+        };
+        let secondary = Color::Rgb {
+            r: 180,
+            g: 185,
+            b: 195,
+        };
+        let muted = Color::Rgb {
+            r: 130,
+            g: 135,
+            b: 145,
+        };
+        let error = Color::Rgb {
+            r: 255,
+            g: 105,
+            b: 115,
+        };
+        let mut theme = Theme::default();
+        theme
+            .colors
+            .insert("panel.foreground".to_string(), surface_foreground);
+        theme
+            .colors
+            .insert("panel.background".to_string(), surface_background);
+        theme
+            .colors
+            .insert("textLink.foreground".to_string(), accent);
+        theme
+            .colors
+            .insert("descriptionForeground".to_string(), secondary);
+        theme
+            .colors
+            .insert("editorLineNumber.foreground".to_string(), muted);
+        theme
+            .colors
+            .insert("editorError.foreground".to_string(), error);
+        theme.ui_style.popup.bg = Some(Color::Rgb { r: 70, g: 0, b: 0 });
+        theme.ui_style.picker_prompt.bg = Some(Color::Rgb { r: 0, g: 70, b: 0 });
+        theme.ui_style.dialog.bg = Some(Color::Rgb { r: 0, g: 0, b: 70 });
+        theme.ui_style.muted.bg = Some(Color::Rgb { r: 70, g: 70, b: 0 });
+        theme.ui_style.deprecated.bg = Some(Color::Rgb { r: 70, g: 0, b: 70 });
+
+        let config = PanelConfig {
+            side: PanelSide::Right,
+            width: 72,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask a follow-up…".to_string(),
+                rows: 3,
+            }),
+            header_actions: Vec::new(),
+            surface: Some(ThemeStyleSpec {
+                foreground: vec!["panel.foreground".to_string()],
+                background: vec!["panel.background".to_string()],
+                bold: None,
+                italic: None,
+            }),
+            border: None,
+        };
+        let palette = TextPanelPalette::new(&theme, &config);
+        let mut panel = TextPanel::new("agent".to_string(), config);
+        panel.blocks = vec![
+            TextPanelBlock {
+                id: "user".to_string(),
+                kind: TextPanelBlockKind::User,
+                format: TextPanelBlockFormat::Plain,
+                text: "question".to_string(),
+            },
+            TextPanelBlock {
+                id: "activity".to_string(),
+                kind: TextPanelBlockKind::Activity,
+                format: TextPanelBlockFormat::Plain,
+                text: "Worked for 13s".to_string(),
+            },
+            TextPanelBlock {
+                id: "agent".to_string(),
+                kind: TextPanelBlockKind::Agent,
+                format: TextPanelBlockFormat::Plain,
+                text: "partial answer".to_string(),
+            },
+            TextPanelBlock {
+                id: "error".to_string(),
+                kind: TextPanelBlockKind::Error,
+                format: TextPanelBlockFormat::Plain,
+                text: "startup failed".to_string(),
+            },
+        ];
+        let composer = panel.composer.as_mut().unwrap();
+        assert!(composer.prompt.set_text("first line\nsecond line"));
+        composer.focused = true;
+        panel.set_status(Some(TextPanelStatus {
+            busy: true,
+            label: "Reading demo.txt".to_string(),
+            stream: true,
+        }));
+        let mut streaming = RenderBuffer::new(72, 22, &theme.style);
+
+        render_text_panel(&mut streaming, &panel, Point::new(0, 0), 72, 22, &theme);
+
+        assert!(streaming
+            .cells
+            .iter()
+            .all(|cell| cell.style.bg == Some(surface_background)));
+        assert_eq!(
+            text_style(&streaming, "Worked for 13s").fg,
+            palette.muted.fg
+        );
+        assert_eq!(
+            text_style(&streaming, "partial answer").fg,
+            palette.primary.fg
+        );
+        assert_eq!(
+            text_style(&streaming, "startup failed").fg,
+            palette.error.fg
+        );
+        assert_eq!(
+            text_style(&streaming, "Reading demo.txt").fg,
+            palette.primary.fg
+        );
+        assert_eq!(text_style(&streaming, "0s").fg, palette.muted.fg);
+        assert_eq!(text_style(&streaming, "second line").fg, palette.primary.fg);
+        assert_eq!(text_style(&streaming, "INSERT").fg, palette.accent.fg);
+        assert_eq!(text_style(&streaming, "^J/^K").fg, palette.secondary.fg);
+        assert!(text_style(&streaming, "^J/^K").bold);
+        assert_eq!(text_style(&streaming, "scroll").fg, palette.muted.fg);
+        assert_eq!(
+            streaming
+                .cells
+                .iter()
+                .filter(|cell| cell.text == "›")
+                .count(),
+            1
+        );
+        assert!(streaming.cells.iter().any(|cell| cell.text == "│"));
+
+        panel.set_status(None);
+        panel.composer.as_mut().unwrap().focused = false;
+        panel.scrollback.focused = true;
+        panel.scrollback.mode = TextPanelScrollbackMode::Normal;
+        let mut scrollback = RenderBuffer::new(72, 22, &theme.style);
+        render_text_panel(&mut scrollback, &panel, Point::new(0, 0), 72, 22, &theme);
+
+        assert!(scrollback
+            .cells
+            .iter()
+            .all(|cell| cell.style.bg == Some(surface_background)));
+        assert_eq!(
+            text_style(&scrollback, "SCROLLBACK NORMAL").fg,
+            palette.accent.fg
+        );
+        assert_eq!(
+            text_style(&scrollback, "hjkl/arrows").fg,
+            palette.secondary.fg
+        );
+        assert_eq!(text_style(&scrollback, "move").fg, palette.muted.fg);
+    }
+
+    #[test]
+    fn text_panel_surface_is_stable_across_dark_light_and_high_contrast_themes() {
+        for path in [
+            "themes/tokyonight-storm.json",
+            "themes/night-owl-light.json",
+            "themes/community-material-theme-lighter-high-contrast.json",
+        ] {
+            let theme = parse_vscode_theme(path).unwrap();
+            let config = PanelConfig {
+                side: PanelSide::Right,
+                width: 40,
+                title: Some("Agent".to_string()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 3,
+                }),
+                ..PanelConfig::default()
+            };
+            let palette = TextPanelPalette::new(&theme, &config);
+            let mut panel = TextPanel::new("agent".to_string(), config);
+            panel.blocks = vec![TextPanelBlock {
+                id: "activity".to_string(),
+                kind: TextPanelBlockKind::Activity,
+                format: TextPanelBlockFormat::Plain,
+                text: "Worked for 13s".to_string(),
+            }];
+            panel.composer.as_mut().unwrap().focused = true;
+            panel.set_status(Some(TextPanelStatus {
+                busy: true,
+                label: "Thinking".to_string(),
+                stream: true,
+            }));
+            let mut buffer = RenderBuffer::new(40, 12, &theme.style);
+
+            render_text_panel(&mut buffer, &panel, Point::new(0, 0), 40, 12, &theme);
+
+            assert!(
+                buffer
+                    .cells
+                    .iter()
+                    .all(|cell| cell.style.bg == palette.surface.bg),
+                "text panel backgrounds diverged for {path}"
+            );
+            let background = palette.surface.bg.unwrap();
+            assert!(contrast_ratio(palette.primary.fg.unwrap(), background) >= 4.5);
+            assert!(contrast_ratio(palette.secondary.fg.unwrap(), background) >= 4.5);
+            assert!(contrast_ratio(palette.accent.fg.unwrap(), background) >= 4.5);
+            assert!(contrast_ratio(palette.muted.fg.unwrap(), background) >= 3.0);
+        }
+    }
+
+    #[test]
+    fn narrow_text_panel_footer_drops_whole_low_priority_shortcuts() {
+        let mut panel = TextPanel::new(
+            "agent".to_string(),
+            PanelConfig {
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 2,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        panel.composer.as_mut().unwrap().focused = true;
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(26, 6, &theme.style);
+
+        render_text_panel(&mut buffer, &panel, Point::new(0, 0), 26, 6, &theme);
+
+        let footer = row_text(&buffer, 5).trim_end().to_string();
+        assert_eq!(footer, "INSERT · Ctrl+Enter send");
+        assert!(!footer.ends_with('·'));
     }
 
     #[test]
