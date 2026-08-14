@@ -7306,7 +7306,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bundled_agent_toggle_creates_hides_and_reopens_the_same_panel() {
+    async fn bundled_agent_toggle_focuses_new_composer_and_restores_reopened_panel() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
@@ -7326,7 +7326,7 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::RestorePanelFocus { id } if id == "agent-conversation"
+            PluginRequest::FocusTextPanelComposer { id } if id == "agent-conversation"
         ));
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
 

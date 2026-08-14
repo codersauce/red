@@ -387,8 +387,10 @@ fn toggle_conversation() {
         ensure_conversation_panel();
         if !was_created {
             render_conversation();
+            red::execute("FocusTextPanelComposer", "agent-conversation");
+        } else {
+            red::execute("RestorePanelFocus", "agent-conversation");
         }
-        red::execute("RestorePanelFocus", "agent-conversation");
     }
 }
 
