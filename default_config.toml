@@ -51,6 +51,15 @@ disabled_plugins = []
 # Remove the bundled agent plugin and reject every Codex process launch.
 disable_ai = false
 
+# Master switch for language-server diagnostics in the editor UI.
+show_diagnostics = true
+
+[diagnostics]
+# Show one severity-aware sign beside the line number. Supported icon styles
+# are "nerd_font", "unicode", "ascii", and "none".
+gutter_signs = true
+icon_style = "nerd_font"
+
 # Direct, reviewable integration with an installed Codex CLI.
 # Override `command` only when Codex is installed outside PATH.
 [agent]
@@ -122,11 +131,6 @@ visual = "default"
 visual_line = "default"
 visual_block = "default"
 waiting = "steady_underscore"
-
-# When this setting is either absent or set to true, red will show
-# diagnostics in the log file. When set to false, red will not show
-# them.
-#show_diagnostics = false 
 
 # Language servers are selected by file extension. The built-in defaults cover
 # Rust, Fish, Markdown, JavaScript/TypeScript, JSON, TOML, YAML, and Lua.

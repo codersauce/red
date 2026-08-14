@@ -82,7 +82,7 @@ use crate::{
     comment::CommentSyntax,
     config::{
         Config, ConfigDiagnostic, ConfigDiagnosticSource, ConfigRecovery, KeyAction,
-        StatuslineConfig,
+        PickerIconStyle, StatuslineConfig,
     },
     dispatcher::Dispatcher,
     highlighter::{Highlighter, LanguageRegistry},
@@ -93,8 +93,8 @@ use crate::{
         normalized_file_path as lsp_normalized_file_path, prepare_workspace_edit,
         text_edit_char_range, workspace_edit_operations, Command as LspCommand, CompletionItemKind,
         CompletionItemLabelDetails, CompletionResponse, CompletionResponseItem, Diagnostic,
-        DocumentEdit as LspDocumentEdit, Hover as LspHover, HoverContents, InboundMessage,
-        InlayHint, InsertTextFormat, Location, LspClient, MarkedString, MarkupKind,
+        DiagnosticSeverity, DocumentEdit as LspDocumentEdit, Hover as LspHover, HoverContents,
+        InboundMessage, InlayHint, InsertTextFormat, Location, LspClient, MarkedString, MarkupKind,
         OpenWorkspaceDocument, ParsedNotification, Position as LspPosition, ProgressParams,
         ProgressToken, Range, ResponseMessage, ServerCapabilities,
         ServerRequest as LspServerRequest, TextEdit as LspTextEdit,
@@ -137,6 +137,7 @@ const TERMINAL_SIZE_RECONCILE_INTERVAL: Duration = Duration::from_millis(100);
 const PLUGIN_REQUESTS_PER_TICK: usize = 64;
 const AGENT_EVENTS_PER_TICK: usize = 64;
 const GUTTER_SIGN_COLUMN_WIDTH: usize = 2;
+const DIAGNOSTIC_GUTTER_NAMESPACE: &str = "diagnostics";
 const MAX_HIGHLIGHT_SLICE_BYTES: usize = 512 * 1024;
 const MAX_PLUGIN_VIEWPORT_LINE_CHARS: usize = 64 * 1024;
 const MAX_DIRECTORY_LISTING_ENTRIES: usize = 160;
@@ -144,6 +145,65 @@ const AGENT_BRIDGE_CAPACITY: usize = 64;
 const PLUGIN_MANAGER_PICKER_ID: i32 = 9_101;
 const PLUGIN_MANAGER_ACTION_PICKER_ID: i32 = 9_102;
 const PLUGIN_MANAGER_INSTALL_PICKER_ID: i32 = 9_103;
+
+fn diagnostic_priority(severity: Option<&DiagnosticSeverity>) -> i32 {
+    match severity {
+        Some(DiagnosticSeverity::Warning) => 30,
+        Some(DiagnosticSeverity::Information) => 20,
+        Some(DiagnosticSeverity::Hint) => 15,
+        Some(DiagnosticSeverity::Error) | None => 40,
+    }
+}
+
+fn diagnostic_gutter_glyph(
+    severity: Option<&DiagnosticSeverity>,
+    icon_style: PickerIconStyle,
+) -> Option<&'static str> {
+    let glyph = match (icon_style, severity) {
+        (PickerIconStyle::None, _) => return None,
+        (PickerIconStyle::NerdFont, Some(DiagnosticSeverity::Warning)) => "",
+        (PickerIconStyle::NerdFont, Some(DiagnosticSeverity::Information)) => "",
+        (PickerIconStyle::NerdFont, Some(DiagnosticSeverity::Hint)) => "",
+        (PickerIconStyle::NerdFont, Some(DiagnosticSeverity::Error) | None) => "",
+        (PickerIconStyle::Unicode, Some(DiagnosticSeverity::Warning)) => "▲",
+        (PickerIconStyle::Unicode, Some(DiagnosticSeverity::Information)) => "ⓘ",
+        (PickerIconStyle::Unicode, Some(DiagnosticSeverity::Hint)) => "•",
+        (PickerIconStyle::Unicode, Some(DiagnosticSeverity::Error) | None) => "●",
+        (PickerIconStyle::Ascii, Some(DiagnosticSeverity::Warning)) => "W",
+        (PickerIconStyle::Ascii, Some(DiagnosticSeverity::Information)) => "I",
+        (PickerIconStyle::Ascii, Some(DiagnosticSeverity::Hint)) => "H",
+        (PickerIconStyle::Ascii, Some(DiagnosticSeverity::Error) | None) => "E",
+    };
+    Some(glyph)
+}
+
+fn diagnostic_foreground(theme: &Theme, severity: Option<&DiagnosticSeverity>) -> Option<Color> {
+    let color = |keys: &[&str]| keys.iter().find_map(|key| theme.colors.get(*key).copied());
+    match severity {
+        Some(DiagnosticSeverity::Warning) => color(&[
+            "editorWarning.foreground",
+            "list.warningForeground",
+            "terminal.ansiYellow",
+        ]),
+        Some(DiagnosticSeverity::Information) => color(&[
+            "editorInfo.foreground",
+            "notificationsInfoIcon.foreground",
+            "terminal.ansiBlue",
+        ]),
+        Some(DiagnosticSeverity::Hint) => color(&[
+            "editorHint.foreground",
+            "editorInlayHint.foreground",
+            "descriptionForeground",
+        ]),
+        Some(DiagnosticSeverity::Error) | None => color(&[
+            "editorError.foreground",
+            "errorForeground",
+            "terminal.ansiRed",
+        ])
+        .or_else(|| theme.error_style.as_ref().and_then(|style| style.fg)),
+    }
+    .or(theme.style.fg)
+}
 
 #[cfg(not(test))]
 type TerminalOutput = std::io::Stdout;
@@ -3592,6 +3652,7 @@ impl Editor {
             }
             self.lsp_coordinator.mark_document_opened(uri);
         }
+        self.sync_diagnostic_gutter_signs();
 
         let count = loaded.config.languages.len();
         self.config.languages = loaded.config.languages;
@@ -8033,6 +8094,7 @@ impl Editor {
                             "relative_line_numbers" => {
                                 json!(self.config.relative_line_numbers)
                             }
+                            "diagnostics" => json!(self.config.diagnostics),
                             "show_diagnostics" => json!(self.config.show_diagnostics),
                             "startup_file_count" => json!(self.config.startup_file_count),
                             "cwd" => json!(std::env::current_dir()
@@ -8054,6 +8116,7 @@ impl Editor {
                             "mouse_scroll_lines": self.config.mouse_scroll_lines,
                             "scrolloff": self.config.scrolloff,
                             "relative_line_numbers": self.config.relative_line_numbers,
+                            "diagnostics": self.config.diagnostics,
                             "show_diagnostics": self.config.show_diagnostics,
                             "startup_file_count": self.config.startup_file_count,
                             "cwd": std::env::current_dir().ok().map(|path| path.to_string_lossy().to_string()),
@@ -9643,6 +9706,58 @@ impl Editor {
         Ok(events)
     }
 
+    fn sync_diagnostic_gutter_signs(&mut self) -> bool {
+        if !self.config.show_diagnostics || !self.config.diagnostics.gutter_signs {
+            return self.gutter_sign_manager.clear(DIAGNOSTIC_GUTTER_NAMESPACE);
+        }
+
+        let icon_style = self.config.diagnostics.icon_style;
+        let mut signs = Vec::new();
+        for (buffer_index, buffer) in self.buffer_manager.iter().enumerate() {
+            let Some(uri) = buffer.uri().ok().flatten() else {
+                continue;
+            };
+            let Some(diagnostics) = self.diagnostics.get(&uri) else {
+                continue;
+            };
+            let mut primary_by_line = BTreeMap::<usize, &Diagnostic>::new();
+            for diagnostic in diagnostics {
+                let line = diagnostic.range.start.line;
+                if buffer.get(line).is_none() {
+                    continue;
+                }
+                let replace = primary_by_line.get(&line).is_none_or(|current| {
+                    diagnostic_priority(diagnostic.severity.as_ref())
+                        > diagnostic_priority(current.severity.as_ref())
+                });
+                if replace {
+                    primary_by_line.insert(line, diagnostic);
+                }
+            }
+            signs.extend(
+                primary_by_line
+                    .into_iter()
+                    .filter_map(|(line, diagnostic)| {
+                        let severity = diagnostic.severity.as_ref();
+                        let text = diagnostic_gutter_glyph(severity, icon_style)?.to_string();
+                        Some(plugin::GutterSign {
+                            buffer_index,
+                            line,
+                            text,
+                            style: Style {
+                                fg: diagnostic_foreground(&self.theme, severity),
+                                ..Style::default()
+                            },
+                            priority: diagnostic_priority(severity),
+                        })
+                    }),
+            );
+        }
+
+        self.gutter_sign_manager
+            .set(DIAGNOSTIC_GUTTER_NAMESPACE.to_string(), signs)
+    }
+
     fn add_diagnostics(&mut self, uri: Option<&str>, diagnostics: &[Diagnostic]) -> Option<Action> {
         let Some(uri) = uri else {
             log!("WARN: no uri provided for diagnostics - {diagnostics:?}");
@@ -9655,6 +9770,7 @@ impl Editor {
             .unwrap_or_else(|| uri.to_string());
         log!("Adding diagnostics for {uri}: {diagnostics:#?}");
         self.diagnostics.insert(uri, diagnostics.to_vec());
+        self.sync_diagnostic_gutter_signs();
 
         Some(Action::Refresh)
     }
@@ -19095,6 +19211,7 @@ impl Editor {
                 window.vx = self.vx;
             }
 
+            self.sync_diagnostic_gutter_signs();
             self.request_diagnostics().await?;
             return self.render(render_buffer);
         }
@@ -19135,6 +19252,7 @@ impl Editor {
             }
         }
 
+        self.sync_diagnostic_gutter_signs();
         self.sync_with_window();
         self.prev_highlight_y = None;
         self.request_diagnostics().await?;
@@ -19197,6 +19315,7 @@ impl Editor {
                 }
             }
         }
+        self.sync_diagnostic_gutter_signs();
         self.ensure_buffer_lsp_opened(buffer_index).await
     }
 
@@ -19396,6 +19515,7 @@ impl Editor {
         self.theme = theme;
         self.highlighter = highlighter;
         self.highlight_cache.clear();
+        self.sync_diagnostic_gutter_signs();
         self.workspace_manager
             .update_theme_with_registry(&self.theme, &self.highlighter.registry());
         self.force_full_redraw = true;
@@ -21385,6 +21505,7 @@ impl Editor {
         }
 
         self.buffer_manager.replace_buffers(restored_buffers);
+        self.sync_diagnostic_gutter_signs();
         self.lsp_coordinator.clear_opened_documents();
         self.buffer_manager.set_active_index(
             buffer_map
@@ -22402,6 +22523,7 @@ impl Editor {
                 self.lsp_coordinator.mark_document_opened(new_uri);
             }
         }
+        self.sync_diagnostic_gutter_signs();
         for index in changed {
             self.select_buffer_for_lsp_edit(index);
             if let Err(error) = self.notify_change(runtime).await {
@@ -30328,6 +30450,7 @@ builtin = "rust"
             },
             severity: Some(severity),
             code,
+            source: None,
             message: message.to_string(),
             related_information: None,
             data: None,
@@ -30420,6 +30543,204 @@ builtin = "rust"
         assert_eq!(editor.current_buffer().contents(), original);
     }
 
+    fn diagnostic_at(
+        line: usize,
+        severity: Option<DiagnosticSeverity>,
+        message: &str,
+    ) -> Diagnostic {
+        Diagnostic {
+            range: Range {
+                start: LspPosition { line, character: 0 },
+                end: LspPosition { line, character: 1 },
+            },
+            severity,
+            code: None,
+            source: None,
+            message: message.to_string(),
+            related_information: None,
+            data: None,
+            tags: None,
+        }
+    }
+
+    #[test]
+    fn diagnostic_gutter_uses_the_highest_severity_and_theme_color() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("main.rs");
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(file.to_string_lossy().into_owned()),
+            "first\nsecond".to_string(),
+        )]);
+        editor.config.show_diagnostics = true;
+        editor.config.diagnostics.icon_style = PickerIconStyle::Ascii;
+        let error_color = Color::Rgb {
+            r: 242,
+            g: 85,
+            b: 90,
+        };
+        editor
+            .theme
+            .colors
+            .insert("editorError.foreground".to_string(), error_color);
+        let uri = crate::lsp::file_uri(&file).unwrap();
+
+        editor.add_diagnostics(
+            Some(&uri),
+            &[
+                diagnostic_at(0, Some(DiagnosticSeverity::Warning), "warning"),
+                diagnostic_at(0, Some(DiagnosticSeverity::Error), "error"),
+            ],
+        );
+
+        let sign = editor
+            .gutter_sign_manager
+            .visible_sign(0, 0)
+            .expect("diagnostic sign");
+        assert_eq!(sign.text, "E");
+        assert_eq!(sign.style.fg, Some(error_color));
+
+        let mut buffer = RenderBuffer::new(60, 12, &Style::default());
+        editor.render(&mut buffer).unwrap();
+        assert_eq!(buffer.cells[0].text, "E");
+        let first_row = buffer.cells[..buffer.width]
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>();
+        assert!(first_row.contains("error"));
+        assert!(!first_row.contains("warning"));
+    }
+
+    #[test]
+    fn clearing_diagnostics_reveals_the_lower_priority_git_sign() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("main.rs");
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(file.to_string_lossy().into_owned()),
+            "value".to_string(),
+        )]);
+        editor.config.show_diagnostics = true;
+        editor.config.diagnostics.icon_style = PickerIconStyle::Ascii;
+        editor.gutter_sign_manager.set(
+            "git-signs".to_string(),
+            vec![plugin::GutterSign {
+                buffer_index: 0,
+                line: 0,
+                text: "~".to_string(),
+                style: Style::default(),
+                priority: 10,
+            }],
+        );
+        let uri = crate::lsp::file_uri(&file).unwrap();
+
+        editor.add_diagnostics(
+            Some(&uri),
+            &[diagnostic_at(
+                0,
+                Some(DiagnosticSeverity::Warning),
+                "warning",
+            )],
+        );
+        assert_eq!(
+            editor
+                .gutter_sign_manager
+                .visible_sign(0, 0)
+                .map(|sign| sign.text.as_str()),
+            Some("W")
+        );
+
+        editor.add_diagnostics(Some(&uri), &[]);
+        assert_eq!(
+            editor
+                .gutter_sign_manager
+                .visible_sign(0, 0)
+                .map(|sign| sign.text.as_str()),
+            Some("~")
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostic_signs_follow_buffer_indices_after_a_buffer_is_deleted() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first.rs");
+        let second = root.path().join("second.rs");
+        let mut editor = lsp_test_editor(vec![
+            Buffer::new(
+                Some(first.to_string_lossy().into_owned()),
+                "first".to_string(),
+            ),
+            Buffer::new(
+                Some(second.to_string_lossy().into_owned()),
+                "second".to_string(),
+            ),
+        ]);
+        editor.config.show_diagnostics = true;
+        editor.config.diagnostics.icon_style = PickerIconStyle::Ascii;
+        let second_uri = crate::lsp::file_uri(&second).unwrap();
+        editor.add_diagnostics(
+            Some(&second_uri),
+            &[diagnostic_at(
+                0,
+                Some(DiagnosticSeverity::Information),
+                "information",
+            )],
+        );
+        assert!(editor.gutter_sign_manager.visible_sign(1, 0).is_some());
+
+        let mut buffer = RenderBuffer::new(60, 12, &Style::default());
+        editor
+            .delete_current_buffer(&mut buffer, true)
+            .await
+            .unwrap();
+
+        assert_eq!(editor.buffer_manager.len(), 1);
+        assert_eq!(
+            editor
+                .gutter_sign_manager
+                .visible_sign(0, 0)
+                .map(|sign| sign.text.as_str()),
+            Some("I")
+        );
+        assert!(editor.gutter_sign_manager.visible_sign(1, 0).is_none());
+    }
+
+    #[tokio::test]
+    async fn restoring_editor_state_rebuilds_diagnostic_signs_for_replaced_buffers() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original.rs");
+        let restored = root.path().join("restored.txt");
+        std::fs::write(&original, "original").unwrap();
+        std::fs::write(&restored, "restored").unwrap();
+
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(original.to_string_lossy().into_owned()),
+            "original".to_string(),
+        )]);
+        editor.config.show_diagnostics = true;
+        editor.config.diagnostics.icon_style = PickerIconStyle::Ascii;
+        let original_uri = crate::lsp::file_uri(&original).unwrap();
+        editor.add_diagnostics(
+            Some(&original_uri),
+            &[diagnostic_at(0, Some(DiagnosticSeverity::Error), "error")],
+        );
+        assert!(editor.gutter_sign_manager.visible_sign(0, 0).is_some());
+
+        let mut restored_editor = lsp_test_editor(vec![Buffer::new(
+            Some(restored.to_string_lossy().into_owned()),
+            "restored".to_string(),
+        )]);
+        let snapshot = restored_editor.editor_state_snapshot();
+        let mut render_buffer = RenderBuffer::new(60, 12, &Style::default());
+
+        let result = editor
+            .restore_editor_state(snapshot, &mut render_buffer)
+            .await
+            .unwrap();
+
+        assert!(result.restored);
+        assert_eq!(editor.buffer_manager[0].file.as_deref(), restored.to_str());
+        assert!(editor.gutter_sign_manager.visible_sign(0, 0).is_none());
+    }
+
     #[tokio::test]
     async fn plugin_file_operations_reconcile_open_buffer_identity_without_losing_edits() {
         let root = tempfile::tempdir().unwrap();
@@ -30429,6 +30750,17 @@ builtin = "rust"
             Some(old.to_string_lossy().into_owned()),
             "unsaved contents".to_string(),
         )]);
+        editor.config.show_diagnostics = true;
+        editor.config.diagnostics.icon_style = PickerIconStyle::Ascii;
+        let old_uri = crate::lsp::file_uri(&old).unwrap();
+        editor.add_diagnostics(
+            Some(&old_uri),
+            &[diagnostic_at(
+                0,
+                Some(DiagnosticSeverity::Warning),
+                "warning",
+            )],
+        );
         editor.buffer_manager[0].dirty = true;
 
         editor
@@ -30446,6 +30778,15 @@ builtin = "rust"
         );
         assert_eq!(editor.buffer_manager[0].contents(), "unsaved contents");
         assert!(editor.buffer_manager[0].is_dirty());
+        let renamed_uri = crate::lsp::file_uri(&renamed).unwrap();
+        assert!(editor.diagnostics.contains_key(&renamed_uri));
+        assert_eq!(
+            editor
+                .gutter_sign_manager
+                .visible_sign(0, 0)
+                .map(|sign| sign.text.as_str()),
+            Some("W")
+        );
 
         editor
             .reconcile_plugin_file_operation(&plugin::filesystem::FileOperationOutcome {
@@ -30459,6 +30800,7 @@ builtin = "rust"
         assert!(editor.buffer_manager[0].file.is_none());
         assert_eq!(editor.buffer_manager[0].contents(), "unsaved contents");
         assert!(editor.buffer_manager[0].is_dirty());
+        assert!(editor.gutter_sign_manager.visible_sign(0, 0).is_none());
         assert_eq!(
             editor.last_error.as_deref(),
             Some("Removed file kept open as an unsaved scratch buffer")
