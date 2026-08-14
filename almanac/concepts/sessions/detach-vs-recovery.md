@@ -34,6 +34,8 @@ The transport is local IPC, not persistence. `src/headless/mod.rs` defines proto
 
 Recovery is written to disk under the configuration directory's `sessions/<owner>/latest.json` namespace, with separate namespaces for each editor and named detached owner [@recovery-doc]. `SessionSnapshot` is the durable schema: it stores working directory, buffers, window layout, registers, jumps, marks, undo history, agent transcript, proposal workspace, and a flag that explicitly marks agent sessions as not resumable unless negotiated [@session].
 
+Visual-selection recovery uses both marks and dedicated selection metadata. The snapshot stores special marks plus buffer-indexed last visual selections, so a recovered editor can restore `gv` shape and direction without treating the selection as live process state [@session].
+
 The entrypoint loads recovery only for `--resume`. It calls `SessionStore::load_latest_with_store`, changes to the snapshot working directory when present, reconstructs buffers from the snapshot, restores editor session state, reports disk divergence, and continues using the store that supplied the resumed snapshot [@main]. The detailed workflow belongs in [Crash recovery snapshots](../../architecture/sessions/crash-recovery-snapshots) and [Resume after crash](../../guides/sessions/resume-after-crash).
 
 ## The Boundary

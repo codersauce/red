@@ -24,9 +24,9 @@ Crash recovery snapshots are Red's disk-backed answer to losing the editor owner
 
 ## Snapshot Contents
 
-`SessionSnapshot` is a durable schema rather than an editor cache. It records the schema version, generation, working directory, capture time, open buffers, active buffer index, window layout, registers, jumps, local marks, global marks, special marks, agent transcript, proposal workspace snapshot, and whether the agent session is resumable [@session-store]. Each buffer entry stores the buffer index, canonical path when present, full in-memory contents, dirty bit, revision, cursor, viewport, undo tree, and the disk text observed at capture time [@session-store].
+`SessionSnapshot` is a durable schema rather than an editor cache. It records the schema version, generation, working directory, capture time, open buffers, active buffer index, window layout, registers, jumps, local marks, global marks, special marks, last visual selections, agent transcript, proposal workspace snapshot, and whether the agent session is resumable [@session-store]. Each buffer entry stores the buffer index, canonical path when present, full in-memory contents, dirty bit, revision, cursor, viewport, undo tree, and the disk text observed at capture time [@session-store].
 
-The editor builds the snapshot from live editor state. It synchronizes the window state, commits buffer undo transactions with the visible cursor, snapshots marks through buffer IDs, captures the agent proposal workspace, and reads the agent transcript from plugin storage [@editor-session]. On restore, Red reconstructs buffers first, then reapplies the window layout, registers, jumps, marks, agent workspace, and archived transcript warning state [@editor-session].
+The editor builds the snapshot from live editor state. It synchronizes the window state, commits buffer undo transactions with the visible cursor, snapshots marks and last-visual-selection metadata through buffer IDs, captures the agent proposal workspace, and reads the agent transcript from plugin storage [@editor-session]. On restore, Red reconstructs buffers first, then reapplies the window layout, registers, jumps, marks, last visual selections, agent workspace, and archived transcript warning state [@editor-session].
 
 ## Owner Namespaces
 
