@@ -902,7 +902,8 @@ async fn dot_repeats_linewise_paste_and_visual_block_insert() {
         .unwrap();
     type_normal_keys(&mut harness, "jIX").await;
     command_key(&mut harness, KeyCode::Esc).await;
-    type_normal_keys(&mut harness, "j.").await;
+    harness.assert_cursor_at(0, 0);
+    type_normal_keys(&mut harness, "jj.").await;
     harness.assert_buffer_contents("Xa\nXb\nXc\nXd");
 }
 
