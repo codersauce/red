@@ -1605,15 +1605,15 @@ impl PanelManager {
     }
 
     pub fn render(&self, buffer: &mut RenderBuffer, theme: &Theme) {
-        self.render_with_active_divider(buffer, theme, None, false);
+        self.render_with_active_dividers(buffer, theme, &[], false);
     }
 
-    /// Paints pane chrome while accenting only the divider captured by the editor.
-    pub(crate) fn render_with_active_divider(
+    /// Paints pane chrome while accenting the dividers captured by the editor.
+    pub(crate) fn render_with_active_dividers(
         &self,
         buffer: &mut RenderBuffer,
         theme: &Theme,
-        active_divider: Option<&str>,
+        active_dividers: &[&str],
         use_ascii: bool,
     ) {
         for placement in self.panel_placements(buffer.width, buffer.height) {
@@ -1621,7 +1621,7 @@ impl PanelManager {
                 continue;
             };
             let position = Point::new(placement.x, placement.y);
-            let is_active = active_divider == Some(placement.id.as_str());
+            let is_active = active_dividers.contains(&placement.id.as_str());
             let border_style = panel_style(theme, config.border.as_ref());
             let border_style = if is_active {
                 theme.active_divider_style(
@@ -2629,16 +2629,11 @@ mod tests {
                     RenderBuffer::new(/*width*/ 40, /*height*/ 24, &theme.style);
                 let index = divider_y * buffer.width + divider_x;
 
-                manager.render_with_active_divider(&mut buffer, &theme, None, use_ascii);
+                manager.render_with_active_dividers(&mut buffer, &theme, &[], use_ascii);
                 let inactive = buffer.cells[index].clone();
                 assert_eq!(inactive.c, ' ');
 
-                manager.render_with_active_divider(
-                    &mut buffer,
-                    &theme,
-                    Some("inspector"),
-                    use_ascii,
-                );
+                manager.render_with_active_dividers(&mut buffer, &theme, &["inspector"], use_ascii);
                 let active = &buffer.cells[index];
                 let expected = match (side, use_ascii) {
                     (PanelSide::Left | PanelSide::Right, false) => '│',
@@ -2652,7 +2647,7 @@ mod tests {
                 assert_eq!(active.style.bg, inactive.style.bg);
                 assert!(active.style.bold);
 
-                manager.render_with_active_divider(&mut buffer, &theme, None, use_ascii);
+                manager.render_with_active_dividers(&mut buffer, &theme, &[], use_ascii);
                 assert_eq!(buffer.cells[index], inactive);
             }
         }
@@ -2684,12 +2679,18 @@ mod tests {
         manager.render(&mut buffer, &theme);
         let inactive_right = buffer.cells[right].clone();
 
-        manager.render_with_active_divider(&mut buffer, &theme, Some("left"), false);
+        manager.render_with_active_dividers(&mut buffer, &theme, &["left"], false);
 
         assert_eq!(buffer.cells[left].c, '│');
         assert_eq!(buffer.cells[left].style.fg, Some(accent));
         assert!(buffer.cells[left].style.bold);
         assert_eq!(buffer.cells[right], inactive_right);
+
+        manager.render_with_active_dividers(&mut buffer, &theme, &["left", "right"], false);
+        assert_eq!(buffer.cells[left].style.fg, Some(accent));
+        assert_eq!(buffer.cells[right].style.fg, Some(accent));
+        assert!(buffer.cells[left].style.bold);
+        assert!(buffer.cells[right].style.bold);
     }
 
     #[test]
