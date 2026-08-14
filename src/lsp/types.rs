@@ -33,7 +33,7 @@ pub struct Diagnostic {
     pub severity: Option<DiagnosticSeverity>,
     pub code: Option<DiagnosticCode>,
     // pub code_description: Option<DiagnosticCodeDescription>,
-    // pub source: Option<String>,
+    pub source: Option<String>,
     pub message: String,
     pub related_information: Option<Vec<DiagnosticRelatedInformation>>,
     pub data: Option<Value>,

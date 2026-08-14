@@ -5755,8 +5755,8 @@ async fn focused_agent_panel_keeps_global_leader_until_the_composer_is_focused()
     let Some(KeyAction::Nested(leader)) = action else {
         panic!("expected Space to start the leader sequence from the conversation, got {action:?}");
     };
-    assert_eq!(leader.len(), 5);
-    for global in ["A", "?", "d", "P", "s"] {
+    assert_eq!(leader.len(), 6);
+    for global in ["A", "?", "d", "e", "P", "s"] {
         assert!(
             leader.contains_key(global),
             "global leader branch {global:?} must remain available"
