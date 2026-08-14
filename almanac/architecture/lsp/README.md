@@ -31,7 +31,7 @@ Red's LSP implementation is split between server selection, JSON-RPC transport, 
 
 Start with [Client Lifecycle And Routing](client-lifecycle-and-routing) for document selectors, workspace roots, lazy process startup, failed-client handling, and polling. Then read [Transport](transport) for JSON-RPC framing, process IO, request correlation, diagnostics debounce, and shutdown.
 
-Use [LSP Document Sync](../editor/lsp-document-sync) when a change touches lazy open, change notifications, diagnostics, path identity, or editor-side coordination. Use [Completion](completion) for request context, stale-response guards, snippet handling, UI filtering, and completion edit application.
+Use [LSP Document Sync](../editor/lsp-document-sync) when a change touches lazy open, change notifications, diagnostics, path identity, or editor-side coordination. Use [Diagnostics UI](diagnostics-ui) for the editor-owned gutter, statusline, picker, and line-popup surfaces built from LSP diagnostics. Use [Completion](completion) for request context, stale-response guards, snippet handling, UI filtering, and completion edit application.
 
 Read [Workspace Edits](workspace-edits) before changing rename, code action, resource operation, or multi-file edit behavior. It is the safety boundary that converts server edits into checked editor-owned changes.
 

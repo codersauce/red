@@ -33,6 +33,8 @@ Git and Neo-tree have an extra split. `plugins/git.hk` remains the editor-facing
 
 That split keeps public plugin compatibility small. A shell can continue to use Red events and UI calls, while pure package code can use typed data models without becoming a public host API. The user-facing host contract for plugin authors belongs in [Plugin host API](../../reference/plugins/host-api), not in the internal bridge operation names [@runtime].
 
+Neo-tree's shell also owns the user-facing create/reveal flow. A successful file create records that the result should be selected, waits for the `FileOperation` result's canonical `created` path, resets the tree through its existing reveal machinery, expands parent directories as needed, and finally calls `SelectPanelRow` for the created file [@plugins-dir] [@runtime]. Directory creation, cancelled prompts, and failed file operations clear the pending selection intent so a later refresh cannot highlight a stale row [@plugins-dir] [@runtime].
+
 ## Relationship To Runtime Assets
 
 Bundled plugins are one layer in Red's runtime asset precedence. `src/assets.rs` resolves assets from the user config directory first, then `$RED_RUNTIME`, then embedded assets; its listing code reports the winning source and lower-precedence shadows [@assets]. This means a bundled plugin is stable enough to ship in the binary, but it is not necessarily the bytes running in a development or customized profile.

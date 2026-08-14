@@ -9,6 +9,9 @@ sources:
   - id: picker
     type: file
     path: src/ui/picker.rs
+  - id: diagnostic-info
+    type: file
+    path: src/ui/diagnostic_info.rs
   - id: completion
     type: file
     path: src/ui/completion.rs
@@ -51,6 +54,10 @@ Red's modal UI components implement a common `Component` trait above the editor 
 ## Completion UI
 
 `CompletionUI` is the completion menu for LSP items. It draws rows produced by its internal renderer, moves selection with arrow keys, `Tab`, `BackTab`, `Ctrl-J`, `Ctrl-K`, and page keys, applies the selected completion on `Enter`, and can apply a completion with an LSP commit character [@completion]. When filtering leaves no selected item, `Enter` closes the dialog and inserts a newline, while `Esc` closes the dialog and enters Normal mode whether or not candidates are visible [@completion]. It returns `allows_event_passthrough() == true`, so normal typed characters and backspace can continue into editor input while the completion menu updates its filter [@completion].
+
+## Diagnostic Popup
+
+`DiagnosticInfo` is the line-diagnostics popup opened by the editor action behind `ShowLineDiagnostics`. It draws rounded dialog chrome, formats numbered diagnostics with severity-colored message spans, diagnostic codes, multiline wrapping, and related information, then handles close, scroll, resize, and theme changes through the `Component` trait [@diagnostic-info]. The [Diagnostics UI](../../architecture/lsp/diagnostics-ui) page explains how this component is fed from the editor's LSP diagnostic snapshot.
 
 ## Composer And Prompt Components
 

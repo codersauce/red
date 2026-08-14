@@ -1,6 +1,6 @@
 ---
 title: "Default Config"
-summary: "Red's default configuration defines the embedded baseline for editor behavior, keymaps, bundled plugins, LSP routing, completion, search, picker UI, cursor shapes, AI, and permissions."
+summary: "Red's default configuration defines the embedded baseline for editor behavior, keymaps, bundled plugins, LSP routing, diagnostics, completion, search, picker UI, cursor shapes, AI, and permissions."
 topics: [reference, configuration, defaults]
 sources:
   - id: defaults
@@ -37,7 +37,7 @@ The top-level schema accepts keys for editor behavior, keymaps, theme, cursor, p
 | `disabled_plugins` | `[]` | Plugin IDs removed from activation [@defaults] [@config]. |
 | `disable_ai` | `false` | When true, removes the agent plugin and rejects Codex launches [@defaults] [@config]. |
 
-`show_diagnostics` defaults to true in code, and `window_borders_ascii` defaults to false [@config]. These fields are accepted user-facing top-level fields even though the shipped default file leaves `show_diagnostics` commented [@defaults] [@config].
+`show_diagnostics` defaults to true in code and in the shipped default file, while `window_borders_ascii` defaults to false in code [@defaults] [@config]. These fields are accepted user-facing top-level fields [@config].
 
 ## Search, Completion, Picker, Statusline, Key Hints, Clipboard, And Cursor
 
@@ -47,7 +47,8 @@ The top-level schema accepts keys for editor behavior, keymaps, theme, cursor, p
 | `[completion]` | `auto_trigger = true`, `min_prefix_length = 1`, `debounce_ms = 120`, `buffer_words = true`, `max_buffer_words = 100` [@defaults] [@config]. |
 | `[picker]` | `input_position = "bottom"` [@defaults] [@config]. |
 | `[picker.icons]` | `style = "nerd_font"`, `color = true`; code also accepts `unicode`, `ascii`, and `none` icon styles [@defaults] [@config]. |
-| `[statusline]` | `left = ["mode", "git_branch", "filename"]`, `right = ["position", "syntax"]`; the configuration schema lets all 25 statusline sections move between sides [@defaults] [@config]. |
+| `[diagnostics]` | `gutter_signs = true`, `icon_style = "nerd_font"`; code also accepts `unicode`, `ascii`, and `none` icon styles for diagnostic gutter signs [@defaults] [@config]. |
+| `[statusline]` | `left = ["mode", "diagnostics", "git_branch", "filename"]`, `right = ["position", "syntax"]`; the configuration schema lets all 25 statusline sections move between sides [@defaults] [@config]. |
 | `[statusline.icons]` | `style = "nerd_font"`, `color = true`; the same `unicode`, `ascii`, and `none` icon styles are accepted for statusline icons [@defaults] [@config]. |
 | `[key_hints]` | `enabled = true`, `delay_ms = 250` [@defaults] [@config]. |
 | `[clipboard]` | Defaults are enabled, sync on yank, and sync on paste when omitted [@config]. |

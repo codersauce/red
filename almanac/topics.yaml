@@ -49,8 +49,8 @@ topics:
     parents: [configuration]
   - slug: diagnostics
     title: Diagnostics
-    description: Validation and diagnostic reporting paths for configuration, tools, and runtime checks.
-    parents: [configuration, validation]
+    description: Diagnostic reporting paths for configuration, language servers, editor UI, tools, and runtime checks.
+    parents: [configuration, validation, lsp]
   - slug: runtime
     title: Runtime
     description: Runtime behavior that crosses editor, Husk, and asset boundaries.
