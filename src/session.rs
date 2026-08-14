@@ -16,6 +16,7 @@ use std::path::Component;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    agent_conversation::AgentConversationSnapshot,
     editor::Content,
     undo::{TextPosition, UndoHistory},
     window::WindowManagerSnapshot,
@@ -108,11 +109,14 @@ pub struct SessionSnapshot {
     /// Human-readable agent transcript retained across recovery.
     #[serde(default)]
     pub agent_transcript: Option<String>,
+    /// Persisted Codex thread binding and Red's clean model-visible projection.
+    #[serde(default)]
+    pub agent_conversation: Option<AgentConversationSnapshot>,
     /// Legacy proposal payload accepted for backward-compatible loading and discarded.
     #[serde(default, rename = "agent_workspace", skip_serializing)]
     pub legacy_agent_workspace: Option<serde_json::Value>,
-    /// False means the transcript is archived context after recovery. Red never
-    /// invents Codex thread resume support that the adapter did not negotiate.
+    /// Legacy compatibility flag. New snapshots derive resumability from the
+    /// presence of [`Self::agent_conversation`].
     #[serde(default)]
     pub agent_session_resumable: bool,
     /// Opaque plugin-owned values co-snapshotted with buffers and undo history.
@@ -2285,6 +2289,7 @@ mod tests {
             special_marks: Vec::new(),
             last_visual_selections: Vec::new(),
             agent_transcript: None,
+            agent_conversation: None,
             legacy_agent_workspace: None,
             agent_session_resumable: false,
             plugin_extensions: HashMap::new(),
@@ -2312,6 +2317,22 @@ mod tests {
             encoded.get("former_plugin"),
             Some(&serde_json::json!({ "version": 1, "reviews": [1, 2] }))
         );
+    }
+
+    #[test]
+    fn persisted_agent_conversation_keeps_its_thread_binding_and_clean_messages() {
+        let mut snapshot = snapshot("source");
+        let mut conversation = AgentConversationSnapshot::new("thread-1", "/workspace");
+        conversation.append_user("turn-1", "Continue the refactor");
+        conversation.append_agent_delta("turn-1", "Done.");
+        snapshot.agent_conversation = Some(conversation.clone());
+        snapshot.agent_session_resumable = true;
+
+        let encoded = serde_json::to_vec(&snapshot).unwrap();
+        let restored: SessionSnapshot = serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(restored.agent_conversation, Some(conversation));
+        assert!(restored.agent_session_resumable);
     }
 
     #[test]

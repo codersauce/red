@@ -87,10 +87,17 @@ impl CodexProcessSpec {
 /// Commands sent from the editor owner to the Codex worker.
 #[derive(Debug, Clone)]
 pub enum CodexCommand {
-    /// Creates an ephemeral app-server thread for a workspace.
+    /// Creates a persisted app-server thread for a workspace.
     NewSession {
         /// Physical workspace root.
         cwd: PathBuf,
+    },
+    /// Rejoins a persisted app-server thread and loads its model-visible history.
+    ResumeSession {
+        /// Physical workspace root.
+        cwd: PathBuf,
+        /// Codex thread identifier stored with Red's session snapshot.
+        session_id: String,
     },
     /// Submits plain user text to a session.
     Prompt {
@@ -137,11 +144,32 @@ pub enum CodexEvent {
         /// Red session identifier.
         session_id: String,
     },
+    /// A persisted thread was rejoined and returned its model-visible history.
+    SessionRestored {
+        /// Codex thread identifier.
+        session_id: String,
+        /// Thread payload returned by `thread/resume`.
+        thread: Value,
+    },
+    /// A persisted thread could not be rejoined.
+    SessionRestoreFailed {
+        /// Requested Codex thread identifier.
+        session_id: String,
+        /// Sanitized app-server error.
+        message: String,
+    },
     /// Streamed assistant text for the active turn.
     Update {
         /// Owning session.
         session_id: String,
         /// Text delta.
+        text: String,
+    },
+    /// Final authoritative contents of an assistant message item.
+    MessageCompleted {
+        /// Owning session.
+        session_id: String,
+        /// Final text returned by `item/completed`.
         text: String,
     },
     /// Structured activity update for tool and reasoning presentation.
@@ -277,12 +305,32 @@ struct Session {
     tool_calls: usize,
 }
 
+#[derive(Debug, Clone)]
+enum SessionLaunch {
+    New,
+    Resume { session_id: String },
+}
+
 enum Pending {
-    Config { cwd: PathBuf },
-    Requirements { cwd: PathBuf, config: Value },
-    Start { cwd: PathBuf },
-    Turn { session_id: String },
-    Interrupt { session_id: String },
+    Config {
+        cwd: PathBuf,
+        launch: SessionLaunch,
+    },
+    Requirements {
+        cwd: PathBuf,
+        config: Value,
+        launch: SessionLaunch,
+    },
+    Launch {
+        cwd: PathBuf,
+        launch: SessionLaunch,
+    },
+    Turn {
+        session_id: String,
+    },
+    Interrupt {
+        session_id: String,
+    },
 }
 
 enum InternalEvent {
@@ -543,7 +591,32 @@ async fn handle_command(
     match command {
         CodexCommand::NewSession { cwd } => {
             let id = rpc_id(next_id);
-            pending.insert(id.clone(), Pending::Config { cwd: cwd.clone() });
+            pending.insert(
+                id.clone(),
+                Pending::Config {
+                    cwd: cwd.clone(),
+                    launch: SessionLaunch::New,
+                },
+            );
+            write_message(
+                input,
+                &json!({
+                    "id": id,
+                    "method": "config/read",
+                    "params": {"includeLayers": false, "cwd": cwd}
+                }),
+            )
+            .await?;
+        }
+        CodexCommand::ResumeSession { cwd, session_id } => {
+            let id = rpc_id(next_id);
+            pending.insert(
+                id.clone(),
+                Pending::Config {
+                    cwd: cwd.clone(),
+                    launch: SessionLaunch::Resume { session_id },
+                },
+            );
             write_message(
                 input,
                 &json!({
@@ -555,7 +628,16 @@ async fn handle_command(
             .await?;
         }
         CodexCommand::Prompt { session_id, text } => {
-            start_turn(session_id, text, input, events, pending, sessions, next_id).await?;
+            start_turn(
+                session_id,
+                json!([{"type": "text", "text": text}]),
+                input,
+                events,
+                pending,
+                sessions,
+                next_id,
+            )
+            .await?;
         }
         CodexCommand::PromptWithContext {
             session_id,
@@ -563,9 +645,22 @@ async fn handle_command(
             uri,
             context,
         } => {
-            let text =
-                format!("{text}\n\nActive editor context from {uri}:\n\n```text\n{context}\n```");
-            start_turn(session_id, text, input, events, pending, sessions, next_id).await?;
+            start_turn(
+                session_id,
+                json!([
+                    {"type": "text", "text": text},
+                    {
+                        "type": "text",
+                        "text": format!("Active editor context from {uri}:\n\n```text\n{context}\n```")
+                    }
+                ]),
+                input,
+                events,
+                pending,
+                sessions,
+                next_id,
+            )
+            .await?;
         }
         CodexCommand::Cancel { session_id } => {
             stop_session(session_id, false, input, events, pending, sessions, next_id).await?;
@@ -580,7 +675,7 @@ async fn handle_command(
 
 async fn start_turn(
     session_id: String,
-    text: String,
+    input_items: Value,
     input: &mut (impl AsyncWrite + Unpin),
     events: &mpsc::Sender<CodexEvent>,
     pending: &mut HashMap<String, Pending>,
@@ -616,7 +711,7 @@ async fn start_turn(
             "method": "turn/start",
             "params": {
                 "threadId": session_id,
-                "input": [{"type": "text", "text": text}],
+                "input": input_items,
                 "approvalPolicy": "never",
                 "sandboxPolicy": {
                     "type": "readOnly"
@@ -711,6 +806,28 @@ async fn handle_message<H: CodexToolHost>(
                     .ok();
             }
         }
+        "item/completed" => {
+            let params = &message["params"];
+            let session_id = params["threadId"].as_str().unwrap_or_default();
+            let turn_id = params["turnId"].as_str().unwrap_or_default();
+            let item = &params["item"];
+            let text = item["text"].as_str().unwrap_or_default();
+            if !text.is_empty()
+                && item["type"].as_str() == Some("agentMessage")
+                && sessions.get(session_id).is_some_and(|session| {
+                    session.active_turn.as_deref() == Some(turn_id)
+                        && !session.cancelled.load(Ordering::Relaxed)
+                })
+            {
+                events
+                    .send(CodexEvent::MessageCompleted {
+                        session_id: session_id.to_string(),
+                        text: text.to_string(),
+                    })
+                    .await
+                    .ok();
+            }
+        }
         "turn/completed" => {
             let params = &message["params"];
             let session_id = params["threadId"].as_str().unwrap_or_default().to_string();
@@ -780,6 +897,19 @@ async fn handle_response(
         return Ok(());
     };
     if let Some(error) = message.get("error") {
+        if let Some(session_id) = pending_resume_session_id(&request) {
+            events
+                .send(CodexEvent::SessionRestoreFailed {
+                    session_id: session_id.to_string(),
+                    message: error["message"]
+                        .as_str()
+                        .unwrap_or("Codex thread could not be restored")
+                        .to_string(),
+                })
+                .await
+                .ok();
+            return Ok(());
+        }
         let session_id = match &request {
             Pending::Turn { session_id } | Pending::Interrupt { session_id } => {
                 Some(session_id.clone())
@@ -799,48 +929,57 @@ async fn handle_response(
         return Ok(());
     }
     match request {
-        Pending::Config { cwd } => {
+        Pending::Config { cwd, launch } => {
             let Some(config) = restricted_config(&message) else {
-                events
-                    .send(CodexEvent::Failed {
-                        session_id: None,
-                        message: "Codex could not restrict configured tools".to_string(),
-                    })
-                    .await
-                    .ok();
+                send_launch_failure(events, &launch, "Codex could not restrict configured tools")
+                    .await;
                 return Ok(());
             };
             let id = rpc_id(next_id);
-            pending.insert(id.clone(), Pending::Requirements { cwd, config });
+            pending.insert(
+                id.clone(),
+                Pending::Requirements {
+                    cwd,
+                    config,
+                    launch,
+                },
+            );
             write_message(
                 input,
                 &json!({"id": id, "method": "configRequirements/read"}),
             )
             .await?;
         }
-        Pending::Requirements { cwd, mut config } => {
+        Pending::Requirements {
+            cwd,
+            mut config,
+            launch,
+        } => {
             let Some(hooks_enabled) = required_hooks_mode(&message) else {
-                events
-                    .send(CodexEvent::Failed {
-                        session_id: None,
-                        message: "Managed Codex requirements prevent an agent-edit session"
-                            .to_string(),
-                    })
-                    .await
-                    .ok();
+                send_launch_failure(
+                    events,
+                    &launch,
+                    "Managed Codex requirements prevent an agent-edit session",
+                )
+                .await;
                 return Ok(());
             };
             config["features"]["hooks"] = json!(hooks_enabled);
             let id = rpc_id(next_id);
-            pending.insert(id.clone(), Pending::Start { cwd: cwd.clone() });
-            write_message(
-                input,
-                &json!({
+            pending.insert(
+                id.clone(),
+                Pending::Launch {
+                    cwd: cwd.clone(),
+                    launch: launch.clone(),
+                },
+            );
+            let request = match launch {
+                SessionLaunch::New => json!({
                     "id": id,
                     "method": "thread/start",
                     "params": {
                         "cwd": cwd,
-                        "ephemeral": true,
+                        "ephemeral": false,
                         "approvalPolicy": "never",
                         "sandbox": "read-only",
                         "environments": [],
@@ -850,16 +989,45 @@ async fn handle_response(
                         "serviceName": "red"
                     }
                 }),
-            )
-            .await?;
+                SessionLaunch::Resume { session_id } => json!({
+                    "id": id,
+                    "method": "thread/resume",
+                    "params": {
+                        "threadId": session_id,
+                        "cwd": cwd,
+                        "approvalPolicy": "never",
+                        "sandbox": "read-only",
+                        "config": config,
+                        "baseInstructions": INSTRUCTIONS
+                    }
+                }),
+            };
+            write_message(input, &request).await?;
         }
-        Pending::Start { cwd } => {
+        Pending::Launch { cwd, launch } => {
             let session_id = message
                 .pointer("/result/thread/id")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            if session_id.is_empty() {
+            let expected_session_id = match &launch {
+                SessionLaunch::New => None,
+                SessionLaunch::Resume { session_id } => Some(session_id.as_str()),
+            };
+            if session_id.is_empty()
+                || expected_session_id.is_some_and(|expected| expected != session_id)
+            {
+                if let SessionLaunch::Resume { session_id } = launch {
+                    events
+                        .send(CodexEvent::SessionRestoreFailed {
+                            session_id,
+                            message: "Codex returned a different thread during restoration"
+                                .to_string(),
+                        })
+                        .await
+                        .ok();
+                    return Ok(());
+                }
                 events
                     .send(CodexEvent::Failed {
                         session_id: None,
@@ -877,10 +1045,26 @@ async fn handle_response(
                         tool_calls: 0,
                     },
                 );
-                events
-                    .send(CodexEvent::SessionCreated { session_id })
-                    .await
-                    .ok();
+                match launch {
+                    SessionLaunch::New => {
+                        events
+                            .send(CodexEvent::SessionCreated { session_id })
+                            .await
+                            .ok();
+                    }
+                    SessionLaunch::Resume { .. } => {
+                        events
+                            .send(CodexEvent::SessionRestored {
+                                session_id,
+                                thread: message
+                                    .pointer("/result/thread")
+                                    .cloned()
+                                    .unwrap_or_else(|| json!({})),
+                            })
+                            .await
+                            .ok();
+                    }
+                }
             }
         }
         Pending::Turn { session_id } => {
@@ -898,6 +1082,37 @@ async fn handle_response(
         }
     }
     Ok(())
+}
+
+fn pending_resume_session_id(request: &Pending) -> Option<&str> {
+    let launch = match request {
+        Pending::Config { launch, .. }
+        | Pending::Requirements { launch, .. }
+        | Pending::Launch { launch, .. } => launch,
+        Pending::Turn { .. } | Pending::Interrupt { .. } => return None,
+    };
+    match launch {
+        SessionLaunch::New => None,
+        SessionLaunch::Resume { session_id } => Some(session_id),
+    }
+}
+
+async fn send_launch_failure(
+    events: &mpsc::Sender<CodexEvent>,
+    launch: &SessionLaunch,
+    message: &str,
+) {
+    let event = match launch {
+        SessionLaunch::New => CodexEvent::Failed {
+            session_id: None,
+            message: message.to_string(),
+        },
+        SessionLaunch::Resume { session_id } => CodexEvent::SessionRestoreFailed {
+            session_id: session_id.clone(),
+            message: message.to_string(),
+        },
+    };
+    events.send(event).await.ok();
 }
 
 async fn handle_tool_call<H: CodexToolHost>(

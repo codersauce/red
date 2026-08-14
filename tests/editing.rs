@@ -1401,6 +1401,14 @@ async fn crash_recovery_keeps_transcript_in_memory_when_preferences_are_unsafe()
     let mut source = EditorHarness::with_config(buffer, default_key_config());
     let mut snapshot = source.editor.test_session_snapshot();
     snapshot.agent_transcript = Some("You: recover me\nAgent: retained\n".to_string());
+    let mut conversation = red::agent_conversation::AgentConversationSnapshot::new(
+        "thread-recoverable",
+        temp.path().to_string_lossy(),
+    );
+    conversation.append_user("turn-1", "recover me");
+    conversation.append_agent_delta("turn-1", "retained");
+    snapshot.agent_conversation = Some(conversation.clone());
+    snapshot.agent_session_resumable = true;
     let restored_buffers = Editor::buffers_from_session_snapshot(&snapshot);
     let preferences = PreferencesStore::load(&preferences_path);
     let mut editor = Editor::with_size_and_preferences(
@@ -1424,6 +1432,7 @@ async fn crash_recovery_keeps_transcript_in_memory_when_preferences_are_unsafe()
         recovered.agent_transcript.as_deref(),
         Some("You: recover me\nAgent: retained\n")
     );
+    assert_eq!(recovered.agent_conversation, Some(conversation));
     assert_eq!(recovered.buffers[0].contents, "recovered text\n");
     assert_eq!(fs::read_to_string(outside).unwrap(), "outside secret");
     let restored = EditorHarness { editor };

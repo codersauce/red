@@ -7,6 +7,7 @@ use std::{
 };
 
 use crate::{
+    agent_conversation::AgentConversationSnapshot,
     agent_tools::{PendingEditorTool, PendingEditorToolResponse},
     codex::CodexBridge,
 };
@@ -25,6 +26,8 @@ pub struct AgentManager {
     active_sessions: HashSet<String>,
     active_turn_ids: HashMap<String, String>,
     turn_started_at: HashMap<String, Instant>,
+    conversation: Option<AgentConversationSnapshot>,
+    forgotten_conversations: HashSet<String>,
 }
 
 impl AgentManager {
@@ -191,6 +194,98 @@ impl AgentManager {
     pub fn clear_turns(&mut self) {
         self.turn_started_at.clear();
     }
+
+    pub fn begin_conversation(&mut self, thread_id: impl Into<String>, cwd: &Path) {
+        let thread_id = thread_id.into();
+        self.forgotten_conversations.remove(&thread_id);
+        self.conversation = Some(AgentConversationSnapshot::new(
+            thread_id,
+            cwd.to_string_lossy(),
+        ));
+    }
+
+    pub fn restore_conversation(&mut self, conversation: AgentConversationSnapshot) {
+        self.root = Some(PathBuf::from(&conversation.cwd));
+        self.conversation = Some(conversation);
+    }
+
+    pub fn reconcile_conversation(
+        &mut self,
+        thread_id: &str,
+        cwd: &Path,
+        thread: &serde_json::Value,
+    ) -> Option<&AgentConversationSnapshot> {
+        let cached = self
+            .conversation
+            .take()
+            .filter(|conversation| conversation.thread_id == thread_id)
+            .unwrap_or_else(|| AgentConversationSnapshot::new(thread_id, cwd.to_string_lossy()));
+        self.conversation = Some(cached.reconciled_with_thread(thread));
+        self.conversation.as_ref()
+    }
+
+    pub fn conversation_snapshot(&self) -> Option<AgentConversationSnapshot> {
+        self.conversation.clone()
+    }
+
+    pub fn forget_conversation(&mut self, session_id: &str) {
+        self.forgotten_conversations.insert(session_id.to_string());
+        if self
+            .conversation
+            .as_ref()
+            .is_some_and(|conversation| conversation.thread_id == session_id)
+        {
+            self.conversation = None;
+        }
+    }
+
+    pub fn take_forgotten_conversation(&mut self, session_id: &str) -> bool {
+        self.forgotten_conversations.remove(session_id)
+    }
+
+    pub fn record_user_message(&mut self, session_id: &str, turn_id: &str, text: &str) {
+        if let Some(conversation) = self
+            .conversation
+            .as_mut()
+            .filter(|conversation| conversation.thread_id == session_id)
+        {
+            conversation.append_user(turn_id, text);
+        }
+    }
+
+    pub fn record_agent_delta(&mut self, session_id: &str, text: &str) {
+        let Some(turn_id) = self.active_turn_ids.get(session_id) else {
+            return;
+        };
+        if let Some(conversation) = self
+            .conversation
+            .as_mut()
+            .filter(|conversation| conversation.thread_id == session_id)
+        {
+            conversation.append_agent_delta(turn_id, text);
+        }
+    }
+
+    pub fn complete_agent_message(&mut self, session_id: &str, text: &str) {
+        let Some(turn_id) = self.active_turn_ids.get(session_id) else {
+            return;
+        };
+        let Some(conversation) = self
+            .conversation
+            .as_mut()
+            .filter(|conversation| conversation.thread_id == session_id)
+        else {
+            return;
+        };
+        if let Some(item) = conversation.items.iter_mut().rev().find(|item| {
+            item.role == crate::agent_conversation::AgentTranscriptRole::Agent
+                && item.turn_id.as_deref() == Some(turn_id)
+        }) {
+            item.text = text.to_string();
+        } else {
+            conversation.append_agent_delta(turn_id, text);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -198,12 +293,19 @@ mod tests {
     use super::AgentManager;
     use crate::agent_tools::PendingEditorToolResponse;
     use serde_json::json;
-    use std::time::{Duration, Instant};
+    use std::{
+        path::Path,
+        time::{Duration, Instant},
+    };
 
     #[test]
     fn owns_session_and_turn_lifecycle() {
         let mut manager = AgentManager::new();
+        manager.begin_conversation("session-1", Path::new("/workspace"));
         manager.mark_session_active("session-1");
+        manager.set_turn_id("session-1", "turn-1");
+        manager.record_user_message("session-1", "turn-1", "Question");
+        manager.record_agent_delta("session-1", "Answer");
         manager.record_turn_start("session-1");
 
         assert!(manager.is_session_active("session-1"));
@@ -211,6 +313,14 @@ mod tests {
 
         manager.mark_session_inactive("session-1");
         assert!(!manager.is_session_active("session-1"));
+        let conversation = manager.conversation_snapshot().unwrap();
+        assert_eq!(conversation.items.len(), 2);
+        assert_eq!(conversation.items[1].text, "Answer");
+
+        manager.forget_conversation("session-1");
+        assert!(manager.conversation_snapshot().is_none());
+        assert!(manager.take_forgotten_conversation("session-1"));
+        assert!(!manager.take_forgotten_conversation("session-1"));
     }
 
     #[tokio::test]

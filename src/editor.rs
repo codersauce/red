@@ -1102,9 +1102,24 @@ fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
             "agent:session_created",
             json!({ "session_id": session_id.to_string() }),
         ),
+        CodexEvent::SessionRestored { session_id, thread } => (
+            "agent:session_restored",
+            json!({ "session_id": session_id, "thread": plugin_json(thread) }),
+        ),
+        CodexEvent::SessionRestoreFailed {
+            session_id,
+            message,
+        } => (
+            "agent:session_restore_failed",
+            json!({ "session_id": session_id, "message": message }),
+        ),
         CodexEvent::Update { session_id, text } => (
             "agent:update",
             json!({ "session_id": session_id.to_string(), "text": text }),
+        ),
+        CodexEvent::MessageCompleted { session_id, text } => (
+            "agent:message_completed",
+            json!({ "session_id": session_id, "text": text }),
         ),
         CodexEvent::Activity { session_id, update } => (
             "agent:activity",
@@ -1303,6 +1318,10 @@ pub enum PluginRequest {
     AgentNewSession {
         cwd: PathBuf,
     },
+    AgentResumeSession {
+        cwd: PathBuf,
+        session_id: String,
+    },
     AgentPrompt {
         session_id: String,
         text: String,
@@ -1320,6 +1339,9 @@ pub enum PluginRequest {
         session_id: String,
     },
     AgentArchiveSession {
+        session_id: String,
+    },
+    AgentForgetSession {
         session_id: String,
     },
     AgentPermissionResponse {
@@ -1677,11 +1699,13 @@ impl PluginRequest {
         match self {
             Self::Action(_) => "Action",
             Self::AgentNewSession { .. } => "AgentNewSession",
+            Self::AgentResumeSession { .. } => "AgentResumeSession",
             Self::AgentPrompt { .. } => "AgentPrompt",
             Self::AgentPromptWithContext { .. } => "AgentPromptWithContext",
             Self::AgentCancel { .. } => "AgentCancel",
             Self::AgentCloseSession { .. } => "AgentCloseSession",
             Self::AgentArchiveSession { .. } => "AgentArchiveSession",
+            Self::AgentForgetSession { .. } => "AgentForgetSession",
             Self::AgentPermissionResponse { .. } => "AgentPermissionResponse",
             Self::EditHistory { .. } => "EditHistory",
             Self::EditorInfo(_) => "EditorInfo",
@@ -2919,20 +2943,7 @@ impl DetachedEditorCore {
             .plugin_registry
             .notify(&mut runtime, "editor:ready", json!({}))
             .await?;
-        if let Some(transcript) = editor
-            .preferences
-            .plugin_storage("agent", &scoped_plugin_storage_key("agent", "transcript"))
-            .and_then(Value::as_str)
-        {
-            editor
-                .plugin_registry
-                .notify(
-                    &mut runtime,
-                    "agent:transcript_restored",
-                    json!({ "transcript": transcript }),
-                )
-                .await?;
-        }
+        editor.restore_agent_plugin_state(&mut runtime).await?;
         editor.ensure_current_buffer_lsp_opened().await?;
         let mut render_buffer = RenderBuffer::new(
             editor.size.0 as usize,
@@ -7091,6 +7102,8 @@ impl Editor {
         let turn_id = uuid::Uuid::new_v4().to_string();
         self.agent_manager
             .set_turn_id(session_id.clone(), turn_id.clone());
+        self.agent_manager
+            .record_user_message(&session_id, &turn_id, &text);
         self.plugin_registry
             .notify(
                 runtime,
@@ -7179,19 +7192,7 @@ impl Editor {
             self.plugin_registry
                 .notify(&mut runtime, "editor:ready", json!({}))
                 .await?;
-            if let Some(transcript) = self
-                .preferences
-                .plugin_storage("agent", &scoped_plugin_storage_key("agent", "transcript"))
-                .and_then(Value::as_str)
-            {
-                self.plugin_registry
-                    .notify(
-                        &mut runtime,
-                        "agent:transcript_restored",
-                        json!({ "transcript": transcript }),
-                    )
-                    .await?;
-            }
+            self.restore_agent_plugin_state(&mut runtime).await?;
             drop(plugin_startup);
         }
 
@@ -7315,6 +7316,82 @@ impl Editor {
         self.agent_manager.set_root(None);
     }
 
+    fn ensure_agent_bridge(&mut self, cwd: &Path) -> anyhow::Result<()> {
+        if self.config.disable_ai {
+            anyhow::bail!("agent support is disabled by `disable_ai = true`");
+        }
+        let cwd = cwd.absolutize()?.into_owned();
+        if let Some(root) = self.agent_manager.root() {
+            anyhow::ensure!(
+                root == cwd,
+                "Codex session root `{}` does not match the active agent workspace `{}`",
+                cwd.display(),
+                root.display()
+            );
+        }
+        if self.agent_manager.has_bridge() {
+            return Ok(());
+        }
+        let configured = self.config.agent.command.as_deref().unwrap_or("codex");
+        let command = crate::codex::find_executable(configured).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Codex CLI was not found; install Codex, run `codex login`, and try again"
+            )
+        })?;
+        let mut spec =
+            CodexProcessSpec::new(command, cwd.clone()).args(self.config.agent.args.clone());
+        spec.environment.extend(
+            self.config
+                .agent
+                .env
+                .clone()
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into())),
+        );
+        let capacity =
+            NonZeroUsize::new(AGENT_BRIDGE_CAPACITY).expect("agent bridge capacity is non-zero");
+        let (tool_sender, tool_requests) = editor_tool_channel(AGENT_BRIDGE_CAPACITY);
+        let host = EditorToolHost::new(tool_sender);
+        let (bridge, task) = start_codex(spec, host, capacity)?;
+        self.agent_manager.set_root(Some(cwd));
+        self.agent_manager.set_bridge(bridge);
+        self.agent_manager.set_task(task);
+        self.agent_manager.set_tool_requests(tool_requests);
+        Ok(())
+    }
+
+    async fn restore_agent_plugin_state(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
+        if let Some(conversation) = self.agent_manager.conversation_snapshot() {
+            let event = if self.agent_manager.has_bridge() {
+                "agent:session_restored"
+            } else {
+                "agent:conversation_restore_pending"
+            };
+            self.plugin_registry
+                .notify(
+                    runtime,
+                    event,
+                    plugin_json(serde_json::to_value(conversation)?),
+                )
+                .await?;
+            return Ok(());
+        }
+        if let Some(transcript) = self
+            .preferences
+            .plugin_storage("agent", &scoped_plugin_storage_key("agent", "transcript"))
+            .and_then(Value::as_str)
+        {
+            self.plugin_registry
+                .notify(
+                    runtime,
+                    "agent:transcript_restored",
+                    json!({ "transcript": transcript }),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn finish_agent_bridge(&mut self, fallback: &str) -> String {
         let result = match self.agent_manager.take_task() {
             Some(task) => Some(task.await),
@@ -7424,6 +7501,56 @@ impl Editor {
             else {
                 break;
             };
+            match &event {
+                CodexEvent::SessionCreated { session_id } => {
+                    let root = self
+                        .agent_manager
+                        .root()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_default();
+                    self.agent_manager.begin_conversation(session_id, &root);
+                }
+                CodexEvent::SessionRestored { session_id, thread } => {
+                    if self.agent_manager.take_forgotten_conversation(session_id) {
+                        if let Some(bridge) = self.agent_manager.bridge() {
+                            let _ = bridge.try_send(CodexCommand::CloseSession {
+                                session_id: session_id.clone(),
+                            });
+                        }
+                        continue;
+                    }
+                    let root = self
+                        .agent_manager
+                        .root()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_default();
+                    let conversation = self
+                        .agent_manager
+                        .reconcile_conversation(session_id, &root, thread)
+                        .cloned();
+                    if let Some(conversation) = conversation {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:session_restored",
+                                plugin_json(serde_json::to_value(conversation)?),
+                            )
+                            .await?;
+                    }
+                    continue;
+                }
+                CodexEvent::Update { session_id, text }
+                    if self.agent_manager.is_session_active(session_id) =>
+                {
+                    self.agent_manager.record_agent_delta(session_id, text);
+                }
+                CodexEvent::MessageCompleted { session_id, text }
+                    if self.agent_manager.is_session_active(session_id) =>
+                {
+                    self.agent_manager.complete_agent_message(session_id, text);
+                }
+                _ => {}
+            }
             if let CodexEvent::Completed { session_id, .. }
             | CodexEvent::Failed {
                 session_id: Some(session_id),
@@ -7433,7 +7560,9 @@ impl Editor {
                 self.agent_manager.mark_session_inactive(session_id);
             }
             match &event {
-                CodexEvent::Update { session_id, .. } | CodexEvent::Activity { session_id, .. }
+                CodexEvent::Update { session_id, .. }
+                | CodexEvent::MessageCompleted { session_id, .. }
+                | CodexEvent::Activity { session_id, .. }
                     if !self.agent_manager.is_session_active(session_id) =>
                 {
                     continue;
@@ -7482,9 +7611,20 @@ impl Editor {
             let message = self
                 .finish_agent_bridge("Codex app-server stopped unexpectedly")
                 .await;
-            self.plugin_registry
-                .notify(runtime, "agent:session_lost", json!({ "message": message }))
-                .await?;
+            if let Some(conversation) = self.agent_manager.conversation_snapshot() {
+                self.plugin_registry
+                    .notify(
+                        runtime,
+                        "agent:conversation_restore_pending",
+                        plugin_json(serde_json::to_value(conversation)?),
+                    )
+                    .await?;
+                self.last_error = Some(format!("{message}; restoring the persisted agent session"));
+            } else {
+                self.plugin_registry
+                    .notify(runtime, "agent:session_lost", json!({ "message": message }))
+                    .await?;
+            }
         }
 
         let completion_changed = if self
@@ -7621,72 +7761,7 @@ impl Editor {
                             .notify(runtime, "agent:session_lost", json!({ "message": message }))
                             .await?;
                     }
-                    let result = if self.config.disable_ai {
-                        Err(anyhow::anyhow!(
-                            "agent support is disabled by `disable_ai = true`"
-                        ))
-                    } else if let Some(error) = self.agent_manager.root().and_then(|root| {
-                        match cwd.absolutize() {
-                            Ok(cwd) if root == cwd.as_ref() => None,
-                            Ok(cwd) => Some(anyhow::anyhow!(
-                                "Codex session root `{}` does not match the active agent workspace `{}`",
-                                cwd.display(),
-                                root.display()
-                            )),
-                            Err(error) => Some(anyhow::Error::new(error)),
-                        }
-                    }) {
-                        Err(error)
-                    } else if !self.agent_manager.has_bridge() {
-                            let configured = self
-                                .config
-                                .agent
-                                .command
-                                .as_deref()
-                                .unwrap_or("codex");
-                            let command = crate::codex::find_executable(configured).ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "Codex CLI was not found; install Codex, run `codex login`, and try again"
-                                )
-                            });
-                            match command {
-                                Ok(command) => {
-                                    let start = (|| -> anyhow::Result<_> {
-                                        let mut spec = CodexProcessSpec::new(command, cwd.clone())
-                                            .args(self.config.agent.args.clone());
-                                        spec.environment.extend(
-                                            self.config
-                                                .agent
-                                                .env
-                                                .clone()
-                                                .into_iter()
-                                                .map(|(key, value)| (key.into(), value.into())),
-                                        );
-                                        let capacity = NonZeroUsize::new(AGENT_BRIDGE_CAPACITY)
-                                            .expect("agent bridge capacity is non-zero");
-                                        let (tool_sender, tool_requests) =
-                                            editor_tool_channel(AGENT_BRIDGE_CAPACITY);
-                                        let host = EditorToolHost::new(tool_sender);
-                                        let spawned = start_codex(spec, host, capacity)?;
-                                        self.agent_manager.set_root(Some(cwd.clone()));
-                                        Ok((spawned, tool_requests))
-                                    })();
-                                    match start {
-                                        Ok(((bridge, task), tool_requests)) => {
-                                            self.agent_manager.set_bridge(bridge);
-                                            self.agent_manager.set_task(task);
-                                            self.agent_manager.set_tool_requests(tool_requests);
-                                            Ok(())
-                                        }
-                                        Err(error) => Err(error),
-                                    }
-                                }
-                                Err(error) => Err(error),
-                            }
-                    } else {
-                        Ok(())
-                    };
-                    if let Err(error) = result {
+                    if let Err(error) = self.ensure_agent_bridge(&cwd) {
                         self.plugin_registry
                             .notify(
                                 runtime,
@@ -7707,6 +7782,50 @@ impl Editor {
                             .await;
                         self.plugin_registry
                             .notify(runtime, "agent:session_lost", json!({ "message": message }))
+                            .await?;
+                    }
+                }
+                PluginRequest::AgentResumeSession { cwd, session_id } => {
+                    if self.agent_manager.is_task_finished() {
+                        let _ = self
+                            .finish_agent_bridge("Codex app-server stopped before restoration")
+                            .await;
+                    }
+                    if let Err(error) = self.ensure_agent_bridge(&cwd) {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:session_restore_failed",
+                                json!({
+                                    "session_id": session_id,
+                                    "message": error.to_string()
+                                }),
+                            )
+                            .await?;
+                        continue;
+                    }
+                    let Some(bridge) = self.agent_manager.bridge() else {
+                        continue;
+                    };
+                    if bridge
+                        .send(CodexCommand::ResumeSession {
+                            cwd,
+                            session_id: session_id.clone(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        let message = self
+                            .finish_agent_bridge(
+                                "Codex app-server stopped while restoring the session",
+                            )
+                            .await;
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:session_restore_failed",
+                                json!({ "session_id": session_id, "message": message }),
+                            )
                             .await?;
                     }
                 }
@@ -7770,6 +7889,10 @@ impl Editor {
                 }
                 PluginRequest::AgentArchiveSession { session_id } => {
                     self.agent_manager.mark_session_inactive(&session_id);
+                }
+                PluginRequest::AgentForgetSession { session_id } => {
+                    self.agent_manager.mark_session_inactive(&session_id);
+                    self.agent_manager.forget_conversation(&session_id);
                 }
                 PluginRequest::AgentPermissionResponse {
                     request_id,
@@ -21097,6 +21220,9 @@ impl Editor {
         }
         self.agent_manager
             .set_root(Some(PathBuf::from(snapshot.cwd.clone())));
+        if let Some(conversation) = snapshot.agent_conversation.clone() {
+            self.agent_manager.restore_conversation(conversation);
+        }
         if let Err(error) = self
             .preferences
             .merge_plugin_storage_snapshot(&snapshot.plugin_extensions)
@@ -21166,7 +21292,7 @@ impl Editor {
             } else {
                 true
             };
-            if !snapshot.agent_session_resumable {
+            if snapshot.agent_conversation.is_none() && !snapshot.agent_session_resumable {
                 self.last_error = Some(if transcript_persisted {
                     "Recovered agent transcript as archived context; start a new session to continue"
                         .to_string()
@@ -21336,6 +21462,8 @@ impl Editor {
             .plugin_storage("agent", &scoped_plugin_storage_key("agent", "transcript"))
             .and_then(Value::as_str)
             .map(str::to_string);
+        let agent_conversation = self.agent_manager.conversation_snapshot();
+        let agent_session_resumable = agent_conversation.is_some();
 
         (
             SessionSnapshot {
@@ -21362,8 +21490,9 @@ impl Editor {
                 special_marks,
                 last_visual_selections,
                 agent_transcript,
+                agent_conversation,
                 legacy_agent_workspace: None,
-                agent_session_resumable: false,
+                agent_session_resumable,
                 plugin_extensions: self.preferences.plugin_storage_snapshot(),
                 legacy_extensions: std::collections::BTreeMap::new(),
             },

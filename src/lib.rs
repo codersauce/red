@@ -14,6 +14,7 @@
 #![recursion_limit = "256"]
 
 pub mod agent_check;
+pub mod agent_conversation;
 pub mod agent_tools;
 pub mod assets;
 pub mod buffer;

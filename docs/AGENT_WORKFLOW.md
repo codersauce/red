@@ -30,7 +30,7 @@ command = "/path/to/codex"
 
 Open a workspace, press `Space A` (or run `:Agent`), type a request, and press
 Enter. Red lazily starts `codex app-server --stdio`, initializes the connection,
-checks the account, starts an ephemeral thread, and submits turns with
+checks the account, starts a persisted thread, and submits turns with
 `turn/start`. Follow-up text and the busy indicator render before dispatch;
 follow-ups submitted during an active turn appear immediately and remain queued
 in FIFO order. Assistant deltas stream into the conversation footer. `Ctrl-c`
@@ -41,6 +41,16 @@ Install or update Codex, run `codex login`, then retry without retyping.
 
 The app-server process is owned by the detachable editor core, so disconnecting
 and reattaching does not intentionally replace a healthy process.
+
+Red snapshots the Codex thread ID together with a structured, clean projection
+of the model-visible user and assistant messages. After an owner or machine
+restart, the Agent composer remains disabled while Red starts a replacement
+app-server and calls `thread/resume`. The returned turns reconcile the panel to
+the history Codex actually loaded; Red's projection keeps injected editor
+context out of the visible user message. If the persisted thread is missing or
+cannot be loaded, Red marks the transcript as archived and makes the next prompt
+start a new thread with bounded recovered context instead of pretending the old
+session is live.
 
 ## Followed editing
 
@@ -97,8 +107,9 @@ queues, and callback duration are bounded. Oversized or malformed frames stop
 the Codex runtime without being rendered into the terminal.
 
 App-server stderr is isolated from the TUI. Structured failures appear in the
-conversation and status line. A stopped process preserves the submitted prompt
-for retry.
+conversation and status line. A stopped process is restarted and the persisted
+thread is resumed when possible; otherwise the transcript becomes explicit
+archived context and the submitted prompt remains available for retry.
 
 Dynamic tools are part of Codex app-server's experimental capability surface.
 Red pins a minimum tested CLI version and fails closed when the required
