@@ -1959,6 +1959,7 @@ mod test {
         let diag = &msg.diagnostics[0];
         let code = diag.code.as_ref().unwrap();
         assert_eq!(code.as_string(), "dead_code");
+        assert_eq!(diag.source.as_deref(), Some("rustc"));
     }
 
     #[tokio::test]

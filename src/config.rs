@@ -3606,7 +3606,7 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
     }
 
     #[test]
-    fn default_config_maps_ctrl_t_to_lsp_document_symbols() {
+    fn default_config_maps_lsp_navigation_and_actions() {
         let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
 
         assert_eq!(
@@ -3642,6 +3642,14 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
             Some(&KeyAction::Single(Action::PluginCommand(
                 "LspReferences".to_string()
             )))
+        );
+        assert_eq!(
+            leader.get("d"),
+            Some(&KeyAction::Single(Action::OpenDiagnosticsPicker))
+        );
+        assert_eq!(
+            leader.get("e"),
+            Some(&KeyAction::Single(Action::OpenErrorDiagnosticsPicker))
         );
         assert_eq!(
             leader.get("f"),

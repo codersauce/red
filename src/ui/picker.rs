@@ -17,7 +17,7 @@ use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
     cmp::Reverse,
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io::{self, BufRead as _, BufReader, Read as _, Seek as _, SeekFrom},
     path::PathBuf,
     sync::Arc,
@@ -313,6 +313,7 @@ pub struct Picker {
     preview_scroll: isize,
     preview_highlighter: PreviewHighlighter,
     preview_text_cache: RefCell<VecDeque<Arc<CachedLocationPreview>>>,
+    location_preview_overrides: HashMap<String, Arc<CachedLocationPreview>>,
     history_key: Option<String>,
     history: Vec<String>,
     history_navigation: Option<PickerHistoryNavigation>,
@@ -480,6 +481,7 @@ impl Picker {
             preview_scroll: 0,
             preview_highlighter: PreviewHighlighter::new(&editor.theme, editor.language_registry()),
             preview_text_cache: RefCell::new(VecDeque::new()),
+            location_preview_overrides: HashMap::new(),
             history_key: None,
             history: Vec::new(),
             history_navigation: None,
@@ -1148,6 +1150,13 @@ impl Picker {
                     "peekViewResult.fileForeground",
                 ])
                 .or_else(|| Some(self.theme.ui_style.picker_prompt.clone())),
+            "hint" => self
+                .color_style(&[
+                    "editorHint.foreground",
+                    "notificationsInfoIcon.foreground",
+                    "editorInfo.foreground",
+                ])
+                .or_else(|| Some(self.theme.ui_style.muted.clone())),
             "gitbranch" | "gitremote" => self
                 .color_style(&[
                     "gitDecoration.submoduleResourceForeground",
@@ -2097,6 +2106,9 @@ impl Picker {
         preview_scroll: isize,
         preview_height: usize,
     ) -> Arc<CachedLocationPreview> {
+        if let Some(preview) = self.location_preview_overrides.get(path) {
+            return Arc::clone(preview);
+        }
         let metadata = std::fs::metadata(path).ok();
         let modified = metadata
             .as_ref()
@@ -2554,6 +2566,9 @@ fn unicode_picker_kind_icon(kind: &str) -> &'static str {
         "Preferred" | "Proceed" | "Success" | "Added" | "Created" | "Staged" => "✓",
         "Warning" | "Warn" | "Modified" | "Permission" | "Amend" => "⚠",
         "Error" | "Failed" | "Deleted" | "Conflict" | "Destructive" => "✗",
+        "Info" => "ℹ",
+        "Hint" => "◆",
+        "Diagnostic" => "●",
         "Cancel" | "Close" => "×",
         "GitCommit" => "●",
         "GitBranch" => "⌁",
@@ -2604,6 +2619,9 @@ fn nerd_font_picker_kind_icon(kind: &str) -> &'static str {
         "Preferred" | "Proceed" | "Success" | "Added" | "Created" | "Staged" => "",
         "Warning" | "Warn" | "Modified" | "Permission" | "Amend" => "",
         "Error" | "Failed" | "Deleted" | "Conflict" | "Destructive" => "",
+        "Info" => "",
+        "Hint" => "",
+        "Diagnostic" => "",
         "Cancel" | "Close" => "󰅖",
         "GitCommit" => "",
         "GitBranch" => "",
@@ -2639,6 +2657,9 @@ fn ascii_picker_kind_icon(kind: &str) -> &'static str {
         "Preferred" | "Proceed" | "Success" | "Added" | "Created" | "Staged" => "+",
         "Warning" | "Warn" | "Modified" | "Permission" | "Amend" => "!",
         "Error" | "Failed" | "Deleted" | "Conflict" | "Destructive" => "x",
+        "Info" => "i",
+        "Hint" => "h",
+        "Diagnostic" => "d",
         "Cancel" | "Close" => "x",
         "GitCommit" => "o",
         "GitBranch" => "b",
@@ -3264,6 +3285,7 @@ pub struct PickerBuilder {
     status: Option<String>,
     busy: bool,
     history_key: Option<String>,
+    location_preview_contents: HashMap<String, String>,
     content_sizing: Option<PickerContentSizing>,
     status_on_query_line: bool,
 }
@@ -3289,6 +3311,7 @@ impl PickerBuilder {
             status: None,
             busy: false,
             history_key: None,
+            location_preview_contents: HashMap::new(),
             content_sizing: None,
             status_on_query_line: false,
         }
@@ -3371,6 +3394,12 @@ impl PickerBuilder {
         self
     }
 
+    /// Uses editor snapshots instead of disk contents for matching location previews.
+    pub(crate) fn location_preview_contents(mut self, contents: HashMap<String, String>) -> Self {
+        self.location_preview_contents = contents;
+        self
+    }
+
     /// Fits an editor-owned picker to its rows while retaining a bounded, readable width.
     pub(crate) fn content_sized(mut self, max_width: usize, max_rows: usize) -> Self {
         self.content_sizing = Some(PickerContentSizing {
@@ -3412,6 +3441,7 @@ impl PickerBuilder {
         let status = self.status;
         let busy = self.busy;
         let history_key = self.history_key;
+        let location_preview_contents = self.location_preview_contents;
         let content_sizing = self.content_sizing;
         let status_on_query_line = self.status_on_query_line;
 
@@ -3434,6 +3464,25 @@ impl PickerBuilder {
             let history = editor.picker_history(&history_key).to_vec();
             picker.set_history(history_key, history);
         }
+        picker.location_preview_overrides = location_preview_contents
+            .into_iter()
+            .map(|(path, contents)| {
+                let text = Arc::<str>::from(contents);
+                let preview = Arc::new(CachedLocationPreview {
+                    path: path.clone(),
+                    modified: None,
+                    len: u64::try_from(text.len()).unwrap_or(u64::MAX),
+                    line_starts: preview_line_starts(&text),
+                    text,
+                    first_line: 0,
+                    source_offset: 0,
+                    requested_start: 0,
+                    requested_height: 0,
+                    complete: true,
+                });
+                (path, preview)
+            })
+            .collect();
         picker.content_sizing = content_sizing;
         picker.status_on_query_line = status_on_query_line;
         picker.resize_to_viewport(editor.vwidth(), editor.vheight());
@@ -3444,15 +3493,20 @@ impl PickerBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
     };
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use serde_json::json;
 
-    use super::{picker_file_icon, picker_file_icon_color, PickerFilterHighlights};
+    use super::{
+        picker_file_icon, picker_file_icon_color, picker_kind_icon, PickerFilterHighlights,
+    };
     use crate::{
         buffer::Buffer,
         color::{contrast_ratio, Color},
@@ -4529,6 +4583,31 @@ mod tests {
         assert_eq!(border.style.fg, Some(border_fg));
         assert_eq!(prompt.style.fg, Some(prompt_fg));
         assert_eq!(picker.dialog.style.bg, Some(popup_bg));
+    }
+
+    #[test]
+    fn location_preview_can_use_an_unsaved_buffer_snapshot() {
+        let editor = test_editor();
+        let path = "/tmp/red-unsaved-preview.py".to_string();
+        let contents = "value = 'unsaved'\n".to_string();
+        let picker = Picker::builder()
+            .structured_items(vec![dynamic_item("diagnostic", "diagnostic")])
+            .location_preview_contents(HashMap::from([(path.clone(), contents.clone())]))
+            .build(&editor);
+
+        let preview = picker.location_preview(&path, Some(0), 0, 10);
+
+        assert_eq!(preview.text.as_ref(), contents);
+        assert!(preview.complete);
+        assert_eq!(preview.first_line, 0);
+    }
+
+    #[test]
+    fn diagnostic_kinds_have_icons_in_every_visible_icon_style() {
+        assert_eq!(picker_kind_icon("Info", PickerIconStyle::Unicode), "ℹ");
+        assert_eq!(picker_kind_icon("Hint", PickerIconStyle::NerdFont), "");
+        assert_eq!(picker_kind_icon("Diagnostic", PickerIconStyle::Ascii), "d");
+        assert_eq!(picker_kind_icon("Error", PickerIconStyle::None), "");
     }
 
     #[test]

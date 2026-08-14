@@ -3163,6 +3163,7 @@ mod tests {
             },
             severity: None,
             code: None,
+            source: None,
             message: message.to_string(),
             related_information: None,
             data: None,

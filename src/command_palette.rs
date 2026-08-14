@@ -751,6 +751,24 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Action::MaximizeWindow,
         ),
         builtin(
+            "lsp.diagnostics",
+            "Diagnostics",
+            "LSP",
+            "Browse all known language-server diagnostics",
+            None,
+            &["problems", "warnings", "errors"],
+            Action::OpenDiagnosticsPicker,
+        ),
+        builtin(
+            "lsp.errors",
+            "Errors",
+            "LSP",
+            "Browse language-server errors",
+            None,
+            &["problems", "diagnostics"],
+            Action::OpenErrorDiagnosticsPicker,
+        ),
+        builtin(
             "lsp.definition",
             "Go to definition",
             "LSP",
@@ -994,6 +1012,8 @@ fn action_label(action: &Action) -> String {
     match action {
         Action::CommandPalette => "All commands".to_string(),
         Action::ConfigDiagnostics => "Configuration diagnostics".to_string(),
+        Action::OpenDiagnosticsPicker => "Diagnostics".to_string(),
+        Action::OpenErrorDiagnosticsPicker => "Errors".to_string(),
         Action::OpenStatuslineManager => "Configure status line".to_string(),
         Action::PluginCommand(name) => humanize_identifier(name),
         Action::Save => "Save file".to_string(),
@@ -1059,7 +1079,6 @@ fn group_label(prefix: &[String], key: &str) -> String {
     match (prefix.as_str(), display_key(key)) {
         ("Space", "h") => "Git hunks".to_string(),
         ("Space", "c") => "Commit message".to_string(),
-        ("Space", "d") => "Debug".to_string(),
         (_, "Ctrl-w") => "Windows".to_string(),
         (_, "g") => "Go to".to_string(),
         (_, "z") => "View".to_string(),
@@ -1149,6 +1168,20 @@ mod tests {
             .shortcuts
             .iter()
             .any(|shortcut| shortcut == "Space f"));
+
+        let diagnostics = entries
+            .iter()
+            .find(|entry| entry.id == "lsp.diagnostics")
+            .unwrap();
+        assert_eq!(diagnostics.action, Action::OpenDiagnosticsPicker);
+        assert_eq!(diagnostics.shortcuts, ["Space d"]);
+
+        let errors = entries
+            .iter()
+            .find(|entry| entry.id == "lsp.errors")
+            .unwrap();
+        assert_eq!(errors.action, Action::OpenErrorDiagnosticsPicker);
+        assert_eq!(errors.shortcuts, ["Space e"]);
 
         let save = entries
             .iter()
@@ -1469,6 +1502,12 @@ mod tests {
         assert!(hints
             .iter()
             .any(|hint| hint.key == "a" && hint.label == "Select all"));
+        assert!(hints
+            .iter()
+            .any(|hint| { hint.key == "d" && hint.label == "Diagnostics" && !hint.is_group }));
+        assert!(hints
+            .iter()
+            .any(|hint| hint.key == "e" && hint.label == "Errors" && !hint.is_group));
     }
 
     #[test]

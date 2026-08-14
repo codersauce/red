@@ -17,6 +17,7 @@
 
 mod agent_manager;
 mod buffer_manager;
+mod diagnostics_picker;
 mod display_layout;
 mod lsp_coordinator;
 pub(crate) mod perf;
@@ -1937,6 +1938,8 @@ pub enum Action {
     OpenSyntaxPicker,
     SetSyntax(String),
     OpenStatuslineManager,
+    OpenDiagnosticsPicker,
+    OpenErrorDiagnosticsPicker,
     PreviewStatuslineLayout(StatuslineConfig),
     SaveStatuslineLayout(StatuslineConfig),
     CancelStatuslineLayout(StatuslineConfig),
@@ -11304,6 +11307,8 @@ impl Editor {
             | Action::FilePicker
             | Action::CommandPalette
             | Action::OpenStatuslineManager
+            | Action::OpenDiagnosticsPicker
+            | Action::OpenErrorDiagnosticsPicker
             | Action::ConfigDiagnostics
             | Action::Suspend
             | Action::ViewLogs
@@ -17408,6 +17413,16 @@ impl Editor {
             Action::OpenStatuslineManager => {
                 self.release_current_dialog_callbacks(runtime);
                 self.current_dialog = Some(Box::new(StatuslineLayoutPanel::new(self)));
+                self.render(buffer)?;
+            }
+            Action::OpenDiagnosticsPicker => {
+                self.release_current_dialog_callbacks(runtime);
+                self.open_diagnostics_picker(diagnostics_picker::DiagnosticFilter::All);
+                self.render(buffer)?;
+            }
+            Action::OpenErrorDiagnosticsPicker => {
+                self.release_current_dialog_callbacks(runtime);
+                self.open_diagnostics_picker(diagnostics_picker::DiagnosticFilter::Errors);
                 self.render(buffer)?;
             }
             Action::PreviewStatuslineLayout(statusline) => {

@@ -358,6 +358,8 @@ Esc = { EnterMode = "Normal" }
 "t" = { PluginCommand = "ThemeBrowser" }
 "w" = { PluginCommand = "LspWorkspaceSymbols" }
 "k" = { PluginCommand = "LspReferences" }
+"d" = "OpenDiagnosticsPicker"
+"e" = "OpenErrorDiagnosticsPicker"
 "f" = "FormatDocument"
 "." = "CodeAction"
 "r" = "StartRename"
@@ -366,14 +368,6 @@ Esc = { EnterMode = "Normal" }
 "?" = "CommandPalette"
 "h" = { "s" = { PluginCommand = "GitHunkStage" }, "u" = { PluginCommand = "GitHunkUnstage" }, "r" = { PluginCommand = "GitHunkReset" } }
 "c" = { "c" = { PluginCommand = "GitSubmitMessage" }, "q" = { PluginCommand = "GitCancelMessage" } }
-
-[keys.normal." "."d"]
-"b" = "DumpBuffer"
-"i" = "DumpDiagnostics"
-"c" = "DumpCapabilities"
-"h" = "DumpHistory"
-"l" = "ViewLogs"
-"p" = "ListPlugins"
 
 [keys.normal."d"]
 "d" = "DeleteCurrentLine"
