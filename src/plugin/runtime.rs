@@ -8610,6 +8610,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_plugin_restores_every_turn_in_a_multi_turn_transcript() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        runtime
+            .notify(
+                "agent:transcript_restored",
+                serde_json::json!({
+                    "transcript": concat!(
+                        "You: first question\n",
+                        "Agent: first answer\n",
+                        "You: second question\n",
+                        "Agent: second answer\n",
+                        "You: third question\n",
+                        "Agent: third answer\n",
+                        "You: fourth question\n",
+                        "Agent: fourth answer\n",
+                    )
+                }),
+            )
+            .await
+            .unwrap();
+
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdateTextPanel { id, blocks } => {
+                assert_eq!(id, "agent-conversation");
+                assert_eq!(blocks.len(), 8);
+                assert_eq!(blocks[0].text, "first question");
+                assert_eq!(blocks[1].text, "first answer");
+                assert_eq!(blocks[6].text, "fourth question");
+                assert_eq!(blocks[7].text, "fourth answer");
+            }
+            _ => panic!("expected restored text panel update"),
+        }
+    }
+
+    #[tokio::test]
     async fn pinned_example_plugin_typechecks_and_activates() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
