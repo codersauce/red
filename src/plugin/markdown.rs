@@ -44,6 +44,15 @@ pub(crate) struct RenderedTextSpan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RenderedTextLine {
     pub(crate) spans: Vec<RenderedTextSpan>,
+    pub(crate) break_after: RenderedTextLineBreak,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RenderedTextLineBreak {
+    Soft,
+    SoftSpace,
+    #[default]
+    Hard,
 }
 
 impl RenderedTextLine {
@@ -55,6 +64,7 @@ impl RenderedTextLine {
                 syntax_style: None,
                 link: None,
             }],
+            break_after: RenderedTextLineBreak::Hard,
         }
     }
 
@@ -206,7 +216,10 @@ impl<'a> MarkdownRenderer<'a> {
                 self.blank_line();
                 let (prefix, _) = self.take_prefixes();
                 let rule_width = self.width.saturating_sub(spans_width(&prefix));
-                let mut line = RenderedTextLine { spans: prefix };
+                let mut line = RenderedTextLine {
+                    spans: prefix,
+                    break_after: RenderedTextLineBreak::Hard,
+                };
                 push_span(
                     &mut line.spans,
                     "─".repeat(rule_width),
@@ -535,7 +548,10 @@ impl<'a> MarkdownRenderer<'a> {
         if self.lines.is_empty() || self.lines.last().is_some_and(RenderedTextLine::is_empty) {
             return;
         }
-        self.lines.push(RenderedTextLine { spans: Vec::new() });
+        self.lines.push(RenderedTextLine {
+            spans: Vec::new(),
+            break_after: RenderedTextLineBreak::Hard,
+        });
     }
 }
 
@@ -696,6 +712,7 @@ fn wrap_spans(
     if tokens.is_empty() {
         return vec![RenderedTextLine {
             spans: fit_prefix(first_prefix, width),
+            break_after: RenderedTextLineBreak::Hard,
         }];
     }
 
@@ -718,7 +735,14 @@ fn wrap_spans(
         let available = width.saturating_sub(prefix_width).max(1);
         let space_width = usize::from(pending_space.is_some() && content_width > 0);
         if content_width > 0 && content_width + space_width + token.width > available {
-            lines.push(RenderedTextLine { spans: prefix });
+            lines.push(RenderedTextLine {
+                spans: prefix,
+                break_after: if pending_space.is_some() {
+                    RenderedTextLineBreak::SoftSpace
+                } else {
+                    RenderedTextLineBreak::Soft
+                },
+            });
             prefix = fit_prefix(continuation_prefix, width.saturating_sub(1));
             content_width = 0;
             pending_space = None;
@@ -750,7 +774,10 @@ fn wrap_spans(
                 let prefix_width = spans_width(&prefix).saturating_sub(content_width);
                 let available = width.saturating_sub(prefix_width).max(1);
                 if content_width > 0 && content_width + grapheme_width > available {
-                    lines.push(RenderedTextLine { spans: prefix });
+                    lines.push(RenderedTextLine {
+                        spans: prefix,
+                        break_after: RenderedTextLineBreak::Soft,
+                    });
                     prefix = fit_prefix(continuation_prefix, width.saturating_sub(1));
                     content_width = 0;
                 }
@@ -780,7 +807,10 @@ fn wrap_spans(
             }
         }
     }
-    lines.push(RenderedTextLine { spans: prefix });
+    lines.push(RenderedTextLine {
+        spans: prefix,
+        break_after: RenderedTextLineBreak::Hard,
+    });
     lines
 }
 
@@ -802,7 +832,10 @@ fn wrap_verbatim(
             let prefix_width = spans_width(&current).saturating_sub(content_width);
             let available = width.saturating_sub(prefix_width).max(1);
             if content_width > 0 && content_width + grapheme_width > available {
-                lines.push(RenderedTextLine { spans: current });
+                lines.push(RenderedTextLine {
+                    spans: current,
+                    break_after: RenderedTextLineBreak::Soft,
+                });
                 current = fit_prefix(continuation_prefix, width.saturating_sub(1));
                 content_width = 0;
             }
@@ -831,7 +864,10 @@ fn wrap_verbatim(
             }
         }
     }
-    lines.push(RenderedTextLine { spans: current });
+    lines.push(RenderedTextLine {
+        spans: current,
+        break_after: RenderedTextLineBreak::Hard,
+    });
     lines
 }
 
@@ -939,7 +975,10 @@ fn render_table(
             TextPanelSpanStyle::Muted,
         );
     }
-    lines.push(RenderedTextLine { spans: separator });
+    lines.push(RenderedTextLine {
+        spans: separator,
+        break_after: RenderedTextLineBreak::Hard,
+    });
     for row in &table.rows {
         push_table_row(
             &mut lines,
@@ -1026,7 +1065,10 @@ fn push_table_row(
                 push_span(&mut output, " ".repeat(right), TextPanelSpanStyle::Text);
             }
         }
-        lines.push(RenderedTextLine { spans: output });
+        lines.push(RenderedTextLine {
+            spans: output,
+            break_after: RenderedTextLineBreak::Hard,
+        });
     }
 }
 
@@ -1093,7 +1135,10 @@ fn render_table_records(
                 "─".repeat(remaining),
                 TextPanelSpanStyle::Muted,
             );
-            lines.push(RenderedTextLine { spans: separator });
+            lines.push(RenderedTextLine {
+                spans: separator,
+                break_after: RenderedTextLineBreak::Hard,
+            });
         }
     }
     lines

@@ -37,7 +37,9 @@ pub(crate) fn paint_rich_text(
 mod tests {
     use crate::{
         editor::RenderBuffer,
-        plugin::markdown::{RenderedTextLine, RenderedTextSpan, TextPanelSpanStyle},
+        plugin::markdown::{
+            RenderedTextLine, RenderedTextLineBreak, RenderedTextSpan, TextPanelSpanStyle,
+        },
         theme::Style,
     };
 
@@ -62,6 +64,7 @@ mod tests {
                     link: None,
                 },
             ],
+            break_after: RenderedTextLineBreak::Hard,
         };
 
         paint_rich_text(&mut buffer, 1, 0, 5, &line, |_| style.clone());
