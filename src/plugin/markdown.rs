@@ -27,6 +27,14 @@ pub(crate) enum TextPanelSpanStyle {
     Muted,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TextPanelSpanSelection {
+    #[default]
+    Content,
+    Chrome,
+    CopySeparator(String),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CodeBlockChrome {
     Framed,
@@ -39,11 +47,29 @@ pub(crate) struct RenderedTextSpan {
     pub(crate) style: TextPanelSpanStyle,
     pub(crate) syntax_style: Option<Style>,
     pub(crate) link: Option<TextPanelLink>,
+    pub(crate) selection: TextPanelSpanSelection,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RenderedTextLine {
     pub(crate) spans: Vec<RenderedTextSpan>,
+    pub(crate) break_after: RenderedTextLineBreak,
+    pub(crate) selection: TextPanelLineSelection,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TextPanelLineSelection {
+    #[default]
+    Semantic,
+    Chrome,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RenderedTextLineBreak {
+    Soft,
+    SoftSpace,
+    #[default]
+    Hard,
 }
 
 impl RenderedTextLine {
@@ -54,7 +80,24 @@ impl RenderedTextLine {
                 style,
                 syntax_style: None,
                 link: None,
+                selection: TextPanelSpanSelection::Content,
             }],
+            break_after: RenderedTextLineBreak::Hard,
+            selection: TextPanelLineSelection::Semantic,
+        }
+    }
+
+    pub(crate) fn chrome(text: String, style: TextPanelSpanStyle) -> Self {
+        Self {
+            spans: vec![RenderedTextSpan {
+                text,
+                style,
+                syntax_style: None,
+                link: None,
+                selection: TextPanelSpanSelection::Chrome,
+            }],
+            break_after: RenderedTextLineBreak::Hard,
+            selection: TextPanelLineSelection::Chrome,
         }
     }
 
@@ -206,8 +249,12 @@ impl<'a> MarkdownRenderer<'a> {
                 self.blank_line();
                 let (prefix, _) = self.take_prefixes();
                 let rule_width = self.width.saturating_sub(spans_width(&prefix));
-                let mut line = RenderedTextLine { spans: prefix };
-                push_span(
+                let mut line = RenderedTextLine {
+                    spans: prefix,
+                    break_after: RenderedTextLineBreak::Hard,
+                    selection: TextPanelLineSelection::Chrome,
+                };
+                push_chrome_span(
                     &mut line.spans,
                     "─".repeat(rule_width),
                     TextPanelSpanStyle::Muted,
@@ -227,7 +274,7 @@ impl<'a> MarkdownRenderer<'a> {
             Tag::Heading { .. } => {
                 self.flush_current();
                 self.blank_line();
-                self.append("▍ ", TextPanelSpanStyle::Heading);
+                self.append_chrome("▍ ", TextPanelSpanStyle::Heading);
                 self.styles.push(TextPanelSpanStyle::Heading);
             }
             Tag::BlockQuote(_) => {
@@ -261,6 +308,7 @@ impl<'a> MarkdownRenderer<'a> {
                         style: TextPanelSpanStyle::Muted,
                         syntax_style: None,
                         link: None,
+                        selection: TextPanelSpanSelection::Chrome,
                     }];
                     self.lines
                         .extend(wrap_spans(&spans, self.width, &prefix, &continuation));
@@ -354,19 +402,26 @@ impl<'a> MarkdownRenderer<'a> {
                 let (_, continuation) = self.take_prefixes();
                 let mut code_prefix = continuation.clone();
                 if self.code_block_chrome == CodeBlockChrome::Framed {
-                    push_span(
+                    push_chrome_span(
                         &mut code_prefix,
                         "│ ".to_string(),
                         TextPanelSpanStyle::Muted,
                     );
                 }
                 for spans in code_lines {
+                    let semantic_blank = spans.iter().all(|span| span.text.is_empty());
+                    let first_line = self.lines.len();
                     self.lines.extend(wrap_verbatim(
                         &spans,
                         self.width,
                         &code_prefix,
                         &code_prefix,
                     ));
+                    if semantic_blank {
+                        for line in &mut self.lines[first_line..] {
+                            line.selection = TextPanelLineSelection::Semantic;
+                        }
+                    }
                 }
                 if self.code_block_chrome == CodeBlockChrome::Framed {
                     let (_, continuation) = self.take_prefixes();
@@ -376,6 +431,7 @@ impl<'a> MarkdownRenderer<'a> {
                             style: TextPanelSpanStyle::Muted,
                             syntax_style: None,
                             link: None,
+                            selection: TextPanelSpanSelection::Chrome,
                         }],
                         self.width,
                         &continuation,
@@ -450,6 +506,13 @@ impl<'a> MarkdownRenderer<'a> {
         self.append_with_link(text, style, self.links.last().cloned().flatten());
     }
 
+    fn append_chrome(&mut self, text: &str, style: TextPanelSpanStyle) {
+        if text.is_empty() {
+            return;
+        }
+        push_chrome_span(&mut self.current, text.to_string(), style);
+    }
+
     fn append_linkified(&mut self, text: &str, style: TextPanelSpanStyle) {
         if let Some(link) = self.links.last().cloned().flatten() {
             self.append_with_link(text, style, Some(link));
@@ -507,8 +570,8 @@ impl<'a> MarkdownRenderer<'a> {
         let mut first = Vec::new();
         let mut continuation = Vec::new();
         for _ in 0..self.quote_depth {
-            push_span(&mut first, "│ ".to_string(), TextPanelSpanStyle::Quote);
-            push_span(
+            push_chrome_span(&mut first, "│ ".to_string(), TextPanelSpanStyle::Quote);
+            push_chrome_span(
                 &mut continuation,
                 "│ ".to_string(),
                 TextPanelSpanStyle::Quote,
@@ -522,7 +585,7 @@ impl<'a> MarkdownRenderer<'a> {
                 item.continuation.clone()
             };
             push_span(&mut first, prefix, TextPanelSpanStyle::User);
-            push_span(
+            push_chrome_span(
                 &mut continuation,
                 item.continuation.clone(),
                 TextPanelSpanStyle::Text,
@@ -535,7 +598,11 @@ impl<'a> MarkdownRenderer<'a> {
         if self.lines.is_empty() || self.lines.last().is_some_and(RenderedTextLine::is_empty) {
             return;
         }
-        self.lines.push(RenderedTextLine { spans: Vec::new() });
+        self.lines.push(RenderedTextLine {
+            spans: Vec::new(),
+            break_after: RenderedTextLineBreak::Hard,
+            selection: TextPanelLineSelection::Semantic,
+        });
     }
 }
 
@@ -567,6 +634,7 @@ fn linkified_spans(
             style,
             syntax_style: None,
             link: None,
+            selection: TextPanelSpanSelection::Content,
         }];
     }
     linkify_source_locations(text)
@@ -589,6 +657,7 @@ fn linkified_spans(
                 },
                 syntax_style: None,
                 link,
+                selection: TextPanelSpanSelection::Content,
             }
         })
         .collect()
@@ -694,8 +763,11 @@ fn wrap_spans(
     }
     let tokens = styled_tokens(spans);
     if tokens.is_empty() {
+        let spans = fit_prefix(first_prefix, width);
         return vec![RenderedTextLine {
-            spans: fit_prefix(first_prefix, width),
+            selection: line_selection(&spans),
+            spans,
+            break_after: RenderedTextLineBreak::Hard,
         }];
     }
 
@@ -707,10 +779,14 @@ fn wrap_spans(
     for token in tokens {
         if token.whitespace {
             if content_width > 0 {
-                pending_space = token
-                    .spans
-                    .first()
-                    .map(|span| (span.style, span.syntax_style.clone(), span.link.clone()));
+                pending_space = token.spans.first().map(|span| {
+                    (
+                        span.style,
+                        span.syntax_style.clone(),
+                        span.link.clone(),
+                        span.selection.clone(),
+                    )
+                });
             }
             continue;
         }
@@ -718,14 +794,30 @@ fn wrap_spans(
         let available = width.saturating_sub(prefix_width).max(1);
         let space_width = usize::from(pending_space.is_some() && content_width > 0);
         if content_width > 0 && content_width + space_width + token.width > available {
-            lines.push(RenderedTextLine { spans: prefix });
+            let selection = line_selection(&prefix);
+            lines.push(RenderedTextLine {
+                spans: prefix,
+                break_after: if pending_space.is_some() {
+                    RenderedTextLineBreak::SoftSpace
+                } else {
+                    RenderedTextLineBreak::Soft
+                },
+                selection,
+            });
             prefix = fit_prefix(continuation_prefix, width.saturating_sub(1));
             content_width = 0;
             pending_space = None;
         }
-        if let Some((style, syntax_style, link)) = pending_space.take() {
+        if let Some((style, syntax_style, link, selection)) = pending_space.take() {
             if content_width > 0 {
-                push_rendered_span(&mut prefix, " ".to_string(), style, syntax_style, link);
+                push_rendered_span(
+                    &mut prefix,
+                    " ".to_string(),
+                    style,
+                    syntax_style,
+                    link,
+                    selection,
+                );
                 content_width += 1;
             }
         }
@@ -739,6 +831,7 @@ fn wrap_spans(
                     span.style,
                     span.syntax_style,
                     span.link,
+                    span.selection,
                 );
             }
             content_width += token.width;
@@ -750,7 +843,12 @@ fn wrap_spans(
                 let prefix_width = spans_width(&prefix).saturating_sub(content_width);
                 let available = width.saturating_sub(prefix_width).max(1);
                 if content_width > 0 && content_width + grapheme_width > available {
-                    lines.push(RenderedTextLine { spans: prefix });
+                    let selection = line_selection(&prefix);
+                    lines.push(RenderedTextLine {
+                        spans: prefix,
+                        break_after: RenderedTextLineBreak::Soft,
+                        selection,
+                    });
                     prefix = fit_prefix(continuation_prefix, width.saturating_sub(1));
                     content_width = 0;
                 }
@@ -765,6 +863,7 @@ fn wrap_spans(
                         span.style,
                         span.syntax_style.clone(),
                         span.link.clone(),
+                        span.selection.clone(),
                     );
                     content_width += 1;
                 } else {
@@ -774,13 +873,19 @@ fn wrap_spans(
                         span.style,
                         span.syntax_style.clone(),
                         span.link.clone(),
+                        span.selection.clone(),
                     );
                     content_width += grapheme_width;
                 }
             }
         }
     }
-    lines.push(RenderedTextLine { spans: prefix });
+    let selection = line_selection(&prefix);
+    lines.push(RenderedTextLine {
+        spans: prefix,
+        break_after: RenderedTextLineBreak::Hard,
+        selection,
+    });
     lines
 }
 
@@ -802,7 +907,12 @@ fn wrap_verbatim(
             let prefix_width = spans_width(&current).saturating_sub(content_width);
             let available = width.saturating_sub(prefix_width).max(1);
             if content_width > 0 && content_width + grapheme_width > available {
-                lines.push(RenderedTextLine { spans: current });
+                let selection = line_selection(&current);
+                lines.push(RenderedTextLine {
+                    spans: current,
+                    break_after: RenderedTextLineBreak::Soft,
+                    selection,
+                });
                 current = fit_prefix(continuation_prefix, width.saturating_sub(1));
                 content_width = 0;
             }
@@ -817,6 +927,7 @@ fn wrap_verbatim(
                     span.style,
                     span.syntax_style.clone(),
                     span.link.clone(),
+                    span.selection.clone(),
                 );
                 content_width += 1;
             } else {
@@ -826,12 +937,18 @@ fn wrap_verbatim(
                     span.style,
                     span.syntax_style.clone(),
                     span.link.clone(),
+                    span.selection.clone(),
                 );
                 content_width += grapheme_width;
             }
         }
     }
-    lines.push(RenderedTextLine { spans: current });
+    let selection = line_selection(&current);
+    lines.push(RenderedTextLine {
+        spans: current,
+        break_after: RenderedTextLineBreak::Hard,
+        selection,
+    });
     lines
 }
 
@@ -857,6 +974,7 @@ fn styled_tokens(spans: &[RenderedTextSpan]) -> Vec<StyledToken> {
                     span.style,
                     span.syntax_style.clone(),
                     span.link.clone(),
+                    span.selection.clone(),
                 );
                 token.width += display_width(grapheme);
             }
@@ -931,15 +1049,19 @@ fn render_table(
     let mut separator = fit_prefix(continuation_prefix, width);
     for (index, column_width) in widths.iter().enumerate() {
         if index > 0 {
-            push_span(&mut separator, " ".repeat(gap), TextPanelSpanStyle::Muted);
+            push_chrome_span(&mut separator, " ".repeat(gap), TextPanelSpanStyle::Muted);
         }
-        push_span(
+        push_chrome_span(
             &mut separator,
             "━".repeat(*column_width),
             TextPanelSpanStyle::Muted,
         );
     }
-    lines.push(RenderedTextLine { spans: separator });
+    lines.push(RenderedTextLine {
+        spans: separator,
+        break_after: RenderedTextLineBreak::Hard,
+        selection: TextPanelLineSelection::Chrome,
+    });
     for row in &table.rows {
         push_table_row(
             &mut lines,
@@ -976,6 +1098,7 @@ fn push_table_row(
                     style: default_style,
                     syntax_style: None,
                     link: None,
+                    selection: TextPanelSpanSelection::Content,
                 }]
             } else if cell.spans.is_empty() {
                 vec![RenderedTextSpan {
@@ -983,6 +1106,7 @@ fn push_table_row(
                     style: default_style,
                     syntax_style: None,
                     link: None,
+                    selection: TextPanelSpanSelection::Content,
                 }]
             } else {
                 cell.spans.clone()
@@ -999,7 +1123,12 @@ fn push_table_row(
         };
         for (column, column_width) in widths.iter().enumerate() {
             if column > 0 {
-                push_span(&mut output, "  ".to_string(), TextPanelSpanStyle::Muted);
+                push_copy_separator(
+                    &mut output,
+                    "  ".to_string(),
+                    "\t",
+                    TextPanelSpanStyle::Muted,
+                );
             }
             let spans = wrapped[column]
                 .get(row_line)
@@ -1012,7 +1141,7 @@ fn push_table_row(
                 Alignment::Right => (remaining, 0),
                 Alignment::Left | Alignment::None => (0, remaining),
             };
-            push_span(&mut output, " ".repeat(left), TextPanelSpanStyle::Text);
+            push_chrome_span(&mut output, " ".repeat(left), TextPanelSpanStyle::Text);
             for span in spans {
                 push_rendered_span(
                     &mut output,
@@ -1020,13 +1149,19 @@ fn push_table_row(
                     span.style,
                     span.syntax_style.clone(),
                     span.link.clone(),
+                    span.selection.clone(),
                 );
             }
             if column + 1 < widths.len() {
-                push_span(&mut output, " ".repeat(right), TextPanelSpanStyle::Text);
+                push_chrome_span(&mut output, " ".repeat(right), TextPanelSpanStyle::Text);
             }
         }
-        lines.push(RenderedTextLine { spans: output });
+        let selection = line_selection(&output);
+        lines.push(RenderedTextLine {
+            spans: output,
+            break_after: RenderedTextLineBreak::Hard,
+            selection,
+        });
     }
 }
 
@@ -1056,6 +1191,7 @@ fn render_table_records(
                     style: TextPanelSpanStyle::Heading,
                     syntax_style: None,
                     link: None,
+                    selection: TextPanelSpanSelection::Content,
                 }],
                 width,
                 prefix,
@@ -1063,7 +1199,7 @@ fn render_table_records(
             ));
 
             let mut value_prefix = continuation_prefix.to_vec();
-            push_span(
+            push_chrome_span(
                 &mut value_prefix,
                 "  ".to_string(),
                 TextPanelSpanStyle::Text,
@@ -1074,6 +1210,7 @@ fn render_table_records(
                     style: TextPanelSpanStyle::Muted,
                     syntax_style: None,
                     link: None,
+                    selection: TextPanelSpanSelection::Content,
                 }]
             } else {
                 value.spans.clone()
@@ -1088,12 +1225,16 @@ fn render_table_records(
         if row_index + 1 < table.rows.len() {
             let mut separator = fit_prefix(continuation_prefix, width);
             let remaining = width.saturating_sub(spans_width(&separator));
-            push_span(
+            push_chrome_span(
                 &mut separator,
                 "─".repeat(remaining),
                 TextPanelSpanStyle::Muted,
             );
-            lines.push(RenderedTextLine { spans: separator });
+            lines.push(RenderedTextLine {
+                spans: separator,
+                break_after: RenderedTextLineBreak::Hard,
+                selection: TextPanelLineSelection::Chrome,
+            });
         }
     }
     lines
@@ -1114,6 +1255,18 @@ fn spans_width(spans: &[RenderedTextSpan]) -> usize {
     spans.iter().map(|span| display_width(&span.text)).sum()
 }
 
+fn line_selection(spans: &[RenderedTextSpan]) -> TextPanelLineSelection {
+    if !spans.is_empty()
+        && spans
+            .iter()
+            .all(|span| !matches!(span.selection, TextPanelSpanSelection::Content))
+    {
+        TextPanelLineSelection::Chrome
+    } else {
+        TextPanelLineSelection::Semantic
+    }
+}
+
 fn fit_prefix(spans: &[RenderedTextSpan], width: usize) -> Vec<RenderedTextSpan> {
     let mut out = Vec::new();
     let mut used = 0usize;
@@ -1129,6 +1282,7 @@ fn fit_prefix(spans: &[RenderedTextSpan], width: usize) -> Vec<RenderedTextSpan>
                 span.style,
                 span.syntax_style.clone(),
                 span.link.clone(),
+                span.selection.clone(),
             );
             used += grapheme_width;
         }
@@ -1140,13 +1294,47 @@ fn push_span(spans: &mut Vec<RenderedTextSpan>, text: String, style: TextPanelSp
     push_span_with_link(spans, text, style, None);
 }
 
+fn push_chrome_span(spans: &mut Vec<RenderedTextSpan>, text: String, style: TextPanelSpanStyle) {
+    push_rendered_span(
+        spans,
+        text,
+        style,
+        None,
+        None,
+        TextPanelSpanSelection::Chrome,
+    );
+}
+
+fn push_copy_separator(
+    spans: &mut Vec<RenderedTextSpan>,
+    display: String,
+    copy: impl Into<String>,
+    style: TextPanelSpanStyle,
+) {
+    push_rendered_span(
+        spans,
+        display,
+        style,
+        None,
+        None,
+        TextPanelSpanSelection::CopySeparator(copy.into()),
+    );
+}
+
 fn push_span_with_link(
     spans: &mut Vec<RenderedTextSpan>,
     text: String,
     style: TextPanelSpanStyle,
     link: Option<TextPanelLink>,
 ) {
-    push_rendered_span(spans, text, style, None, link);
+    push_rendered_span(
+        spans,
+        text,
+        style,
+        None,
+        link,
+        TextPanelSpanSelection::Content,
+    );
 }
 
 fn push_rendered_span(
@@ -1155,12 +1343,17 @@ fn push_rendered_span(
     style: TextPanelSpanStyle,
     syntax_style: Option<Style>,
     link: Option<TextPanelLink>,
+    selection: TextPanelSpanSelection,
 ) {
     if text.is_empty() {
         return;
     }
     if let Some(last) = spans.last_mut() {
-        if last.style == style && last.syntax_style == syntax_style && last.link == link {
+        if last.style == style
+            && last.syntax_style == syntax_style
+            && last.link == link
+            && last.selection == selection
+        {
             last.text.push_str(&text);
             return;
         }
@@ -1170,6 +1363,7 @@ fn push_rendered_span(
         style,
         syntax_style,
         link,
+        selection,
     });
 }
 
@@ -1181,7 +1375,14 @@ fn push_span_with_syntax(
     if text.is_empty() {
         return;
     }
-    push_rendered_span(spans, text, TextPanelSpanStyle::Code, syntax_style, None);
+    push_rendered_span(
+        spans,
+        text,
+        TextPanelSpanStyle::Code,
+        syntax_style,
+        None,
+        TextPanelSpanSelection::Content,
+    );
 }
 
 #[cfg(test)]

@@ -13,17 +13,19 @@ use std::{collections::HashMap, time::Instant};
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use serde::{Deserialize, Serialize};
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::markdown::{
-    render_markdown_lines, wrap_plain_text, RenderedTextLine, RenderedTextSpan, TextPanelSpanStyle,
+    render_markdown_lines, wrap_plain_text, RenderedTextLine, RenderedTextLineBreak,
+    RenderedTextSpan, TextPanelLineSelection, TextPanelSpanSelection, TextPanelSpanStyle,
 };
 use super::text_link::{TextPanelLink, TextPanelLinkTarget};
 use crate::{
     editor::{render_buffer::RenderBuffer, Point},
     theme::{SelectionForegroundPriority, Style, Theme, ThemeStyleSpec},
     ui::{
-        normalize_prompt_newlines, paint_rich_text, wrap_text, FollowTailViewport, PromptBuffer,
-        PromptInput, PROMPT_MAX_BYTES,
+        normalize_prompt_newlines, wrap_text, FollowTailViewport, PromptBuffer, PromptInput,
+        PROMPT_MAX_BYTES,
     },
     unicode_utils::{display_width, fit_display_width, truncate_display_width},
 };
@@ -221,6 +223,112 @@ pub struct TextPanel {
     status: Option<TextPanelStatus>,
     busy_since: Option<Instant>,
     selected_link: Option<u64>,
+    scrollback: TextPanelScrollback,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum TextPanelScrollbackMode {
+    #[default]
+    Normal,
+    Visual,
+    VisualLine,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TextPanelScrollback {
+    focused: bool,
+    initialized: bool,
+    mode: TextPanelScrollbackMode,
+    cursor: usize,
+    preferred_column: Option<usize>,
+    selection_anchor: Option<usize>,
+    mouse_anchor: Option<usize>,
+    mouse_dragging: bool,
+    pending_find: Option<PendingScrollbackFind>,
+    last_find: Option<ScrollbackFind>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingScrollbackFind {
+    direction: ScrollbackFindDirection,
+    till: bool,
+    count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScrollbackFind {
+    direction: ScrollbackFindDirection,
+    till: bool,
+    target: char,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ScrollbackFindDirection {
+    Forward,
+    Backward,
+}
+
+#[derive(Debug, Clone)]
+struct TextPanelLayoutCell {
+    text: String,
+    copy_prefix: String,
+    column: usize,
+    width: usize,
+    link: Option<TextPanelLink>,
+    virtual_space: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TextPanelLayoutLine {
+    first: usize,
+    cells: Vec<TextPanelLayoutCell>,
+    break_after: RenderedTextLineBreak,
+    selectable: bool,
+    chrome_only: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TextPanelLayout {
+    rendered: Vec<RenderedTextLine>,
+    lines: Vec<TextPanelLayoutLine>,
+    len: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TextPanelYank {
+    pub(crate) text: String,
+    pub(crate) linewise: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TextPanelScrollbackInput {
+    Handled,
+    Yank(TextPanelYank),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TextPanelMotion {
+    Left,
+    Right,
+    Up,
+    Down,
+    LineStart,
+    FirstNonBlank,
+    LineEnd,
+    NextWord,
+    PreviousWord,
+    WordEnd,
+    PreviousParagraph,
+    NextParagraph,
+    PageUp,
+    PageDown,
+    HalfPageUp,
+    HalfPageDown,
+    ViewportTop,
+    ViewportMiddle,
+    ViewportBottom,
+    Top,
+    Bottom,
 }
 
 const TEXT_PANEL_SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -286,6 +394,7 @@ impl TextPanel {
             status: None,
             busy_since: None,
             selected_link: None,
+            scrollback: TextPanelScrollback::default(),
         }
     }
 
@@ -319,6 +428,11 @@ impl TextPanel {
         } else {
             self.clamp_scroll(panel_height, panel_width);
         }
+        let layout = self.layout(panel_width);
+        self.scrollback.cursor = layout.clamp(self.scrollback.cursor);
+        if layout.len == 0 {
+            self.scrollback.initialized = false;
+        }
     }
 
     fn append_delta(
@@ -344,6 +458,8 @@ impl TextPanel {
         } else {
             self.clamp_scroll(panel_height, panel_width);
         }
+        let layout = self.layout(panel_width);
+        self.scrollback.cursor = layout.clamp(self.scrollback.cursor);
     }
 
     fn move_scroll(&mut self, delta: isize, panel_height: usize, panel_width: usize) {
@@ -455,6 +571,13 @@ impl TextPanel {
         };
         let (link, line) = &links[index];
         self.selected_link = Some(link.id);
+        self.scrollback.focused = true;
+        self.scrollback.mode = TextPanelScrollbackMode::Normal;
+        self.scrollback.selection_anchor = None;
+        let layout = self.layout(width);
+        if let Some(offset) = layout.link_offset(link.id) {
+            self.scrollback.cursor = offset;
+        }
         self.viewport.restore(self.scroll, self.follow_tail);
         self.viewport.reveal(*line, self.visible_rows(panel_height));
         self.scroll = self.viewport.offset();
@@ -484,7 +607,7 @@ impl TextPanel {
                         lines.push(turn_separator(width));
                     }
                 }
-                lines.push(RenderedTextLine::plain(
+                lines.push(RenderedTextLine::chrome(
                     "▎ You".to_string(),
                     TextPanelSpanStyle::User,
                 ));
@@ -507,7 +630,7 @@ impl TextPanel {
                 lines.extend(block_lines.into_iter().map(user_accented));
             } else {
                 if let Some((label, style)) = block_label(&block.kind) {
-                    lines.push(RenderedTextLine::plain(label.to_string(), style));
+                    lines.push(RenderedTextLine::chrome(label.to_string(), style));
                 }
 
                 let style = block_style(&block.kind);
@@ -536,11 +659,609 @@ impl TextPanel {
                     style: TextPanelSpanStyle::User,
                     syntax_style: None,
                     link: None,
+                    selection: TextPanelSpanSelection::Chrome,
                 });
             }
         }
         lines
     }
+}
+
+impl TextPanelLayout {
+    fn new(rendered: Vec<RenderedTextLine>) -> Self {
+        let mut next = 0usize;
+        let lines = rendered
+            .iter()
+            .map(|line| {
+                let first = next;
+                let mut column = 0usize;
+                let mut cells = Vec::new();
+                let mut pending_copy_separator = String::new();
+                for span in &line.spans {
+                    match &span.selection {
+                        TextPanelSpanSelection::Chrome => {
+                            column = column.saturating_add(display_width(&span.text));
+                        }
+                        TextPanelSpanSelection::CopySeparator(copy) => {
+                            pending_copy_separator.clone_from(copy);
+                            column = column.saturating_add(display_width(&span.text));
+                        }
+                        TextPanelSpanSelection::Content => {
+                            for grapheme in span.text.graphemes(true) {
+                                let width = display_width(grapheme).max(1);
+                                cells.push(TextPanelLayoutCell {
+                                    text: grapheme.to_string(),
+                                    copy_prefix: std::mem::take(&mut pending_copy_separator),
+                                    column,
+                                    width,
+                                    link: span.link.clone(),
+                                    virtual_space: false,
+                                });
+                                next = next.saturating_add(1);
+                                column = column.saturating_add(width);
+                            }
+                        }
+                    }
+                }
+                if !cells.is_empty() && line.break_after == RenderedTextLineBreak::SoftSpace {
+                    cells.push(TextPanelLayoutCell {
+                        text: " ".to_string(),
+                        copy_prefix: String::new(),
+                        column,
+                        width: 0,
+                        link: None,
+                        virtual_space: true,
+                    });
+                    next = next.saturating_add(1);
+                }
+                let selectable = !cells.is_empty();
+                let chrome_only = line.selection == TextPanelLineSelection::Chrome;
+                TextPanelLayoutLine {
+                    first,
+                    cells,
+                    break_after: line.break_after,
+                    selectable,
+                    chrome_only,
+                }
+            })
+            .collect();
+        Self {
+            rendered,
+            lines,
+            len: next,
+        }
+    }
+
+    fn clamp(&self, offset: usize) -> usize {
+        offset.min(self.len.saturating_sub(1))
+    }
+
+    fn position(&self, offset: usize) -> Option<(usize, usize, usize)> {
+        if self.len == 0 {
+            return None;
+        }
+        let offset = self.clamp(offset);
+        self.lines.iter().enumerate().find_map(|(row, line)| {
+            let index = offset.checked_sub(line.first)?;
+            let cell = line.cells.get(index)?;
+            Some((row, index, cell.column))
+        })
+    }
+
+    fn offset_at(&self, row: usize, column: usize) -> Option<usize> {
+        let line = self.lines.get(row)?;
+        line.cells
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| !cell.virtual_space)
+            .min_by_key(|(_, cell)| {
+                let end = cell.column.saturating_add(cell.width.saturating_sub(1));
+                if column < cell.column {
+                    cell.column - column
+                } else {
+                    column.saturating_sub(end)
+                }
+            })
+            .map(|(index, _)| line.first.saturating_add(index))
+    }
+
+    fn nearest_offset_on_row(&self, row: usize, column: usize) -> Option<usize> {
+        if let Some(offset) = self.offset_at(row, column) {
+            return Some(offset);
+        }
+        (1..self.lines.len()).find_map(|distance| {
+            row.checked_sub(distance)
+                .and_then(|candidate| self.offset_at(candidate, column))
+                .or_else(|| self.offset_at(row.saturating_add(distance), column))
+        })
+    }
+
+    fn offset_at_or_after(&self, row: usize, column: usize) -> Option<usize> {
+        (row..self.lines.len()).find_map(|candidate| self.offset_at(candidate, column))
+    }
+
+    fn offset_at_or_before(&self, row: usize, column: usize) -> Option<usize> {
+        (0..=row.min(self.lines.len().saturating_sub(1)))
+            .rev()
+            .find_map(|candidate| self.offset_at(candidate, column))
+    }
+
+    fn line_bounds(&self, row: usize) -> Option<(usize, usize)> {
+        let line = self.lines.get(row)?;
+        let first = line.cells.iter().position(|cell| !cell.virtual_space)?;
+        let last = line.cells.iter().rposition(|cell| !cell.virtual_space)?;
+        Some((
+            line.first.saturating_add(first),
+            line.first.saturating_add(last),
+        ))
+    }
+
+    fn logical_line_bounds(&self, row: usize) -> Option<(usize, usize)> {
+        let mut first_row = row.min(self.lines.len().saturating_sub(1));
+        while first_row > 0 && self.lines[first_row - 1].break_after != RenderedTextLineBreak::Hard
+        {
+            first_row -= 1;
+        }
+        let mut last_row = row.min(self.lines.len().saturating_sub(1));
+        while last_row + 1 < self.lines.len()
+            && self.lines[last_row].break_after != RenderedTextLineBreak::Hard
+        {
+            last_row += 1;
+        }
+        let start = (first_row..=last_row)
+            .find_map(|candidate| self.line_bounds(candidate))?
+            .0;
+        let end = (first_row..=last_row)
+            .rev()
+            .find_map(|candidate| self.line_bounds(candidate))?
+            .1;
+        Some((start, end))
+    }
+
+    fn first_non_blank(&self, row: usize) -> Option<usize> {
+        let line = self.lines.get(row)?;
+        line.cells
+            .iter()
+            .position(|cell| !cell.text.chars().all(char::is_whitespace))
+            .map(|index| line.first.saturating_add(index))
+            .or_else(|| self.line_bounds(row).map(|(first, _)| first))
+    }
+
+    fn link_at(&self, offset: usize) -> Option<TextPanelLinkTarget> {
+        let (row, index, _) = self.position(offset)?;
+        self.lines
+            .get(row)?
+            .cells
+            .get(index)?
+            .link
+            .as_ref()
+            .map(|link| link.target.clone())
+    }
+
+    fn link_offset(&self, id: u64) -> Option<usize> {
+        self.lines.iter().find_map(|line| {
+            line.cells
+                .iter()
+                .position(|cell| cell.link.as_ref().is_some_and(|link| link.id == id))
+                .map(|index| line.first.saturating_add(index))
+        })
+    }
+
+    fn selected_text(&self, start: usize, end: usize, linewise: bool) -> String {
+        if self.len == 0 {
+            return String::new();
+        }
+        let mut start = self.clamp(start);
+        let mut end = self.clamp(end);
+        if start > end {
+            std::mem::swap(&mut start, &mut end);
+        }
+        if linewise {
+            let Some((start_row, _, _)) = self.position(start) else {
+                return String::new();
+            };
+            let Some((end_row, _, _)) = self.position(end) else {
+                return String::new();
+            };
+            if let Some((line_start, _)) = self.logical_line_bounds(start_row) {
+                start = line_start;
+            }
+            if let Some((_, line_end)) = self.logical_line_bounds(end_row) {
+                end = line_end;
+            }
+        }
+
+        let Some((start_row, _, _)) = self.position(start) else {
+            return String::new();
+        };
+        let Some((end_row, _, _)) = self.position(end) else {
+            return String::new();
+        };
+        let mut output = String::new();
+        for row in start_row..=end_row {
+            if row > start_row && !self.lines[row - 1].chrome_only {
+                match self.lines[row - 1].break_after {
+                    RenderedTextLineBreak::Soft => {}
+                    RenderedTextLineBreak::SoftSpace => {}
+                    RenderedTextLineBreak::Hard => output.push('\n'),
+                }
+            }
+            let line = &self.lines[row];
+            let mut wrote_selected_cell = false;
+            for (index, cell) in line.cells.iter().enumerate() {
+                let offset = line.first.saturating_add(index);
+                if offset >= start && offset <= end {
+                    if wrote_selected_cell {
+                        output.push_str(&cell.copy_prefix);
+                    }
+                    output.push_str(&cell.text);
+                    wrote_selected_cell = true;
+                }
+            }
+        }
+        if linewise && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output
+    }
+}
+
+impl TextPanel {
+    fn layout(&self, width: usize) -> TextPanelLayout {
+        let mut layout = TextPanelLayout::new(self.rendered_lines(width.max(1)));
+        if self.status.as_ref().is_some_and(|status| status.stream) {
+            if let Some(line) = layout.lines.last_mut() {
+                if line.cells.last().is_some_and(|cell| cell.text == "▌") {
+                    line.cells.pop();
+                    layout.len = layout.len.saturating_sub(1);
+                }
+            }
+        }
+        layout
+    }
+
+    fn focus_scrollback(&mut self, width: usize) {
+        if let Some(composer) = self.composer.as_mut() {
+            composer.focused = false;
+        }
+        self.scrollback.focused = true;
+        self.scrollback.mode = TextPanelScrollbackMode::Normal;
+        self.scrollback.selection_anchor = None;
+        let layout = self.layout(width);
+        if !self.scrollback.initialized {
+            self.scrollback.cursor = (self.scroll..layout.lines.len())
+                .find_map(|row| layout.offset_at(row, 0))
+                .unwrap_or_else(|| layout.clamp(self.scrollback.cursor));
+            self.scrollback.initialized = layout.len > 0;
+        } else {
+            self.scrollback.cursor = layout.clamp(self.scrollback.cursor);
+        }
+    }
+
+    fn blur_scrollback(&mut self) {
+        self.scrollback.focused = false;
+        self.scrollback.mode = TextPanelScrollbackMode::Normal;
+        self.scrollback.selection_anchor = None;
+        self.scrollback.mouse_anchor = None;
+        self.scrollback.mouse_dragging = false;
+    }
+
+    fn selection_bounds(&self, layout: &TextPanelLayout) -> Option<(usize, usize)> {
+        let anchor = self.scrollback.selection_anchor?;
+        let mut start = layout.clamp(anchor);
+        let mut end = layout.clamp(self.scrollback.cursor);
+        if start > end {
+            std::mem::swap(&mut start, &mut end);
+        }
+        if self.scrollback.mode == TextPanelScrollbackMode::VisualLine {
+            let (start_row, _, _) = layout.position(start)?;
+            let (end_row, _, _) = layout.position(end)?;
+            start = layout.logical_line_bounds(start_row)?.0;
+            end = layout.logical_line_bounds(end_row)?.1;
+        }
+        Some((start, end))
+    }
+
+    fn reveal_scrollback_cursor(&mut self, layout: &TextPanelLayout, panel_height: usize) {
+        let Some((row, _, _)) = layout.position(self.scrollback.cursor) else {
+            return;
+        };
+        self.viewport.restore(self.scroll, self.follow_tail);
+        self.viewport.reveal(row, self.visible_rows(panel_height));
+        self.scroll = self.viewport.offset();
+        self.follow_tail = self.viewport.is_following();
+    }
+
+    fn move_scrollback(
+        &mut self,
+        motion: TextPanelMotion,
+        count: usize,
+        panel_height: usize,
+        width: usize,
+    ) {
+        let layout = self.layout(width);
+        if layout.len == 0 {
+            self.scrollback.cursor = 0;
+            return;
+        }
+        self.scrollback.cursor = layout.clamp(self.scrollback.cursor);
+        let count = count.max(1);
+        let (row, _, column) = layout.position(self.scrollback.cursor).unwrap_or_default();
+        let visible_rows = self.visible_rows(panel_height).max(1);
+        let target = match motion {
+            TextPanelMotion::Left => self.scrollback.cursor.saturating_sub(count),
+            TextPanelMotion::Right => self
+                .scrollback
+                .cursor
+                .saturating_add(count)
+                .min(layout.len - 1),
+            TextPanelMotion::Up | TextPanelMotion::Down => {
+                let goal = self.scrollback.preferred_column.unwrap_or(column);
+                self.scrollback.preferred_column = Some(goal);
+                let target_row = if matches!(motion, TextPanelMotion::Up) {
+                    row.saturating_sub(count)
+                } else {
+                    row.saturating_add(count)
+                        .min(layout.lines.len().saturating_sub(1))
+                };
+                if matches!(motion, TextPanelMotion::Up) {
+                    layout.offset_at_or_before(target_row, goal)
+                } else {
+                    layout.offset_at_or_after(target_row, goal)
+                }
+                .unwrap_or(self.scrollback.cursor)
+            }
+            TextPanelMotion::LineStart => layout.line_bounds(row).map_or(0, |bounds| bounds.0),
+            TextPanelMotion::FirstNonBlank => layout
+                .first_non_blank(row)
+                .unwrap_or(self.scrollback.cursor),
+            TextPanelMotion::LineEnd => layout
+                .line_bounds(row)
+                .map_or(self.scrollback.cursor, |bounds| bounds.1),
+            TextPanelMotion::NextWord => {
+                word_motion(&layout, self.scrollback.cursor, count, WordMotion::Next)
+            }
+            TextPanelMotion::PreviousWord => {
+                word_motion(&layout, self.scrollback.cursor, count, WordMotion::Previous)
+            }
+            TextPanelMotion::WordEnd => {
+                word_motion(&layout, self.scrollback.cursor, count, WordMotion::End)
+            }
+            TextPanelMotion::PreviousParagraph | TextPanelMotion::NextParagraph => {
+                let mut target_row = row;
+                for _ in 0..count {
+                    target_row = if matches!(motion, TextPanelMotion::PreviousParagraph) {
+                        (0..target_row)
+                            .rev()
+                            .find(|candidate| {
+                                !layout.lines[*candidate].cells.is_empty()
+                                    && (*candidate == 0
+                                        || layout.lines[candidate.saturating_sub(1)]
+                                            .cells
+                                            .is_empty())
+                            })
+                            .unwrap_or(0)
+                    } else {
+                        ((target_row + 1)..layout.lines.len())
+                            .find(|candidate| {
+                                !layout.lines[*candidate].cells.is_empty()
+                                    && layout.lines[candidate.saturating_sub(1)].cells.is_empty()
+                            })
+                            .unwrap_or(layout.lines.len().saturating_sub(1))
+                    };
+                }
+                layout
+                    .nearest_offset_on_row(target_row, column)
+                    .unwrap_or(self.scrollback.cursor)
+            }
+            TextPanelMotion::PageUp | TextPanelMotion::HalfPageUp => {
+                let amount = if matches!(motion, TextPanelMotion::PageUp) {
+                    visible_rows
+                } else {
+                    visible_rows.div_ceil(2)
+                };
+                let target_row = row.saturating_sub(amount.saturating_mul(count));
+                layout
+                    .offset_at_or_before(target_row, column)
+                    .or_else(|| layout.offset_at_or_after(target_row, column))
+                    .unwrap_or(self.scrollback.cursor)
+            }
+            TextPanelMotion::PageDown | TextPanelMotion::HalfPageDown => {
+                let amount = if matches!(motion, TextPanelMotion::PageDown) {
+                    visible_rows
+                } else {
+                    visible_rows.div_ceil(2)
+                };
+                let target_row = row
+                    .saturating_add(amount.saturating_mul(count))
+                    .min(layout.lines.len().saturating_sub(1));
+                layout
+                    .offset_at_or_after(target_row, column)
+                    .or_else(|| layout.offset_at_or_before(target_row, column))
+                    .unwrap_or(self.scrollback.cursor)
+            }
+            TextPanelMotion::ViewportTop => layout
+                .offset_at_or_after(self.scroll, column)
+                .or_else(|| layout.offset_at_or_before(self.scroll, column))
+                .unwrap_or(self.scrollback.cursor),
+            TextPanelMotion::ViewportMiddle => layout
+                .nearest_offset_on_row(self.scroll.saturating_add(visible_rows / 2), column)
+                .unwrap_or(self.scrollback.cursor),
+            TextPanelMotion::ViewportBottom => layout
+                .offset_at_or_before(
+                    self.scroll
+                        .saturating_add(visible_rows.saturating_sub(1))
+                        .min(layout.lines.len().saturating_sub(1)),
+                    column,
+                )
+                .or_else(|| layout.offset_at_or_after(self.scroll, column))
+                .unwrap_or(self.scrollback.cursor),
+            TextPanelMotion::Top => 0,
+            TextPanelMotion::Bottom => layout.len - 1,
+        };
+        self.scrollback.cursor = layout.clamp(target);
+        if !matches!(motion, TextPanelMotion::Up | TextPanelMotion::Down) {
+            self.scrollback.preferred_column = None;
+        }
+        if matches!(motion, TextPanelMotion::Bottom) {
+            self.scroll_to_bottom(panel_height, width);
+        } else {
+            self.follow_tail = false;
+            self.reveal_scrollback_cursor(&layout, panel_height);
+        }
+        self.selected_link = None;
+    }
+
+    fn yank_scrollback(&mut self, width: usize) -> Option<TextPanelYank> {
+        let layout = self.layout(width);
+        let (start, end) = self.selection_bounds(&layout)?;
+        let linewise = self.scrollback.mode == TextPanelScrollbackMode::VisualLine;
+        let text = layout.selected_text(start, end, linewise);
+        if text.is_empty() {
+            return None;
+        }
+        self.scrollback.cursor = start;
+        self.scrollback.mode = TextPanelScrollbackMode::Normal;
+        self.scrollback.selection_anchor = None;
+        Some(TextPanelYank { text, linewise })
+    }
+
+    fn find_in_scrollback(
+        &mut self,
+        find: ScrollbackFind,
+        count: usize,
+        panel_height: usize,
+        width: usize,
+    ) {
+        let layout = self.layout(width);
+        let Some((row, _, _)) = layout.position(self.scrollback.cursor) else {
+            return;
+        };
+        let Some((line_start, line_end)) = layout.line_bounds(row) else {
+            return;
+        };
+        let cells = layout_cells(&layout);
+        let matches_target = |offset: usize| {
+            cells
+                .get(offset)
+                .is_some_and(|cell| cell.text.starts_with(find.target))
+        };
+        let target = match find.direction {
+            ScrollbackFindDirection::Forward => ((self.scrollback.cursor + 1)..=line_end)
+                .filter(|offset| matches_target(*offset))
+                .nth(count.saturating_sub(1))
+                .map(|offset| {
+                    if find.till {
+                        offset.saturating_sub(1)
+                    } else {
+                        offset
+                    }
+                }),
+            ScrollbackFindDirection::Backward => (line_start..self.scrollback.cursor)
+                .rev()
+                .filter(|offset| matches_target(*offset))
+                .nth(count.saturating_sub(1))
+                .map(|offset| {
+                    if find.till {
+                        offset.saturating_add(1).min(line_end)
+                    } else {
+                        offset
+                    }
+                }),
+        };
+        if let Some(target) = target {
+            self.scrollback.cursor = target;
+            self.scrollback.preferred_column = None;
+            self.follow_tail = false;
+            self.reveal_scrollback_cursor(&layout, panel_height);
+            self.selected_link = None;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WordClass {
+    Whitespace,
+    Word,
+    Punctuation,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WordMotion {
+    Next,
+    Previous,
+    End,
+}
+
+fn word_class(cell: &TextPanelLayoutCell) -> WordClass {
+    let mut chars = cell.text.chars();
+    let Some(character) = chars.next() else {
+        return WordClass::Whitespace;
+    };
+    if character.is_whitespace() {
+        WordClass::Whitespace
+    } else if character.is_alphanumeric() || character == '_' {
+        WordClass::Word
+    } else {
+        WordClass::Punctuation
+    }
+}
+
+fn layout_cells(layout: &TextPanelLayout) -> Vec<&TextPanelLayoutCell> {
+    layout.lines.iter().flat_map(|line| &line.cells).collect()
+}
+
+fn word_motion(layout: &TextPanelLayout, offset: usize, count: usize, motion: WordMotion) -> usize {
+    let cells = layout_cells(layout);
+    if cells.is_empty() {
+        return 0;
+    }
+    let mut cursor = offset.min(cells.len() - 1);
+    for _ in 0..count.max(1) {
+        cursor = match motion {
+            WordMotion::Next => {
+                let class = word_class(cells[cursor]);
+                let mut next = cursor.saturating_add(1);
+                while next < cells.len() && word_class(cells[next]) == class {
+                    next += 1;
+                }
+                while next < cells.len() && word_class(cells[next]) == WordClass::Whitespace {
+                    next += 1;
+                }
+                next.min(cells.len() - 1)
+            }
+            WordMotion::Previous => {
+                let mut previous = cursor.saturating_sub(1);
+                while previous > 0 && word_class(cells[previous]) == WordClass::Whitespace {
+                    previous -= 1;
+                }
+                let class = word_class(cells[previous]);
+                while previous > 0 && word_class(cells[previous - 1]) == class {
+                    previous -= 1;
+                }
+                previous
+            }
+            WordMotion::End => {
+                let mut end = cursor;
+                if end + 1 < cells.len() {
+                    end += 1;
+                }
+                while end < cells.len() && word_class(cells[end]) == WordClass::Whitespace {
+                    end += 1;
+                }
+                if end >= cells.len() {
+                    cells.len() - 1
+                } else {
+                    let class = word_class(cells[end]);
+                    while end + 1 < cells.len() && word_class(cells[end + 1]) == class {
+                        end += 1;
+                    }
+                    end
+                }
+            }
+        };
+    }
+    cursor
 }
 
 fn namespace_block_links(lines: &mut [RenderedTextLine], block_index: usize) {
@@ -950,6 +1671,10 @@ impl PanelManager {
             && (self.panels.contains_key(id) || self.text_panels.contains_key(id))
         {
             self.focused = Some(id.to_string());
+            if let Some(panel) = self.text_panels.get_mut(id) {
+                let width = effective_panel_width(&panel.config, usize::MAX);
+                panel.focus_scrollback(width);
+            }
             true
         } else {
             false
@@ -970,6 +1695,9 @@ impl PanelManager {
                 .and_then(|panel| panel.composer.as_mut())
             {
                 composer.focused = false;
+            }
+            if let Some(panel) = self.text_panels.get_mut(id) {
+                panel.blur_scrollback();
             }
         }
         self.focused = None;
@@ -1084,6 +1812,14 @@ impl PanelManager {
                 }
                 "top" => panel.scroll_to_top(),
                 "bottom" => panel.scroll_to_bottom(panel_height, width),
+                "composer_focus" => {
+                    panel.blur_scrollback();
+                    if let Some(composer) = panel.composer.as_mut() {
+                        if composer.enabled {
+                            composer.focused = true;
+                        }
+                    }
+                }
                 _ => {}
             }
             return Some(PanelEvent {
@@ -1115,6 +1851,171 @@ impl PanelManager {
         })
     }
 
+    pub(crate) fn handle_focused_scrollback_input(
+        &mut self,
+        event: &Event,
+        panel_height: usize,
+        terminal_width: usize,
+        count: usize,
+    ) -> Option<TextPanelScrollbackInput> {
+        let focused = self.focused.clone()?;
+        let panel = self.text_panels.get_mut(&focused)?;
+        if !panel.scrollback.focused {
+            return None;
+        }
+        let Event::Key(key) = event else {
+            return None;
+        };
+        let width = effective_panel_width(&panel.config, terminal_width);
+        let panel_height = effective_panel_height(&panel.config, panel_height);
+
+        if let Some(pending) = panel.scrollback.pending_find.take() {
+            if key.code == KeyCode::Esc {
+                return Some(TextPanelScrollbackInput::Handled);
+            }
+            let KeyCode::Char(target) = key.code else {
+                return Some(TextPanelScrollbackInput::Handled);
+            };
+            let find = ScrollbackFind {
+                direction: pending.direction,
+                till: pending.till,
+                target,
+            };
+            panel.find_in_scrollback(find, pending.count, panel_height, width);
+            panel.scrollback.last_find = Some(find);
+            return Some(TextPanelScrollbackInput::Handled);
+        }
+
+        if key.code == KeyCode::Esc && panel.scrollback.mode != TextPanelScrollbackMode::Normal {
+            panel.scrollback.mode = TextPanelScrollbackMode::Normal;
+            panel.scrollback.selection_anchor = None;
+            return Some(TextPanelScrollbackInput::Handled);
+        }
+        if key.code == KeyCode::Esc {
+            let composer_enabled = panel
+                .composer
+                .as_ref()
+                .is_some_and(|composer| composer.enabled);
+            if composer_enabled {
+                panel.blur_scrollback();
+                if let Some(composer) = panel.composer.as_mut() {
+                    composer.focused = true;
+                }
+                return Some(TextPanelScrollbackInput::Handled);
+            }
+            return None;
+        }
+        if key.modifiers.is_empty() && matches!(key.code, KeyCode::Char('i' | 'a')) {
+            let composer_enabled = panel
+                .composer
+                .as_ref()
+                .is_some_and(|composer| composer.enabled);
+            if composer_enabled {
+                panel.blur_scrollback();
+                if let Some(composer) = panel.composer.as_mut() {
+                    composer.focused = true;
+                    composer.prompt.set_mode(crate::editor::Mode::Normal);
+                    let _ = composer
+                        .prompt
+                        .handle_event(event, width.saturating_sub(2).max(1));
+                }
+                return Some(TextPanelScrollbackInput::Handled);
+            }
+        }
+        if !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            match key.code {
+                KeyCode::Char('v') => {
+                    panel.scrollback.mode =
+                        if panel.scrollback.mode == TextPanelScrollbackMode::Visual {
+                            TextPanelScrollbackMode::Normal
+                        } else {
+                            TextPanelScrollbackMode::Visual
+                        };
+                    panel.scrollback.selection_anchor = (panel.scrollback.mode
+                        != TextPanelScrollbackMode::Normal)
+                        .then_some(panel.scrollback.cursor);
+                    return Some(TextPanelScrollbackInput::Handled);
+                }
+                KeyCode::Char('V') => {
+                    panel.scrollback.mode =
+                        if panel.scrollback.mode == TextPanelScrollbackMode::VisualLine {
+                            TextPanelScrollbackMode::Normal
+                        } else {
+                            TextPanelScrollbackMode::VisualLine
+                        };
+                    panel.scrollback.selection_anchor = (panel.scrollback.mode
+                        != TextPanelScrollbackMode::Normal)
+                        .then_some(panel.scrollback.cursor);
+                    return Some(TextPanelScrollbackInput::Handled);
+                }
+                KeyCode::Char('y') if panel.scrollback.mode != TextPanelScrollbackMode::Normal => {
+                    return panel
+                        .yank_scrollback(width)
+                        .map(TextPanelScrollbackInput::Yank);
+                }
+                KeyCode::Char('f' | 'F' | 't' | 'T') => {
+                    panel.scrollback.pending_find = Some(PendingScrollbackFind {
+                        direction: if matches!(key.code, KeyCode::Char('F' | 'T')) {
+                            ScrollbackFindDirection::Backward
+                        } else {
+                            ScrollbackFindDirection::Forward
+                        },
+                        till: matches!(key.code, KeyCode::Char('t' | 'T')),
+                        count,
+                    });
+                    return Some(TextPanelScrollbackInput::Handled);
+                }
+                KeyCode::Char(';' | ',') => {
+                    let Some(mut find) = panel.scrollback.last_find else {
+                        return Some(TextPanelScrollbackInput::Handled);
+                    };
+                    if key.code == KeyCode::Char(',') {
+                        find.direction = match find.direction {
+                            ScrollbackFindDirection::Forward => ScrollbackFindDirection::Backward,
+                            ScrollbackFindDirection::Backward => ScrollbackFindDirection::Forward,
+                        };
+                    }
+                    panel.find_in_scrollback(find, count, panel_height, width);
+                    return Some(TextPanelScrollbackInput::Handled);
+                }
+                _ => {}
+            }
+        }
+
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let motion = match key.code {
+            KeyCode::Left | KeyCode::Char('h') if !control => TextPanelMotion::Left,
+            KeyCode::Right | KeyCode::Char('l') if !control => TextPanelMotion::Right,
+            KeyCode::Up | KeyCode::Char('k') if !control => TextPanelMotion::Up,
+            KeyCode::Down | KeyCode::Char('j') if !control => TextPanelMotion::Down,
+            KeyCode::Home | KeyCode::Char('0') if !control => TextPanelMotion::LineStart,
+            KeyCode::Char('^') if !control => TextPanelMotion::FirstNonBlank,
+            KeyCode::End | KeyCode::Char('$') if !control => TextPanelMotion::LineEnd,
+            KeyCode::Char('w' | 'W') if !control => TextPanelMotion::NextWord,
+            KeyCode::Char('b' | 'B') if !control => TextPanelMotion::PreviousWord,
+            KeyCode::Char('e' | 'E') if !control => TextPanelMotion::WordEnd,
+            KeyCode::Char('{') if !control => TextPanelMotion::PreviousParagraph,
+            KeyCode::Char('}') if !control => TextPanelMotion::NextParagraph,
+            KeyCode::PageUp => TextPanelMotion::PageUp,
+            KeyCode::PageDown => TextPanelMotion::PageDown,
+            KeyCode::Char('b') if control => TextPanelMotion::PageUp,
+            KeyCode::Char('f') if control => TextPanelMotion::PageDown,
+            KeyCode::Char('u') if control => TextPanelMotion::HalfPageUp,
+            KeyCode::Char('d') if control => TextPanelMotion::HalfPageDown,
+            KeyCode::Char('H') if !control => TextPanelMotion::ViewportTop,
+            KeyCode::Char('M') if !control => TextPanelMotion::ViewportMiddle,
+            KeyCode::Char('L') if !control => TextPanelMotion::ViewportBottom,
+            KeyCode::Char('g') if !control => TextPanelMotion::Top,
+            KeyCode::Char('G') if !control => TextPanelMotion::Bottom,
+            _ => return None,
+        };
+        panel.move_scrollback(motion, count, panel_height, width);
+        Some(TextPanelScrollbackInput::Handled)
+    }
+
     pub fn handle_mouse_scroll(
         &mut self,
         id: &str,
@@ -1128,6 +2029,22 @@ impl PanelManager {
             let width = effective_panel_width(&panel.config, terminal_width);
             let panel_height = effective_panel_height(&panel.config, panel_height);
             panel.move_scroll(delta, panel_height, width);
+            if panel.scrollback.focused {
+                let layout = panel.layout(width);
+                if let Some((row, _, column)) = layout.position(panel.scrollback.cursor) {
+                    let visible = panel.visible_rows(panel_height);
+                    let first = panel.scroll;
+                    let last = first
+                        .saturating_add(visible.saturating_sub(1))
+                        .min(layout.lines.len().saturating_sub(1));
+                    let target_row = row.clamp(first, last);
+                    if target_row != row {
+                        if let Some(offset) = layout.nearest_offset_on_row(target_row, column) {
+                            panel.scrollback.cursor = offset;
+                        }
+                    }
+                }
+            }
             return Some(PanelEvent {
                 panel_id: panel.id.clone(),
                 action: action.to_string(),
@@ -1168,13 +2085,29 @@ impl PanelManager {
         panel.select_link(forward, panel_height, width)
     }
 
+    pub(crate) fn focus_focused_text_scrollback(&mut self, terminal_width: usize) -> bool {
+        let Some(focused) = self.focused.clone() else {
+            return false;
+        };
+        let Some(panel) = self.text_panels.get_mut(&focused) else {
+            return false;
+        };
+        let width = effective_panel_width(&panel.config, terminal_width);
+        panel.focus_scrollback(width);
+        true
+    }
+
     pub(crate) fn focused_text_link_target(
         &self,
         terminal_width: usize,
     ) -> Option<TextPanelLinkTarget> {
         let panel = self.text_panels.get(self.focused.as_deref()?)?;
         let width = effective_panel_width(&panel.config, terminal_width);
-        panel.selected_link_target(width)
+        if panel.scrollback.focused {
+            panel.layout(width).link_at(panel.scrollback.cursor)
+        } else {
+            panel.selected_link_target(width)
+        }
     }
 
     pub(crate) fn text_link_at_position(
@@ -1237,17 +2170,17 @@ impl PanelManager {
         if !self.z_order.iter().any(|panel_id| panel_id == id) {
             return false;
         }
-        let Some(composer) = self
-            .text_panels
-            .get_mut(id)
-            .and_then(|panel| panel.composer.as_mut())
-        else {
+        let Some(panel) = self.text_panels.get_mut(id) else {
+            return false;
+        };
+        let Some(composer) = panel.composer.as_mut() else {
             return false;
         };
         if !composer.enabled {
             return false;
         }
         composer.focused = true;
+        panel.blur_scrollback();
         self.focused = Some(id.to_string());
         true
     }
@@ -1349,6 +2282,7 @@ impl PanelManager {
                 if (composer.prompt.mode() == crate::editor::Mode::Normal
                     && key.modifiers.is_empty()
                     && matches!(key.code, KeyCode::Char('j' | 'k') | KeyCode::Up | KeyCode::Down))
+                    || matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
                     || (key.modifiers.contains(KeyModifiers::CONTROL)
                         && matches!(key.code, KeyCode::Char('h' | 'j' | 'k' | 'g' | 'G' | 'w')))
         );
@@ -1387,6 +2321,11 @@ impl PanelManager {
             },
             PromptInput::Cancel => {
                 composer.focused = false;
+                panel.scrollback.focused = true;
+                panel.scrollback.mode = TextPanelScrollbackMode::Normal;
+                panel.scrollback.selection_anchor = None;
+                let layout = panel.layout(panel_width);
+                panel.scrollback.cursor = layout.clamp(panel.scrollback.cursor);
                 ("composer_blur", None)
             }
             PromptInput::Unhandled
@@ -1410,6 +2349,13 @@ impl PanelManager {
     /// Returns the prompt-local editor mode while the docked composer owns focus.
     pub(crate) fn focused_text_panel_cursor_mode(&self) -> Option<crate::editor::Mode> {
         let panel = self.text_panels.get(self.focused.as_deref()?)?;
+        if panel.scrollback.focused {
+            return Some(match panel.scrollback.mode {
+                TextPanelScrollbackMode::Normal => crate::editor::Mode::Normal,
+                TextPanelScrollbackMode::Visual => crate::editor::Mode::Visual,
+                TextPanelScrollbackMode::VisualLine => crate::editor::Mode::VisualLine,
+            });
+        }
         let composer = panel.composer.as_ref()?;
         (composer.focused && composer.enabled).then(|| composer.prompt.mode())
     }
@@ -1421,14 +2367,36 @@ impl PanelManager {
     ) -> Option<(usize, usize)> {
         let id = self.focused.as_deref()?;
         let panel = self.text_panels.get(id)?;
-        let composer = panel.composer.as_ref()?;
-        if !composer.focused || !composer.enabled {
-            return None;
-        }
         let placement = self
             .panel_placements(terminal_width, terminal_height)
             .into_iter()
             .find(|placement| placement.id == id)?;
+        if panel.scrollback.focused {
+            let title_rows = usize::from(
+                panel.config.title.is_some() || !panel.config.header_actions.is_empty(),
+            );
+            let visible_rows = panel.visible_rows(placement.height);
+            let layout = panel.layout(placement.width);
+            let max_scroll = layout.lines.len().saturating_sub(visible_rows);
+            let scroll = panel.viewport.visible_offset(max_scroll);
+            let (row, _, column) = layout
+                .position(panel.scrollback.cursor)
+                .unwrap_or((scroll, 0, 0));
+            if row < scroll || row >= scroll.saturating_add(visible_rows) {
+                return None;
+            }
+            return Some((
+                placement.x.saturating_add(column),
+                placement
+                    .y
+                    .saturating_add(title_rows)
+                    .saturating_add(row.saturating_sub(scroll)),
+            ));
+        }
+        let composer = panel.composer.as_ref()?;
+        if !composer.focused || !composer.enabled {
+            return None;
+        }
         let content_width = placement.width.saturating_sub(2).max(1);
         let wrapped = wrap_text(&composer.prompt.text(), content_width);
         let (row, column) = wrapped
@@ -1506,10 +2474,33 @@ impl PanelManager {
                         composer.prompt.set_cursor(index);
                     }
                 }
+                panel.blur_scrollback();
                 "composer_focus"
             } else {
-                if let Some(composer) = panel.composer.as_mut() {
-                    composer.focused = false;
+                panel.focus_scrollback(placement.width);
+                let title_rows = usize::from(
+                    panel.config.title.is_some() || !panel.config.header_actions.is_empty(),
+                );
+                let content_height = placement
+                    .height
+                    .saturating_sub(panel.composer_height())
+                    .saturating_sub(panel.status_height());
+                let screen_row = y.saturating_sub(placement.y);
+                if screen_row >= title_rows && screen_row < content_height {
+                    let layout = panel.layout(placement.width);
+                    let visible_rows = content_height.saturating_sub(title_rows);
+                    let max_scroll = layout.lines.len().saturating_sub(visible_rows);
+                    let scroll = panel.viewport.visible_offset(max_scroll);
+                    let row = scroll.saturating_add(screen_row.saturating_sub(title_rows));
+                    let column = x.saturating_sub(placement.x);
+                    if let Some(offset) = layout.nearest_offset_on_row(row, column) {
+                        panel.scrollback.cursor = offset;
+                        panel.scrollback.mouse_anchor = Some(offset);
+                        panel.scrollback.mouse_dragging = true;
+                        panel.scrollback.mode = TextPanelScrollbackMode::Normal;
+                        panel.scrollback.selection_anchor = None;
+                        panel.selected_link = None;
+                    }
                 }
                 "select"
             };
@@ -1532,6 +2523,88 @@ impl PanelManager {
             row: panel.selected_row(),
             text: None,
         })
+    }
+
+    pub(crate) fn drag_focused_text_selection(
+        &mut self,
+        x: usize,
+        y: usize,
+        terminal_width: usize,
+        terminal_height: usize,
+    ) -> bool {
+        let Some(id) = self.focused.clone() else {
+            return false;
+        };
+        let Some(placement) = self
+            .panel_placements(terminal_width, terminal_height)
+            .into_iter()
+            .find(|placement| placement.id == id)
+        else {
+            return false;
+        };
+        let Some(panel) = self.text_panels.get_mut(&id) else {
+            return false;
+        };
+        let Some(anchor) = panel.scrollback.mouse_anchor else {
+            return false;
+        };
+        if !panel.scrollback.mouse_dragging {
+            return false;
+        }
+        let title_rows =
+            usize::from(panel.config.title.is_some() || !panel.config.header_actions.is_empty());
+        let content_height = placement
+            .height
+            .saturating_sub(panel.composer_height())
+            .saturating_sub(panel.status_height());
+        if content_height <= title_rows {
+            return false;
+        }
+        let top = placement.y.saturating_add(title_rows);
+        let bottom = placement.y.saturating_add(content_height.saturating_sub(1));
+        if y < top {
+            panel.move_scroll(-1, placement.height, placement.width);
+        } else if y > bottom {
+            panel.move_scroll(1, placement.height, placement.width);
+        }
+        let layout = panel.layout(placement.width);
+        let visible_rows = content_height.saturating_sub(title_rows);
+        let max_scroll = layout.lines.len().saturating_sub(visible_rows);
+        let scroll = panel.viewport.visible_offset(max_scroll);
+        let screen_row = y.clamp(top, bottom).saturating_sub(top);
+        let row = scroll.saturating_add(screen_row);
+        let column = x
+            .clamp(
+                placement.x,
+                placement
+                    .x
+                    .saturating_add(placement.width.saturating_sub(1)),
+            )
+            .saturating_sub(placement.x);
+        let Some(offset) = layout.nearest_offset_on_row(row, column) else {
+            return false;
+        };
+        panel.scrollback.cursor = offset;
+        if offset != anchor {
+            panel.scrollback.mode = TextPanelScrollbackMode::Visual;
+            panel.scrollback.selection_anchor = Some(anchor);
+            panel.follow_tail = false;
+        }
+        true
+    }
+
+    pub(crate) fn finish_focused_text_selection(&mut self) -> bool {
+        let Some(panel) = self
+            .focused
+            .as_deref()
+            .and_then(|id| self.text_panels.get_mut(id))
+        else {
+            return false;
+        };
+        let dragging = panel.scrollback.mouse_dragging;
+        panel.scrollback.mouse_dragging = false;
+        panel.scrollback.mouse_anchor = None;
+        dragging
     }
 
     pub fn panel_at_position(
@@ -1922,16 +2995,31 @@ fn render_text_panel(
         .saturating_sub(composer_height)
         .saturating_sub(status_height);
     let visible_rows = content_height.saturating_sub(title_rows);
-    let lines = panel.rendered_lines(width);
-    let max_scroll = lines.len().saturating_sub(visible_rows);
+    let layout = panel.layout(width);
+    let max_scroll = layout.lines.len().saturating_sub(visible_rows);
     let scroll = panel.viewport.visible_offset(max_scroll);
-    for (offset, line) in lines.iter().skip(scroll).take(visible_rows).enumerate() {
+    let selection = panel.selection_bounds(&layout);
+    for (offset, line) in layout
+        .rendered
+        .iter()
+        .skip(scroll)
+        .take(visible_rows)
+        .enumerate()
+    {
+        let line_index = scroll.saturating_add(offset);
         render_text_spans(
             buffer,
             position.x,
             position.y.saturating_add(title_rows + offset),
             width,
             line,
+            layout.lines.get(line_index).map_or(0, |line| line.first),
+            layout
+                .lines
+                .get(line_index)
+                .is_some_and(|line| line.selectable)
+                .then_some(selection)
+                .flatten(),
             panel.selected_link,
             theme,
         );
@@ -1959,6 +3047,7 @@ fn render_text_panel(
         render_text_panel_composer(
             buffer,
             composer,
+            &panel.scrollback,
             position,
             width,
             content_height + status_height,
@@ -1976,9 +3065,11 @@ enum TextPanelOverflow {
     Both,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_text_panel_composer(
     buffer: &mut RenderBuffer,
     composer: &TextPanelComposer,
+    scrollback: &TextPanelScrollback,
     position: Point,
     width: usize,
     top: usize,
@@ -2030,7 +3121,19 @@ fn render_text_panel_composer(
             style,
         );
     }
-    let hints = if composer.focused && composer.prompt.mode() == crate::editor::Mode::Normal {
+    let hints = if scrollback.focused {
+        match scrollback.mode {
+            TextPanelScrollbackMode::Normal => {
+                "SCROLLBACK NORMAL · hjkl/arrows move · v/V select · y copy · a edit"
+            }
+            TextPanelScrollbackMode::Visual => {
+                "SCROLLBACK VISUAL · motions extend · y copy · Esc cancel"
+            }
+            TextPanelScrollbackMode::VisualLine => {
+                "SCROLLBACK VISUAL LINE · motions extend · y copy · Esc cancel"
+            }
+        }
+    } else if composer.focused && composer.prompt.mode() == crate::editor::Mode::Normal {
         "NORMAL · j/k ↑/↓ scroll · i/a edit · Enter send · Esc nav"
     } else if composer.focused {
         "INSERT · ^J/^K scroll · ^g/^G ends · Ctrl+Enter send · Esc normal"
@@ -2147,16 +3250,21 @@ fn text_panel_header_action_at(config: &PanelConfig, width: usize, x: usize) -> 
         .map(|(_, action, _)| action)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_text_spans(
     buffer: &mut RenderBuffer,
     x: usize,
     y: usize,
     width: usize,
     line: &RenderedTextLine,
+    line_first: usize,
+    selection: Option<(usize, usize)>,
     selected_link: Option<u64>,
     theme: &Theme,
 ) {
-    paint_rich_text(buffer, x, y, width, line, |span| {
+    let mut column = 0usize;
+    let mut offset = line_first;
+    for span in &line.spans {
         let base_style = text_panel_span_style(span.style, theme);
         let mut style = if let Some(syntax_style) = &span.syntax_style {
             Style {
@@ -2176,8 +3284,29 @@ fn render_text_spans(
             let selection = theme.list_selection_style();
             style = theme.selected_style(&style, &selection, SelectionForegroundPriority::Content);
         }
-        style
-    });
+        for grapheme in span.text.graphemes(true) {
+            let grapheme_width = display_width(grapheme).max(1);
+            if column.saturating_add(grapheme_width) > width {
+                return;
+            }
+            let mut grapheme_style = style.clone();
+            let selectable = matches!(span.selection, TextPanelSpanSelection::Content);
+            if selectable && selection.is_some_and(|(start, end)| offset >= start && offset <= end)
+            {
+                let selected = theme.list_selection_style();
+                grapheme_style = theme.selected_style(
+                    &grapheme_style,
+                    &selected,
+                    SelectionForegroundPriority::Content,
+                );
+            }
+            buffer.set_text(x.saturating_add(column), y, grapheme, &grapheme_style);
+            column = column.saturating_add(grapheme_width);
+            if selectable {
+                offset = offset.saturating_add(1);
+            }
+        }
+    }
 }
 
 fn text_panel_span_style(style: TextPanelSpanStyle, theme: &Theme) -> Style {
@@ -2270,18 +3399,25 @@ fn block_style(kind: &TextPanelBlockKind) -> TextPanelSpanStyle {
 }
 
 fn turn_separator(width: usize) -> RenderedTextLine {
-    RenderedTextLine::plain("─".repeat(width.max(1)), TextPanelSpanStyle::Muted)
+    RenderedTextLine::chrome("─".repeat(width.max(1)), TextPanelSpanStyle::Muted)
 }
 
 fn user_accented(line: RenderedTextLine) -> RenderedTextLine {
+    let break_after = line.break_after;
+    let selection = line.selection;
     let mut spans = vec![RenderedTextSpan {
         text: "▎ ".to_string(),
         style: TextPanelSpanStyle::User,
         syntax_style: None,
         link: None,
+        selection: TextPanelSpanSelection::Chrome,
     }];
     spans.extend(line.spans);
-    RenderedTextLine { spans }
+    RenderedTextLine {
+        spans,
+        break_after,
+        selection,
+    }
 }
 
 fn render_row_segments(
@@ -3055,6 +4191,7 @@ mod tests {
                         ..Style::default()
                     }),
                     link: None,
+                    selection: TextPanelSpanSelection::Content,
                 },
                 RenderedTextSpan {
                     text: "b".to_string(),
@@ -3064,12 +4201,15 @@ mod tests {
                         ..Style::default()
                     }),
                     link: None,
+                    selection: TextPanelSpanSelection::Content,
                 },
             ],
+            break_after: RenderedTextLineBreak::Hard,
+            selection: TextPanelLineSelection::Semantic,
         };
         let mut buffer = RenderBuffer::new(2, 1, &theme.style);
 
-        render_text_spans(&mut buffer, 0, 0, 2, &line, None, &theme);
+        render_text_spans(&mut buffer, 0, 0, 2, &line, 0, None, None, &theme);
 
         assert_eq!(
             buffer.cells[0].style,
@@ -3089,6 +4229,40 @@ mod tests {
                 italic: false,
             }
         );
+    }
+
+    #[test]
+    fn scrollback_highlight_skips_display_chrome() {
+        let theme = Theme::default();
+        let line = RenderedTextLine {
+            spans: vec![
+                RenderedTextSpan {
+                    text: "│ ".to_string(),
+                    style: TextPanelSpanStyle::Muted,
+                    syntax_style: None,
+                    link: None,
+                    selection: TextPanelSpanSelection::Chrome,
+                },
+                RenderedTextSpan {
+                    text: "x".to_string(),
+                    style: TextPanelSpanStyle::Code,
+                    syntax_style: None,
+                    link: None,
+                    selection: TextPanelSpanSelection::Content,
+                },
+            ],
+            break_after: RenderedTextLineBreak::Hard,
+            selection: TextPanelLineSelection::Semantic,
+        };
+        let mut normal = RenderBuffer::new(3, 1, &theme.style);
+        let mut selected = RenderBuffer::new(3, 1, &theme.style);
+
+        render_text_spans(&mut normal, 0, 0, 3, &line, 0, None, None, &theme);
+        render_text_spans(&mut selected, 0, 0, 3, &line, 0, Some((0, 0)), None, &theme);
+
+        assert_eq!(normal.cells[0].style, selected.cells[0].style);
+        assert_eq!(normal.cells[1].style, selected.cells[1].style);
+        assert_ne!(normal.cells[2].style, selected.cells[2].style);
     }
 
     #[test]
@@ -3948,7 +5122,7 @@ mod tests {
             .map(|row| row_text(&buffer, row))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(top.contains("↓ more · j/k scroll · G latest"));
+        assert!(top.contains("SCROLLBACK NORMAL · hjkl/arrows move"));
 
         manager.handle_focused_key("bottom", 15, 80, 0).unwrap();
         let mut buffer = RenderBuffer::new(80, 15, &theme.style);
@@ -3957,7 +5131,7 @@ mod tests {
             .map(|row| row_text(&buffer, row))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(bottom.contains("↑ history · j/k scroll · g oldest"));
+        assert!(bottom.contains("SCROLLBACK NORMAL · hjkl/arrows move"));
     }
 
     #[test]
@@ -4404,5 +5578,555 @@ mod tests {
         render_panel(&mut buffer, &panel, Point::new(0, 0), 6, &theme);
 
         assert_eq!(row_text(&buffer, 0), "abc M ");
+    }
+
+    #[test]
+    fn scrollback_selection_copy_ignores_soft_wraps_and_preserves_hard_breaks() {
+        let mut panel = TextPanel::new("agent".to_string(), PanelConfig::default());
+        panel.blocks = vec![TextPanelBlock {
+            id: "answer".to_string(),
+            kind: TextPanelBlockKind::Text,
+            format: TextPanelBlockFormat::Plain,
+            text: "alpha beta gamma\nsecond line".to_string(),
+        }];
+
+        let layout = panel.layout(7);
+        assert!(layout.lines.len() > 2);
+        assert_eq!(
+            layout.selected_text(0, layout.len - 1, false),
+            "alpha beta gamma\nsecond line"
+        );
+
+        let wide = panel.layout(40);
+        assert_eq!(layout.len, wide.len);
+        assert_eq!(
+            layout.selected_text(6, 9, false),
+            wide.selected_text(6, 9, false)
+        );
+
+        panel.blocks[0].kind = TextPanelBlockKind::User;
+        let narrow_user = panel.layout(7);
+        let wide_user = panel.layout(40);
+        assert_eq!(narrow_user.len, wide_user.len);
+        assert_eq!(
+            narrow_user.selected_text(0, narrow_user.len - 1, false),
+            "alpha beta gamma\nsecond line"
+        );
+    }
+
+    #[test]
+    fn markdown_selection_omits_code_frames_and_preserves_code_blank_lines() {
+        let mut panel = TextPanel::new("agent".to_string(), PanelConfig::default());
+        panel.blocks = vec![TextPanelBlock {
+            id: "answer".to_string(),
+            kind: TextPanelBlockKind::Text,
+            format: TextPanelBlockFormat::Markdown,
+            text: "```bash\n/game\n\npwd\n```".to_string(),
+        }];
+
+        let layout = panel.layout(40);
+        let copied = layout.selected_text(0, layout.len - 1, false);
+
+        assert_eq!(copied, "/game\n\npwd");
+        assert!(!copied.contains("bash"));
+        assert!(!copied.contains(['┌', '│', '└']));
+        assert_eq!(layout.len, "/gamepwd".graphemes(true).count());
+        assert!(layout.lines.iter().any(|line| line.chrome_only));
+    }
+
+    #[test]
+    fn markdown_selection_omits_heading_quote_rule_and_role_chrome() {
+        let mut panel = TextPanel::new("agent".to_string(), PanelConfig::default());
+        panel.blocks = vec![
+            TextPanelBlock {
+                id: "user".to_string(),
+                kind: TextPanelBlockKind::User,
+                format: TextPanelBlockFormat::Markdown,
+                text: "# Heading\n\n> quoted **strong** and `inline`".to_string(),
+            },
+            TextPanelBlock {
+                id: "agent".to_string(),
+                kind: TextPanelBlockKind::Agent,
+                format: TextPanelBlockFormat::Markdown,
+                text: "---\n\nAfter".to_string(),
+            },
+        ];
+
+        let layout = panel.layout(60);
+        let copied = layout.selected_text(0, layout.len - 1, false);
+
+        for content in ["Heading", "quoted strong and inline", "After"] {
+            assert!(
+                copied.contains(content),
+                "missing semantic content {content:?}"
+            );
+        }
+        for chrome in ["▎ You", "◆ Agent", "▍", "│", "─"] {
+            assert!(!copied.contains(chrome), "copied display chrome {chrome:?}");
+        }
+    }
+
+    #[test]
+    fn markdown_selection_keeps_list_structure_and_link_labels() {
+        let mut panel = TextPanel::new("agent".to_string(), PanelConfig::default());
+        panel.blocks = vec![TextPanelBlock {
+            id: "answer".to_string(),
+            kind: TextPanelBlockKind::Text,
+            format: TextPanelBlockFormat::Markdown,
+            text: "- item\n- [x] done\n\n1. numbered\n\n[label](https://example.com)".to_string(),
+        }];
+
+        let layout = panel.layout(50);
+        let copied = layout.selected_text(0, layout.len - 1, false);
+
+        assert!(copied.contains("• item"));
+        assert!(copied.contains("• ☑ done"));
+        assert!(copied.contains("1. numbered"));
+        assert!(copied.contains("label"));
+        assert!(!copied.contains("https://example.com"));
+    }
+
+    #[test]
+    fn markdown_table_selection_uses_tabs_and_omits_grid_padding() {
+        let mut panel = TextPanel::new("agent".to_string(), PanelConfig::default());
+        panel.blocks = vec![TextPanelBlock {
+            id: "answer".to_string(),
+            kind: TextPanelBlockKind::Text,
+            format: TextPanelBlockFormat::Markdown,
+            text: "| Name | Value |\n|---|---|\n| one | 1 |".to_string(),
+        }];
+
+        let layout = panel.layout(40);
+        let copied = layout.selected_text(0, layout.len - 1, false);
+
+        assert_eq!(copied, "Name\tValue\none\t1");
+        assert!(!copied.contains('━'));
+        assert!(!copied.contains("  "));
+    }
+
+    #[test]
+    fn markdown_selection_is_stable_across_wrapping_and_unicode() {
+        let mut panel = TextPanel::new("agent".to_string(), PanelConfig::default());
+        panel.blocks = vec![TextPanelBlock {
+            id: "answer".to_string(),
+            kind: TextPanelBlockKind::Text,
+            format: TextPanelBlockFormat::Markdown,
+            text: "# Café 👩‍💻\n\n- outer item with enough words to wrap\n   - nested e\u{301} item\n\n> quoted words that also wrap\n\n```bash\necho 👩‍💻-abcdefghijk\n```"
+                .to_string(),
+        }];
+
+        let narrow = panel.layout(14);
+        let wide = panel.layout(80);
+        let narrow_copy = narrow.selected_text(0, narrow.len - 1, false);
+        let wide_copy = wide.selected_text(0, wide.len - 1, false);
+
+        assert_eq!(narrow.len, wide.len);
+        assert_eq!(narrow_copy, wide_copy);
+        assert!(narrow_copy.contains("Café 👩‍💻"));
+        assert!(narrow_copy.contains("  • nested e\u{301} item"));
+        assert!(narrow_copy.contains("echo 👩‍💻-abcdefghijk"));
+        assert!(!narrow_copy.contains(['▍', '│', '┌', '└']));
+    }
+
+    #[test]
+    fn markdown_selection_keeps_visible_html_and_image_alt_text() {
+        let mut panel = TextPanel::new("agent".to_string(), PanelConfig::default());
+        panel.blocks = vec![TextPanelBlock {
+            id: "answer".to_string(),
+            kind: TextPanelBlockKind::Text,
+            format: TextPanelBlockFormat::Markdown,
+            text: "Press <kbd>Ctrl</kbd> beside ![diagram](https://example.com/image.png)."
+                .to_string(),
+        }];
+
+        let layout = panel.layout(80);
+        let copied = layout.selected_text(0, layout.len - 1, false);
+
+        assert_eq!(copied, "Press <kbd>Ctrl</kbd> beside diagram.");
+        assert!(!copied.contains("https://example.com/image.png"));
+    }
+
+    #[test]
+    fn narrow_markdown_table_selection_omits_record_chrome() {
+        let mut panel = TextPanel::new("agent".to_string(), PanelConfig::default());
+        panel.blocks = vec![TextPanelBlock {
+            id: "answer".to_string(),
+            kind: TextPanelBlockKind::Text,
+            format: TextPanelBlockFormat::Markdown,
+            text: "| Name | Value |\n|---|---|\n| one | 1 |\n| two | 2 |".to_string(),
+        }];
+
+        let layout = panel.layout(10);
+        let copied = layout.selected_text(0, layout.len - 1, false);
+
+        for content in ["Name", "Value", "one", "1", "two", "2"] {
+            assert!(copied.contains(content));
+        }
+        assert!(!copied.contains(['─', '━']));
+        assert!(!copied.lines().any(|line| line.starts_with("  ")));
+    }
+
+    #[test]
+    fn scrollback_focus_starts_on_the_first_visible_row_so_j_moves_down() {
+        use crossterm::event::KeyEvent;
+
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 20,
+                title: Some("Agent".to_string()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 2,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_text_panel(
+            "agent",
+            vec![TextPanelBlock {
+                id: "answer".to_string(),
+                kind: TextPanelBlockKind::Text,
+                format: TextPanelBlockFormat::Plain,
+                text: (1..=30)
+                    .map(|line| format!("line {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            }],
+            8,
+            80,
+        );
+        assert!(manager.focus_text_panel_composer("agent"));
+        assert!(manager.focus_focused_text_scrollback(80));
+
+        let panel = &manager.text_panels["agent"];
+        assert!(panel.scroll > 0);
+        let before_row = panel
+            .layout(20)
+            .position(panel.scrollback.cursor)
+            .unwrap()
+            .0;
+        assert_eq!(before_row, panel.scroll);
+
+        manager
+            .handle_focused_scrollback_input(
+                &Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+                8,
+                80,
+                1,
+            )
+            .unwrap();
+
+        let panel = &manager.text_panels["agent"];
+        let after_row = panel
+            .layout(20)
+            .position(panel.scrollback.cursor)
+            .unwrap()
+            .0;
+        assert_eq!(after_row, before_row + 1);
+    }
+
+    #[test]
+    fn scrollback_j_moves_forward_across_empty_rows() {
+        use crossterm::event::KeyEvent;
+
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 20,
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_text_panel(
+            "agent",
+            vec![TextPanelBlock {
+                id: "answer".to_string(),
+                kind: TextPanelBlockKind::Text,
+                format: TextPanelBlockFormat::Plain,
+                text: "first\n\nthird".to_string(),
+            }],
+            10,
+            80,
+        );
+        assert!(manager.focus_panel("agent"));
+        manager
+            .handle_focused_scrollback_input(
+                &Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)),
+                10,
+                80,
+                1,
+            )
+            .unwrap();
+
+        let before = manager.text_panels["agent"].scrollback.cursor;
+        manager
+            .handle_focused_scrollback_input(
+                &Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+                10,
+                80,
+                1,
+            )
+            .unwrap();
+
+        let panel = &manager.text_panels["agent"];
+        assert!(panel.scrollback.cursor > before);
+        let layout = panel.layout(20);
+        let (row, _, _) = layout.position(panel.scrollback.cursor).unwrap();
+        assert_eq!(
+            layout.selected_text(panel.scrollback.cursor, panel.scrollback.cursor, false),
+            "t"
+        );
+        assert_eq!(row, 2);
+    }
+
+    #[test]
+    fn scrollback_escape_i_and_a_return_to_the_composer_in_one_keypress() {
+        use crossterm::event::KeyEvent;
+
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 30,
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 2,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_text_panel(
+            "agent",
+            vec![TextPanelBlock {
+                id: "answer".to_string(),
+                kind: TextPanelBlockKind::Text,
+                format: TextPanelBlockFormat::Plain,
+                text: "answer".to_string(),
+            }],
+            10,
+            80,
+        );
+        assert!(manager.focus_text_panel_composer("agent"));
+        manager.handle_focused_text_input(&Event::Paste("abcd".to_string()), 80);
+
+        assert!(manager.focus_focused_text_scrollback(80));
+        manager
+            .handle_focused_scrollback_input(
+                &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                10,
+                80,
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            manager.focused_text_panel_cursor_mode(),
+            Some(crate::editor::Mode::Insert)
+        );
+
+        for (key, expected_cursor) in [('i', 1), ('a', 2)] {
+            let composer = manager
+                .text_panels
+                .get_mut("agent")
+                .unwrap()
+                .composer
+                .as_mut()
+                .unwrap();
+            composer.prompt.set_cursor(1);
+            composer.prompt.set_mode(crate::editor::Mode::Insert);
+            assert!(manager.focus_focused_text_scrollback(80));
+
+            manager
+                .handle_focused_scrollback_input(
+                    &Event::Key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)),
+                    10,
+                    80,
+                    1,
+                )
+                .unwrap();
+
+            let panel = &manager.text_panels["agent"];
+            let composer = panel.composer.as_ref().unwrap();
+            assert!(composer.focused);
+            assert!(!panel.scrollback.focused);
+            assert_eq!(composer.prompt.mode(), crate::editor::Mode::Insert);
+            assert_eq!(composer.prompt.cursor(), expected_cursor);
+        }
+    }
+
+    #[test]
+    fn scrollback_visual_line_yank_is_unicode_safe_and_linewise() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 20,
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_text_panel(
+            "agent",
+            vec![TextPanelBlock {
+                id: "answer".to_string(),
+                kind: TextPanelBlockKind::Text,
+                format: TextPanelBlockFormat::Plain,
+                text: "a👨‍👩‍👧‍👦e\u{301}\nsecond".to_string(),
+            }],
+            10,
+            80,
+        );
+        assert!(manager.focus_panel("agent"));
+        manager
+            .handle_focused_scrollback_input(
+                &Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char('g'),
+                    KeyModifiers::NONE,
+                )),
+                10,
+                80,
+                1,
+            )
+            .unwrap();
+        manager
+            .handle_focused_scrollback_input(
+                &Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char('V'),
+                    KeyModifiers::SHIFT,
+                )),
+                10,
+                80,
+                1,
+            )
+            .unwrap();
+        let yank = manager
+            .handle_focused_scrollback_input(
+                &Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char('y'),
+                    KeyModifiers::NONE,
+                )),
+                10,
+                80,
+                1,
+            )
+            .unwrap();
+
+        assert_eq!(
+            yank,
+            TextPanelScrollbackInput::Yank(TextPanelYank {
+                text: "a👨‍👩‍👧‍👦e\u{301}\n".to_string(),
+                linewise: true,
+            })
+        );
+    }
+
+    #[test]
+    fn scrollback_character_find_extends_visual_selection() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 20,
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_text_panel(
+            "agent",
+            vec![TextPanelBlock {
+                id: "answer".to_string(),
+                kind: TextPanelBlockKind::Text,
+                format: TextPanelBlockFormat::Plain,
+                text: "alpha beta".to_string(),
+            }],
+            10,
+            80,
+        );
+        assert!(manager.focus_panel("agent"));
+        let mut outcome = None;
+        for key in ['g', 'v', 'f', 'b', 'y'] {
+            outcome = manager.handle_focused_scrollback_input(
+                &Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char(key),
+                    KeyModifiers::NONE,
+                )),
+                10,
+                80,
+                1,
+            );
+        }
+
+        let panel = &manager.text_panels["agent"];
+        assert_eq!(panel.scrollback.mode, TextPanelScrollbackMode::Normal);
+        assert_eq!(panel.scrollback.cursor, 0);
+        assert_eq!(
+            outcome,
+            Some(TextPanelScrollbackInput::Yank(TextPanelYank {
+                text: "alpha b".to_string(),
+                linewise: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn streaming_append_does_not_expand_an_active_scrollback_selection() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 20,
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_text_panel(
+            "agent",
+            vec![TextPanelBlock {
+                id: "answer".to_string(),
+                kind: TextPanelBlockKind::Text,
+                format: TextPanelBlockFormat::Plain,
+                text: "alpha beta".to_string(),
+            }],
+            10,
+            80,
+        );
+        assert!(manager.focus_panel("agent"));
+        for key in ['g', 'v', 'e'] {
+            manager
+                .handle_focused_scrollback_input(
+                    &Event::Key(crossterm::event::KeyEvent::new(
+                        KeyCode::Char(key),
+                        KeyModifiers::NONE,
+                    )),
+                    10,
+                    80,
+                    1,
+                )
+                .unwrap();
+        }
+        manager.append_text_panel("agent", "answer", " gamma", 10, 80);
+
+        let yank = manager
+            .handle_focused_scrollback_input(
+                &Event::Key(crossterm::event::KeyEvent::new(
+                    KeyCode::Char('y'),
+                    KeyModifiers::NONE,
+                )),
+                10,
+                80,
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            yank,
+            TextPanelScrollbackInput::Yank(TextPanelYank {
+                text: "alpha".to_string(),
+                linewise: false,
+            })
+        );
     }
 }

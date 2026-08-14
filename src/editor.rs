@@ -11444,6 +11444,36 @@ impl Editor {
         {
             return Self::panel_event_key_action(event);
         }
+        let count = usize::from(self.repeater.unwrap_or(1));
+        if let Some(input) = self.panel_manager.handle_focused_scrollback_input(
+            ev,
+            usize::from(self.size.1.saturating_sub(2)),
+            usize::from(self.size.0),
+            count,
+        ) {
+            self.repeater = None;
+            return Some(match input {
+                plugin::panel::TextPanelScrollbackInput::Handled => {
+                    KeyAction::Single(Action::Refresh)
+                }
+                plugin::panel::TextPanelScrollbackInput::Yank(yank) => {
+                    let length = yank.text.graphemes(true).count();
+                    let lines = yank.text.lines().count();
+                    let content = if yank.linewise {
+                        Content::linewise(yank.text)
+                    } else {
+                        Content::charwise(yank.text)
+                    };
+                    self.set_default_register(content);
+                    self.last_error = Some(if yank.linewise {
+                        format!("{} lines yanked", lines.max(1))
+                    } else {
+                        format!("{length} characters yanked")
+                    });
+                    KeyAction::Single(Action::Refresh)
+                }
+            });
+        }
         match ev {
             Event::Key(event) => {
                 if matches!(event.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
@@ -11459,13 +11489,21 @@ impl Editor {
                     }
                 }
                 if matches!(event.code, KeyCode::Tab | KeyCode::BackTab) {
+                    if self.panel_manager.focused_text_input_active()
+                        && self
+                            .panel_manager
+                            .focus_focused_text_scrollback(usize::from(self.size.0))
+                    {
+                        return Some(KeyAction::Single(Action::Refresh));
+                    }
                     let panel_height = usize::from(self.size.1.saturating_sub(2));
                     let forward = event.code == KeyCode::Tab;
-                    if self.panel_manager.select_focused_text_link(
+                    let selected = self.panel_manager.select_focused_text_link(
                         forward,
                         panel_height,
                         usize::from(self.size.0),
-                    ) {
+                    );
+                    if selected || !self.panel_manager.focused_row_panel() {
                         return Some(KeyAction::Single(Action::Refresh));
                     }
                 }
@@ -11511,7 +11549,7 @@ impl Editor {
                     }
                     KeyCode::Char('H') => "history",
                     KeyCode::Char('N') => "new",
-                    KeyCode::Char('a') if !self.panel_manager.focused_row_panel() => {
+                    KeyCode::Char('a' | 'i') if !self.panel_manager.focused_row_panel() => {
                         "composer_focus"
                     }
                     KeyCode::Char('x') if !self.panel_manager.focused_row_panel() => "clear",
@@ -11633,16 +11671,29 @@ impl Editor {
 
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(target) = self
-                    .panel_manager
-                    .text_link_at_position(x, y, width, height)
+                if event
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
                 {
-                    return Some(self.follow_text_panel_link(target));
+                    if let Some(target) = self
+                        .panel_manager
+                        .text_link_at_position(x, y, width, height)
+                    {
+                        return Some(self.follow_text_panel_link(target));
+                    }
                 }
                 self.panel_manager
                     .focus_panel_at_position(x, y, width, height)
                     .and_then(Self::panel_event_key_action)
             }
+            MouseEventKind::Drag(MouseButton::Left) => self
+                .panel_manager
+                .drag_focused_text_selection(x, y, width, height)
+                .then_some(KeyAction::Single(Action::Refresh)),
+            MouseEventKind::Up(MouseButton::Left) => self
+                .panel_manager
+                .finish_focused_text_selection()
+                .then_some(KeyAction::Single(Action::Refresh)),
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let placement = self.panel_manager.panel_at_position(x, y, width, height)?;
                 let scroll_lines = isize::try_from(self.config.mouse_scroll_lines.unwrap_or(3))
@@ -24516,6 +24567,16 @@ impl Editor {
         self.restore_panel_layout(id);
         self.apply_panel_layout();
         self.sync_with_window();
+    }
+
+    #[doc(hidden)]
+    pub fn test_update_text_panel(&mut self, id: &str, blocks: Vec<plugin::TextPanelBlock>) {
+        self.panel_manager.update_text_panel(
+            id,
+            blocks,
+            usize::from(self.size.1.saturating_sub(2)),
+            usize::from(self.size.0),
+        );
     }
 
     #[doc(hidden)]

@@ -17,8 +17,8 @@ use red::{
     editor::{Action, Content, Editor, Mode, SearchDirection},
     lsp::LspClient,
     plugin::{
-        PanelConfig, PanelRow, PanelRowKind, PanelSegment, PanelSide, Runtime,
-        TextPanelComposerConfig,
+        PanelConfig, PanelRow, PanelRowKind, PanelSegment, PanelSide, Runtime, TextPanelBlock,
+        TextPanelBlockFormat, TextPanelBlockKind, TextPanelComposerConfig,
     },
     preferences::PreferencesStore,
     theme::{Style, Theme},
@@ -5840,6 +5840,175 @@ async fn focused_agent_panel_keeps_global_leader_until_the_composer_is_focused()
 }
 
 #[test]
+fn agent_scrollback_tab_focuses_a_cursor_and_visual_yank_uses_the_clipboard() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    let clipboard_text = Arc::new(Mutex::new(None));
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::from(
+            clipboard_text.clone(),
+        )));
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 24,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+            ..PanelConfig::default()
+        },
+    );
+    harness.editor.test_update_text_panel(
+        "agent",
+        vec![TextPanelBlock {
+            id: "answer".to_string(),
+            kind: TextPanelBlockKind::Text,
+            format: TextPanelBlockFormat::Plain,
+            text: "alpha beta gamma".to_string(),
+        }],
+    );
+    assert!(harness.editor.test_focus_text_panel_composer("agent"));
+
+    harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+        .unwrap();
+    assert!(harness.render_cursor_position().is_some());
+
+    for key in ['g', 'w', 'v', 'e', 'y'] {
+        harness
+            .editor
+            .test_handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(key),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+    }
+
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("beta"));
+    assert_eq!(harness.last_error(), Some("4 characters yanked"));
+    assert!(harness.render_cursor_position().is_some());
+}
+
+#[test]
+fn agent_scrollback_visual_yank_copies_code_without_markdown_frame() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    let clipboard_text = Arc::new(Mutex::new(None));
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::from(
+            clipboard_text.clone(),
+        )));
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 24,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+            ..PanelConfig::default()
+        },
+    );
+    harness.editor.test_update_text_panel(
+        "agent",
+        vec![TextPanelBlock {
+            id: "answer".to_string(),
+            kind: TextPanelBlockKind::Agent,
+            format: TextPanelBlockFormat::Markdown,
+            text: "```bash\n/game\n```".to_string(),
+        }],
+    );
+    assert!(harness.editor.test_focus_text_panel_composer("agent"));
+
+    for code in [
+        KeyCode::Tab,
+        KeyCode::Char('g'),
+        KeyCode::Char('v'),
+        KeyCode::Char('G'),
+        KeyCode::Char('y'),
+    ] {
+        harness
+            .editor
+            .test_handle_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+            .unwrap();
+    }
+
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("/game"));
+}
+
+#[test]
+fn mouse_drag_selects_agent_scrollback_text_for_visual_yank() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    let clipboard_text = Arc::new(Mutex::new(None));
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::from(
+            clipboard_text.clone(),
+        )));
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 24,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+            ..PanelConfig::default()
+        },
+    );
+    harness.editor.test_update_text_panel(
+        "agent",
+        vec![TextPanelBlock {
+            id: "answer".to_string(),
+            kind: TextPanelBlockKind::Text,
+            format: TextPanelBlockFormat::Plain,
+            text: "alpha beta gamma".to_string(),
+        }],
+    );
+
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Drag(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        let column = if matches!(kind, MouseEventKind::Down(_)) {
+            56
+        } else {
+            60
+        };
+        harness
+            .editor
+            .test_handle_event(Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .unwrap();
+    }
+    harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("alpha"));
+}
+
+#[test]
 fn focused_agent_composer_routes_control_navigation_to_the_conversation() {
     let buffer = Buffer::new(None, "abcdef".to_string());
     let mut harness = EditorHarness::with_config(buffer, default_key_config());
@@ -7011,7 +7180,7 @@ async fn ctrl_w_w_focuses_agent_composer_and_makes_cursor_visible() {
             ))
     ));
     assert_eq!(harness.editor.test_focused_panel_id(), Some("agent"));
-    assert_eq!(harness.render_cursor_position(), None);
+    assert!(harness.render_cursor_position().is_some());
 }
 
 #[tokio::test]
