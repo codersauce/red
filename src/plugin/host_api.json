@@ -1,5 +1,5 @@
 {
-  "version": "0.8.0",
+  "version": "0.9.0",
   "calls": [
     { "name": "Print", "kind": "execute", "signature": "(message: String)", "introduced": "0.1.0" },
     { "name": "FilePicker", "kind": "execute", "signature": "()", "introduced": "0.1.0" },
@@ -16,11 +16,13 @@
     { "name": "PreviewTheme", "kind": "execute", "signature": "(theme: String)", "introduced": "0.1.0" },
     { "name": "SetTheme", "kind": "execute", "signature": "(theme: String)", "introduced": "0.1.0" },
     { "name": "AgentNewSession", "kind": "execute", "signature": "(cwd: String)", "introduced": "0.1.0" },
+    { "name": "AgentResumeSession", "kind": "execute", "signature": "(cwd: String, session_id: String)", "introduced": "0.9.0" },
     { "name": "AgentPrompt", "kind": "execute", "signature": "(session_id: String, text: String)", "introduced": "0.1.0" },
     { "name": "AgentPromptWithContext", "kind": "execute", "signature": "(session_id: String, text: String, context: Json)", "introduced": "0.2.0" },
     { "name": "AgentCancel", "kind": "execute", "signature": "(session_id: String)", "introduced": "0.1.0" },
     { "name": "AgentCloseSession", "kind": "execute", "signature": "(session_id: String)", "introduced": "0.2.0" },
     { "name": "AgentArchiveSession", "kind": "execute", "signature": "(session_id: String)", "introduced": "0.2.0" },
+    { "name": "AgentForgetSession", "kind": "execute", "signature": "(session_id: String)", "introduced": "0.9.0" },
     { "name": "AgentPermissionResponse", "kind": "execute", "signature": "(request_id: String, option_id: String?)", "introduced": "0.1.0" },
     { "name": "RevertTransaction", "kind": "execute", "signature": "(transaction_id: String)", "introduced": "0.1.0" },
     { "name": "SetCursorPosition", "kind": "execute", "signature": "(x: i32, y: i32)", "introduced": "0.1.0" },

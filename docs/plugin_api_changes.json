@@ -1,6 +1,12 @@
 {
-  "api_version": "0.8.0",
+  "api_version": "0.9.0",
   "changes": [
+    {
+      "version": "0.9.0",
+      "kind": "introduced",
+      "symbols": ["AgentResumeSession", "AgentForgetSession", "agent:conversation_restore_pending", "agent:session_restored", "agent:session_restore_failed"],
+      "migration_note": "docs/PLUGIN_API.md#agent-composer"
+    },
     {
       "version": "0.8.0",
       "kind": "introduced",

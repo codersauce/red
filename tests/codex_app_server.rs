@@ -74,15 +74,37 @@ for line in sys.stdin:
     elif method == "thread/start":
         assert message["params"]["sandbox"] == "read-only"
         assert message["params"]["approvalPolicy"] == "never"
+        assert message["params"]["ephemeral"] is False
         assert len(message["params"]["dynamicTools"]) == 9
         expected_hooks = os.environ.get("RED_MOCK_EXPECT_HOOKS") == "true"
         assert message["params"]["config"]["features"]["hooks"] is expected_hooks
         assert "codex_hooks" not in message["params"]["config"]["features"]
         send({"id": ident, "result": {"thread": {"id": "thread-red"}}})
+    elif method == "thread/resume":
+        assert message["params"]["threadId"] == "thread-red"
+        assert message["params"]["sandbox"] == "read-only"
+        assert message["params"]["approvalPolicy"] == "never"
+        assert "dynamicTools" not in message["params"]
+        if os.environ.get("RED_MOCK_RESUME_ERROR"):
+            send({"id": ident, "error": {"code": -32602, "message": "stored thread is unavailable"}})
+            continue
+        send({"id": ident, "result": {"thread": {
+            "id": "thread-red",
+            "ephemeral": False,
+            "turns": [{
+                "id": "restored-turn",
+                "status": "completed",
+                "items": [
+                    {"id": "restored-user", "type": "userMessage", "content": [{"type": "text", "text": "earlier question"}]},
+                    {"id": "restored-agent", "type": "agentMessage", "text": "earlier answer"}
+                ]
+            }]
+        }}})
     elif method == "turn/start":
-        text = message["params"]["input"][0]["text"]
-        assert "Active editor context from red-buffer://active:" in text
-        assert "unsaved editor text" in text
+        assert message["params"]["input"][0]["text"] == "update the file"
+        context = message["params"]["input"][1]["text"]
+        assert "Active editor context from red-buffer://active:" in context
+        assert "unsaved editor text" in context
         send({"id": ident, "result": {"turn": {"id": "turn-red"}}})
         send({"method": "item/agentMessage/delta", "params": {
             "threadId": "thread-red", "turnId": "turn-red", "delta": "working"
@@ -94,6 +116,10 @@ for line in sys.stdin:
         }})
     elif ident == "tool-write":
         assert message["result"]["success"] is True
+        send({"method": "item/completed", "params": {
+            "threadId": "thread-red", "turnId": "turn-red",
+            "item": {"id": "agent-red", "type": "agentMessage", "text": "working"}
+        }})
         send({"method": "turn/completed", "params": {
             "threadId": "thread-red",
             "turn": {"id": "turn-red", "status": "completed"}
@@ -163,6 +189,88 @@ async fn direct_app_server_streams_and_routes_writes_to_the_host() {
         vec![("src/main.rs".to_string(), "updated\n".to_string())]
     );
 
+    drop(bridge);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn direct_app_server_resumes_a_persisted_thread_with_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex = mock_codex(directory.path());
+    let host = RecordingHost {
+        writes: Arc::new(Mutex::new(Vec::new())),
+    };
+    let (mut bridge, task) = start_codex(
+        CodexProcessSpec::new(codex, directory.path()),
+        host,
+        NonZeroUsize::new(32).unwrap(),
+    )
+    .unwrap();
+
+    bridge
+        .send(CodexCommand::ResumeSession {
+            cwd: directory.path().to_path_buf(),
+            session_id: "thread-red".to_string(),
+        })
+        .await
+        .unwrap();
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(event) = bridge.try_recv() {
+                break event;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    match event {
+        CodexEvent::SessionRestored { session_id, thread } => {
+            assert_eq!(session_id, "thread-red");
+            assert_eq!(thread["turns"][0]["items"][1]["text"], "earlier answer");
+        }
+        other => panic!("expected restored session, got {other:?}"),
+    }
+    drop(bridge);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn direct_app_server_reports_a_missing_persisted_thread_as_restore_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex = mock_codex(directory.path());
+    let host = RecordingHost {
+        writes: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut spec = CodexProcessSpec::new(codex, directory.path());
+    spec.environment
+        .insert("RED_MOCK_RESUME_ERROR".into(), "true".into());
+    let (mut bridge, task) = start_codex(spec, host, NonZeroUsize::new(32).unwrap()).unwrap();
+
+    bridge
+        .send(CodexCommand::ResumeSession {
+            cwd: directory.path().to_path_buf(),
+            session_id: "thread-red".to_string(),
+        })
+        .await
+        .unwrap();
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(event) = bridge.try_recv() {
+                break event;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        event,
+        CodexEvent::SessionRestoreFailed { session_id, message }
+            if session_id == "thread-red" && message.contains("unavailable")
+    ));
     drop(bridge);
     task.await.unwrap().unwrap();
 }

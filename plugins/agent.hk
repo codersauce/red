@@ -40,6 +40,19 @@ struct AgentTranscriptEvent {
     transcript: String,
 }
 
+struct AgentConversationItem {
+    id: String,
+    turn_id: Option<String>,
+    role: String,
+    text: String,
+}
+
+struct AgentConversationEvent {
+    thread_id: String,
+    cwd: String,
+    items: [AgentConversationItem],
+}
+
 struct AgentStringValueEvent {
     value: String,
 }
@@ -179,6 +192,7 @@ struct AgentState {
     prompt_queue: [AgentPromptQueueItem],
     queued_prompt_blocks: [AgentTextBlock],
     recap_pending: bool,
+    restoring: bool,
     cancelled_session_id: String,
     stream_block_id: String,
     block_generation: i32,
@@ -213,6 +227,7 @@ fn initial_state() -> AgentState {
         prompt_queue: [],
         queued_prompt_blocks: [],
         recap_pending: false,
+        restoring: false,
         cancelled_session_id: "",
         stream_block_id: "",
         block_generation: 0,
@@ -259,6 +274,7 @@ fn session_created(event: AgentSessionEvent) {
     let pending_block_id = red::string(state().pending_prompt_block_id, "");
     let replay = state().pending_prompt_is_replay;
     red::state_patch(AgentState { session_id: event.session_id });
+    red::state_patch(AgentState { restoring: false });
     if previous_session_id != event.session_id || (pending != "" && replay) {
         red::state_patch(AgentState { turn_active: false });
     }
@@ -301,6 +317,12 @@ fn session_created(event: AgentSessionEvent) {
     scope = "global",
 )]
 fn prompt() {
+    if state().restoring {
+        ensure_conversation_panel();
+        red::execute("SetTextPanelComposerState", "agent-conversation", false, "Restoring agent session…");
+        red::execute("FocusPanel", "agent-conversation");
+        return;
+    }
     let has_live_session = red::string(state().session_id, "") != "";
     let has_restored_conversation = red::string(state().pending_prompt, "") == ""
         && red::trim(red::string(state().transcript, "")) != "";
@@ -309,6 +331,9 @@ fn prompt() {
         ensure_conversation_panel();
         if !was_created {
             render_conversation();
+        }
+        if !has_live_session && state().recap_pending {
+            red::execute("SetTextPanelComposerState", "agent-conversation", true, "Archived conversation · next message starts a new session");
         }
         red::execute("FocusTextPanelComposer", "agent-conversation");
         return;
@@ -883,9 +908,13 @@ fn close_conversation() {
 fn new_conversation() {
     let session_id = red::string(state().session_id, "");
     if session_id != "" {
-        red::execute("AgentCloseSession", session_id);
+        if !state().restoring {
+            red::execute("AgentCloseSession", session_id);
+        }
+        red::execute("AgentForgetSession", session_id);
     }
     red::state_patch(AgentState { session_id: "" });
+    red::state_patch(AgentState { restoring: false });
     red::state_patch(AgentState { cancelled_session_id: "" });
     red::state_patch(AgentState { turn_active: false });
     set_phase("idle", "");
@@ -973,6 +1002,54 @@ fn update(event: AgentTextEvent) {
         red::execute("CancelTimeout", timer);
     }
     red::state_patch(AgentState { stream_timer: red::execute("SetTimeout", 50) });
+}
+
+#[red::on("agent:message_completed")]
+fn message_completed(event: AgentTextEvent) {
+    if !is_current_session(event.session_id) {
+        return;
+    }
+    let text = red::string(event.text, "");
+    if !state().streaming {
+        update(event);
+        return;
+    }
+    let block_id = red::string(state().stream_block_id, "");
+    let blocks = state().transcript_blocks;
+    let updated = [];
+    for block in blocks {
+        if block.id == block_id {
+            block.text = text;
+        }
+        updated = red::push(updated, block);
+    }
+    red::state_patch(AgentState { transcript_blocks: updated });
+    red::state_patch(AgentState { transcript: flat_transcript(updated) });
+    red::state_patch(AgentState { stream_delta: "" });
+    red::state_patch(AgentState { stream_trimmed: false });
+    render_conversation();
+}
+
+fn flat_transcript(blocks: [AgentTextBlock]) -> String {
+    let transcript = "";
+    for block in blocks {
+        let text = red::string(block.text, "");
+        if text == "" {
+            continue;
+        }
+        let label = "System";
+        if block.kind == "user" {
+            label = "You";
+        } else if block.kind == "agent" {
+            label = "Agent";
+        } else if block.kind == "error" {
+            label = "Error";
+        } else if block.kind == "activity" {
+            label = "Activity";
+        }
+        transcript = transcript + label + ": " + text + "\n";
+    }
+    return transcript;
 }
 
 #[red::on("agent:completed")]
@@ -1265,7 +1342,82 @@ fn transcript_restored(event: AgentTranscriptEvent) {
     red::state_patch(AgentState { stream_block_id: "" });
     red::state_patch(AgentState { stream_delta: "" });
     red::state_patch(AgentState { stream_trimmed: false });
+    red::state_patch(AgentState { recap_pending: red::trim(transcript) != "" });
     render_conversation();
+}
+
+#[red::on("agent:conversation_restore_pending")]
+fn conversation_restore_pending(event: AgentConversationEvent) {
+    load_conversation(event);
+    red::state_patch(AgentState { session_id: event.thread_id });
+    red::state_patch(AgentState { restoring: true });
+    red::state_patch(AgentState { turn_active: false });
+    red::state_patch(AgentState { activity_block_id: "" });
+    red::state_patch(AgentState { activity_rows: [] });
+    red::state_patch(AgentState { thought: "" });
+    ensure_conversation_panel();
+    set_phase("restoring", "Restoring session…");
+    red::execute("SetTextPanelComposerState", "agent-conversation", false, "Restoring agent session…");
+    red::execute("AgentResumeSession", event.cwd, event.thread_id);
+}
+
+#[red::on("agent:session_restored")]
+fn session_restored(event: AgentConversationEvent) {
+    load_conversation(event);
+    red::state_patch(AgentState { session_id: event.thread_id });
+    red::state_patch(AgentState { restoring: false });
+    red::state_patch(AgentState { recap_pending: false });
+    set_phase("idle", "");
+    red::execute("SetTextPanelComposerState", "agent-conversation", true, "");
+    red::execute("Print", "Agent session restored");
+}
+
+struct AgentSessionRestoreFailedEvent {
+    session_id: String,
+    message: String,
+}
+
+#[red::on("agent:session_restore_failed")]
+fn session_restore_failed(event: AgentSessionRestoreFailedEvent) {
+    red::state_patch(AgentState { session_id: "" });
+    red::state_patch(AgentState { restoring: false });
+    red::state_patch(AgentState { recap_pending: red::trim(red::string(state().transcript, "")) != "" });
+    red::execute("AgentForgetSession", event.session_id);
+    ensure_conversation_panel();
+    set_phase("idle", "");
+    red::execute("SetTextPanelComposerState", "agent-conversation", true, "Archived conversation · next message starts a new session");
+    red::execute("Print", "Agent session could not be restored: " + event.message);
+}
+
+fn load_conversation(event: AgentConversationEvent) {
+    let transcript = "";
+    let blocks = [];
+    let generation = 0;
+    for item in event.items {
+        let role = red::string(item.role, "agent");
+        let kind = "agent";
+        let label = "Agent";
+        let format = "markdown";
+        if role == "user" {
+            kind = "user";
+            label = "You";
+            format = "plain";
+        }
+        transcript = transcript + label + ": " + red::string(item.text, "") + "\n";
+        generation = generation + 1;
+        blocks = red::push(blocks, AgentTextBlock {
+            id: red::string(item.id, kind + ":" + generation),
+            kind: kind,
+            format: format,
+            text: red::string(item.text, ""),
+        });
+    }
+    red::state_patch(AgentState { transcript: transcript });
+    red::state_patch(AgentState { transcript_blocks: blocks });
+    red::state_patch(AgentState { block_generation: generation });
+    reset_stream_render();
+    render_conversation();
+    red::execute("SetStorage", "transcript", transcript);
 }
 
 fn render_conversation() {

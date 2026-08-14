@@ -1,6 +1,6 @@
 # Husk plugin compatibility
 
-Red host API version `0.8.0` is defined by
+Red host API version `0.9.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -24,9 +24,9 @@ required/optional arity (`HUSK-A0002`) and obvious literal argument types
 annotations use `HUSK-A0004`. `--no-typecheck` is an unsupported development
 escape hatch; compatibility guarantees do not apply while it is enabled.
 
-Red `0.8.0` retains the complete `0.4.0`, `0.6.0`, and `0.7.0` contracts, so existing
+Red `0.9.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`, and `0.8.0` contracts, so existing
 packages that declare those minors continue to load. New packages should target
-`"red_api_version": "^0.8.0"`.
+`"red_api_version": "^0.9.0"`.
 
 ## Scratch-buffer workflows
 
@@ -254,6 +254,14 @@ The host owns multiline editing, wrapping, cursor movement, and history navigati
 
 `AgentArchiveSession(session_id: String)` was also introduced in host API `0.2.0`. Use it when Codex app-server has already stopped and the host must not send an interrupt to a replacement process that may reuse the same session ID. Use `AgentCloseSession(session_id: String)` for a live session that should be closed normally.
 
+Host API `0.9.0` adds `AgentResumeSession(cwd, session_id)` for rejoining a
+persisted Codex thread and `AgentForgetSession(session_id)` for an explicit new
+conversation. The bundled Agent plugin renders
+`agent:conversation_restore_pending` with its composer disabled, then replaces
+the cached projection from `agent:session_restored`; a
+`agent:session_restore_failed` event converts the cached transcript to clearly
+archived context.
+
 `AgentPrompt` automatically attaches bounded editor context containing the active visual selection or a roughly 80-line cursor excerpt, unsaved-state metadata, cursor/range, and intersecting diagnostics. Files outside the workspace, ignored paths, common credential/secret filenames, and binary buffers are omitted. Plugins that need to inspect or explicitly override this context can call `GetAgentContext(callback)` and `AgentPromptWithContext(session_id: String, text: String, context: Json)`; the context object accepts `uri` and `text` fields and is included in the direct Codex turn.
 
 ## Text panels
@@ -277,7 +285,7 @@ A focused footer is a host-owned modal text area, not an editor file buffer. It 
 
 The footer starts in Insert mode, where Enter, Shift-Enter, or `Ctrl-j` inserts a newline, `Ctrl-Enter` or `Alt-Enter` submits, and Escape enters Normal mode. In Normal mode, Enter submits and Escape emits `composer_blur`; Escape from Visual or Search mode first returns to Normal. `Ctrl-p`/`Ctrl-n` navigate local prompt history. `Ctrl-c` remains a pane-level shortcut that emits `interrupt` without changing the composer draft or focus. Successful submission emits `panel:event:<id>` with `action: "submit"` and the complete `text`; other footer actions include `composer_focus`, `composer_blur`, `interrupt`, `clear`, `new`, `history`, and `close`. `SetPanelVisible(id, visible)` hides or restores a panel without discarding its blocks, scroll position, or draft. Replacing text-panel blocks with an empty list resets scrolling and restores tail-following. Footer panels shrink on narrow terminals while preserving an editor viewport.
 
-Codex app-server updates other than assistant text chunks are forwarded to plugins as `agent:activity` with the normalized `update` payload. Core editor-tool calls also emit this event with `session_update: "editor_tool"`, `status: "in_progress"`, and a concise `title` such as `Opening src/main.rs` or `Proposing 2 edit(s) in src/main.rs`. This allows status/tool/plan progress to be displayed without treating it as transcript text.
+Codex app-server updates other than assistant text chunks are forwarded to plugins as `agent:activity` with the normalized `update` payload. Core editor-tool calls also emit this event with `session_update: "editor_tool"`, `status: "in_progress"`, and a concise `title` such as `Opening src/main.rs` or `Editing src/main.rs (2 changes)`. This allows status/tool/plan progress to be displayed without treating it as transcript text. Agent recovery uses `agent:conversation_restore_pending`, `AgentResumeSession`, `agent:session_restored`, and `agent:session_restore_failed`; plugins must not enable follow-up input while restoration is pending.
 
 ## Quarantine and self-check
 

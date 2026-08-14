@@ -41,8 +41,9 @@ mixed across a running session.
 Detach and crash recovery solve different failures. A client or SSH disconnect leaves
 the live owner and agent process running. If the owner itself crashes or the machine
 restarts, use `red --resume` to load the latest atomic snapshot; see
-[`SESSION_RECOVERY.md`](SESSION_RECOVERY.md). Restored transcript context does not imply
-that a Codex process survived a machine or owner crash.
+[`SESSION_RECOVERY.md`](SESSION_RECOVERY.md). A restored Codex process is always new;
+Red uses the snapshotted thread ID to rejoin its persisted conversation before enabling
+follow-ups.
 
 Windows supports `red --resume` but not detach/attach in this release. Named-pipe support
 is deferred; Red reports this limitation directly instead of silently falling back to an

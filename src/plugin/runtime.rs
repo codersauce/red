@@ -1091,6 +1091,18 @@ impl RedHost {
                     .map_or_else(|| PathBuf::from("."), PathBuf::from);
                 self.send_request(PluginRequest::AgentNewSession { cwd });
             }
+            "AgentResumeSession" => {
+                let cwd = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .map_or_else(|| PathBuf::from("."), PathBuf::from);
+                let session_id = args
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("AgentResumeSession requires a session id"))?
+                    .to_string();
+                self.send_request(PluginRequest::AgentResumeSession { cwd, session_id });
+            }
             "AgentPrompt" => {
                 let session_id = args
                     .first()
@@ -1151,6 +1163,14 @@ impl RedHost {
                     .ok_or_else(|| anyhow::anyhow!("AgentArchiveSession requires a session id"))?
                     .to_string();
                 self.send_request(PluginRequest::AgentArchiveSession { session_id });
+            }
+            "AgentForgetSession" => {
+                let session_id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("AgentForgetSession requires a session id"))?
+                    .to_string();
+                self.send_request(PluginRequest::AgentForgetSession { session_id });
             }
             "AgentPermissionResponse" => {
                 let request_id = args
@@ -4175,34 +4195,49 @@ mod tests {
 
     async fn submit_agent_prompt(runtime: &mut Runtime, prompt: &str) {
         runtime.execute_command("AgentPrompt").await.unwrap();
-        match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::FocusTextPanelComposer { id } => {
-                assert_eq!(id, "agent-conversation");
-                runtime
-                    .notify(
-                        "panel:event:agent-conversation",
-                        serde_json::json!({ "action": "submit", "text": prompt }),
-                    )
-                    .await
-                    .unwrap();
+        loop {
+            match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::SetTextPanelComposerState {
+                    id,
+                    enabled,
+                    status,
+                } => {
+                    assert_eq!(id, "agent-conversation");
+                    assert!(enabled);
+                    assert!(status
+                        .as_deref()
+                        .is_some_and(|status| status.contains("Archived conversation")));
+                }
+                PluginRequest::FocusTextPanelComposer { id } => {
+                    assert_eq!(id, "agent-conversation");
+                    runtime
+                        .notify(
+                            "panel:event:agent-conversation",
+                            serde_json::json!({ "action": "submit", "text": prompt }),
+                        )
+                        .await
+                        .unwrap();
+                    break;
+                }
+                PluginRequest::GetPluginStorage {
+                    plugin,
+                    key,
+                    request_id,
+                } => {
+                    assert_eq!(plugin, "agent");
+                    assert_eq!(key, "prompt_history");
+                    runtime
+                        .resolve_request(request_id, serde_json::json!({ "value": [] }))
+                        .await
+                        .unwrap();
+                    let handle = recv_agent_composer().0;
+                    assert!(runtime
+                        .notify_composer(handle, ComposerCallback::Submitted(prompt.to_string()))
+                        .unwrap());
+                    break;
+                }
+                _ => panic!("expected docked or floating agent composer"),
             }
-            PluginRequest::GetPluginStorage {
-                plugin,
-                key,
-                request_id,
-            } => {
-                assert_eq!(plugin, "agent");
-                assert_eq!(key, "prompt_history");
-                runtime
-                    .resolve_request(request_id, serde_json::json!({ "value": [] }))
-                    .await
-                    .unwrap();
-                let handle = recv_agent_composer().0;
-                assert!(runtime
-                    .notify_composer(handle, ComposerCallback::Submitted(prompt.to_string()))
-                    .unwrap());
-            }
-            _ => panic!("expected docked or floating agent composer"),
         }
     }
 
@@ -8728,9 +8763,92 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelComposerState {
+                id,
+                enabled: true,
+                status: Some(status),
+            } if id == "agent-conversation" && status.contains("Archived conversation")
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
             PluginRequest::FocusTextPanelComposer { id } if id == "agent-conversation"
         ));
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn bundled_agent_plugin_restores_the_bound_codex_thread_before_enabling_input() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        runtime
+            .notify(
+                "agent:conversation_restore_pending",
+                serde_json::json!({
+                    "thread_id": "thread-restored",
+                    "cwd": "/workspace",
+                    "items": [
+                        {"id": "user-1", "turn_id": "turn-1", "role": "user", "text": "Earlier question"},
+                        {"id": "agent-1", "turn_id": "turn-1", "role": "agent", "text": "Earlier answer"}
+                    ]
+                }),
+            )
+            .await
+            .unwrap();
+
+        let mut saw_disabled_composer = false;
+        let mut saw_resume = false;
+        let mut saw_cached_transcript = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            match request {
+                PluginRequest::UpdateTextPanel { blocks, .. } => {
+                    saw_cached_transcript = blocks.len() == 2
+                        && blocks[0].text == "Earlier question"
+                        && blocks[1].text == "Earlier answer";
+                }
+                PluginRequest::SetTextPanelComposerState { enabled: false, .. } => {
+                    saw_disabled_composer = true;
+                }
+                PluginRequest::AgentResumeSession { cwd, session_id } => {
+                    saw_resume = cwd == Path::new("/workspace") && session_id == "thread-restored";
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_cached_transcript);
+        assert!(saw_disabled_composer);
+        assert!(saw_resume);
+
+        runtime
+            .notify(
+                "agent:session_restored",
+                serde_json::json!({
+                    "thread_id": "thread-restored",
+                    "cwd": "/workspace",
+                    "items": [
+                        {"id": "native-user", "turn_id": "native-turn", "role": "user", "text": "Earlier question"},
+                        {"id": "native-agent", "turn_id": "native-turn", "role": "agent", "text": "Earlier answer"}
+                    ]
+                }),
+            )
+            .await
+            .unwrap();
+
+        let mut saw_enabled_composer = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if matches!(
+                request,
+                PluginRequest::SetTextPanelComposerState { enabled: true, .. }
+            ) {
+                saw_enabled_composer = true;
+            }
+        }
+        assert!(saw_enabled_composer);
     }
 
     #[tokio::test]

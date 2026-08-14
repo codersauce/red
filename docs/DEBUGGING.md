@@ -45,7 +45,7 @@ Run `red --agent-check` for the installed executable and minimum-version report,
 
 `src/codex/mod.rs` owns bounded JSONL transport, sessions, turns, cancellation, and dynamic-tool dispatch. `src/agent_tools.rs` validates editor tool shapes and UTF-16 edits. The editor resolves every tool path within the physical workspace, reveals the target, serializes a short follow delay, applies revision-checked edits through its transaction boundary, and saves the attributed buffer.
 
-When an edit reports a stale revision, compare the revision returned by `read_file` with the current visible buffer. Do not bypass the check by writing directly: that could discard user work and lose agent attribution. A restored transcript does not imply that a prior Codex thread or process is still live.
+When an edit reports a stale revision, compare the revision returned by `read_file` with the current visible buffer. Do not bypass the check by writing directly: that could discard user work and lose agent attribution. During recovery, distinguish a newly started app-server process from the persisted Codex thread it rejoins. The composer is not enabled until `thread/resume` returns and Red reconciles the visible transcript with those turns.
 
 If an attributed edit reaches the buffer but saving fails, the dynamic-tool result reports `applied: true`, `saved: false`, and the error. The dirty buffer remains visible and recoverable.
 
