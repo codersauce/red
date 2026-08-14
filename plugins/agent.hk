@@ -28,6 +28,7 @@ struct AgentErrorEvent {
 struct AgentSessionLostEvent {
     session_id: String,
     prompt: String,
+    message: String,
 }
 
 struct AgentPanelEvent {
@@ -1070,6 +1071,7 @@ fn failed(event: AgentErrorEvent) {
         red::execute("Print", "Agent setup failed while a turn is active: " + event.message);
         return;
     }
+    ensure_conversation_panel();
     red::state_patch(AgentState { turn_active: false });
     collapse_activity(red::null());
     set_phase("idle", "");
@@ -1086,12 +1088,22 @@ fn failed(event: AgentErrorEvent) {
         return;
     }
     if red::string(state().pending_prompt, "") != "" || state().session_id == "" {
-        red::execute("Print", "Codex unavailable: " + event.message + ". Your prompt is preserved");
+        let has_pending_prompt = red::string(state().pending_prompt, "") != "";
+        let notice = "Codex unavailable: " + event.message;
+        if has_pending_prompt {
+            notice = notice + ". Your prompt is preserved";
+        }
+        red::execute("Print", notice);
+        let retry_label = "Retry Codex startup";
+        if has_pending_prompt {
+            retry_label = "Retry the saved prompt";
+        }
         red::execute("OpenPicker", "Retry Codex", [
-            PickerItem { id: "retry", label: "Retry the saved prompt", kind: "Action" },
+            PickerItem { id: "retry", label: retry_label, kind: "Action" },
+            PickerItem { id: "logs", label: "Open Red logs", kind: "Diagnostics" },
         ], PickerOptions {
-            placeholder: "Retry after fixing the Codex setup",
-            status: "Enter selects; Escape keeps the saved prompt",
+            placeholder: "Inspect the error in the Agent pane or choose an action",
+            status: "Enter selects · Escape keeps the diagnostic visible",
             presentation: "compact",
         }, PickerHandlers {
             selected: setup_selected,
@@ -1106,6 +1118,7 @@ fn failed(event: AgentErrorEvent) {
 fn session_lost(event: AgentSessionLostEvent) {
     let session_id = red::string(state().session_id, "");
     let attempted = red::string(event.prompt, "");
+    let message = red::string(event.message, "Codex app-server stopped");
     if !is_current_session(red::string(event.session_id, "")) && (session_id != "" || attempted == "") {
         return;
     }
@@ -1122,18 +1135,18 @@ fn session_lost(event: AgentSessionLostEvent) {
         red::state_patch(AgentState { pending_prompt: attempted });
         red::state_patch(AgentState { pending_prompt_block_id: "" });
         red::state_patch(AgentState { pending_prompt_is_replay: true });
-        red::execute("Print", "Codex app-server stopped; retrying the saved prompt");
+        red::execute("Print", message + "; retrying the saved prompt");
         start();
-    } else if red::string(state().pending_prompt, "") != "" {
-        failed(AgentErrorEvent { session_id: "", message: "Codex app-server stopped" });
     } else {
-        red::execute("Print", "Codex app-server stopped. Press Space A to start a new session");
+        failed(AgentErrorEvent { session_id: "", message: message });
     }
 }
 
 fn setup_selected(item: PickerItem) {
     if item.id == "retry" {
         start();
+    } else if item.id == "logs" {
+        red::execute("ViewLogs");
     }
 }
 

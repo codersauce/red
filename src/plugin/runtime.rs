@@ -7667,7 +7667,7 @@ mod tests {
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::Action(Action::Print(message))
-                if message == "Codex app-server stopped; retrying the saved prompt"
+                if message == "no Codex session is running; retrying the saved prompt"
         ));
         let request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::GetConfig { request_id, key } => {
@@ -7804,6 +7804,10 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetTextPanelStatus { id, status: None }
                 if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -8301,6 +8305,10 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
+            PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetTextPanelStatus { id, status: None }
                 if id == "agent-conversation"
         ));
@@ -8324,14 +8332,14 @@ mod tests {
                 .iter()
                 .map(|item| item.id.as_str())
                 .collect::<Vec<_>>(),
-            ["retry"]
+            ["retry", "logs"]
         );
         assert_eq!(
             items
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["Retry the saved prompt"]
+            ["Retry the saved prompt", "Open Red logs"]
         );
 
         runtime
@@ -8401,10 +8409,6 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
-        ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
@@ -8497,6 +8501,16 @@ mod tests {
         ));
 
         drain_requests();
+        let (setup_picker, items) = open_agent_setup_picker(&mut runtime).await;
+        runtime
+            .notify_picker(setup_picker, PickerCallback::Selected(items[1].clone()))
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::ViewLogs)
+        ));
+
+        drain_requests();
         let (setup_picker, _) = open_agent_setup_picker(&mut runtime).await;
         runtime
             .notify_picker(setup_picker, PickerCallback::Cancelled)
@@ -8536,8 +8550,12 @@ mod tests {
         ));
         runtime
             .notify(
-                "agent:error",
-                serde_json::json!({ "message": "Codex login required" }),
+                "agent:session_lost",
+                serde_json::json!({
+                    "session_id": "",
+                    "prompt": "",
+                    "message": "Codex live authentication was rejected by workplace policy"
+                }),
             )
             .await
             .unwrap();
@@ -8548,8 +8566,26 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
+            PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
         ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetTextPanelStatus { id, status: None }
+                if id == "agent-conversation"
+        ));
+        let blocks = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::UpdateTextPanel { id, blocks } => {
+                assert_eq!(id, "agent-conversation");
+                blocks
+            }
+            _ => panic!("expected persistent agent startup diagnostic"),
+        };
+        assert!(blocks.iter().any(|block| {
+            block.kind == crate::plugin::TextPanelBlockKind::Error
+                && block
+                    .text
+                    .contains("live authentication was rejected by workplace policy")
+        }));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetPluginStorage { plugin, key, .. }
@@ -8558,9 +8594,12 @@ mod tests {
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::Action(Action::Print(message))
-                if message.contains("prompt is preserved")
+                if message.contains("live authentication was rejected by workplace policy")
+                    && !message.contains("prompt is preserved")
         ));
-        recv_agent_picker("Retry Codex");
+        let (_, items) = recv_agent_picker("Retry Codex");
+        assert_eq!(items[0].label, "Retry Codex startup");
+        assert_eq!(items[1].label, "Open Red logs");
     }
 
     #[tokio::test]

@@ -141,6 +141,7 @@ const GUTTER_SIGN_COLUMN_WIDTH: usize = 2;
 const DIAGNOSTIC_GUTTER_NAMESPACE: &str = "diagnostics";
 const MAX_HIGHLIGHT_SLICE_BYTES: usize = 512 * 1024;
 const MAX_PLUGIN_VIEWPORT_LINE_CHARS: usize = 64 * 1024;
+const MAX_AGENT_FAILURE_MESSAGE_CHARS: usize = 2048;
 const MAX_DIRECTORY_LISTING_ENTRIES: usize = 160;
 const AGENT_BRIDGE_CAPACITY: usize = 64;
 const PLUGIN_MANAGER_PICKER_ID: i32 = 9_101;
@@ -1149,6 +1150,18 @@ fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
             }),
         ),
     }
+}
+
+fn bounded_agent_failure_message(message: &str) -> String {
+    if message.chars().count() <= MAX_AGENT_FAILURE_MESSAGE_CHARS {
+        return message.to_string();
+    }
+    let mut bounded = message
+        .chars()
+        .take(MAX_AGENT_FAILURE_MESSAGE_CHARS)
+        .collect::<String>();
+    bounded.push_str("… (full details are in the Red log)");
+    bounded
 }
 
 fn agent_context_path_is_sensitive(path: &Path) -> bool {
@@ -6893,7 +6906,24 @@ impl Editor {
         text: String,
         context: Option<(String, String)>,
     ) -> anyhow::Result<bool> {
-        if !self.agent_manager.has_bridge() || self.agent_manager.is_task_finished() {
+        if self.agent_manager.is_task_finished() {
+            let message = self
+                .finish_agent_bridge("Codex app-server stopped before the prompt was sent")
+                .await;
+            self.plugin_registry
+                .notify(
+                    runtime,
+                    "agent:session_lost",
+                    json!({
+                        "session_id": session_id,
+                        "prompt": text,
+                        "message": message
+                    }),
+                )
+                .await?;
+            return Ok(false);
+        }
+        if !self.agent_manager.has_bridge() {
             self.abort_agent_bridge();
             self.plugin_registry
                 .notify(
@@ -6902,7 +6932,7 @@ impl Editor {
                     json!({
                         "session_id": session_id,
                         "prompt": text,
-                        "message": "no Codex session is running"
+                        "message": "No Codex app-server session is running"
                     }),
                 )
                 .await?;
@@ -6954,7 +6984,9 @@ impl Editor {
             },
         );
         if bridge.send(command).await.is_err() {
-            self.abort_agent_bridge();
+            let message = self
+                .finish_agent_bridge("Codex app-server stopped while sending the prompt")
+                .await;
             self.plugin_registry
                 .notify(
                     runtime,
@@ -6962,7 +6994,7 @@ impl Editor {
                     json!({
                         "session_id": session_id,
                         "prompt": text,
-                        "message": "Codex app-server stopped"
+                        "message": message
                     }),
                 )
                 .await?;
@@ -7422,6 +7454,31 @@ impl Editor {
         self.agent_manager.clear_tool_requests();
     }
 
+    async fn finish_agent_bridge(&mut self, fallback: &str) -> String {
+        let result = match self.agent_manager.take_task() {
+            Some(task) => Some(task.await),
+            None => None,
+        };
+        drop(self.agent_manager.take_bridge());
+        self.agent_manager.clear_active_sessions();
+        self.agent_manager.clear_turns();
+        self.agent_manager.clear_tool_requests();
+
+        let message = match result {
+            Some(Ok(Err(error))) => {
+                let details = format!("{error:#}");
+                log!("Codex app-server task failed: {details}");
+                format!("Codex app-server failed: {details}")
+            }
+            Some(Err(error)) if !error.is_cancelled() => {
+                log!("Codex app-server task failed: {error}");
+                format!("Codex app-server task failed: {error}")
+            }
+            Some(Ok(Ok(()))) | Some(Err(_)) | None => fallback.to_string(),
+        };
+        bounded_agent_failure_message(&message)
+    }
+
     async fn service_background(
         &mut self,
         buffer: &mut RenderBuffer,
@@ -7550,20 +7607,11 @@ impl Editor {
                 .bridge()
                 .is_none_or(|bridge| !bridge.has_pending_events())
         {
-            let _ = self
-                .agent_manager
-                .take_task()
-                .expect("finished Codex task must exist")
+            let message = self
+                .finish_agent_bridge("Codex app-server stopped unexpectedly")
                 .await;
-            self.agent_manager.take_bridge();
-            self.agent_manager.clear_active_sessions();
-            self.agent_manager.clear_tool_requests();
             self.plugin_registry
-                .notify(
-                    runtime,
-                    "agent:session_lost",
-                    json!({ "message": "Codex app-server stopped" }),
-                )
+                .notify(runtime, "agent:session_lost", json!({ "message": message }))
                 .await?;
         }
 
@@ -7695,19 +7743,11 @@ impl Editor {
                 }
                 PluginRequest::AgentNewSession { cwd } => {
                     if self.agent_manager.is_task_finished() {
-                        let _ = self
-                            .agent_manager
-                            .take_task()
-                            .expect("finished Codex task must exist")
+                        let message = self
+                            .finish_agent_bridge("Codex app-server stopped unexpectedly")
                             .await;
-                        self.agent_manager.take_bridge();
-                        self.agent_manager.clear_active_sessions();
                         self.plugin_registry
-                            .notify(
-                                runtime,
-                                "agent:session_lost",
-                                json!({ "message": "Codex app-server stopped" }),
-                            )
+                            .notify(runtime, "agent:session_lost", json!({ "message": message }))
                             .await?;
                     }
                     let result = if self.config.disable_ai {
@@ -7804,13 +7844,13 @@ impl Editor {
                         continue;
                     };
                     if bridge.send(CodexCommand::NewSession { cwd }).await.is_err() {
-                        self.abort_agent_bridge();
-                        self.plugin_registry
-                            .notify(
-                                runtime,
-                                "agent:session_lost",
-                                json!({ "message": "Codex app-server stopped" }),
+                        let message = self
+                            .finish_agent_bridge(
+                                "Codex app-server stopped while starting the session",
                             )
+                            .await;
+                        self.plugin_registry
+                            .notify(runtime, "agent:session_lost", json!({ "message": message }))
                             .await?;
                     }
                 }
@@ -27178,7 +27218,12 @@ builtin = "rust"
                 }
 
                 fn lost(event: Json) {
-                    red::execute("Print", red::string(red::state("trace"), "") + "lost");
+                    red::execute(
+                        "Print",
+                        red::string(red::state("trace"), "")
+                            + "lost:"
+                            + red::string(event.message, "missing failure detail")
+                    );
                 }
             "#,
         )
@@ -27259,7 +27304,7 @@ builtin = "rust"
         let mut expected = (0..event_count)
             .map(|index| format!("{index},"))
             .collect::<String>();
-        expected.push_str("completed,lost");
+        expected.push_str("completed,lost:Codex app-server failed: fixture adapter exited");
         assert_eq!(editor.last_error.as_deref(), Some(expected.as_str()));
         assert!(!editor.agent_manager.has_bridge());
         assert!(!editor.agent_manager.is_task_finished());

@@ -205,3 +205,43 @@ async fn direct_app_server_starts_with_required_hooks() {
     drop(bridge);
     task.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn direct_app_server_reports_live_startup_failure_and_stderr_availability() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex = directory.path().join("codex-fails");
+    std::fs::write(
+        &codex,
+        "#!/bin/sh\necho 'workplace policy rejected app-server startup' >&2\nexit 23\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&codex).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&codex, permissions).unwrap();
+    let host = RecordingHost {
+        writes: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let (_bridge, task) = start_codex(
+        CodexProcessSpec::new(codex, directory.path()),
+        host,
+        NonZeroUsize::new(32).unwrap(),
+    )
+    .unwrap();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("failing Codex worker should terminate")
+        .unwrap()
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        error.contains("Codex app-server initialization failed"),
+        "{error}"
+    );
+    assert!(error.contains("status: 23"), "{error}");
+    assert!(
+        error.contains("diagnostic details to the Red log"),
+        "{error}"
+    );
+}

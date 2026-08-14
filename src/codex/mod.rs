@@ -12,7 +12,7 @@ use std::{
     process::Stdio,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex as StdMutex,
     },
     time::{Duration, Instant},
 };
@@ -25,7 +25,9 @@ use async_trait::async_trait;
 use ignore::WalkBuilder;
 use serde_json::{json, Value};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
+    io::{
+        AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
+    },
     process::Command,
     sync::{mpsc, Mutex},
     task::JoinHandle,
@@ -35,6 +37,7 @@ use tokio::{
 use crate::agent_tools::{editor_tool_schemas, EditorToolCall, EditorToolRequest};
 
 const APP_FRAME_BYTES: usize = 1024 * 1024;
+const STDERR_TAIL_BYTES: usize = 32 * 1024;
 const TOOL_CONTENT_BYTES: usize = 960 * 1024;
 const MAX_TOOL_CALLS: usize = 32;
 const MAX_FILES: usize = 4096;
@@ -323,14 +326,18 @@ async fn run<H: CodexToolHost>(
         .current_dir(&spec.current_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("failed to start Codex executable {:?}", spec.command))?;
+    let stderr = child.stderr.take().context("Codex stderr is unavailable")?;
+    let stderr_tail = Arc::new(StdMutex::new(Vec::new()));
+    let mut stderr_task = tokio::spawn(drain_stderr_tail(stderr, Arc::clone(&stderr_tail)));
     let mut input = BufWriter::new(child.stdin.take().context("Codex stdin is unavailable")?);
     let mut output = BufReader::new(child.stdout.take().context("Codex stdout is unavailable")?);
 
-    request(
+    let result: Result<()> = async {
+        request(
         &mut input,
         &mut output,
         json!({
@@ -347,10 +354,10 @@ async fn run<H: CodexToolHost>(
         }),
         "red-initialize",
     )
-    .await
-    .context("Codex app-server initialization failed")?;
-    write_message(&mut input, &json!({"method": "initialized", "params": {}})).await?;
-    let account = request(
+        .await
+        .context("Codex app-server initialization failed")?;
+        write_message(&mut input, &json!({"method": "initialized", "params": {}})).await?;
+        let account = request(
         &mut input,
         &mut output,
         json!({
@@ -360,18 +367,18 @@ async fn run<H: CodexToolHost>(
         }),
         "red-account",
     )
-    .await?;
-    let authenticated = account
-        .pointer("/result/account")
-        .is_some_and(|account| !account.is_null())
-        || account
-            .pointer("/result/requiresOpenaiAuth")
-            .and_then(Value::as_bool)
-            == Some(false);
-    anyhow::ensure!(
-        authenticated,
-        "Codex is not authenticated; run `codex login` and try again"
-    );
+        .await?;
+        let authenticated = account
+            .pointer("/result/account")
+            .is_some_and(|account| !account.is_null())
+            || account
+                .pointer("/result/requiresOpenaiAuth")
+                .and_then(Value::as_bool)
+                == Some(false);
+        anyhow::ensure!(
+            authenticated,
+            "Codex is not authenticated; run `codex login` and try again"
+        );
 
     let (lines_tx, mut lines_rx) = mpsc::channel::<Result<Value>>(128);
     tokio::spawn(async move {
@@ -436,9 +443,92 @@ async fn run<H: CodexToolHost>(
         }
     }
 
-    drop(input);
-    let _ = timeout(Duration::from_secs(2), child.wait()).await;
-    Ok(())
+        drop(input);
+        Ok(())
+    }
+    .await;
+
+    let wait_result = timeout(Duration::from_secs(2), child.wait()).await;
+    if wait_result.is_ok() {
+        if timeout(Duration::from_millis(250), &mut stderr_task)
+            .await
+            .is_err()
+        {
+            stderr_task.abort();
+        }
+    } else {
+        stderr_task.abort();
+    }
+    let stderr = stderr_tail
+        .lock()
+        .map(|tail| sanitized_stderr_tail(&tail))
+        .unwrap_or_else(|_| "Codex stderr capture failed".to_string());
+    if !stderr.is_empty() {
+        crate::log!("Codex app-server stderr (bounded tail):\n{stderr}");
+    }
+
+    let exit_status = match wait_result {
+        Ok(Ok(status)) => Some(status),
+        Ok(Err(error)) => {
+            crate::log!("Unable to read Codex app-server exit status: {error}");
+            None
+        }
+        Err(_) => {
+            crate::log!("Codex app-server did not exit within two seconds");
+            None
+        }
+    };
+    match result {
+        Ok(()) if exit_status.is_some_and(|status| !status.success()) => {
+            let status = exit_status.expect("checked above");
+            let mut message = format!("Codex app-server exited with {status}");
+            if !stderr.is_empty() {
+                message.push_str("; Codex wrote diagnostic details to the Red log");
+            }
+            Err(anyhow::anyhow!(message))
+        }
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let mut message = format!("{error:#}");
+            if let Some(status) = exit_status.filter(|status| !status.success()) {
+                message.push_str(&format!("; Codex exited with {status}"));
+            }
+            if !stderr.is_empty() {
+                message.push_str("; Codex wrote diagnostic details to the Red log");
+            }
+            Err(anyhow::anyhow!(message))
+        }
+    }
+}
+
+async fn drain_stderr_tail(
+    mut stderr: impl AsyncRead + Unpin,
+    tail: Arc<StdMutex<Vec<u8>>>,
+) -> std::io::Result<()> {
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let bytes = stderr.read(&mut chunk).await?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        let mut tail = tail
+            .lock()
+            .map_err(|_| std::io::Error::other("Codex stderr capture lock is poisoned"))?;
+        tail.extend_from_slice(&chunk[..bytes]);
+        if tail.len() > STDERR_TAIL_BYTES {
+            let excess = tail.len() - STDERR_TAIL_BYTES;
+            tail.drain(..excess);
+        }
+    }
+}
+
+fn sanitized_stderr_tail(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .filter(|character| matches!(character, '\n' | '\r' | '\t') || !character.is_control())
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 async fn handle_command(
