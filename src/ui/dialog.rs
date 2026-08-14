@@ -18,6 +18,7 @@ pub struct Dialog {
     footer: Option<String>,
     actions: Vec<UiAction>,
     action_width: Option<usize>,
+    action_inset: usize,
     left_aligned_title: bool,
     pub x: usize,
     pub y: usize,
@@ -76,6 +77,7 @@ impl Dialog {
             footer: None,
             actions: Vec::new(),
             action_width: None,
+            action_inset: 0,
             left_aligned_title: false,
             x,
             y,
@@ -161,6 +163,11 @@ impl Dialog {
     pub fn set_actions(&mut self, actions: Vec<UiAction>) {
         self.set_footer(None);
         self.actions = actions;
+    }
+
+    /// Keeps responsive footer actions a consistent distance from both borders.
+    pub(crate) fn set_action_inset(&mut self, inset: usize) {
+        self.action_inset = inset;
     }
 }
 
@@ -302,8 +309,15 @@ impl Component for Dialog {
             .y
             .saturating_add(height.saturating_sub(inset.saturating_add(1)));
         if !self.actions.is_empty() && inner_width > 0 {
-            let action_width = self.action_width.unwrap_or(inner_width).min(inner_width);
-            let action_x = footer_x.saturating_add(inner_width.saturating_sub(action_width));
+            let action_inset = self.action_inset.min(inner_width.saturating_sub(1) / 2);
+            let available_width = inner_width.saturating_sub(action_inset.saturating_mul(2));
+            let action_width = self
+                .action_width
+                .unwrap_or(available_width)
+                .min(available_width);
+            let action_x = footer_x
+                .saturating_add(action_inset)
+                .saturating_add(available_width.saturating_sub(action_width));
             ActionBar::new(&self.actions).render_right_aligned(
                 buffer,
                 action_x,

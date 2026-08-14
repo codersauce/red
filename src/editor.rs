@@ -25335,7 +25335,7 @@ builtin = "rust"
         assert!(!quit);
         assert!(editor.current_dialog.is_some());
         let frame = render_text_rows(&buffer).join("\n");
-        assert!(frame.contains("WHAT’S NEW"));
+        assert!(frame.contains("RELEASE NOTES"));
         assert!(frame.contains("What’s new in Red"));
         assert!(frame.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
     }
@@ -25421,7 +25421,7 @@ builtin = "rust"
             .snapshot(None)
             .lines
             .iter()
-            .any(|line| line.text.contains("WHAT’S NEW")));
+            .any(|line| line.text.contains("RELEASE NOTES")));
         assert_eq!(core.editor.preferences.last_seen_version(), None);
 
         assert!(core.prepare_startup_whats_new().unwrap());
@@ -25430,7 +25430,7 @@ builtin = "rust"
             .snapshot(None)
             .lines
             .iter()
-            .any(|line| line.text.contains("WHAT’S NEW")));
+            .any(|line| line.text.contains("RELEASE NOTES")));
         core.mark_whats_new_presented();
 
         assert_eq!(

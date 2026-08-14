@@ -99,9 +99,9 @@ impl ReleaseNotes {
         let mut sections = Vec::new();
 
         for (heading, label) in [
-            ("Features", "What’s new"),
+            ("Features", "New features"),
             ("Performance", "Faster and smoother"),
-            ("Bug Fixes", "Fixed"),
+            ("Bug Fixes", "Fixes"),
         ] {
             let mut in_section = false;
             let mut changes = Vec::new();
@@ -321,8 +321,8 @@ mod tests {
         let notes = ReleaseNotes::from_changelog(CHANGELOG, "0.5.0", None);
         let highlights = notes.highlights_markdown();
 
-        assert!(highlights.contains("## What’s new"));
-        assert!(highlights.contains("## Fixed"));
+        assert!(highlights.contains("## New features"));
+        assert!(highlights.contains("## Fixes"));
         assert!(highlights.contains("issues/2"));
         assert!(!highlights.contains("commit/abcdef"));
     }
