@@ -6692,7 +6692,10 @@ impl Editor {
                 .map_err(anyhow::Error::new)
         };
         #[cfg(not(unix))]
-        let result = self.current_buffer_mut().save();
+        let result = {
+            let _ = (root, path);
+            self.current_buffer_mut().save()
+        };
         match result {
             Ok(message) => {
                 if let Some(file) = self.current_buffer().file.clone() {
