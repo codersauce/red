@@ -12,9 +12,9 @@ project context that future agents should not rediscover from scratch.
 
 Start with [Getting Started](getting-started) when you need the main reading
 paths through the Red editor, agent, Husk, sessions, and development areas.
-Use [Architecture](architecture), [Guides](guides), [Decisions](decisions), and
-[Reference](reference) when you want to browse by page type instead of by
-subsystem.
+Use [Concepts](concepts), [Architecture](architecture), [Guides](guides),
+[Decisions](decisions), and [Reference](reference) when you want to browse by
+page type instead of by subsystem.
 
 ## Notability Bar
 

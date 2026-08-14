@@ -12,6 +12,21 @@ sources:
   - id: config-decision
     type: file
     path: almanac/decisions/configuration/fail-closed-recovery.md
+  - id: engine-ownership
+    type: file
+    path: almanac/decisions/husk/engine-instance-ownership.md
+  - id: scripts-modules
+    type: file
+    path: almanac/decisions/husk/scripts-and-modules.md
+  - id: extension-tiers
+    type: file
+    path: almanac/decisions/husk/extension-tiers.md
+  - id: semantic-profiles
+    type: file
+    path: almanac/decisions/husk/semantic-profiles.md
+  - id: value-semantics
+    type: file
+    path: almanac/decisions/husk/value-semantics.md
   - id: language-pack
     type: file
     path: almanac/decisions/plugins/language-pack-distribution.md
@@ -40,7 +55,7 @@ Read [Embedded assets with user ejection](runtime/embedded-assets-with-user-ejec
 
 ## Husk Decisions
 
-The Husk decision set defines how the scripting language stays embeddable, deterministic, and narrow at extension boundaries. Read [Engine instance ownership](husk/engine-instance-ownership) for immutable engine versus mutable instance state, [Scripts and modules](husk/scripts-and-modules) for first-run execution shape and package reproducibility, [Extension tiers](husk/extension-tiers) for static native modules and portable WebAssembly Components, [Semantic profiles](husk/semantic-profiles) for native semantics versus isolated JavaScript compatibility, and [Value semantics](husk/value-semantics) for runtime value behavior.
+The Husk decision set defines how the scripting language stays embeddable, deterministic, and narrow at extension boundaries. Read [Engine instance ownership](husk/engine-instance-ownership) for immutable engine versus mutable instance state [@engine-ownership], [Scripts and modules](husk/scripts-and-modules) for first-run execution shape and package reproducibility [@scripts-modules], [Extension tiers](husk/extension-tiers) for static native modules and portable WebAssembly Components [@extension-tiers], [Semantic profiles](husk/semantic-profiles) for native semantics versus isolated JavaScript compatibility [@semantic-profiles], and [Value semantics](husk/value-semantics) for runtime value behavior [@value-semantics].
 
 ## Plugin And Language-Pack Decisions
 

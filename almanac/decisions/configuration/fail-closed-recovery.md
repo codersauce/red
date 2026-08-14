@@ -1,7 +1,7 @@
 ---
 title: "Configuration Fail-Closed Recovery"
 summary: "Red keeps editing available on whole-file configuration failure while disabling plugins, AI, LSP, logging, and plugin permissions."
-topics: [decisions, configuration, diagnostics]
+topics: [decisions, configuration, diagnostics, safety]
 sources:
   - id: config
     type: file

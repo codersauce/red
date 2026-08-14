@@ -1,7 +1,7 @@
 ---
 title: "Layered Config Recovery"
 summary: "Red builds effective configuration from embedded defaults, recoverable user TOML, strict CLI overrides, and runtime diagnostics."
-topics: [architecture, configuration, startup, diagnostics]
+topics: [architecture, configuration, startup, diagnostics, safety]
 sources:
   - id: config-loader
     type: file
