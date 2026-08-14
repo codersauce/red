@@ -18630,6 +18630,13 @@ impl Editor {
             (selection.y1, selection.y0)
         };
 
+        let primary_cursor = self.cursor_snapshot();
+        let committed_terminal_frame = self.previous_render_buffer.clone();
+        let committed_render_generation = self.render_generation;
+        let committed_cursor_position = self.last_rendered_cursor_position;
+        let committed_bracket_rows = self.last_rendered_bracket_rows.clone();
+        let committed_cursor_surface = self.last_rendered_cursor_surface.clone();
+        let committed_force_full_redraw = self.force_full_redraw;
         let mut scratch_buffer = buffer.clone();
         let previous_terminal_output_enabled = self.terminal_output_enabled;
         self.terminal_output_enabled = false;
@@ -18655,6 +18662,16 @@ impl Editor {
 
         self.block_replay_depth = self.block_replay_depth.saturating_sub(1);
         self.terminal_output_enabled = previous_terminal_output_enabled;
+        // Replay renders into a scratch frame with terminal output suppressed. Keep
+        // terminal-derived caches tied to the last frame that was actually written,
+        // then return to the primary edit so Escape finishes at the block's first row.
+        self.previous_render_buffer = committed_terminal_frame;
+        self.render_generation = committed_render_generation;
+        self.last_rendered_cursor_position = committed_cursor_position;
+        self.last_rendered_bracket_rows = committed_bracket_rows;
+        self.last_rendered_cursor_surface = committed_cursor_surface;
+        self.force_full_redraw = committed_force_full_redraw;
+        self.restore_cursor_snapshot(primary_cursor);
 
         if let Err(error) = replay_result {
             if self.block_replay_depth == 0 {
@@ -27546,6 +27563,98 @@ builtin = "rust"
                 expected,
                 "logical cursor mismatch after {label}: {:?}",
                 self.observation()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn visual_block_replay_preserves_terminal_frame_and_primary_cursor() {
+        let mut harness = RenderedCursorHarness::new("one\ntwo\nthree\nfour", (0, 0));
+
+        harness
+            .press(
+                KeyCode::Char('v'),
+                KeyModifiers::CONTROL,
+                "entering visual block mode",
+            )
+            .await;
+        for _ in 0..3 {
+            harness.press_char('j').await;
+        }
+        harness.press_char('I').await;
+        harness.press_char('X').await;
+
+        let committed_terminal_frame = harness
+            .editor
+            .previous_render_buffer
+            .clone()
+            .expect("the primary block insertion should be rendered");
+        let primary_cursor = harness.editor.cursor_snapshot();
+
+        harness
+            .editor
+            .execute(
+                &Action::InsertBlock,
+                &mut harness.buffer,
+                &mut harness.runtime,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            harness.editor.current_buffer().contents(),
+            "Xone\nXtwo\nXthree\nXfour"
+        );
+        assert_eq!(
+            harness
+                .editor
+                .previous_render_buffer
+                .as_ref()
+                .unwrap()
+                .cells,
+            committed_terminal_frame.cells,
+            "hidden block replay must not claim its scratch frame was written to the terminal"
+        );
+        assert_eq!(
+            harness.editor.cursor_snapshot(),
+            primary_cursor,
+            "block replay must return to the cursor used for the primary insertion"
+        );
+    }
+
+    #[tokio::test]
+    async fn visual_block_insert_and_change_restore_cursor_after_escape() {
+        for (operation, expected) in [
+            ('I', "Xone\nXtwo\nXthree\nXfour"),
+            ('c', "Xne\nXwo\nXhree\nXour"),
+        ] {
+            let mut harness = RenderedCursorHarness::new("one\ntwo\nthree\nfour", (0, 0));
+
+            harness
+                .press(
+                    KeyCode::Char('v'),
+                    KeyModifiers::CONTROL,
+                    "entering visual block mode",
+                )
+                .await;
+            for _ in 0..3 {
+                harness.press_char('j').await;
+            }
+            harness.press_char(operation).await;
+            harness.press_char('X').await;
+            harness.escape().await;
+
+            assert_eq!(harness.editor.current_buffer().contents(), expected);
+            harness.assert_cursor((0, 0), &format!("completing visual block {operation:?}"));
+            assert_eq!(
+                harness
+                    .editor
+                    .previous_render_buffer
+                    .as_ref()
+                    .unwrap()
+                    .cells,
+                harness.buffer.cells,
+                "the final terminal frame must include every visual block row"
             );
         }
     }
