@@ -73,6 +73,7 @@ struct FileOperationResult {
     ok: bool,
     error: Option<String>,
     undo_supported: bool,
+    created: [String],
 }
 
 struct PathOperation {
@@ -155,6 +156,7 @@ struct NeoTreeState {
     pending_extension: String,
     pending_source: String,
     pending_parent: String,
+    select_created_file: bool,
     reveal_target: String,
     reveal_parts: [String],
     reveal_index: i32,
@@ -187,6 +189,7 @@ fn initial_state() -> NeoTreeState {
         pending_extension: "",
         pending_source: "",
         pending_parent: ".",
+        select_created_file: false,
         reveal_target: "",
         reveal_parts: [],
         reveal_index: 0,
@@ -411,6 +414,7 @@ fn open_path_prompt(kind: String, title: String, initial: String, source: String
 
 fn path_prompt_cancelled(event: ComposerCancelled) {
     red::state_patch(NeoTreeState { pending_kind: "" });
+    red::state_patch(NeoTreeState { select_created_file: false });
 }
 
 fn path_prompt_submitted(value: String) {
@@ -427,6 +431,7 @@ fn path_prompt_submitted(value: String) {
         if kind == "create" && red::ends_with(query, "/") {
             create_kind = "create_directory";
         }
+        red::state_patch(NeoTreeState { select_created_file: create_kind == "create" });
         request_path_operation(PathOperation {
             kind: create_kind,
             path: path_join(parent, query),
@@ -464,10 +469,15 @@ fn request_paths_operation(operation: PathsOperation) {
 fn operation_loaded(result: FileOperationResult) {
     let kind = red::string(state().pending_kind, "operation");
     if !red::bool(result.ok, false) {
+        red::state_patch(NeoTreeState { select_created_file: false });
         red::execute("Print", "Neo-tree " + kind + " failed: " + optional_text(result.error, "unknown error"));
         return;
     }
 
+    let created_file = "";
+    if red::bool(state().select_created_file, false) && red::len(result.created) > 0 {
+        created_file = result.created[0];
+    }
     if kind == "trash" && red::bool(result.undo_supported, false) {
         red::state_patch(NeoTreeState { trash_history: red::push(state().trash_history, TrashBatch {
             paths: state().pending_paths,
@@ -475,8 +485,13 @@ fn operation_loaded(result: FileOperationResult) {
     }
     red::state_patch(NeoTreeState { selected: [] });
     red::state_patch(NeoTreeState { pending_kind: "" });
+    red::state_patch(NeoTreeState { select_created_file: false });
     red::execute("Print", "Neo-tree " + kind + " complete");
-    reset_tree();
+    if created_file != "" {
+        reset_tree_revealing(created_file);
+    } else {
+        reset_tree();
+    }
 }
 
 fn selected_paths(row: TreePanelRow) -> [String] {
@@ -676,6 +691,10 @@ fn show_help() {
 }
 
 fn reset_tree() {
+    reset_tree_revealing("");
+}
+
+fn reset_tree_revealing(path: String) {
     for watch in state().watches {
         red::execute("UnwatchDirectory", watch.id);
     }
@@ -683,6 +702,9 @@ fn reset_tree() {
     red::state_patch(NeoTreeState { children: [] });
     red::state_patch(NeoTreeState { expanded: ["."] });
     clear_reveal();
+    if path != "" {
+        prepare_reveal(path);
+    }
     request_directory(".");
     request_git_status();
 }
@@ -814,17 +836,25 @@ fn tree_path_for_file(file: String, cwd: String) -> String {
 }
 
 fn start_reveal(tree_path: String) {
+    if !prepare_reveal(tree_path) {
+        return;
+    }
+
+    add_expanded(".");
+    continue_reveal();
+}
+
+fn prepare_reveal(tree_path: String) -> bool {
     let parts = red::neotree_core("reveal_parts", tree_path);
     if red::len(parts) == 0 {
-        return;
+        return false;
     }
 
     red::state_patch(NeoTreeState { reveal_target: tree_path });
     red::state_patch(NeoTreeState { reveal_parts: parts });
     red::state_patch(NeoTreeState { reveal_index: 0 });
     red::state_patch(NeoTreeState { reveal_parent: "." });
-    add_expanded(".");
-    continue_reveal();
+    return true;
 }
 
 fn continue_reveal() {

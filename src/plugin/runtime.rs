@@ -12173,6 +12173,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn neotree_selects_a_new_file_after_refreshing_its_parent() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("neotree", include_str!("../../plugins/neotree.hk"))
+            .await
+            .unwrap();
+
+        runtime
+            .notify(
+                "panel:event:neotree",
+                serde_json::json!({
+                    "action": "a",
+                    "row": { "path": "./src", "kind": "directory" },
+                }),
+            )
+            .await
+            .unwrap();
+        let create_handle = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackInput { handle, .. } => handle,
+            _ => panic!("expected Neo-tree create prompt"),
+        };
+        runtime
+            .notify_composer(
+                create_handle,
+                ComposerCallback::Submitted("generated.rs".to_string()),
+            )
+            .unwrap();
+        let operation_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::FileOperation {
+                operation,
+                request_id,
+            } => {
+                assert_eq!(
+                    operation,
+                    serde_json::json!({
+                        "kind": "create",
+                        "path": "./src/generated.rs",
+                    })
+                );
+                request_id
+            }
+            _ => panic!("expected Neo-tree create file operation"),
+        };
+
+        runtime
+            .resolve_request(
+                operation_request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "error": null,
+                    "undo_supported": false,
+                    "created": ["src/generated.rs"],
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::Action(Action::Print(message))
+                if message == "Neo-tree create complete"
+        ));
+        let root_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ListDirectory { path, request_id } => {
+                assert_eq!(path, ".");
+                request_id
+            }
+            _ => panic!("expected Neo-tree root refresh"),
+        };
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::GetGitStatus { path, .. } if path == "."
+        ));
+
+        runtime
+            .resolve_request(
+                root_request_id,
+                serde_json::json!({
+                    "path": ".",
+                    "entries": [
+                        { "name": "src", "path": "./src", "kind": "directory" },
+                    ],
+                    "error": null,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::WatchDirectory { path, .. } if path == "."
+        ));
+        let src_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::ListDirectory { path, request_id } => {
+                assert_eq!(path, "./src");
+                request_id
+            }
+            _ => panic!("expected created file parent refresh"),
+        };
+
+        runtime
+            .resolve_request(
+                src_request_id,
+                serde_json::json!({
+                    "path": "./src",
+                    "entries": [
+                        { "name": "generated.rs", "path": "./src/generated.rs", "kind": "file" },
+                    ],
+                    "error": null,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::WatchDirectory { path, .. } if path == "./src"
+        ));
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::SelectPanelRow { id, row_id } => {
+                assert_eq!(id, "neotree");
+                assert_eq!(row_id, "./src/generated.rs");
+            }
+            _ => panic!("expected Neo-tree to select the created file"),
+        }
+    }
+
+    #[tokio::test]
     async fn neotree_handles_optional_selection_and_nullable_file_operation_errors() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
