@@ -10,7 +10,7 @@ use crate::{
     config::{KeyAction, Keys},
     editor::{Action, Mode, SearchDirection},
     plugin::RegisteredPluginCommand,
-    ui::PickerItem,
+    ui::{PickerIcon, PickerItem},
     unicode_utils::{display_width, truncate_display_width},
 };
 
@@ -210,7 +210,10 @@ pub(crate) fn picker_items(entries: &[CommandPaletteEntry]) -> Vec<PickerItem> {
 
             PickerItem {
                 id: entry.id.clone(),
-                icon: None,
+                icon: Some(PickerIcon::Symbol {
+                    kind: command_area_icon_kind(&entry.category).to_string(),
+                    role: Some("Command".to_string()),
+                }),
                 label: entry.title.clone(),
                 kind: Some("Command".to_string()),
                 annotation: Some(format!("{category}{category_padding}")),
@@ -228,6 +231,25 @@ pub(crate) fn picker_items(entries: &[CommandPaletteEntry]) -> Vec<PickerItem> {
             }
         })
         .collect()
+}
+
+fn command_area_icon_kind(category: &str) -> &'static str {
+    match category {
+        "Agent" => "CommandAgent",
+        "Buffer" => "CommandBuffer",
+        "Debug" => "CommandDebug",
+        "Edit" => "CommandEdit",
+        "Editor" => "CommandEditor",
+        "Extensions" => "CommandExtensions",
+        "File" => "CommandFile",
+        "Git" => "CommandGit",
+        "LSP" => "CommandLsp",
+        "Panel" => "CommandPanel",
+        "Search" => "CommandSearch",
+        "View" => "CommandView",
+        "Window" => "CommandWindow",
+        _ => "Command",
+    }
 }
 
 /// Scores one command row against a tokenized query without searching descriptions.
@@ -1506,6 +1528,20 @@ mod tests {
         let save = items.iter().find(|item| item.id == "file.save").unwrap();
 
         assert_eq!(format.kind.as_deref(), Some("Command"));
+        assert_eq!(
+            format.icon,
+            Some(PickerIcon::Symbol {
+                kind: "CommandLsp".to_string(),
+                role: Some("Command".to_string()),
+            })
+        );
+        assert_eq!(
+            save.icon,
+            Some(PickerIcon::Symbol {
+                kind: "CommandFile".to_string(),
+                role: Some("Command".to_string()),
+            })
+        );
         assert_eq!(format.label, "Format document");
         assert_eq!(format.annotation.as_deref().map(str::trim), Some("LSP"));
         assert!(format
@@ -1522,6 +1558,29 @@ mod tests {
             .detail
             .as_deref()
             .is_some_and(|detail| detail.contains(":w")));
+    }
+
+    #[test]
+    fn command_areas_map_to_semantic_icons_with_a_generic_fallback() {
+        for (category, expected) in [
+            ("Agent", "CommandAgent"),
+            ("Buffer", "CommandBuffer"),
+            ("Debug", "CommandDebug"),
+            ("Edit", "CommandEdit"),
+            ("Editor", "CommandEditor"),
+            ("Extensions", "CommandExtensions"),
+            ("File", "CommandFile"),
+            ("Git", "CommandGit"),
+            ("LSP", "CommandLsp"),
+            ("Panel", "CommandPanel"),
+            ("Search", "CommandSearch"),
+            ("View", "CommandView"),
+            ("Window", "CommandWindow"),
+        ] {
+            assert_eq!(command_area_icon_kind(category), expected, "{category}");
+        }
+
+        assert_eq!(command_area_icon_kind("Custom Plugin"), "Command");
     }
 
     #[test]
