@@ -2,12 +2,13 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
+    path::{Path, PathBuf},
     time::Instant,
 };
 
 use crate::{
-    agent_tools::PendingEditorTool, agent_workspace::ProposalWorkspace, codex::CodexBridge,
+    agent_tools::{PendingEditorTool, PendingEditorToolResponse},
+    codex::CodexBridge,
 };
 
 /// Encapsulates background AI agent task state, active turn metrics, and tool channels.
@@ -15,9 +16,14 @@ use crate::{
 pub struct AgentManager {
     bridge: Option<CodexBridge>,
     task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
-    workspace: Option<Arc<Mutex<ProposalWorkspace>>>,
+    root: Option<PathBuf>,
     tool_requests: Option<tokio::sync::mpsc::Receiver<PendingEditorTool>>,
+    playback_tool: Option<PendingEditorTool>,
+    playback_ready_at: Option<Instant>,
+    playback_response: Option<PendingEditorToolResponse>,
+    playback_response_ready_at: Option<Instant>,
     active_sessions: HashSet<String>,
+    active_turn_ids: HashMap<String, String>,
     turn_started_at: HashMap<String, Instant>,
 }
 
@@ -62,16 +68,12 @@ impl AgentManager {
         self.task.take()
     }
 
-    pub fn workspace(&self) -> Option<&Arc<Mutex<ProposalWorkspace>>> {
-        self.workspace.as_ref()
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
     }
 
-    pub fn workspace_cloned(&self) -> Option<Arc<Mutex<ProposalWorkspace>>> {
-        self.workspace.clone()
-    }
-
-    pub fn set_workspace(&mut self, workspace: Option<Arc<Mutex<ProposalWorkspace>>>) {
-        self.workspace = workspace;
+    pub fn set_root(&mut self, root: Option<PathBuf>) {
+        self.root = root;
     }
 
     pub fn set_tool_requests(&mut self, requests: tokio::sync::mpsc::Receiver<PendingEditorTool>) {
@@ -80,12 +82,61 @@ impl AgentManager {
 
     pub fn clear_tool_requests(&mut self) {
         self.tool_requests = None;
+        self.playback_tool = None;
+        self.playback_ready_at = None;
+        self.playback_response = None;
+        self.playback_response_ready_at = None;
     }
 
     pub fn try_recv_tool_request(&mut self) -> Option<PendingEditorTool> {
         self.tool_requests
             .as_mut()
             .and_then(|requests| requests.try_recv().ok())
+    }
+
+    pub fn has_playback_work(&self) -> bool {
+        self.playback_tool.is_some() || self.playback_response.is_some()
+    }
+
+    pub fn stage_playback_tool(&mut self, tool: PendingEditorTool, ready_at: Instant) {
+        self.playback_tool = Some(tool);
+        self.playback_ready_at = Some(ready_at);
+    }
+
+    pub fn take_ready_playback_tool(&mut self, now: Instant) -> Option<PendingEditorTool> {
+        if self
+            .playback_ready_at
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.playback_ready_at = None;
+            self.playback_tool.take()
+        } else {
+            None
+        }
+    }
+
+    pub fn stage_playback_response(
+        &mut self,
+        response: PendingEditorToolResponse,
+        ready_at: Instant,
+    ) {
+        self.playback_response = Some(response);
+        self.playback_response_ready_at = Some(ready_at);
+    }
+
+    pub fn take_ready_playback_response(
+        &mut self,
+        now: Instant,
+    ) -> Option<PendingEditorToolResponse> {
+        if self
+            .playback_response_ready_at
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.playback_response_ready_at = None;
+            self.playback_response.take()
+        } else {
+            None
+        }
     }
 
     /// Marks a session as active.
@@ -96,6 +147,7 @@ impl AgentManager {
     /// Marks a session as inactive.
     pub fn mark_session_inactive(&mut self, session_id: &str) {
         self.active_sessions.remove(session_id);
+        self.active_turn_ids.remove(session_id);
     }
 
     pub fn is_session_active(&self, session_id: &str) -> bool {
@@ -108,6 +160,16 @@ impl AgentManager {
 
     pub fn clear_active_sessions(&mut self) {
         self.active_sessions.clear();
+        self.active_turn_ids.clear();
+    }
+
+    pub fn set_turn_id(&mut self, session_id: impl Into<String>, turn_id: impl Into<String>) {
+        self.active_turn_ids
+            .insert(session_id.into(), turn_id.into());
+    }
+
+    pub fn turn_id(&self, session_id: &str) -> Option<&str> {
+        self.active_turn_ids.get(session_id).map(String::as_str)
     }
 
     /// Records turn start timestamp for turn duration metrics.
@@ -134,6 +196,9 @@ impl AgentManager {
 #[cfg(test)]
 mod tests {
     use super::AgentManager;
+    use crate::agent_tools::PendingEditorToolResponse;
+    use serde_json::json;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn owns_session_and_turn_lifecycle() {
@@ -146,5 +211,28 @@ mod tests {
 
         manager.mark_session_inactive("session-1");
         assert!(!manager.is_session_active("session-1"));
+    }
+
+    #[tokio::test]
+    async fn holds_completed_edits_until_the_follow_deadline() {
+        let mut manager = AgentManager::new();
+        let (response, received) = tokio::sync::oneshot::channel();
+        let now = Instant::now();
+        manager.stage_playback_response(
+            PendingEditorToolResponse {
+                response,
+                result: Ok(json!({ "saved": true })),
+            },
+            now + Duration::from_millis(700),
+        );
+
+        assert!(manager.has_playback_work());
+        assert!(manager.take_ready_playback_response(now).is_none());
+        let completed = manager
+            .take_ready_playback_response(now + Duration::from_millis(700))
+            .unwrap();
+        completed.response.send(completed.result).unwrap();
+        assert_eq!(received.await.unwrap().unwrap()["saved"], true);
+        assert!(!manager.has_playback_work());
     }
 }

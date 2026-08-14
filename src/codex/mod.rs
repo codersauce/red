@@ -1,7 +1,7 @@
 //! Direct client for the installed Codex app-server.
 //!
 //! Red deliberately runs Codex read-only and exposes bounded dynamic tools for
-//! editor-aware reads and reviewable proposal writes. No ACP adapter sits
+//! editor-aware reads and attributed editor writes. No ACP adapter sits
 //! between the editor and Codex.
 
 use std::{
@@ -49,7 +49,7 @@ const MAX_WALK_ENTRIES: usize = 65_536;
 const MAX_WALK_TIME: Duration = Duration::from_secs(5);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
-const INSTRUCTIONS: &str = "You are Red's coding assistant. You have no shell or native patch tool. Use list_files and search_files to locate relevant code. Use get_editor_state, open_file, select_text, and run_editor_action to inspect and navigate the editor. Always use read_file before reasoning about a file, and use apply_edits or write_file for every edit. Edits are reviewable editor proposals and never touch disk. Do not claim a change was saved. Keep responses concise.";
+const INSTRUCTIONS: &str = "You are Red's coding assistant. You have no shell or native patch tool. Use list_files and search_files to locate relevant code. Use get_editor_state, open_file, select_text, and run_editor_action to inspect and navigate the editor. Always use read_file before reasoning about or editing a file. Pass the revision returned by read_file to apply_edits or write_file. Successful edits update Red's visible buffer and are saved to disk. Keep responses concise.";
 
 /// Exact process launch specification for one Codex app-server worker.
 #[derive(Debug, Clone)]
@@ -150,11 +150,6 @@ pub enum CodexEvent {
         session_id: String,
         /// Bounded app-server update payload.
         update: Value,
-    },
-    /// Proposal contents changed for a session.
-    ProposalsChanged {
-        /// Owning session.
-        session_id: String,
     },
     /// Active turn reached a terminal success state.
     Completed {
@@ -258,12 +253,18 @@ impl CodexBridgeWorker {
 }
 
 #[async_trait]
-/// Editor and proposal operations exposed to bounded Codex dynamic tools.
+/// Editor operations exposed to bounded Codex dynamic tools.
 pub trait CodexToolHost: Send + 'static {
-    /// Reads authoritative visible or staged contents for one session.
+    /// Reads authoritative visible contents for one session.
     async fn read_file(&mut self, session_id: &str, path: &str) -> Result<Value>;
-    /// Stages complete proposed contents without mutating disk.
-    async fn write_file(&mut self, session_id: &str, path: &str, content: String) -> Result<Value>;
+    /// Replaces complete contents through the editor and persists them.
+    async fn write_file(
+        &mut self,
+        session_id: &str,
+        path: &str,
+        expected_revision: u64,
+        content: String,
+    ) -> Result<Value>;
     /// Dispatches an editor-owned semantic tool request.
     async fn editor_tool(&mut self, request: EditorToolRequest) -> Result<Value>;
 }
@@ -822,7 +823,7 @@ async fn handle_response(
                 events
                     .send(CodexEvent::Failed {
                         session_id: None,
-                        message: "Managed Codex requirements prevent a reviewable session"
+                        message: "Managed Codex requirements prevent an agent-edit session"
                             .to_string(),
                     })
                     .await
@@ -956,10 +957,14 @@ async fn handle_tool_call<H: CodexToolHost>(
                 }
                 "write_file" => {
                     let path = required_string(&arguments, "path")?;
+                    let expected_revision = arguments
+                        .get("expected_revision")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| anyhow::anyhow!("write_file requires expected_revision"))?;
                     let content = required_string(&arguments, "content")?.to_string();
                     host.lock()
                         .await
-                        .write_file(&session_id, path, content)
+                        .write_file(&session_id, path, expected_revision, content)
                         .await
                 }
                 "get_editor_state" | "open_file" | "select_text" | "apply_edits"
@@ -1264,8 +1269,8 @@ fn tool_definitions() -> Value {
     let mut tools = vec![
         json!({"type": "function", "name": "list_files", "description": "List workspace files, respecting ignore files.", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}}),
         json!({"type": "function", "name": "search_files", "description": "Search workspace text files.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"], "additionalProperties": false}}),
-        json!({"type": "function", "name": "read_file", "description": "Read through Red so unsaved contents are visible.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": false}}),
-        json!({"type": "function", "name": "write_file", "description": "Stage complete contents as a reviewable Red proposal.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"], "additionalProperties": false}}),
+        json!({"type": "function", "name": "read_file", "description": "Read a file through Red so unsaved contents and the current editor revision are visible.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": false}}),
+        json!({"type": "function", "name": "write_file", "description": "Replace complete file contents through Red and save them. Use the revision returned by read_file.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "expected_revision": {"type": "integer", "minimum": 0}, "content": {"type": "string"}}, "required": ["path", "expected_revision", "content"], "additionalProperties": false}}),
     ];
     tools.extend(editor_tool_schemas("inputSchema"));
     Value::Array(tools)

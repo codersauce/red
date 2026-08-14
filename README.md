@@ -86,9 +86,9 @@ completed `codex login`.
 - **Make it yours.** Embedded Husk plugins power the file tree, project search,
   Git workspace, and theme browser. Defaults work immediately; configuration
   remains optional.
-- **Keep the final say.** Red gives Codex editor context, including unsaved
-  buffers, while staging every suggested write as an isolated proposal for
-  explicit review.
+- **See the work happen.** Red gives Codex editor context, including unsaved
+  buffers, and follows each tool call by revealing the file and edit before it
+  is applied and saved.
 - **Work reliably.** Atomic recovery works across platforms, and Unix
   detach/attach sessions preserve buffers, plugins, LSP state, and running
   agents across terminal or SSH disconnects.
@@ -110,7 +110,6 @@ is fine: the embedded defaults, plugins, and themes are enough to start editing.
 | `Ctrl-p` | Find a file with fuzzy search and live preview |
 | `Space G` | Open the Git status workspace |
 | `Space A` | Ask the agent with editor context |
-| `:AgentReview` | Review pending agent proposals |
 | `Space t` | Browse themes with live preview |
 
 See [Getting started](docs/GETTING_STARTED.md) for editing, navigation,
@@ -118,18 +117,19 @@ configuration, language servers, Git, CLI, and troubleshooting guidance. The
 [Vim compatibility matrix](docs/VIM_COMPATIBILITY.md) is the precise,
 versioned behavior contract.
 
-## A safer agent workflow
+## A visible agent workflow
 
 ![Red preparing a contextual agent prompt over the active source file](docs/images/agent-workflow.jpg)
 
-Every agent edit is a proposal. Nothing touches your files until you accept it.
+Agent edits happen through Red's editor transaction and save paths while you
+follow along in the active buffer.
 
 1. **Ask.** Open the agent with `Space A`; Red includes a bounded selection or
    cursor excerpt, unsaved contents, and relevant diagnostics.
-2. **Review.** Codex reads editor state and stages attributed changes in an
-   isolated proposal filesystem. Open them with `:AgentReview`.
-3. **Decide.** Accept the useful hunks and reject the rest. Codex does not
-   silently write into the workspace.
+2. **Follow.** Red reveals the target file and cursor before each bounded tool
+   call, then briefly pauses so the change is readable.
+3. **Continue.** Revision-checked edits are attributed to the Codex session,
+   applied to the visible buffer, and saved to disk through Red.
 
 The integration uses the Codex app-server directly and supports persistent
 conversation, queued follow-ups, live tool progress, and explicit session

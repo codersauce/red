@@ -2,7 +2,7 @@
 //!
 //! The interactive binary in `main.rs` assembles these modules, while this crate owns
 //! the reusable state machines behind editing, rendering, language servers, plugins,
-//! agent proposals, recovery, and detachable sessions. Most state is coordinated by
+//! live agent editing, recovery, and detachable sessions. Most state is coordinated by
 //! [`editor::Editor`] on one async task. Background processes and blocking persistence
 //! work communicate with that owner through bounded channels or explicit join handles.
 //!
@@ -15,7 +15,6 @@
 
 pub mod agent_check;
 pub mod agent_tools;
-pub mod agent_workspace;
 pub mod assets;
 pub mod buffer;
 pub mod cli;

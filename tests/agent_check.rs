@@ -32,10 +32,7 @@ fn direct_codex_check_reports_a_compatible_cli_as_ready() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
     assert!(stdout.contains("backend: Codex app-server"), "{stdout}");
-    assert!(
-        stdout.contains("reviewable-edit readiness: ready"),
-        "{stdout}"
-    );
+    assert!(stdout.contains("agent-edit readiness: ready"), "{stdout}");
     assert!(stdout.contains("codex-cli 0.144.5"), "{stdout}");
 }
 
@@ -56,7 +53,7 @@ fn direct_codex_check_rejects_an_old_cli() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!output.status.success(), "{stdout}");
     assert!(
-        stdout.contains("reviewable-edit readiness: not ready"),
+        stdout.contains("agent-edit readiness: not ready"),
         "{stdout}"
     );
     assert!(stdout.contains("0.144.1 or newer"), "{stdout}");
@@ -97,8 +94,5 @@ fn agent_check_does_not_initialize_unrelated_runtime_resources() {
         "agent-check failed with {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
         output.status
     );
-    assert!(
-        stdout.contains("reviewable-edit readiness: ready"),
-        "{stdout}"
-    );
+    assert!(stdout.contains("agent-edit readiness: ready"), "{stdout}");
 }

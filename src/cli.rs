@@ -40,7 +40,7 @@ pub struct Args {
     #[clap(long = "agent-check")]
     pub agent_check: bool,
 
-    /// Exit non-zero when the Codex prerequisite check is not reviewable-edit ready.
+    /// Exit non-zero when the Codex prerequisite check is not agent-edit ready.
     #[clap(long, requires = "agent_check")]
     pub strict: bool,
 

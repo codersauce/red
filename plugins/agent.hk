@@ -1,6 +1,6 @@
-// Bundled Codex conversation, review, permission, and attributed-history interface.
+// Bundled Codex conversation, follow, permission, and attributed-history interface.
 //
-// Rust owns process and thread lifecycle, dynamic tools, proposal isolation, acceptance,
+// Rust owns process and thread lifecycle, dynamic tools, live editor changes, saving,
 // and recovery. This plugin owns only presentation and session-scoped UI state. Event
 // handlers ignore foreign session IDs, queued prompts remain FIFO, and deactivate closes
 // plugin UI resources without claiming that an active Codex process survived recovery.
@@ -113,51 +113,6 @@ struct TextPanelHeaderAction {
     compact_label: String,
 }
 
-struct AgentProposalHunk {
-    id: String,
-    old_start: i32,
-    old_end: i32,
-    old_text: String,
-    new_text: String,
-}
-
-struct AgentProposalFile {
-    session_id: String,
-    path: String,
-    conflict: bool,
-    message: String,
-    hunks: [AgentProposalHunk],
-}
-
-struct AgentProposalsResult {
-    files: [AgentProposalFile],
-    // The proposal API uses null or a human-readable error string.
-    error: Option<String>,
-}
-
-struct AgentProposalConflictEvent {
-    session_id: String,
-    path: String,
-}
-
-struct AgentProposalRowData {
-    session_id: String,
-    path: String,
-    hunk_id: String,
-    old_text: String,
-    new_text: String,
-    conflict: bool,
-}
-
-struct AgentProposalRow {
-    data: AgentProposalRowData,
-}
-
-struct AgentReviewEvent {
-    action: String,
-    row: AgentProposalRow,
-}
-
 struct AgentEdit {
     old_text: String,
     new_text: String,
@@ -212,14 +167,11 @@ struct AgentState {
     panel_created: bool,
     panel_open: bool,
     focus_panel_on_first_prompt: bool,
-    review_open: bool,
-    detail: [[PanelSegment]],
     permission_request_id: String,
     prompt_history: [String],
     pending_prompt: String,
     pending_prompt_block_id: String,
     pending_prompt_is_replay: bool,
-    proposal_notice: bool,
     transcript: String,
     transcript_blocks: [AgentTextBlock],
     streaming: bool,
@@ -249,17 +201,11 @@ fn initial_state() -> AgentState {
         panel_created: false,
         panel_open: false,
         focus_panel_on_first_prompt: false,
-        review_open: false,
-        detail: [[PanelSegment {
-            text: "Select a hunk to inspect it",
-            style: muted_style(),
-        }]],
         permission_request_id: "",
         prompt_history: [],
         pending_prompt: "",
         pending_prompt_block_id: "",
         pending_prompt_is_replay: false,
-        proposal_notice: false,
         transcript: "",
         transcript_blocks: [],
         streaming: false,
@@ -325,7 +271,6 @@ fn session_created(event: AgentSessionEvent) {
     ensure_conversation_panel();
     render_conversation();
     red::execute("Print", "Agent session started");
-    refresh_proposals();
     if pending != "" {
         red::state_patch(AgentState { pending_prompt: "" });
         red::state_patch(AgentState { pending_prompt_block_id: "" });
@@ -469,7 +414,6 @@ fn prompt_submitted(text: String) {
         }
     }
     red::state_patch(AgentState { prompt_history: history });
-    red::state_patch(AgentState { proposal_notice: false });
     if state().session_id == "" {
         stage_pending_prompt(text);
         red::execute("SetStorage", "prompt_history", history);
@@ -950,7 +894,6 @@ fn new_conversation() {
     red::state_patch(AgentState { pending_prompt: "" });
     red::state_patch(AgentState { pending_prompt_block_id: "" });
     red::state_patch(AgentState { pending_prompt_is_replay: false });
-    red::state_patch(AgentState { proposal_notice: false });
     clear_conversation();
     red::state_patch(AgentState { transcript: "" });
     red::execute("SetStorage", "transcript", "");
@@ -1460,218 +1403,6 @@ fn legacy_transcript_blocks(transcript: String) -> [AgentTextBlock] {
 }
 
 #[red::command(
-    name = "AgentReview",
-    title = "Review agent changes",
-    category = "Agent",
-    description = "Review changes proposed by the agent",
-    aliases = ["proposals"],
-    scope = "global",
-)]
-fn review() {
-    red::state_patch(AgentState { review_open: true });
-    red::execute("OpenWorkspace", "agent-review", WorkspaceConfig {
-        title: "Agent proposals",
-        detail_ratio: 58,
-        min_two_pane_width: 88,
-    });
-    refresh_proposals();
-}
-
-fn refresh_proposals() {
-    if !state().review_open {
-        return;
-    }
-    red::request("AgentProposals", render_proposals, state().session_id);
-}
-
-fn render_proposals(result: AgentProposalsResult) {
-    let rows = [];
-    let file_index = 0;
-    let truncated = false;
-    while file_index < red::len(result.files) && red::len(rows) < 499 {
-        let file = result.files[file_index];
-        let status = " " + red::len(file.hunks) + " hunks";
-        let status_style = muted_style();
-        if file.conflict {
-            status = " conflict";
-            status_style = warning_style();
-        }
-        rows = red::push(rows, WorkspaceRow {
-            id: "file:" + file.session_id + ":" + file.path,
-            selectable: true,
-            segments: [PanelSegment { text: file.path, style: heading_style() }],
-            right_segments: [PanelSegment {
-                text: status,
-                style: status_style,
-            }],
-            data: AgentProposalRowData {
-                session_id: file.session_id,
-                path: file.path,
-                hunk_id: "",
-                old_text: "",
-                new_text: "",
-                conflict: file.conflict,
-            },
-        });
-        if file.conflict {
-            if red::len(rows) < 499 {
-                rows = red::push(rows, WorkspaceRow {
-                    id: "conflict:" + file.session_id + ":" + file.path,
-                    selectable: false,
-                    depth: 1,
-                    segments: [PanelSegment { text: file.message, style: warning_style() }],
-                });
-            } else {
-                truncated = true;
-            }
-        } else {
-            let hunk_index = 0;
-            while hunk_index < red::len(file.hunks) && red::len(rows) < 499 {
-                let hunk = file.hunks[hunk_index];
-                rows = red::push(rows, WorkspaceRow {
-                    id: "hunk:" + file.session_id + ":" + hunk.id,
-                    selectable: true,
-                    depth: 1,
-                    segments: [PanelSegment {
-                        text: "chars " + hunk.old_start + ".." + hunk.old_end,
-                        style: normal_style(),
-                    }],
-                    data: AgentProposalRowData {
-                        session_id: file.session_id,
-                        path: file.path,
-                        hunk_id: hunk.id,
-                        old_text: hunk.old_text,
-                        new_text: hunk.new_text,
-                        conflict: false,
-                    },
-                });
-                hunk_index = hunk_index + 1;
-            }
-            if hunk_index < red::len(file.hunks) {
-                truncated = true;
-            }
-        }
-        file_index = file_index + 1;
-    }
-    if file_index < red::len(result.files) {
-        truncated = true;
-    }
-    if truncated {
-        rows = red::push(rows, WorkspaceRow {
-            id: "proposals-truncated",
-            selectable: false,
-            segments: [PanelSegment { text: "… review limited to 500 rows", style: muted_style() }],
-        });
-    }
-    if let Some(error) = result.error {
-        rows = red::push(rows, WorkspaceRow {
-            id: "error",
-            selectable: false,
-            segments: [PanelSegment { text: error, style: warning_style() }],
-        });
-    } else if red::len(rows) == 0 {
-        rows = red::push(rows, WorkspaceRow {
-            id: "empty",
-            selectable: false,
-            segments: [PanelSegment { text: "No pending proposals", style: success_style() }],
-        });
-    }
-    red::execute("UpdateWorkspace", "agent-review", WorkspaceModel {
-        header: [PanelSegment { text: "Review before any buffer or disk change", style: muted_style() }],
-        rows: rows,
-        detail: state().detail,
-        footer: [PanelSegment {
-            text: "a accept hunk  A accept file  r reject hunk  R reject file  q close",
-            style: muted_style(),
-        }],
-    });
-}
-
-#[red::on("workspace:event:agent-review")]
-fn review_event(event: AgentReviewEvent) {
-    if event.action == "q" || event.action == "escape" {
-        red::state_patch(AgentState { review_open: false });
-        red::execute("CloseWorkspace", "agent-review");
-        return;
-    }
-    let row = event.row;
-    if row == red::null() || row.data.path == red::null() {
-        return;
-    }
-    if event.action == "up" || event.action == "down" || event.action == "page_up" || event.action == "page_down" {
-        show_proposal_detail(row);
-    } else if event.action == "a" {
-        red::execute("AgentAcceptProposal", row.data.session_id, row.data.path, row.data.hunk_id);
-    } else if event.action == "A" {
-        red::execute("AgentAcceptProposal", row.data.session_id, row.data.path, "");
-    } else if event.action == "r" {
-        red::execute("AgentRejectProposal", row.data.session_id, row.data.path, row.data.hunk_id);
-    } else if event.action == "R" {
-        red::execute("AgentRejectProposal", row.data.session_id, row.data.path, "");
-    }
-}
-
-fn show_proposal_detail(row: AgentProposalRow) {
-    if row.data.hunk_id == "" {
-        return;
-    }
-    let detail = [];
-    let old_lines = red::split(row.data.old_text, "\n");
-    let old_index = 0;
-    while old_index < red::len(old_lines) && red::len(detail) < 400 {
-        detail = red::push(detail, [PanelSegment { text: "- " + old_lines[old_index], style: warning_style() }]);
-        old_index = old_index + 1;
-    }
-    let new_lines = red::split(row.data.new_text, "\n");
-    let new_index = 0;
-    while new_index < red::len(new_lines) && red::len(detail) < 400 {
-        detail = red::push(detail, [PanelSegment { text: "+ " + new_lines[new_index], style: success_style() }]);
-        new_index = new_index + 1;
-    }
-    if old_index < red::len(old_lines) || new_index < red::len(new_lines) {
-        detail = red::push(detail, [PanelSegment {
-            text: "… detail limited to 400 lines",
-            style: muted_style(),
-        }]);
-    }
-    red::state_patch(AgentState { detail: detail });
-    refresh_proposals();
-}
-
-#[red::on("agent:proposals_changed")]
-#[red::on("agent:proposal_applied")]
-fn proposals_changed(event: AgentSessionEvent) {
-    if !is_current_session(event.session_id) && !state().review_open {
-        return;
-    }
-    refresh_proposals();
-    if !state().review_open && !state().proposal_notice {
-        red::request("AgentProposals", proposals_ready, state().session_id);
-    }
-}
-
-fn proposals_ready(result: AgentProposalsResult) {
-    let files = red::len(result.files);
-    if files == 0 || state().review_open || state().proposal_notice {
-        return;
-    }
-    let hunks = 0;
-    let file_index = 0;
-    while file_index < red::len(result.files) && file_index < 500 {
-        hunks = hunks + red::len(result.files[file_index].hunks);
-        file_index = file_index + 1;
-    }
-    red::state_patch(AgentState { proposal_notice: true });
-    red::execute("Print", "Agent changes ready: " + files + " files, " + hunks + " hunks. Use :AgentReview to review before applying");
-}
-
-#[red::on("agent:proposal_conflict")]
-fn proposal_conflict(event: AgentProposalConflictEvent) {
-    red::execute("Print", "Agent proposal conflicts with current buffer: " + event.path);
-    refresh_proposals();
-}
-
-#[red::command(
     name = "AgentHistory",
     title = "Show agent history",
     category = "Agent",
@@ -1836,7 +1567,6 @@ fn deactivate() {
     red::execute("SetTextPanelStatus", "agent-conversation");
     red::state_patch(AgentState { session_id: "" });
     red::state_patch(AgentState { cancelled_session_id: "" });
-    red::state_patch(AgentState { review_open: false });
     red::state_patch(AgentState { permission_request_id: "" });
     let timer = red::string(state().stream_timer, "");
     if timer != "" {
