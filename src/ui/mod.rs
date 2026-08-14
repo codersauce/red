@@ -57,7 +57,7 @@ pub use statusline_layout::StatuslineLayoutPanel;
 
 use crate::{
     config::KeyAction,
-    editor::{Action, RenderBuffer},
+    editor::{Action, Mode, RenderBuffer},
     lsp::types::CompletionResponseItem,
     plugin::{ComposerHandle, PickerHandle},
     theme::Theme,
@@ -122,6 +122,10 @@ pub trait Component: Send {
     }
 
     fn cursor_position(&self) -> Option<(usize, usize)> {
+        None
+    }
+
+    fn cursor_mode(&self) -> Option<Mode> {
         None
     }
 }

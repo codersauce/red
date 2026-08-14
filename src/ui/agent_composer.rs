@@ -377,6 +377,10 @@ impl Component for AgentComposer {
             .min(self.viewport_height.saturating_sub(1));
         Some((x, y))
     }
+
+    fn cursor_mode(&self) -> Option<Mode> {
+        Some(self.prompt.mode())
+    }
 }
 
 pub(crate) fn wrap_text(text: &str, width: usize) -> WrappedText {
