@@ -513,7 +513,7 @@ fn render_line(
     });
 }
 
-fn hover_span_style(span: &RenderedTextSpan, theme: &Theme) -> Style {
+pub(crate) fn hover_span_style(span: &RenderedTextSpan, theme: &Theme) -> Style {
     let base = &theme.ui_style.dialog;
     let code_background = theme
         .colors

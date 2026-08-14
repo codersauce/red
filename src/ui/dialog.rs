@@ -130,7 +130,6 @@ impl Dialog {
 
     /// Places a modal title inside the left edge of its top border.
     #[must_use]
-    #[cfg(test)]
     pub(crate) const fn with_left_aligned_title(mut self) -> Self {
         self.left_aligned_title = true;
         self
@@ -149,7 +148,6 @@ impl Dialog {
     }
 
     /// Sets compact, right-aligned metadata in the dialog header.
-    #[cfg(test)]
     pub(crate) fn set_header_status(&mut self, status: Option<String>) {
         self.header_status = status;
     }

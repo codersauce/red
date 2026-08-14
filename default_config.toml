@@ -39,6 +39,12 @@ sidescrolloff = 0
 # disappears on the first edit, file open, or window split.
 splash = true
 
+# Present a themed release announcement once after installing a new version.
+show_whats_new = true
+
+# Refresh bundled release notes from GitHub without delaying editor startup.
+fetch_release_notes = true
+
 # Path to the log file. Relative paths are resolved from Red's config
 # directory. If the log file is not present, Red will create it; if it is
 # present, Red will append to it.

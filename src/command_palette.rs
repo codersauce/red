@@ -48,6 +48,8 @@ pub(crate) const BUILTIN_COLON_COMMANDS: &[&str] = &[
 const SPECIAL_BUILTIN_COLON_COMMANDS: &[&str] = &[
     "commands",
     "command-palette",
+    "whats-new",
+    "changelog",
     "db",
     "dh",
     "di",
@@ -371,6 +373,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Some(":config-diagnostics"),
             &[],
             Action::ConfigDiagnostics,
+        ),
+        builtin(
+            "editor.whats_new",
+            "What’s new in Red",
+            "Editor",
+            "Read highlights and release notes for the installed version",
+            Some(":whats-new"),
+            &[":changelog", "release notes", "what's new", "updates"],
+            Action::OpenWhatsNew,
         ),
         builtin(
             "editor.statusline_manager",
@@ -1021,6 +1032,7 @@ fn action_label(action: &Action) -> String {
     match action {
         Action::CommandPalette => "All commands".to_string(),
         Action::ConfigDiagnostics => "Configuration diagnostics".to_string(),
+        Action::OpenWhatsNew => "What’s new in Red".to_string(),
         Action::OpenDiagnosticsPicker => "Diagnostics".to_string(),
         Action::OpenErrorDiagnosticsPicker => "Errors".to_string(),
         Action::OpenStatuslineManager => "Configure status line".to_string(),
@@ -1111,6 +1123,8 @@ fn colon_name_is_builtin(name: &str) -> bool {
         name,
         "commands"
             | "command-palette"
+            | "whats-new"
+            | "changelog"
             | "db"
             | "dh"
             | "di"
@@ -1206,6 +1220,14 @@ mod tests {
             .unwrap();
         assert_eq!(statusline.colon.as_deref(), Some(":statusline"));
         assert_eq!(statusline.action, Action::OpenStatuslineManager);
+
+        let whats_new = entries
+            .iter()
+            .find(|entry| entry.id == "editor.whats_new")
+            .unwrap();
+        assert_eq!(whats_new.colon.as_deref(), Some(":whats-new"));
+        assert!(whats_new.aliases.iter().any(|alias| alias == ":changelog"));
+        assert_eq!(whats_new.action, Action::OpenWhatsNew);
     }
 
     #[test]

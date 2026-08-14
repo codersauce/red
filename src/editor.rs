@@ -112,10 +112,11 @@ use crate::{
     ui::{
         AgentComposer, CompletionUI, Component, Confirmation, DiagnosticInfo, FilePicker,
         HoverInfo, HoverInfoFormat, Info, InputPrompt, LegacyPickerOptions, Picker, PickerItem,
-        PickerOptions, PickerPreview, PickerUpdate, StatuslineLayoutPanel,
+        PickerOptions, PickerPreview, PickerUpdate, StatuslineLayoutPanel, WhatsNewPanel,
     },
     undo::{AppliedTextEdit, CursorSnapshot, EditOrigin, RevertEdit, TextPosition, TextRange},
     utils::{expand_user_path, get_workspace_path},
+    whats_new::ReleaseNotes,
     window::{WindowDivider, WindowId, WindowManager, WindowManagerSnapshot},
 };
 
@@ -2005,6 +2006,7 @@ pub enum Action {
     CommandPalette,
     OpenSyntaxPicker,
     SetSyntax(String),
+    OpenWhatsNew,
     OpenStatuslineManager,
     OpenDiagnosticsPicker,
     OpenErrorDiagnosticsPicker,
@@ -2680,6 +2682,15 @@ pub struct Editor {
     /// Persistent preferences, including command-line history.
     preferences: PreferencesStore,
 
+    /// A release has changed, but no visible client has seen its announcement yet.
+    whats_new_startup_pending: bool,
+
+    /// Set only after an interactive terminal or authenticated detached client exists.
+    whats_new_auto_presentation_enabled: bool,
+
+    /// The announcement was prepared and still needs a successful rendered-frame claim.
+    whats_new_needs_persistence: bool,
+
     /// Active command-history navigation state.
     command_history_navigation: Option<CommandHistoryNavigation>,
 
@@ -2978,6 +2989,21 @@ impl DetachedEditorCore {
 
     pub fn clear_pending_paste(&mut self) {
         self.pending_paste.clear();
+    }
+
+    /// Prepares a pending release modal only after a client authenticates.
+    pub fn prepare_startup_whats_new(&mut self) -> anyhow::Result<bool> {
+        if !self.editor.prepare_startup_whats_new() {
+            return Ok(false);
+        }
+        self.editor.render(&mut self.render_buffer)?;
+        self.finish_render()?;
+        Ok(true)
+    }
+
+    /// Claims the version only after its first frame reaches an attached client.
+    pub fn mark_whats_new_presented(&mut self) {
+        self.editor.mark_whats_new_presented();
     }
 
     pub async fn shutdown(&mut self) {
@@ -3850,6 +3876,9 @@ impl Editor {
         let buffer_manager = buffer_manager::BufferManager::with_buffers(buffers);
         let session_manager = session_manager::SessionManager::new();
         let agent_manager = agent_manager::AgentManager::new();
+        let whats_new_startup_pending = preferences.is_persistent()
+            && config.show_whats_new.unwrap_or(true)
+            && preferences.last_seen_version() != Some(env!("CARGO_PKG_VERSION"));
 
         Ok(Editor {
             buffer_manager,
@@ -3940,6 +3969,9 @@ impl Editor {
             substitute_confirmation: None,
             command: String::new(),
             preferences,
+            whats_new_startup_pending,
+            whats_new_auto_presentation_enabled: false,
+            whats_new_needs_persistence: false,
             command_history_navigation: None,
             command_completion: None,
             search_term: String::new(),
@@ -4016,6 +4048,57 @@ impl Editor {
             buffers,
             preferences,
         )
+    }
+
+    /// Defers release announcements while crash recovery owns the first frame.
+    pub fn suppress_startup_whats_new(&mut self) {
+        self.whats_new_startup_pending = false;
+    }
+
+    fn open_whats_new_panel(&mut self) -> bool {
+        if !WhatsNewPanel::fits(self.vwidth(), self.vheight()) {
+            return false;
+        }
+
+        let version = env!("CARGO_PKG_VERSION");
+        let notes = ReleaseNotes::bundled(version, self.preferences.last_seen_version());
+        let refresh = if self.config.fetch_release_notes.unwrap_or(true) {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let fallback = notes.clone();
+            tokio::spawn(async move {
+                let result = ReleaseNotes::fetch(version, &fallback)
+                    .await
+                    .map_err(|error| format!("{error:#}"));
+                let _ = sender.send(result);
+            });
+            Some(receiver)
+        } else {
+            None
+        };
+
+        self.current_dialog = Some(Box::new(WhatsNewPanel::new(self, notes, refresh)));
+        self.whats_new_startup_pending = false;
+        self.whats_new_needs_persistence = true;
+        true
+    }
+
+    fn prepare_startup_whats_new(&mut self) -> bool {
+        self.whats_new_auto_presentation_enabled = true;
+        self.whats_new_startup_pending
+            && self.current_dialog.is_none()
+            && self.open_whats_new_panel()
+    }
+
+    fn mark_whats_new_presented(&mut self) {
+        if !std::mem::take(&mut self.whats_new_needs_persistence) {
+            return;
+        }
+        if let Err(error) = self
+            .preferences
+            .set_last_seen_version(env!("CARGO_PKG_VERSION"))
+        {
+            log!("could not persist the displayed release version: {error}");
+        }
     }
 
     /// Synchronizes the editor's state with the active window
@@ -6950,7 +7033,9 @@ impl Editor {
         self.ensure_current_buffer_lsp_opened().await?;
         let (columns, rows) = terminal::size()?;
         self.resize_terminal_surface(columns, rows, &mut buffer);
+        self.prepare_startup_whats_new();
         self.render(&mut buffer)?;
+        self.mark_whats_new_presented();
         drop(interactive_startup);
         let mut pending_events = VecDeque::new();
         let mut last_terminal_size_reconciliation = Instant::now();
@@ -7226,6 +7311,14 @@ impl Editor {
             false
         };
 
+        let startup_release_changed = if self.whats_new_auto_presentation_enabled
+            && self.whats_new_startup_pending
+            && self.current_dialog.is_none()
+        {
+            self.open_whats_new_panel()
+        } else {
+            false
+        };
         let dialog_changed = if let Some(current_dialog) = &mut self.current_dialog {
             current_dialog.tick()?
         } else {
@@ -7239,8 +7332,16 @@ impl Editor {
             self.keymap_hints_visible = true;
         }
         let panel_animation_changed = self.panel_manager.poll_animation();
-        if completion_changed || dialog_changed || keymap_hints_changed || panel_animation_changed {
+        if completion_changed
+            || startup_release_changed
+            || dialog_changed
+            || keymap_hints_changed
+            || panel_animation_changed
+        {
             self.render(buffer)?;
+            if startup_release_changed {
+                self.mark_whats_new_presented();
+            }
         }
 
         // if self.sync_state.should_notify() {
@@ -11683,6 +11784,9 @@ impl Editor {
 
         if matches!(cmd, "commands" | "command-palette") {
             return vec![Action::CommandPalette];
+        }
+        if matches!(cmd, "whats-new" | "changelog") {
+            return vec![Action::OpenWhatsNew];
         }
         if cmd == "config-diagnostics" {
             return vec![Action::ConfigDiagnostics];
@@ -17556,6 +17660,16 @@ impl Editor {
                 self.force_full_redraw = true;
                 self.last_error = Some(format!("syntax: {label}"));
                 self.render(buffer)?;
+            }
+            Action::OpenWhatsNew => {
+                self.release_current_dialog_callbacks(runtime);
+                if self.open_whats_new_panel() {
+                    self.render(buffer)?;
+                    self.mark_whats_new_presented();
+                } else {
+                    self.last_error = Some("terminal is too small for release notes".to_string());
+                    self.render(buffer)?;
+                }
             }
             Action::OpenStatuslineManager => {
                 self.release_current_dialog_callbacks(runtime);
@@ -25189,6 +25303,198 @@ builtin = "rust"
             editor.handle_command("statusline", &runtime),
             vec![Action::OpenStatuslineManager]
         );
+    }
+
+    #[test]
+    fn release_note_colon_commands_open_the_same_branded_panel() {
+        let mut editor = test_editor(80, 24);
+        let runtime = Runtime::new();
+
+        assert_eq!(
+            editor.handle_command("whats-new", &runtime),
+            vec![Action::OpenWhatsNew]
+        );
+        assert_eq!(
+            editor.handle_command("changelog", &runtime),
+            vec![Action::OpenWhatsNew]
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_release_notes_action_renders_without_waiting_for_github() {
+        let mut editor = test_editor(90, 24);
+        editor.config.fetch_release_notes = Some(false);
+        let mut runtime = Runtime::new();
+        let mut buffer = RenderBuffer::new(90, 24, &Style::default());
+
+        let quit = editor
+            .execute(&Action::OpenWhatsNew, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert!(!quit);
+        assert!(editor.current_dialog.is_some());
+        let frame = render_text_rows(&buffer).join("\n");
+        assert!(frame.contains("WHAT’S NEW"));
+        assert!(frame.contains("What’s new in Red"));
+        assert!(frame.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+    }
+
+    #[tokio::test]
+    async fn startup_release_is_claimed_only_after_its_frame_is_rendered() {
+        let directory =
+            std::env::temp_dir().join(format!("red-whats-new-{}", uuid::Uuid::new_v4()));
+        let path = directory.join("preferences.json");
+        let preferences = PreferencesStore::load(&path);
+        let config = Config {
+            fetch_release_notes: Some(false),
+            ..Config::default()
+        };
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = Editor::with_size_and_preferences(
+            lsp,
+            90,
+            24,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, String::new())],
+            preferences,
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        let mut buffer = RenderBuffer::new(90, 24, &Style::default());
+
+        assert!(editor.prepare_startup_whats_new());
+        assert_eq!(editor.preferences.last_seen_version(), None);
+        editor.render(&mut buffer).unwrap();
+        editor.mark_whats_new_presented();
+
+        let reloaded = PreferencesStore::load(&path);
+        assert_eq!(
+            reloaded.last_seen_version(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+
+        let config = Config {
+            fetch_release_notes: Some(false),
+            ..Config::default()
+        };
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut reopened = Editor::with_size_and_preferences(
+            lsp,
+            90,
+            24,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, String::new())],
+            reloaded,
+        )
+        .unwrap();
+        assert!(!reopened.prepare_startup_whats_new());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[tokio::test]
+    async fn detached_release_waits_for_a_client_and_a_successful_frame() {
+        let directory =
+            std::env::temp_dir().join(format!("red-whats-new-detached-{}", uuid::Uuid::new_v4()));
+        let path = directory.join("preferences.json");
+        let preferences = PreferencesStore::load(&path);
+        let config = Config {
+            fetch_release_notes: Some(false),
+            ..Config::default()
+        };
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let editor = Editor::with_size_and_preferences(
+            lsp,
+            90,
+            24,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, String::new())],
+            preferences,
+        )
+        .unwrap();
+        let mut core = DetachedEditorCore::new(editor).await.unwrap();
+
+        assert!(!core
+            .snapshot(None)
+            .lines
+            .iter()
+            .any(|line| line.text.contains("WHAT’S NEW")));
+        assert_eq!(core.editor.preferences.last_seen_version(), None);
+
+        assert!(core.prepare_startup_whats_new().unwrap());
+        assert_eq!(core.editor.preferences.last_seen_version(), None);
+        assert!(core
+            .snapshot(None)
+            .lines
+            .iter()
+            .any(|line| line.text.contains("WHAT’S NEW")));
+        core.mark_whats_new_presented();
+
+        assert_eq!(
+            PreferencesStore::load(&path).last_seen_version(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[tokio::test]
+    async fn crash_recovery_defers_the_release_announcement() {
+        let directory =
+            std::env::temp_dir().join(format!("red-whats-new-recovery-{}", uuid::Uuid::new_v4()));
+        let path = directory.join("preferences.json");
+        let preferences = PreferencesStore::load(&path);
+        let config = Config {
+            fetch_release_notes: Some(false),
+            ..Config::default()
+        };
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = Editor::with_size_and_preferences(
+            lsp,
+            90,
+            24,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, String::new())],
+            preferences,
+        )
+        .unwrap();
+
+        editor.suppress_startup_whats_new();
+
+        assert!(!editor.prepare_startup_whats_new());
+        assert_eq!(editor.preferences.last_seen_version(), None);
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn disabled_release_announcements_remain_available_on_demand() {
+        let directory =
+            std::env::temp_dir().join(format!("red-whats-new-disabled-{}", uuid::Uuid::new_v4()));
+        let path = directory.join("preferences.json");
+        let preferences = PreferencesStore::load(&path);
+        let config = Config {
+            show_whats_new: Some(false),
+            fetch_release_notes: Some(false),
+            ..Config::default()
+        };
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = Editor::with_size_and_preferences(
+            lsp,
+            90,
+            24,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, String::new())],
+            preferences,
+        )
+        .unwrap();
+
+        assert!(!editor.prepare_startup_whats_new());
+        assert!(editor.open_whats_new_panel());
+        fs::remove_dir_all(directory).ok();
     }
 
     #[tokio::test]
