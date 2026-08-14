@@ -3144,26 +3144,37 @@ impl Editor {
         }
     }
 
+    pub(crate) fn active_cursor_shape(&self) -> CursorShape {
+        if self.is_waiting_for_key_sequence() {
+            return self.config.cursor.waiting;
+        }
+
+        let mode = if let Some(dialog) = self.current_dialog.as_ref() {
+            dialog.cursor_mode().unwrap_or(self.mode)
+        } else {
+            self.panel_manager
+                .focused_text_panel_cursor_mode()
+                .unwrap_or(self.mode)
+        };
+        match mode {
+            Mode::Normal => self.config.cursor.normal,
+            Mode::Command => self.config.cursor.command,
+            Mode::Insert => self.config.cursor.insert,
+            Mode::Search => self.config.cursor.search,
+            Mode::Visual => self.config.cursor.visual,
+            Mode::VisualLine => self.config.cursor.visual_line,
+            Mode::VisualBlock => self.config.cursor.visual_block,
+        }
+    }
+
     fn set_cursor_style(&mut self) -> anyhow::Result<()> {
         if !self.terminal_output_enabled {
             return Ok(());
         }
 
         self.queue_theme_cursor_color()?;
-        let shape = if self.is_waiting_for_key_sequence() {
-            self.config.cursor.waiting
-        } else {
-            match self.mode {
-                Mode::Normal => self.config.cursor.normal,
-                Mode::Command => self.config.cursor.command,
-                Mode::Insert => self.config.cursor.insert,
-                Mode::Search => self.config.cursor.search,
-                Mode::Visual => self.config.cursor.visual,
-                Mode::VisualLine => self.config.cursor.visual_line,
-                Mode::VisualBlock => self.config.cursor.visual_block,
-            }
-        };
-        self.stdout.queue(cursor_style_for_shape(shape))?;
+        self.stdout
+            .queue(cursor_style_for_shape(self.active_cursor_shape()))?;
 
         Ok(())
     }
@@ -3205,6 +3216,45 @@ mod tests {
             Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![source]).unwrap();
         editor.test_disable_terminal_output();
         editor
+    }
+
+    #[test]
+    fn focused_agent_composer_uses_its_prompt_local_cursor_shape() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let mut config = Config::default();
+        config.cursor.normal = CursorShape::SteadyBlock;
+        config.cursor.insert = CursorShape::SteadyBar;
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let mut editor = Editor::with_size(
+            lsp,
+            60,
+            12,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, "background".to_string())],
+        )
+        .unwrap();
+        editor.test_create_text_panel(
+            "agent",
+            crate::plugin::PanelConfig {
+                side: crate::plugin::PanelSide::Right,
+                width: 32,
+                composer: Some(crate::plugin::TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 2,
+                }),
+                ..crate::plugin::PanelConfig::default()
+            },
+        );
+        assert!(editor.test_focus_text_panel_composer("agent"));
+
+        assert_eq!(editor.active_cursor_shape(), CursorShape::SteadyBar);
+        editor.panel_manager.handle_focused_text_input(
+            &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            60,
+        );
+        assert_eq!(editor.active_cursor_shape(), CursorShape::SteadyBlock);
     }
 
     fn rendered_rows(buffer: &RenderBuffer) -> Vec<String> {

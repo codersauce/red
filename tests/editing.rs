@@ -5812,6 +5812,24 @@ async fn focused_agent_panel_keeps_global_leader_until_the_composer_is_focused()
             ))
     ));
     assert!(harness.render_cursor_position().is_some());
+
+    let action = harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )))
+        .unwrap();
+    assert!(matches!(
+        action,
+        Some(KeyAction::Multiple(actions))
+            if actions.iter().any(|action| matches!(
+                action,
+                Action::NotifyPlugins(name, payload)
+                    if name == "panel:event:agent" && payload["action"] == "interrupt"
+            ))
+    ));
+    assert!(harness.render_cursor_position().is_some());
 }
 
 #[tokio::test]
@@ -6640,6 +6658,21 @@ async fn ctrl_w_w_focuses_agent_composer_and_makes_cursor_visible() {
             if actions.iter().any(|action| matches!(
                 action,
                 Action::NotifyPlugins(name, payload)
+                    if name == "panel:event:agent" && payload["action"] == "composer_input"
+            ))
+    ));
+    assert!(harness.render_cursor_position().is_some());
+
+    let action = harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .unwrap();
+    assert!(matches!(
+        action,
+        Some(KeyAction::Multiple(actions))
+            if actions.iter().any(|action| matches!(
+                action,
+                Action::NotifyPlugins(name, payload)
                     if name == "panel:event:agent" && payload["action"] == "composer_blur"
             ))
     ));
@@ -7004,7 +7037,7 @@ async fn mouse_drag_preserves_a_focused_text_composer_and_its_draft() {
         .editor
         .test_handle_event(Event::Key(KeyEvent::new(
             KeyCode::Enter,
-            KeyModifiers::NONE,
+            KeyModifiers::CONTROL,
         )))
         .unwrap();
     assert!(matches!(

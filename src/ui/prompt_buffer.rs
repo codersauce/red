@@ -276,6 +276,7 @@ impl PromptBuffer {
         self.history.insert(0, text.clone());
         self.history.truncate(50);
         self.clear();
+        self.set_mode(Mode::Insert);
         Some(text)
     }
 
@@ -1436,6 +1437,7 @@ mod tests {
         );
         assert_eq!(prompt.text(), "");
         assert_eq!(prompt.cursor(), 0);
+        assert_eq!(prompt.mode(), Mode::Insert);
         assert_eq!(prompt.history(), ["  first\nsecond  ", "older"]);
         assert!(prompt.buffer().file.is_none());
     }

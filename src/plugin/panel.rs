@@ -21,8 +21,11 @@ use super::text_link::{TextPanelLink, TextPanelLinkTarget};
 use crate::{
     editor::{render_buffer::RenderBuffer, Point},
     theme::{SelectionForegroundPriority, Style, Theme, ThemeStyleSpec},
-    ui::{paint_rich_text, wrap_text, FollowTailViewport, PromptBuffer, PROMPT_MAX_BYTES},
-    unicode_utils::{display_width, fit_display_width, grapheme_len, truncate_display_width},
+    ui::{
+        normalize_prompt_newlines, paint_rich_text, wrap_text, FollowTailViewport, PromptBuffer,
+        PromptInput, PROMPT_MAX_BYTES,
+    },
+    unicode_utils::{display_width, fit_display_width, truncate_display_width},
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -259,26 +262,6 @@ impl TextPanelComposer {
         }
     }
 
-    fn insert(&mut self, text: &str) {
-        if self.prompt.insert(text) {
-            self.validation = None;
-        } else if text.len() > MAX_COMPOSER_BYTES.saturating_sub(self.prompt.text().len()) {
-            self.validation = Some("Prompt exceeds 128 KiB");
-        }
-    }
-
-    fn backspace(&mut self) {
-        if self.prompt.backspace() {
-            self.validation = None;
-        }
-    }
-
-    fn delete(&mut self) {
-        if self.prompt.delete() {
-            self.validation = None;
-        }
-    }
-
     fn take_submission(&mut self) -> Option<String> {
         let Some(text) = self.prompt.take_submission() else {
             self.validation = Some("Prompt is empty");
@@ -286,24 +269,6 @@ impl TextPanelComposer {
         };
         self.validation = None;
         Some(text)
-    }
-
-    fn history_previous(&mut self) {
-        self.prompt.history_previous();
-    }
-
-    fn history_next(&mut self) {
-        self.prompt.history_next();
-    }
-
-    fn move_vertical(&mut self, delta: isize, width: usize) {
-        let code = if delta.is_negative() {
-            KeyCode::Up
-        } else {
-            KeyCode::Down
-        };
-        let event = Event::Key(crossterm::event::KeyEvent::new(code, KeyModifiers::NONE));
-        self.prompt.handle_event(&event, width);
     }
 }
 
@@ -1301,72 +1266,56 @@ impl PanelManager {
         if !composer.focused || !composer.enabled {
             return None;
         }
-
-        let mut action = "composer_input";
-        let mut text = None;
-        match event {
-            Event::Paste(pasted) => composer.insert(pasted),
-            Event::Key(key) => match (key.code, key.modifiers) {
-                (KeyCode::Esc, _) => {
-                    composer.focused = false;
-                    action = "composer_blur";
-                }
-                (KeyCode::Enter, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
-                    composer.insert("\n");
-                }
-                (KeyCode::Char('j' | 'J'), modifiers)
-                    if modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    composer.insert("\n");
-                }
-                (KeyCode::Char('p' | 'P'), modifiers)
-                    if modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    composer.history_previous();
-                }
-                (KeyCode::Char('n' | 'N'), modifiers)
-                    if modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    composer.history_next();
-                }
-                (KeyCode::Enter, _) => {
-                    text = composer.take_submission();
-                    action = "submit";
-                }
-                (KeyCode::Backspace, _) => composer.backspace(),
-                (KeyCode::Delete, _) => composer.delete(),
-                (KeyCode::Left, _) => composer
-                    .prompt
-                    .set_cursor(composer.prompt.cursor().saturating_sub(1)),
-                (KeyCode::Right, _) => {
-                    composer.prompt.set_cursor(
-                        composer
-                            .prompt
-                            .cursor()
-                            .saturating_add(1)
-                            .min(grapheme_len(&composer.prompt.text())),
-                    );
-                }
-                (KeyCode::Up, _) => {
-                    composer.move_vertical(-1, panel_width.saturating_sub(2));
-                }
-                (KeyCode::Down, _) => {
-                    composer.move_vertical(1, panel_width.saturating_sub(2));
-                }
-                (KeyCode::Home, _) => composer.prompt.set_cursor(0),
-                (KeyCode::End, _) => composer
-                    .prompt
-                    .set_cursor(grapheme_len(&composer.prompt.text())),
-                (KeyCode::Tab, _) => composer.insert("\t"),
-                (KeyCode::Char(character), modifiers)
-                    if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    composer.insert(&character.to_string());
-                }
-                _ => return None,
-            },
-            _ => return None,
+        if matches!(
+            event,
+            Event::Key(key)
+                if matches!(key.code, KeyCode::Char('c' | 'C'))
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+        ) {
+            // Ctrl-C is a pane-level interrupt. Let the editor route it without
+            // changing the focused composer's mode, draft, or cursor.
+            return None;
         }
+
+        let previous_bytes = composer.prompt.text().len();
+        let inserted_bytes = match event {
+            Event::Paste(text) => normalize_prompt_newlines(text).len(),
+            Event::Key(key) => match key.code {
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    character.len_utf8()
+                }
+                _ => 0,
+            },
+            _ => 0,
+        };
+        let (action, text) = match composer
+            .prompt
+            .handle_event(event, panel_width.saturating_sub(2).max(1))
+        {
+            PromptInput::Changed => {
+                composer.validation = None;
+                ("composer_input", None)
+            }
+            PromptInput::Submit => match composer.take_submission() {
+                Some(text) => ("submit", Some(text)),
+                None => ("composer_input", None),
+            },
+            PromptInput::Cancel => {
+                composer.focused = false;
+                ("composer_blur", None)
+            }
+            PromptInput::Unhandled
+                if inserted_bytes > MAX_COMPOSER_BYTES.saturating_sub(previous_bytes) =>
+            {
+                composer.validation = Some("Prompt exceeds 128 KiB");
+                ("composer_input", None)
+            }
+            PromptInput::Unhandled => return None,
+        };
 
         Some(PanelEvent {
             panel_id: panel.id.clone(),
@@ -1375,6 +1324,13 @@ impl PanelManager {
             row: None,
             text,
         })
+    }
+
+    /// Returns the prompt-local editor mode while the docked composer owns focus.
+    pub(crate) fn focused_text_panel_cursor_mode(&self) -> Option<crate::editor::Mode> {
+        let panel = self.text_panels.get(self.focused.as_deref()?)?;
+        let composer = panel.composer.as_ref()?;
+        (composer.focused && composer.enabled).then(|| composer.prompt.mode())
     }
 
     pub fn focused_text_panel_cursor_position(
@@ -1970,8 +1926,10 @@ fn render_text_panel_composer(
             style,
         );
     }
-    let hints = if composer.focused {
-        "Esc nav · Enter send · ^J newline · ^P/^N history"
+    let hints = if composer.focused && composer.prompt.mode() == crate::editor::Mode::Normal {
+        "NORMAL · Enter send · Esc nav · i/a edit · u undo"
+    } else if composer.focused {
+        "INSERT · Ctrl+Enter send · Enter newline · Esc normal · ^P/^N history"
     } else {
         "a edit · x clear · N new · q close · ^C stop"
     };
@@ -3014,7 +2972,7 @@ mod tests {
         );
         let submitted = manager
             .handle_focused_text_input(
-                &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
                 80,
             )
             .unwrap();
@@ -3035,6 +2993,143 @@ mod tests {
         let restored = manager.text_panels["agent"].composer.as_ref().unwrap();
         assert_eq!(restored.prompt.text(), "draft");
         assert!(manager.focused_text_panel_cursor_position(80, 20).is_some());
+    }
+
+    #[test]
+    fn text_panel_composer_uses_prompt_local_normal_and_insert_modes() {
+        use crossterm::event::KeyEvent;
+
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 52,
+                title: Some("Agent".to_string()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 3,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        assert!(manager.focus_text_panel_composer("agent"));
+        manager.handle_focused_text_input(&Event::Paste("first second".to_string()), 80);
+        assert!(manager
+            .handle_focused_text_input(
+                &Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                80,
+            )
+            .is_none());
+        assert!(manager.focused_text_input_active());
+        assert_eq!(
+            manager.text_panels["agent"]
+                .composer
+                .as_ref()
+                .unwrap()
+                .prompt
+                .text(),
+            "first second"
+        );
+        assert_eq!(
+            manager.focused_text_panel_cursor_mode(),
+            Some(crate::editor::Mode::Insert)
+        );
+
+        let escape = manager
+            .handle_focused_text_input(
+                &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                80,
+            )
+            .unwrap();
+        assert_eq!(escape.action, "composer_input");
+        assert_eq!(
+            manager.focused_text_panel_cursor_mode(),
+            Some(crate::editor::Mode::Normal)
+        );
+
+        for character in ['0', 'd', 'w'] {
+            manager.handle_focused_text_input(
+                &Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+                80,
+            );
+        }
+        let composer = manager.text_panels["agent"].composer.as_ref().unwrap();
+        assert_eq!(composer.prompt.text(), "second");
+
+        manager.handle_focused_text_input(
+            &Event::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)),
+            80,
+        );
+        let composer = manager.text_panels["agent"].composer.as_ref().unwrap();
+        assert_eq!(composer.prompt.text(), "first second");
+
+        manager.handle_focused_text_input(
+            &Event::Key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+            80,
+        );
+        manager.handle_focused_text_input(
+            &Event::Key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::SHIFT)),
+            80,
+        );
+        assert_eq!(
+            manager.focused_text_panel_cursor_mode(),
+            Some(crate::editor::Mode::Insert)
+        );
+
+        let submitted = manager
+            .handle_focused_text_input(
+                &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+                80,
+            )
+            .unwrap();
+        assert_eq!(submitted.action, "submit");
+        assert_eq!(submitted.text.as_deref(), Some("first second!"));
+        assert_eq!(
+            manager.focused_text_panel_cursor_mode(),
+            Some(crate::editor::Mode::Insert)
+        );
+    }
+
+    #[test]
+    fn text_panel_composer_renders_its_local_mode_and_blurs_from_normal_mode() {
+        use crossterm::event::KeyEvent;
+
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 70,
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 2,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        assert!(manager.focus_text_panel_composer("agent"));
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(80, 20, &theme.style);
+
+        manager.render(&mut buffer, &theme);
+        assert!((0..20).any(|row| row_text(&buffer, row).contains("INSERT")));
+
+        manager.handle_focused_text_input(
+            &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            80,
+        );
+        manager.render(&mut buffer, &theme);
+        assert!((0..20).any(|row| row_text(&buffer, row).contains("NORMAL")));
+
+        let blur = manager
+            .handle_focused_text_input(
+                &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                80,
+            )
+            .unwrap();
+        assert_eq!(blur.action, "composer_blur");
+        assert!(!manager.focused_text_input_active());
     }
 
     #[test]

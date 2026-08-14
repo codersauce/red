@@ -1268,7 +1268,7 @@ fn render_conversation() {
             id: "empty",
             kind: "activity",
             format: "plain",
-            text: "No messages yet.\n\nEnter sends · ^J adds a line\na edits from the panel · Space A opens the prompt\n^C stops a running turn",
+            text: "No messages yet.\n\nCtrl+Enter sends · Enter adds a line\nEsc enters Normal mode · a edits from the panel\n^C stops a running turn",
         }];
     }
     red::execute("UpdateTextPanel", "agent-conversation", blocks);
