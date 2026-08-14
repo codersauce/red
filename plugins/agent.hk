@@ -360,8 +360,17 @@ fn session_created(event: AgentSessionEvent) {
     scope = "global",
 )]
 fn prompt() {
-    if red::string(state().session_id, "") != "" {
+    let has_live_session = red::string(state().session_id, "") != "";
+    let has_restored_conversation = red::string(state().pending_prompt, "") == ""
+        && red::trim(red::string(state().transcript, "")) != "";
+    if has_live_session || has_restored_conversation {
+        let was_created = state().panel_created;
         ensure_conversation_panel();
+        if !was_created {
+            render_conversation();
+        }
+        red::execute("FocusTextPanelComposer", "agent-conversation");
+        return;
     }
     red::request("GetStorage", prompt_history_loaded, "prompt_history");
 }

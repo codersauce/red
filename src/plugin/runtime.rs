@@ -4132,9 +4132,19 @@ mod tests {
         }
     }
 
-    async fn open_agent_composer(runtime: &mut Runtime) -> ComposerHandle {
+    async fn submit_agent_prompt(runtime: &mut Runtime, prompt: &str) {
         runtime.execute_command("AgentPrompt").await.unwrap();
-        let request_id = match ACTION_DISPATCHER.recv_request() {
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::FocusTextPanelComposer { id } => {
+                assert_eq!(id, "agent-conversation");
+                runtime
+                    .notify(
+                        "panel:event:agent-conversation",
+                        serde_json::json!({ "action": "submit", "text": prompt }),
+                    )
+                    .await
+                    .unwrap();
+            }
             PluginRequest::GetPluginStorage {
                 plugin,
                 key,
@@ -4142,22 +4152,17 @@ mod tests {
             } => {
                 assert_eq!(plugin, "agent");
                 assert_eq!(key, "prompt_history");
-                request_id
+                runtime
+                    .resolve_request(request_id, serde_json::json!({ "value": [] }))
+                    .await
+                    .unwrap();
+                let handle = recv_agent_composer().0;
+                assert!(runtime
+                    .notify_composer(handle, ComposerCallback::Submitted(prompt.to_string()))
+                    .unwrap());
             }
-            _ => panic!("expected agent prompt-history request"),
-        };
-        runtime
-            .resolve_request(request_id, serde_json::json!({ "value": [] }))
-            .await
-            .unwrap();
-        recv_agent_composer().0
-    }
-
-    async fn submit_agent_prompt(runtime: &mut Runtime, prompt: &str) {
-        let handle = open_agent_composer(runtime).await;
-        assert!(runtime
-            .notify_composer(handle, ComposerCallback::Submitted(prompt.to_string()))
-            .unwrap());
+            _ => panic!("expected docked or floating agent composer"),
+        }
     }
 
     async fn open_agent_setup_picker(runtime: &mut Runtime) -> (PickerHandle, Vec<PickerItem>) {
@@ -6171,37 +6176,21 @@ mod tests {
             PluginRequest::Action(Action::Print(message)) if message == "Agent session started"
         ));
 
-        runtime.execute_command("AgentPrompt").await.unwrap();
-        let history_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetPluginStorage {
-                plugin,
-                key,
-                request_id,
-            } => {
-                assert_eq!(plugin, "agent");
-                assert_eq!(key, "prompt_history");
-                request_id
-            }
-            _ => panic!("expected agent prompt-history request"),
-        };
+        runtime.execute_command("Agent").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusTextPanelComposer { id } if id == "agent-conversation"
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
         runtime
-            .resolve_request(
-                history_request_id,
-                serde_json::json!({ "value": ["previous prompt", "previous prompt", " \n "] }),
+            .notify(
+                "panel:event:agent-conversation",
+                serde_json::json!({
+                    "action": "submit",
+                    "text": "  inspect the workspace\ninclude all unsaved changes  ",
+                }),
             )
             .await
-            .unwrap();
-        let (composer, title, query, history) = recv_agent_composer();
-        assert_eq!(title.as_deref(), Some("Agent prompt"));
-        assert!(query.is_empty());
-        assert_eq!(history, ["previous prompt"]);
-        runtime
-            .notify_composer(
-                composer,
-                ComposerCallback::Submitted(
-                    "  inspect the workspace\ninclude all unsaved changes  ".to_string(),
-                ),
-            )
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -6245,10 +6234,7 @@ mod tests {
             PluginRequest::SetPluginStorage { plugin, key, value }
                 if plugin == "agent"
                     && key == "prompt_history"
-                    && value == serde_json::json!([
-                        "  inspect the workspace\ninclude all unsaved changes  ",
-                        "previous prompt"
-                    ])
+                    && value == serde_json::json!(["  inspect the workspace\ninclude all unsaved changes  "])
         ));
         runtime
             .notify(
@@ -7116,23 +7102,10 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetPanelVisible { id, visible: true } if id == "agent-conversation"
         ));
-        let history_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetPluginStorage {
-                plugin,
-                key,
-                request_id,
-            } => {
-                assert_eq!(plugin, "agent");
-                assert_eq!(key, "prompt_history");
-                request_id
-            }
-            _ => panic!("expected the prompt-history request after reopening"),
-        };
-        runtime
-            .resolve_request(history_request_id, serde_json::json!({ "value": [] }))
-            .await
-            .unwrap();
-        recv_agent_composer();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusTextPanelComposer { id } if id == "agent-conversation"
+        ));
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
 
         runtime.execute_command("AgentNew").await.unwrap();
@@ -8649,6 +8622,24 @@ mod tests {
             }
             _ => panic!("expected restored text panel update"),
         }
+
+        runtime.execute_command("Agent").await.unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.len() == 8
+                    && blocks[7].text == "fourth answer"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::FocusTextPanelComposer { id } if id == "agent-conversation"
+        ));
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
     #[tokio::test]
