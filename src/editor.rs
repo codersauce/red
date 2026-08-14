@@ -11547,7 +11547,7 @@ impl Editor {
                     {
                         "Ctrl-r"
                     }
-                    KeyCode::Char('H') => "history",
+                    KeyCode::Char('H') if self.panel_manager.focused_row_panel() => "history",
                     KeyCode::Char('N') => "new",
                     KeyCode::Char('a' | 'i') if !self.panel_manager.focused_row_panel() => {
                         "composer_focus"
@@ -34069,6 +34069,52 @@ while True:
         editor.suppress_reactivation_click = false;
         editor.handle_event(&activation_click).unwrap();
         assert_eq!(editor.panel_manager.focused_panel_id(), None);
+    }
+
+    #[test]
+    fn focused_text_panel_shift_h_does_not_open_agent_history() {
+        let mut editor = test_editor(40, 10);
+        editor.test_create_text_panel(
+            "agent-conversation",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Right,
+                width: 16,
+                title: Some("Agent".to_string()),
+                composer: Some(plugin::TextPanelComposerConfig {
+                    placeholder: "Ask a follow-up…".to_string(),
+                    rows: 3,
+                }),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        assert!(editor.test_focus_text_panel_composer("agent-conversation"));
+        assert!(editor
+            .handle_panel_event(
+                &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                None,
+            )
+            .is_some());
+        assert_eq!(
+            editor.panel_manager.focused_text_panel_cursor_mode(),
+            Some(Mode::Normal)
+        );
+
+        let action = editor
+            .handle_panel_event(
+                &Event::Key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT)),
+                None,
+            )
+            .expect("focused text panel should consume Shift-H");
+
+        let KeyAction::Multiple(actions) = action else {
+            panic!("expected a panel notification");
+        };
+        assert!(matches!(
+            actions.first(),
+            Some(Action::NotifyPlugins(topic, payload))
+                if topic == "panel:event:agent-conversation"
+                    && payload["action"] != "history"
+        ));
     }
 
     #[test]

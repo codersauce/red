@@ -1664,7 +1664,7 @@ fn render_history(result: AgentHistoryResult) {
     red::execute("UpdateWorkspace", "agent-history", WorkspaceModel {
         rows: rows,
         detail: state().history_detail,
-        footer: [PanelSegment { text: "r safe revert  q close", style: muted_style() }],
+        footer: [PanelSegment { text: "r safe revert  Esc/q close", style: muted_style() }],
     });
 }
 

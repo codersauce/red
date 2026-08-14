@@ -6490,6 +6490,25 @@ mod tests {
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateWorkspace { id, .. } if id == "agent-history"
         ));
+        runtime
+            .notify(
+                "workspace:event:agent-history",
+                serde_json::json!({
+                    "action": "escape",
+                    "row": {
+                        "data": {
+                            "transaction_id": "transaction-1",
+                            "edits": []
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::CloseWorkspace { id } if id == "agent-history"
+        ));
     }
 
     #[tokio::test]
