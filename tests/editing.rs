@@ -6654,6 +6654,47 @@ async fn focused_panel_routes_ctrl_w_w_into_focus_cycle() {
 }
 
 #[tokio::test]
+async fn focused_agent_composer_routes_ctrl_w_w_into_focus_cycle() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 40,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+            ..PanelConfig::default()
+        },
+    );
+    assert!(harness.editor.test_focus_text_panel_composer("agent"));
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('w'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    assert!(harness.is_waiting_for_key_sequence());
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("agent"));
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('w'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+
+    assert!(!harness.is_waiting_for_key_sequence());
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+}
+
+#[tokio::test]
 async fn ctrl_w_w_focuses_agent_composer_and_makes_cursor_visible() {
     let buffer = Buffer::new(None, "abcdef".to_string());
     let mut harness = EditorHarness::with_config(buffer, default_key_config());

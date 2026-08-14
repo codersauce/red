@@ -1283,7 +1283,7 @@ impl PanelManager {
                     && key.modifiers.is_empty()
                     && matches!(key.code, KeyCode::Char('j' | 'k') | KeyCode::Up | KeyCode::Down))
                     || (key.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(key.code, KeyCode::Char('h' | 'j' | 'k' | 'g' | 'G')))
+                        && matches!(key.code, KeyCode::Char('h' | 'j' | 'k' | 'g' | 'G' | 'w')))
         );
         if delegates_to_panel_navigation {
             // Let the panel-navigation layer scroll the conversation without
@@ -3238,6 +3238,7 @@ mod tests {
             (KeyCode::Char('j'), KeyModifiers::CONTROL),
             (KeyCode::Char('k'), KeyModifiers::CONTROL),
             (KeyCode::Char('g'), KeyModifiers::CONTROL),
+            (KeyCode::Char('w'), KeyModifiers::CONTROL),
             (
                 KeyCode::Char('G'),
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT,
