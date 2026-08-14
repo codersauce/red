@@ -28,6 +28,8 @@ pub struct Preferences {
     picker_history: HashMap<String, Vec<String>>,
     #[serde(default)]
     plugin_storage: HashMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_seen_version: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +46,12 @@ impl PreferencesStore {
             path: None,
             preferences: Preferences::default(),
         }
+    }
+
+    /// Whether the store can remember a release across separate editor sessions.
+    #[must_use]
+    pub fn is_persistent(&self) -> bool {
+        self.path.is_some()
     }
 
     /// Loads preferences, falling back to empty state on any read or parse error.
@@ -82,6 +90,21 @@ impl PreferencesStore {
             .get(key)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    /// Returns the most recent Red release successfully presented to the user.
+    #[must_use]
+    pub fn last_seen_version(&self) -> Option<&str> {
+        self.preferences.last_seen_version.as_deref()
+    }
+
+    /// Records a release only after its announcement has actually been rendered.
+    pub fn set_last_seen_version(&mut self, version: &str) -> anyhow::Result<()> {
+        if self.last_seen_version() == Some(version) {
+            return Ok(());
+        }
+        self.preferences.last_seen_version = Some(version.to_string());
+        self.save()
     }
 
     /// Appends a non-empty command unless it duplicates the newest entry.
@@ -380,6 +403,34 @@ mod tests {
         let store = PreferencesStore::load(path);
 
         assert!(store.command_history().is_empty());
+        assert_eq!(store.last_seen_version(), None);
+    }
+
+    #[test]
+    fn seen_release_version_survives_a_preferences_reload() {
+        let dir = unique_temp_dir("release-preferences");
+        let path = dir.join("preferences.json");
+        let mut store = PreferencesStore::load(&path);
+
+        store.set_last_seen_version("0.5.0").unwrap();
+
+        let reloaded = PreferencesStore::load(&path);
+        assert_eq!(reloaded.last_seen_version(), Some("0.5.0"));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn older_preferences_without_a_seen_release_remain_compatible() {
+        let dir = unique_temp_dir("legacy-release-preferences");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("preferences.json");
+        fs::write(&path, r#"{"command_history":["write"]}"#).unwrap();
+
+        let store = PreferencesStore::load(&path);
+
+        assert_eq!(store.command_history(), ["write"]);
+        assert_eq!(store.last_seen_version(), None);
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]

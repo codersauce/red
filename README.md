@@ -162,6 +162,11 @@ The current release includes:
 See the [latest release notes](https://github.com/codersauce/red/releases/latest)
 or the [complete changelog](CHANGELOG.md) for details.
 
+After installing a new version, Red opens a themed **What’s new** panel once.
+Reopen it whenever you like with `:whats-new`, `:changelog`, or the command
+palette. Release notes are bundled for offline use and refreshed from the exact
+matching GitHub release in the background.
+
 ## Configuration
 
 Red layers your settings over embedded defaults, so a configuration file can
@@ -171,6 +176,9 @@ contain only the values you want to change:
 # ~/.config/red/config.toml
 theme = "red.json"
 scrolloff = 8
+# Disable the automatic release panel or its optional GitHub refresh:
+# show_whats_new = false
+# fetch_release_notes = false
 
 [search]
 ignorecase = true

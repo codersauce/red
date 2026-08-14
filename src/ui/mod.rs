@@ -26,6 +26,7 @@ mod rich_text;
 mod selection;
 mod spinner;
 mod statusline_layout;
+mod whats_new;
 
 pub use action_bar::{
     ActionBar, ActionBarLayout, ActionBarRole, ActionBarSpan, ActionMode, ActionPriority, UiAction,
@@ -57,6 +58,7 @@ pub(crate) use rich_text::paint_rich_text;
 pub(crate) use selection::{FollowTailViewport, SelectionViewport};
 pub(crate) use spinner::{spinner_frame, SPINNER_FRAME_INTERVAL_MS};
 pub use statusline_layout::StatuslineLayoutPanel;
+pub use whats_new::WhatsNewPanel;
 
 use crate::{
     config::KeyAction,

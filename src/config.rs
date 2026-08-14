@@ -238,6 +238,14 @@ pub struct Config {
     /// Show the startup splash when red opens without file arguments.
     /// Defaults to on.
     pub splash: Option<bool>,
+    /// Announce each newly installed Red release once after interactive startup.
+    /// Defaults to on.
+    #[serde(default)]
+    pub show_whats_new: Option<bool>,
+    /// Refresh bundled release notes from the matching published GitHub release.
+    /// Defaults to on.
+    #[serde(default)]
+    pub fetch_release_notes: Option<bool>,
     /// Interactive search behavior.
     #[serde(default)]
     pub search: SearchConfig,
@@ -1754,6 +1762,8 @@ fn known_top_level_field(field: &str) -> bool {
             | "sidescroll"
             | "sidescrolloff"
             | "splash"
+            | "show_whats_new"
+            | "fetch_release_notes"
             | "search"
             | "completion"
             | "picker"
@@ -3751,6 +3761,8 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
     fn default_config_maps_command_palette_entrypoints_and_enables_key_hints() {
         let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
 
+        assert_eq!(config.show_whats_new, Some(true));
+        assert_eq!(config.fetch_release_notes, Some(true));
         assert_eq!(
             config.keys.normal.get("F1"),
             Some(&KeyAction::Single(Action::CommandPalette))

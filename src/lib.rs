@@ -47,6 +47,7 @@ pub mod ui;
 pub mod undo;
 pub mod unicode_utils;
 pub mod utils;
+pub mod whats_new;
 pub mod window;
 
 // Test utilities for integration tests

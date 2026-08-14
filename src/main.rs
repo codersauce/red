@@ -246,6 +246,7 @@ async fn run() -> anyhow::Result<()> {
     editor.set_language_reload_source(config_file, args.config_overrides.clone());
     editor.set_config_diagnostics(diagnostics, recovery);
     if let Some(snapshot) = &resumed_session {
+        editor.suppress_startup_whats_new();
         for divergence in editor.restore_session_snapshot(snapshot)? {
             eprintln!(
                 "Recovered {} with external disk changes:\n{}",

@@ -797,12 +797,13 @@ async fn serve_editor_connection(
         return Ok(false);
     }
     validate_terminal_size(columns, rows)?;
-    {
+    let displayed_whats_new = {
         let mut core = core.lock().await;
         core.clear_pending_paste();
         core.resize(columns, rows).await?;
         core.focus(focused).await?;
-    }
+        core.prepare_startup_whats_new()?
+    };
     let render = core.lock().await.snapshot(last_revision);
     let mut client_revision = render.revision;
     write_frame(
@@ -813,6 +814,9 @@ async fn serve_editor_connection(
         },
     )
     .await?;
+    if displayed_whats_new {
+        core.lock().await.mark_whats_new_presented();
+    }
 
     loop {
         let message = tokio::time::timeout(CLIENT_HEARTBEAT_LEASE, read_frame(&mut reader)).await;
