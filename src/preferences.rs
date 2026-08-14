@@ -52,7 +52,7 @@ impl PanelLayoutPreference {
         } else {
             self.horizontal_size
         }
-}
+    }
 }
 
 #[derive(Debug, Clone)]
