@@ -17,7 +17,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use super::markdown::{
     render_markdown_lines, wrap_plain_text, RenderedTextLine, RenderedTextLineBreak,
-    RenderedTextSpan, TextPanelSpanStyle,
+    RenderedTextSpan, TextPanelLineSelection, TextPanelSpanSelection, TextPanelSpanStyle,
 };
 use super::text_link::{TextPanelLink, TextPanelLinkTarget};
 use crate::{
@@ -271,6 +271,7 @@ enum ScrollbackFindDirection {
 #[derive(Debug, Clone)]
 struct TextPanelLayoutCell {
     text: String,
+    copy_prefix: String,
     column: usize,
     width: usize,
     link: Option<TextPanelLink>,
@@ -283,7 +284,7 @@ struct TextPanelLayoutLine {
     cells: Vec<TextPanelLayoutCell>,
     break_after: RenderedTextLineBreak,
     selectable: bool,
-    chrome_prefix_graphemes: usize,
+    chrome_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -606,7 +607,7 @@ impl TextPanel {
                         lines.push(turn_separator(width));
                     }
                 }
-                lines.push(RenderedTextLine::plain(
+                lines.push(RenderedTextLine::chrome(
                     "▎ You".to_string(),
                     TextPanelSpanStyle::User,
                 ));
@@ -629,7 +630,7 @@ impl TextPanel {
                 lines.extend(block_lines.into_iter().map(user_accented));
             } else {
                 if let Some((label, style)) = block_label(&block.kind) {
-                    lines.push(RenderedTextLine::plain(label.to_string(), style));
+                    lines.push(RenderedTextLine::chrome(label.to_string(), style));
                 }
 
                 let style = block_style(&block.kind);
@@ -658,6 +659,7 @@ impl TextPanel {
                     style: TextPanelSpanStyle::User,
                     syntax_style: None,
                     link: None,
+                    selection: TextPanelSpanSelection::Chrome,
                 });
             }
         }
@@ -674,54 +676,52 @@ impl TextPanelLayout {
                 let first = next;
                 let mut column = 0usize;
                 let mut cells = Vec::new();
-                let text = line
-                    .spans
-                    .iter()
-                    .map(|span| span.text.as_str())
-                    .collect::<String>();
-                let selectable =
-                    !text.is_empty() && !text.chars().all(|character| character == '─');
-                let chrome_prefix_graphemes = line.spans.first().map_or(0, |span| {
-                    usize::from(
-                        span.style == TextPanelSpanStyle::User && span.text.as_str() == "▎ ",
-                    ) * span.text.graphemes(true).count()
-                });
-                if selectable {
-                    let mut grapheme_index = 0usize;
-                    for span in &line.spans {
-                        for grapheme in span.text.graphemes(true) {
-                            let width = display_width(grapheme).max(1);
-                            if grapheme_index >= chrome_prefix_graphemes {
+                let mut pending_copy_separator = String::new();
+                for span in &line.spans {
+                    match &span.selection {
+                        TextPanelSpanSelection::Chrome => {
+                            column = column.saturating_add(display_width(&span.text));
+                        }
+                        TextPanelSpanSelection::CopySeparator(copy) => {
+                            pending_copy_separator.clone_from(copy);
+                            column = column.saturating_add(display_width(&span.text));
+                        }
+                        TextPanelSpanSelection::Content => {
+                            for grapheme in span.text.graphemes(true) {
+                                let width = display_width(grapheme).max(1);
                                 cells.push(TextPanelLayoutCell {
                                     text: grapheme.to_string(),
+                                    copy_prefix: std::mem::take(&mut pending_copy_separator),
                                     column,
                                     width,
                                     link: span.link.clone(),
                                     virtual_space: false,
                                 });
                                 next = next.saturating_add(1);
+                                column = column.saturating_add(width);
                             }
-                            column = column.saturating_add(width);
-                            grapheme_index = grapheme_index.saturating_add(1);
                         }
                     }
-                    if line.break_after == RenderedTextLineBreak::SoftSpace {
-                        cells.push(TextPanelLayoutCell {
-                            text: " ".to_string(),
-                            column,
-                            width: 0,
-                            link: None,
-                            virtual_space: true,
-                        });
-                        next = next.saturating_add(1);
-                    }
                 }
+                if !cells.is_empty() && line.break_after == RenderedTextLineBreak::SoftSpace {
+                    cells.push(TextPanelLayoutCell {
+                        text: " ".to_string(),
+                        copy_prefix: String::new(),
+                        column,
+                        width: 0,
+                        link: None,
+                        virtual_space: true,
+                    });
+                    next = next.saturating_add(1);
+                }
+                let selectable = !cells.is_empty();
+                let chrome_only = line.selection == TextPanelLineSelection::Chrome;
                 TextPanelLayoutLine {
                     first,
                     cells,
                     break_after: line.break_after,
                     selectable,
-                    chrome_prefix_graphemes,
+                    chrome_only,
                 }
             })
             .collect();
@@ -879,7 +879,7 @@ impl TextPanelLayout {
         };
         let mut output = String::new();
         for row in start_row..=end_row {
-            if row > start_row {
+            if row > start_row && !self.lines[row - 1].chrome_only {
                 match self.lines[row - 1].break_after {
                     RenderedTextLineBreak::Soft => {}
                     RenderedTextLineBreak::SoftSpace => {}
@@ -887,10 +887,15 @@ impl TextPanelLayout {
                 }
             }
             let line = &self.lines[row];
+            let mut wrote_selected_cell = false;
             for (index, cell) in line.cells.iter().enumerate() {
                 let offset = line.first.saturating_add(index);
                 if offset >= start && offset <= end {
+                    if wrote_selected_cell {
+                        output.push_str(&cell.copy_prefix);
+                    }
                     output.push_str(&cell.text);
+                    wrote_selected_cell = true;
                 }
             }
         }
@@ -3012,10 +3017,6 @@ fn render_text_panel(
             layout
                 .lines
                 .get(line_index)
-                .map_or(0, |line| line.chrome_prefix_graphemes),
-            layout
-                .lines
-                .get(line_index)
                 .is_some_and(|line| line.selectable)
                 .then_some(selection)
                 .flatten(),
@@ -3257,14 +3258,12 @@ fn render_text_spans(
     width: usize,
     line: &RenderedTextLine,
     line_first: usize,
-    chrome_prefix_graphemes: usize,
     selection: Option<(usize, usize)>,
     selected_link: Option<u64>,
     theme: &Theme,
 ) {
     let mut column = 0usize;
     let mut offset = line_first;
-    let mut grapheme_index = 0usize;
     for span in &line.spans {
         let base_style = text_panel_span_style(span.style, theme);
         let mut style = if let Some(syntax_style) = &span.syntax_style {
@@ -3291,7 +3290,7 @@ fn render_text_spans(
                 return;
             }
             let mut grapheme_style = style.clone();
-            let selectable = grapheme_index >= chrome_prefix_graphemes;
+            let selectable = matches!(span.selection, TextPanelSpanSelection::Content);
             if selectable && selection.is_some_and(|(start, end)| offset >= start && offset <= end)
             {
                 let selected = theme.list_selection_style();
@@ -3306,7 +3305,6 @@ fn render_text_spans(
             if selectable {
                 offset = offset.saturating_add(1);
             }
-            grapheme_index = grapheme_index.saturating_add(1);
         }
     }
 }
@@ -3401,19 +3399,25 @@ fn block_style(kind: &TextPanelBlockKind) -> TextPanelSpanStyle {
 }
 
 fn turn_separator(width: usize) -> RenderedTextLine {
-    RenderedTextLine::plain("─".repeat(width.max(1)), TextPanelSpanStyle::Muted)
+    RenderedTextLine::chrome("─".repeat(width.max(1)), TextPanelSpanStyle::Muted)
 }
 
 fn user_accented(line: RenderedTextLine) -> RenderedTextLine {
     let break_after = line.break_after;
+    let selection = line.selection;
     let mut spans = vec![RenderedTextSpan {
         text: "▎ ".to_string(),
         style: TextPanelSpanStyle::User,
         syntax_style: None,
         link: None,
+        selection: TextPanelSpanSelection::Chrome,
     }];
     spans.extend(line.spans);
-    RenderedTextLine { spans, break_after }
+    RenderedTextLine {
+        spans,
+        break_after,
+        selection,
+    }
 }
 
 fn render_row_segments(
@@ -4187,6 +4191,7 @@ mod tests {
                         ..Style::default()
                     }),
                     link: None,
+                    selection: TextPanelSpanSelection::Content,
                 },
                 RenderedTextSpan {
                     text: "b".to_string(),
@@ -4196,13 +4201,15 @@ mod tests {
                         ..Style::default()
                     }),
                     link: None,
+                    selection: TextPanelSpanSelection::Content,
                 },
             ],
             break_after: RenderedTextLineBreak::Hard,
+            selection: TextPanelLineSelection::Semantic,
         };
         let mut buffer = RenderBuffer::new(2, 1, &theme.style);
 
-        render_text_spans(&mut buffer, 0, 0, 2, &line, 0, 0, None, None, &theme);
+        render_text_spans(&mut buffer, 0, 0, 2, &line, 0, None, None, &theme);
 
         assert_eq!(
             buffer.cells[0].style,
@@ -4222,6 +4229,40 @@ mod tests {
                 italic: false,
             }
         );
+    }
+
+    #[test]
+    fn scrollback_highlight_skips_display_chrome() {
+        let theme = Theme::default();
+        let line = RenderedTextLine {
+            spans: vec![
+                RenderedTextSpan {
+                    text: "│ ".to_string(),
+                    style: TextPanelSpanStyle::Muted,
+                    syntax_style: None,
+                    link: None,
+                    selection: TextPanelSpanSelection::Chrome,
+                },
+                RenderedTextSpan {
+                    text: "x".to_string(),
+                    style: TextPanelSpanStyle::Code,
+                    syntax_style: None,
+                    link: None,
+                    selection: TextPanelSpanSelection::Content,
+                },
+            ],
+            break_after: RenderedTextLineBreak::Hard,
+            selection: TextPanelLineSelection::Semantic,
+        };
+        let mut normal = RenderBuffer::new(3, 1, &theme.style);
+        let mut selected = RenderBuffer::new(3, 1, &theme.style);
+
+        render_text_spans(&mut normal, 0, 0, 3, &line, 0, None, None, &theme);
+        render_text_spans(&mut selected, 0, 0, 3, &line, 0, Some((0, 0)), None, &theme);
+
+        assert_eq!(normal.cells[0].style, selected.cells[0].style);
+        assert_eq!(normal.cells[1].style, selected.cells[1].style);
+        assert_ne!(normal.cells[2].style, selected.cells[2].style);
     }
 
     #[test]
@@ -5569,8 +5610,160 @@ mod tests {
         assert_eq!(narrow_user.len, wide_user.len);
         assert_eq!(
             narrow_user.selected_text(0, narrow_user.len - 1, false),
-            "▎ You\nalpha beta gamma\nsecond line"
+            "alpha beta gamma\nsecond line"
         );
+    }
+
+    #[test]
+    fn markdown_selection_omits_code_frames_and_preserves_code_blank_lines() {
+        let mut panel = TextPanel::new("agent".to_string(), PanelConfig::default());
+        panel.blocks = vec![TextPanelBlock {
+            id: "answer".to_string(),
+            kind: TextPanelBlockKind::Text,
+            format: TextPanelBlockFormat::Markdown,
+            text: "```bash\n/game\n\npwd\n```".to_string(),
+        }];
+
+        let layout = panel.layout(40);
+        let copied = layout.selected_text(0, layout.len - 1, false);
+
+        assert_eq!(copied, "/game\n\npwd");
+        assert!(!copied.contains("bash"));
+        assert!(!copied.contains(['┌', '│', '└']));
+        assert_eq!(layout.len, "/gamepwd".graphemes(true).count());
+        assert!(layout.lines.iter().any(|line| line.chrome_only));
+    }
+
+    #[test]
+    fn markdown_selection_omits_heading_quote_rule_and_role_chrome() {
+        let mut panel = TextPanel::new("agent".to_string(), PanelConfig::default());
+        panel.blocks = vec![
+            TextPanelBlock {
+                id: "user".to_string(),
+                kind: TextPanelBlockKind::User,
+                format: TextPanelBlockFormat::Markdown,
+                text: "# Heading\n\n> quoted **strong** and `inline`".to_string(),
+            },
+            TextPanelBlock {
+                id: "agent".to_string(),
+                kind: TextPanelBlockKind::Agent,
+                format: TextPanelBlockFormat::Markdown,
+                text: "---\n\nAfter".to_string(),
+            },
+        ];
+
+        let layout = panel.layout(60);
+        let copied = layout.selected_text(0, layout.len - 1, false);
+
+        for content in ["Heading", "quoted strong and inline", "After"] {
+            assert!(
+                copied.contains(content),
+                "missing semantic content {content:?}"
+            );
+        }
+        for chrome in ["▎ You", "◆ Agent", "▍", "│", "─"] {
+            assert!(!copied.contains(chrome), "copied display chrome {chrome:?}");
+        }
+    }
+
+    #[test]
+    fn markdown_selection_keeps_list_structure_and_link_labels() {
+        let mut panel = TextPanel::new("agent".to_string(), PanelConfig::default());
+        panel.blocks = vec![TextPanelBlock {
+            id: "answer".to_string(),
+            kind: TextPanelBlockKind::Text,
+            format: TextPanelBlockFormat::Markdown,
+            text: "- item\n- [x] done\n\n1. numbered\n\n[label](https://example.com)".to_string(),
+        }];
+
+        let layout = panel.layout(50);
+        let copied = layout.selected_text(0, layout.len - 1, false);
+
+        assert!(copied.contains("• item"));
+        assert!(copied.contains("• ☑ done"));
+        assert!(copied.contains("1. numbered"));
+        assert!(copied.contains("label"));
+        assert!(!copied.contains("https://example.com"));
+    }
+
+    #[test]
+    fn markdown_table_selection_uses_tabs_and_omits_grid_padding() {
+        let mut panel = TextPanel::new("agent".to_string(), PanelConfig::default());
+        panel.blocks = vec![TextPanelBlock {
+            id: "answer".to_string(),
+            kind: TextPanelBlockKind::Text,
+            format: TextPanelBlockFormat::Markdown,
+            text: "| Name | Value |\n|---|---|\n| one | 1 |".to_string(),
+        }];
+
+        let layout = panel.layout(40);
+        let copied = layout.selected_text(0, layout.len - 1, false);
+
+        assert_eq!(copied, "Name\tValue\none\t1");
+        assert!(!copied.contains('━'));
+        assert!(!copied.contains("  "));
+    }
+
+    #[test]
+    fn markdown_selection_is_stable_across_wrapping_and_unicode() {
+        let mut panel = TextPanel::new("agent".to_string(), PanelConfig::default());
+        panel.blocks = vec![TextPanelBlock {
+            id: "answer".to_string(),
+            kind: TextPanelBlockKind::Text,
+            format: TextPanelBlockFormat::Markdown,
+            text: "# Café 👩‍💻\n\n- outer item with enough words to wrap\n   - nested e\u{301} item\n\n> quoted words that also wrap\n\n```bash\necho 👩‍💻-abcdefghijk\n```"
+                .to_string(),
+        }];
+
+        let narrow = panel.layout(14);
+        let wide = panel.layout(80);
+        let narrow_copy = narrow.selected_text(0, narrow.len - 1, false);
+        let wide_copy = wide.selected_text(0, wide.len - 1, false);
+
+        assert_eq!(narrow.len, wide.len);
+        assert_eq!(narrow_copy, wide_copy);
+        assert!(narrow_copy.contains("Café 👩‍💻"));
+        assert!(narrow_copy.contains("  • nested e\u{301} item"));
+        assert!(narrow_copy.contains("echo 👩‍💻-abcdefghijk"));
+        assert!(!narrow_copy.contains(['▍', '│', '┌', '└']));
+    }
+
+    #[test]
+    fn markdown_selection_keeps_visible_html_and_image_alt_text() {
+        let mut panel = TextPanel::new("agent".to_string(), PanelConfig::default());
+        panel.blocks = vec![TextPanelBlock {
+            id: "answer".to_string(),
+            kind: TextPanelBlockKind::Text,
+            format: TextPanelBlockFormat::Markdown,
+            text: "Press <kbd>Ctrl</kbd> beside ![diagram](https://example.com/image.png)."
+                .to_string(),
+        }];
+
+        let layout = panel.layout(80);
+        let copied = layout.selected_text(0, layout.len - 1, false);
+
+        assert_eq!(copied, "Press <kbd>Ctrl</kbd> beside diagram.");
+        assert!(!copied.contains("https://example.com/image.png"));
+    }
+
+    #[test]
+    fn narrow_markdown_table_selection_omits_record_chrome() {
+        let mut panel = TextPanel::new("agent".to_string(), PanelConfig::default());
+        panel.blocks = vec![TextPanelBlock {
+            id: "answer".to_string(),
+            kind: TextPanelBlockKind::Text,
+            format: TextPanelBlockFormat::Markdown,
+            text: "| Name | Value |\n|---|---|\n| one | 1 |\n| two | 2 |".to_string(),
+        }];
+
+        let layout = panel.layout(10);
+        let copied = layout.selected_text(0, layout.len - 1, false);
+
+        for content in ["Name", "Value", "one", "1", "two", "2"] {
+            assert!(copied.contains(content));
+        }
+        assert!(!copied.contains(['─', '━']));
+        assert!(!copied.lines().any(|line| line.starts_with("  ")));
     }
 
     #[test]

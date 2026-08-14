@@ -38,7 +38,8 @@ mod tests {
     use crate::{
         editor::RenderBuffer,
         plugin::markdown::{
-            RenderedTextLine, RenderedTextLineBreak, RenderedTextSpan, TextPanelSpanStyle,
+            RenderedTextLine, RenderedTextLineBreak, RenderedTextSpan, TextPanelLineSelection,
+            TextPanelSpanSelection, TextPanelSpanStyle,
         },
         theme::Style,
     };
@@ -56,15 +57,18 @@ mod tests {
                     style: TextPanelSpanStyle::Text,
                     syntax_style: None,
                     link: None,
+                    selection: TextPanelSpanSelection::Content,
                 },
                 RenderedTextSpan {
                     text: "世z".to_string(),
                     style: TextPanelSpanStyle::Strong,
                     syntax_style: None,
                     link: None,
+                    selection: TextPanelSpanSelection::Content,
                 },
             ],
             break_after: RenderedTextLineBreak::Hard,
+            selection: TextPanelLineSelection::Semantic,
         };
 
         paint_rich_text(&mut buffer, 1, 0, 5, &line, |_| style.clone());

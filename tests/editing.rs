@@ -5895,6 +5895,56 @@ fn agent_scrollback_tab_focuses_a_cursor_and_visual_yank_uses_the_clipboard() {
 }
 
 #[test]
+fn agent_scrollback_visual_yank_copies_code_without_markdown_frame() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    let clipboard_text = Arc::new(Mutex::new(None));
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::from(
+            clipboard_text.clone(),
+        )));
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 24,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+            ..PanelConfig::default()
+        },
+    );
+    harness.editor.test_update_text_panel(
+        "agent",
+        vec![TextPanelBlock {
+            id: "answer".to_string(),
+            kind: TextPanelBlockKind::Agent,
+            format: TextPanelBlockFormat::Markdown,
+            text: "```bash\n/game\n```".to_string(),
+        }],
+    );
+    assert!(harness.editor.test_focus_text_panel_composer("agent"));
+
+    for code in [
+        KeyCode::Tab,
+        KeyCode::Char('g'),
+        KeyCode::Char('v'),
+        KeyCode::Char('G'),
+        KeyCode::Char('y'),
+    ] {
+        harness
+            .editor
+            .test_handle_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+            .unwrap();
+    }
+
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("/game"));
+}
+
+#[test]
 fn mouse_drag_selects_agent_scrollback_text_for_visual_yank() {
     let buffer = Buffer::new(None, "abcdef".to_string());
     let mut harness = EditorHarness::with_config(buffer, default_key_config());
