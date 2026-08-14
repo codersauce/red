@@ -1276,6 +1276,20 @@ impl PanelManager {
             // changing the focused composer's mode, draft, or cursor.
             return None;
         }
+        let delegates_to_panel_navigation = matches!(
+            event,
+            Event::Key(key)
+                if (composer.prompt.mode() == crate::editor::Mode::Normal
+                    && key.modifiers.is_empty()
+                    && matches!(key.code, KeyCode::Char('j' | 'k') | KeyCode::Up | KeyCode::Down))
+                    || (key.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(key.code, KeyCode::Char('h' | 'j' | 'k' | 'g' | 'G')))
+        );
+        if delegates_to_panel_navigation {
+            // Let the panel-navigation layer scroll the conversation without
+            // moving or editing the focused prompt.
+            return None;
+        }
 
         let previous_bytes = composer.prompt.text().len();
         let inserted_bytes = match event {
@@ -1943,9 +1957,9 @@ fn render_text_panel_composer(
         );
     }
     let hints = if composer.focused && composer.prompt.mode() == crate::editor::Mode::Normal {
-        "NORMAL · Enter send · Esc nav · i/a edit · u undo"
+        "NORMAL · j/k ↑/↓ scroll · i/a edit · Enter send · Esc nav"
     } else if composer.focused {
-        "INSERT · Ctrl+Enter send · Enter newline · Esc normal · ^P/^N history"
+        "INSERT · ^J/^K scroll · ^g/^G ends · Ctrl+Enter send · Esc normal"
     } else {
         match overflow {
             TextPanelOverflow::Both => {
@@ -2990,7 +3004,7 @@ mod tests {
         assert!(manager.focus_text_panel_composer("agent"));
         manager.handle_focused_text_input(&Event::Paste("one 👨‍👩‍👧\r\ntwo".to_string()), 80);
         manager.handle_focused_text_input(
-            &Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             80,
         );
         manager.handle_focused_text_input(
@@ -3116,6 +3130,148 @@ mod tests {
             manager.focused_text_panel_cursor_mode(),
             Some(crate::editor::Mode::Insert)
         );
+    }
+
+    #[test]
+    fn text_panel_composer_delegates_navigation_keys_to_panel_scrolling() {
+        use crossterm::event::KeyEvent;
+
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 32,
+                title: Some("Agent".to_string()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 3,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_text_panel(
+            "agent",
+            vec![TextPanelBlock {
+                id: "history".to_string(),
+                kind: TextPanelBlockKind::Agent,
+                format: TextPanelBlockFormat::Plain,
+                text: (1..=30)
+                    .map(|line| format!("line {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            }],
+            15,
+            80,
+        );
+        assert!(manager.focus_text_panel_composer("agent"));
+        manager.handle_focused_text_input(&Event::Paste("first\nsecond".to_string()), 80);
+        manager.handle_focused_text_input(
+            &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            80,
+        );
+        let prompt_cursor = manager.text_panels["agent"]
+            .composer
+            .as_ref()
+            .unwrap()
+            .prompt
+            .cursor();
+
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Up,
+            KeyCode::Down,
+        ] {
+            assert!(
+                manager
+                    .handle_focused_text_input(
+                        &Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+                        80,
+                    )
+                    .is_none(),
+                "{code:?} should fall through to panel navigation"
+            );
+            assert_eq!(
+                manager.text_panels["agent"]
+                    .composer
+                    .as_ref()
+                    .unwrap()
+                    .prompt
+                    .cursor(),
+                prompt_cursor,
+                "{code:?} should not move the Normal-mode prompt cursor"
+            );
+        }
+
+        manager
+            .text_panels
+            .get_mut("agent")
+            .unwrap()
+            .scroll_to_top();
+        manager.handle_focused_key("down", 15, 80, 0).unwrap();
+        assert_eq!(manager.text_panels["agent"].scroll, 1);
+
+        manager
+            .text_panels
+            .get_mut("agent")
+            .unwrap()
+            .composer
+            .as_mut()
+            .unwrap()
+            .prompt
+            .set_mode(crate::editor::Mode::Insert);
+        let insert_text = manager.text_panels["agent"]
+            .composer
+            .as_ref()
+            .unwrap()
+            .prompt
+            .text();
+        let insert_cursor = manager.text_panels["agent"]
+            .composer
+            .as_ref()
+            .unwrap()
+            .prompt
+            .cursor();
+        for (code, modifiers) in [
+            (KeyCode::Char('h'), KeyModifiers::CONTROL),
+            (KeyCode::Char('j'), KeyModifiers::CONTROL),
+            (KeyCode::Char('k'), KeyModifiers::CONTROL),
+            (KeyCode::Char('g'), KeyModifiers::CONTROL),
+            (
+                KeyCode::Char('G'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        ] {
+            assert!(
+                manager
+                    .handle_focused_text_input(&Event::Key(KeyEvent::new(code, modifiers)), 80)
+                    .is_none(),
+                "{modifiers:?}+{code:?} should fall through to panel navigation"
+            );
+            let prompt = &manager.text_panels["agent"]
+                .composer
+                .as_ref()
+                .unwrap()
+                .prompt;
+            assert_eq!(prompt.text(), insert_text);
+            assert_eq!(prompt.cursor(), insert_cursor);
+        }
+
+        let inserted = manager
+            .handle_focused_text_input(
+                &Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+                80,
+            )
+            .unwrap();
+        assert_eq!(inserted.action, "composer_input");
+        assert!(manager.text_panels["agent"]
+            .composer
+            .as_ref()
+            .unwrap()
+            .prompt
+            .text()
+            .contains('j'));
     }
 
     #[test]

@@ -5832,6 +5832,69 @@ async fn focused_agent_panel_keeps_global_leader_until_the_composer_is_focused()
     assert!(harness.render_cursor_position().is_some());
 }
 
+#[test]
+fn focused_agent_composer_routes_control_navigation_to_the_conversation() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 40,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+            ..PanelConfig::default()
+        },
+    );
+    assert!(harness.editor.test_focus_text_panel_composer("agent"));
+
+    for (code, modifiers, expected) in [
+        (KeyCode::Char('h'), KeyModifiers::CONTROL, "up"),
+        (KeyCode::Char('j'), KeyModifiers::CONTROL, "down"),
+        (KeyCode::Char('k'), KeyModifiers::CONTROL, "up"),
+        (KeyCode::Char('g'), KeyModifiers::CONTROL, "top"),
+        (
+            KeyCode::Char('G'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            "bottom",
+        ),
+    ] {
+        let action = harness
+            .editor
+            .test_handle_event(Event::Key(KeyEvent::new(code, modifiers)))
+            .unwrap();
+        assert!(matches!(
+            action,
+            Some(KeyAction::Multiple(actions))
+                if actions.iter().any(|action| matches!(
+                    action,
+                    Action::NotifyPlugins(name, payload)
+                        if name == "panel:event:agent" && payload["action"] == expected
+                ))
+        ));
+    }
+
+    let action = harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+    assert!(matches!(
+        action,
+        Some(KeyAction::Multiple(actions))
+            if actions.iter().any(|action| matches!(
+                action,
+                Action::NotifyPlugins(name, payload)
+                    if name == "panel:event:agent" && payload["action"] == "composer_input"
+            ))
+    ));
+}
+
 #[tokio::test]
 async fn escape_from_focused_panel_restores_editor_cursor() {
     let mut harness = EditorHarness::with_content("abcdef");

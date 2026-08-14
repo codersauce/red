@@ -11171,11 +11171,17 @@ impl Editor {
                         return Some(self.follow_text_panel_link(target));
                     }
                 }
+                let control = event.modifiers.contains(KeyModifiers::CONTROL);
+                let text_panel = !self.panel_manager.focused_row_panel();
                 let action = match event.code {
                     KeyCode::Esc => {
                         self.panel_manager.focus_editor();
                         return Some(KeyAction::Single(Action::Refresh));
                     }
+                    KeyCode::Char('h' | 'k') if control && text_panel => "up",
+                    KeyCode::Char('j') if control && text_panel => "down",
+                    KeyCode::Char('g') if control && text_panel => "top",
+                    KeyCode::Char('G') if control && text_panel => "bottom",
                     KeyCode::Up | KeyCode::Char('k') => "up",
                     KeyCode::Down | KeyCode::Char('j') => "down",
                     KeyCode::PageUp => "page_up",
