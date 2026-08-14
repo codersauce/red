@@ -102,7 +102,7 @@ use crate::{
     },
     matchit::{self, MatchDirection, MatchMotion},
     plugin::{self, ComposerHandle, PickerHandle, PluginRegistry, RequestId, Runtime},
-    preferences::PreferencesStore,
+    preferences::{PanelLayoutPreference, PreferencesStore},
     session::{
         capture_session_disk_fingerprint, detect_disk_divergence, read_session_disk_contents,
         RecoveryDivergence, SessionAnchorAffinity, SessionBufferSnapshot, SessionDiskFingerprint,
@@ -141,6 +141,7 @@ const GUTTER_SIGN_COLUMN_WIDTH: usize = 2;
 const DIAGNOSTIC_GUTTER_NAMESPACE: &str = "diagnostics";
 const MAX_HIGHLIGHT_SLICE_BYTES: usize = 512 * 1024;
 const MAX_PLUGIN_VIEWPORT_LINE_CHARS: usize = 64 * 1024;
+const MAX_AGENT_FAILURE_MESSAGE_CHARS: usize = 2048;
 const MAX_DIRECTORY_LISTING_ENTRIES: usize = 160;
 const AGENT_BRIDGE_CAPACITY: usize = 64;
 const PLUGIN_MANAGER_PICKER_ID: i32 = 9_101;
@@ -933,16 +934,47 @@ enum FocusTarget {
 }
 
 #[derive(Debug, Clone)]
-enum DividerDrag {
-    Panel {
-        id: String,
-        side: plugin::PanelSide,
-        origin: Point,
-        initial_size: usize,
-    },
-    Window {
-        divider: WindowDivider,
-    },
+enum DividerResizeTarget {
+    Panel { id: String, side: plugin::PanelSide },
+    Window { divider: WindowDivider },
+}
+
+impl DividerResizeTarget {
+    fn is_vertical(&self) -> bool {
+        match self {
+            Self::Panel { side, .. } => {
+                matches!(side, plugin::PanelSide::Left | plugin::PanelSide::Right)
+            }
+            Self::Window { divider } => divider.is_vertical(),
+        }
+    }
+
+    fn pointer_delta(&self, from: Point, to: Point) -> isize {
+        match self {
+            Self::Panel { side, .. } => {
+                let (from, to) = match side {
+                    plugin::PanelSide::Left | plugin::PanelSide::Right => (from.x, to.x),
+                    plugin::PanelSide::Top | plugin::PanelSide::Bottom => (from.y, to.y),
+                };
+                isize::try_from(to)
+                    .unwrap_or(isize::MAX)
+                    .saturating_sub(isize::try_from(from).unwrap_or(isize::MAX))
+            }
+            Self::Window { divider } => divider.coordinate_delta(from, to),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DividerDrag {
+    target: DividerResizeTarget,
+    last_position: Point,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PaneResizeMode {
+    vertical: Option<DividerResizeTarget>,
+    horizontal: Option<DividerResizeTarget>,
 }
 
 fn expanded_path_string(path: &str) -> anyhow::Result<String> {
@@ -1118,6 +1150,18 @@ fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
             }),
         ),
     }
+}
+
+fn bounded_agent_failure_message(message: &str) -> String {
+    if message.chars().count() <= MAX_AGENT_FAILURE_MESSAGE_CHARS {
+        return message.to_string();
+    }
+    let mut bounded = message
+        .chars()
+        .take(MAX_AGENT_FAILURE_MESSAGE_CHARS)
+        .collect::<String>();
+    bounded.push_str("… (full details are in the Red log)");
+    bounded
 }
 
 fn agent_context_path_is_sensitive(path: &Path) -> bool {
@@ -1507,6 +1551,9 @@ pub enum PluginRequest {
     FocusPanel {
         id: String,
     },
+    RestorePanelFocus {
+        id: String,
+    },
     FocusEditor,
     SetPanelVisible {
         id: String,
@@ -1671,6 +1718,7 @@ impl PluginRequest {
             Self::ClearTextPanelComposer { .. } => "ClearTextPanelComposer",
             Self::SelectPanelRow { .. } => "SelectPanelRow",
             Self::FocusPanel { .. } => "FocusPanel",
+            Self::RestorePanelFocus { .. } => "RestorePanelFocus",
             Self::FocusEditor => "FocusEditor",
             Self::SetPanelVisible { .. } => "SetPanelVisible",
             Self::ClosePanel { .. } => "ClosePanel",
@@ -2156,11 +2204,18 @@ pub enum Action {
     MoveWindowToBottom,
     MoveWindowToTop,
     MoveWindowToRight,
+    EnterPaneResizeMode,
+    ExitPaneResizeMode,
+    MovePaneDividerUp(usize),
+    MovePaneDividerDown(usize),
+    MovePaneDividerLeft(usize),
+    MovePaneDividerRight(usize),
     ResizeWindowUp(usize),
     ResizeWindowDown(usize),
     ResizeWindowLeft(usize),
     ResizeWindowRight(usize),
     BalanceWindows,
+    ResetPanelLayout(Option<String>),
     MaximizeWindow,
     OnlyWindow,
 }
@@ -2610,6 +2665,9 @@ pub struct Editor {
 
     /// Current editor mode (normal, insert, visual, etc)
     mode: Mode,
+
+    /// Captured dividers moved by directional keys while pane resize mode is active.
+    pane_resize_mode: Option<PaneResizeMode>,
 
     /// Cursor position where the current insert session began.
     insert_entry_cursor: Option<CursorSnapshot>,
@@ -3941,6 +3999,7 @@ impl Editor {
             prev_highlight_y: None,
             vx,
             mode: Mode::Normal,
+            pane_resize_mode: None,
             insert_entry_cursor: None,
             generated_indent: None,
             waiting_command: None,
@@ -4482,9 +4541,244 @@ impl Editor {
         if !self.panel_manager.update_panel_layout(id, side, size) {
             return false;
         }
+        self.persist_panel_layout(id);
         self.apply_panel_layout();
         self.sync_with_window();
         true
+    }
+
+    fn restore_panel_layout(&mut self, id: &str) {
+        let workspace = get_workspace_path();
+        let Some(layout) = self.preferences.panel_layout(&workspace, id).copied() else {
+            return;
+        };
+        let size = layout.size_for(layout.side).or_else(|| {
+            self.panel_manager
+                .panel_default_layout(id)
+                .map(|(_, size)| size)
+        });
+        if let Some(size) = size {
+            self.panel_manager.restore_panel_layout(
+                id,
+                layout.side,
+                size,
+                layout.vertical_size,
+                layout.horizontal_size,
+            );
+        }
+    }
+
+    fn persist_panel_layout(&mut self, id: &str) {
+        let Some((side, _)) = self.panel_manager.panel_layout(id) else {
+            return;
+        };
+        let layout = PanelLayoutPreference {
+            side,
+            vertical_size: self
+                .panel_manager
+                .panel_preferred_size(id, plugin::PanelSide::Left),
+            horizontal_size: self
+                .panel_manager
+                .panel_preferred_size(id, plugin::PanelSide::Top),
+        };
+        if let Err(error) = self
+            .preferences
+            .set_panel_layout(&get_workspace_path(), id, layout)
+        {
+            log!("failed to save panel layout for {id:?}: {error}");
+        }
+    }
+
+    fn reset_panel_layout_preferences(&mut self, panel_id: Option<&str>) -> bool {
+        let workspace = get_workspace_path();
+        let preference_changed = if let Some(panel_id) = panel_id {
+            self.preferences.remove_panel_layout(&workspace, panel_id)
+        } else {
+            self.preferences.clear_panel_layouts(&workspace)
+        };
+        let preference_changed = match preference_changed {
+            Ok(changed) => changed,
+            Err(error) => {
+                log!("failed to reset panel layout preferences: {error}");
+                self.last_error = Some(format!("unable to save panel layout reset: {error}"));
+                false
+            }
+        };
+
+        let panel_ids = panel_id.map_or_else(
+            || self.panel_manager.panel_ids(),
+            |panel_id| vec![panel_id.to_string()],
+        );
+        let mut live_changed = false;
+        let mut live_found = false;
+        for panel_id in panel_ids {
+            if self.panel_manager.panel_layout(&panel_id).is_some() {
+                live_found = true;
+                live_changed |= self.panel_manager.reset_panel_layout(&panel_id);
+            }
+        }
+        if let Some(panel_id) = panel_id.filter(|_| !live_found && !preference_changed) {
+            self.last_error = Some(format!("unknown panel {panel_id:?}"));
+        }
+        if live_changed {
+            self.apply_panel_layout();
+            self.sync_with_window();
+        }
+        live_changed || preference_changed
+    }
+
+    fn divider_resize_target_at_position(&self, x: usize, y: usize) -> Option<DividerResizeTarget> {
+        if let Some(divider) = self.panel_manager.panel_divider_at_position(
+            x,
+            y,
+            usize::from(self.size.0),
+            usize::from(self.size.1),
+        ) {
+            return Some(DividerResizeTarget::Panel {
+                id: divider.id,
+                side: divider.side,
+            });
+        }
+
+        self.window_manager
+            .divider_at_position(x, y)
+            .map(|divider| DividerResizeTarget::Window { divider })
+    }
+
+    fn divider_resize_target_on_window_edge(
+        &self,
+        position: Point,
+        size: (usize, usize),
+        vertical: bool,
+        positive_edge: bool,
+    ) -> Option<DividerResizeTarget> {
+        if vertical {
+            let x = if positive_edge {
+                position.x.saturating_add(size.0)
+            } else {
+                position.x.checked_sub(1)?
+            };
+            let end = position.y.saturating_add(size.1);
+            (position.y..end).find_map(|y| {
+                self.divider_resize_target_at_position(x, y)
+                    .filter(|target| target.is_vertical())
+            })
+        } else {
+            let y = if positive_edge {
+                position.y.saturating_add(size.1)
+            } else {
+                position.y.checked_sub(1)?
+            };
+            let end = position.x.saturating_add(size.0);
+            (position.x..end).find_map(|x| {
+                self.divider_resize_target_at_position(x, y)
+                    .filter(|target| !target.is_vertical())
+            })
+        }
+    }
+
+    fn focused_pane_resize_targets(&self) -> PaneResizeMode {
+        if let Some(panel_id) = self.panel_manager.focused_panel_id() {
+            let Some((side, _)) = self.panel_manager.panel_layout(panel_id) else {
+                return PaneResizeMode::default();
+            };
+            let target = DividerResizeTarget::Panel {
+                id: panel_id.to_string(),
+                side,
+            };
+            return if target.is_vertical() {
+                PaneResizeMode {
+                    vertical: Some(target),
+                    horizontal: None,
+                }
+            } else {
+                PaneResizeMode {
+                    vertical: None,
+                    horizontal: Some(target),
+                }
+            };
+        }
+
+        let Some(window) = self.window_manager.active_window() else {
+            return PaneResizeMode::default();
+        };
+        let resolve = |vertical| {
+            self.divider_resize_target_on_window_edge(
+                window.position,
+                window.size,
+                vertical,
+                /*positive_edge*/ true,
+            )
+            .or_else(|| {
+                self.divider_resize_target_on_window_edge(
+                    window.position,
+                    window.size,
+                    vertical,
+                    /*positive_edge*/ false,
+                )
+            })
+        };
+        PaneResizeMode {
+            vertical: resolve(true),
+            horizontal: resolve(false),
+        }
+    }
+
+    fn move_divider_target_by(&mut self, target: &DividerResizeTarget, delta: isize) -> bool {
+        if delta == 0 {
+            return false;
+        }
+
+        match target {
+            DividerResizeTarget::Panel { id, side } => {
+                let Some((_, current_size)) = self.panel_manager.panel_layout(id) else {
+                    return false;
+                };
+                let size_delta =
+                    if matches!(side, plugin::PanelSide::Right | plugin::PanelSide::Bottom) {
+                        delta.saturating_neg()
+                    } else {
+                        delta
+                    };
+                self.set_panel_size(id, *side, current_size.saturating_add_signed(size_delta))
+            }
+            DividerResizeTarget::Window { divider } => {
+                self.sync_to_window();
+                let Some(span) = self.window_manager.divider_span(divider) else {
+                    return false;
+                };
+                let position = span.moved_by(delta);
+                let resized = self
+                    .window_manager
+                    .resize_divider(divider, position.x, position.y);
+                if resized {
+                    self.sync_with_window();
+                }
+                resized
+            }
+        }
+    }
+
+    fn move_captured_pane_divider(
+        &mut self,
+        direction: crate::window::Direction,
+        amount: usize,
+    ) -> bool {
+        let amount = isize::try_from(amount).unwrap_or(isize::MAX);
+        let (vertical, delta) = match direction {
+            crate::window::Direction::Left => (true, amount.saturating_neg()),
+            crate::window::Direction::Right => (true, amount),
+            crate::window::Direction::Up => (false, amount.saturating_neg()),
+            crate::window::Direction::Down => (false, amount),
+        };
+        let target = self.pane_resize_mode.as_ref().and_then(|mode| {
+            if vertical {
+                mode.vertical.clone()
+            } else {
+                mode.horizontal.clone()
+            }
+        });
+        target.is_some_and(|target| self.move_divider_target_by(&target, delta))
     }
 
     fn resize_window_or_panel(
@@ -4572,6 +4866,7 @@ impl Editor {
     fn resize_terminal_surface(&mut self, width: u16, height: u16, buffer: &mut RenderBuffer) {
         self.size = (width, height);
         self.divider_drag = None;
+        self.pane_resize_mode = None;
         let max_y = (height as usize).saturating_sub(2);
         self.cy = self.cy.min(max_y.saturating_sub(1));
         self.resize_window_layout((width as usize, height as usize));
@@ -6619,7 +6914,24 @@ impl Editor {
         text: String,
         context: Option<(String, String)>,
     ) -> anyhow::Result<bool> {
-        if !self.agent_manager.has_bridge() || self.agent_manager.is_task_finished() {
+        if self.agent_manager.is_task_finished() {
+            let message = self
+                .finish_agent_bridge("Codex app-server stopped before the prompt was sent")
+                .await;
+            self.plugin_registry
+                .notify(
+                    runtime,
+                    "agent:session_lost",
+                    json!({
+                        "session_id": session_id,
+                        "prompt": text,
+                        "message": message
+                    }),
+                )
+                .await?;
+            return Ok(false);
+        }
+        if !self.agent_manager.has_bridge() {
             self.abort_agent_bridge();
             self.plugin_registry
                 .notify(
@@ -6628,7 +6940,7 @@ impl Editor {
                     json!({
                         "session_id": session_id,
                         "prompt": text,
-                        "message": "no Codex session is running"
+                        "message": "No Codex app-server session is running"
                     }),
                 )
                 .await?;
@@ -6680,7 +6992,9 @@ impl Editor {
             },
         );
         if bridge.send(command).await.is_err() {
-            self.abort_agent_bridge();
+            let message = self
+                .finish_agent_bridge("Codex app-server stopped while sending the prompt")
+                .await;
             self.plugin_registry
                 .notify(
                     runtime,
@@ -6688,7 +7002,7 @@ impl Editor {
                     json!({
                         "session_id": session_id,
                         "prompt": text,
-                        "message": "Codex app-server stopped"
+                        "message": message
                     }),
                 )
                 .await?;
@@ -7148,6 +7462,31 @@ impl Editor {
         self.agent_manager.clear_tool_requests();
     }
 
+    async fn finish_agent_bridge(&mut self, fallback: &str) -> String {
+        let result = match self.agent_manager.take_task() {
+            Some(task) => Some(task.await),
+            None => None,
+        };
+        drop(self.agent_manager.take_bridge());
+        self.agent_manager.clear_active_sessions();
+        self.agent_manager.clear_turns();
+        self.agent_manager.clear_tool_requests();
+
+        let message = match result {
+            Some(Ok(Err(error))) => {
+                let details = format!("{error:#}");
+                log!("Codex app-server task failed: {details}");
+                format!("Codex app-server failed: {details}")
+            }
+            Some(Err(error)) if !error.is_cancelled() => {
+                log!("Codex app-server task failed: {error}");
+                format!("Codex app-server task failed: {error}")
+            }
+            Some(Ok(Ok(()))) | Some(Err(_)) | None => fallback.to_string(),
+        };
+        bounded_agent_failure_message(&message)
+    }
+
     async fn service_background(
         &mut self,
         buffer: &mut RenderBuffer,
@@ -7276,20 +7615,11 @@ impl Editor {
                 .bridge()
                 .is_none_or(|bridge| !bridge.has_pending_events())
         {
-            let _ = self
-                .agent_manager
-                .take_task()
-                .expect("finished Codex task must exist")
+            let message = self
+                .finish_agent_bridge("Codex app-server stopped unexpectedly")
                 .await;
-            self.agent_manager.take_bridge();
-            self.agent_manager.clear_active_sessions();
-            self.agent_manager.clear_tool_requests();
             self.plugin_registry
-                .notify(
-                    runtime,
-                    "agent:session_lost",
-                    json!({ "message": "Codex app-server stopped" }),
-                )
+                .notify(runtime, "agent:session_lost", json!({ "message": message }))
                 .await?;
         }
 
@@ -7421,19 +7751,11 @@ impl Editor {
                 }
                 PluginRequest::AgentNewSession { cwd } => {
                     if self.agent_manager.is_task_finished() {
-                        let _ = self
-                            .agent_manager
-                            .take_task()
-                            .expect("finished Codex task must exist")
+                        let message = self
+                            .finish_agent_bridge("Codex app-server stopped unexpectedly")
                             .await;
-                        self.agent_manager.take_bridge();
-                        self.agent_manager.clear_active_sessions();
                         self.plugin_registry
-                            .notify(
-                                runtime,
-                                "agent:session_lost",
-                                json!({ "message": "Codex app-server stopped" }),
-                            )
+                            .notify(runtime, "agent:session_lost", json!({ "message": message }))
                             .await?;
                     }
                     let result = if self.config.disable_ai {
@@ -7530,13 +7852,13 @@ impl Editor {
                         continue;
                     };
                     if bridge.send(CodexCommand::NewSession { cwd }).await.is_err() {
-                        self.abort_agent_bridge();
-                        self.plugin_registry
-                            .notify(
-                                runtime,
-                                "agent:session_lost",
-                                json!({ "message": "Codex app-server stopped" }),
+                        let message = self
+                            .finish_agent_bridge(
+                                "Codex app-server stopped while starting the session",
                             )
+                            .await;
+                        self.plugin_registry
+                            .notify(runtime, "agent:session_lost", json!({ "message": message }))
                             .await?;
                     }
                 }
@@ -8627,7 +8949,8 @@ impl Editor {
                     }
                 }
                 PluginRequest::CreatePanel { id, config } => {
-                    self.panel_manager.create_panel(id, config);
+                    self.panel_manager.create_panel(id.clone(), config);
+                    self.restore_panel_layout(&id);
                     self.apply_panel_layout();
                     needs_render = true;
                 }
@@ -8636,7 +8959,8 @@ impl Editor {
                     needs_render = true;
                 }
                 PluginRequest::CreateTextPanel { id, config } => {
-                    self.panel_manager.create_text_panel(id, config);
+                    self.panel_manager.create_text_panel(id.clone(), config);
+                    self.restore_panel_layout(&id);
                     self.apply_panel_layout();
                     needs_render = true;
                 }
@@ -8701,6 +9025,10 @@ impl Editor {
                 }
                 PluginRequest::FocusPanel { id } => {
                     self.panel_manager.focus_panel(&id);
+                    needs_render = true;
+                }
+                PluginRequest::RestorePanelFocus { id } => {
+                    self.panel_manager.restore_panel_focus(&id);
                     needs_render = true;
                 }
                 PluginRequest::FocusEditor => {
@@ -10967,6 +11295,10 @@ impl Editor {
 
         self.clear_keymap_hints();
 
+        if self.pane_resize_mode.is_some() {
+            return Ok(self.handle_pane_resize_event(ev));
+        }
+
         if let Some(current_dialog) = &mut self.current_dialog {
             let action = current_dialog.handle_event(ev);
             let allows_passthrough = current_dialog.allows_event_passthrough();
@@ -11115,6 +11447,27 @@ impl Editor {
         })
     }
 
+    /// Routes one-cell pane resizing ahead of editor and focused-panel input.
+    fn handle_pane_resize_event(&self, ev: &event::Event) -> Option<KeyAction> {
+        let Event::Key(key) = ev else {
+            return matches!(ev, Event::Mouse(_))
+                .then_some(KeyAction::Single(Action::ExitPaneResizeMode));
+        };
+        if !key.modifiers.is_empty() {
+            return None;
+        }
+
+        let action = match key.code {
+            KeyCode::Char('h') | KeyCode::Left => Action::MovePaneDividerLeft(1),
+            KeyCode::Char('j') | KeyCode::Down => Action::MovePaneDividerDown(1),
+            KeyCode::Char('k') | KeyCode::Up => Action::MovePaneDividerUp(1),
+            KeyCode::Char('l') | KeyCode::Right => Action::MovePaneDividerRight(1),
+            KeyCode::Esc | KeyCode::Enter => Action::ExitPaneResizeMode,
+            _ => return None,
+        };
+        Some(KeyAction::Single(action))
+    }
+
     fn handle_focus_event(
         &mut self,
         ev: &event::Event,
@@ -11123,11 +11476,12 @@ impl Editor {
         match ev {
             Event::FocusLost => {
                 let divider_was_active = self.divider_drag.take().is_some();
+                let resize_mode_was_active = self.pane_resize_mode.take().is_some();
                 self.suppress_reactivation_click = false;
                 if self.is_focused {
                     self.is_focused = false;
                     self.render(buffer)?;
-                } else if divider_was_active {
+                } else if divider_was_active || resize_mode_was_active {
                     self.render(buffer)?;
                 } else {
                     self.draw_cursor()?;
@@ -11182,6 +11536,36 @@ impl Editor {
         {
             return Self::panel_event_key_action(event);
         }
+        let count = usize::from(self.repeater.unwrap_or(1));
+        if let Some(input) = self.panel_manager.handle_focused_scrollback_input(
+            ev,
+            usize::from(self.size.1.saturating_sub(2)),
+            usize::from(self.size.0),
+            count,
+        ) {
+            self.repeater = None;
+            return Some(match input {
+                plugin::panel::TextPanelScrollbackInput::Handled => {
+                    KeyAction::Single(Action::Refresh)
+                }
+                plugin::panel::TextPanelScrollbackInput::Yank(yank) => {
+                    let length = yank.text.graphemes(true).count();
+                    let lines = yank.text.lines().count();
+                    let content = if yank.linewise {
+                        Content::linewise(yank.text)
+                    } else {
+                        Content::charwise(yank.text)
+                    };
+                    self.set_default_register(content);
+                    self.last_error = Some(if yank.linewise {
+                        format!("{} lines yanked", lines.max(1))
+                    } else {
+                        format!("{length} characters yanked")
+                    });
+                    KeyAction::Single(Action::Refresh)
+                }
+            });
+        }
         match ev {
             Event::Key(event) => {
                 if matches!(event.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
@@ -11197,13 +11581,21 @@ impl Editor {
                     }
                 }
                 if matches!(event.code, KeyCode::Tab | KeyCode::BackTab) {
+                    if self.panel_manager.focused_text_input_active()
+                        && self
+                            .panel_manager
+                            .focus_focused_text_scrollback(usize::from(self.size.0))
+                    {
+                        return Some(KeyAction::Single(Action::Refresh));
+                    }
                     let panel_height = usize::from(self.size.1.saturating_sub(2));
                     let forward = event.code == KeyCode::Tab;
-                    if self.panel_manager.select_focused_text_link(
+                    let selected = self.panel_manager.select_focused_text_link(
                         forward,
                         panel_height,
                         usize::from(self.size.0),
-                    ) {
+                    );
+                    if selected || !self.panel_manager.focused_row_panel() {
                         return Some(KeyAction::Single(Action::Refresh));
                     }
                 }
@@ -11215,11 +11607,17 @@ impl Editor {
                         return Some(self.follow_text_panel_link(target));
                     }
                 }
+                let control = event.modifiers.contains(KeyModifiers::CONTROL);
+                let text_panel = !self.panel_manager.focused_row_panel();
                 let action = match event.code {
                     KeyCode::Esc => {
                         self.panel_manager.focus_editor();
                         return Some(KeyAction::Single(Action::Refresh));
                     }
+                    KeyCode::Char('h' | 'k') if control && text_panel => "up",
+                    KeyCode::Char('j') if control && text_panel => "down",
+                    KeyCode::Char('g') if control && text_panel => "top",
+                    KeyCode::Char('G') if control && text_panel => "bottom",
                     KeyCode::Up | KeyCode::Char('k') => "up",
                     KeyCode::Down | KeyCode::Char('j') => "down",
                     KeyCode::PageUp => "page_up",
@@ -11241,9 +11639,12 @@ impl Editor {
                     {
                         "Ctrl-r"
                     }
-                    KeyCode::Char('H') => "history",
+                    KeyCode::Char('H') if self.panel_manager.focused_row_panel() => "history",
                     KeyCode::Char('N') => "new",
-                    KeyCode::Char('a') if !self.panel_manager.focused_row_panel() => {
+                    KeyCode::Char('a' | 'i')
+                        if event.modifiers.is_empty()
+                            && !self.panel_manager.focused_row_panel() =>
+                    {
                         "composer_focus"
                     }
                     KeyCode::Char('x') if !self.panel_manager.focused_row_panel() => "clear",
@@ -11327,69 +11728,21 @@ impl Editor {
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.divider_drag = None;
-                if let Some(divider) = self.panel_manager.panel_divider_at_position(
-                    x,
-                    y,
-                    usize::from(self.size.0),
-                    usize::from(self.size.1),
-                ) {
-                    let (_, initial_size) = self.panel_manager.panel_layout(&divider.id)?;
-                    self.divider_drag = Some(DividerDrag::Panel {
-                        id: divider.id,
-                        side: divider.side,
-                        origin: Point::new(x, y),
-                        initial_size,
-                    });
-                    return Some(KeyAction::Single(Action::Refresh));
-                }
-
-                if let Some(divider) = self.window_manager.divider_at_position(x, y) {
-                    self.divider_drag = Some(DividerDrag::Window { divider });
-                    return Some(KeyAction::Single(Action::Refresh));
-                }
-
-                None
+                let target = self.divider_resize_target_at_position(x, y)?;
+                self.divider_drag = Some(DividerDrag {
+                    target,
+                    last_position: Point::new(x, y),
+                });
+                Some(KeyAction::Single(Action::Refresh))
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 let drag = self.divider_drag.clone()?;
-                let resized = match drag {
-                    DividerDrag::Panel {
-                        id,
-                        side,
-                        origin,
-                        initial_size,
-                    } => {
-                        let delta = match side {
-                            plugin::PanelSide::Left | plugin::PanelSide::Right => {
-                                isize::try_from(x)
-                                    .unwrap_or(isize::MAX)
-                                    .saturating_sub(isize::try_from(origin.x).unwrap_or(isize::MAX))
-                            }
-                            plugin::PanelSide::Top | plugin::PanelSide::Bottom => {
-                                isize::try_from(y)
-                                    .unwrap_or(isize::MAX)
-                                    .saturating_sub(isize::try_from(origin.y).unwrap_or(isize::MAX))
-                            }
-                        };
-                        let delta =
-                            if matches!(side, plugin::PanelSide::Right | plugin::PanelSide::Bottom)
-                            {
-                                delta.saturating_neg()
-                            } else {
-                                delta
-                            };
-                        let requested_size = initial_size.saturating_add_signed(delta);
-                        self.set_panel_size(&id, side, requested_size)
-                    }
-                    DividerDrag::Window { divider } => {
-                        self.sync_to_window();
-                        let resized = self.window_manager.resize_divider(&divider, x, y);
-                        if resized {
-                            self.sync_with_window();
-                        }
-                        resized
-                    }
-                };
+                let position = Point::new(x, y);
+                let delta = drag.target.pointer_delta(drag.last_position, position);
+                let resized = self.move_divider_target_by(&drag.target, delta);
+                if let Some(active_drag) = &mut self.divider_drag {
+                    active_drag.last_position = position;
+                }
 
                 Some(if resized {
                     KeyAction::Single(Action::Refresh)
@@ -11413,16 +11766,29 @@ impl Editor {
 
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(target) = self
-                    .panel_manager
-                    .text_link_at_position(x, y, width, height)
+                if event
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
                 {
-                    return Some(self.follow_text_panel_link(target));
+                    if let Some(target) = self
+                        .panel_manager
+                        .text_link_at_position(x, y, width, height)
+                    {
+                        return Some(self.follow_text_panel_link(target));
+                    }
                 }
                 self.panel_manager
                     .focus_panel_at_position(x, y, width, height)
                     .and_then(Self::panel_event_key_action)
             }
+            MouseEventKind::Drag(MouseButton::Left) => self
+                .panel_manager
+                .drag_focused_text_selection(x, y, width, height)
+                .then_some(KeyAction::Single(Action::Refresh)),
+            MouseEventKind::Up(MouseButton::Left) => self
+                .panel_manager
+                .finish_focused_text_selection()
+                .then_some(KeyAction::Single(Action::Refresh)),
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let placement = self.panel_manager.panel_at_position(x, y, width, height)?;
                 let scroll_lines = isize::try_from(self.config.mouse_scroll_lines.unwrap_or(3))
@@ -11610,11 +11976,18 @@ impl Editor {
             | Action::MoveWindowToBottom
             | Action::MoveWindowToTop
             | Action::MoveWindowToRight
+            | Action::EnterPaneResizeMode
+            | Action::ExitPaneResizeMode
+            | Action::MovePaneDividerUp(_)
+            | Action::MovePaneDividerDown(_)
+            | Action::MovePaneDividerLeft(_)
+            | Action::MovePaneDividerRight(_)
             | Action::ResizeWindowUp(_)
             | Action::ResizeWindowDown(_)
             | Action::ResizeWindowLeft(_)
             | Action::ResizeWindowRight(_)
             | Action::BalanceWindows
+            | Action::ResetPanelLayout(_)
             | Action::MaximizeWindow
             | Action::OnlyWindow => true,
             Action::PluginCommand(command) => runtime.is_some_and(|runtime| {
@@ -12040,6 +12413,14 @@ impl Editor {
 
             if cmd == "only" {
                 actions.push(Action::OnlyWindow);
+            }
+
+            if cmd == "panel-layout-reset" {
+                if parsed.args.len() > 1 {
+                    self.last_error = Some("usage: panel-layout-reset [panel-id]".to_string());
+                    return Vec::new();
+                }
+                actions.push(Action::ResetPanelLayout(parsed.args.first().cloned()));
             }
 
             if cmd == "noh" || cmd == "nohlsearch" {
@@ -18254,6 +18635,36 @@ impl Editor {
             Action::MoveWindowToRight => {
                 self.move_focused_window_to_edge(crate::window::Direction::Right, buffer)?;
             }
+            Action::EnterPaneResizeMode => {
+                add_to_history = false;
+                self.pane_resize_mode = Some(self.focused_pane_resize_targets());
+                self.render(buffer)?;
+            }
+            Action::ExitPaneResizeMode => {
+                add_to_history = false;
+                self.pane_resize_mode = None;
+                self.render(buffer)?;
+            }
+            Action::MovePaneDividerUp(amount) => {
+                if self.move_captured_pane_divider(crate::window::Direction::Up, *amount) {
+                    self.render(buffer)?;
+                }
+            }
+            Action::MovePaneDividerDown(amount) => {
+                if self.move_captured_pane_divider(crate::window::Direction::Down, *amount) {
+                    self.render(buffer)?;
+                }
+            }
+            Action::MovePaneDividerLeft(amount) => {
+                if self.move_captured_pane_divider(crate::window::Direction::Left, *amount) {
+                    self.render(buffer)?;
+                }
+            }
+            Action::MovePaneDividerRight(amount) => {
+                if self.move_captured_pane_divider(crate::window::Direction::Right, *amount) {
+                    self.render(buffer)?;
+                }
+            }
             Action::ResizeWindowUp(amount) => {
                 if self.resize_window_or_panel(crate::window::Direction::Up, *amount) {
                     self.render(buffer)?;
@@ -18277,6 +18688,13 @@ impl Editor {
             Action::BalanceWindows => {
                 if self.balance_focused_window_or_panel() {
                     self.render(buffer)?;
+                }
+            }
+            Action::ResetPanelLayout(panel_id) => {
+                if self.reset_panel_layout_preferences(panel_id.as_deref()) {
+                    self.render(buffer)?;
+                } else if self.last_error.is_some() {
+                    self.draw_commandline(buffer);
                 }
             }
             Action::MaximizeWindow => {
@@ -24264,6 +24682,7 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_create_panel(&mut self, id: &str, config: plugin::PanelConfig) {
         self.panel_manager.create_panel(id.to_string(), config);
+        self.restore_panel_layout(id);
         self.apply_panel_layout();
         self.sync_with_window();
     }
@@ -24271,8 +24690,19 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_create_text_panel(&mut self, id: &str, config: plugin::PanelConfig) {
         self.panel_manager.create_text_panel(id.to_string(), config);
+        self.restore_panel_layout(id);
         self.apply_panel_layout();
         self.sync_with_window();
+    }
+
+    #[doc(hidden)]
+    pub fn test_update_text_panel(&mut self, id: &str, blocks: Vec<plugin::TextPanelBlock>) {
+        self.panel_manager.update_text_panel(
+            id,
+            blocks,
+            usize::from(self.size.1.saturating_sub(2)),
+            usize::from(self.size.0),
+        );
     }
 
     #[doc(hidden)]
@@ -26135,6 +26565,94 @@ builtin = "rust"
     }
 
     #[tokio::test]
+    async fn saved_panel_layout_restores_both_axes_and_reset_command_clears_it() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut preferences = PreferencesStore::in_memory();
+        let workspace = get_workspace_path();
+        preferences
+            .set_panel_layout(
+                &workspace,
+                "agent-conversation",
+                PanelLayoutPreference {
+                    side: plugin::PanelSide::Bottom,
+                    vertical_size: Some(52),
+                    horizontal_size: Some(9),
+                },
+            )
+            .unwrap();
+        let mut editor = Editor::with_size_and_preferences(
+            lsp,
+            100,
+            30,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, String::new())],
+            preferences,
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        editor.test_create_text_panel(
+            "agent-conversation",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Right,
+                width: 62,
+                title: Some("Agent".to_string()),
+                ..plugin::PanelConfig::default()
+            },
+        );
+
+        assert_eq!(
+            editor.test_panel_layout("agent-conversation"),
+            Some((plugin::PanelSide::Bottom, 9))
+        );
+        assert_eq!(
+            editor
+                .panel_manager
+                .panel_preferred_size("agent-conversation", plugin::PanelSide::Left),
+            Some(52)
+        );
+        assert!(editor.set_panel_size("agent-conversation", plugin::PanelSide::Left, 48));
+        assert_eq!(
+            editor
+                .preferences
+                .panel_layout(&workspace, "agent-conversation"),
+            Some(&PanelLayoutPreference {
+                side: plugin::PanelSide::Left,
+                vertical_size: Some(48),
+                horizontal_size: Some(9),
+            })
+        );
+        let mut buffer = RenderBuffer::new(100, 30, &Style::default());
+        let mut runtime = Runtime::new();
+
+        enter_colon_command(
+            &mut editor,
+            &mut buffer,
+            &mut runtime,
+            "panel-layout-reset agent-conversation",
+        )
+        .await;
+
+        assert_eq!(
+            editor.test_panel_layout("agent-conversation"),
+            Some((plugin::PanelSide::Right, 62))
+        );
+        assert_eq!(
+            editor
+                .preferences
+                .panel_layout(&workspace, "agent-conversation"),
+            None
+        );
+        assert_eq!(
+            editor
+                .panel_manager
+                .panel_preferred_size("agent-conversation", plugin::PanelSide::Top),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn detached_mouse_drag_resizes_each_docked_pane_without_stealing_focus() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
@@ -26786,7 +27304,12 @@ builtin = "rust"
                 }
 
                 fn lost(event: Json) {
-                    red::execute("Print", red::string(red::state("trace"), "") + "lost");
+                    red::execute(
+                        "Print",
+                        red::string(red::state("trace"), "")
+                            + "lost:"
+                            + red::string(event.message, "missing failure detail")
+                    );
                 }
             "#,
         )
@@ -26867,7 +27390,7 @@ builtin = "rust"
         let mut expected = (0..event_count)
             .map(|index| format!("{index},"))
             .collect::<String>();
-        expected.push_str("completed,lost");
+        expected.push_str("completed,lost:Codex app-server failed: fixture adapter exited");
         assert_eq!(editor.last_error.as_deref(), Some(expected.as_str()));
         assert!(!editor.agent_manager.has_bridge());
         assert!(!editor.agent_manager.is_task_finished());
@@ -33862,6 +34385,52 @@ while True:
         editor.suppress_reactivation_click = false;
         editor.handle_event(&activation_click).unwrap();
         assert_eq!(editor.panel_manager.focused_panel_id(), None);
+    }
+
+    #[test]
+    fn focused_text_panel_shift_h_does_not_open_agent_history() {
+        let mut editor = test_editor(40, 10);
+        editor.test_create_text_panel(
+            "agent-conversation",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Right,
+                width: 16,
+                title: Some("Agent".to_string()),
+                composer: Some(plugin::TextPanelComposerConfig {
+                    placeholder: "Ask a follow-up…".to_string(),
+                    rows: 3,
+                }),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        assert!(editor.test_focus_text_panel_composer("agent-conversation"));
+        assert!(editor
+            .handle_panel_event(
+                &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                None,
+            )
+            .is_some());
+        assert_eq!(
+            editor.panel_manager.focused_text_panel_cursor_mode(),
+            Some(Mode::Normal)
+        );
+
+        let action = editor
+            .handle_panel_event(
+                &Event::Key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT)),
+                None,
+            )
+            .expect("focused text panel should consume Shift-H");
+
+        let KeyAction::Multiple(actions) = action else {
+            panic!("expected a panel notification");
+        };
+        assert!(matches!(
+            actions.first(),
+            Some(Action::NotifyPlugins(topic, payload))
+                if topic == "panel:event:agent-conversation"
+                    && payload["action"] != "history"
+        ));
     }
 
     #[test]

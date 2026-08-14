@@ -31,6 +31,7 @@ pub(crate) const BUILTIN_COLON_COMMANDS: &[&str] = &[
     "vs",
     "close",
     "only",
+    "panel-layout-reset",
     "noh",
     "nohlsearch",
     "set",
@@ -744,6 +745,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Action::MoveWindowToRight,
         ),
         builtin(
+            "window.resize_mode",
+            "Resize pane",
+            "Window",
+            "Resize the focused pane with h, j, k, l, or the arrow keys",
+            None,
+            &["resize mode"],
+            Action::EnterPaneResizeMode,
+        ),
+        builtin(
             "window.balance",
             "Balance windows",
             "Window",
@@ -751,6 +761,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             None,
             &[],
             Action::BalanceWindows,
+        ),
+        builtin(
+            "panel.layout_reset",
+            "Reset panel layout",
+            "Panel",
+            "Restore docked panels to their plugin-defined positions and sizes",
+            Some(":panel-layout-reset"),
+            &["reset panes"],
+            Action::ResetPanelLayout(None),
         ),
         builtin(
             "window.maximize",
@@ -1083,6 +1102,7 @@ fn action_label(action: &Action) -> String {
         Action::CloseWindow => "Close window".to_string(),
         Action::OnlyWindow => "Keep only current window".to_string(),
         Action::BalanceWindows => "Balance windows".to_string(),
+        Action::ResetPanelLayout(_) => "Reset panel layout".to_string(),
         Action::MaximizeWindow => "Maximize window".to_string(),
         Action::NextWindow => "Next window".to_string(),
         Action::PreviousWindow => "Previous window".to_string(),
@@ -1094,6 +1114,8 @@ fn action_label(action: &Action) -> String {
         Action::MoveWindowToBottom => "Move window to bottom edge".to_string(),
         Action::MoveWindowToTop => "Move window to top edge".to_string(),
         Action::MoveWindowToRight => "Move window to right edge".to_string(),
+        Action::EnterPaneResizeMode => "Resize pane".to_string(),
+        Action::ExitPaneResizeMode => "Exit pane resize mode".to_string(),
         Action::ViewLogs => "View logs".to_string(),
         Action::ListPlugins => "Language packs".to_string(),
         Action::DumpBuffer => "Dump buffer".to_string(),
@@ -1248,6 +1270,17 @@ mod tests {
         assert_eq!(whats_new.colon.as_deref(), Some(":whats-new"));
         assert!(whats_new.aliases.iter().any(|alias| alias == ":changelog"));
         assert_eq!(whats_new.action, Action::OpenWhatsNew);
+
+        let resize = entries
+            .iter()
+            .find(|entry| entry.id == "window.resize_mode")
+            .unwrap();
+        assert_eq!(resize.title, "Resize pane");
+        assert_eq!(resize.action, Action::EnterPaneResizeMode);
+        assert!(resize
+            .shortcuts
+            .iter()
+            .any(|shortcut| shortcut == "Ctrl-w r"));
     }
 
     #[test]
@@ -1614,6 +1647,9 @@ mod tests {
                 .iter()
                 .any(|hint| hint.key == key && hint.label == label && !hint.is_group));
         }
+        assert!(hints
+            .iter()
+            .any(|hint| hint.key == "r" && hint.label == "Resize pane" && !hint.is_group));
     }
 
     #[test]

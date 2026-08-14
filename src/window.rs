@@ -64,6 +64,22 @@ pub(crate) struct WindowDivider {
     size: (usize, usize),
 }
 
+impl WindowDivider {
+    pub(crate) fn is_vertical(&self) -> bool {
+        self.axis == DividerAxis::Vertical
+    }
+
+    pub(crate) fn coordinate_delta(&self, from: Point, to: Point) -> isize {
+        let (from, to) = match self.axis {
+            DividerAxis::Vertical => (from.x, to.x),
+            DividerAxis::Horizontal => (from.y, to.y),
+        };
+        isize::try_from(to)
+            .unwrap_or(isize::MAX)
+            .saturating_sub(isize::try_from(from).unwrap_or(isize::MAX))
+    }
+}
+
 /// Current terminal-cell segment occupied by one captured split divider.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DividerSpan {
@@ -85,6 +101,17 @@ impl DividerSpan {
                 y == self.origin.y
                     && x >= self.origin.x
                     && x < self.origin.x.saturating_add(self.length)
+            }
+        }
+    }
+
+    pub(crate) fn moved_by(&self, delta: isize) -> Point {
+        match self.axis {
+            DividerAxis::Vertical => {
+                Point::new(self.origin.x.saturating_add_signed(delta), self.origin.y)
+            }
+            DividerAxis::Horizontal => {
+                Point::new(self.origin.x, self.origin.y.saturating_add_signed(delta))
             }
         }
     }

@@ -162,6 +162,49 @@ async fn direct_app_server_streams_and_routes_writes_to_the_host() {
 }
 
 #[tokio::test]
+async fn direct_app_server_starts_without_managed_feature_requirements() {
+    for requirements in [
+        json!({"allowedSandboxModes": ["read-only"]}),
+        json!({"allowedSandboxModes": ["read-only"], "featureRequirements": null}),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let codex = mock_codex(directory.path());
+        let host = RecordingHost {
+            writes: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut spec = CodexProcessSpec::new(codex, directory.path());
+        spec.environment.insert(
+            "RED_MOCK_REQUIREMENTS".into(),
+            requirements.to_string().into(),
+        );
+        let (mut bridge, task) = start_codex(spec, host, NonZeroUsize::new(32).unwrap()).unwrap();
+
+        bridge
+            .send(CodexCommand::NewSession {
+                cwd: directory.path().to_path_buf(),
+            })
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(event) = bridge.try_recv() {
+                    break event;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(event, CodexEvent::SessionCreated { session_id } if session_id == "thread-red")
+        );
+        drop(bridge);
+        task.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
 async fn direct_app_server_starts_with_required_hooks() {
     let directory = tempfile::tempdir().unwrap();
     let codex = mock_codex(directory.path());
@@ -204,4 +247,44 @@ async fn direct_app_server_starts_with_required_hooks() {
     );
     drop(bridge);
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn direct_app_server_reports_live_startup_failure_and_stderr_availability() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex = directory.path().join("codex-fails");
+    std::fs::write(
+        &codex,
+        "#!/bin/sh\necho 'workplace policy rejected app-server startup' >&2\nexit 23\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&codex).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&codex, permissions).unwrap();
+    let host = RecordingHost {
+        writes: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let (_bridge, task) = start_codex(
+        CodexProcessSpec::new(codex, directory.path()),
+        host,
+        NonZeroUsize::new(32).unwrap(),
+    )
+    .unwrap();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("failing Codex worker should terminate")
+        .unwrap()
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        error.contains("Codex app-server initialization failed"),
+        "{error}"
+    );
+    assert!(error.contains("status: 23"), "{error}");
+    assert!(
+        error.contains("diagnostic details to the Red log"),
+        "{error}"
+    );
 }

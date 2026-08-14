@@ -28,6 +28,7 @@ struct AgentErrorEvent {
 struct AgentSessionLostEvent {
     session_id: String,
     prompt: String,
+    message: String,
 }
 
 struct AgentPanelEvent {
@@ -99,11 +100,6 @@ struct AgentTextBlock {
     kind: String,
     format: String,
     text: String,
-}
-
-struct BoundedAgentBlocks {
-    blocks: [AgentTextBlock],
-    trimmed: bool,
 }
 
 struct TextPanelComposerConfig {
@@ -360,10 +356,40 @@ fn session_created(event: AgentSessionEvent) {
     scope = "global",
 )]
 fn prompt() {
-    if red::string(state().session_id, "") != "" {
+    let has_live_session = red::string(state().session_id, "") != "";
+    let has_restored_conversation = red::string(state().pending_prompt, "") == ""
+        && red::trim(red::string(state().transcript, "")) != "";
+    if has_live_session || has_restored_conversation {
+        let was_created = state().panel_created;
         ensure_conversation_panel();
+        if !was_created {
+            render_conversation();
+        }
+        red::execute("FocusTextPanelComposer", "agent-conversation");
+        return;
     }
     red::request("GetStorage", prompt_history_loaded, "prompt_history");
+}
+
+#[red::command(
+    name = "AgentToggle",
+    title = "Toggle agent conversation",
+    category = "Agent",
+    description = "Show or hide the agent conversation pane",
+    aliases = ["toggle chat"],
+    scope = "global",
+)]
+fn toggle_conversation() {
+    if state().panel_open {
+        close_conversation();
+    } else {
+        let was_created = state().panel_created;
+        ensure_conversation_panel();
+        if !was_created {
+            render_conversation();
+        }
+        red::execute("RestorePanelFocus", "agent-conversation");
+    }
 }
 
 #[red::command(
@@ -443,15 +469,45 @@ fn prompt_submitted(text: String) {
     red::state_patch(AgentState { prompt_history: history });
     red::state_patch(AgentState { proposal_notice: false });
     if state().session_id == "" {
+        stage_pending_prompt(text);
         red::execute("SetStorage", "prompt_history", history);
-        red::state_patch(AgentState { pending_prompt: text });
-        red::state_patch(AgentState { pending_prompt_block_id: "" });
-        red::state_patch(AgentState { pending_prompt_is_replay: false });
         start();
         return;
     }
     submit_prompt(text);
     red::execute("SetStorage", "prompt_history", history);
+}
+
+/// Paint the first submitted message before starting or retrying Codex.
+fn stage_pending_prompt(text: String) {
+    ensure_conversation_panel();
+    let previous = red::string(state().pending_prompt, "");
+    let block_id = red::string(state().pending_prompt_block_id, "");
+    let replay = state().pending_prompt_is_replay;
+    if previous != text || (!replay && block_id == "") {
+        remove_queued_prompt_block(block_id);
+        let generation = red::int(state().block_generation, 0) + 1;
+        block_id = "user:" + generation;
+        red::state_patch(AgentState { block_generation: generation });
+        let queued_blocks = state().queued_prompt_blocks;
+        queued_blocks = red::push(queued_blocks, AgentTextBlock {
+            id: block_id,
+            kind: "user",
+            format: "plain",
+            text: text,
+        });
+        red::state_patch(AgentState { queued_prompt_blocks: queued_blocks });
+        red::state_patch(AgentState { pending_prompt_block_id: block_id });
+        red::state_patch(AgentState { pending_prompt_is_replay: false });
+    }
+    red::state_patch(AgentState { pending_prompt: text });
+    render_conversation();
+    if state().focus_panel_on_first_prompt {
+        red::state_patch(AgentState { focus_panel_on_first_prompt: false });
+        red::execute("FocusPanel", "agent-conversation");
+    }
+    set_phase("waiting", "Starting agent…");
+    red::execute("Refresh");
 }
 
 fn submit_prompt(text: String) {
@@ -478,8 +534,7 @@ fn submit_prompt(text: String) {
             format: "plain",
             text: text,
         });
-        let bounded = bounded_transcript_blocks(queued_blocks, block_id);
-        red::state_patch(AgentState { queued_prompt_blocks: bounded.blocks });
+        red::state_patch(AgentState { queued_prompt_blocks: queued_blocks });
         if state().streaming {
             red::state_patch(AgentState { stream_trimmed: true });
         }
@@ -725,7 +780,7 @@ fn render_activity() {
     render_conversation();
 }
 
-/// Collapse the finished turn's timeline into a one-line summary (or drop it).
+/// Collapse the finished turn's timeline into one trailing summary (or drop it).
 fn collapse_activity(elapsed_ms: i64) {
     let block_id = red::string(state().activity_block_id, "");
     red::state_patch(AgentState { activity_block_id: "" });
@@ -733,47 +788,51 @@ fn collapse_activity(elapsed_ms: i64) {
     red::state_patch(AgentState { activity_rows: [] });
     red::state_patch(AgentState { thought: "" });
     let elapsed = format_turn_elapsed(elapsed_ms);
-    if block_id == "" && elapsed == "" {
+    let count = red::len(rows);
+    if block_id == "" && count == 0 && elapsed == "" {
         return;
     }
-    let count = red::len(rows);
     let blocks = state().transcript_blocks;
-    if block_id == "" {
-        let generation = red::int(state().block_generation, 0) + 1;
-        red::state_patch(AgentState { block_generation: generation });
-        block_id = "activity:" + generation;
-        blocks = red::push(blocks, AgentTextBlock {
-            id: block_id,
-            kind: "activity",
-            format: "plain",
-            text: "",
-        });
-    }
     let updated = [];
     for block in blocks {
-        if block.id == block_id {
-            let summary = "";
-            if count > 0 {
-                summary = "✓ " + count + " steps";
-                if count == 1 {
-                    summary = "✓ 1 step";
-                }
-            }
-            if elapsed != "" {
-                if summary != "" {
-                    summary = summary + "\n";
-                }
-                summary = summary + "Worked for " + elapsed;
-            }
-            if summary == "" {
-                continue;
-            }
-            block.text = summary;
+        if block.id != block_id || block_id == "" {
+            updated = red::push(updated, block);
         }
-        updated = red::push(updated, block);
+    }
+    let summary = "";
+    if count > 0 {
+        summary = "✓ " + count + " steps";
+        if count == 1 {
+            summary = "✓ 1 step";
+        }
+    }
+    if elapsed != "" {
+        if summary != "" {
+            summary = summary + " · ";
+        }
+        summary = summary + "Worked for " + elapsed;
+    }
+    if summary != "" {
+        let generation = red::int(state().block_generation, 0) + 1;
+        red::state_patch(AgentState { block_generation: generation });
+        updated = red::push(updated, AgentTextBlock {
+            id: "activity:" + generation,
+            kind: "activity",
+            format: "plain",
+            text: summary,
+        });
+        let transcript = state().transcript;
+        if transcript != "" && !red::ends_with(transcript, "\n") {
+            transcript = transcript + "\n";
+        }
+        transcript = transcript + "Activity: " + summary + "\n";
+        red::state_patch(AgentState { transcript: transcript });
     }
     red::state_patch(AgentState { transcript_blocks: updated });
     render_conversation();
+    if summary != "" {
+        red::execute("SetStorage", "transcript", state().transcript);
+    }
 }
 
 fn format_turn_elapsed(elapsed_ms: i64) -> String {
@@ -951,9 +1010,6 @@ fn update(event: AgentTextEvent) {
     }
 
     transcript = transcript + delta;
-    if red::len(transcript) > 20000 {
-        transcript = red::slice(transcript, red::len(transcript) - 20000);
-    }
     red::state_patch(AgentState { transcript: transcript });
 
     let blocks = state().transcript_blocks;
@@ -964,11 +1020,7 @@ fn update(event: AgentTextEvent) {
         }
         updated = red::push(updated, block);
     }
-    let bounded = bounded_transcript_blocks(updated, block_id);
-    red::state_patch(AgentState { transcript_blocks: bounded.blocks });
-    if bounded.trimmed {
-        red::state_patch(AgentState { stream_trimmed: true });
-    }
+    red::state_patch(AgentState { transcript_blocks: updated });
     red::state_patch(AgentState { stream_delta: red::string(state().stream_delta, "") + delta });
 
     let timer = red::string(state().stream_timer, "");
@@ -1061,9 +1113,11 @@ fn failed(event: AgentErrorEvent) {
         red::execute("Print", "Agent setup failed while a turn is active: " + event.message);
         return;
     }
+    ensure_conversation_panel();
     red::state_patch(AgentState { turn_active: false });
     collapse_activity(red::null());
     set_phase("idle", "");
+    commit_pending_prompt();
     let session_id = red::string(event.session_id, "");
     if session_id != "" && session_id == red::string(state().cancelled_session_id, "") {
         red::execute("AgentCloseSession", session_id);
@@ -1077,12 +1131,22 @@ fn failed(event: AgentErrorEvent) {
         return;
     }
     if red::string(state().pending_prompt, "") != "" || state().session_id == "" {
-        red::execute("Print", "Codex unavailable: " + event.message + ". Your prompt is preserved");
+        let has_pending_prompt = red::string(state().pending_prompt, "") != "";
+        let notice = "Codex unavailable: " + event.message;
+        if has_pending_prompt {
+            notice = notice + ". Your prompt is preserved";
+        }
+        red::execute("Print", notice);
+        let retry_label = "Retry Codex startup";
+        if has_pending_prompt {
+            retry_label = "Retry the saved prompt";
+        }
         red::execute("OpenPicker", "Retry Codex", [
-            PickerItem { id: "retry", label: "Retry the saved prompt", kind: "Action" },
+            PickerItem { id: "retry", label: retry_label, kind: "Action" },
+            PickerItem { id: "logs", label: "Open Red logs", kind: "Diagnostics" },
         ], PickerOptions {
-            placeholder: "Retry after fixing the Codex setup",
-            status: "Enter selects; Escape keeps the saved prompt",
+            placeholder: "Inspect the error in the Agent pane or choose an action",
+            status: "Enter selects · Escape keeps the diagnostic visible",
             presentation: "compact",
         }, PickerHandlers {
             selected: setup_selected,
@@ -1093,10 +1157,25 @@ fn failed(event: AgentErrorEvent) {
     }
 }
 
+/// Preserve an optimistic startup message before appending its failure.
+fn commit_pending_prompt() {
+    let text = red::string(state().pending_prompt, "");
+    let block_id = red::string(state().pending_prompt_block_id, "");
+    if text == "" || block_id == "" {
+        return;
+    }
+    remove_queued_prompt_block(block_id);
+    append_transcript_block("You", text, block_id);
+    red::execute("SetStorage", "transcript", state().transcript);
+    red::state_patch(AgentState { pending_prompt_block_id: "" });
+    red::state_patch(AgentState { pending_prompt_is_replay: true });
+}
+
 #[red::on("agent:session_lost")]
 fn session_lost(event: AgentSessionLostEvent) {
     let session_id = red::string(state().session_id, "");
     let attempted = red::string(event.prompt, "");
+    let message = red::string(event.message, "Codex app-server stopped");
     if !is_current_session(red::string(event.session_id, "")) && (session_id != "" || attempted == "") {
         return;
     }
@@ -1113,18 +1192,18 @@ fn session_lost(event: AgentSessionLostEvent) {
         red::state_patch(AgentState { pending_prompt: attempted });
         red::state_patch(AgentState { pending_prompt_block_id: "" });
         red::state_patch(AgentState { pending_prompt_is_replay: true });
-        red::execute("Print", "Codex app-server stopped; retrying the saved prompt");
+        red::execute("Print", message + "; retrying the saved prompt");
         start();
-    } else if red::string(state().pending_prompt, "") != "" {
-        failed(AgentErrorEvent { session_id: "", message: "Codex app-server stopped" });
     } else {
-        red::execute("Print", "Codex app-server stopped. Press Space A to start a new session");
+        failed(AgentErrorEvent { session_id: "", message: message });
     }
 }
 
 fn setup_selected(item: PickerItem) {
     if item.id == "retry" {
         start();
+    } else if item.id == "logs" {
+        red::execute("ViewLogs");
     }
 }
 
@@ -1147,9 +1226,6 @@ fn finish_agent_turn() {
     let transcript = state().transcript;
     if !red::ends_with(transcript, "\n") {
         transcript = transcript + "\n";
-    }
-    if red::len(transcript) > 20000 {
-        transcript = red::slice(transcript, red::len(transcript) - 20000);
     }
     red::state_patch(AgentState { transcript: transcript });
     red::state_patch(AgentState { streaming: false });
@@ -1186,9 +1262,6 @@ fn append_transcript_block(role: String, text: String, block_id: String) {
         red::state_patch(AgentState { stream_trimmed: false });
     }
     transcript = transcript + role + ": " + text + "\n";
-    if red::len(transcript) > 20000 {
-        transcript = red::slice(transcript, red::len(transcript) - 20000);
-    }
     red::state_patch(AgentState { transcript: transcript });
 
     let kind = "text";
@@ -1209,8 +1282,7 @@ fn append_transcript_block(role: String, text: String, block_id: String) {
         format: "plain",
         text: text,
     });
-    let bounded = bounded_transcript_blocks(blocks, "");
-    red::state_patch(AgentState { transcript_blocks: bounded.blocks });
+    red::state_patch(AgentState { transcript_blocks: blocks });
     render_conversation();
 }
 
@@ -1241,9 +1313,8 @@ fn transcript_restored(event: AgentTranscriptEvent) {
     let transcript = red::string(event.transcript, "");
     let blocks = legacy_transcript_blocks(transcript);
     let generation = red::len(blocks);
-    let bounded = bounded_transcript_blocks(blocks, "");
     red::state_patch(AgentState { transcript: transcript });
-    red::state_patch(AgentState { transcript_blocks: bounded.blocks });
+    red::state_patch(AgentState { transcript_blocks: blocks });
     red::state_patch(AgentState { block_generation: generation });
     red::state_patch(AgentState { streaming: false });
     red::state_patch(AgentState { stream_block_id: "" });
@@ -1253,16 +1324,11 @@ fn transcript_restored(event: AgentTranscriptEvent) {
 }
 
 fn render_conversation() {
-    let blocks = state().transcript_blocks;
-    let keep_id = red::string(state().stream_block_id, "");
+    let blocks = normalize_transcript_blocks(state().transcript_blocks);
+    red::state_patch(AgentState { transcript_blocks: blocks });
     for block in state().queued_prompt_blocks {
         blocks = red::push(blocks, block);
-        if keep_id == "" {
-            keep_id = block.id;
-        }
     }
-    let bounded = bounded_transcript_blocks(blocks, keep_id);
-    blocks = bounded.blocks;
     if red::len(blocks) == 0 {
         blocks = [AgentTextBlock {
             id: "empty",
@@ -1274,6 +1340,25 @@ fn render_conversation() {
     red::execute("UpdateTextPanel", "agent-conversation", blocks);
 }
 
+/// Normalize blocks from live, migrated, and restored state before they reach the panel.
+fn normalize_transcript_blocks(blocks: [AgentTextBlock]) -> [AgentTextBlock] {
+    let normalized = [];
+    for block in blocks {
+        let kind = red::string(block.kind, "text");
+        let format = "plain";
+        if kind == "agent" {
+            format = "markdown";
+        }
+        normalized = red::push(normalized, AgentTextBlock {
+            id: red::string(block.id, ""),
+            kind: kind,
+            format: format,
+            text: red::string(block.text, ""),
+        });
+    }
+    return normalized;
+}
+
 fn legacy_transcript_blocks(transcript: String) -> [AgentTextBlock] {
     let blocks: [AgentTextBlock] = [];
     let index = 0;
@@ -1282,6 +1367,29 @@ fn legacy_transcript_blocks(transcript: String) -> [AgentTextBlock] {
     let text = "";
     let lines = red::split(transcript, "\n");
     let line_index = 0;
+    // Older flat transcripts were capped by slicing their first characters. If
+    // that removed the leading role marker, infer the truncated fragment from
+    // the next intact turn: a following user turn means the fragment was the
+    // preceding agent response, while a following agent turn means it was the
+    // preceding user prompt. Agent is the safer fallback for a lone fragment
+    // because responses are normally much larger than prompts.
+    let leading_kind = "agent";
+    let leading_format = "markdown";
+    for line in lines {
+        if red::starts_with(line, "You: ") {
+            break;
+        }
+        if red::starts_with(line, "Agent: ") {
+            leading_kind = "user";
+            leading_format = "plain";
+            break;
+        }
+        if red::starts_with(line, "Error: ")
+            || red::starts_with(line, "Activity: ")
+            || red::starts_with(line, "System: ") {
+            break;
+        }
+    }
 
     for line in lines {
         line_index = line_index + 1;
@@ -1305,6 +1413,9 @@ fn legacy_transcript_blocks(transcript: String) -> [AgentTextBlock] {
         } else if red::starts_with(line, "Error: ") {
             next_kind = "error";
             prefix = 7;
+        } else if red::starts_with(line, "Activity: ") {
+            next_kind = "activity";
+            prefix = 10;
         } else if red::starts_with(line, "System: ") {
             next_kind = "text";
             prefix = 8;
@@ -1326,8 +1437,8 @@ fn legacy_transcript_blocks(transcript: String) -> [AgentTextBlock] {
         } else {
             if kind == "" {
                 index = index + 1;
-                kind = "text";
-                format = "plain";
+                kind = leading_kind;
+                format = leading_format;
             } else {
                 text = text + "\n";
             }
@@ -1344,39 +1455,6 @@ fn legacy_transcript_blocks(transcript: String) -> [AgentTextBlock] {
         });
     }
     return blocks;
-}
-
-fn bounded_transcript_blocks(blocks: [AgentTextBlock], keep_id: String) -> BoundedAgentBlocks {
-    let total = 0;
-    for block in blocks {
-        total = total + red::len(red::string(block.text, ""));
-    }
-    if total <= 20000 {
-        return BoundedAgentBlocks { blocks: blocks, trimmed: false };
-    }
-
-    let excess = total - 20000;
-    let bounded: [AgentTextBlock] = [];
-    let block_index = 0;
-    for block in blocks {
-        block_index = block_index + 1;
-        let text = red::string(block.text, "");
-        let length = red::len(text);
-        if excess >= length && block.id != keep_id && block_index < red::len(blocks) {
-            excess = excess - length;
-            continue;
-        }
-        if excess > 0 {
-            let cut = excess;
-            if cut > length {
-                cut = length;
-            }
-            block.text = red::slice(text, cut);
-            excess = excess - cut;
-        }
-        bounded = red::push(bounded, block);
-    }
-    return BoundedAgentBlocks { blocks: bounded, trimmed: true };
 }
 
 #[red::command(
@@ -1655,7 +1733,7 @@ fn render_history(result: AgentHistoryResult) {
     red::execute("UpdateWorkspace", "agent-history", WorkspaceModel {
         rows: rows,
         detail: state().history_detail,
-        footer: [PanelSegment { text: "r safe revert  q close", style: muted_style() }],
+        footer: [PanelSegment { text: "r safe revert  Esc/q close", style: muted_style() }],
     });
 }
 

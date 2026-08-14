@@ -300,6 +300,7 @@ Esc = { EnterMode = "Normal" }
 # "_" = "SplitVertical"
 "Ctrl-p" = "FilePicker"
 "Ctrl-Shift-p" = "CommandPalette"
+"Alt-a" = { PluginCommand = "AgentToggle" }
 "Alt-x" = "CommandPalette"
 "F1" = "CommandPalette"
 "Ctrl-j" = { PluginCommand = "BufferPicker" }
@@ -350,6 +351,7 @@ Esc = { EnterMode = "Normal" }
 "c" = "CloseWindow"
 "q" = "CloseWindow"
 "Ctrl-w" = "NextWindow"
+"r" = "EnterPaneResizeMode"
 "+" = { ResizeWindowDown = 1 }
 "-" = { ResizeWindowUp = 1 }
 "<" = { ResizeWindowLeft = 1 }

@@ -3680,6 +3680,10 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
             ctrl_w.get("v"),
             Some(&KeyAction::Single(Action::SplitVertical))
         );
+        assert_eq!(
+            ctrl_w.get("r"),
+            Some(&KeyAction::Single(Action::EnterPaneResizeMode))
+        );
         for (key, action) in [
             ("+", Action::ResizeWindowDown(1)),
             ("-", Action::ResizeWindowUp(1)),
@@ -3895,6 +3899,19 @@ max_buffer_words = 20
                 "AgentOpen".to_string()
             )))
         );
+    }
+
+    #[test]
+    fn default_config_maps_alt_a_to_agent_toggle() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+
+        assert_eq!(
+            config.keys.normal.get("Alt-a"),
+            Some(&KeyAction::Single(Action::PluginCommand(
+                "AgentToggle".to_string()
+            )))
+        );
+        assert!(!config.keys.insert.contains_key("Alt-a"));
     }
 
     #[test]
