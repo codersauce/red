@@ -1046,6 +1046,73 @@ async fn last_change_and_last_visual_marks_are_available() {
 }
 
 #[tokio::test]
+async fn gv_restores_the_last_visual_area_mode_and_direction() {
+    let buffer = Buffer::new(None, "abcdef\nsecond".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "llvh").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "Ggv").await;
+
+    harness.assert_mode(Mode::Visual);
+    assert_eq!(harness.selection(), Some((1, 0, 2, 0)));
+    harness.assert_cursor_at(1, 0);
+
+    harness.execute_action(Action::MoveLeft).await.unwrap();
+    assert_eq!(harness.selection(), Some((0, 0, 2, 0)));
+}
+
+#[tokio::test]
+async fn gv_in_visual_mode_exchanges_current_and_previous_areas() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "vl").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "llvl").await;
+    assert_eq!(harness.selection(), Some((3, 0, 4, 0)));
+
+    type_normal_keys(&mut harness, "gv").await;
+    assert_eq!(harness.selection(), Some((0, 0, 1, 0)));
+
+    type_normal_keys(&mut harness, "gv").await;
+    assert_eq!(harness.selection(), Some((3, 0, 4, 0)));
+}
+
+#[tokio::test]
+async fn gv_restores_line_and_block_modes_after_session_recovery() {
+    for mode in [Mode::VisualLine, Mode::VisualBlock] {
+        let contents = "one\ntwo\nthree";
+        let buffer = Buffer::new(None, contents.to_string());
+        let mut source = EditorHarness::with_config(buffer, default_key_config());
+        source
+            .execute_action(Action::EnterMode(mode))
+            .await
+            .unwrap();
+        source.execute_action(Action::MoveDown).await.unwrap();
+        source
+            .execute_action(Action::EnterMode(Mode::Normal))
+            .await
+            .unwrap();
+        let snapshot = source.editor.test_session_snapshot();
+
+        let buffer = Buffer::new(None, contents.to_string());
+        let mut restored = EditorHarness::with_config(buffer, default_key_config());
+        restored.editor.restore_session_snapshot(&snapshot).unwrap();
+        restored
+            .execute_action(Action::RestoreLastVisualSelection)
+            .await
+            .unwrap();
+
+        restored.assert_mode(mode);
+        assert_eq!(
+            restored.selection().map(|(_, y0, _, y1)| (y0, y1)),
+            Some((0, 1))
+        );
+    }
+}
+
+#[tokio::test]
 async fn global_mark_reopens_a_closed_file_buffer() {
     let marked_path = temp_file_path("global-mark");
     let other_path = temp_file_path("global-mark-other");
@@ -4556,6 +4623,58 @@ async fn test_undo_indent_and_unindent() {
     harness.assert_buffer_contents("line");
     harness.execute_action(Action::Undo).await.unwrap();
     harness.assert_buffer_contents("    line");
+}
+
+#[tokio::test]
+async fn visual_indent_shifts_all_selected_lines_as_one_change() {
+    let buffer = Buffer::new(None, "one\n\n  two\n   ".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "Vjjj>").await;
+
+    harness.assert_mode(Mode::Normal);
+    harness.assert_buffer_contents("    one\n\n      two\n       ");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("one\n\n  two\n   ");
+}
+
+#[tokio::test]
+async fn visual_indent_supports_character_block_and_counted_selections() {
+    for mode in [Mode::Visual, Mode::VisualBlock] {
+        let buffer = Buffer::new(None, "one\ntwo".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness
+            .execute_action(Action::EnterMode(mode))
+            .await
+            .unwrap();
+        harness.execute_action(Action::MoveDown).await.unwrap();
+        type_normal_keys(&mut harness, ">").await;
+
+        harness.assert_mode(Mode::Normal);
+        harness.assert_buffer_contents("    one\n    two");
+    }
+
+    let buffer = Buffer::new(None, "one\ntwo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "Vj2>").await;
+    harness.assert_buffer_contents("        one\n        two");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("one\ntwo");
+}
+
+#[tokio::test]
+async fn gv_reselects_lines_after_visual_indent() {
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "Vj>gv").await;
+
+    harness.assert_mode(Mode::VisualLine);
+    assert_eq!(
+        harness.selection().map(|(_, y0, _, y1)| (y0, y1)),
+        Some((0, 1))
+    );
+    harness.assert_buffer_contents("    one\n    two\nthree");
 }
 
 #[tokio::test]

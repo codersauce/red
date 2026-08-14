@@ -1,7 +1,7 @@
 # Red Vim compatibility matrix
 
-**Matrix version:** 1.3
-**Validated against:** Red 0.2.4, July 2026
+**Matrix version:** 1.4
+**Validated against:** Red 0.5.0, August 2026
 **Status vocabulary:** **supported**, **intentional difference**, **not yet supported**
 
 “Real Vim keys” means the rows marked **supported** below. It does not mean complete
@@ -44,6 +44,8 @@ the corresponding integration tests.
 | Visual character | **supported** | Motions, supported text objects, yank/delete/change/paste, and Unicode selections. |
 | Visual line | **supported** | Linewise yank/delete/change/paste, including whole-document and interior replacements. |
 | Visual block | **supported** | Block delete/change/insert, one-transaction replay, undo/redo, and dot-repeat for block insert. |
+| Restore Visual selection | **supported** | `gv` restores the previous buffer-local Visual area with its character, line, or block shape and original direction. In Visual mode it exchanges the current and previous areas. Selection metadata survives session recovery, while `<` and `>` continue to track edits. |
+| Visual indent | **supported** | `[count]>` shifts every covered line by `count × shiftwidth` in one undoable transaction for character, line, and block selections. Empty lines remain empty, and `gv` restores the shifted range. |
 | Visual `r` replace and case changes | **supported** | Visual `r{char}`, `u`, `U`, and `~` replace/change the selection in one transaction, including shifted terminal key events and Visual-line/block selections. |
 | Wrapped-line motions | **supported** | `gj`, `gk`, `g0`, `g^`, and `g$`; scroll and cursor state are window-local. |
 

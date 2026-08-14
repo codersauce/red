@@ -3523,6 +3523,25 @@ input_position = "left"
     }
 
     #[test]
+    fn default_config_maps_last_visual_restore_and_visual_indent() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+        let Some(KeyAction::Nested(normal_g)) = config.keys.normal.get("g") else {
+            panic!("default config should map normal g to nested actions");
+        };
+        let Some(KeyAction::Nested(visual_g)) = config.keys.visual.get("g") else {
+            panic!("default config should map visual g to nested actions");
+        };
+
+        let restore = Some(&KeyAction::Single(Action::RestoreLastVisualSelection));
+        assert_eq!(normal_g.get("v"), restore);
+        assert_eq!(visual_g.get("v"), restore);
+        assert_eq!(
+            config.keys.visual.get(">"),
+            Some(&KeyAction::Single(Action::IndentSelection(1)))
+        );
+    }
+
+    #[test]
     fn default_config_maps_matchit_keys() {
         let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
 

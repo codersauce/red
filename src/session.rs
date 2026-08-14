@@ -103,6 +103,9 @@ pub struct SessionSnapshot {
     /// Editor-managed special marks.
     #[serde(default)]
     pub special_marks: Vec<SessionMark>,
+    /// Buffer-local metadata needed to reconstruct the last Visual selection.
+    #[serde(default)]
+    pub last_visual_selections: Vec<SessionVisualSelection>,
     /// Human-readable agent transcript retained across recovery.
     #[serde(default)]
     pub agent_transcript: Option<String>,
@@ -190,6 +193,29 @@ pub struct SessionMark {
     pub fallback: TextPosition,
     /// Insertion-side behavior at the exact anchor.
     pub affinity: SessionAnchorAffinity,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+/// Visual selection shape retained across session recovery.
+pub enum SessionVisualMode {
+    /// Characterwise selection.
+    Character,
+    /// Linewise selection.
+    Line,
+    /// Rectangular selection.
+    Block,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// Durable metadata paired with the `<` and `>` special marks.
+pub struct SessionVisualSelection {
+    /// Buffer index used when the selection was captured.
+    pub buffer_index: usize,
+    /// Shape of the previous Visual selection.
+    pub mode: SessionVisualMode,
+    /// Whether the selection anchor is the earlier `<` endpoint.
+    pub anchor_at_start: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2263,6 +2289,7 @@ mod tests {
             local_marks: Vec::new(),
             global_marks: Vec::new(),
             special_marks: Vec::new(),
+            last_visual_selections: Vec::new(),
             agent_transcript: None,
             agent_workspace: None,
             agent_session_resumable: false,

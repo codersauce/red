@@ -110,7 +110,8 @@ use crate::{
     session::{
         capture_session_disk_fingerprint, detect_disk_divergence, read_session_disk_contents,
         RecoveryDivergence, SessionAnchorAffinity, SessionBufferSnapshot, SessionDiskFingerprint,
-        SessionJump, SessionMark, SessionSnapshot, SessionStore, SESSION_SCHEMA_VERSION,
+        SessionJump, SessionMark, SessionSnapshot, SessionStore, SessionVisualMode,
+        SessionVisualSelection, SESSION_SCHEMA_VERSION,
     },
     theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
     ui::{
@@ -1870,6 +1871,7 @@ pub enum Action {
     Save,
     SaveAs(String),
     EnterMode(Mode),
+    RestoreLastVisualSelection,
     EnterSearch(SearchDirection),
 
     Undo,
@@ -2029,6 +2031,7 @@ pub enum Action {
     ReplaceLineAt(usize, String),
 
     IndentLine,
+    IndentSelection(u16),
     UnindentLine,
 
     GoToLine(usize),
@@ -2247,7 +2250,7 @@ impl Default for CursorGoal {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 /// Editor interaction mode used by keymaps, cursor styling, and selection.
 pub enum Mode {
     /// Command-oriented navigation mode.
@@ -2410,6 +2413,12 @@ struct Rect {
     y0: usize,
     x1: usize,
     y1: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LastVisualSelection {
+    mode: Mode,
+    anchor_at_start: bool,
 }
 
 impl Rect {
@@ -2738,6 +2747,7 @@ pub struct Editor {
     local_marks: HashMap<BufferId, HashMap<char, EditAnchor>>,
     global_marks: HashMap<char, EditAnchor>,
     special_marks: HashMap<(BufferId, char), EditAnchor>,
+    last_visual_selections: HashMap<BufferId, LastVisualSelection>,
     substitute_confirmation: Option<SubstituteConfirmation>,
 
     /// Current command line content
@@ -3949,6 +3959,7 @@ impl Editor {
             local_marks: HashMap::new(),
             global_marks: HashMap::new(),
             special_marks: HashMap::new(),
+            last_visual_selections: HashMap::new(),
             substitute_confirmation: None,
             command: String::new(),
             preferences,
@@ -14625,6 +14636,34 @@ impl Editor {
         Self::leading_indentation(&self.current_line_contents().unwrap_or_default())
     }
 
+    fn indent_selection(&mut self, count: u16) -> bool {
+        let Some(selection) = self.selection else {
+            return false;
+        };
+        let first_line = selection.y0.min(selection.y1);
+        let last_line = selection.y0.max(selection.y1);
+        let indentation = self.indentation();
+        let columns = indentation
+            .shift_width
+            .saturating_mul(usize::from(count.max(1)));
+        let prefix = indentation.whitespace_for_columns(columns);
+
+        self.begin_transaction("indent selection");
+        for line in first_line..=last_line {
+            let Some(contents) = self.current_buffer().get(line) else {
+                continue;
+            };
+            if trim_line_ending(&contents).is_empty() {
+                continue;
+            }
+            self.replace_range(TextRange::insertion(TextPosition::new(line, 0)), &prefix);
+        }
+        self.move_to_text_position(TextPosition::new(first_line, 0));
+        self.selection = None;
+        self.selection_start = None;
+        self.commit_transaction(self.cursor_snapshot())
+    }
+
     /// Executes a single editor action
     ///
     /// This is the core action dispatcher that:
@@ -14947,6 +14986,15 @@ impl Editor {
                 self.begin_search(*direction);
                 self.render(buffer)?;
             }
+            Action::RestoreLastVisualSelection => {
+                add_to_history = false;
+                if self.restore_last_visual_selection() {
+                    self.render(buffer)?;
+                } else {
+                    self.last_error = Some("last visual selection is not set".to_string());
+                    self.draw_commandline(buffer);
+                }
+            }
             Action::EnterMode(new_mode) => {
                 add_to_history = false;
                 let old_mode = self.mode;
@@ -14957,7 +15005,7 @@ impl Editor {
                     new_mode,
                     Mode::Visual | Mode::VisualLine | Mode::VisualBlock
                 ) {
-                    self.capture_last_visual_marks();
+                    self.capture_last_visual_selection();
                 }
                 self.selection = None;
                 self.pending_visual_text_object_scope = None;
@@ -17972,6 +18020,15 @@ impl Editor {
                 self.notify_change(runtime).await?;
                 self.render(buffer)?;
             }
+            Action::IndentSelection(count) => {
+                self.capture_last_visual_selection();
+                let changed = self.indent_selection(*count);
+                if changed {
+                    self.notify_change(runtime).await?;
+                }
+                self.execute(&Action::EnterMode(Mode::Normal), buffer, runtime)
+                    .await?;
+            }
             Action::UnindentLine => {
                 let spaces = self.current_line_indentation();
                 let chars_to_remove = std::cmp::min(spaces, self.indentation().shift_width);
@@ -20190,6 +20247,9 @@ impl Editor {
                     KeyAction::Single(Action::ToggleCommentLines(_)) => {
                         KeyAction::Single(Action::ToggleCommentLines(count))
                     }
+                    KeyAction::Single(Action::IndentSelection(_)) => {
+                        KeyAction::Single(Action::IndentSelection(count))
+                    }
                     KeyAction::Single(Action::StartUppercaseOperator(_)) => {
                         KeyAction::Single(Action::StartUppercaseOperator(count))
                     }
@@ -20298,17 +20358,87 @@ impl Editor {
         self.special_marks.insert((anchor.buffer_id, mark), anchor);
     }
 
-    fn capture_last_visual_marks(&mut self) {
+    fn capture_last_visual_selection(&mut self) {
+        if !self.is_visual() {
+            return;
+        }
         let Some(selection) = self.selection else {
             return;
         };
         let (x0, y0, x1, y1) = selection.into();
-        let start = TextPosition::new(y0, self.grapheme_to_char_on_line(x0, y0));
-        let end = TextPosition::new(y1, self.grapheme_to_char_on_line(x1, y1));
+        let first = Point::new(x0, y0);
+        let second = Point::new(x1, y1);
+        let (start_point, end_point) = if first <= second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let start = TextPosition::new(
+            start_point.y,
+            self.grapheme_to_char_on_line(start_point.x, start_point.y),
+        );
+        let end = TextPosition::new(
+            end_point.y,
+            self.grapheme_to_char_on_line(end_point.x, end_point.y),
+        );
         let start_char = self.current_buffer().position_to_char_idx(start);
         let end_char = self.current_buffer().position_to_char_idx(end);
         self.set_special_mark_at_char('<', start_char, AnchorAffinity::Left);
         self.set_special_mark_at_char('>', end_char, AnchorAffinity::Right);
+        self.last_visual_selections.insert(
+            self.current_buffer().id(),
+            LastVisualSelection {
+                mode: self.mode,
+                anchor_at_start: self.selection_start == Some(start_point),
+            },
+        );
+    }
+
+    fn restore_last_visual_selection(&mut self) -> bool {
+        let buffer_id = self.current_buffer().id();
+        let Some(selection) = self.last_visual_selections.get(&buffer_id).copied() else {
+            return false;
+        };
+        let Some(start_anchor) = self.special_marks.get(&(buffer_id, '<')).cloned() else {
+            return false;
+        };
+        let Some(end_anchor) = self.special_marks.get(&(buffer_id, '>')).cloned() else {
+            return false;
+        };
+
+        if self.is_visual() {
+            self.capture_last_visual_selection();
+        }
+
+        let start_position = self
+            .current_buffer()
+            .char_idx_to_position(start_anchor.char_index);
+        let end_position = self
+            .current_buffer()
+            .char_idx_to_position(end_anchor.char_index);
+        let start = self.point_for_text_position(start_position);
+        let end = self.point_for_text_position(end_position);
+        let (anchor, cursor) = if selection.anchor_at_start {
+            (start, end)
+        } else {
+            (end, start)
+        };
+
+        self.mode = selection.mode;
+        self.selection_start = Some(anchor);
+        self.set_selection(start, end);
+        self.move_to_text_position(if selection.anchor_at_start {
+            end_position
+        } else {
+            start_position
+        });
+        self.pending_visual_text_object_scope = None;
+        self.pending_operator = None;
+        self.pending_character_motion = None;
+        self.refresh_cursor_goal();
+        self.selection_start = Some(anchor);
+        self.update_selection_end(cursor);
+        true
     }
 
     fn transform_anchor_for_edit(
@@ -21097,6 +21227,7 @@ impl Editor {
         self.local_marks.clear();
         self.global_marks.clear();
         self.special_marks.clear();
+        self.last_visual_selections.clear();
         for mark in &snapshot.local_marks {
             if let Some(anchor) = self.restore_session_mark(mark, &buffer_map) {
                 self.local_marks
@@ -21115,6 +21246,26 @@ impl Editor {
                 self.special_marks
                     .insert((anchor.buffer_id, mark.name), anchor);
             }
+        }
+        for selection in &snapshot.last_visual_selections {
+            let Some(buffer_position) = buffer_map.get(&selection.buffer_index).copied() else {
+                continue;
+            };
+            let Some(buffer_id) = self.buffer_manager.get(buffer_position).map(Buffer::id) else {
+                continue;
+            };
+            let mode = match selection.mode {
+                SessionVisualMode::Character => Mode::Visual,
+                SessionVisualMode::Line => Mode::VisualLine,
+                SessionVisualMode::Block => Mode::VisualBlock,
+            };
+            self.last_visual_selections.insert(
+                buffer_id,
+                LastVisualSelection {
+                    mode,
+                    anchor_at_start: selection.anchor_at_start,
+                },
+            );
         }
         self.agent_manager.set_workspace(
             snapshot
@@ -21338,6 +21489,24 @@ impl Editor {
             .iter()
             .filter_map(|((_, name), anchor)| self.snapshot_mark(*name, anchor, &buffer_indices))
             .collect();
+        let last_visual_selections = self
+            .last_visual_selections
+            .iter()
+            .filter_map(|(buffer_id, selection)| {
+                let buffer_index = *buffer_indices.get(buffer_id)?;
+                let mode = match selection.mode {
+                    Mode::Visual => SessionVisualMode::Character,
+                    Mode::VisualLine => SessionVisualMode::Line,
+                    Mode::VisualBlock => SessionVisualMode::Block,
+                    Mode::Normal | Mode::Insert | Mode::Command | Mode::Search => return None,
+                };
+                Some(SessionVisualSelection {
+                    buffer_index,
+                    mode,
+                    anchor_at_start: selection.anchor_at_start,
+                })
+            })
+            .collect();
         let agent_workspace = self
             .agent_manager
             .workspace()
@@ -21371,6 +21540,7 @@ impl Editor {
                 local_marks,
                 global_marks,
                 special_marks,
+                last_visual_selections,
                 agent_transcript,
                 agent_workspace,
                 agent_session_resumable: false,
