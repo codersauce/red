@@ -246,7 +246,7 @@ Esc = { EnterMode = "Normal" }
 "o" = "InsertLineBelowCursor"
 "O" = "InsertLineAtCursor"
 "G" = "MoveToBottom"
-"g" = { "g" = "MoveToTop", "%" = "MatchitBackward", "c" = { StartCommentOperator = 1 }, "d" = "GoToDefinition", "j" = "MoveScreenLineDown", "k" = "MoveScreenLineUp", "0" = "MoveToScreenLineStart", "^" = "MoveToScreenLineFirstNonBlank", "$" = "MoveToScreenLineEnd", "e" = "MoveToPreviousWordEnd", "E" = "MoveToPreviousBigWordEnd", "J" = { JoinLinesKeepSpaces = 2 }, "W" = "ToggleWrap", "u" = { StartLowercaseOperator = 1 }, "U" = { StartUppercaseOperator = 1 }, "~" = { StartToggleCaseOperator = 1 }, "-" = "SelectPreviousUndoBranch", "+" = "SelectNextUndoBranch" }
+"g" = { "g" = "MoveToTop", "%" = "MatchitBackward", "c" = { StartCommentOperator = 1 }, "d" = "GoToDefinition", "j" = "MoveScreenLineDown", "k" = "MoveScreenLineUp", "0" = "MoveToScreenLineStart", "^" = "MoveToScreenLineFirstNonBlank", "$" = "MoveToScreenLineEnd", "e" = "MoveToPreviousWordEnd", "E" = "MoveToPreviousBigWordEnd", "J" = { JoinLinesKeepSpaces = 2 }, "W" = "ToggleWrap", "v" = "RestoreLastVisualSelection", "u" = { StartLowercaseOperator = 1 }, "U" = { StartUppercaseOperator = 1 }, "~" = { StartToggleCaseOperator = 1 }, "-" = "SelectPreviousUndoBranch", "+" = "SelectNextUndoBranch" }
 "u" = "Undo"
 "U" = "Redo"
 "Ctrl-r" = "Redo"
@@ -401,8 +401,10 @@ Esc = { EnterMode = "Normal" }
 "p" = [ "Paste", { EnterMode = "Normal" } ]
 "P" = [ "PasteBefore", { EnterMode = "Normal" } ]
 "I" = "InsertBlock"
+">" = { IndentSelection = 1 }
+"<" = { UnindentSelection = 1 }
 "J" = [ { JoinLines = 2 }, { EnterMode = "Normal" } ]
-"g" = { "c" = [ "ToggleCommentSelection", { EnterMode = "Normal" } ], "J" = [ { JoinLinesKeepSpaces = 2 }, { EnterMode = "Normal" } ] }
+"g" = { "c" = [ "ToggleCommentSelection", { EnterMode = "Normal" } ], "J" = [ { JoinLinesKeepSpaces = 2 }, { EnterMode = "Normal" } ], "v" = "RestoreLastVisualSelection" }
 "u" = [ { TransformSelection = "Lower" }, { EnterMode = "Normal" } ]
 "U" = [ { TransformSelection = "Upper" }, { EnterMode = "Normal" } ]
 "~" = [ { TransformSelection = "Toggle" }, { EnterMode = "Normal" } ]
