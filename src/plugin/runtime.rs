@@ -2588,6 +2588,7 @@ impl RedHost {
             "detail_diff_args" => "commands::detail_diff_args",
             "hunk_diff_args" => "commands::hunk_diff_args",
             "commit_args" => "commands::commit_args",
+            "commit_history_args" => "commands::commit_history_args",
             _ => anyhow::bail!("unknown Git core operation `{operation}`"),
         };
 
@@ -11205,13 +11206,34 @@ mod tests {
 
     #[cfg(not(windows))]
     #[tokio::test]
-    async fn git_commit_scratch_includes_status_diff_and_managed_commands() {
+    async fn git_generated_commit_scratch_uses_staged_context_and_managed_commands() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let repository = tempfile::tempdir().unwrap();
         let root = repository.path();
         assert!(Command::new("git")
             .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.join("base.txt"), "base\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "base.txt"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.name=Red Test",
+                "-c",
+                "user.email=red@example.test",
+                "commit",
+                "-qm",
+                "feat(core): establish repository style",
+            ])
             .current_dir(root)
             .status()
             .unwrap()
@@ -11252,7 +11274,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let (picker, create) = match ACTION_DISPATCHER.recv_request() {
+        let (picker, generate) = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::OpenCallbackPicker {
                 handle,
                 title,
@@ -11260,16 +11282,22 @@ mod tests {
                 ..
             } => {
                 assert_eq!(title.as_deref(), Some("Commit"));
-                let create = items
+                assert_eq!(items.first().map(|item| item.id.as_str()), Some("generate"));
+                assert_eq!(
+                    items.first().map(|item| item.label.as_str()),
+                    Some("Generate message")
+                );
+                assert!(items.iter().any(|item| item.id == "create"));
+                let generate = items
                     .into_iter()
-                    .find(|item| item.id == "create")
-                    .expect("commit picker should contain Create commit");
-                (handle, create)
+                    .find(|item| item.id == "generate")
+                    .expect("commit picker should contain generated message");
+                (handle, generate)
             }
             _ => panic!("expected the commit picker"),
         };
         runtime
-            .notify_picker(picker, PickerCallback::Selected(create))
+            .notify_picker(picker, PickerCallback::Selected(generate))
             .unwrap();
         let request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::GetEditorState { request_id } => request_id,
@@ -11277,6 +11305,47 @@ mod tests {
         };
         runtime
             .resolve_request(request_id, serde_json::json!({ "version": 1 }))
+            .await
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let generation_request = loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            let mut generation_request = None;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                if let PluginRequest::GenerateCommitMessage {
+                    request_id,
+                    cwd,
+                    branch,
+                    staged_diff,
+                    recent_commits,
+                } = request
+                {
+                    assert_eq!(cwd.canonicalize().unwrap(), root.canonicalize().unwrap());
+                    assert!(branch == "master" || branch == "main");
+                    assert!(staged_diff.contains("staged.txt"));
+                    assert!(staged_diff.contains("+hello"));
+                    assert!(recent_commits.contains("feat(core): establish repository style"));
+                    generation_request = Some(request_id);
+                }
+            }
+            if let Some(request_id) = generation_request {
+                break request_id;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "commit message generation was not requested"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        runtime
+            .resolve_request(
+                generation_request,
+                serde_json::json!({
+                    "message": "feat(git): describe staged files",
+                    "error": ""
+                }),
+            )
             .await
             .unwrap();
 
@@ -11300,6 +11369,7 @@ mod tests {
                 assert_eq!(name, "[Git Commit].gitcommit");
                 assert_eq!(submit.as_deref(), Some("GitSubmitMessage"));
                 assert_eq!(cancel.as_deref(), Some("GitCancelMessage"));
+                assert!(text.starts_with("feat(git): describe staged files\n"));
                 assert!(text.contains("# --- Red commit context"));
                 assert!(text.contains("# Changes to be committed:"));
                 assert!(text.contains("staged.txt"));

@@ -43,6 +43,11 @@ struct GitPluginOptions {
     signs: GitSignGlyphs,
     staged_signs: GitSignGlyphs,
     signs_staged: GitSignGlyphs,
+    commit_generation: GitCommitGenerationOptions,
+}
+
+struct GitCommitGenerationOptions {
+    history_count: i32,
 }
 
 struct GitPluginConfig {
@@ -256,6 +261,10 @@ struct GitPluginState {
     commit_draft_text: String,
     commit_context_process: String,
     commit_context_output: String,
+    commit_generate_message: bool,
+    commit_history_count: i32,
+    commit_history_process: String,
+    commit_history_output: String,
     signs: [GitGutterSign],
     sign_jobs: [SignJob],
     prompt_kind: String,
@@ -348,6 +357,10 @@ fn initial_state() -> GitPluginState {
         commit_draft_text: "",
         commit_context_process: "",
         commit_context_output: "",
+        commit_generate_message: false,
+        commit_history_count: 20,
+        commit_history_process: "",
+        commit_history_output: "",
         signs: [],
         sign_jobs: [],
         prompt_kind: "",
@@ -554,6 +567,13 @@ fn git_config_loaded(event: GitConfigEvent) {
     merge_sign_glyphs(false, options.signs);
     merge_sign_glyphs(true, options.staged_signs);
     merge_sign_glyphs(true, options.signs_staged);
+    let generation = options.commit_generation;
+    if generation != red::null() {
+        let count = red::int(generation.history_count, 20);
+        if count < 0 { count = 0; }
+        if count > 50 { count = 50; }
+        red::state_patch(GitPluginState { commit_history_count: count });
+    }
 }
 
 fn merge_sign_glyphs(staged: bool, configured: GitSignGlyphs) {
@@ -2598,7 +2618,8 @@ fn cancel_message() { finish_commit_scratch(false, ""); }
 
 fn commit_menu() {
     red::execute("OpenPicker", "Commit", [
-        PickerItem { id: "create", label: "Create commit", kind: "Created" },
+        PickerItem { id: "generate", label: "Generate message", kind: "Codex" },
+        PickerItem { id: "create", label: "Write message", kind: "Manual" },
         PickerItem { id: "amend", label: "Amend commit", kind: "Amend" },
         PickerItem { id: "no-edit", label: "Amend without editing", kind: "Amend" },
         PickerItem { id: "cancel", label: "Cancel", kind: "Cancel" },
@@ -2616,7 +2637,11 @@ fn commit_choice(item: PickerItem) {
         open_confirmation("Amend commit", "Rewrite HEAD while keeping its message.");
         return;
     }
-    red::state_patch(GitPluginState { commit_mode: item.id });
+    let mode = item.id;
+    let generate = item.id == "generate";
+    if generate { mode = "create"; }
+    red::state_patch(GitPluginState { commit_mode: mode });
+    red::state_patch(GitPluginState { commit_generate_message: generate });
     red::request("GetEditorState", commit_snapshot_loaded);
 }
 
@@ -2626,7 +2651,11 @@ fn commit_snapshot_loaded(snapshot: Json) {
     let text = red::string(plugin_state().commit_retry_text, "");
     red::state_patch(GitPluginState { commit_retry_text: "" });
     red::state_patch(GitPluginState { commit_draft_text: text });
+    if text != "" {
+        red::state_patch(GitPluginState { commit_generate_message: false });
+    }
     red::state_patch(GitPluginState { commit_context_output: "" });
+    red::state_patch(GitPluginState { commit_history_output: "" });
     let process_id = red::execute("SpawnProcess", Process {
         command: "git",
         args: ["diff", "--cached", "--stat", "--patch", "--no-ext-diff", "--color=never"],
@@ -2658,11 +2687,84 @@ fn finish_commit_context(process_id: String) {
         return;
     }
     red::state_patch(GitPluginState { commit_context_process: "" });
+    if red::bool(plugin_state().commit_generate_message, false) {
+        if red::trim(red::string(plugin_state().commit_context_output, "")) == "" {
+            red::execute("Print", "No staged changes to describe; opening a blank commit message");
+            open_commit_editor("");
+            return;
+        }
+        let count = red::int(plugin_state().commit_history_count, 20);
+        if count <= 0 {
+            request_generated_commit_message();
+            return;
+        }
+        red::execute("Print", "Generating commit message with Codex…");
+        let process_id = red::execute("SpawnProcess", Process {
+            command: "git",
+            args: red::git_core("commit_history_args", count),
+            env: Json { GIT_PAGER: "cat", LC_ALL: "C" },
+            raw_output: true,
+            cwd: red::string(plugin_state().root, "."),
+        });
+        red::state_patch(GitPluginState { commit_history_process: process_id });
+        red::on("process:" + process_id, commit_history_event);
+        return;
+    }
+    open_commit_editor(red::string(plugin_state().commit_draft_text, ""));
+}
+
+fn commit_history_event(event: ProcessEvent) {
+    match event {
+        ProcessEvent::Stdout { process_id, line, plugin_name } => {
+            if process_id == plugin_state().commit_history_process {
+                red::state_patch(GitPluginState {
+                    commit_history_output: plugin_state().commit_history_output + line,
+                });
+            }
+        }
+        ProcessEvent::Exit { process_id, code, plugin_name } => finish_commit_history(process_id),
+        ProcessEvent::Error { process_id, message, plugin_name } => finish_commit_history(process_id),
+        ProcessEvent::Stderr { process_id, line, plugin_name } => {}
+    }
+}
+
+fn finish_commit_history(process_id: String) {
+    if process_id != plugin_state().commit_history_process { return; }
+    red::state_patch(GitPluginState { commit_history_process: "" });
+    request_generated_commit_message();
+}
+
+fn request_generated_commit_message() {
+    let state = plugin_state().state;
+    red::request(
+        "GenerateCommitMessage",
+        commit_message_generated,
+        red::string(plugin_state().root, "."),
+        Json {
+            branch: red::string(state.head, ""),
+            staged_diff: red::string(plugin_state().commit_context_output, ""),
+            recent_commits: red::string(plugin_state().commit_history_output, ""),
+        }
+    );
+}
+
+fn commit_message_generated(result: Json) {
+    let message = red::trim(red::string(result.message, ""));
+    let error = red::trim(red::string(result.error, ""));
+    if error != "" {
+        red::execute("Print", "Codex could not generate a commit message: " + error);
+    }
+    open_commit_editor(message);
+}
+
+fn open_commit_editor(message: String) {
     let text = commit_editor_text(
-        red::string(plugin_state().commit_draft_text, ""),
+        message,
         red::string(plugin_state().commit_context_output, "")
     );
     red::state_patch(GitPluginState { commit_draft_text: "" });
+    red::state_patch(GitPluginState { commit_history_output: "" });
+    red::state_patch(GitPluginState { commit_generate_message: false });
     red::request(
         "OpenScratchBuffer",
         commit_scratch_opened,

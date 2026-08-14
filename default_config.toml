@@ -475,6 +475,11 @@ delete = "▁"
 topdelete = "▔"
 changedelete = "~"
 
+# Generated commit messages use recent non-merge commits only as style examples.
+# Set this to 0 to omit commit history, or up to 50 for a larger sample.
+[plugin_config.git.commit_generation]
+history_count = 20
+
 # Symbol pickers use the global picker icon style. Set enabled to false to hide
 # their icons. Override any lowercase LSP kind with a custom string; an empty
 # string hides only that kind.
