@@ -1551,6 +1551,9 @@ pub enum PluginRequest {
     FocusPanel {
         id: String,
     },
+    RestorePanelFocus {
+        id: String,
+    },
     FocusEditor,
     SetPanelVisible {
         id: String,
@@ -1715,6 +1718,7 @@ impl PluginRequest {
             Self::ClearTextPanelComposer { .. } => "ClearTextPanelComposer",
             Self::SelectPanelRow { .. } => "SelectPanelRow",
             Self::FocusPanel { .. } => "FocusPanel",
+            Self::RestorePanelFocus { .. } => "RestorePanelFocus",
             Self::FocusEditor => "FocusEditor",
             Self::SetPanelVisible { .. } => "SetPanelVisible",
             Self::ClosePanel { .. } => "ClosePanel",
@@ -9019,6 +9023,10 @@ impl Editor {
                     self.panel_manager.focus_panel(&id);
                     needs_render = true;
                 }
+                PluginRequest::RestorePanelFocus { id } => {
+                    self.panel_manager.restore_panel_focus(&id);
+                    needs_render = true;
+                }
                 PluginRequest::FocusEditor => {
                     self.panel_manager.focus_editor();
                     needs_render = true;
@@ -11589,7 +11597,10 @@ impl Editor {
                     }
                     KeyCode::Char('H') if self.panel_manager.focused_row_panel() => "history",
                     KeyCode::Char('N') => "new",
-                    KeyCode::Char('a' | 'i') if !self.panel_manager.focused_row_panel() => {
+                    KeyCode::Char('a' | 'i')
+                        if event.modifiers.is_empty()
+                            && !self.panel_manager.focused_row_panel() =>
+                    {
                         "composer_focus"
                     }
                     KeyCode::Char('x') if !self.panel_manager.focused_row_panel() => "clear",

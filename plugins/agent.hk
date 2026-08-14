@@ -372,6 +372,27 @@ fn prompt() {
 }
 
 #[red::command(
+    name = "AgentToggle",
+    title = "Toggle agent conversation",
+    category = "Agent",
+    description = "Show or hide the agent conversation pane",
+    aliases = ["toggle chat"],
+    scope = "global",
+)]
+fn toggle_conversation() {
+    if state().panel_open {
+        close_conversation();
+    } else {
+        let was_created = state().panel_created;
+        ensure_conversation_panel();
+        if !was_created {
+            render_conversation();
+        }
+        red::execute("RestorePanelFocus", "agent-conversation");
+    }
+}
+
+#[red::command(
     name = "AgentOpen",
     title = "Open agent conversation",
     category = "Agent",

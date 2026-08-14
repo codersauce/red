@@ -354,7 +354,15 @@ pub struct TextPanel {
     busy_since: Option<Instant>,
     selected_link: Option<u64>,
     scrollback: TextPanelScrollback,
+    last_focused_region: TextPanelFocusRegion,
     layout_cache: RefCell<Option<(usize, Arc<TextPanelLayout>)>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum TextPanelFocusRegion {
+    #[default]
+    Scrollback,
+    Composer,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -526,6 +534,7 @@ impl TextPanel {
             busy_since: None,
             selected_link: None,
             scrollback: TextPanelScrollback::default(),
+            last_focused_region: TextPanelFocusRegion::default(),
             layout_cache: RefCell::new(None),
         }
     }
@@ -1097,6 +1106,34 @@ impl TextPanel {
         self.scrollback.selection_anchor = None;
         self.scrollback.mouse_anchor = None;
         self.scrollback.mouse_dragging = false;
+    }
+
+    fn remember_focused_region(&mut self) {
+        if self
+            .composer
+            .as_ref()
+            .is_some_and(|composer| composer.focused)
+        {
+            self.last_focused_region = TextPanelFocusRegion::Composer;
+        } else if self.scrollback.focused {
+            self.last_focused_region = TextPanelFocusRegion::Scrollback;
+        }
+    }
+
+    fn restore_focused_region(&mut self, width: usize) {
+        if self.last_focused_region == TextPanelFocusRegion::Composer
+            && self
+                .composer
+                .as_ref()
+                .is_some_and(|composer| composer.enabled)
+        {
+            self.blur_scrollback();
+            if let Some(composer) = self.composer.as_mut() {
+                composer.focused = true;
+            }
+        } else {
+            self.focus_scrollback(width);
+        }
     }
 
     fn selection_bounds(&self, layout: &TextPanelLayout) -> Option<(usize, usize)> {
@@ -1834,6 +1871,21 @@ impl PanelManager {
         }
     }
 
+    pub fn restore_panel_focus(&mut self, id: &str) -> bool {
+        if !self.z_order.iter().any(|panel_id| panel_id == id)
+            || (!self.panels.contains_key(id) && !self.text_panels.contains_key(id))
+        {
+            return false;
+        }
+
+        self.focused = Some(id.to_string());
+        if let Some(panel) = self.text_panels.get_mut(id) {
+            let width = effective_panel_width(&panel.config, usize::MAX);
+            panel.restore_focused_region(width);
+        }
+        true
+    }
+
     pub fn select_row_by_id(&mut self, id: &str, row_id: &str, height: usize) -> bool {
         self.panels
             .get_mut(id)
@@ -1842,14 +1894,11 @@ impl PanelManager {
 
     pub fn focus_editor(&mut self) {
         if let Some(id) = self.focused.as_deref() {
-            if let Some(composer) = self
-                .text_panels
-                .get_mut(id)
-                .and_then(|panel| panel.composer.as_mut())
-            {
-                composer.focused = false;
-            }
             if let Some(panel) = self.text_panels.get_mut(id) {
+                panel.remember_focused_region();
+                if let Some(composer) = panel.composer.as_mut() {
+                    composer.focused = false;
+                }
                 panel.blur_scrollback();
             }
         }
@@ -5307,6 +5356,15 @@ mod tests {
         );
         assert!(manager.focus_text_panel_composer("agent"));
         manager.handle_focused_text_input(&Event::Paste("keep this draft".to_string()), 80);
+        manager
+            .text_panels
+            .get_mut("agent")
+            .unwrap()
+            .composer
+            .as_mut()
+            .unwrap()
+            .prompt
+            .set_cursor(5);
 
         assert!(manager.set_panel_visible("agent", false));
         assert_eq!(manager.reserved_right_width(), 0);
@@ -5315,9 +5373,37 @@ mod tests {
 
         assert!(manager.set_panel_visible("agent", true));
         assert_eq!(manager.reserved_right_width(), 25);
-        assert!(manager.focus_text_panel_composer("agent"));
+        assert!(manager.restore_panel_focus("agent"));
+        assert!(manager.focused_text_input_active());
         let composer = manager.text_panels["agent"].composer.as_ref().unwrap();
         assert_eq!(composer.prompt.text(), "keep this draft");
+        assert_eq!(composer.prompt.cursor(), 5);
+
+        manager.update_text_panel(
+            "agent",
+            vec![TextPanelBlock {
+                id: "answer".to_string(),
+                kind: TextPanelBlockKind::Agent,
+                format: TextPanelBlockFormat::Plain,
+                text: "abcdef".to_string(),
+            }],
+            20,
+            80,
+        );
+        assert!(manager.focus_panel("agent"));
+        manager
+            .text_panels
+            .get_mut("agent")
+            .unwrap()
+            .scrollback
+            .cursor = 3;
+        assert!(manager.set_panel_visible("agent", false));
+        assert!(manager.set_panel_visible("agent", true));
+        assert!(manager.restore_panel_focus("agent"));
+        let panel = &manager.text_panels["agent"];
+        assert!(panel.scrollback.focused);
+        assert!(!panel.composer.as_ref().unwrap().focused);
+        assert_eq!(panel.scrollback.cursor, 3);
     }
 
     #[test]

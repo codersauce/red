@@ -5745,12 +5745,27 @@ async fn focused_agent_panel_keeps_global_leader_until_the_composer_is_focused()
             r#"
                 pub fn activate() {
                     red::add_command("Agent", noop, Json { scope: "global" });
+                    red::add_command("AgentToggle", noop, Json { scope: "global" });
                 }
                 fn noop() {}
             "#,
         )
         .await
         .unwrap();
+
+    let toggle = harness
+        .editor
+        .test_handle_event_with_runtime(
+            Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT)),
+            &runtime,
+        )
+        .unwrap();
+    assert_eq!(
+        toggle,
+        Some(KeyAction::Single(Action::PluginCommand(
+            "AgentToggle".to_string()
+        )))
+    );
 
     let action = harness
         .editor

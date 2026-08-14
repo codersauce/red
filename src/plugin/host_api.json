@@ -67,6 +67,7 @@
     { "name": "ClearTextPanelComposer", "kind": "execute", "signature": "(id: String)", "introduced": "0.2.0" },
     { "name": "SelectPanelRow", "kind": "execute", "signature": "(id: String, row_id: String)", "introduced": "0.1.0" },
     { "name": "FocusPanel", "kind": "execute", "signature": "(id: String)", "introduced": "0.1.0" },
+    { "name": "RestorePanelFocus", "kind": "execute", "signature": "(id: String)", "introduced": "0.5.0" },
     { "name": "FocusEditor", "kind": "execute", "signature": "()", "introduced": "0.1.0" },
     { "name": "SetPanelVisible", "kind": "execute", "signature": "(id: String, visible: bool)", "introduced": "0.2.0" },
     { "name": "ClosePanel", "kind": "execute", "signature": "(id: String)", "introduced": "0.1.0" },

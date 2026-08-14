@@ -3881,6 +3881,19 @@ max_buffer_words = 20
     }
 
     #[test]
+    fn default_config_maps_alt_a_to_agent_toggle() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+
+        assert_eq!(
+            config.keys.normal.get("Alt-a"),
+            Some(&KeyAction::Single(Action::PluginCommand(
+                "AgentToggle".to_string()
+            )))
+        );
+        assert!(!config.keys.insert.contains_key("Alt-a"));
+    }
+
+    #[test]
     fn default_config_enables_project_search() {
         let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
         let Some(KeyAction::Nested(leader)) = config.keys.normal.get(" ") else {

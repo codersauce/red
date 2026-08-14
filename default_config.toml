@@ -300,6 +300,7 @@ Esc = { EnterMode = "Normal" }
 # "_" = "SplitVertical"
 "Ctrl-p" = "FilePicker"
 "Ctrl-Shift-p" = "CommandPalette"
+"Alt-a" = { PluginCommand = "AgentToggle" }
 "Alt-x" = "CommandPalette"
 "F1" = "CommandPalette"
 "Ctrl-j" = { PluginCommand = "BufferPicker" }
