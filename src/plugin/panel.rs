@@ -1862,15 +1862,30 @@ fn render_text_panel(
     }
 
     if let Some(composer) = &panel.composer {
+        let overflow = match (scroll > 0, scroll < max_scroll) {
+            (true, true) => TextPanelOverflow::Both,
+            (true, false) => TextPanelOverflow::Above,
+            (false, true) => TextPanelOverflow::Below,
+            (false, false) => TextPanelOverflow::None,
+        };
         render_text_panel_composer(
             buffer,
             composer,
             position,
             width,
             content_height + status_height,
+            overflow,
             theme,
         );
     }
+}
+
+#[derive(Clone, Copy)]
+enum TextPanelOverflow {
+    None,
+    Above,
+    Below,
+    Both,
 }
 
 fn render_text_panel_composer(
@@ -1879,6 +1894,7 @@ fn render_text_panel_composer(
     position: Point,
     width: usize,
     top: usize,
+    overflow: TextPanelOverflow,
     theme: &Theme,
 ) {
     if width == 0 {
@@ -1931,7 +1947,18 @@ fn render_text_panel_composer(
     } else if composer.focused {
         "INSERT · Ctrl+Enter send · Enter newline · Esc normal · ^P/^N history"
     } else {
-        "a edit · x clear · N new · q close · ^C stop"
+        match overflow {
+            TextPanelOverflow::Both => {
+                "↑↓ more · j/k scroll · g/G ends · a edit · q close · ^C stop"
+            }
+            TextPanelOverflow::Below => {
+                "↓ more · j/k scroll · G latest · a edit · q close · ^C stop"
+            }
+            TextPanelOverflow::Above => {
+                "↑ history · j/k scroll · g oldest · a edit · q close · ^C stop"
+            }
+            TextPanelOverflow::None => "a edit · x clear · N new · q close · ^C stop",
+        }
     };
     let status = composer.validation.or(composer.status.as_deref());
     let status = status.map_or_else(|| hints.to_string(), |status| format!("{status} · {hints}"));
@@ -3612,6 +3639,58 @@ mod tests {
         let bottom = manager.handle_focused_key("bottom", 4, 16, 0).unwrap();
         assert!(bottom.selected_index >= page.selected_index);
         assert!(manager.text_panels["agent"].follow_tail);
+    }
+
+    #[test]
+    fn text_panel_footer_makes_offscreen_restored_history_discoverable() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 62,
+                title: Some("Agent".to_string()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 3,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_text_panel(
+            "agent",
+            vec![TextPanelBlock {
+                id: "restored".to_string(),
+                kind: TextPanelBlockKind::Agent,
+                format: TextPanelBlockFormat::Plain,
+                text: (1..=30)
+                    .map(|line| format!("restored line {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            }],
+            15,
+            80,
+        );
+        assert!(manager.focus_panel("agent"));
+        manager.handle_focused_key("top", 15, 80, 0).unwrap();
+
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(80, 15, &theme.style);
+        manager.render(&mut buffer, &theme);
+        let top = (0..15)
+            .map(|row| row_text(&buffer, row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(top.contains("↓ more · j/k scroll · G latest"));
+
+        manager.handle_focused_key("bottom", 15, 80, 0).unwrap();
+        let mut buffer = RenderBuffer::new(80, 15, &theme.style);
+        manager.render(&mut buffer, &theme);
+        let bottom = (0..15)
+            .map(|row| row_text(&buffer, row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(bottom.contains("↑ history · j/k scroll · g oldest"));
     }
 
     #[test]
