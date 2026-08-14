@@ -5983,16 +5983,16 @@ fn mouse_drag_selects_agent_scrollback_text_for_visual_yank() {
         MouseEventKind::Up(MouseButton::Left),
     ] {
         let column = if matches!(kind, MouseEventKind::Down(_)) {
-            56
+            57
         } else {
-            60
+            61
         };
         harness
             .editor
             .test_handle_event(Event::Mouse(MouseEvent {
                 kind,
                 column,
-                row: 1,
+                row: 2,
                 modifiers: KeyModifiers::NONE,
             }))
             .unwrap();

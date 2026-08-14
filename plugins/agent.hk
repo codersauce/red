@@ -735,7 +735,7 @@ fn render_activity() {
     render_conversation();
 }
 
-/// Collapse the finished turn's timeline into a one-line summary (or drop it).
+/// Collapse the finished turn's timeline into one trailing summary (or drop it).
 fn collapse_activity(elapsed_ms: i64) {
     let block_id = red::string(state().activity_block_id, "");
     red::state_patch(AgentState { activity_block_id: "" });
@@ -743,47 +743,54 @@ fn collapse_activity(elapsed_ms: i64) {
     red::state_patch(AgentState { activity_rows: [] });
     red::state_patch(AgentState { thought: "" });
     let elapsed = format_turn_elapsed(elapsed_ms);
-    if block_id == "" && elapsed == "" {
+    let count = red::len(rows);
+    if block_id == "" && count == 0 && elapsed == "" {
         return;
     }
-    let count = red::len(rows);
     let blocks = state().transcript_blocks;
-    if block_id == "" {
-        let generation = red::int(state().block_generation, 0) + 1;
-        red::state_patch(AgentState { block_generation: generation });
-        block_id = "activity:" + generation;
-        blocks = red::push(blocks, AgentTextBlock {
-            id: block_id,
-            kind: "activity",
-            format: "plain",
-            text: "",
-        });
-    }
     let updated = [];
     for block in blocks {
-        if block.id == block_id {
-            let summary = "";
-            if count > 0 {
-                summary = "✓ " + count + " steps";
-                if count == 1 {
-                    summary = "✓ 1 step";
-                }
-            }
-            if elapsed != "" {
-                if summary != "" {
-                    summary = summary + "\n";
-                }
-                summary = summary + "Worked for " + elapsed;
-            }
-            if summary == "" {
-                continue;
-            }
-            block.text = summary;
+        if block.id != block_id || block_id == "" {
+            updated = red::push(updated, block);
         }
-        updated = red::push(updated, block);
+    }
+    let summary = "";
+    if count > 0 {
+        summary = "✓ " + count + " steps";
+        if count == 1 {
+            summary = "✓ 1 step";
+        }
+    }
+    if elapsed != "" {
+        if summary != "" {
+            summary = summary + " · ";
+        }
+        summary = summary + "Worked for " + elapsed;
+    }
+    if summary != "" {
+        let generation = red::int(state().block_generation, 0) + 1;
+        red::state_patch(AgentState { block_generation: generation });
+        updated = red::push(updated, AgentTextBlock {
+            id: "activity:" + generation,
+            kind: "activity",
+            format: "plain",
+            text: summary,
+        });
+        let transcript = state().transcript;
+        if transcript != "" && !red::ends_with(transcript, "\n") {
+            transcript = transcript + "\n";
+        }
+        transcript = transcript + "Activity: " + summary + "\n";
+        if red::len(transcript) > 20000 {
+            transcript = red::slice(transcript, red::len(transcript) - 20000);
+        }
+        red::state_patch(AgentState { transcript: transcript });
     }
     red::state_patch(AgentState { transcript_blocks: updated });
     render_conversation();
+    if summary != "" {
+        red::execute("SetStorage", "transcript", state().transcript);
+    }
 }
 
 fn format_turn_elapsed(elapsed_ms: i64) -> String {
@@ -1275,7 +1282,8 @@ fn transcript_restored(event: AgentTranscriptEvent) {
 }
 
 fn render_conversation() {
-    let blocks = state().transcript_blocks;
+    let blocks = normalize_transcript_blocks(state().transcript_blocks);
+    red::state_patch(AgentState { transcript_blocks: blocks });
     let keep_id = red::string(state().stream_block_id, "");
     for block in state().queued_prompt_blocks {
         blocks = red::push(blocks, block);
@@ -1294,6 +1302,25 @@ fn render_conversation() {
         }];
     }
     red::execute("UpdateTextPanel", "agent-conversation", blocks);
+}
+
+/// Normalize blocks from live, migrated, and restored state before they reach the panel.
+fn normalize_transcript_blocks(blocks: [AgentTextBlock]) -> [AgentTextBlock] {
+    let normalized = [];
+    for block in blocks {
+        let kind = red::string(block.kind, "text");
+        let format = "plain";
+        if kind == "agent" {
+            format = "markdown";
+        }
+        normalized = red::push(normalized, AgentTextBlock {
+            id: red::string(block.id, ""),
+            kind: kind,
+            format: format,
+            text: red::string(block.text, ""),
+        });
+    }
+    return normalized;
 }
 
 fn legacy_transcript_blocks(transcript: String) -> [AgentTextBlock] {
@@ -1327,6 +1354,9 @@ fn legacy_transcript_blocks(transcript: String) -> [AgentTextBlock] {
         } else if red::starts_with(line, "Error: ") {
             next_kind = "error";
             prefix = 7;
+        } else if red::starts_with(line, "Activity: ") {
+            next_kind = "activity";
+            prefix = 10;
         } else if red::starts_with(line, "System: ") {
             next_kind = "text";
             prefix = 8;

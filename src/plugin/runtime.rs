@@ -6120,6 +6120,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_completion_moves_muted_summary_after_markdown_response_and_persists_it()
+    {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+        runtime
+            .notify(
+                "agent:session_created",
+                serde_json::json!({ "session_id": "session-summary" }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        submit_agent_prompt(&mut runtime, "explain it").await;
+        drain_requests();
+        runtime
+            .notify(
+                "agent:activity",
+                serde_json::json!({
+                    "session_id": "session-summary",
+                    "update": {
+                        "session_update": "tool_call",
+                        "tool_call_id": "tool-1",
+                        "title": "Read source",
+                        "status": "completed",
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        runtime
+            .notify(
+                "agent:update",
+                serde_json::json!({
+                    "session_id": "session-summary",
+                    "text": "### Result\n\n**Done.**",
+                }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        runtime
+            .notify(
+                "agent:completed",
+                serde_json::json!({
+                    "session_id": "session-summary",
+                    "stop_reason": "completed",
+                    "elapsed_ms": 13_000,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let mut saw_final_blocks = false;
+        let mut saw_persisted_summary = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            match request {
+                PluginRequest::UpdateTextPanel { id, blocks } => {
+                    saw_final_blocks |= id == "agent-conversation"
+                        && blocks.len() == 3
+                        && blocks[1].kind == crate::plugin::TextPanelBlockKind::Agent
+                        && blocks[1].format == crate::plugin::TextPanelBlockFormat::Markdown
+                        && blocks[1].text == "### Result\n\n**Done.**"
+                        && blocks[2].kind == crate::plugin::TextPanelBlockKind::Activity
+                        && blocks[2].text == "✓ 1 step · Worked for 13s";
+                }
+                PluginRequest::SetPluginStorage { plugin, key, value } => {
+                    saw_persisted_summary |= plugin == "agent"
+                        && key == "transcript"
+                        && value.as_str().is_some_and(|text| {
+                            text.ends_with("Activity: ✓ 1 step · Worked for 13s\n")
+                        });
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_final_blocks,
+            "completion summary must trail the response"
+        );
+        assert!(
+            saw_persisted_summary,
+            "completion summary must survive transcript restoration"
+        );
+    }
+
+    #[tokio::test]
     async fn bundled_agent_plugin_creates_prompts_streams_and_cancels() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -6404,6 +6496,15 @@ mod tests {
                     && blocks.last().is_some_and(|block| {
                         block.kind == crate::plugin::TextPanelBlockKind::Activity
                             && block.text == "Worked for 1h 2m 3s"
+                    })
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, value }
+                if plugin == "agent"
+                    && key == "transcript"
+                    && value.as_str().is_some_and(|text| {
+                        text.ends_with("Activity: Worked for 1h 2m 3s\n")
                     })
         ));
         assert!(matches!(
@@ -8617,7 +8718,9 @@ mod tests {
             .notify(
                 "agent:transcript_restored",
                 serde_json::json!({
-                    "transcript": format!("You: list the arguments\nAgent: {markdown}\nSystem: Agent stopped: end_turn\n")
+                    "transcript": format!(
+                        "You: list the arguments\nAgent: {markdown}\nActivity: Worked for 13s\nSystem: Agent stopped: end_turn\n"
+                    )
                 }),
             )
             .await
@@ -8626,7 +8729,7 @@ mod tests {
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::UpdateTextPanel { id, blocks } => {
                 assert_eq!(id, "agent-conversation");
-                assert_eq!(blocks.len(), 2);
+                assert_eq!(blocks.len(), 3);
                 assert_eq!(blocks[0].kind, crate::plugin::TextPanelBlockKind::User);
                 assert_eq!(blocks[0].text, "list the arguments");
                 assert_eq!(blocks[1].kind, crate::plugin::TextPanelBlockKind::Agent);
@@ -8635,6 +8738,8 @@ mod tests {
                     crate::plugin::TextPanelBlockFormat::Markdown
                 );
                 assert_eq!(blocks[1].text, markdown);
+                assert_eq!(blocks[2].kind, crate::plugin::TextPanelBlockKind::Activity);
+                assert_eq!(blocks[2].text, "Worked for 13s");
             }
             _ => panic!("expected restored text panel update"),
         }

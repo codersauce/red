@@ -305,6 +305,43 @@ fn theme_color(theme: &Theme, candidates: &[&str]) -> Option<Color> {
         .find_map(|candidate| theme.colors.get(*candidate).copied())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TextPanelContentMetrics {
+    inset: usize,
+    width: usize,
+}
+
+impl TextPanelContentMetrics {
+    fn new(panel_width: usize) -> Self {
+        let inset = usize::from(panel_width >= 3);
+        Self {
+            inset,
+            width: panel_width.saturating_sub(inset.saturating_mul(2)).max(1),
+        }
+    }
+
+    fn x(self, panel_x: usize) -> usize {
+        panel_x.saturating_add(self.inset)
+    }
+
+    fn contains_x(self, panel_x: usize, x: usize) -> bool {
+        let start = self.x(panel_x);
+        x >= start && x < start.saturating_add(self.width)
+    }
+
+    fn column(self, panel_x: usize, x: usize) -> usize {
+        x.saturating_sub(self.x(panel_x))
+    }
+}
+
+fn text_panel_header_rows(config: &PanelConfig) -> usize {
+    if config.title.is_some() || !config.header_actions.is_empty() {
+        2
+    } else {
+        0
+    }
+}
+
 pub struct TextPanel {
     pub id: String,
     pub config: PanelConfig,
@@ -607,9 +644,7 @@ impl TextPanel {
 
     fn visible_rows(&self, panel_height: usize) -> usize {
         panel_height
-            .saturating_sub(usize::from(
-                self.config.title.is_some() || !self.config.header_actions.is_empty(),
-            ))
+            .saturating_sub(text_panel_header_rows(&self.config))
             .saturating_sub(self.composer_height())
             .saturating_sub(self.status_height())
             .max(1)
@@ -1023,7 +1058,8 @@ impl TextPanel {
             }
         }
 
-        let mut layout = TextPanelLayout::new(self.build_rendered_lines(width));
+        let content_width = TextPanelContentMetrics::new(width).width;
+        let mut layout = TextPanelLayout::new(self.build_rendered_lines(content_width));
         if self.status.as_ref().is_some_and(|status| status.stream) {
             if let Some(line) = layout.lines.last_mut() {
                 if line.cells.last().is_some_and(|cell| cell.text == "▌") {
@@ -2236,14 +2272,17 @@ impl PanelManager {
     ) -> Option<TextPanelLinkTarget> {
         let placement = self.panel_at_position(x, y, terminal_width, terminal_height)?;
         let panel = self.text_panels.get_mut(&placement.id)?;
-        let title_rows =
-            usize::from(panel.config.title.is_some() || !panel.config.header_actions.is_empty());
+        let title_rows = text_panel_header_rows(&panel.config);
+        let metrics = TextPanelContentMetrics::new(placement.width);
         let content_height = placement
             .height
             .saturating_sub(panel.composer_height())
             .saturating_sub(panel.status_height());
         let screen_row = y.saturating_sub(placement.y);
-        if screen_row < title_rows || screen_row >= content_height {
+        if screen_row < title_rows
+            || screen_row >= content_height
+            || !metrics.contains_x(placement.x, x)
+        {
             return None;
         }
 
@@ -2257,7 +2296,7 @@ impl PanelManager {
             panel.scroll.min(max_scroll)
         };
         let line = lines.get(scroll + screen_row - title_rows)?;
-        let column = x.saturating_sub(placement.x);
+        let column = metrics.column(placement.x, x);
         let mut used = 0usize;
         for span in &line.spans {
             let end = used.saturating_add(display_width(&span.text));
@@ -2490,9 +2529,8 @@ impl PanelManager {
             .into_iter()
             .find(|placement| placement.id == id)?;
         if panel.scrollback.focused {
-            let title_rows = usize::from(
-                panel.config.title.is_some() || !panel.config.header_actions.is_empty(),
-            );
+            let title_rows = text_panel_header_rows(&panel.config);
+            let metrics = TextPanelContentMetrics::new(placement.width);
             let visible_rows = panel.visible_rows(placement.height);
             let layout = panel.layout(placement.width);
             let max_scroll = layout.lines.len().saturating_sub(visible_rows);
@@ -2504,7 +2542,7 @@ impl PanelManager {
                 return None;
             }
             return Some((
-                placement.x.saturating_add(column),
+                metrics.x(placement.x).saturating_add(column),
                 placement
                     .y
                     .saturating_add(title_rows)
@@ -2515,7 +2553,8 @@ impl PanelManager {
         if !composer.focused || !composer.enabled {
             return None;
         }
-        let content_width = placement.width.saturating_sub(2).max(1);
+        let metrics = TextPanelContentMetrics::new(placement.width);
+        let content_width = metrics.width.saturating_sub(2).max(1);
         let wrapped = wrap_text(&composer.prompt.text(), content_width);
         let (row, column) = wrapped
             .positions
@@ -2526,7 +2565,10 @@ impl PanelManager {
         let first = row.saturating_sub(rows.saturating_sub(1));
         let top = placement.height.saturating_sub(panel.composer_height());
         Some((
-            placement.x.saturating_add(2).saturating_add(column),
+            metrics
+                .x(placement.x)
+                .saturating_add(2)
+                .saturating_add(column),
             placement
                 .y
                 .saturating_add(top)
@@ -2545,11 +2587,12 @@ impl PanelManager {
         let placement = self.panel_at_position(x, y, terminal_width, terminal_height)?;
         self.focused = Some(placement.id.clone());
         if let Some(panel) = self.text_panels.get_mut(&placement.id) {
-            if y == placement.y {
+            let metrics = TextPanelContentMetrics::new(placement.width);
+            if y == placement.y && metrics.contains_x(placement.x, x) {
                 if let Some(action) = text_panel_header_action_at(
                     &panel.config,
-                    placement.width,
-                    x.saturating_sub(placement.x),
+                    metrics.width,
+                    metrics.column(placement.x, x),
                 ) {
                     return Some(PanelEvent {
                         panel_id: panel.id.clone(),
@@ -2572,7 +2615,7 @@ impl PanelManager {
             {
                 if let Some(composer) = panel.composer.as_mut() {
                     composer.focused = true;
-                    let content_width = placement.width.saturating_sub(2).max(1);
+                    let content_width = metrics.width.saturating_sub(2).max(1);
                     let wrapped = wrap_text(&composer.prompt.text(), content_width);
                     let cursor_row = wrapped
                         .positions
@@ -2581,7 +2624,7 @@ impl PanelManager {
                     let rows = composer.config.rows.max(1);
                     let first = cursor_row.saturating_sub(rows.saturating_sub(1));
                     let row = first.saturating_add(y.saturating_sub(composer_top + 1));
-                    let column = x.saturating_sub(placement.x + 2);
+                    let column = x.saturating_sub(metrics.x(placement.x).saturating_add(2));
                     if let Some((index, _)) = wrapped
                         .positions
                         .iter()
@@ -2596,9 +2639,7 @@ impl PanelManager {
                 "composer_focus"
             } else {
                 panel.focus_scrollback(placement.width);
-                let title_rows = usize::from(
-                    panel.config.title.is_some() || !panel.config.header_actions.is_empty(),
-                );
+                let title_rows = text_panel_header_rows(&panel.config);
                 let content_height = placement
                     .height
                     .saturating_sub(panel.composer_height())
@@ -2610,7 +2651,7 @@ impl PanelManager {
                     let max_scroll = layout.lines.len().saturating_sub(visible_rows);
                     let scroll = panel.viewport.visible_offset(max_scroll);
                     let row = scroll.saturating_add(screen_row.saturating_sub(title_rows));
-                    let column = x.saturating_sub(placement.x);
+                    let column = metrics.column(placement.x, x);
                     if let Some(offset) = layout.nearest_offset_on_row(row, column) {
                         panel.scrollback.cursor = offset;
                         panel.scrollback.mouse_anchor = Some(offset);
@@ -2669,8 +2710,8 @@ impl PanelManager {
         if !panel.scrollback.mouse_dragging {
             return false;
         }
-        let title_rows =
-            usize::from(panel.config.title.is_some() || !panel.config.header_actions.is_empty());
+        let title_rows = text_panel_header_rows(&panel.config);
+        let metrics = TextPanelContentMetrics::new(placement.width);
         let content_height = placement
             .height
             .saturating_sub(panel.composer_height())
@@ -2693,12 +2734,12 @@ impl PanelManager {
         let row = scroll.saturating_add(screen_row);
         let column = x
             .clamp(
-                placement.x,
-                placement
-                    .x
-                    .saturating_add(placement.width.saturating_sub(1)),
+                metrics.x(placement.x),
+                metrics
+                    .x(placement.x)
+                    .saturating_add(metrics.width.saturating_sub(1)),
             )
-            .saturating_sub(placement.x);
+            .saturating_sub(metrics.x(placement.x));
         let Some(offset) = layout.nearest_offset_on_row(row, column) else {
             return false;
         };
@@ -3069,6 +3110,8 @@ fn render_text_panel(
         return;
     }
     let palette = TextPanelPalette::new(theme, &panel.config);
+    let metrics = TextPanelContentMetrics::new(width);
+    let content_position = Point::new(metrics.x(position.x), position.y);
 
     for y in 0..height {
         buffer.set_text(
@@ -3079,31 +3122,40 @@ fn render_text_panel(
         );
     }
 
-    let header_actions = text_panel_header_actions(&panel.config, width);
-    let title_rows = usize::from(panel.config.title.is_some() || !header_actions.is_empty());
+    let header_actions = text_panel_header_actions(&panel.config, metrics.width);
+    let title_rows = text_panel_header_rows(&panel.config);
     let title_width = header_actions
         .first()
-        .map_or(width, |(start, _, _)| start.saturating_sub(1));
+        .map_or(metrics.width, |(start, _, _)| start.saturating_sub(1));
     if let Some(title) = &panel.config.title {
         let title_style = Style {
             bold: true,
             ..palette.primary.clone()
         };
         buffer.set_text(
-            position.x,
+            content_position.x,
             position.y,
             &fit_display_width(title, title_width),
             &title_style,
         );
     }
     for (start, _, label) in header_actions {
-        let x = position.x + start;
+        let x = content_position.x + start;
         buffer.set_text(x, position.y, "[", &palette.divider);
         buffer.set_text(x + 1, position.y, label, &palette.accent);
         buffer.set_text(
             x + 1 + display_width(label),
             position.y,
             "]",
+            &palette.divider,
+        );
+    }
+    if title_rows > 0 {
+        let divider = "─".repeat(width);
+        buffer.set_text(
+            position.x,
+            position.y.saturating_add(1),
+            &divider,
             &palette.divider,
         );
     }
@@ -3128,9 +3180,9 @@ fn render_text_panel(
         let line_index = scroll.saturating_add(offset);
         render_text_spans(
             buffer,
-            position.x,
+            content_position.x,
             position.y.saturating_add(title_rows + offset),
-            width,
+            metrics.width,
             line,
             layout.lines.get(line_index).map_or(0, |line| line.first),
             layout
@@ -3150,8 +3202,8 @@ fn render_text_panel(
             buffer,
             panel,
             status,
-            position,
-            width,
+            content_position,
+            metrics.width,
             content_height,
             &palette,
         );
@@ -3164,12 +3216,26 @@ fn render_text_panel(
             (false, true) => TextPanelOverflow::Below,
             (false, false) => TextPanelOverflow::None,
         };
+        let composer_top = position
+            .y
+            .saturating_add(content_height)
+            .saturating_add(status_height);
+        buffer.set_text(
+            position.x,
+            composer_top,
+            &"─".repeat(width),
+            if composer.focused {
+                &palette.accent
+            } else {
+                &palette.divider
+            },
+        );
         render_text_panel_composer(
             buffer,
             composer,
             &panel.scrollback,
-            position,
-            width,
+            content_position,
+            metrics.width,
             content_height + status_height,
             overflow,
             &palette,
@@ -3447,17 +3513,6 @@ fn render_text_panel_composer(
         return;
     }
     let top = position.y.saturating_add(top);
-    let divider = "─".repeat(width);
-    buffer.set_text(
-        position.x,
-        top,
-        &fit_display_width(&divider, width),
-        if composer.focused {
-            &palette.accent
-        } else {
-            &palette.divider
-        },
-    );
 
     let rows = composer.config.rows.max(1);
     let content_width = width.saturating_sub(2).max(1);
@@ -5189,13 +5244,13 @@ mod tests {
 
         let placement = manager.panel_at_position(40, 0, 80, 20).unwrap();
         assert_eq!(
-            manager.text_link_at_position(placement.x + 1, 2, 80, 20),
+            manager.text_link_at_position(placement.x + 1, 3, 80, 20),
             Some(TextPanelLinkTarget::ExternalUrl(
                 "https://example.com".to_string()
             ))
         );
         assert_eq!(
-            manager.text_link_at_position(placement.x + 11, 2, 80, 20),
+            manager.text_link_at_position(placement.x + 11, 3, 80, 20),
             Some(TextPanelLinkTarget::File {
                 path: "src/main.rs".to_string(),
                 location: None,
@@ -5224,7 +5279,7 @@ mod tests {
         assert!(manager.focus_text_panel_composer("agent"));
         manager.handle_focused_text_input(&Event::Paste("first line\nsecond line".to_string()), 80);
 
-        let event = manager.focus_panel_at_position(53, 15, 80, 20).unwrap();
+        let event = manager.focus_panel_at_position(54, 15, 80, 20).unwrap();
         assert_eq!(event.action, "composer_focus");
         manager.handle_focused_text_input(&Event::Paste("X".to_string()), 80);
 
@@ -5549,6 +5604,45 @@ mod tests {
     }
 
     #[test]
+    fn text_panel_insets_content_and_separates_header_chrome() {
+        let config = PanelConfig {
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+            header_actions: vec![TextPanelHeaderAction {
+                id: "close".to_string(),
+                label: "×".to_string(),
+                compact_label: Some("×".to_string()),
+            }],
+            ..PanelConfig::default()
+        };
+        let mut panel = TextPanel::new("agent".to_string(), config);
+        panel.blocks = vec![TextPanelBlock {
+            id: "agent:1".to_string(),
+            kind: TextPanelBlockKind::Agent,
+            format: TextPanelBlockFormat::Markdown,
+            text: "body".to_string(),
+        }];
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(40, 12, &theme.style);
+
+        render_text_panel(&mut buffer, &panel, Point::new(0, 0), 40, 12, &theme);
+
+        assert_eq!(text_position(&buffer, "Agent"), Some(Point::new(1, 0)));
+        assert!(buffer.cells[40..80].iter().all(|cell| cell.text == "─"));
+        assert_eq!(text_position(&buffer, "◆ Agent"), Some(Point::new(1, 2)));
+        assert_eq!(text_position(&buffer, "body"), Some(Point::new(1, 3)));
+        let composer_divider = (12 - panel.composer_height()) * 40;
+        assert!(buffer.cells[composer_divider..composer_divider + 40]
+            .iter()
+            .all(|cell| cell.text == "─"));
+        assert_eq!(TextPanelContentMetrics::new(2).inset, 0);
+        assert_eq!(TextPanelContentMetrics::new(2).width, 2);
+    }
+
+    #[test]
     fn text_panel_surface_is_stable_across_dark_light_and_high_contrast_themes() {
         for path in [
             "themes/tokyonight-storm.json",
@@ -5618,7 +5712,7 @@ mod tests {
         render_text_panel(&mut buffer, &panel, Point::new(0, 0), 26, 6, &theme);
 
         let footer = row_text(&buffer, 5).trim_end().to_string();
-        assert_eq!(footer, "INSERT · Ctrl+Enter send");
+        assert_eq!(footer, " INSERT · Ctrl+Enter send");
         assert!(!footer.ends_with('·'));
     }
 
@@ -5884,8 +5978,9 @@ mod tests {
 
         manager.render(&mut buffer, &theme);
 
-        assert!(row_text(&buffer, 0).contains("│▎ You"));
-        assert!(row_text(&buffer, 1).contains("│▎ hello"));
+        assert!(row_text(&buffer, 0).contains("│ ▎ You"));
+        assert!(row_text(&buffer, 1).contains("│ ▎ hell"));
+        assert!(row_text(&buffer, 2).contains("│ ▎ o"));
         assert!(manager.panel_at_position(7, 0, 16, 7).is_none());
         assert!(manager.panel_at_position(8, 0, 16, 7).is_some());
     }
