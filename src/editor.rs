@@ -21505,6 +21505,7 @@ impl Editor {
         }
 
         self.buffer_manager.replace_buffers(restored_buffers);
+        self.sync_diagnostic_gutter_signs();
         self.lsp_coordinator.clear_opened_documents();
         self.buffer_manager.set_active_index(
             buffer_map
@@ -30698,6 +30699,44 @@ builtin = "rust"
             Some("I")
         );
         assert!(editor.gutter_sign_manager.visible_sign(1, 0).is_none());
+    }
+
+    #[tokio::test]
+    async fn restoring_editor_state_rebuilds_diagnostic_signs_for_replaced_buffers() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original.rs");
+        let restored = root.path().join("restored.txt");
+        std::fs::write(&original, "original").unwrap();
+        std::fs::write(&restored, "restored").unwrap();
+
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(original.to_string_lossy().into_owned()),
+            "original".to_string(),
+        )]);
+        editor.config.show_diagnostics = true;
+        editor.config.diagnostics.icon_style = PickerIconStyle::Ascii;
+        let original_uri = crate::lsp::file_uri(&original).unwrap();
+        editor.add_diagnostics(
+            Some(&original_uri),
+            &[diagnostic_at(0, Some(DiagnosticSeverity::Error), "error")],
+        );
+        assert!(editor.gutter_sign_manager.visible_sign(0, 0).is_some());
+
+        let mut restored_editor = lsp_test_editor(vec![Buffer::new(
+            Some(restored.to_string_lossy().into_owned()),
+            "restored".to_string(),
+        )]);
+        let snapshot = restored_editor.editor_state_snapshot();
+        let mut render_buffer = RenderBuffer::new(60, 12, &Style::default());
+
+        let result = editor
+            .restore_editor_state(snapshot, &mut render_buffer)
+            .await
+            .unwrap();
+
+        assert!(result.restored);
+        assert_eq!(editor.buffer_manager[0].file.as_deref(), restored.to_str());
+        assert!(editor.gutter_sign_manager.visible_sign(0, 0).is_none());
     }
 
     #[tokio::test]
