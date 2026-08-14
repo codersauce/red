@@ -2792,7 +2792,11 @@ impl Editor {
         let read_only = statusline_file_is_read_only(file_path.as_deref());
         let relative_path = statusline_relative_path(file_path.as_deref(), &workspace_root);
         let context = StatuslineContext {
-            mode: format_mode_name(&self.mode).to_string(),
+            mode: if self.pane_resize_mode {
+                "RESIZE".to_string()
+            } else {
+                format_mode_name(&self.mode)
+            },
             filename: if dirty && !show_modified_separately {
                 format!("{filename} [+]")
             } else {
