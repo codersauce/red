@@ -348,6 +348,10 @@ impl PluginWorkspace {
         theme: &Theme,
         registry: &Arc<LanguageRegistry>,
     ) {
+        if model.detail_document.is_none() {
+            self.focus = WorkspaceFocus::Rows;
+            self.detail_selection_anchor = None;
+        }
         let selected_id = self
             .model
             .rows
@@ -827,7 +831,9 @@ impl WorkspaceManager {
         let workspace = self.active.as_mut()?;
         let layout = WorkspaceLayout::calculate(workspace, height, width);
         if let Some(focus) = layout.focus_at(column, row) {
-            workspace.focus = focus;
+            if focus == WorkspaceFocus::Rows || workspace.model.detail_document.is_some() {
+                workspace.focus = focus;
+            }
         }
         let visible_rows = layout.visible_rows(workspace.focus);
         match action {
@@ -1699,6 +1705,72 @@ mod tests {
             .unwrap();
         assert_eq!(event.focus, WorkspaceFocus::Detail);
         assert_eq!(event.detail_index, 3);
+    }
+
+    #[test]
+    fn passive_detail_preview_keeps_actions_focused_on_the_selected_row() {
+        let theme = Theme::default();
+        let mut manager = WorkspaceManager::default();
+        manager.open("git".to_string(), WorkspaceConfig::default());
+        manager.update(
+            "git",
+            WorkspaceModel {
+                rows: vec![row("untracked:new-file.txt", true)],
+                detail: vec![vec![PanelSegment {
+                    text: "No textual diff available.".to_string(),
+                    style: None,
+                    semantic: None,
+                }]],
+                ..WorkspaceModel::default()
+            },
+            &theme,
+        );
+
+        let layout = WorkspaceLayout::calculate(manager.active.as_ref().unwrap(), 24, 100);
+        let detail = layout
+            .detail
+            .expect("wide workspace should show the preview pane");
+        let click = manager
+            .handle_mouse("mouse_click", detail.x + 2, detail.y + 1, 24, 100)
+            .unwrap();
+        assert_eq!(click.focus, WorkspaceFocus::Rows);
+
+        let stage = manager.handle_action("s".to_string(), 24, 100).unwrap();
+        assert_eq!(stage.focus, WorkspaceFocus::Rows);
+        assert_eq!(stage.row.unwrap().id, "untracked:new-file.txt");
+        assert!(stage.detail_line.is_none());
+    }
+
+    #[test]
+    fn losing_the_detail_document_returns_focus_to_rows() {
+        let mut manager = WorkspaceManager::default();
+        manager.open("git".to_string(), WorkspaceConfig::default());
+        manager.update("git", model_with_document(), &Theme::default());
+        assert_eq!(
+            manager
+                .handle_action("toggle".to_string(), 20, 100)
+                .unwrap()
+                .focus,
+            WorkspaceFocus::Detail
+        );
+
+        manager.update(
+            "git",
+            WorkspaceModel {
+                rows: vec![row("file", true)],
+                detail: vec![vec![]],
+                ..WorkspaceModel::default()
+            },
+            &Theme::default(),
+        );
+
+        assert_eq!(
+            manager
+                .handle_action("s".to_string(), 20, 100)
+                .unwrap()
+                .focus,
+            WorkspaceFocus::Rows
+        );
     }
 
     #[test]

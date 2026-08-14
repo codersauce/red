@@ -276,6 +276,8 @@ struct GitPluginState {
     detail_rendered_section: String,
     detail_timer: String,
     pending_detail_row: Option<GitWorkspaceRow>,
+    row_action_process: String,
+    row_action_error: String,
     safe_sync_pending: bool,
     confirm_mode: String,
     confirm_args: [String],
@@ -369,6 +371,8 @@ fn initial_state() -> GitPluginState {
         detail_rendered_section: "",
         detail_timer: "",
         pending_detail_row: None,
+        row_action_process: "",
+        row_action_error: "",
         safe_sync_pending: false,
         confirm_mode: "",
         confirm_args: [],
@@ -670,7 +674,7 @@ fn update_status(output: String) {
         refresh_selected_detail(false);
     }
     let safe_sync_pending = plugin_state().safe_sync_pending;
-    if changed {
+    if changed || forced {
         render_dashboard();
     }
     if changed || forced {
@@ -1472,7 +1476,11 @@ fn finish_detail() {
     red::state_patch(GitPluginState { detail_rendered_path: path });
     red::state_patch(GitPluginState { detail_rendered_section: section });
     if output == "" {
-        red::state_patch(GitPluginState { detail: [[PanelSegment { text: "No textual diff available.", style: muted_style() }]] });
+        let message = "No textual diff available.";
+        if section == "untracked" {
+            message = "Empty file.";
+        }
+        red::state_patch(GitPluginState { detail: [[PanelSegment { text: message, style: muted_style() }]] });
         red::state_patch(GitPluginState { detail_document: None });
     } else {
         red::state_patch(GitPluginState {
@@ -1533,7 +1541,56 @@ fn run_row_action(row: Option<GitWorkspaceRow>, action: String) {
         args: args,
         cwd: red::string(plugin_state().root, "."),
     });
-    red::on("process:" + process_id, action_finished);
+    red::state_patch(GitPluginState {
+        row_action_process: process_id,
+        row_action_error: "",
+    });
+    red::on("process:" + process_id, row_action_finished);
+}
+
+fn row_action_finished(event: ProcessEvent) {
+    match event {
+        ProcessEvent::Stderr { process_id, line, plugin_name } => {
+            if process_id == plugin_state().row_action_process && plugin_state().row_action_error == "" {
+                red::state_patch(GitPluginState {
+                    row_action_error: line,
+                });
+            }
+        }
+        ProcessEvent::Error { process_id, message, plugin_name } => {
+            if process_id == plugin_state().row_action_process {
+                red::state_patch(GitPluginState {
+                    row_action_process: "",
+                    row_action_error: "",
+                });
+                red::execute("Print", "Git action failed: " + message);
+            }
+        }
+        ProcessEvent::Exit { process_id, code, plugin_name } => {
+            if process_id != plugin_state().row_action_process {
+                return;
+            }
+            let error = red::trim(plugin_state().row_action_error);
+            red::state_patch(GitPluginState {
+                row_action_process: "",
+                row_action_error: "",
+            });
+            let exit_code = 0;
+            if let Some(value) = code {
+                exit_code = value;
+            }
+            if exit_code != 0 {
+                if error != "" {
+                    red::execute("Print", error);
+                } else {
+                    red::execute("Print", "Git action failed with exit code " + exit_code);
+                }
+                return;
+            }
+            force_refresh();
+        }
+        ProcessEvent::Stdout { process_id, line, plugin_name } => {}
+    }
 }
 
 fn run_detail_action(event: GitWorkspaceEvent) {
