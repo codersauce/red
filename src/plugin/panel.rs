@@ -542,7 +542,13 @@ impl TextPanel {
     fn set_status(&mut self, status: Option<TextPanelStatus>) {
         let stream_changed = self.status.as_ref().is_some_and(|status| status.stream)
             != status.as_ref().is_some_and(|status| status.stream);
-        if stream_changed {
+        let busy_spacer_changed = self
+            .blocks
+            .last()
+            .is_some_and(|block| block.kind == TextPanelBlockKind::User)
+            && self.status.as_ref().is_some_and(|status| status.busy)
+                != status.as_ref().is_some_and(|status| status.busy);
+        if stream_changed || busy_spacer_changed {
             self.invalidate_layout();
         }
         self.busy_since = if status.as_ref().is_some_and(|status| status.busy) {
@@ -797,7 +803,14 @@ impl TextPanel {
                 TextPanelSpanStyle::Text,
             ));
         }
-        if lines.last().is_some_and(RenderedTextLine::is_empty) {
+        let separate_user_prompt_from_busy_status = self
+            .blocks
+            .last()
+            .is_some_and(|block| block.kind == TextPanelBlockKind::User)
+            && self.status.as_ref().is_some_and(|status| status.busy);
+        if lines.last().is_some_and(RenderedTextLine::is_empty)
+            && !separate_user_prompt_from_busy_status
+        {
             lines.pop();
         }
         if self.status.as_ref().is_some_and(|status| status.stream) {
@@ -5611,6 +5624,69 @@ mod tests {
         assert!(!row_text(&buffer, 8).contains("Reading demo.txt"));
         assert!((1..9).any(|row| row_text(&buffer, row).contains("partial answer")));
         assert!(!(1..9).any(|row| row_text(&buffer, row).contains("partial answer▌")));
+    }
+
+    #[test]
+    fn busy_status_leaves_a_blank_row_after_a_trailing_user_prompt() {
+        let mut panel = TextPanel::new(
+            "agent".to_string(),
+            PanelConfig {
+                width: 40,
+                ..PanelConfig::default()
+            },
+        );
+        panel.blocks = vec![
+            TextPanelBlock {
+                id: "agent:1".to_string(),
+                kind: TextPanelBlockKind::Agent,
+                format: TextPanelBlockFormat::Plain,
+                text: "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine".to_string(),
+            },
+            TextPanelBlock {
+                id: "user:2".to_string(),
+                kind: TextPanelBlockKind::User,
+                format: TextPanelBlockFormat::Plain,
+                text: "follow up".to_string(),
+            },
+        ];
+
+        assert!(!panel
+            .layout(40)
+            .rendered
+            .last()
+            .is_some_and(RenderedTextLine::is_empty));
+
+        panel.set_status(Some(TextPanelStatus {
+            busy: true,
+            label: "Waiting for agent…".to_string(),
+            stream: false,
+        }));
+        assert!(panel
+            .layout(40)
+            .rendered
+            .last()
+            .is_some_and(RenderedTextLine::is_empty));
+        panel.scroll_to_bottom(8, 40);
+
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(40, 8, &theme.style);
+        render_text_panel(&mut buffer, &panel, Point::new(0, 0), 40, 8, &theme);
+
+        let status_y = text_position(&buffer, "Waiting for agent…").unwrap().y;
+        assert_eq!(status_y, 7);
+        assert!(row_text(&buffer, status_y - 1).trim().is_empty());
+        assert!(row_text(&buffer, status_y - 2).contains("follow up"));
+
+        panel.set_status(Some(TextPanelStatus {
+            busy: false,
+            label: "Ready".to_string(),
+            stream: false,
+        }));
+        assert!(!panel
+            .layout(40)
+            .rendered
+            .last()
+            .is_some_and(RenderedTextLine::is_empty));
     }
 
     #[test]
