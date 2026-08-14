@@ -1067,6 +1067,9 @@ impl RedHost {
             "Hover" => {
                 self.send_request(PluginRequest::Action(Action::Hover));
             }
+            "ShowLineDiagnostics" => {
+                self.send_request(PluginRequest::Action(Action::ShowLineDiagnostics));
+            }
             "ViewLogs" => {
                 self.send_request(PluginRequest::Action(Action::ViewLogs));
             }

@@ -109,9 +109,9 @@ use crate::{
     },
     theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
     ui::{
-        AgentComposer, CompletionUI, Component, Confirmation, FilePicker, HoverInfo,
-        HoverInfoFormat, Info, InputPrompt, LegacyPickerOptions, Picker, PickerItem, PickerOptions,
-        PickerPreview, PickerUpdate, StatuslineLayoutPanel,
+        AgentComposer, CompletionUI, Component, Confirmation, DiagnosticInfo, FilePicker,
+        HoverInfo, HoverInfoFormat, Info, InputPrompt, LegacyPickerOptions, Picker, PickerItem,
+        PickerOptions, PickerPreview, PickerUpdate, StatuslineLayoutPanel,
     },
     undo::{AppliedTextEdit, CursorSnapshot, EditOrigin, RevertEdit, TextPosition, TextRange},
     utils::{expand_user_path, get_workspace_path},
@@ -969,6 +969,14 @@ fn hover_document(
         ),
     };
     (!text.trim().is_empty()).then_some((text, format, actions))
+}
+
+fn diagnostic_covers_line(diagnostic: &Diagnostic, line: usize) -> bool {
+    let start = &diagnostic.range.start;
+    let end = &diagnostic.range.end;
+    line >= start.line
+        && line <= end.line
+        && (start.line == end.line || line != end.line || end.character != 0)
 }
 
 fn render_marked_string(marked: MarkedString) -> String {
@@ -1947,6 +1955,7 @@ pub enum Action {
     ClearDiagnostics(String, Vec<usize>),
     RefreshDiagnostics,
     Refresh,
+    ShowLineDiagnostics,
     Hover,
     ExecuteLspCommand(Box<LspCommand>),
     FormatDocument,
@@ -5724,6 +5733,7 @@ impl Editor {
                 | Action::DoPing
                 | Action::RefreshDiagnostics
                 | Action::Refresh
+                | Action::ShowLineDiagnostics
                 | Action::Hover
                 | Action::FormatDocument
                 | Action::CodeAction
@@ -9644,6 +9654,19 @@ impl Editor {
         self.diagnostics.insert(uri, diagnostics.to_vec());
 
         Some(Action::Refresh)
+    }
+
+    fn diagnostics_for_current_line(&self) -> Option<Vec<Diagnostic>> {
+        let uri = self.current_buffer().uri().ok().flatten()?;
+        let line = self.buffer_line();
+        let diagnostics = self
+            .diagnostics
+            .get(&uri)?
+            .iter()
+            .filter(|diagnostic| diagnostic_covers_line(diagnostic, line))
+            .cloned()
+            .collect::<Vec<_>>();
+        (!diagnostics.is_empty()).then_some(diagnostics)
     }
 
     fn process_progress(&mut self, progress_params: &ProgressParams) -> Option<Action> {
@@ -16394,6 +16417,14 @@ impl Editor {
                     self.lsp
                         .hover(&file, position.character, position.line)
                         .await?;
+                }
+            }
+            Action::ShowLineDiagnostics => {
+                if let Some(diagnostics) = self.diagnostics_for_current_line() {
+                    let popup = DiagnosticInfo::new(self, diagnostics);
+                    self.release_current_dialog_callbacks(runtime);
+                    self.current_dialog = Some(Box::new(popup));
+                    self.render(buffer)?;
                 }
             }
             Action::ExecuteLspCommand(command) => {
@@ -24151,6 +24182,7 @@ impl Editor {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::lsp::DiagnosticSeverity;
     use std::path::PathBuf;
 
     fn catalog_test_package() -> plugin::catalog::CatalogPackage {
@@ -30259,6 +30291,118 @@ builtin = "rust"
         let mut editor = Editor::with_size(lsp, 60, 12, config, Theme::default(), buffers).unwrap();
         editor.test_disable_terminal_output();
         editor
+    }
+
+    fn line_diagnostic(
+        start: (usize, usize),
+        end: (usize, usize),
+        severity: DiagnosticSeverity,
+        message: &str,
+        code: Option<crate::lsp::DiagnosticCode>,
+    ) -> Diagnostic {
+        Diagnostic {
+            range: Range {
+                start: LspPosition {
+                    line: start.0,
+                    character: start.1,
+                },
+                end: LspPosition {
+                    line: end.0,
+                    character: end.1,
+                },
+            },
+            severity: Some(severity),
+            code,
+            message: message.to_string(),
+            related_information: None,
+            data: None,
+            tags: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn show_line_diagnostics_opens_a_numbered_severity_aware_popup() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("main.py");
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(file.to_string_lossy().into_owned()),
+            "first\nsecond\nthird".to_string(),
+        )]);
+        let uri = crate::lsp::file_uri(&file).unwrap();
+        editor.cy = 1;
+        editor.add_diagnostics(
+            Some(&uri),
+            &[
+                line_diagnostic(
+                    (0, 0),
+                    (2, 0),
+                    DiagnosticSeverity::Warning,
+                    "spans the current line",
+                    None,
+                ),
+                line_diagnostic(
+                    (1, 0),
+                    (1, 4),
+                    DiagnosticSeverity::Error,
+                    "missing import",
+                    Some(crate::lsp::DiagnosticCode::String(
+                        "reportMissingImports".to_string(),
+                    )),
+                ),
+            ],
+        );
+        let original = editor.current_buffer().contents();
+        let mut buffer = RenderBuffer::new(60, 12, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .execute(&Action::ShowLineDiagnostics, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert!(editor.current_dialog.is_some());
+        assert_eq!(editor.current_buffer().contents(), original);
+        let rendered = render_text_rows(&buffer).join("\n");
+        assert!(rendered.contains("Diagnostics:"), "{rendered}");
+        assert!(rendered.contains("1. spans the current line"), "{rendered}");
+        assert!(
+            rendered.contains("2. missing import [reportMissingImports]"),
+            "{rendered}"
+        );
+        assert!(rendered.contains('╭'));
+    }
+
+    #[tokio::test]
+    async fn show_line_diagnostics_is_a_safe_noop_without_a_matching_diagnostic() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("main.py");
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(file.to_string_lossy().into_owned()),
+            "first\nsecond\nthird".to_string(),
+        )]);
+        let uri = crate::lsp::file_uri(&file).unwrap();
+        editor.cy = 2;
+        editor.add_diagnostics(
+            Some(&uri),
+            &[line_diagnostic(
+                (0, 0),
+                (2, 0),
+                DiagnosticSeverity::Warning,
+                "ends before this line",
+                None,
+            )],
+        );
+        let original = editor.current_buffer().contents();
+        let mut buffer = RenderBuffer::new(60, 12, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .execute(&Action::ShowLineDiagnostics, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert!(editor.current_dialog.is_none());
+        assert_eq!(editor.current_buffer().contents(), original);
     }
 
     #[tokio::test]
