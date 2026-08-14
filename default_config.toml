@@ -266,7 +266,7 @@ Esc = { EnterMode = "Normal" }
 "X" = { DeletePreviousChars = 1 }
 "s" = { ChangeCharsAtCursor = 1 }
 "S" = { ChangeCurrentLines = 1 }
-"D" = { DeleteToLineEnd = 1 }
+"D" = "ShowLineDiagnostics"
 "C" = { ChangeToLineEnd = 1 }
 "Y" = { YankToLineEnd = 1 }
 "J" = { JoinLines = 2 }

@@ -9,6 +9,42 @@ pub(crate) struct ScreenRect {
     pub(crate) height: usize,
 }
 
+/// Fits a cursor-anchored popup inside the editor viewport.
+///
+/// The popup prefers the side of the cursor with the most vertical room and
+/// shifts left when its right edge would leave the viewport. The returned
+/// height is the visible content height; callers add their own border cells.
+pub(crate) fn anchored_popup_geometry(
+    anchor: (usize, usize),
+    viewport_width: usize,
+    viewport_height: usize,
+    content_width: usize,
+    content_height: usize,
+) -> (usize, usize, usize) {
+    let width = content_width.min(viewport_width.saturating_sub(2));
+    let max_x = viewport_width.saturating_sub(width.saturating_add(2));
+    let wide = width.saturating_add(2) >= viewport_width.saturating_mul(2) / 3;
+    let x = if wide {
+        usize::from(max_x > 0)
+    } else {
+        anchor.0.min(max_x)
+    };
+    let below = viewport_height.saturating_sub(anchor.1.saturating_add(3));
+    let above = anchor.1.saturating_sub(2);
+    let capacity = if below >= content_height || below >= above {
+        below
+    } else {
+        above
+    };
+    let height = content_height.min(capacity);
+    let y = if capacity == above && above > below {
+        anchor.1.saturating_sub(height.saturating_add(2))
+    } else {
+        anchor.1.saturating_add(1)
+    };
+    (x, y, height)
+}
+
 impl ScreenRect {
     /// Returns whether an absolute terminal cell lies inside the rectangle.
     #[must_use]
@@ -36,7 +72,7 @@ impl ScreenRect {
 
 #[cfg(test)]
 mod tests {
-    use super::ScreenRect;
+    use super::{anchored_popup_geometry, ScreenRect};
 
     #[test]
     fn rectangle_uses_exclusive_saturating_edges() {
@@ -67,5 +103,12 @@ mod tests {
         assert!(!rect.contains(usize::MAX, usize::MAX));
         assert_eq!(rect.content_height(), 0);
         assert_eq!(rect.content_offset(usize::MAX), None);
+    }
+
+    #[test]
+    fn anchored_popup_prefers_available_space_and_stays_in_bounds() {
+        assert_eq!(anchored_popup_geometry((8, 1), 20, 10, 8, 3), (8, 2, 3));
+        assert_eq!(anchored_popup_geometry((18, 8), 20, 10, 8, 3), (10, 3, 3));
+        assert_eq!(anchored_popup_geometry((0, 0), 1, 1, 8, 3), (0, 1, 0));
     }
 }

@@ -16,6 +16,7 @@ use crate::{
 
 use super::{
     dialog::{BorderStyle, Dialog, SurfaceRole},
+    geometry::anchored_popup_geometry,
     paint_rich_text, ActionPriority, Component, UiAction,
 };
 
@@ -77,7 +78,7 @@ impl HoverInfo {
             &editor.language_registry(),
             &actions,
         );
-        let (x, y, height) = hover_geometry(
+        let (x, y, height) = anchored_popup_geometry(
             anchor,
             viewport_width,
             viewport_height,
@@ -171,7 +172,7 @@ impl HoverInfo {
             &self.registry,
             &self.actions,
         );
-        let (x, y, height) = hover_geometry(
+        let (x, y, height) = anchored_popup_geometry(
             self.anchor,
             viewport_width,
             viewport_height,
@@ -459,37 +460,6 @@ fn hover_width_limit(source: &str, format: HoverInfoFormat, viewport_width: usiz
     } else {
         MAX_PROSE_HOVER_WIDTH
     })
-}
-
-fn hover_geometry(
-    anchor: (usize, usize),
-    viewport_width: usize,
-    viewport_height: usize,
-    content_width: usize,
-    content_height: usize,
-) -> (usize, usize, usize) {
-    let width = content_width.min(viewport_width.saturating_sub(2));
-    let max_x = viewport_width.saturating_sub(width.saturating_add(2));
-    let wide = width.saturating_add(2) >= viewport_width.saturating_mul(2) / 3;
-    let x = if wide {
-        usize::from(max_x > 0)
-    } else {
-        anchor.0.min(max_x)
-    };
-    let below = viewport_height.saturating_sub(anchor.1.saturating_add(3));
-    let above = anchor.1.saturating_sub(2);
-    let capacity = if below >= content_height || below >= above {
-        below
-    } else {
-        above
-    };
-    let height = content_height.min(capacity);
-    let y = if capacity == above && above > below {
-        anchor.1.saturating_sub(height.saturating_add(2))
-    } else {
-        anchor.1.saturating_add(1)
-    };
-    (x, y, height)
 }
 
 fn line_width(line: &RenderedTextLine) -> usize {

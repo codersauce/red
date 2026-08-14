@@ -10,6 +10,7 @@
     { "name": "CloseDialog", "kind": "execute", "signature": "()", "introduced": "0.1.0" },
     { "name": "GoToDefinition", "kind": "execute", "signature": "()", "introduced": "0.1.0" },
     { "name": "Hover", "kind": "execute", "signature": "()", "introduced": "0.1.0" },
+    { "name": "ShowLineDiagnostics", "kind": "execute", "signature": "()", "introduced": "0.8.0" },
     { "name": "ViewLogs", "kind": "execute", "signature": "()", "introduced": "0.1.0" },
     { "name": "ListPlugins", "kind": "execute", "signature": "()", "introduced": "0.1.0" },
     { "name": "PreviewTheme", "kind": "execute", "signature": "(theme: String)", "introduced": "0.1.0" },

@@ -769,6 +769,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Action::Hover,
         ),
         builtin(
+            "lsp.line_diagnostics",
+            "Show line diagnostics",
+            "LSP",
+            "Inspect every diagnostic that covers the current line",
+            None,
+            &["diagnostic", "error", "warning"],
+            Action::ShowLineDiagnostics,
+        ),
+        builtin(
             "lsp.format",
             "Format document",
             "LSP",
@@ -1013,6 +1022,7 @@ fn action_label(action: &Action) -> String {
         Action::CodeAction => "Show code actions".to_string(),
         Action::StartRename => "Rename symbol".to_string(),
         Action::Hover => "Show hover documentation".to_string(),
+        Action::ShowLineDiagnostics => "Show line diagnostics".to_string(),
         Action::SignatureHelp => "Show signature help".to_string(),
         Action::ClearSearchHighlight => "Clear search highlights".to_string(),
         Action::ToggleWrap => "Toggle line wrapping".to_string(),
@@ -1450,6 +1460,18 @@ mod tests {
         assert!(filter_score(git, "Space G").is_some());
         assert!(filter_score(git, "source control").is_some());
         assert!(filter_score(git, "git dashboard").is_some());
+    }
+
+    #[test]
+    fn line_diagnostics_command_exposes_the_default_shift_d_shortcut() {
+        let commands = entries(&default_keys(), &[]);
+        let diagnostics = commands
+            .iter()
+            .find(|entry| entry.id == "lsp.line_diagnostics")
+            .expect("line diagnostics command");
+
+        assert_eq!(diagnostics.action, Action::ShowLineDiagnostics);
+        assert_eq!(diagnostics.shortcuts, vec!["D"]);
     }
 
     #[test]

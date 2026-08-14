@@ -420,6 +420,15 @@ fn default_key_config() -> Config {
     toml::from_str(include_str!("../default_config.toml")).unwrap()
 }
 
+fn line_end_delete_key_config() -> Config {
+    let mut config = default_key_config();
+    config.keys.normal.insert(
+        "D".to_string(),
+        KeyAction::Single(Action::DeleteToLineEnd(1)),
+    );
+    config
+}
+
 fn comment_harness(file: &str, contents: &str) -> EditorHarness {
     let buffer = Buffer::new(Some(file.to_string()), contents.to_string());
     EditorHarness::with_config(buffer, default_key_config())
@@ -2895,7 +2904,7 @@ async fn test_delete_line() {
 async fn test_delete_to_end_of_line() {
     let mut harness = EditorHarness::with_config(
         Buffer::new(None, "Hello World Test".to_string()),
-        default_key_config(),
+        line_end_delete_key_config(),
     );
 
     type_normal_keys(&mut harness, "wD").await;
@@ -7672,7 +7681,7 @@ async fn vim_editing_shortcuts_honor_counts_and_register_kinds() {
     for (contents, keys, expected) in cases {
         let mut harness = EditorHarness::with_config(
             Buffer::new(None, contents.to_string()),
-            default_key_config(),
+            line_end_delete_key_config(),
         );
 
         type_normal_keys(&mut harness, keys).await;
@@ -7715,7 +7724,7 @@ async fn vim_line_end_changes_repeat_at_the_new_cursor() {
     for (keys, expected) in [("wCX", "one X\nthree X"), ("wD", "one \nthree ")] {
         let mut harness = EditorHarness::with_config(
             Buffer::new(None, "one two\nthree four".to_string()),
-            default_key_config(),
+            line_end_delete_key_config(),
         );
         type_normal_keys(&mut harness, keys).await;
         if harness.is_insert() {

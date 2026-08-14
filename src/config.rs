@@ -3191,6 +3191,16 @@ env = { NO_BROWSER = "1" }
     }
 
     #[test]
+    fn default_config_maps_shift_d_to_line_diagnostics() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+
+        assert_eq!(
+            config.keys.normal.get("D"),
+            Some(&KeyAction::Single(Action::ShowLineDiagnostics))
+        );
+    }
+
+    #[test]
     fn default_config_maps_neovim_style_search_keys() {
         let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
 
