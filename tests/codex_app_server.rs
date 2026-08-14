@@ -162,6 +162,49 @@ async fn direct_app_server_streams_and_routes_writes_to_the_host() {
 }
 
 #[tokio::test]
+async fn direct_app_server_starts_without_managed_feature_requirements() {
+    for requirements in [
+        json!({"allowedSandboxModes": ["read-only"]}),
+        json!({"allowedSandboxModes": ["read-only"], "featureRequirements": null}),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let codex = mock_codex(directory.path());
+        let host = RecordingHost {
+            writes: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut spec = CodexProcessSpec::new(codex, directory.path());
+        spec.environment.insert(
+            "RED_MOCK_REQUIREMENTS".into(),
+            requirements.to_string().into(),
+        );
+        let (mut bridge, task) = start_codex(spec, host, NonZeroUsize::new(32).unwrap()).unwrap();
+
+        bridge
+            .send(CodexCommand::NewSession {
+                cwd: directory.path().to_path_buf(),
+            })
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(event) = bridge.try_recv() {
+                    break event;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(event, CodexEvent::SessionCreated { session_id } if session_id == "thread-red")
+        );
+        drop(bridge);
+        task.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
 async fn direct_app_server_starts_with_required_hooks() {
     let directory = tempfile::tempdir().unwrap();
     let codex = mock_codex(directory.path());

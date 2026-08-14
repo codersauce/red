@@ -4132,6 +4132,77 @@ mod tests {
         }
     }
 
+    fn recv_optimistic_agent_start(
+        prompt: &str,
+        expected_history: serde_json::Value,
+        expect_panel_creation: bool,
+    ) -> RequestId {
+        let mut created = false;
+        let mut focused = false;
+        let mut rendered = false;
+        let mut busy = false;
+        let mut refreshed = false;
+        let mut history_saved = false;
+
+        loop {
+            match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::CreateTextPanel { id, .. } => {
+                    assert_eq!(id, "agent-conversation");
+                    created = true;
+                }
+                PluginRequest::UpdateTextPanel { id, blocks } => {
+                    assert_eq!(id, "agent-conversation");
+                    assert_eq!(
+                        blocks
+                            .iter()
+                            .filter(|block| {
+                                block.kind == crate::plugin::TextPanelBlockKind::User
+                                    && block.text == prompt
+                            })
+                            .count(),
+                        1,
+                        "an optimistic prompt must appear exactly once"
+                    );
+                    rendered = true;
+                }
+                PluginRequest::FocusPanel { id } => {
+                    assert_eq!(id, "agent-conversation");
+                    focused = true;
+                }
+                PluginRequest::SetTextPanelStatus {
+                    id,
+                    status: Some(status),
+                } => {
+                    assert_eq!(id, "agent-conversation");
+                    assert!(status.busy);
+                    assert_eq!(status.label, "Starting agent…");
+                    busy = true;
+                }
+                PluginRequest::Action(Action::Refresh) => {
+                    assert!(rendered, "the prompt must render before refresh");
+                    assert!(busy, "the startup status must render before refresh");
+                    refreshed = true;
+                }
+                PluginRequest::SetPluginStorage { plugin, key, value } => {
+                    assert_eq!(plugin, "agent");
+                    assert_eq!(key, "prompt_history");
+                    assert_eq!(value, expected_history);
+                    assert!(refreshed, "paint the prompt before persisting history");
+                    history_saved = true;
+                }
+                PluginRequest::GetConfig { request_id, key } => {
+                    assert_eq!(key.as_deref(), Some("cwd"));
+                    assert!(refreshed, "paint the prompt before starting Codex");
+                    assert!(history_saved, "save prompt history before requesting Codex");
+                    assert_eq!(created, expect_panel_creation);
+                    assert_eq!(focused, expect_panel_creation);
+                    return request_id;
+                }
+                _ => panic!("unexpected request before optimistic agent startup"),
+            }
+        }
+    }
+
     async fn submit_agent_prompt(runtime: &mut Runtime, prompt: &str) {
         runtime.execute_command("AgentPrompt").await.unwrap();
         match ACTION_DISPATCHER.recv_request() {
@@ -5920,21 +5991,11 @@ mod tests {
                 ComposerCallback::Submitted("explain the workspace".to_string()),
             )
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, value }
-                if plugin == "agent"
-                    && key == "prompt_history"
-                    && value == serde_json::json!(["explain the workspace"])
-        ));
-
-        let request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(key.as_deref(), Some("cwd"));
-                request_id
-            }
-            _ => panic!("expected the pending prompt to request the workspace root"),
-        };
+        let request_id = recv_optimistic_agent_start(
+            "explain the workspace",
+            serde_json::json!(["explain the workspace"]),
+            true,
+        );
         runtime
             .resolve_request(request_id, serde_json::json!({ "value": "/workspace" }))
             .await
@@ -5954,10 +6015,6 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
             PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
         ));
         assert!(matches!(
@@ -5970,10 +6027,6 @@ mod tests {
                 if id == "agent-conversation"
                     && blocks.len() == 1
                     && blocks[0].text == "explain the workspace"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::FocusPanel { id } if id == "agent-conversation"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -7951,18 +8004,11 @@ mod tests {
                 ComposerCallback::Submitted("keep this prompt".to_string()),
             )
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, .. }
-                if plugin == "agent" && key == "prompt_history"
-        ));
-        let cwd_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(key.as_deref(), Some("cwd"));
-                request_id
-            }
-            _ => panic!("expected the lazy-start current-directory request"),
-        };
+        let cwd_request_id = recv_optimistic_agent_start(
+            "keep this prompt",
+            serde_json::json!(["keep this prompt"]),
+            true,
+        );
         runtime
             .resolve_request(cwd_request_id, serde_json::json!({ "value": "/workspace" }))
             .await
@@ -7986,16 +8032,28 @@ mod tests {
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetTextPanelStatus { id, status: None }
                 if id == "agent-conversation"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.len() == 1
+                    && blocks[0].text == "keep this prompt"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, .. }
+                if plugin == "agent" && key == "transcript"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.len() == 2
+                    && blocks[0].text == "keep this prompt"
+                    && blocks[1].text == "Codex app-server stopped"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -8405,13 +8463,7 @@ mod tests {
                 .take(49)
                 .cloned(),
         );
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, value }
-                if plugin == "agent"
-                    && key == "prompt_history"
-                    && value == serde_json::json!(expected_saved)
-        ));
+        let _ = recv_optimistic_agent_start(&submitted, serde_json::json!(expected_saved), true);
     }
 
     #[tokio::test]
@@ -8452,20 +8504,11 @@ mod tests {
                 ComposerCallback::Submitted("inspect unsaved changes".to_string()),
             )
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, value }
-                if plugin == "agent"
-                    && key == "prompt_history"
-                    && value == serde_json::json!(["inspect unsaved changes"])
-        ));
-        let cwd_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(key.as_deref(), Some("cwd"));
-                request_id
-            }
-            _ => panic!("expected lazy agent current-directory request"),
-        };
+        let cwd_request_id = recv_optimistic_agent_start(
+            "inspect unsaved changes",
+            serde_json::json!(["inspect unsaved changes"]),
+            true,
+        );
         runtime
             .resolve_request(cwd_request_id, serde_json::json!({ "value": "/workspace" }))
             .await
@@ -8484,16 +8527,28 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
             PluginRequest::SetTextPanelStatus { id, status: None }
                 if id == "agent-conversation"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.len() == 1
+                    && blocks[0].text == "inspect unsaved changes"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::SetPluginStorage { plugin, key, .. }
+                if plugin == "agent" && key == "transcript"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, blocks }
+                if id == "agent-conversation"
+                    && blocks.len() == 2
+                    && blocks[0].text == "inspect unsaved changes"
+                    && blocks[1].text == "Codex login required"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
@@ -8560,18 +8615,11 @@ mod tests {
                 ComposerCallback::Submitted("inspect unsaved changes".to_string()),
             )
             .unwrap();
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, .. }
-                if plugin == "agent" && key == "prompt_history"
-        ));
-        let cwd_request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetConfig { request_id, key } => {
-                assert_eq!(key.as_deref(), Some("cwd"));
-                request_id
-            }
-            _ => panic!("expected agent retry current-directory request"),
-        };
+        let cwd_request_id = recv_optimistic_agent_start(
+            "inspect unsaved changes",
+            serde_json::json!(["inspect unsaved changes"]),
+            false,
+        );
         runtime
             .resolve_request(cwd_request_id, serde_json::json!({ "value": "/workspace" }))
             .await
@@ -8595,28 +8643,6 @@ mod tests {
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),
             PluginRequest::Action(Action::Print(message)) if message == "Agent session started"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::FocusPanel { id } if id == "agent-conversation"
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetTextPanelStatus { id, status: Some(status) }
-                if id == "agent-conversation" && status.busy
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::Action(Action::Refresh)
-        ));
-        assert!(matches!(
-            ACTION_DISPATCHER.recv_request(),
-            PluginRequest::SetPluginStorage { plugin, key, .. }
-                if plugin == "agent" && key == "transcript"
         ));
         assert!(matches!(
             ACTION_DISPATCHER.recv_request(),

@@ -448,15 +448,45 @@ fn prompt_submitted(text: String) {
     red::state_patch(AgentState { prompt_history: history });
     red::state_patch(AgentState { proposal_notice: false });
     if state().session_id == "" {
+        stage_pending_prompt(text);
         red::execute("SetStorage", "prompt_history", history);
-        red::state_patch(AgentState { pending_prompt: text });
-        red::state_patch(AgentState { pending_prompt_block_id: "" });
-        red::state_patch(AgentState { pending_prompt_is_replay: false });
         start();
         return;
     }
     submit_prompt(text);
     red::execute("SetStorage", "prompt_history", history);
+}
+
+/// Paint the first submitted message before starting or retrying Codex.
+fn stage_pending_prompt(text: String) {
+    ensure_conversation_panel();
+    let previous = red::string(state().pending_prompt, "");
+    let block_id = red::string(state().pending_prompt_block_id, "");
+    let replay = state().pending_prompt_is_replay;
+    if previous != text || (!replay && block_id == "") {
+        remove_queued_prompt_block(block_id);
+        let generation = red::int(state().block_generation, 0) + 1;
+        block_id = "user:" + generation;
+        red::state_patch(AgentState { block_generation: generation });
+        let queued_blocks = state().queued_prompt_blocks;
+        queued_blocks = red::push(queued_blocks, AgentTextBlock {
+            id: block_id,
+            kind: "user",
+            format: "plain",
+            text: text,
+        });
+        red::state_patch(AgentState { queued_prompt_blocks: queued_blocks });
+        red::state_patch(AgentState { pending_prompt_block_id: block_id });
+        red::state_patch(AgentState { pending_prompt_is_replay: false });
+    }
+    red::state_patch(AgentState { pending_prompt: text });
+    render_conversation();
+    if state().focus_panel_on_first_prompt {
+        red::state_patch(AgentState { focus_panel_on_first_prompt: false });
+        red::execute("FocusPanel", "agent-conversation");
+    }
+    set_phase("waiting", "Starting agent…");
+    red::execute("Refresh");
 }
 
 fn submit_prompt(text: String) {
@@ -1066,6 +1096,7 @@ fn failed(event: AgentErrorEvent) {
     red::state_patch(AgentState { turn_active: false });
     collapse_activity(red::null());
     set_phase("idle", "");
+    commit_pending_prompt();
     let session_id = red::string(event.session_id, "");
     if session_id != "" && session_id == red::string(state().cancelled_session_id, "") {
         red::execute("AgentCloseSession", session_id);
@@ -1103,6 +1134,20 @@ fn failed(event: AgentErrorEvent) {
     } else {
         red::execute("Print", "Agent error: " + event.message);
     }
+}
+
+/// Preserve an optimistic startup message before appending its failure.
+fn commit_pending_prompt() {
+    let text = red::string(state().pending_prompt, "");
+    let block_id = red::string(state().pending_prompt_block_id, "");
+    if text == "" || block_id == "" {
+        return;
+    }
+    remove_queued_prompt_block(block_id);
+    append_transcript_block("You", text, block_id);
+    red::execute("SetStorage", "transcript", state().transcript);
+    red::state_patch(AgentState { pending_prompt_block_id: "" });
+    red::state_patch(AgentState { pending_prompt_is_replay: true });
 }
 
 #[red::on("agent:session_lost")]

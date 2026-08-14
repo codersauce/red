@@ -1234,9 +1234,13 @@ fn required_hooks_mode(response: &Value) -> Option<bool> {
     if requirements.is_null() {
         return Some(false);
     }
-    let features = response
-        .pointer("/result/requirements/featureRequirements")
-        .and_then(Value::as_object)?;
+    let Some(features) = requirements.get("featureRequirements") else {
+        return Some(false);
+    };
+    if features.is_null() {
+        return Some(false);
+    }
+    let features = features.as_object()?;
     if [
         "apps",
         "connectors",
@@ -1530,6 +1534,32 @@ mod tests {
             json!({"result": {}}),
         ] {
             assert_eq!(required_hooks_mode(&response), Some(false));
+        }
+    }
+
+    #[test]
+    fn required_hooks_mode_disables_hooks_without_feature_requirements() {
+        for requirements in [
+            json!({"allowedSandboxModes": ["read-only", "workspace-write"]}),
+            json!({
+                "allowedSandboxModes": ["read-only", "workspace-write"],
+                "featureRequirements": null
+            }),
+        ] {
+            let response = json!({"result": {"requirements": requirements}});
+
+            assert_eq!(required_hooks_mode(&response), Some(false));
+        }
+    }
+
+    #[test]
+    fn required_hooks_mode_rejects_malformed_feature_requirements() {
+        for features in [json!(false), json!([]), json!("hooks")] {
+            let response = json!({
+                "result": {"requirements": {"featureRequirements": features}}
+            });
+
+            assert_eq!(required_hooks_mode(&response), None);
         }
     }
 }
