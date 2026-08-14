@@ -1,4 +1,4 @@
-//! Best-effort persistence for command history, picker history, and plugin-owned values.
+//! Best-effort persistence for histories, workspace panel layouts, and plugin-owned values.
 //!
 //! Preferences are convenience state rather than recovery state: malformed or
 //! unreadable data loads as an empty store and is reported through the configured
@@ -14,7 +14,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::LOGGER;
+use crate::{plugin::PanelSide, LOGGER};
 
 const COMMAND_HISTORY_LIMIT: usize = 100;
 const PICKER_HISTORY_LIMIT: usize = 100;
@@ -30,6 +30,29 @@ pub struct Preferences {
     plugin_storage: HashMap<String, serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_seen_version: Option<String>,
+    #[serde(default)]
+    panel_layouts: HashMap<String, HashMap<String, PanelLayoutPreference>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Workspace-scoped layout chosen for one stable plugin panel.
+pub struct PanelLayoutPreference {
+    pub side: PanelSide,
+    #[serde(default)]
+    pub vertical_size: Option<usize>,
+    #[serde(default)]
+    pub horizontal_size: Option<usize>,
+}
+
+impl PanelLayoutPreference {
+    /// Returns the preferred size for the axis containing `side`.
+    pub fn size_for(self, side: PanelSide) -> Option<usize> {
+        if matches!(side, PanelSide::Left | PanelSide::Right) {
+            self.vertical_size
+        } else {
+            self.horizontal_size
+        }
+}
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +191,63 @@ impl PreferencesStore {
         }
 
         self.save()
+    }
+
+    /// Reads the saved layout for one panel in a workspace.
+    pub fn panel_layout(&self, workspace: &Path, panel_id: &str) -> Option<&PanelLayoutPreference> {
+        self.preferences
+            .panel_layouts
+            .get(&workspace_key(workspace))?
+            .get(panel_id)
+    }
+
+    /// Saves one panel layout and immediately persists it.
+    pub fn set_panel_layout(
+        &mut self,
+        workspace: &Path,
+        panel_id: &str,
+        layout: PanelLayoutPreference,
+    ) -> anyhow::Result<()> {
+        self.preferences
+            .panel_layouts
+            .entry(workspace_key(workspace))
+            .or_default()
+            .insert(panel_id.to_string(), layout);
+        self.save()
+    }
+
+    /// Removes one saved panel layout from a workspace.
+    pub fn remove_panel_layout(
+        &mut self,
+        workspace: &Path,
+        panel_id: &str,
+    ) -> anyhow::Result<bool> {
+        let workspace = workspace_key(workspace);
+        let Some(layouts) = self.preferences.panel_layouts.get_mut(&workspace) else {
+            return Ok(false);
+        };
+        if layouts.remove(panel_id).is_none() {
+            return Ok(false);
+        }
+        if layouts.is_empty() {
+            self.preferences.panel_layouts.remove(&workspace);
+        }
+        self.save()?;
+        Ok(true)
+    }
+
+    /// Removes every saved panel layout for a workspace.
+    pub fn clear_panel_layouts(&mut self, workspace: &Path) -> anyhow::Result<bool> {
+        if self
+            .preferences
+            .panel_layouts
+            .remove(&workspace_key(workspace))
+            .is_none()
+        {
+            return Ok(false);
+        }
+        self.save()?;
+        Ok(true)
     }
 
     /// Reads a plugin-owned preference value.
@@ -312,6 +392,10 @@ impl PreferencesStore {
 
 fn plugin_storage_key(plugin: &str, key: &str) -> String {
     format!("{plugin}:{key}")
+}
+
+fn workspace_key(workspace: &Path) -> String {
+    workspace.to_string_lossy().into_owned()
 }
 
 fn load_preferences(path: &Path) -> anyhow::Result<Preferences> {
@@ -639,6 +723,66 @@ mod tests {
             Some(&serde_json::json!(["other"]))
         );
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn panel_layouts_persist_by_workspace_and_panel() {
+        let dir = unique_temp_dir("panel-layouts");
+        let path = dir.join("preferences.json");
+        let first_workspace = Path::new("/repo/first");
+        let second_workspace = Path::new("/repo/second");
+        let mut store = PreferencesStore::load(&path);
+        let first_layout = PanelLayoutPreference {
+            side: PanelSide::Right,
+            vertical_size: Some(48),
+            horizontal_size: Some(9),
+        };
+        let second_layout = PanelLayoutPreference {
+            side: PanelSide::Bottom,
+            vertical_size: Some(30),
+            horizontal_size: Some(12),
+        };
+
+        store
+            .set_panel_layout(first_workspace, "agent-conversation", first_layout)
+            .unwrap();
+        store
+            .set_panel_layout(second_workspace, "agent-conversation", second_layout)
+            .unwrap();
+
+        let store = PreferencesStore::load(&path);
+        assert_eq!(
+            store.panel_layout(first_workspace, "agent-conversation"),
+            Some(&first_layout)
+        );
+        assert_eq!(
+            store.panel_layout(second_workspace, "agent-conversation"),
+            Some(&second_layout)
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn clearing_panel_layouts_only_affects_the_selected_workspace() {
+        let first_workspace = Path::new("/repo/first");
+        let second_workspace = Path::new("/repo/second");
+        let layout = PanelLayoutPreference {
+            side: PanelSide::Left,
+            vertical_size: Some(32),
+            horizontal_size: None,
+        };
+        let mut store = PreferencesStore::in_memory();
+        store
+            .set_panel_layout(first_workspace, "tree", layout)
+            .unwrap();
+        store
+            .set_panel_layout(second_workspace, "tree", layout)
+            .unwrap();
+
+        assert!(store.clear_panel_layouts(first_workspace).unwrap());
+
+        assert_eq!(store.panel_layout(first_workspace, "tree"), None);
+        assert_eq!(store.panel_layout(second_workspace, "tree"), Some(&layout));
     }
 
     #[cfg(unix)]

@@ -734,6 +734,7 @@ impl PanelSizes {
 pub struct PanelManager {
     panels: HashMap<String, PluginPanel>,
     text_panels: HashMap<String, TextPanel>,
+    default_layouts: HashMap<String, (PanelSide, usize)>,
     preferred_sizes: HashMap<String, PanelSizes>,
     z_order: Vec<String>,
     focused: Option<String>,
@@ -742,6 +743,8 @@ pub struct PanelManager {
 
 impl PanelManager {
     pub fn create_panel(&mut self, id: String, config: PanelConfig) {
+        self.default_layouts
+            .insert(id.clone(), (config.side, config.width));
         self.remember_panel_size(&id, config.side, config.width);
         self.text_panels.remove(&id);
         self.panels
@@ -752,6 +755,8 @@ impl PanelManager {
     }
 
     pub fn create_text_panel(&mut self, id: String, config: PanelConfig) {
+        self.default_layouts
+            .insert(id.clone(), (config.side, config.width));
         self.remember_panel_size(&id, config.side, config.width);
         self.panels.remove(&id);
         self.text_panels
@@ -822,6 +827,30 @@ impl PanelManager {
         changed
     }
 
+    /// Applies a persisted layout, including preferences for both docking axes.
+    pub fn restore_panel_layout(
+        &mut self,
+        id: &str,
+        side: PanelSide,
+        size: usize,
+        vertical_size: Option<usize>,
+        horizontal_size: Option<usize>,
+    ) -> bool {
+        let Some(config) = self.panel_config_mut(id) else {
+            return false;
+        };
+        let changed = config.side != side || config.width != size;
+        config.side = side;
+        config.width = size;
+        if let Some(vertical_size) = vertical_size {
+            self.remember_panel_size(id, PanelSide::Left, vertical_size);
+        }
+        if let Some(horizontal_size) = horizontal_size {
+            self.remember_panel_size(id, PanelSide::Top, horizontal_size);
+        }
+        changed
+    }
+
     /// Returns the docking edge and requested size of a stable panel.
     pub fn panel_layout(&self, id: &str) -> Option<(PanelSide, usize)> {
         self.panel_config(id)
@@ -838,6 +867,43 @@ impl PanelManager {
         self.preferred_sizes.get(id)?.axis(side).default
     }
 
+    /// Returns the docking edge and size supplied when the panel was created.
+    pub fn panel_default_layout(&self, id: &str) -> Option<(PanelSide, usize)> {
+        self.default_layouts.get(id).copied()
+    }
+
+    /// Returns every live panel ID, including panels that are currently hidden.
+    pub fn panel_ids(&self) -> Vec<String> {
+        let mut ids = self
+            .panels
+            .keys()
+            .chain(self.text_panels.keys())
+            .cloned()
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    /// Restores a panel's creation layout and forgets sizes chosen on other axes.
+    pub fn reset_panel_layout(&mut self, id: &str) -> bool {
+        let Some((side, size)) = self.panel_default_layout(id) else {
+            return false;
+        };
+        let changed = self.panel_layout(id) != Some((side, size));
+        if let Some(panel) = self.panels.get_mut(id) {
+            panel.config.side = side;
+            panel.config.width = size;
+        } else if let Some(panel) = self.text_panels.get_mut(id) {
+            panel.config.side = side;
+            panel.config.width = size;
+        } else {
+            return false;
+        }
+        self.preferred_sizes.remove(id);
+        self.remember_panel_size(id, side, size);
+        changed
+    }
+
     fn remember_panel_size(&mut self, id: &str, side: PanelSide, size: usize) {
         self.preferred_sizes
             .entry(id.to_string())
@@ -848,6 +914,7 @@ impl PanelManager {
     pub fn close_panel(&mut self, id: &str) {
         self.panels.remove(id);
         self.text_panels.remove(id);
+        self.default_layouts.remove(id);
         self.preferred_sizes.remove(id);
         self.z_order.retain(|panel_id| panel_id != id);
         if self.focused.as_deref() == Some(id) {
@@ -1686,6 +1753,13 @@ impl PanelManager {
             .get(id)
             .map(|panel| &panel.config)
             .or_else(|| self.text_panels.get(id).map(|panel| &panel.config))
+    }
+
+    fn panel_config_mut(&mut self, id: &str) -> Option<&mut PanelConfig> {
+        if let Some(panel) = self.panels.get_mut(id) {
+            return Some(&mut panel.config);
+        }
+        self.text_panels.get_mut(id).map(|panel| &mut panel.config)
     }
 }
 
@@ -2777,6 +2851,41 @@ mod tests {
             Some(11)
         );
         assert_eq!(manager.panel_default_size("tree", PanelSide::Top), Some(8));
+    }
+
+    #[test]
+    fn restored_panel_layout_keeps_creation_defaults_and_both_axis_sizes() {
+        let mut manager = PanelManager::default();
+        manager.create_panel(
+            "tree".to_string(),
+            PanelConfig {
+                side: PanelSide::Left,
+                width: 24,
+                ..PanelConfig::default()
+            },
+        );
+
+        assert!(manager.restore_panel_layout("tree", PanelSide::Bottom, 11, Some(31), Some(11),));
+        assert_eq!(
+            manager.panel_default_layout("tree"),
+            Some((PanelSide::Left, 24))
+        );
+        assert_eq!(
+            manager.panel_preferred_size("tree", PanelSide::Right),
+            Some(31)
+        );
+        assert_eq!(
+            manager.panel_preferred_size("tree", PanelSide::Top),
+            Some(11)
+        );
+
+        assert!(manager.reset_panel_layout("tree"));
+        assert_eq!(manager.panel_layout("tree"), Some((PanelSide::Left, 24)));
+        assert_eq!(
+            manager.panel_preferred_size("tree", PanelSide::Right),
+            Some(24)
+        );
+        assert_eq!(manager.panel_preferred_size("tree", PanelSide::Top), None);
     }
 
     #[test]

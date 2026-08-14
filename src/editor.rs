@@ -102,7 +102,7 @@ use crate::{
     },
     matchit::{self, MatchDirection, MatchMotion},
     plugin::{self, ComposerHandle, PickerHandle, PluginRegistry, RequestId, Runtime},
-    preferences::PreferencesStore,
+    preferences::{PanelLayoutPreference, PreferencesStore},
     session::{
         capture_session_disk_fingerprint, detect_disk_divergence, read_session_disk_contents,
         RecoveryDivergence, SessionAnchorAffinity, SessionBufferSnapshot, SessionDiskFingerprint,
@@ -2196,6 +2196,7 @@ pub enum Action {
     ResizeWindowLeft(usize),
     ResizeWindowRight(usize),
     BalanceWindows,
+    ResetPanelLayout(Option<String>),
     MaximizeWindow,
     OnlyWindow,
 }
@@ -4521,9 +4522,90 @@ impl Editor {
         if !self.panel_manager.update_panel_layout(id, side, size) {
             return false;
         }
+        self.persist_panel_layout(id);
         self.apply_panel_layout();
         self.sync_with_window();
         true
+    }
+
+    fn restore_panel_layout(&mut self, id: &str) {
+        let workspace = get_workspace_path();
+        let Some(layout) = self.preferences.panel_layout(&workspace, id).copied() else {
+            return;
+        };
+        let size = layout.size_for(layout.side).or_else(|| {
+            self.panel_manager
+                .panel_default_layout(id)
+                .map(|(_, size)| size)
+        });
+        if let Some(size) = size {
+            self.panel_manager.restore_panel_layout(
+                id,
+                layout.side,
+                size,
+                layout.vertical_size,
+                layout.horizontal_size,
+            );
+        }
+    }
+
+    fn persist_panel_layout(&mut self, id: &str) {
+        let Some((side, _)) = self.panel_manager.panel_layout(id) else {
+            return;
+        };
+        let layout = PanelLayoutPreference {
+            side,
+            vertical_size: self
+                .panel_manager
+                .panel_preferred_size(id, plugin::PanelSide::Left),
+            horizontal_size: self
+                .panel_manager
+                .panel_preferred_size(id, plugin::PanelSide::Top),
+        };
+        if let Err(error) = self
+            .preferences
+            .set_panel_layout(&get_workspace_path(), id, layout)
+        {
+            log!("failed to save panel layout for {id:?}: {error}");
+        }
+    }
+
+    fn reset_panel_layout_preferences(&mut self, panel_id: Option<&str>) -> bool {
+        let workspace = get_workspace_path();
+        let preference_changed = if let Some(panel_id) = panel_id {
+            self.preferences.remove_panel_layout(&workspace, panel_id)
+        } else {
+            self.preferences.clear_panel_layouts(&workspace)
+        };
+        let preference_changed = match preference_changed {
+            Ok(changed) => changed,
+            Err(error) => {
+                log!("failed to reset panel layout preferences: {error}");
+                self.last_error = Some(format!("unable to save panel layout reset: {error}"));
+                false
+            }
+        };
+
+        let panel_ids = panel_id.map_or_else(
+            || self.panel_manager.panel_ids(),
+            |panel_id| vec![panel_id.to_string()],
+        );
+        let mut live_changed = false;
+        let mut live_found = false;
+        for panel_id in panel_ids {
+            if self.panel_manager.panel_layout(&panel_id).is_some() {
+                live_found = true;
+                live_changed |= self.panel_manager.reset_panel_layout(&panel_id);
+            }
+        }
+        if let Some(panel_id) = panel_id.filter(|_| !live_found && !preference_changed) {
+            self.last_error = Some(format!("unknown panel {panel_id:?}"));
+        }
+        if live_changed {
+            self.apply_panel_layout();
+            self.sync_with_window();
+        }
+        live_changed || preference_changed
     }
 
     fn divider_resize_target_at_position(&self, x: usize, y: usize) -> Option<DividerResizeTarget> {
@@ -8819,7 +8901,8 @@ impl Editor {
                     }
                 }
                 PluginRequest::CreatePanel { id, config } => {
-                    self.panel_manager.create_panel(id, config);
+                    self.panel_manager.create_panel(id.clone(), config);
+                    self.restore_panel_layout(&id);
                     self.apply_panel_layout();
                     needs_render = true;
                 }
@@ -8828,7 +8911,8 @@ impl Editor {
                     needs_render = true;
                 }
                 PluginRequest::CreateTextPanel { id, config } => {
-                    self.panel_manager.create_text_panel(id, config);
+                    self.panel_manager.create_text_panel(id.clone(), config);
+                    self.restore_panel_layout(&id);
                     self.apply_panel_layout();
                     needs_render = true;
                 }
@@ -11757,6 +11841,7 @@ impl Editor {
             | Action::ResizeWindowLeft(_)
             | Action::ResizeWindowRight(_)
             | Action::BalanceWindows
+            | Action::ResetPanelLayout(_)
             | Action::MaximizeWindow
             | Action::OnlyWindow => true,
             Action::PluginCommand(command) => runtime.is_some_and(|runtime| {
@@ -12182,6 +12267,14 @@ impl Editor {
 
             if cmd == "only" {
                 actions.push(Action::OnlyWindow);
+            }
+
+            if cmd == "panel-layout-reset" {
+                if parsed.args.len() > 1 {
+                    self.last_error = Some("usage: panel-layout-reset [panel-id]".to_string());
+                    return Vec::new();
+                }
+                actions.push(Action::ResetPanelLayout(parsed.args.first().cloned()));
             }
 
             if cmd == "noh" || cmd == "nohlsearch" {
@@ -18439,6 +18532,13 @@ impl Editor {
                     self.render(buffer)?;
                 }
             }
+            Action::ResetPanelLayout(panel_id) => {
+                if self.reset_panel_layout_preferences(panel_id.as_deref()) {
+                    self.render(buffer)?;
+                } else if self.last_error.is_some() {
+                    self.draw_commandline(buffer);
+                }
+            }
             Action::MaximizeWindow => {
                 if self.update_window_layout(WindowManager::maximize_window) {
                     self.render(buffer)?;
@@ -24405,6 +24505,7 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_create_panel(&mut self, id: &str, config: plugin::PanelConfig) {
         self.panel_manager.create_panel(id.to_string(), config);
+        self.restore_panel_layout(id);
         self.apply_panel_layout();
         self.sync_with_window();
     }
@@ -24412,6 +24513,7 @@ impl Editor {
     #[doc(hidden)]
     pub fn test_create_text_panel(&mut self, id: &str, config: plugin::PanelConfig) {
         self.panel_manager.create_text_panel(id.to_string(), config);
+        self.restore_panel_layout(id);
         self.apply_panel_layout();
         self.sync_with_window();
     }
@@ -26272,6 +26374,94 @@ builtin = "rust"
         assert_eq!(
             detached_input_to_crossterm(crate::headless::InputEvent::Mouse { event: mouse }),
             Event::Mouse(mouse)
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_panel_layout_restores_both_axes_and_reset_command_clears_it() {
+        let config = Config::default();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut preferences = PreferencesStore::in_memory();
+        let workspace = get_workspace_path();
+        preferences
+            .set_panel_layout(
+                &workspace,
+                "agent-conversation",
+                PanelLayoutPreference {
+                    side: plugin::PanelSide::Bottom,
+                    vertical_size: Some(52),
+                    horizontal_size: Some(9),
+                },
+            )
+            .unwrap();
+        let mut editor = Editor::with_size_and_preferences(
+            lsp,
+            100,
+            30,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, String::new())],
+            preferences,
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        editor.test_create_text_panel(
+            "agent-conversation",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Right,
+                width: 62,
+                title: Some("Agent".to_string()),
+                ..plugin::PanelConfig::default()
+            },
+        );
+
+        assert_eq!(
+            editor.test_panel_layout("agent-conversation"),
+            Some((plugin::PanelSide::Bottom, 9))
+        );
+        assert_eq!(
+            editor
+                .panel_manager
+                .panel_preferred_size("agent-conversation", plugin::PanelSide::Left),
+            Some(52)
+        );
+        assert!(editor.set_panel_size("agent-conversation", plugin::PanelSide::Left, 48));
+        assert_eq!(
+            editor
+                .preferences
+                .panel_layout(&workspace, "agent-conversation"),
+            Some(&PanelLayoutPreference {
+                side: plugin::PanelSide::Left,
+                vertical_size: Some(48),
+                horizontal_size: Some(9),
+            })
+        );
+        let mut buffer = RenderBuffer::new(100, 30, &Style::default());
+        let mut runtime = Runtime::new();
+
+        enter_colon_command(
+            &mut editor,
+            &mut buffer,
+            &mut runtime,
+            "panel-layout-reset agent-conversation",
+        )
+        .await;
+
+        assert_eq!(
+            editor.test_panel_layout("agent-conversation"),
+            Some((plugin::PanelSide::Right, 62))
+        );
+        assert_eq!(
+            editor
+                .preferences
+                .panel_layout(&workspace, "agent-conversation"),
+            None
+        );
+        assert_eq!(
+            editor
+                .panel_manager
+                .panel_preferred_size("agent-conversation", plugin::PanelSide::Top),
+            None
         );
     }
 
