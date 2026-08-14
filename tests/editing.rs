@@ -6010,25 +6010,86 @@ async fn focused_horizontal_panels_resize_with_vim_height_chords() {
 }
 
 #[tokio::test]
+async fn pane_resize_mode_moves_docked_panel_dividers_in_screen_direction() {
+    for (side, initial_size, grow_keys, shrink_keys) in [
+        (
+            PanelSide::Left,
+            20,
+            [KeyCode::Char('l'), KeyCode::Right],
+            [KeyCode::Char('h'), KeyCode::Left],
+        ),
+        (
+            PanelSide::Right,
+            20,
+            [KeyCode::Char('h'), KeyCode::Left],
+            [KeyCode::Char('l'), KeyCode::Right],
+        ),
+        (
+            PanelSide::Top,
+            6,
+            [KeyCode::Char('j'), KeyCode::Down],
+            [KeyCode::Char('k'), KeyCode::Up],
+        ),
+        (
+            PanelSide::Bottom,
+            6,
+            [KeyCode::Char('k'), KeyCode::Up],
+            [KeyCode::Char('j'), KeyCode::Down],
+        ),
+    ] {
+        let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness.editor.test_create_panel(
+            "inspector",
+            PanelConfig {
+                side,
+                width: initial_size,
+                ..PanelConfig::default()
+            },
+        );
+        assert!(harness.editor.test_focus_panel("inspector"));
+
+        execute_window_chord(&mut harness, 'r').await;
+        for key in grow_keys {
+            execute_unmodified_key(&mut harness, key).await;
+        }
+        assert_eq!(
+            harness.editor.test_panel_layout("inspector"),
+            Some((side, initial_size + 2)),
+            "moving the {side:?} panel's divider outward should grow it",
+        );
+
+        for key in shrink_keys {
+            execute_unmodified_key(&mut harness, key).await;
+        }
+        assert_eq!(
+            harness.editor.test_panel_layout("inspector"),
+            Some((side, initial_size)),
+            "moving the {side:?} panel's divider inward should shrink it",
+        );
+    }
+}
+
+#[tokio::test]
 async fn pane_resize_mode_resizes_editor_splits_with_hjkl_and_arrows() {
     for (split_action, grow_keys, shrink_keys, vertical) in [
         (
             Action::SplitVertical,
-            [KeyCode::Char('l'), KeyCode::Right],
             [KeyCode::Char('h'), KeyCode::Left],
+            [KeyCode::Char('l'), KeyCode::Right],
             true,
         ),
         (
             Action::SplitHorizontal,
-            [KeyCode::Char('j'), KeyCode::Down],
             [KeyCode::Char('k'), KeyCode::Up],
+            [KeyCode::Char('j'), KeyCode::Down],
             false,
         ),
     ] {
         let buffer = Buffer::new(None, "first\nsecond\nthird\n".to_string());
         let mut harness = EditorHarness::with_config(buffer, default_key_config());
         harness.execute_action(split_action).await.unwrap();
-        let (_, initial_size) = harness.editor.test_active_window_bounds().unwrap();
+        let (initial_position, initial_size) = harness.editor.test_active_window_bounds().unwrap();
         let initial_dimension = if vertical {
             initial_size.0
         } else {
@@ -6041,9 +6102,14 @@ async fn pane_resize_mode_resizes_editor_splits_with_hjkl_and_arrows() {
         for key in grow_keys {
             execute_unmodified_key(&mut harness, key).await;
         }
-        let (_, grown_size) = harness.editor.test_active_window_bounds().unwrap();
+        let (grown_position, grown_size) = harness.editor.test_active_window_bounds().unwrap();
         let grown_dimension = if vertical { grown_size.0 } else { grown_size.1 };
         assert_eq!(grown_dimension, initial_dimension + 2);
+        if vertical {
+            assert_eq!(grown_position.x, initial_position.x - 2);
+        } else {
+            assert_eq!(grown_position.y, initial_position.y - 2);
+        }
 
         for key in shrink_keys {
             execute_unmodified_key(&mut harness, key).await;
@@ -6077,13 +6143,32 @@ async fn focused_agent_composer_can_enter_and_exit_pane_resize_mode() {
             ..PanelConfig::default()
         },
     );
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+    let initial_editor_size = harness.editor.test_active_window_bounds().unwrap().1;
+
+    execute_window_chord(&mut harness, 'r').await;
+    execute_unmodified_key(&mut harness, KeyCode::Char('h')).await;
+    assert_eq!(
+        harness.editor.test_panel_layout("agent"),
+        Some((PanelSide::Right, 21)),
+        "moving the shared divider left should work while the editor is focused",
+    );
+    let resized_editor_size = harness.editor.test_active_window_bounds().unwrap().1;
+    assert_eq!(resized_editor_size.0, initial_editor_size.0 - 1,);
+    execute_unmodified_key(&mut harness, KeyCode::Right).await;
+    assert_eq!(
+        harness.editor.test_panel_layout("agent"),
+        Some((PanelSide::Right, 20))
+    );
+    execute_unmodified_key(&mut harness, KeyCode::Enter).await;
+
     assert!(harness.editor.test_focus_text_panel_composer("agent"));
 
     execute_window_chord(&mut harness, 'r').await;
     assert!(harness.statusline_row().contains("RESIZE"));
     assert_eq!(harness.editor.test_focused_panel_id(), Some("agent"));
 
-    for key in [KeyCode::Char('l'), KeyCode::Right] {
+    for key in [KeyCode::Char('h'), KeyCode::Left] {
         execute_unmodified_key(&mut harness, key).await;
     }
     assert_eq!(
@@ -6101,7 +6186,7 @@ async fn focused_agent_composer_can_enter_and_exit_pane_resize_mode() {
     );
     assert!(harness.statusline_row().contains("RESIZE"));
 
-    for key in [KeyCode::Char('h'), KeyCode::Left] {
+    for key in [KeyCode::Char('l'), KeyCode::Right] {
         execute_unmodified_key(&mut harness, key).await;
     }
     assert_eq!(
@@ -6131,6 +6216,19 @@ async fn pane_resize_mode_cancels_when_terminal_focus_is_lost() {
     assert!(harness.statusline_row().contains("RESIZE"));
 
     harness.execute_event(Event::FocusLost).await.unwrap();
+    assert!(!harness.statusline_row().contains("RESIZE"));
+}
+
+#[tokio::test]
+async fn pane_resize_mode_cancels_when_terminal_geometry_changes() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+
+    execute_window_chord(&mut harness, 'r').await;
+    assert!(harness.statusline_row().contains("RESIZE"));
+
+    harness.execute_event(Event::Resize(100, 30)).await.unwrap();
     assert!(!harness.statusline_row().contains("RESIZE"));
 }
 

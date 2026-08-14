@@ -1114,14 +1114,28 @@ impl Editor {
         // Startup splash over the pristine scratch window (docs/SPLASH.md)
         self.render_splash(buffer);
 
-        let active_panel_divider = match self.divider_drag.as_ref() {
-            Some(super::DividerDrag::Panel { id, .. }) => Some(id.as_str()),
-            _ => None,
-        };
-        self.panel_manager.render_with_active_divider(
+        let mut active_panel_dividers = Vec::with_capacity(3);
+        if let Some(super::DividerDrag {
+            target: super::DividerResizeTarget::Panel { id, .. },
+            ..
+        }) = self.divider_drag.as_ref()
+        {
+            active_panel_dividers.push(id.as_str());
+        }
+        if let Some(mode) = self.pane_resize_mode.as_ref() {
+            for target in [mode.vertical.as_ref(), mode.horizontal.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if let super::DividerResizeTarget::Panel { id, .. } = target {
+                    active_panel_dividers.push(id.as_str());
+                }
+            }
+        }
+        self.panel_manager.render_with_active_dividers(
             buffer,
             &self.theme,
-            active_panel_divider,
+            &active_panel_dividers,
             self.config.window_borders_ascii,
         );
 
@@ -1671,13 +1685,29 @@ impl Editor {
             bold: false,
             italic: false,
         };
-        let active_divider = match self.divider_drag.as_ref() {
-            Some(super::DividerDrag::Window { divider }) => {
-                self.window_manager.divider_span(divider)
+        let mut active_dividers = Vec::with_capacity(3);
+        if let Some(super::DividerDrag {
+            target: super::DividerResizeTarget::Window { divider },
+            ..
+        }) = self.divider_drag.as_ref()
+        {
+            if let Some(span) = self.window_manager.divider_span(divider) {
+                active_dividers.push(span);
             }
-            _ => None,
-        };
-        let active_separator_style = active_divider.as_ref().map(|_| {
+        }
+        if let Some(mode) = self.pane_resize_mode.as_ref() {
+            for target in [mode.vertical.as_ref(), mode.horizontal.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if let super::DividerResizeTarget::Window { divider } = target {
+                    if let Some(span) = self.window_manager.divider_span(divider) {
+                        active_dividers.push(span);
+                    }
+                }
+            }
+        }
+        let active_separator_style = (!active_dividers.is_empty()).then(|| {
             self.theme
                 .active_divider_style(&separator_style, &self.theme.style)
         });
@@ -1848,11 +1878,11 @@ impl Editor {
                 }
             };
 
-            let style = active_divider
-                .as_ref()
-                .filter(|span| span.contains(*x, *y))
-                .and(active_separator_style.as_ref())
-                .unwrap_or(&separator_style);
+            let style = if active_dividers.iter().any(|span| span.contains(*x, *y)) {
+                active_separator_style.as_ref().unwrap_or(&separator_style)
+            } else {
+                &separator_style
+            };
             buffer.set_char(*x, *y, junction_char, style, &self.theme);
         }
 
@@ -2792,7 +2822,7 @@ impl Editor {
         let read_only = statusline_file_is_read_only(file_path.as_deref());
         let relative_path = statusline_relative_path(file_path.as_deref(), &workspace_root);
         let context = StatuslineContext {
-            mode: if self.pane_resize_mode {
+            mode: if self.pane_resize_mode.is_some() {
                 "RESIZE".to_string()
             } else {
                 format_mode_name(&self.mode)
@@ -4031,7 +4061,12 @@ mod tests {
                     .window_manager
                     .divider_at_position(x, y)
                     .expect("the visible split must be draggable");
-                editor.divider_drag = Some(super::super::DividerDrag::Window { divider });
+                editor.divider_drag = Some(super::super::DividerDrag {
+                    target: super::super::DividerResizeTarget::Window {
+                        divider: divider.clone(),
+                    },
+                    last_position: Point::new(x, y),
+                });
                 let mut buffer = RenderBuffer::new(40, 10, &Style::default());
 
                 editor.render_all_window_separators(&mut buffer).unwrap();
@@ -4055,6 +4090,18 @@ mod tests {
                     }),
                 );
                 assert!(!released.style.bold);
+
+                let target = super::super::DividerResizeTarget::Window { divider };
+                editor.pane_resize_mode = Some(super::super::PaneResizeMode {
+                    vertical: vertical.then_some(target.clone()),
+                    horizontal: (!vertical).then_some(target),
+                });
+                editor.render_all_window_separators(&mut buffer).unwrap();
+
+                let keyboard_active = &buffer.cells[y * buffer.width + x];
+                assert_eq!(keyboard_active.c, expected);
+                assert_eq!(keyboard_active.style.fg, Some(accent));
+                assert!(keyboard_active.style.bold);
             }
         }
     }
@@ -4088,7 +4135,10 @@ mod tests {
             .window_manager
             .divider_at_position(/*x*/ 1, horizontal_y)
             .expect("the nested horizontal separator must be draggable");
-        editor.divider_drag = Some(super::super::DividerDrag::Window { divider });
+        editor.divider_drag = Some(super::super::DividerDrag {
+            target: super::super::DividerResizeTarget::Window { divider },
+            last_position: Point::new(/*x*/ 1, horizontal_y),
+        });
         let mut buffer = RenderBuffer::new(40, 10, &Style::default());
 
         editor.render_all_window_separators(&mut buffer).unwrap();

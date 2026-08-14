@@ -932,16 +932,47 @@ enum FocusTarget {
 }
 
 #[derive(Debug, Clone)]
-enum DividerDrag {
-    Panel {
-        id: String,
-        side: plugin::PanelSide,
-        origin: Point,
-        initial_size: usize,
-    },
-    Window {
-        divider: WindowDivider,
-    },
+enum DividerResizeTarget {
+    Panel { id: String, side: plugin::PanelSide },
+    Window { divider: WindowDivider },
+}
+
+impl DividerResizeTarget {
+    fn is_vertical(&self) -> bool {
+        match self {
+            Self::Panel { side, .. } => {
+                matches!(side, plugin::PanelSide::Left | plugin::PanelSide::Right)
+            }
+            Self::Window { divider } => divider.is_vertical(),
+        }
+    }
+
+    fn pointer_delta(&self, from: Point, to: Point) -> isize {
+        match self {
+            Self::Panel { side, .. } => {
+                let (from, to) = match side {
+                    plugin::PanelSide::Left | plugin::PanelSide::Right => (from.x, to.x),
+                    plugin::PanelSide::Top | plugin::PanelSide::Bottom => (from.y, to.y),
+                };
+                isize::try_from(to)
+                    .unwrap_or(isize::MAX)
+                    .saturating_sub(isize::try_from(from).unwrap_or(isize::MAX))
+            }
+            Self::Window { divider } => divider.coordinate_delta(from, to),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DividerDrag {
+    target: DividerResizeTarget,
+    last_position: Point,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PaneResizeMode {
+    vertical: Option<DividerResizeTarget>,
+    horizontal: Option<DividerResizeTarget>,
 }
 
 fn expanded_path_string(path: &str) -> anyhow::Result<String> {
@@ -2154,6 +2185,10 @@ pub enum Action {
     MoveWindowToRight,
     EnterPaneResizeMode,
     ExitPaneResizeMode,
+    MovePaneDividerUp(usize),
+    MovePaneDividerDown(usize),
+    MovePaneDividerLeft(usize),
+    MovePaneDividerRight(usize),
     ResizeWindowUp(usize),
     ResizeWindowDown(usize),
     ResizeWindowLeft(usize),
@@ -2609,8 +2644,8 @@ pub struct Editor {
     /// Current editor mode (normal, insert, visual, etc)
     mode: Mode,
 
-    /// Whether directional keys temporarily resize the focused pane.
-    pane_resize_mode: bool,
+    /// Captured dividers moved by directional keys while pane resize mode is active.
+    pane_resize_mode: Option<PaneResizeMode>,
 
     /// Cursor position where the current insert session began.
     insert_entry_cursor: Option<CursorSnapshot>,
@@ -3915,7 +3950,7 @@ impl Editor {
             prev_highlight_y: None,
             vx,
             mode: Mode::Normal,
-            pane_resize_mode: false,
+            pane_resize_mode: None,
             insert_entry_cursor: None,
             generated_indent: None,
             waiting_command: None,
@@ -4408,6 +4443,160 @@ impl Editor {
         true
     }
 
+    fn divider_resize_target_at_position(&self, x: usize, y: usize) -> Option<DividerResizeTarget> {
+        if let Some(divider) = self.panel_manager.panel_divider_at_position(
+            x,
+            y,
+            usize::from(self.size.0),
+            usize::from(self.size.1),
+        ) {
+            return Some(DividerResizeTarget::Panel {
+                id: divider.id,
+                side: divider.side,
+            });
+        }
+
+        self.window_manager
+            .divider_at_position(x, y)
+            .map(|divider| DividerResizeTarget::Window { divider })
+    }
+
+    fn divider_resize_target_on_window_edge(
+        &self,
+        position: Point,
+        size: (usize, usize),
+        vertical: bool,
+        positive_edge: bool,
+    ) -> Option<DividerResizeTarget> {
+        if vertical {
+            let x = if positive_edge {
+                position.x.saturating_add(size.0)
+            } else {
+                position.x.checked_sub(1)?
+            };
+            let end = position.y.saturating_add(size.1);
+            (position.y..end).find_map(|y| {
+                self.divider_resize_target_at_position(x, y)
+                    .filter(|target| target.is_vertical())
+            })
+        } else {
+            let y = if positive_edge {
+                position.y.saturating_add(size.1)
+            } else {
+                position.y.checked_sub(1)?
+            };
+            let end = position.x.saturating_add(size.0);
+            (position.x..end).find_map(|x| {
+                self.divider_resize_target_at_position(x, y)
+                    .filter(|target| !target.is_vertical())
+            })
+        }
+    }
+
+    fn focused_pane_resize_targets(&self) -> PaneResizeMode {
+        if let Some(panel_id) = self.panel_manager.focused_panel_id() {
+            let Some((side, _)) = self.panel_manager.panel_layout(panel_id) else {
+                return PaneResizeMode::default();
+            };
+            let target = DividerResizeTarget::Panel {
+                id: panel_id.to_string(),
+                side,
+            };
+            return if target.is_vertical() {
+                PaneResizeMode {
+                    vertical: Some(target),
+                    horizontal: None,
+                }
+            } else {
+                PaneResizeMode {
+                    vertical: None,
+                    horizontal: Some(target),
+                }
+            };
+        }
+
+        let Some(window) = self.window_manager.active_window() else {
+            return PaneResizeMode::default();
+        };
+        let resolve = |vertical| {
+            self.divider_resize_target_on_window_edge(
+                window.position,
+                window.size,
+                vertical,
+                /*positive_edge*/ true,
+            )
+            .or_else(|| {
+                self.divider_resize_target_on_window_edge(
+                    window.position,
+                    window.size,
+                    vertical,
+                    /*positive_edge*/ false,
+                )
+            })
+        };
+        PaneResizeMode {
+            vertical: resolve(true),
+            horizontal: resolve(false),
+        }
+    }
+
+    fn move_divider_target_by(&mut self, target: &DividerResizeTarget, delta: isize) -> bool {
+        if delta == 0 {
+            return false;
+        }
+
+        match target {
+            DividerResizeTarget::Panel { id, side } => {
+                let Some((_, current_size)) = self.panel_manager.panel_layout(id) else {
+                    return false;
+                };
+                let size_delta =
+                    if matches!(side, plugin::PanelSide::Right | plugin::PanelSide::Bottom) {
+                        delta.saturating_neg()
+                    } else {
+                        delta
+                    };
+                self.set_panel_size(id, *side, current_size.saturating_add_signed(size_delta))
+            }
+            DividerResizeTarget::Window { divider } => {
+                self.sync_to_window();
+                let Some(span) = self.window_manager.divider_span(divider) else {
+                    return false;
+                };
+                let position = span.moved_by(delta);
+                let resized = self
+                    .window_manager
+                    .resize_divider(divider, position.x, position.y);
+                if resized {
+                    self.sync_with_window();
+                }
+                resized
+            }
+        }
+    }
+
+    fn move_captured_pane_divider(
+        &mut self,
+        direction: crate::window::Direction,
+        amount: usize,
+    ) -> bool {
+        let amount = isize::try_from(amount).unwrap_or(isize::MAX);
+        let (vertical, delta) = match direction {
+            crate::window::Direction::Left => (true, amount.saturating_neg()),
+            crate::window::Direction::Right => (true, amount),
+            crate::window::Direction::Up => (false, amount.saturating_neg()),
+            crate::window::Direction::Down => (false, amount),
+        };
+        let target = self.pane_resize_mode.as_ref().and_then(|mode| {
+            if vertical {
+                mode.vertical.clone()
+            } else {
+                mode.horizontal.clone()
+            }
+        });
+        target.is_some_and(|target| self.move_divider_target_by(&target, delta))
+    }
+
     fn resize_window_or_panel(
         &mut self,
         direction: crate::window::Direction,
@@ -4493,6 +4682,7 @@ impl Editor {
     fn resize_terminal_surface(&mut self, width: u16, height: u16, buffer: &mut RenderBuffer) {
         self.size = (width, height);
         self.divider_drag = None;
+        self.pane_resize_mode = None;
         let max_y = (height as usize).saturating_sub(2);
         self.cy = self.cy.min(max_y.saturating_sub(1));
         self.resize_window_layout((width as usize, height as usize));
@@ -10828,7 +11018,7 @@ impl Editor {
 
         self.clear_keymap_hints();
 
-        if self.pane_resize_mode {
+        if self.pane_resize_mode.is_some() {
             return Ok(self.handle_pane_resize_event(ev));
         }
 
@@ -10991,10 +11181,10 @@ impl Editor {
         }
 
         let action = match key.code {
-            KeyCode::Char('h') | KeyCode::Left => Action::ResizeWindowLeft(1),
-            KeyCode::Char('j') | KeyCode::Down => Action::ResizeWindowDown(1),
-            KeyCode::Char('k') | KeyCode::Up => Action::ResizeWindowUp(1),
-            KeyCode::Char('l') | KeyCode::Right => Action::ResizeWindowRight(1),
+            KeyCode::Char('h') | KeyCode::Left => Action::MovePaneDividerLeft(1),
+            KeyCode::Char('j') | KeyCode::Down => Action::MovePaneDividerDown(1),
+            KeyCode::Char('k') | KeyCode::Up => Action::MovePaneDividerUp(1),
+            KeyCode::Char('l') | KeyCode::Right => Action::MovePaneDividerRight(1),
             KeyCode::Esc | KeyCode::Enter => Action::ExitPaneResizeMode,
             _ => return None,
         };
@@ -11009,7 +11199,7 @@ impl Editor {
         match ev {
             Event::FocusLost => {
                 let divider_was_active = self.divider_drag.take().is_some();
-                let resize_mode_was_active = std::mem::take(&mut self.pane_resize_mode);
+                let resize_mode_was_active = self.pane_resize_mode.take().is_some();
                 self.suppress_reactivation_click = false;
                 if self.is_focused {
                     self.is_focused = false;
@@ -11220,69 +11410,21 @@ impl Editor {
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.divider_drag = None;
-                if let Some(divider) = self.panel_manager.panel_divider_at_position(
-                    x,
-                    y,
-                    usize::from(self.size.0),
-                    usize::from(self.size.1),
-                ) {
-                    let (_, initial_size) = self.panel_manager.panel_layout(&divider.id)?;
-                    self.divider_drag = Some(DividerDrag::Panel {
-                        id: divider.id,
-                        side: divider.side,
-                        origin: Point::new(x, y),
-                        initial_size,
-                    });
-                    return Some(KeyAction::Single(Action::Refresh));
-                }
-
-                if let Some(divider) = self.window_manager.divider_at_position(x, y) {
-                    self.divider_drag = Some(DividerDrag::Window { divider });
-                    return Some(KeyAction::Single(Action::Refresh));
-                }
-
-                None
+                let target = self.divider_resize_target_at_position(x, y)?;
+                self.divider_drag = Some(DividerDrag {
+                    target,
+                    last_position: Point::new(x, y),
+                });
+                Some(KeyAction::Single(Action::Refresh))
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 let drag = self.divider_drag.clone()?;
-                let resized = match drag {
-                    DividerDrag::Panel {
-                        id,
-                        side,
-                        origin,
-                        initial_size,
-                    } => {
-                        let delta = match side {
-                            plugin::PanelSide::Left | plugin::PanelSide::Right => {
-                                isize::try_from(x)
-                                    .unwrap_or(isize::MAX)
-                                    .saturating_sub(isize::try_from(origin.x).unwrap_or(isize::MAX))
-                            }
-                            plugin::PanelSide::Top | plugin::PanelSide::Bottom => {
-                                isize::try_from(y)
-                                    .unwrap_or(isize::MAX)
-                                    .saturating_sub(isize::try_from(origin.y).unwrap_or(isize::MAX))
-                            }
-                        };
-                        let delta =
-                            if matches!(side, plugin::PanelSide::Right | plugin::PanelSide::Bottom)
-                            {
-                                delta.saturating_neg()
-                            } else {
-                                delta
-                            };
-                        let requested_size = initial_size.saturating_add_signed(delta);
-                        self.set_panel_size(&id, side, requested_size)
-                    }
-                    DividerDrag::Window { divider } => {
-                        self.sync_to_window();
-                        let resized = self.window_manager.resize_divider(&divider, x, y);
-                        if resized {
-                            self.sync_with_window();
-                        }
-                        resized
-                    }
-                };
+                let position = Point::new(x, y);
+                let delta = drag.target.pointer_delta(drag.last_position, position);
+                let resized = self.move_divider_target_by(&drag.target, delta);
+                if let Some(active_drag) = &mut self.divider_drag {
+                    active_drag.last_position = position;
+                }
 
                 Some(if resized {
                     KeyAction::Single(Action::Refresh)
@@ -11505,6 +11647,10 @@ impl Editor {
             | Action::MoveWindowToRight
             | Action::EnterPaneResizeMode
             | Action::ExitPaneResizeMode
+            | Action::MovePaneDividerUp(_)
+            | Action::MovePaneDividerDown(_)
+            | Action::MovePaneDividerLeft(_)
+            | Action::MovePaneDividerRight(_)
             | Action::ResizeWindowUp(_)
             | Action::ResizeWindowDown(_)
             | Action::ResizeWindowLeft(_)
@@ -18126,13 +18272,33 @@ impl Editor {
             }
             Action::EnterPaneResizeMode => {
                 add_to_history = false;
-                self.pane_resize_mode = true;
+                self.pane_resize_mode = Some(self.focused_pane_resize_targets());
                 self.render(buffer)?;
             }
             Action::ExitPaneResizeMode => {
                 add_to_history = false;
-                self.pane_resize_mode = false;
+                self.pane_resize_mode = None;
                 self.render(buffer)?;
+            }
+            Action::MovePaneDividerUp(amount) => {
+                if self.move_captured_pane_divider(crate::window::Direction::Up, *amount) {
+                    self.render(buffer)?;
+                }
+            }
+            Action::MovePaneDividerDown(amount) => {
+                if self.move_captured_pane_divider(crate::window::Direction::Down, *amount) {
+                    self.render(buffer)?;
+                }
+            }
+            Action::MovePaneDividerLeft(amount) => {
+                if self.move_captured_pane_divider(crate::window::Direction::Left, *amount) {
+                    self.render(buffer)?;
+                }
+            }
+            Action::MovePaneDividerRight(amount) => {
+                if self.move_captured_pane_divider(crate::window::Direction::Right, *amount) {
+                    self.render(buffer)?;
+                }
             }
             Action::ResizeWindowUp(amount) => {
                 if self.resize_window_or_panel(crate::window::Direction::Up, *amount) {
