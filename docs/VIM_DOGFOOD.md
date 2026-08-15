@@ -15,7 +15,7 @@ At minimum, the week must exercise:
 - named macros, `@@`, counted playback, and dot-repeat across distinct locations;
 - insert, visual, visual-line, and visual-block changes;
 - search, substitution with confirmation, command cancellation, undo, and redo;
-- local/global/special marks and backward/forward jumplist traversal;
+- local/global/special marks and Neovim-style window-local jumplist traversal;
 - Unicode text, an empty buffer, both final-line forms, wrapped lines, and two windows.
 
 ## Issue classification

@@ -50,7 +50,7 @@ and intentional differences precisely.
 - `zz` centers the current line.
 - `%` jumps to a matching bracket. `g%`, `[%`, and `]%` provide related
   matching-bracket motions.
-- `Ctrl-o` and `Tab` move backward and forward through the jump list.
+- `Ctrl-o` and `Ctrl-i` (or `Tab`) move backward and forward through the current window's jump list.
 - `gj` and `gk` move by screen line when wrapping is enabled.
 
 ## Editing

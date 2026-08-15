@@ -61,7 +61,7 @@ the corresponding integration tests.
 | Substitute syntax | **intentional difference** | Patterns and capture expansion use Rust `regex`; delimiters may be escaped. Vim magic modes, expression replacement, and omitted trailing delimiters are not supported. |
 | Undo/redo | **supported** | Linear, per-buffer transactions with dirty-state checkpoints. |
 | Undo tree | **supported** | Undo followed by a new edit creates a sibling branch. `g-`/`g+` select a sibling deterministically and redo traverses it; `:undotree` opens the small visual navigator. |
-| Jumplist | **supported** | Search and long/file motions record jumps; `Ctrl-o` and `Tab` traverse backward/forward. |
+| Jumplist | **supported** | Search and long/file motions record window-local jumps; splits copy their source window's list, positions follow edits, same-line entries are cleaned up, and `Ctrl-o` / `Ctrl-i` (`Tab`) traverse backward/forward without discarding the forward branch. |
 | Local marks | **supported** | `ma`–`mz`, exact backtick jump, and first-nonblank apostrophe jump. They remain tied to the in-memory buffer and report an error after it is deleted. |
 | Global marks | **supported** | `mA`–`mZ`; an existing marked file is reopened after its buffer closes. A deleted file produces an error and is never recreated by a jump. |
 | Special marks | **supported** | Previous jump (`''`/````), last change (`'.`/``.` ``), and last visual bounds (`'<`, `'>`, `` `< ``, `` `> ``). |

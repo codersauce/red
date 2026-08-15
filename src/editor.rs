@@ -110,7 +110,7 @@ use crate::{
         capture_session_disk_fingerprint, detect_disk_divergence, read_session_disk_contents,
         RecoveryDivergence, SessionAnchorAffinity, SessionBufferSnapshot, SessionDiskFingerprint,
         SessionJump, SessionMark, SessionSnapshot, SessionStore, SessionVisualMode,
-        SessionVisualSelection, SESSION_SCHEMA_VERSION,
+        SessionVisualSelection, SessionWindowJumps, SESSION_SCHEMA_VERSION,
     },
     theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
     ui::{
@@ -122,7 +122,7 @@ use crate::{
     undo::{AppliedTextEdit, CursorSnapshot, EditOrigin, RevertEdit, TextPosition, TextRange},
     utils::{expand_user_path, get_workspace_path, normalized_file_path, same_file_path},
     whats_new::ReleaseNotes,
-    window::{WindowDivider, WindowId, WindowManager, WindowManagerSnapshot},
+    window::{JumpEntry, JumpList, WindowDivider, WindowId, WindowManager, WindowManagerSnapshot},
 };
 
 use self::display_layout::{
@@ -3058,13 +3058,6 @@ pub struct Editor {
     /// Indentation rules per file type
     indentation: HashMap<String, Indentation>,
 
-    /// Cursor locations remembered for CTRL-O/CTRL-I style jumps.
-    jump_list: Vec<HistoryEntry>,
-
-    /// Current position in `jump_list`; `jump_list.len()` means the live cursor
-    /// is past the newest recorded jump.
-    jump_index: usize,
-
     /// Pending render commands from plugins
     render_commands: VecDeque<RenderCommand>,
 
@@ -3494,6 +3487,7 @@ struct PathCompletionCandidate {
 #[derive(Debug, Clone)]
 struct SearchSession {
     origin: HistoryEntry,
+    jump_origin: JumpEntry,
     origin_vtop: usize,
     direction: SearchDirection,
     draft: String,
@@ -3630,14 +3624,6 @@ struct ExternalFormatOnSave {
 impl HistoryEntry {
     fn new(file: Option<String>, x: usize, y: usize) -> Self {
         Self { file, x, y }
-    }
-
-    fn same_location(&self, other: &Self) -> bool {
-        self.file == other.file && self.x == other.x && self.y == other.y
-    }
-
-    fn moved_from(&self, other: &Self) -> bool {
-        !self.same_location(other)
     }
 }
 
@@ -4230,8 +4216,6 @@ impl Editor {
             clipboard,
             diagnostics: HashMap::new(),
             indentation,
-            jump_list: Vec::new(),
-            jump_index: 0,
             render_commands: VecDeque::new(),
             overlay_manager: plugin::OverlayManager::new(),
             decoration_manager: plugin::DecorationManager::default(),
@@ -13298,6 +13282,7 @@ impl Editor {
     fn begin_search(&mut self, direction: SearchDirection) {
         self.active_search = Some(SearchSession {
             origin: self.current_history_entry(),
+            jump_origin: self.current_jump_entry(),
             origin_vtop: self.vtop,
             direction,
             draft: String::new(),
@@ -15449,7 +15434,7 @@ impl Editor {
             .ensure_notified_revision(action_buffer_id, action_buffer_revision);
         let event_snapshot_before_action = self.event_snapshot();
         let action_cause = Self::action_cause(action);
-        let history_entry_before_action = self.current_history_entry();
+        let jump_entry_before_action = self.current_jump_entry();
         let picker_handle_before_action = self
             .current_dialog
             .as_ref()
@@ -16560,11 +16545,7 @@ impl Editor {
                 if *mark == '\'' {
                     add_to_history = false;
                     if let Some(entry) = self.jump_back_entry() {
-                        let action = self.action_for_history_entry(&entry);
-                        self.execute_with_tracking(
-                            &action, buffer, runtime, /*tracking*/ false,
-                        )
-                        .await?;
+                        self.jump_to_entry(&entry, buffer, runtime).await?;
                     } else {
                         self.last_error = Some("previous jump is not set".to_string());
                     }
@@ -16944,19 +16925,30 @@ impl Editor {
             }
             Action::DumpHistory => {
                 add_to_history = false;
+                self.clean_jump_list();
+                let (entries, index) = {
+                    let list = self.active_jump_list();
+                    (list.entries.clone(), list.index)
+                };
                 log!("");
                 log!("--------------- JUMP LIST ------------------");
-                for (idx, item) in self.jump_list.iter().enumerate() {
-                    let marker = if idx == self.jump_index { ">" } else { " " };
+                for (idx, item) in entries.iter().enumerate() {
+                    let marker = if idx == index { ">" } else { " " };
+                    let name = self
+                        .buffer_manager
+                        .iter()
+                        .find(|candidate| candidate.id() == item.buffer_id)
+                        .map(|candidate| candidate.name().to_string())
+                        .unwrap_or_else(|| "<unloaded>".to_string());
                     log!(
                         "{} {:<25} | {:>2} {:>2}",
                         marker,
-                        item.file.as_deref().unwrap_or("<unnamed>"),
-                        item.x,
-                        item.y
+                        name,
+                        item.fallback.character,
+                        item.fallback.line
                     );
                 }
-                if self.jump_index == self.jump_list.len() {
+                if index == entries.len() {
                     log!("> <current>");
                 }
                 log!("--------------------------------------------");
@@ -18173,7 +18165,7 @@ impl Editor {
                     self.active_search = None;
                     self.mode = Mode::Normal;
                     self.move_to_search_match(match_);
-                    self.save_to_history(session.origin);
+                    self.save_to_history(session.jump_origin);
                     self.render(buffer)?;
                     self.notify_search_highlighted(runtime, "CommitSearch")
                         .await?;
@@ -18777,9 +18769,7 @@ impl Editor {
                 add_to_history = false;
                 if let Some(entry) = self.jump_back_entry() {
                     log!("jumping back to {entry:?}");
-                    let action = self.action_for_history_entry(&entry);
-                    self.execute_with_tracking(&action, buffer, runtime, false)
-                        .await?;
+                    self.jump_to_entry(&entry, buffer, runtime).await?;
                 } else {
                     self.last_error = Some("at start of jump list".to_string());
                     self.draw_commandline(buffer);
@@ -18789,9 +18779,7 @@ impl Editor {
                 add_to_history = false;
                 if let Some(entry) = self.jump_forward_entry() {
                     log!("jumping forward to {entry:?}");
-                    let action = self.action_for_history_entry(&entry);
-                    self.execute_with_tracking(&action, buffer, runtime, false)
-                        .await?;
+                    self.jump_to_entry(&entry, buffer, runtime).await?;
                 } else {
                     self.last_error = Some("at end of jump list".to_string());
                     self.draw_commandline(buffer);
@@ -19075,7 +19063,7 @@ impl Editor {
         }
 
         if add_to_history && Self::records_jump(action) {
-            self.save_to_history(history_entry_before_action);
+            self.save_to_history(jump_entry_before_action);
         }
 
         if self.current_buffer().id() == action_buffer_id
@@ -19166,10 +19154,11 @@ impl Editor {
                 | Action::RepeatSearch
                 | Action::RepeatSearchOpposite
                 | Action::SearchWordUnderCursor
-                | Action::PageDown
-                | Action::PageUp
                 | Action::MoveToBottom
                 | Action::MoveToTop
+                | Action::MoveToViewportTop(_)
+                | Action::MoveToViewportMiddle
+                | Action::MoveToViewportBottom(_)
                 | Action::MoveToFilePercent(_)
                 | Action::MatchitForward
                 | Action::MatchitBackward
@@ -19182,88 +19171,182 @@ impl Editor {
                 | Action::JumpToMark { .. }
                 | Action::OpenLocation(_, _)
                 | Action::OpenFile(_)
+                | Action::SplitHorizontalWithFile(_)
+                | Action::SplitVerticalWithFile(_)
                 | Action::NextBuffer
                 | Action::PreviousBuffer
         )
     }
 
-    fn action_for_history_entry(&self, entry: &HistoryEntry) -> Action {
-        match &entry.file {
-            Some(file) if self.current_buffer().file.as_ref() != Some(file) => {
-                Action::MoveToFilePos(file.clone(), entry.x, entry.y + 1)
-            }
-            _ => Action::MoveTo(entry.x, entry.y + 1),
+    fn active_jump_list(&self) -> &JumpList {
+        &self
+            .window_manager
+            .active_window()
+            .expect("editor must always retain an active window")
+            .jump_list
+    }
+
+    fn active_jump_list_mut(&mut self) -> &mut JumpList {
+        &mut self
+            .window_manager
+            .active_window_mut()
+            .expect("editor must always retain an active window")
+            .jump_list
+    }
+
+    fn current_jump_entry(&self) -> JumpEntry {
+        let fallback = self.cursor_text_position();
+        JumpEntry {
+            buffer_id: self.current_buffer().id(),
+            char_index: self.current_buffer().position_to_char_idx(fallback),
+            fallback,
         }
     }
 
-    fn save_to_history(&mut self, entry: HistoryEntry) {
-        let current = self.current_history_entry();
-        if entry.same_location(&current) {
+    fn clean_jump_list(&mut self) {
+        let valid_buffers = self
+            .buffer_manager
+            .iter()
+            .map(Buffer::id)
+            .collect::<HashSet<_>>();
+        let current_buffer_id = self.current_buffer().id();
+        let current_line = self.buffer_line();
+        let list = self.active_jump_list_mut();
+        let old_index = list.index.min(list.entries.len());
+        let mut keep = vec![false; list.entries.len()];
+
+        for (from, entry) in list.entries.iter().enumerate() {
+            if !valid_buffers.contains(&entry.buffer_id) {
+                continue;
+            }
+            let duplicate_ahead = list.entries[from + 1..].iter().any(|later| {
+                later.buffer_id == entry.buffer_id && later.fallback.line == entry.fallback.line
+            });
+            keep[from] = !duplicate_ahead;
+        }
+
+        let new_index = keep
+            .iter()
+            .take(old_index)
+            .filter(|keep_entry| **keep_entry)
+            .count();
+        let mut position = 0;
+        list.entries.retain(|_| {
+            let retain = keep[position];
+            position += 1;
+            retain
+        });
+        list.index = new_index.min(list.entries.len());
+
+        if list.index == list.entries.len()
+            && list.entries.last().is_some_and(|last| {
+                last.buffer_id == current_buffer_id && last.fallback.line == current_line
+            })
+        {
+            list.entries.pop();
+            list.index = list.entries.len();
+        }
+    }
+
+    fn forget_jumps_for_buffer(&mut self, buffer_id: BufferId) {
+        for window in self.window_manager.windows_mut() {
+            let old_index = window.jump_list.index.min(window.jump_list.entries.len());
+            let retained_before_index = window.jump_list.entries[..old_index]
+                .iter()
+                .filter(|entry| entry.buffer_id != buffer_id)
+                .count();
+            window
+                .jump_list
+                .entries
+                .retain(|entry| entry.buffer_id != buffer_id);
+            window.jump_list.index = retained_before_index.min(window.jump_list.entries.len());
+        }
+    }
+
+    fn save_to_history(&mut self, entry: JumpEntry) {
+        let current = self.current_jump_entry();
+        if entry.buffer_id == current.buffer_id && entry.char_index == current.char_index {
             return;
         }
-
-        if self.jump_index < self.jump_list.len() {
-            self.jump_list.truncate(self.jump_index + 1);
-        }
-
-        if let Some(prev) = self.jump_list.last() {
-            if !entry.moved_from(prev) {
-                self.jump_index = self.jump_list.len();
-                return;
-            }
-        }
-
         self.push_history_entry(entry);
     }
 
     fn push_current_history_entry(&mut self) {
-        let entry = self.current_history_entry();
-        if self
-            .jump_list
-            .last()
-            .is_some_and(|prev| prev.same_location(&entry))
-        {
-            self.jump_index = self.jump_list.len();
-            return;
-        }
-        self.push_history_entry(entry);
+        self.push_history_entry(self.current_jump_entry());
     }
 
-    fn push_history_entry(&mut self, entry: HistoryEntry) {
-        self.jump_list.push(entry);
-        if self.jump_list.len() > JUMPLIST_SIZE {
-            self.jump_list.remove(0);
+    fn push_history_entry(&mut self, entry: JumpEntry) {
+        let list = self.active_jump_list_mut();
+        list.entries.push(entry);
+        if list.entries.len() > JUMPLIST_SIZE {
+            list.entries.remove(0);
         }
-        self.jump_index = self.jump_list.len();
+        list.index = list.entries.len();
     }
 
-    fn jump_back_entry(&mut self) -> Option<HistoryEntry> {
-        if self.jump_index == self.jump_list.len() {
-            if self.jump_list.is_empty() {
+    fn jump_back_entry(&mut self) -> Option<JumpEntry> {
+        self.clean_jump_list();
+        if self.active_jump_list().index == self.active_jump_list().entries.len() {
+            if self.active_jump_list().entries.is_empty() {
                 return None;
             }
             self.push_current_history_entry();
-            if self.jump_list.len() < 2 {
+            let list = self.active_jump_list_mut();
+            if list.entries.len() < 2 {
                 return None;
             }
-            self.jump_index = self.jump_list.len() - 2;
+            list.index = list.entries.len() - 2;
         } else {
-            if self.jump_index == 0 {
+            let list = self.active_jump_list_mut();
+            if list.index == 0 {
                 return None;
             }
-            self.jump_index -= 1;
+            list.index -= 1;
         }
 
-        self.jump_list.get(self.jump_index).cloned()
+        let list = self.active_jump_list();
+        list.entries.get(list.index).cloned()
     }
 
-    fn jump_forward_entry(&mut self) -> Option<HistoryEntry> {
-        if self.jump_list.is_empty() || self.jump_index >= self.jump_list.len().saturating_sub(1) {
+    fn jump_forward_entry(&mut self) -> Option<JumpEntry> {
+        self.clean_jump_list();
+        let list = self.active_jump_list_mut();
+        if list.entries.is_empty() || list.index >= list.entries.len().saturating_sub(1) {
             return None;
         }
 
-        self.jump_index += 1;
-        self.jump_list.get(self.jump_index).cloned()
+        list.index += 1;
+        list.entries.get(list.index).cloned()
+    }
+
+    async fn jump_to_entry(
+        &mut self,
+        entry: &JumpEntry,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let Some(buffer_index) = self
+            .buffer_manager
+            .iter()
+            .position(|candidate| candidate.id() == entry.buffer_id)
+        else {
+            return Ok(());
+        };
+
+        if self.buffer_manager.active_index() != buffer_index {
+            self.set_current_buffer(buffer, buffer_index).await?;
+        }
+        let position = self.current_buffer().char_idx_to_position(entry.char_index);
+        let line = self.current_buffer().get(position.line).unwrap_or_default();
+        let x = char_to_grapheme(trim_line_ending(&line), position.character);
+        self.execute_with_tracking(
+            &Action::MoveTo(x, position.line + 1),
+            buffer,
+            runtime,
+            false,
+        )
+        .await?;
+        Ok(())
     }
 
     /// Move to the top line of the selection
@@ -20073,6 +20156,7 @@ impl Editor {
 
         self.sync_to_window();
         let removed_id = self.current_buffer().id();
+        self.forget_jumps_for_buffer(removed_id);
         self.scratch_buffers.remove(&removed_id);
         let removed_uri = self.current_buffer().uri()?;
         if let Some(uri) = removed_uri.as_deref() {
@@ -21210,6 +21294,26 @@ impl Editor {
                 );
             }
         }
+        for window in self.window_manager.windows_mut() {
+            for entry in &mut window.jump_list.entries {
+                if entry.buffer_id == buffer_id {
+                    let mut anchor = EditAnchor {
+                        buffer_id: entry.buffer_id,
+                        file: None,
+                        char_index: entry.char_index,
+                        fallback: entry.fallback,
+                        affinity: AnchorAffinity::Right,
+                    };
+                    Self::transform_anchor_for_edit(
+                        &mut anchor,
+                        edit.start_char,
+                        edit.end_char,
+                        edit.new_char_len,
+                    );
+                    entry.char_index = anchor.char_index;
+                }
+            }
+        }
 
         let buffer = self.current_buffer();
         let fallback_positions = self
@@ -21228,12 +21332,16 @@ impl Editor {
                     .filter(|((anchor_buffer_id, _), _)| *anchor_buffer_id == buffer_id)
                     .map(|(_, anchor)| anchor),
             )
-            .map(|anchor| {
-                (
-                    anchor.char_index,
-                    buffer.char_idx_to_position(anchor.char_index),
-                )
-            })
+            .map(|anchor| anchor.char_index)
+            .chain(
+                self.window_manager
+                    .windows()
+                    .into_iter()
+                    .flat_map(|window| window.jump_list.entries.iter())
+                    .filter(|entry| entry.buffer_id == buffer_id)
+                    .map(|entry| entry.char_index),
+            )
+            .map(|char_index| (char_index, buffer.char_idx_to_position(char_index)))
             .collect::<HashMap<_, _>>();
         let update_fallback = |anchor: &mut EditAnchor| {
             if let Some(position) = fallback_positions.get(&anchor.char_index) {
@@ -21252,6 +21360,18 @@ impl Editor {
             .filter(|((anchor_buffer_id, _), _)| *anchor_buffer_id == buffer_id)
             .map(|(_, anchor)| anchor)
             .for_each(update_fallback);
+        for window in self.window_manager.windows_mut() {
+            window
+                .jump_list
+                .entries
+                .iter_mut()
+                .filter(|entry| entry.buffer_id == buffer_id)
+                .for_each(|entry| {
+                    if let Some(position) = fallback_positions.get(&entry.char_index) {
+                        entry.fallback = *position;
+                    }
+                });
+        }
     }
 
     fn replace_range(&mut self, range: TextRange, new_text: &str) {
@@ -21956,16 +22076,38 @@ impl Editor {
         });
         self.panel_manager.stage_restore(snapshot.panels.clone());
         self.registers = snapshot.registers.clone();
-        self.jump_list = snapshot
-            .jumps
+        let saved_window_jumps = if snapshot.window_jumps.is_empty() {
+            vec![SessionWindowJumps {
+                window_index: self.window_manager.active_window_id(),
+                jumps: snapshot.jumps.clone(),
+                jump_index: snapshot.jump_index,
+            }]
+        } else {
+            snapshot.window_jumps.clone()
+        };
+        let restored_window_jumps = saved_window_jumps
             .iter()
-            .map(|jump| HistoryEntry {
-                file: jump.file.clone(),
-                x: jump.x,
-                y: jump.y,
+            .map(|saved| {
+                let entries = saved
+                    .jumps
+                    .iter()
+                    .filter_map(|jump| self.restore_session_jump(jump, &buffer_map))
+                    .collect::<Vec<_>>();
+                (
+                    saved.window_index,
+                    JumpList {
+                        index: saved.jump_index.min(entries.len()),
+                        entries,
+                    },
+                )
             })
-            .collect();
-        self.jump_index = snapshot.jump_index.min(self.jump_list.len());
+            .collect::<Vec<_>>();
+        let mut windows = self.window_manager.windows_mut();
+        for (window_index, jump_list) in restored_window_jumps {
+            if let Some(window) = windows.get_mut(window_index) {
+                *window.jump_list = jump_list;
+            }
+        }
         self.local_marks.clear();
         self.global_marks.clear();
         self.special_marks.clear();
@@ -22146,6 +22288,36 @@ impl Editor {
         })
     }
 
+    fn restore_session_jump(
+        &self,
+        jump: &SessionJump,
+        buffer_map: &HashMap<usize, usize>,
+    ) -> Option<JumpEntry> {
+        let buffer_index = jump
+            .buffer_index
+            .and_then(|saved| buffer_map.get(&saved).copied())
+            .or_else(|| {
+                jump.file.as_ref().and_then(|file| {
+                    self.buffer_manager
+                        .iter()
+                        .position(|buffer| buffer.file.as_ref() == Some(file))
+                })
+            })
+            .unwrap_or_else(|| self.buffer_manager.active_index());
+        let buffer = self.buffer_manager.get(buffer_index)?;
+        let char_index = jump.char_index.unwrap_or_else(|| {
+            let line = buffer.get(jump.y).unwrap_or_default();
+            let character = grapheme_to_char(trim_line_ending(&line), jump.x);
+            buffer.position_to_char_idx(TextPosition::new(jump.y, character))
+        });
+        let fallback = buffer.char_idx_to_position(char_index);
+        Some(JumpEntry {
+            buffer_id: buffer.id(),
+            char_index: buffer.position_to_char_idx(fallback),
+            fallback,
+        })
+    }
+
     fn durable_session_snapshot(
         &mut self,
         include_disk_contents: bool,
@@ -22223,6 +22395,34 @@ impl Editor {
             .enumerate()
             .map(|(index, buffer)| (buffer.id(), index))
             .collect::<HashMap<_, _>>();
+        let window_jumps = self
+            .window_manager
+            .windows()
+            .into_iter()
+            .enumerate()
+            .map(|(window_index, window)| {
+                let jumps = window
+                    .jump_list
+                    .entries
+                    .iter()
+                    .filter_map(|jump| self.snapshot_jump(jump, &buffer_indices))
+                    .collect::<Vec<_>>();
+                SessionWindowJumps {
+                    window_index,
+                    jump_index: window.jump_list.index.min(jumps.len()),
+                    jumps,
+                }
+            })
+            .collect::<Vec<_>>();
+        let active_window_jumps = window_jumps
+            .iter()
+            .find(|saved| saved.window_index == self.window_manager.active_window_id());
+        let jumps = active_window_jumps
+            .map(|saved| saved.jumps.clone())
+            .unwrap_or_default();
+        let jump_index = active_window_jumps
+            .map(|saved| saved.jump_index)
+            .unwrap_or_default();
         let local_marks = self
             .local_marks
             .values()
@@ -22276,16 +22476,9 @@ impl Editor {
                 window_layout: self.window_manager.snapshot(),
                 panels: self.panel_manager.snapshot(usize::from(self.size.0)),
                 registers: self.registers.clone(),
-                jumps: self
-                    .jump_list
-                    .iter()
-                    .map(|jump| SessionJump {
-                        file: jump.file.clone(),
-                        x: jump.x,
-                        y: jump.y,
-                    })
-                    .collect(),
-                jump_index: self.jump_index,
+                jumps,
+                jump_index,
+                window_jumps,
                 local_marks,
                 global_marks,
                 special_marks,
@@ -22317,6 +22510,24 @@ impl Editor {
                 AnchorAffinity::Left => SessionAnchorAffinity::Left,
                 AnchorAffinity::Right => SessionAnchorAffinity::Right,
             },
+        })
+    }
+
+    fn snapshot_jump(
+        &self,
+        jump: &JumpEntry,
+        buffer_indices: &HashMap<BufferId, usize>,
+    ) -> Option<SessionJump> {
+        let buffer_index = *buffer_indices.get(&jump.buffer_id)?;
+        let buffer = self.buffer_manager.get(buffer_index)?;
+        let fallback = buffer.char_idx_to_position(jump.char_index);
+        let line = buffer.get(fallback.line).unwrap_or_default();
+        Some(SessionJump {
+            file: buffer.file.clone(),
+            x: char_to_grapheme(trim_line_ending(&line), fallback.character),
+            y: fallback.line,
+            buffer_index: Some(buffer_index),
+            char_index: Some(jump.char_index),
         })
     }
 
@@ -35218,7 +35429,7 @@ while True:
         assert_eq!(editor.buffer_line(), 1);
         assert_eq!(editor.cx, 2);
         assert_eq!(editor.buffer_manager.len(), 2);
-        assert!(!editor.jump_list.is_empty());
+        assert!(!editor.active_jump_list().entries.is_empty());
 
         editor
             .execute(

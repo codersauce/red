@@ -1162,6 +1162,39 @@ async fn global_mark_reopens_a_closed_file_buffer() {
 }
 
 #[tokio::test]
+async fn jumplist_switches_buffers_but_forgets_a_deleted_buffer() {
+    let first_path = temp_file_path("jumplist-first");
+    let second_path = temp_file_path("jumplist-second");
+    fs::write(&first_path, "one\ntwo\nthree").unwrap();
+    fs::write(&second_path, "alpha\nbeta").unwrap();
+    let buffer = Buffer::new(Some(first_path.clone()), "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness
+        .execute_action(Action::OpenFile(second_path.clone()))
+        .await
+        .unwrap();
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_buffer_contents("one\ntwo\nthree");
+    harness.assert_cursor_at(0, 1);
+    harness.execute_action(Action::JumpForward).await.unwrap();
+    harness.assert_buffer_contents("alpha\nbeta");
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness
+        .execute_action(Action::DeleteBuffer(/*force*/ true))
+        .await
+        .unwrap();
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_buffer_contents("alpha\nbeta");
+    assert!(harness.commandline_row().contains("at start of jump list"));
+
+    fs::remove_file(first_path).unwrap();
+    fs::remove_file(second_path).unwrap();
+}
+
+#[tokio::test]
 async fn mark_tracks_a_visual_block_multi_edit_transaction() {
     let mut harness = EditorHarness::with_content("a\nb\nc");
     harness.execute_action(Action::MoveDown).await.unwrap();

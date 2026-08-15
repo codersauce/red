@@ -6,7 +6,7 @@ use red::{
     buffer::Buffer,
     color::Color,
     config::{Config, KeyAction},
-    editor::{Action, Mode, SearchDirection},
+    editor::{Action, Editor, Mode, SearchDirection},
     theme::Style,
 };
 use std::collections::HashMap;
@@ -1125,7 +1125,7 @@ async fn repeated_jump_back_and_forward_do_not_skip_entries() {
 }
 
 #[tokio::test]
-async fn new_jump_from_middle_discards_forward_entries() {
+async fn new_jump_from_middle_preserves_forward_entries_like_neovim_default() {
     let mut harness = EditorHarness::with_content("one\ntwo\nthree\nfour\nfive");
 
     harness.execute_action(Action::MoveTo(0, 2)).await.unwrap();
@@ -1143,11 +1143,18 @@ async fn new_jump_from_middle_discards_forward_entries() {
 
     harness.execute_action(Action::JumpBack).await.unwrap();
     harness.assert_cursor_at(0, 1);
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 3);
 }
 
 #[tokio::test]
-async fn default_normal_keys_map_ctrl_o_and_tab_to_jumplist_navigation() {
+async fn default_normal_keys_map_ctrl_o_ctrl_i_and_tab_to_jumplist_navigation() {
     let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    assert_eq!(
+        config.keys.normal.get("Ctrl-i"),
+        Some(&KeyAction::Single(Action::JumpForward))
+    );
     assert_eq!(
         config.keys.normal.get("Tab"),
         Some(&KeyAction::Single(Action::JumpForward))
@@ -1167,9 +1174,139 @@ async fn default_normal_keys_map_ctrl_o_and_tab_to_jumplist_navigation() {
         .unwrap();
     harness.assert_cursor_at(0, 0);
 
-    let tab_event = Event::Key(KeyEvent::from(KeyCode::Tab));
-    harness.execute_event(tab_event).await.unwrap();
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('i'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
     harness.assert_cursor_at(0, 2);
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 0);
+
+    harness
+        .execute_event(Event::Key(KeyEvent::from(KeyCode::Tab)))
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 2);
+}
+
+#[tokio::test]
+async fn jumplist_keeps_only_the_newest_column_for_each_buffer_line() {
+    let mut harness = EditorHarness::with_content("abcdef\nsecond\nthird");
+
+    harness.execute_action(Action::MoveTo(3, 1)).await.unwrap();
+    harness.execute_action(Action::MoveTo(0, 3)).await.unwrap();
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(3, 0);
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(3, 0);
+    assert!(harness.commandline_row().contains("at start of jump list"));
+}
+
+#[tokio::test]
+async fn jumplist_positions_follow_lines_inserted_before_them() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree\nfour\nfive");
+
+    harness.execute_action(Action::MoveTo(0, 3)).await.unwrap();
+    harness.execute_action(Action::MoveTo(0, 5)).await.unwrap();
+    harness.execute_action(Action::MoveTo(0, 1)).await.unwrap();
+    harness
+        .execute_action(Action::InsertLineAtCursor)
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 5);
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 3);
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 1);
+}
+
+#[tokio::test]
+async fn split_windows_copy_then_independently_traverse_their_jumplists() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree\nfour\nfive");
+
+    harness.execute_action(Action::MoveTo(0, 2)).await.unwrap();
+    harness.execute_action(Action::MoveTo(0, 4)).await.unwrap();
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+    harness.execute_action(Action::MoveTo(0, 5)).await.unwrap();
+
+    harness.execute_action(Action::NextWindow).await.unwrap();
+    harness.assert_cursor_at(0, 3);
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 1);
+
+    harness.execute_action(Action::NextWindow).await.unwrap();
+    harness.assert_cursor_at(0, 4);
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 0);
+}
+
+#[tokio::test]
+async fn per_window_jumplists_round_trip_through_session_recovery() {
+    let contents = "one\ntwo\nthree\nfour\nfive";
+    let mut source = EditorHarness::with_content(contents);
+
+    source.execute_action(Action::MoveTo(0, 2)).await.unwrap();
+    source.execute_action(Action::MoveTo(0, 4)).await.unwrap();
+    source.execute_action(Action::SplitVertical).await.unwrap();
+    source.execute_action(Action::MoveTo(0, 5)).await.unwrap();
+    let snapshot = source.editor.test_session_snapshot();
+
+    assert_eq!(snapshot.window_jumps.len(), 2);
+    let mut buffers = Editor::buffers_from_session_snapshot(&snapshot);
+    let mut restored = EditorHarness::with_buffer(buffers.remove(0));
+    restored.editor.restore_session_snapshot(&snapshot).unwrap();
+
+    restored.execute_action(Action::JumpBack).await.unwrap();
+    restored.assert_cursor_at(0, 0);
+    restored.execute_action(Action::NextWindow).await.unwrap();
+    restored.assert_cursor_at(0, 3);
+    restored.execute_action(Action::JumpBack).await.unwrap();
+    restored.assert_cursor_at(0, 1);
+}
+
+#[tokio::test]
+async fn viewport_motions_record_jumps_but_page_scrolling_does_not() {
+    let contents = (1..=60)
+        .map(|line| format!("line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut viewport_harness = EditorHarness::with_content(&contents);
+    for _ in 0..30 {
+        viewport_harness
+            .execute_action(Action::MoveDown)
+            .await
+            .unwrap();
+    }
+    viewport_harness
+        .execute_action(Action::MoveToViewportTop(1))
+        .await
+        .unwrap();
+    viewport_harness
+        .execute_action(Action::JumpBack)
+        .await
+        .unwrap();
+    viewport_harness.assert_cursor_at(0, 30);
+
+    let mut page_harness = EditorHarness::with_content(&contents);
+    page_harness.execute_action(Action::PageDown).await.unwrap();
+    let cursor_after_page = page_harness.cursor_position();
+    page_harness.execute_action(Action::JumpBack).await.unwrap();
+    assert_eq!(page_harness.cursor_position(), cursor_after_page);
+    assert!(page_harness
+        .commandline_row()
+        .contains("at start of jump list"));
 }
 
 #[tokio::test]

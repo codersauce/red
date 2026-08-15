@@ -278,6 +278,7 @@ Esc = { EnterMode = "Normal" }
 "Ctrl-u" = { HalfPageUp = 0 }
 "Ctrl-d" = { HalfPageDown = 0 }
 "Ctrl-o" = "JumpBack"
+"Ctrl-i" = "JumpForward"
 "Tab" = "JumpForward"
 "x" = "DeleteCharAtCursorPos"
 "X" = { DeletePreviousChars = 1 }
