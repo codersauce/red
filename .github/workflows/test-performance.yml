@@ -1,0 +1,160 @@
+name: Rust Test Performance
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Runner platform to benchmark
+        required: true
+        default: ubuntu-latest
+        type: choice
+        options:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+      runner:
+        description: Test runners to compare
+        required: true
+        default: both
+        type: choice
+        options:
+          - both
+          - cargo
+          - nextest
+      scope:
+        description: Run the root package or every workspace package
+        required: true
+        default: root
+        type: choice
+        options:
+          - root
+          - workspace
+      package:
+        description: Optional package for a quick focused benchmark with root scope
+        required: false
+        default: ''
+        type: string
+      runs:
+        description: Number of measured runs per runner
+        required: true
+        default: '3'
+        type: choice
+        options:
+          - '1'
+          - '3'
+          - '5'
+      warm_build:
+        description: Prebuild tests and collect Cargo compilation timings
+        required: true
+        default: true
+        type: boolean
+      use_sccache:
+        description: Enable the GitHub Actions sccache backend
+        required: true
+        default: false
+        type: boolean
+      use_mold:
+        description: Use the mold linker on Linux
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  RUST_BACKTRACE: 1
+
+jobs:
+  benchmark:
+    name: Compare ${{ inputs.runner }} on ${{ inputs.platform }}
+    runs-on: ${{ inputs.platform }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install ripgrep
+        uses: ./.github/actions/install-ripgrep
+
+      - name: Install cargo-nextest
+        if: inputs.runner != 'cargo'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.143
+          checksum: true
+          fallback: none
+
+      - name: Set up sccache
+        if: inputs.use_sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Enable sccache
+        if: inputs.use_sccache
+        shell: bash
+        run: |
+          echo 'SCCACHE_GHA_ENABLED=true' >> "$GITHUB_ENV"
+          echo 'RUSTC_WRAPPER=sccache' >> "$GITHUB_ENV"
+
+      - name: Reject mold outside Linux
+        if: inputs.use_mold && runner.os != 'Linux'
+        shell: bash
+        run: |
+          echo 'The mold linker benchmark is only supported on Linux.' >&2
+          exit 1
+
+      - name: Install mold
+        if: inputs.use_mold && runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes mold
+          echo 'RUSTFLAGS=-C link-arg=-fuse-ld=mold' >> "$GITHUB_ENV"
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ (inputs.use_mold || inputs.use_sccache) && format('benchmark-{0}-mold-{1}-sccache-{2}', runner.os, inputs.use_mold, inputs.use_sccache) || format('validation-{0}', runner.os) }}
+
+      - name: Benchmark test runners
+        shell: bash
+        env:
+          BENCHMARK_RUNNER: ${{ inputs.runner }}
+          BENCHMARK_SCOPE: ${{ inputs.scope }}
+          BENCHMARK_PACKAGE: ${{ inputs.package }}
+          BENCHMARK_RUNS: ${{ inputs.runs }}
+          BENCHMARK_WARM_BUILD: ${{ inputs.warm_build }}
+        run: |
+          args=(--runner "$BENCHMARK_RUNNER" --scope "$BENCHMARK_SCOPE" --runs "$BENCHMARK_RUNS")
+          if [[ "$BENCHMARK_WARM_BUILD" == true ]]; then
+            args+=(--timings)
+          else
+            args+=(--no-prebuild)
+          fi
+          if [[ -n "$BENCHMARK_PACKAGE" ]]; then
+            args+=(--package "$BENCHMARK_PACKAGE")
+          fi
+          python3 scripts/test_performance.py "${args[@]}"
+
+      - name: Report sccache statistics
+        if: always() && inputs.use_sccache
+        shell: bash
+        run: sccache --show-stats
+
+      - name: Upload benchmark and test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-performance-${{ inputs.platform }}-${{ github.run_id }}
+          path: |
+            target/test-performance/results.json
+            target/cargo-timings
+            target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 14

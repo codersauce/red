@@ -1,0 +1,61 @@
+name: Install ripgrep
+description: Install checksum-verified ripgrep releases without refreshing package indexes.
+
+runs:
+  using: composite
+  steps:
+    - name: Install ripgrep on Linux
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        version=15.2.0
+        archive="$RUNNER_TEMP/ripgrep-$version-x86_64-unknown-linux-musl.tar.gz"
+        install_dir="$RUNNER_TEMP/ripgrep"
+        expected_sha256=33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c
+
+        curl --fail --show-error --silent --location --retry 3 \
+          "https://github.com/BurntSushi/ripgrep/releases/download/$version/ripgrep-$version-x86_64-unknown-linux-musl.tar.gz" \
+          --output "$archive"
+        printf '%s  %s\n' "$expected_sha256" "$archive" | sha256sum --check
+        mkdir -p "$install_dir"
+        tar -xzf "$archive" -C "$install_dir" --strip-components=1
+        printf '%s\n' "$install_dir" >> "$GITHUB_PATH"
+        "$install_dir/rg" --version
+
+    - name: Install ripgrep on macOS
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        set -euo pipefail
+        if ! command -v rg >/dev/null 2>&1; then
+          brew install ripgrep
+        fi
+        rg --version
+
+    - name: Install ripgrep on Windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $version = "15.2.0"
+        $archive = Join-Path $env:RUNNER_TEMP "ripgrep.zip"
+        $extractRoot = Join-Path $env:RUNNER_TEMP "ripgrep"
+        $url = "https://github.com/BurntSushi/ripgrep/releases/download/$version/ripgrep-$version-x86_64-pc-windows-msvc.zip"
+        $expectedSha256 = "71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5"
+
+        Invoke-WebRequest -Uri $url -OutFile $archive
+        $actualSha256 = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualSha256 -ne $expectedSha256) {
+          throw "ripgrep archive checksum mismatch: expected $expectedSha256, got $actualSha256"
+        }
+
+        Expand-Archive -Path $archive -DestinationPath $extractRoot -Force
+        $installDir = Join-Path $extractRoot "ripgrep-$version-x86_64-pc-windows-msvc"
+        $executable = Join-Path $installDir "rg.exe"
+        if (-not (Test-Path $executable)) {
+          throw "ripgrep executable was not found at $executable"
+        }
+
+        $installDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        & $executable --version

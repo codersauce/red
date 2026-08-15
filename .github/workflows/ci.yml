@@ -16,6 +16,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
   RUST_BACKTRACE: 1
 
 jobs:
@@ -36,6 +38,9 @@ jobs:
 
       - name: Test Discord release announcements
         run: python3 -m unittest tests.test_discord_release
+
+      - name: Test validation helpers
+        run: python3 -m unittest tests.test_doctest_packages tests.test_test_performance
 
   test:
     name: Test Suite (${{ matrix.platform.standard }}, ${{ matrix.rust }})
@@ -67,57 +72,13 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
 
-      - name: Install ripgrep (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install --yes ripgrep
+      - name: Install ripgrep
+        uses: ./.github/actions/install-ripgrep
 
-      - name: Install ripgrep (macOS)
-        if: runner.os == 'macOS'
-        run: brew install ripgrep
-
-      - name: Install ripgrep (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $version = "15.2.0"
-          $archive = Join-Path $env:RUNNER_TEMP "ripgrep.zip"
-          $extractRoot = Join-Path $env:RUNNER_TEMP "ripgrep"
-          $url = "https://github.com/BurntSushi/ripgrep/releases/download/$version/ripgrep-$version-x86_64-pc-windows-msvc.zip"
-          $expectedSha256 = "71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5"
-
-          Invoke-WebRequest -Uri $url -OutFile $archive
-          $actualSha256 = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualSha256 -ne $expectedSha256) {
-            throw "ripgrep archive checksum mismatch: expected $expectedSha256, got $actualSha256"
-          }
-
-          Expand-Archive -Path $archive -DestinationPath $extractRoot -Force
-          $installDir = Join-Path $extractRoot "ripgrep-$version-x86_64-pc-windows-msvc"
-          $executable = Join-Path $installDir "rg.exe"
-          if (-not (Test-Path $executable)) {
-            throw "ripgrep executable was not found at $executable"
-          }
-
-          $installDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          & $executable --version
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: validation-${{ runner.os }}
 
       - name: Run tests
         run: cargo test --all-targets --all-features --verbose
@@ -140,6 +101,8 @@ jobs:
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: validation-${{ runner.os }}
 
       - name: Deny every Clippy warning
         run: cargo clippy --all-targets --all-features -- -D warnings
@@ -169,23 +132,10 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-self-check-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: validation-${{ runner.os }}
 
       - name: Initialize bundled runtime
         run: cargo run --locked -- --self-check
@@ -288,23 +238,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Cache Rust release build artifacts
+        uses: Swatinem/rust-cache@v2
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-release-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: release-${{ matrix.target }}
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
@@ -327,11 +264,10 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: validation-${{ runner.os }}
 
       - name: Build documentation and deny rustdoc warnings
         env:
@@ -339,7 +275,7 @@ jobs:
         run: cargo doc --workspace --no-deps --all-features --document-private-items
 
       - name: Run documentation tests
-        run: cargo test --workspace --doc
+        run: python3 scripts/doctest_packages.py --no-default-features
 
       - name: Check documentation links
         run: |

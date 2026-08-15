@@ -53,6 +53,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Cache Rust release build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+        env:
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/red
+
       - name: Build release binary
         env:
           RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/red
