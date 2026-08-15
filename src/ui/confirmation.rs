@@ -336,19 +336,19 @@ impl Component for Confirmation {
             (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 Some(self.terminal_action(false))
             }
-            (KeyCode::Left | KeyCode::BackTab, _) => {
+            (KeyCode::Left | KeyCode::BackTab | KeyCode::Char('h') | KeyCode::Char('k'), _) => {
                 self.accept_selected = true;
                 Some(KeyAction::Single(Action::Refresh))
             }
-            (KeyCode::Right | KeyCode::Tab, _) => {
+            (KeyCode::Right | KeyCode::Tab | KeyCode::Char('j') | KeyCode::Char('l'), _) => {
                 self.accept_selected = false;
                 Some(KeyAction::Single(Action::Refresh))
             }
-            (KeyCode::Up | KeyCode::Char('k'), _) if self.multiline => {
+            (KeyCode::Up, _) if self.multiline => {
                 self.scroll = self.scroll.saturating_sub(1);
                 Some(KeyAction::Single(Action::Refresh))
             }
-            (KeyCode::Down | KeyCode::Char('j'), _) if self.multiline => {
+            (KeyCode::Down, _) if self.multiline => {
                 self.scroll = self.scroll.saturating_add(1).min(self.max_scroll());
                 Some(KeyAction::Single(Action::Refresh))
             }
@@ -449,6 +449,35 @@ mod tests {
                         && matches!(event.as_ref(), PickerCallback::Selected(item) if item.id == "accept")
                 )
         ));
+    }
+
+    #[test]
+    fn confirmation_buttons_support_vim_navigation() {
+        let editor = editor();
+        let mut confirmation = Confirmation::new_callback(
+            &editor,
+            "Delete file?",
+            "This cannot be undone.",
+            PickerHandle::from_raw(7),
+        );
+
+        for key_code in [KeyCode::Char('h'), KeyCode::Char('k')] {
+            confirmation.accept_selected = false;
+            assert_eq!(
+                confirmation.handle_event(&key(key_code)),
+                Some(KeyAction::Single(Action::Refresh))
+            );
+            assert!(confirmation.accept_selected);
+        }
+
+        for key_code in [KeyCode::Char('j'), KeyCode::Char('l')] {
+            confirmation.accept_selected = true;
+            assert_eq!(
+                confirmation.handle_event(&key(key_code)),
+                Some(KeyAction::Single(Action::Refresh))
+            );
+            assert!(!confirmation.accept_selected);
+        }
     }
 
     #[test]
