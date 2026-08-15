@@ -47,6 +47,9 @@ pub(crate) const BUILTIN_COLON_COMMANDS: &[&str] = &[
 ];
 
 const SPECIAL_BUILTIN_COLON_COMMANDS: &[&str] = &[
+    "InlineHistory",
+    "inline-history",
+    "InlineHistoryExport",
     "commands",
     "command-palette",
     "whats-new",
@@ -379,6 +382,15 @@ pub(crate) fn keymap_hints(
 
 fn builtin_commands() -> Vec<BuiltinCommand> {
     vec![
+        builtin(
+            "editor.inline_history",
+            "Inline assist history",
+            "Editor",
+            "Browse retained questions, answers, and source-linked comments",
+            Some(":InlineHistory"),
+            &[":inline-history", "inline questions", "reviewed source"],
+            Action::OpenInlineHistory,
+        ),
         builtin(
             "editor.command_palette",
             "All commands",
@@ -1180,6 +1192,7 @@ fn key_action_label(action: &KeyAction) -> Option<String> {
 fn action_label(action: &Action) -> String {
     match action {
         Action::CommandPalette => "All commands".to_string(),
+        Action::OpenInlineHistory => "Inline assist history".to_string(),
         Action::ConfigDiagnostics => "Configuration diagnostics".to_string(),
         Action::OpenWhatsNew => "What’s new in Red".to_string(),
         Action::OpenDiagnosticsPicker => "Diagnostics".to_string(),

@@ -21,6 +21,9 @@ scrolloff = 3
 # Wrap long lines at the window edge. This matches Vim/Neovim's 'wrap'.
 wrap = true
 
+# Keep inline questions and answers in local editor recovery snapshots.
+persist_inline_history = true
+
 # Show the absolute line number on the cursor line and the distance from the
 # cursor on every other line, like Vim/Neovim's 'relativenumber'.
 relative_line_numbers = false
@@ -376,6 +379,11 @@ Esc = { EnterMode = "Normal" }
 "o" = "OnlyWindow"
 
 [keys.normal." "]
+"H" = "OpenInlineHistory"
+"C" = "AddSampleInlineComment"
+"X" = "ClearInlineComments"
+"v" = "ShowInlineComment"
+"x" = "DismissInlineComment"
 " " = "NextBuffer"
 "a" = [ "MoveToTop", { EnterMode = "VisualLine" }, "MoveToBottom" ]
 "A" = { PluginCommand = "Agent" }
@@ -400,10 +408,12 @@ Esc = { EnterMode = "Normal" }
 "c" = { "c" = { PluginCommand = "GitSubmitMessage" }, "q" = { PluginCommand = "GitCancelMessage" } }
 
 [keys.normal." "."]"]
+"c" = "NextInlineComment"
 "a" = "SwapNextParameter"
 "m" = "SwapNextFunction"
 
 [keys.normal." "."["]
+"c" = "PreviousInlineComment"
 "a" = "SwapPreviousParameter"
 "m" = "SwapPreviousFunction"
 
@@ -435,6 +445,8 @@ Esc = { EnterMode = "Normal" }
 "~" = [ { TransformSelection = "Toggle" }, { EnterMode = "Normal" } ]
 
 [keys.visual." "]
+"C" = "AddSampleInlineComment"
+"X" = [ "ClearInlineComments", { EnterMode = "Normal" } ]
 "A" = { PluginCommand = "Agent" }
 "i" = "InlineAssist"
 "h" = { "s" = { PluginCommand = "GitHunkStage" }, "u" = { PluginCommand = "GitHunkUnstage" }, "r" = { PluginCommand = "GitHunkReset" } }

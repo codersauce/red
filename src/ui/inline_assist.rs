@@ -25,7 +25,7 @@ const MAX_ERROR_ROWS: usize = 4;
 pub enum InlineAssistPopupState {
     Prompt { initial: String, refining: bool },
     Working,
-    Applied,
+    Applied { edited: bool, comments: usize },
     Failed(String),
 }
 
@@ -148,7 +148,7 @@ impl InlineAssistPopup {
                     .saturating_add(1)
             }
             InlineAssistPopupState::Working => 2,
-            InlineAssistPopupState::Applied => 2,
+            InlineAssistPopupState::Applied { .. } => 2,
             InlineAssistPopupState::Failed(message) => wrap_text(message, width.max(1))
                 .rows
                 .len()
@@ -294,7 +294,7 @@ impl Component for InlineAssistPopup {
             }
             InlineAssistPopupState::Working => {
                 let message = format!(
-                    "{} Generating bounded replacement…",
+                    "{} Preparing inline result…",
                     spinner_frame(self.spinner_tick as u64 * SPINNER_FRAME_INTERVAL_MS)
                 );
                 if self.dialog.height > 0 {
@@ -309,15 +309,28 @@ impl Component for InlineAssistPopup {
                     );
                 }
             }
-            InlineAssistPopupState::Applied => {
+            InlineAssistPopupState::Applied { edited, comments } => {
+                let message = match (*edited, *comments) {
+                    (true, 0) => "Applied to buffer (unsaved)".to_string(),
+                    (true, count) => format!("Applied unsaved edit · {count} comment(s)"),
+                    (false, 0) => "No changes or comments needed".to_string(),
+                    (false, count) => format!("Added {count} inline comment(s) · code unchanged"),
+                };
                 if self.dialog.height > 0 {
-                    buffer.set_text(x, y, "Applied to buffer (unsaved)", &self.style);
+                    buffer.set_text(x, y, &truncate_display_width(&message, width), &self.style);
                 }
                 if self.dialog.height > 1 {
                     buffer.set_text(
                         x,
                         y.saturating_add(1),
-                        &truncate_display_width("Enter keep · u undo · r refine · A agent", width),
+                        &truncate_display_width(
+                            if *edited {
+                                "Enter keep · u undo · r refine · A agent"
+                            } else {
+                                "Enter keep · u dismiss · r refine · A agent"
+                            },
+                            width,
+                        ),
                         &self.theme.ui_style.muted,
                     );
                 }
@@ -388,7 +401,7 @@ impl Component for InlineAssistPopup {
                 && !self.inside(mouse.column as usize, mouse.row as usize)
             {
                 let action = match &self.state {
-                    InlineAssistPopupState::Applied => Action::KeepInlineAssist,
+                    InlineAssistPopupState::Applied { .. } => Action::KeepInlineAssist,
                     InlineAssistPopupState::Prompt { refining: true, .. } => {
                         Action::CancelInlineAssistRefine
                     }
@@ -459,7 +472,7 @@ impl Component for InlineAssistPopup {
                 }
                 _ => None,
             },
-            InlineAssistPopupState::Applied => match event {
+            InlineAssistPopupState::Applied { .. } => match event {
                 Event::Key(key) => match key.code {
                     KeyCode::Enter | KeyCode::Esc | KeyCode::Char('k') => {
                         Some(KeyAction::Single(Action::KeepInlineAssist))
@@ -589,8 +602,14 @@ mod tests {
     #[test]
     fn applied_state_exposes_keep_undo_refine_and_escalate() {
         let editor = editor();
-        let mut popup =
-            InlineAssistPopup::new(&editor, "selection", InlineAssistPopupState::Applied);
+        let mut popup = InlineAssistPopup::new(
+            &editor,
+            "selection",
+            InlineAssistPopupState::Applied {
+                edited: true,
+                comments: 0,
+            },
+        );
         for (key, action) in [
             (KeyCode::Enter, Action::KeepInlineAssist),
             (KeyCode::Char('u'), Action::UndoInlineAssist),
@@ -611,7 +630,10 @@ mod tests {
         let popup = InlineAssistPopup::new_avoiding_rows(
             &editor,
             "lines 5–8 selection",
-            InlineAssistPopupState::Applied,
+            InlineAssistPopupState::Applied {
+                edited: true,
+                comments: 0,
+            },
             Some(avoid_rows),
         );
         let popup_last_row = popup
@@ -691,7 +713,10 @@ mod tests {
         let mut popup = InlineAssistPopup::new_in_layout(
             &editor,
             "line 4",
-            InlineAssistPopupState::Applied,
+            InlineAssistPopupState::Applied {
+                edited: true,
+                comments: 0,
+            },
             OverlayLayout {
                 viewport,
                 anchor: (48, 4),

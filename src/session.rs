@@ -119,6 +119,9 @@ pub struct SessionSnapshot {
     /// Persisted Codex thread binding and Red's clean model-visible projection.
     #[serde(default)]
     pub agent_conversation: Option<AgentConversationSnapshot>,
+    /// Source-linked inline questions and results, independent of provider threads.
+    #[serde(default)]
+    pub inline_history: crate::inline_history::InlineHistory,
     /// Legacy proposal payload accepted for backward-compatible loading and discarded.
     #[serde(default, rename = "agent_workspace", skip_serializing)]
     pub legacy_agent_workspace: Option<serde_json::Value>,
@@ -2193,6 +2196,7 @@ fn validate_snapshot(mut snapshot: SessionSnapshot) -> anyhow::Result<SessionSna
             )
         })?;
     }
+    snapshot.inline_history.validate()?;
     // Versions in the supported range use serde defaults as their migration path.
     snapshot.version = SESSION_SCHEMA_VERSION;
     Ok(snapshot)
@@ -2316,6 +2320,7 @@ mod tests {
             last_visual_selections: Vec::new(),
             agent_transcript: None,
             agent_conversation: None,
+            inline_history: Default::default(),
             legacy_agent_workspace: None,
             agent_session_resumable: false,
             plugin_extensions: HashMap::new(),

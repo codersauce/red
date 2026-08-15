@@ -27,6 +27,13 @@ pub(crate) enum SelectionForegroundPriority {
     Selection,
 }
 
+/// Overall appearance of the active editor theme, independent of the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeMode {
+    Dark,
+    Light,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Theme {
     #[allow(unused)]
@@ -66,6 +73,98 @@ pub struct ThemeStyleSpec {
 }
 
 impl Theme {
+    /// Classifies the editor's resolved background by perceived luminance.
+    pub fn mode(&self) -> ThemeMode {
+        if self.style.bg.is_some_and(Color::is_light) {
+            ThemeMode::Light
+        } else {
+            ThemeMode::Dark
+        }
+    }
+
+    fn inline_comment_background(&self) -> Color {
+        let black = Color::Rgb { r: 0, g: 0, b: 0 };
+        let editor_background = blend_color(self.style.bg.unwrap_or(black), black);
+        if let Some(background) = self.colors.get("red.inlineCommentBackground") {
+            return blend_color(*background, editor_background);
+        }
+        let light = self.mode() == ThemeMode::Light;
+        let background = if light {
+            Color::Rgb {
+                r: 228,
+                g: 228,
+                b: 231,
+            }
+        } else {
+            Color::Rgb {
+                r: 39,
+                g: 39,
+                b: 43,
+            }
+        };
+        if contrast_ratio(background, editor_background) >= 1.08 {
+            background
+        } else if light {
+            Color::Rgb {
+                r: 212,
+                g: 212,
+                b: 216,
+            }
+        } else {
+            Color::Rgb {
+                r: 58,
+                g: 58,
+                b: 64,
+            }
+        }
+    }
+
+    pub(crate) fn inline_comment_style(&self) -> Style {
+        let background = self.inline_comment_background();
+        let foreground = self
+            .colors
+            .get("red.inlineCommentForeground")
+            .or_else(|| self.colors.get("editorInfo.foreground"))
+            .copied()
+            .or_else(|| self.get_style("comment").and_then(|style| style.fg))
+            .or(self.ui_style.muted.fg)
+            .or(self.style.fg)
+            .unwrap_or(Color::Rgb {
+                r: 128,
+                g: 128,
+                b: 128,
+            });
+        Style {
+            fg: Some(ensure_minimum_contrast(foreground, background, 4.5)),
+            bg: Some(background),
+            italic: true,
+            ..Style::default()
+        }
+    }
+
+    pub(crate) fn inline_comment_guide_style(&self) -> Style {
+        let mut style = self.inline_comment_style();
+        let background = self.style.bg.unwrap_or_default();
+        if let Some(foreground) = style.fg {
+            let (Color::Rgb { r, g, b } | Color::Rgba { r, g, b, .. }) = foreground;
+            style.fg = Some(blend_color(Color::Rgba { r, g, b, a: 80 }, background));
+        }
+        style.bg = self.style.bg;
+        style.italic = false;
+        style
+    }
+
+    pub(crate) fn inline_comment_arrow_style(&self) -> Style {
+        let mut style = self.inline_comment_style();
+        let background = self.style.bg.unwrap_or_default();
+        style.fg = style
+            .fg
+            .map(|foreground| ensure_minimum_contrast(foreground, background, 4.5));
+        style.bg = self.style.bg;
+        style.italic = false;
+        style
+    }
+
     pub(crate) fn current_line_number_style(&self) -> Style {
         let mut style = self.gutter_style.fallback_bg(&self.style);
         style.fg = self
@@ -608,6 +707,57 @@ impl Style {
 mod tests {
     use super::*;
     use crate::color::contrast_ratio;
+
+    #[test]
+    fn theme_mode_uses_perceived_background_luminance() {
+        let mut theme = Theme::default();
+        theme.style.bg = Some(Color::Rgb {
+            r: 20,
+            g: 20,
+            b: 24,
+        });
+        assert_eq!(theme.mode(), ThemeMode::Dark);
+        theme.style.bg = Some(Color::Rgb {
+            r: 250,
+            g: 250,
+            b: 247,
+        });
+        assert_eq!(theme.mode(), ThemeMode::Light);
+        theme.style.bg = None;
+        assert_eq!(theme.mode(), ThemeMode::Dark);
+    }
+
+    #[test]
+    fn inline_comment_background_uses_gray_unless_explicitly_overridden() {
+        let mut theme = Theme::default();
+        theme.colors.clear();
+        theme.style.bg = Some(Color::Rgb {
+            r: 16,
+            g: 16,
+            b: 20,
+        });
+        let terminal = Color::Rgb { r: 0, g: 0, b: 0 };
+        theme
+            .colors
+            .insert("terminal.background".to_string(), terminal);
+        assert_eq!(
+            theme.inline_comment_style().bg,
+            Some(Color::Rgb {
+                r: 39,
+                g: 39,
+                b: 43
+            })
+        );
+        let custom = Color::Rgb {
+            r: 45,
+            g: 55,
+            b: 65,
+        };
+        theme
+            .colors
+            .insert("red.inlineCommentBackground".to_string(), custom);
+        assert_eq!(theme.inline_comment_style().bg, Some(custom));
+    }
 
     fn style(r: u8, g: u8, b: u8) -> Style {
         Style {

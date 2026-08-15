@@ -246,6 +246,9 @@ pub struct Config {
     /// Defaults to on.
     #[serde(default)]
     pub fetch_release_notes: Option<bool>,
+    /// Retain inline conversations in local editor recovery snapshots. Defaults to on.
+    #[serde(default)]
+    pub persist_inline_history: Option<bool>,
     /// Interactive search behavior.
     #[serde(default)]
     pub search: SearchConfig,
@@ -1820,6 +1823,7 @@ fn known_top_level_field(field: &str) -> bool {
             | "splash"
             | "show_whats_new"
             | "fetch_release_notes"
+            | "persist_inline_history"
             | "search"
             | "completion"
             | "picker"
@@ -3891,6 +3895,8 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
 
         assert_eq!(config.show_whats_new, Some(true));
         assert_eq!(config.fetch_release_notes, Some(true));
+        assert_eq!(config.persist_inline_history, Some(true));
+        assert!(known_top_level_field("persist_inline_history"));
         assert_eq!(
             config.keys.normal.get("F1"),
             Some(&KeyAction::Single(Action::CommandPalette))

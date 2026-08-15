@@ -164,8 +164,9 @@ for line in sys.stdin:
         assert message["params"]["ephemeral"] is True
         assert message["params"]["sandbox"] == "read-only"
         tools = message["params"]["dynamicTools"]
-        assert len(tools) == 1
+        assert len(tools) == 2
         assert tools[0]["name"] == "submit_replacement"
+        assert tools[1]["name"] == "submit_comments"
         assert "inline code editor" in message["params"]["baseInstructions"]
         send({"id": ident, "result": {"thread": {"id": "inline-red"}}})
     elif method == "turn/start":
@@ -175,17 +176,29 @@ for line in sys.stdin:
         assert "submit_replacement" in text
         turn_id = f"inline-turn-{turn}"
         send({"id": ident, "result": {"turn": {"id": turn_id}}})
+        if turn == 1:
+            send({"method": "item/agentMessage/delta", "params": {
+                "threadId": "inline-red", "turnId": turn_id, "delta": "Renamed the value."
+            }})
+        tool = "submit_comments" if turn in (3, 5) else "submit_replacement"
+        if turn == 3:
+            arguments = {"comments": [{"start_line": 1, "end_line": 2, "message": "Review both lines"}]}
+        elif turn == 4:
+            arguments = {"replacement": "first();\nsecond();\n", "comments": [{"start_line": 2, "message": "Explain the second call"}]}
+        elif turn == 5:
+            arguments = {"comments": [{"start_line": 1, "message": "Must not be applied"}]}
+        else:
+            arguments = {"replacement": "let answer = 42;\n" if turn == 1 else "let answer: u64 = 42;\n"}
         send({"id": f"inline-tool-{turn}", "method": "item/tool/call", "params": {
             "threadId": "inline-red", "turnId": turn_id,
-            "tool": "submit_replacement",
-            "arguments": {"replacement": "let answer = 42;\n" if turn == 1 else "let answer: u64 = 42;\n"}
+            "tool": tool, "arguments": arguments
         }})
     elif str(ident).startswith("inline-tool-"):
         assert message["result"]["success"] is True
         current = str(ident).split("-")[-1]
         send({"method": "turn/completed", "params": {
             "threadId": "inline-red",
-            "turn": {"id": f"inline-turn-{current}", "status": "completed"}
+            "turn": {"id": f"inline-turn-{current}", "status": "interrupted" if current == "5" else "completed"}
         }})
 "#,
     )
@@ -253,10 +266,15 @@ async fn inline_app_server_is_ephemeral_tool_limited_and_supports_followups() {
     ));
     assert!(matches!(
         next_event(&mut bridge, &mut task).await,
-        CodexEvent::InlineReplacement { request_id, session_id, replacement }
+        CodexEvent::InlineAnswerDelta { request_id, text }
+            if request_id == "request-1" && text == "Renamed the value."
+    ));
+    assert!(matches!(
+        next_event(&mut bridge, &mut task).await,
+        CodexEvent::InlineResult { request_id, session_id, result }
             if request_id == "request-1"
                 && session_id == "inline-red"
-                && replacement == "let answer = 42;\n"
+                && result.replacement.as_deref() == Some("let answer = 42;\n")
     ));
 
     bridge
@@ -270,9 +288,35 @@ async fn inline_app_server_is_ephemeral_tool_limited_and_supports_followups() {
         .unwrap();
     assert!(matches!(
         next_event(&mut bridge, &mut task).await,
-        CodexEvent::InlineReplacement { request_id, replacement, .. }
-            if request_id == "request-2" && replacement == "let answer: u64 = 42;\n"
+        CodexEvent::InlineResult { request_id, result, .. }
+            if request_id == "request-2" && result.replacement.as_deref() == Some("let answer: u64 = 42;\n")
     ));
+    for turn in 3..=5 {
+        bridge
+            .send(CodexCommand::InlineAssistFollowup {
+                request_id: format!("request-{turn}"),
+                session_id: "inline-red".to_string(),
+                prompt: "review the target".to_string(),
+                context: "<target>first();\nsecond();\n</target>".to_string(),
+            })
+            .await
+            .unwrap();
+        let event = next_event(&mut bridge, &mut task).await;
+        match (turn, event) {
+            (3, CodexEvent::InlineResult { result, .. }) => {
+                assert!(result.replacement.is_none());
+                assert_eq!(result.comments[0].last_line(), 2);
+            }
+            (4, CodexEvent::InlineResult { result, .. }) => {
+                assert_eq!(result.replacement.as_deref(), Some("first();\nsecond();\n"));
+                assert_eq!(result.comments[0].start_line, 2);
+            }
+            (5, CodexEvent::InlineFailed { message, .. }) => {
+                assert!(message.contains("interrupted"))
+            }
+            (_, event) => panic!("unexpected inline event: {event:?}"),
+        }
+    }
     assert!(writes.lock().unwrap().is_empty());
 
     drop(bridge);

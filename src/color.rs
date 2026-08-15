@@ -20,6 +20,16 @@ impl Default for Color {
     }
 }
 
+impl Color {
+    /// Whether this color has a light perceived luminance.
+    ///
+    /// Resolve transparent colors against their actual background first when
+    /// one is available. Otherwise transparency is composited against black.
+    pub fn is_light(self) -> bool {
+        relative_luminance(self) > 0.5
+    }
+}
+
 impl From<Color> for crossterm::style::Color {
     fn from(color: Color) -> Self {
         match color {
