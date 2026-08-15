@@ -13,6 +13,8 @@ use red::{
 };
 use serde_json::{json, Value};
 
+static MOCK_CODEX_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Clone)]
 struct RecordingHost {
     writes: Arc<Mutex<Vec<(String, String)>>>,
@@ -194,28 +196,41 @@ for line in sys.stdin:
     path
 }
 
-async fn next_event(bridge: &mut red::codex::CodexBridge) -> CodexEvent {
+async fn next_event(
+    bridge: &mut red::codex::CodexBridge,
+    task: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+) -> CodexEvent {
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            if let Some(event) = bridge.try_recv() {
-                break event;
+        tokio::select! {
+            event = async {
+                loop {
+                    if let Some(event) = bridge.try_recv() {
+                        break event;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            } => event,
+            result = &mut *task => match result {
+                Ok(Ok(())) => panic!("Codex worker stopped before producing an event"),
+                Ok(Err(error)) => panic!("Codex worker failed before producing an event: {error:#}"),
+                Err(error) => panic!("Codex worker task failed before producing an event: {error}"),
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await
-    .unwrap()
+    .expect("Codex worker did not produce an event within ten seconds")
 }
 
 #[tokio::test]
 async fn inline_app_server_is_ephemeral_tool_limited_and_supports_followups() {
+    let _serial = MOCK_CODEX_TEST_LOCK.lock().await;
     let directory = tempfile::tempdir().unwrap();
     let codex = mock_inline_codex(directory.path());
     let writes = Arc::new(Mutex::new(Vec::new()));
     let host = RecordingHost {
         writes: Arc::clone(&writes),
     };
-    let (mut bridge, task) = start_codex(
+    let (mut bridge, mut task) = start_codex(
         CodexProcessSpec::new(codex, directory.path()),
         host,
         NonZeroUsize::new(32).unwrap(),
@@ -232,12 +247,12 @@ async fn inline_app_server_is_ephemeral_tool_limited_and_supports_followups() {
         .await
         .unwrap();
     assert!(matches!(
-        next_event(&mut bridge).await,
+        next_event(&mut bridge, &mut task).await,
         CodexEvent::InlineSessionCreated { request_id, session_id }
             if request_id == "request-1" && session_id == "inline-red"
     ));
     assert!(matches!(
-        next_event(&mut bridge).await,
+        next_event(&mut bridge, &mut task).await,
         CodexEvent::InlineReplacement { request_id, session_id, replacement }
             if request_id == "request-1"
                 && session_id == "inline-red"
@@ -254,7 +269,7 @@ async fn inline_app_server_is_ephemeral_tool_limited_and_supports_followups() {
         .await
         .unwrap();
     assert!(matches!(
-        next_event(&mut bridge).await,
+        next_event(&mut bridge, &mut task).await,
         CodexEvent::InlineReplacement { request_id, replacement, .. }
             if request_id == "request-2" && replacement == "let answer: u64 = 42;\n"
     ));
@@ -320,13 +335,14 @@ for line in sys.stdin:
 
 #[tokio::test]
 async fn direct_app_server_streams_and_routes_writes_to_the_host() {
+    let _serial = MOCK_CODEX_TEST_LOCK.lock().await;
     let directory = tempfile::tempdir().unwrap();
     let codex = mock_codex(directory.path());
     let writes = Arc::new(Mutex::new(Vec::new()));
     let host = RecordingHost {
         writes: Arc::clone(&writes),
     };
-    let (mut bridge, task) = start_codex(
+    let (mut bridge, mut task) = start_codex(
         CodexProcessSpec::new(codex, directory.path()),
         host,
         NonZeroUsize::new(32).unwrap(),
@@ -339,11 +355,9 @@ async fn direct_app_server_streams_and_routes_writes_to_the_host() {
         })
         .await
         .unwrap();
-    let session_id = loop {
-        if let Some(CodexEvent::SessionCreated { session_id }) = bridge.try_recv() {
-            break session_id;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let session_id = match next_event(&mut bridge, &mut task).await {
+        CodexEvent::SessionCreated { session_id } => session_id,
+        other => panic!("expected created session, got {other:?}"),
     };
     assert_eq!(session_id, "thread-red");
 
@@ -358,14 +372,14 @@ async fn direct_app_server_streams_and_routes_writes_to_the_host() {
         .unwrap();
     let mut streamed = String::new();
     loop {
-        match bridge.try_recv() {
-            Some(CodexEvent::Update { text, .. }) => streamed.push_str(&text),
-            Some(CodexEvent::Completed { stop_reason, .. }) => {
+        match next_event(&mut bridge, &mut task).await {
+            CodexEvent::Update { text, .. } => streamed.push_str(&text),
+            CodexEvent::Completed { stop_reason, .. } => {
                 assert_eq!(stop_reason, "completed");
                 break;
             }
-            Some(CodexEvent::Failed { message, .. }) => panic!("{message}"),
-            _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            CodexEvent::Failed { message, .. } => panic!("{message}"),
+            _ => {}
         }
     }
     assert_eq!(streamed, "working");
@@ -380,13 +394,14 @@ async fn direct_app_server_streams_and_routes_writes_to_the_host() {
 
 #[tokio::test]
 async fn direct_app_server_generates_commit_messages_without_tools_or_agent_events() {
+    let _serial = MOCK_CODEX_TEST_LOCK.lock().await;
     let directory = tempfile::tempdir().unwrap();
     let codex = mock_commit_codex(directory.path());
     let writes = Arc::new(Mutex::new(Vec::new()));
     let host = RecordingHost {
         writes: Arc::clone(&writes),
     };
-    let (mut bridge, task) = start_codex(
+    let (mut bridge, mut task) = start_codex(
         CodexProcessSpec::new(codex, directory.path()),
         host,
         NonZeroUsize::new(32).unwrap(),
@@ -401,16 +416,7 @@ async fn direct_app_server_generates_commit_messages_without_tools_or_agent_even
         })
         .await
         .unwrap();
-    let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if let Some(event) = bridge.try_recv() {
-                break event;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    let event = next_event(&mut bridge, &mut task).await;
 
     assert!(matches!(
         event,
@@ -426,12 +432,13 @@ async fn direct_app_server_generates_commit_messages_without_tools_or_agent_even
 
 #[tokio::test]
 async fn direct_app_server_resumes_a_persisted_thread_with_history() {
+    let _serial = MOCK_CODEX_TEST_LOCK.lock().await;
     let directory = tempfile::tempdir().unwrap();
     let codex = mock_codex(directory.path());
     let host = RecordingHost {
         writes: Arc::new(Mutex::new(Vec::new())),
     };
-    let (mut bridge, task) = start_codex(
+    let (mut bridge, mut task) = start_codex(
         CodexProcessSpec::new(codex, directory.path()),
         host,
         NonZeroUsize::new(32).unwrap(),
@@ -445,16 +452,7 @@ async fn direct_app_server_resumes_a_persisted_thread_with_history() {
         })
         .await
         .unwrap();
-    let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if let Some(event) = bridge.try_recv() {
-                break event;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    let event = next_event(&mut bridge, &mut task).await;
 
     match event {
         CodexEvent::SessionRestored { session_id, thread } => {
@@ -469,6 +467,7 @@ async fn direct_app_server_resumes_a_persisted_thread_with_history() {
 
 #[tokio::test]
 async fn direct_app_server_reports_a_missing_persisted_thread_as_restore_failure() {
+    let _serial = MOCK_CODEX_TEST_LOCK.lock().await;
     let directory = tempfile::tempdir().unwrap();
     let codex = mock_codex(directory.path());
     let host = RecordingHost {
@@ -477,7 +476,7 @@ async fn direct_app_server_reports_a_missing_persisted_thread_as_restore_failure
     let mut spec = CodexProcessSpec::new(codex, directory.path());
     spec.environment
         .insert("RED_MOCK_RESUME_ERROR".into(), "true".into());
-    let (mut bridge, task) = start_codex(spec, host, NonZeroUsize::new(32).unwrap()).unwrap();
+    let (mut bridge, mut task) = start_codex(spec, host, NonZeroUsize::new(32).unwrap()).unwrap();
 
     bridge
         .send(CodexCommand::ResumeSession {
@@ -486,16 +485,7 @@ async fn direct_app_server_reports_a_missing_persisted_thread_as_restore_failure
         })
         .await
         .unwrap();
-    let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if let Some(event) = bridge.try_recv() {
-                break event;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    let event = next_event(&mut bridge, &mut task).await;
 
     assert!(matches!(
         event,
@@ -508,6 +498,7 @@ async fn direct_app_server_reports_a_missing_persisted_thread_as_restore_failure
 
 #[tokio::test]
 async fn direct_app_server_starts_without_managed_feature_requirements() {
+    let _serial = MOCK_CODEX_TEST_LOCK.lock().await;
     for requirements in [
         json!({"allowedSandboxModes": ["read-only"]}),
         json!({"allowedSandboxModes": ["read-only"], "featureRequirements": null}),
@@ -522,7 +513,8 @@ async fn direct_app_server_starts_without_managed_feature_requirements() {
             "RED_MOCK_REQUIREMENTS".into(),
             requirements.to_string().into(),
         );
-        let (mut bridge, task) = start_codex(spec, host, NonZeroUsize::new(32).unwrap()).unwrap();
+        let (mut bridge, mut task) =
+            start_codex(spec, host, NonZeroUsize::new(32).unwrap()).unwrap();
 
         bridge
             .send(CodexCommand::NewSession {
@@ -530,16 +522,7 @@ async fn direct_app_server_starts_without_managed_feature_requirements() {
             })
             .await
             .unwrap();
-        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if let Some(event) = bridge.try_recv() {
-                    break event;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
+        let event = next_event(&mut bridge, &mut task).await;
 
         assert!(
             matches!(event, CodexEvent::SessionCreated { session_id } if session_id == "thread-red")
@@ -551,6 +534,7 @@ async fn direct_app_server_starts_without_managed_feature_requirements() {
 
 #[tokio::test]
 async fn direct_app_server_starts_with_required_hooks() {
+    let _serial = MOCK_CODEX_TEST_LOCK.lock().await;
     let directory = tempfile::tempdir().unwrap();
     let codex = mock_codex(directory.path());
     let host = RecordingHost {
@@ -568,7 +552,7 @@ async fn direct_app_server_starts_with_required_hooks() {
     );
     spec.environment
         .insert("RED_MOCK_EXPECT_HOOKS".into(), "true".into());
-    let (mut bridge, task) = start_codex(spec, host, NonZeroUsize::new(32).unwrap()).unwrap();
+    let (mut bridge, mut task) = start_codex(spec, host, NonZeroUsize::new(32).unwrap()).unwrap();
 
     bridge
         .send(CodexCommand::NewSession {
@@ -576,16 +560,7 @@ async fn direct_app_server_starts_with_required_hooks() {
         })
         .await
         .unwrap();
-    let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if let Some(event) = bridge.try_recv() {
-                break event;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    let event = next_event(&mut bridge, &mut task).await;
 
     assert!(
         matches!(event, CodexEvent::SessionCreated { session_id } if session_id == "thread-red")
@@ -596,6 +571,7 @@ async fn direct_app_server_starts_with_required_hooks() {
 
 #[tokio::test]
 async fn direct_app_server_reports_live_startup_failure_and_stderr_availability() {
+    let _serial = MOCK_CODEX_TEST_LOCK.lock().await;
     let directory = tempfile::tempdir().unwrap();
     let codex = directory.path().join("codex-fails");
     std::fs::write(
