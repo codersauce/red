@@ -27,6 +27,12 @@ sources:
   - id: discord-release
     type: file
     path: scripts/discord_release.py
+  - id: release-cliff
+    type: file
+    path: cliff.release.toml
+  - id: whats-new
+    type: file
+    path: src/whats_new.rs
 ---
 
 Use this guide to publish a Red release without mixing up release preparation, the tag build, draft release review, Homebrew publication, installer smoke tests, and announcement. The release process is split on purpose: a prepare workflow opens a normal release PR, an annotated tag builds and smoke-tests archives into a draft GitHub release, publishing that release updates Homebrew, and a separate Discord workflow announces only published non-prerelease releases unless manually invoked [@prepare-release] [@release] [@announce-discord].
@@ -68,11 +74,11 @@ The Release workflow runs on `v*` tag pushes and manual dispatch with an existin
 
 The smoke job extracts every archive and runs `--self-check`. It requires the final line to be `red self-check ok`, fails on unhealthy plugin status lines, and checks that the binary does not contain the GitHub workspace path [@release]. This is the packaging-level runtime gate; the exact command behavior is covered by [Self Check](../../reference/runtime/self-check).
 
-The publish job verifies package version and committed release changelog, regenerates release changelog content, copies `install/install.sh` and `install/install.ps1` into the release assets, generates `SHA256SUMS.txt`, writes release notes with install commands, creates or updates a draft GitHub release, and uploads all assets [@release].
+The publish job verifies package version and committed release changelog, regenerates release changelog content, copies `install/install.sh` and `install/install.ps1` into the release assets, generates `SHA256SUMS.txt`, generates public GitHub release notes with `cliff.release.toml`, appends installation and checksum guidance, creates or updates a draft GitHub release, and uploads all assets [@release] [@release-cliff].
 
 ## Review And Publish The Draft
 
-Before publishing, confirm the draft release contains all four archives, `SHA256SUMS.txt`, `install.sh`, and `install.ps1`, and that install instructions match the release tag [@releasing]. Do not publish if the package version, changelog section, checksums, or assets do not match the intended tag. If a tag was pushed with the wrong version, the release docs require deleting the draft release and tag, fixing the version, and pushing a new tag before anything is published [@releasing].
+Before publishing, confirm the draft release contains all four archives, `SHA256SUMS.txt`, `install.sh`, and `install.ps1`, that install instructions match the release tag, and that change authors, pull request numbers, and first-time contributors are credited correctly [@releasing]. Do not publish if the package version, changelog section, checksums, assets, or public notes do not match the intended tag. If a tag was pushed with the wrong version, the release docs require deleting the draft release and tag, fixing the version, and pushing a new tag before anything is published [@releasing].
 
 Publishing the GitHub release triggers a second `Release` workflow run for the `release.published` event; its build, smoke, and draft-publish jobs are skipped, and only the `homebrew` job is eligible [@release]. That job requires `HOMEBREW_TAP_TOKEN`, downloads release tarballs and checksums, writes `Formula/red.rb` with OS-specific URLs and SHA-256 values, and pushes the formula update if it changed [@release]. Use `gh run list --event release` when checking publication automation, because the release-event `Release` run and the tag-push `Release` run have the same workflow name [@release].
 
@@ -80,4 +86,6 @@ Publishing the GitHub release triggers a second `Release` workflow run for the `
 
 After publishing, verify Homebrew and the stable installers. The release docs require `brew update`, `brew install codersauce/tap/red`, `red --version`, and temporary-directory installer checks for Unix and Windows [@releasing]. Follow [Release Installers](../installers/release-installers) for installer-specific checks.
 
-The Discord announcement workflow runs on published releases and manual dispatch, but it skips prereleases for automatic release events [@announce-discord]. It reads the published GitHub release, runs `scripts/discord_release.py` to build JSON and a Markdown summary, checks the webhook only when not in dry-run mode, and posts through `curl` with retry options [@announce-discord]. The helper selects announcement sections from "Features", "Performance", and "Bug Fixes", builds a compact embed, chooses an image based on release scopes, and can include `@everyone` only when the workflow passes the flag [@discord-release].
+The Discord announcement workflow runs on published releases and manual dispatch, but it skips prereleases for automatic release events [@announce-discord]. It reads the published GitHub release, runs `scripts/discord_release.py` to build JSON and a Markdown summary, checks the webhook only when not in dry-run mode, and posts through `curl` with retry options [@announce-discord]. The helper selects announcement sections from "Features", "Performance", and "Bug Fixes", stops before installation boilerplate, builds a compact embed, chooses an image based on release scopes, and can include `@everyone` only when the workflow passes the flag [@discord-release].
+
+The in-app What's New panel uses the embedded `CHANGELOG.md` as an immediate offline fallback, then can replace the current version's notes with the matching published GitHub release body when it is available [@whats-new]. It keeps contributor bullets in the full release notes but excludes them from the short highlight extraction, so first-time contributor credit remains visible without becoming a product-change highlight [@whats-new].
