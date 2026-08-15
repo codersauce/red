@@ -46,6 +46,7 @@ fn self_check_reports_every_bundled_plugin_and_finishes_with_success() {
         "lsp_symbols",
         "neotree",
         "project_search",
+        "session_restore",
         "theme_browser",
     ];
     for plugin in expected {

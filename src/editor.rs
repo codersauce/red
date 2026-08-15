@@ -8364,6 +8364,9 @@ impl Editor {
                             "diagnostics" => json!(self.config.diagnostics),
                             "show_diagnostics" => json!(self.config.show_diagnostics),
                             "startup_file_count" => json!(self.config.startup_file_count),
+                            "startup_session_resumed" => {
+                                json!(self.config.startup_session_resumed)
+                            }
                             "cwd" => json!(std::env::current_dir()
                                 .ok()
                                 .map(|path| path.to_string_lossy().to_string())),
@@ -8386,6 +8389,7 @@ impl Editor {
                             "diagnostics": self.config.diagnostics,
                             "show_diagnostics": self.config.show_diagnostics,
                             "startup_file_count": self.config.startup_file_count,
+                            "startup_session_resumed": self.config.startup_session_resumed,
                             "cwd": std::env::current_dir().ok().map(|path| path.to_string_lossy().to_string()),
                             "executable": std::env::current_exe().ok().map(|path| path.to_string_lossy().to_string()),
                             "keys": self.config.keys,

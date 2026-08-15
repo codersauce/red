@@ -12196,6 +12196,17 @@ mod tests {
             .notify("editor:ready", serde_json::json!({}))
             .await
             .unwrap();
+        let resumed_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(key.as_deref(), Some("startup_session_resumed"));
+                request_id
+            }
+            _ => panic!("unexpected plugin request"),
+        };
+        runtime
+            .resolve_request(resumed_request_id, serde_json::json!({ "value": false }))
+            .await
+            .unwrap();
         let startup_request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::GetConfig { request_id, key } => {
                 assert_eq!(key.as_deref(), Some("startup_file_count"));
@@ -12263,6 +12274,39 @@ mod tests {
             }
             _ => panic!("unexpected plugin request"),
         }
+    }
+
+    #[tokio::test]
+    async fn session_restore_does_not_override_core_recovery() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "session_restore",
+                include_str!("../../plugins/session_restore.hk"),
+            )
+            .await
+            .unwrap();
+
+        runtime
+            .notify("editor:ready", serde_json::json!({}))
+            .await
+            .unwrap();
+        let resumed_request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetConfig { request_id, key } => {
+                assert_eq!(key.as_deref(), Some("startup_session_resumed"));
+                request_id
+            }
+            _ => panic!("unexpected plugin request"),
+        };
+        runtime
+            .resolve_request(resumed_request_id, serde_json::json!({ "value": true }))
+            .await
+            .unwrap();
+
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
     #[tokio::test]
