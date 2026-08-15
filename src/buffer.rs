@@ -172,11 +172,12 @@ impl Buffer {
         }
     }
 
-    /// Replaces the buffer with its current file contents and clears undo history.
+    /// Reads the current file contents without mutating the buffer.
     ///
-    /// The method increments the content revision but does not notify LSP or plugins.
-    /// It fails for unnamed, missing, unreadable, or non-UTF-8 files.
-    pub fn reload_from_file(&mut self) -> anyhow::Result<String> {
+    /// The editor owns applying the returned contents through its transaction boundary so
+    /// reloads retain undo history, marks, dirty-state revisions, and change notifications.
+    /// This fails for unnamed, missing, unreadable, or non-UTF-8 files.
+    pub(crate) fn read_backing_file(&self) -> anyhow::Result<(String, String)> {
         let Some(file) = self.file.clone() else {
             return Err(anyhow::anyhow!("No file name"));
         };
@@ -187,20 +188,7 @@ impl Buffer {
         }
 
         let contents = std::fs::read_to_string(&path)?;
-        let byte_count = contents.len();
-
-        self.content = Rope::from_str(&contents);
-        self.file = Some(path.to_string_lossy().into_owned());
-        self.undo_history = UndoHistory::default();
-        self.dirty = false;
-        self.revision = self.revision.wrapping_add(1);
-
-        Ok(format!(
-            "{:?} {}L, {}B read",
-            self.file.as_deref().unwrap_or(&file),
-            self.len(),
-            byte_count
-        ))
+        Ok((path.to_string_lossy().into_owned(), contents))
     }
 
     /// Gets the file type based on the file extension

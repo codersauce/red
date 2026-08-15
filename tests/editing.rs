@@ -1780,6 +1780,16 @@ async fn edit_with_force_reloads_dirty_current_file() {
     assert_eq!(harness.buffer_contents(), "one\nchanged\n");
     assert_eq!(harness.cursor_position(), (1, 1));
     assert!(!harness.is_dirty());
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    assert_eq!(harness.buffer_contents(), "one\nxtwo\n");
+    assert_eq!(harness.cursor_position(), (1, 1));
+    assert!(harness.is_dirty());
+
+    harness.execute_action(Action::Redo).await.unwrap();
+    assert_eq!(harness.buffer_contents(), "one\nchanged\n");
+    assert_eq!(harness.cursor_position(), (1, 1));
+    assert!(!harness.is_dirty());
     fs::remove_file(path).unwrap();
 }
 
