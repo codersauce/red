@@ -32,7 +32,7 @@ Read [Plugin architecture](architecture/plugins) when changing bundled plugins o
 
 ## Agent Work
 
-Read [Reviewable agent edits](concepts/reviewable-agent-edits) before changing agent behavior. The README states the user-facing contract: Codex receives editor context, but every suggested write is staged as an isolated proposal until explicit review [@readme]. The deeper reading order starts at [Agent architecture](architecture/agent), then continues through the Codex app-server flow, proposal workspace, dynamic tools, and review guide.
+Read [Agent-attributed edits](concepts/agent-attributed-edits) before changing agent behavior. The README states the user-facing contract: Codex receives editor context, Red reveals each tool call, and edits apply and save through the editor [@readme]. The deeper reading order starts at [Agent architecture](architecture/agent), then continues through the Codex app-server flow, followed editing, dynamic tools, and history guide.
 
 ## Husk Work
 

@@ -73,7 +73,7 @@ topics:
     parents: [persistence]
   - slug: persistence
     title: Persistence
-    description: Durable local state such as sessions, preferences, locks, and proposals.
+    description: Durable local state such as sessions, preferences, locks, and agent conversations.
     parents: [architecture]
   - slug: buffers
     title: Buffers
@@ -173,15 +173,15 @@ topics:
     parents: [lsp, editing]
   - slug: agent
     title: Agent
-    description: Red's Codex integration, dynamic tools, proposals, and review workflow.
+    description: Red's Codex integration, dynamic tools, followed editing, and agent history workflow.
     parents: [architecture]
   - slug: codex
     title: Codex
     description: Direct Codex app-server lifecycle and prerequisite checks.
     parents: [agent]
-  - slug: reviewable-edits
-    title: Reviewable Edits
-    description: Proposal-first edit handling for Codex and editor-owned application.
+  - slug: agent-edits
+    title: Agent Edits
+    description: Codex edit handling through Red-owned tools, attribution, followed application, and history.
     parents: [agent, safety]
   - slug: safety
     title: Safety

@@ -42,7 +42,7 @@ Use [Runtime lifecycle](startup/runtime-lifecycle) and [Red command](../referenc
 
 [Husk architecture](husk) covers the embedded and standalone scripting workspace: public embedding, packages and locks, extension tiers, and the Husk language server [@husk-hub]. [LSP architecture](lsp) covers server routing, process transport, editor document synchronization, completion, workspace edits, capabilities, configuration, and Husk LSP integration [@lsp-hub].
 
-[Agent architecture](agent) is the entry point for Codex app-server integration, dynamic tools, proposal workspaces, reviewable edits, and proposal review operations [@agent-hub]. Keep it connected to [Reviewable agent edits](../concepts/reviewable-agent-edits), because the architecture is built around proposal-first mutation rather than direct agent writes.
+[Agent architecture](agent) is the entry point for Codex app-server integration, dynamic tools, followed editing, agent attribution, and history operations [@agent-hub]. Keep it connected to [Agent-attributed edits](../concepts/agent-attributed-edits), because the architecture is built around Red-owned tool application rather than native Codex workspace writes.
 
 ## State, Assets, And Sessions
 

@@ -12,9 +12,12 @@ sources:
   - id: codex
     type: file
     path: src/codex/mod.rs
+  - id: workflow
+    type: file
+    path: docs/AGENT_WORKFLOW.md
 ---
 
-Red's accepted agent integration decision is to speak directly to the installed Codex CLI through `codex app-server --stdio`. ADR 0003 supersedes the earlier ACP foundation and removes the ACP client, generic ACP adapters, OpenAI Responses companion, and Codex ACP translation companion from the supported workflow [@adr-0003]. The consequence for future agent work is narrow but important: Red owns the app-server process, JSONL framing, threads, turns, cancellation, request correlation, dynamic-tool dispatch, and proposal workspace, while Codex runs read-only with native approvals denied [@adr-0003] [@codex].
+Red's accepted agent integration decision is to speak directly to the installed Codex CLI through `codex app-server --stdio`. ADR 0003 supersedes the earlier ACP foundation and removes the ACP client, generic ACP adapters, OpenAI Responses companion, and Codex ACP translation companion from the supported workflow [@adr-0003]. The consequence for future agent work is narrow but important: Red owns the app-server process, JSONL framing, threads, turns, cancellation, request correlation, and dynamic-tool dispatch, while Codex runs read-only with native approvals denied [@adr-0003] [@codex].
 
 ## Status
 
@@ -26,13 +29,13 @@ The original ACP foundation put Red's agent boundary behind an Agent Client Prot
 
 ADR 0001 therefore made provider qualification a gate: Phase 2 had to either select an adapter whose edits demonstrably used ACP client filesystem methods or build a provider-specific integration that redirected every read and write into Red's proposal filesystem [@adr-0001]. ADR 0003 records that the removed Codex companion already translated ACP into app-server calls, so moving that client into core removed a process and protocol boundary while preserving persistent conversations, streaming, cancellation, editor-aware tools, and reviewable proposals [@adr-0003].
 
-`codex exec` was rejected as an automatic fallback because its one-shot automation surface cannot provide Red's bidirectional live editor tools and proposal callbacks without a workspace mirror and post-hoc diff import [@adr-0003]. That would weaken unsaved-buffer semantics and the review guarantee that Red maintains through [Reviewable Agent Edits](../../concepts/reviewable-agent-edits).
+`codex exec` was rejected as an automatic fallback because its one-shot automation surface cannot provide Red's bidirectional live editor tools without a workspace mirror and post-hoc diff import [@adr-0003]. That would weaken unsaved-buffer semantics and the editor-owned edit boundary described in [Agent-Attributed Edits](../../concepts/agent-attributed-edits).
 
 ## Decision
 
 Red integrates directly with `codex app-server --stdio` and supports one agent backend [@adr-0003]. Red no longer ships or supports ACP adapters or companion executables for the agent path [@adr-0003]. The app-server worker in `src/codex/mod.rs` launches Codex with `app-server --stdio`, disables apps, connectors, plugins, and remote plugins, initializes with experimental app-server capability enabled, verifies authentication through `account/read`, starts ephemeral threads, and submits turns with read-only sandboxing, no execution environments, and `approvalPolicy = "never"` [@codex].
 
-The decision keeps the proposal workspace as the only supported write path [@adr-0003]. In implementation, Codex receives Red's dynamic tool definitions and base instructions telling it to use Red's read, editor, and proposal tools rather than a shell or native patch tool [@codex]. Native file-change, command-execution, and permission approval requests are declined or reduced to empty permissions at the app-server boundary [@codex].
+The current implementation keeps Red-owned dynamic tools as the only supported write path [@workflow] [@codex]. Codex receives dynamic tool definitions and base instructions telling it to use Red's read and editor tools rather than a shell or native patch tool; successful full-agent edits update Red's visible buffer and are saved to disk through the editor [@codex]. Native file-change, command-execution, and permission approval requests are declined or reduced to empty permissions at the app-server boundary [@codex].
 
 ## Consequences
 

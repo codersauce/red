@@ -1,6 +1,6 @@
 ---
 title: "Guides"
-summary: "Guide pages give maintainers task-oriented procedures for validation, plugins, LSP debugging, sessions, performance checks, releases, installers, and agent proposal review."
+summary: "Guide pages give maintainers task-oriented procedures for validation, plugins, LSP debugging, sessions, performance checks, releases, installers, and agent history inspection."
 topics: [guides, navigation]
 sources:
   - id: topics
@@ -17,7 +17,7 @@ sources:
     path: almanac/guides/lsp/debugging-lsp-failures.md
   - id: agent-guide
     type: file
-    path: almanac/guides/agent/review-agent-proposals.md
+    path: almanac/guides/agent/inspect-agent-history.md
   - id: detach-guide
     type: file
     path: almanac/guides/sessions/detach-reattach.md
@@ -47,7 +47,7 @@ Use [Write A Husk Plugin](plugins/write-a-husk-plugin) when adding or updating a
 
 ## Agent And Session Operations
 
-[Review Agent Proposals](agent/review-agent-proposals) is the operational guide for inspecting, accepting, rejecting, and recovering Codex proposal changes without bypassing the reviewable-edit boundary [@agent-guide].
+[Inspect Agent History](agent/inspect-agent-history) is the operational guide for inspecting and safely reverting Codex-origin transactions after followed edits or inline assist have entered Red's undo history [@agent-guide].
 
 For live sessions, use [Detach And Reattach](sessions/detach-reattach) when the owner process should stay alive across terminal disconnects [@detach-guide]. Use [Resume After Crash](sessions/resume-after-crash) when the owner is gone and the task is to recover the newest useful snapshot deliberately [@recovery-guide].
 

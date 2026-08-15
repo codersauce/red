@@ -1,6 +1,6 @@
 ---
 title: "Concepts"
-summary: "Concept pages define the durable mental models behind Red's editor, Husk runtime, plugins, LSP, sessions, and agent review boundaries."
+summary: "Concept pages define the durable mental models behind Red's editor, Husk runtime, plugins, LSP, sessions, and agent edit boundaries."
 topics: [concepts, navigation]
 sources:
   - id: topics
@@ -30,9 +30,9 @@ sources:
   - id: dialogs
     type: file
     path: almanac/concepts/plugins/callback-scoped-dialogs.md
-  - id: reviewable-edits
+  - id: agent-edits
     type: file
-    path: almanac/concepts/reviewable-agent-edits.md
+    path: almanac/concepts/agent-attributed-edits.md
   - id: detach-recovery
     type: file
     path: almanac/concepts/sessions/detach-vs-recovery.md
@@ -51,7 +51,7 @@ pages.
 
 Start with [Red editor](red-editor) for the product-level model: Red combines a
 modal terminal editor, embedded runtime assets, language tooling, Husk plugins,
-crash recovery, detachable sessions, and review-before-apply Codex workflow
+crash recovery, detachable sessions, and followed Codex editing
 [@red-editor].
 
 For editor internals, read [Editor coordinate systems](editor/coordinate-systems)
@@ -77,10 +77,10 @@ capability set stays conservative [@lsp].
 
 ## Agent And Session Boundaries
 
-[Reviewable agent edits](reviewable-agent-edits) is the core concept for Red's
-Codex integration: agent writes stay in proposal state until the user explicitly
-accepts them through the editor [@reviewable-edits]. Read it before the agent
-architecture or operational review guide.
+[Agent-attributed edits](agent-attributed-edits) is the core concept for Red's
+Codex integration: agent writes enter editor-owned transactions with session and
+turn attribution instead of using native Codex workspace writes [@agent-edits].
+Read it before the agent architecture or history guide.
 
 [Detach versus recovery](sessions/detach-vs-recovery) separates live Unix owner
 sessions from persisted crash-recovery snapshots [@detach-recovery]. That

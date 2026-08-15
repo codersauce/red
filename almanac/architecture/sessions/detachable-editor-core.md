@@ -38,7 +38,7 @@ Client input is converted back into Crossterm events and passed through the norm
 
 Detach is useful because the owner keeps running when no client is attached. `serve_editor_session` accepts at most one interactive client, but it also runs a 10 ms background interval that calls `DetachedEditorCore::tick` while the session is detached or idle [@headless-ipc]. The core tick services plugin processes, LSP messages, timers, directory watches, and agent events, persists recovery snapshots when due, and emits a render delta only if the editor render generation changed [@editor-core].
 
-Tests exercise that ownership boundary. The detach integration fixture starts a mock Codex app-server, edits through one client, drops that client, verifies the original Codex process is still alive, reconnects, and asserts that reattach did not restart the process [@detach-tests]. Other detached-core tests cover background agent events, proposal safety, plugin cursor requests, chunked paste, and resize notification through the native editor path [@editor-core].
+Tests exercise that ownership boundary. The detach integration fixture starts a mock Codex app-server, edits through one client, drops that client, verifies the original Codex process is still alive, reconnects, and asserts that reattach did not restart the process [@detach-tests]. Other detached-core tests cover background agent events, plugin cursor requests, chunked paste, and resize notification through the native editor path [@editor-core].
 
 ## Reconnect And Stop Behavior
 

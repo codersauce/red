@@ -17,7 +17,7 @@ sources:
     path: src/editor.rs
 ---
 
-Use this guide when Red or the machine crashed and the editor owner is no longer running. The expected result is an interactive editor restored from the newest valid crash snapshot, with dirty buffers and pending proposal state in memory, any disk divergence printed for review, and no recovered text written to disk until you explicitly save [@recovery-doc]. If the owner is still alive and only the terminal disappeared, use [Detach and reattach](detach-reattach) instead.
+Use this guide when Red or the machine crashed and the editor owner is no longer running. The expected result is an interactive editor restored from the newest valid crash snapshot, with dirty buffers in memory, any disk divergence printed for review, and no recovered text written to disk until you explicitly save [@recovery-doc]. If the owner is still alive and only the terminal disappeared, use [Detach and reattach](detach-reattach) instead.
 
 ## Before Running Resume
 
@@ -33,7 +33,7 @@ The CLI makes `--resume` conflict with positional files and `--root`, so resume 
 
 ## What Resume Selects
 
-`red --resume` loads from the configuration directory's `sessions` root [@main-entry]. The store scans owner namespaces and chooses recoverable snapshots with dirty buffers or pending proposal files ahead of clean snapshots, then chooses by saved time and generation [@session-store]. Legacy root snapshots are still considered because the scan includes the root store as well as owner directories [@session-store].
+`red --resume` loads from the configuration directory's `sessions` root [@main-entry]. The store scans owner namespaces and chooses recoverable snapshots with dirty buffers ahead of clean snapshots, then chooses by saved time and generation [@session-store]. Legacy root snapshots are still considered because the scan includes the root store as well as owner directories [@session-store].
 
 After loading, Red changes to the snapshot's saved working directory when present [@main-entry]. It reconstructs buffers directly from the snapshot, creates the editor, restores the full session state, and reuses the store that supplied the snapshot so later clean saves replace the stale recovery point in that namespace [@main-entry].
 
@@ -54,7 +54,7 @@ Inside the editor, Red can also show `Recovered unsaved state; N file(s) changed
 
 Recovered dirty text is editor memory, not an automatic disk write. The recovery documentation states that restored dirty contents remain in memory and Red never writes them to disk until an explicit save [@recovery-doc]. Review the divergence report before saving any buffer whose backing file changed externally.
 
-For agent work, treat restored transcript context and pending proposals as recovery material, not a live Codex continuation. The snapshot stores proposal workspace state and transcript text, but `agent_session_resumable` defaults to false, and restore reports archived transcript context when the adapter did not negotiate resumability [@session-store] [@editor-session].
+For agent work, distinguish structured conversations from archived transcript text. New snapshots can store an `agent_conversation` with the Codex thread binding and clean message projection; on restore, Red loads that conversation into `AgentManager` so the replacement app-server can resume and reconcile it when possible [@session-store] [@editor-session]. Legacy flat transcript text without a resumable conversation is restored as archived context, and Red tells the user to start a new session instead of pretending the old process survived [@editor-session].
 
 ## If Resume Fails
 

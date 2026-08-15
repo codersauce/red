@@ -1,6 +1,6 @@
 ---
 title: "Crash Recovery Snapshots"
-summary: "Red persists editor-owned session snapshots so a later `red --resume` can recover dirty buffers, layout, undo history, and pending agent proposals without writing recovered text to disk."
+summary: "Red persists editor-owned session snapshots so a later `red --resume` can recover dirty buffers, layout, undo history, plugin storage, and agent conversation context without writing recovered text to disk."
 topics: [sessions, recovery, architecture]
 sources:
   - id: session-store
@@ -24,15 +24,15 @@ Crash recovery snapshots are Red's disk-backed answer to losing the editor owner
 
 ## Snapshot Contents
 
-`SessionSnapshot` is a durable schema rather than an editor cache. It records the schema version, generation, working directory, capture time, open buffers, active buffer index, window layout, registers, jumps, local marks, global marks, special marks, last visual selections, agent transcript, proposal workspace snapshot, and whether the agent session is resumable [@session-store]. Each buffer entry stores the buffer index, canonical path when present, full in-memory contents, dirty bit, revision, cursor, viewport, undo tree, and the disk text observed at capture time [@session-store].
+`SessionSnapshot` is a durable schema rather than an editor cache. It records the schema version, generation, working directory, capture time, open buffers, active buffer index, window layout, registers, jumps, local marks, global marks, special marks, last visual selections, optional agent transcript text, optional structured agent conversation, a legacy `agent_workspace` compatibility field, an agent resumability flag, plugin extensions, and unknown legacy extensions [@session-store]. Each buffer entry stores the buffer index, canonical path when present, full in-memory contents, dirty bit, revision, cursor, viewport, undo tree, and the disk text observed at capture time [@session-store].
 
-The editor builds the snapshot from live editor state. It synchronizes the window state, commits buffer undo transactions with the visible cursor, snapshots marks and last-visual-selection metadata through buffer IDs, captures the agent proposal workspace, and reads the agent transcript from plugin storage [@editor-session]. On restore, Red reconstructs buffers first, then reapplies the window layout, registers, jumps, marks, last visual selections, agent workspace, and archived transcript warning state [@editor-session].
+The editor builds the snapshot from live editor state. It synchronizes the window state, commits buffer undo transactions with the visible cursor, snapshots marks and last-visual-selection metadata through buffer IDs, captures agent transcript storage, captures the `AgentManager` conversation snapshot, and records plugin storage extensions [@editor-session]. On restore, Red reconstructs buffers first, then reapplies the window layout, registers, jumps, marks, last visual selections, agent conversation, plugin storage extensions, legacy plugin imports, and archived transcript warning state [@editor-session].
 
 ## Owner Namespaces
 
 The snapshot root is `Config::path("sessions")`. Normal interactive editors receive an owner like `editor-<uuid>`, detached owners receive `detached-<session>`, and a resumed editor reuses the store that supplied the snapshot [@main-entry]. `SessionStore::for_owner` restricts owner names to a single safe path component and rejects a symlinked root before it joins the owner directory [@session-store].
 
-`SessionStore::load_latest_with_store` scans the root store and every owner directory below the root. It ranks snapshots with dirty buffers or pending proposal files ahead of clean snapshots, then uses capture time and generation to break ties [@session-store]. That ranking is why a dirty older editor can beat a newer clean exit when the user runs [Resume after crash](../../guides/sessions/resume-after-crash).
+`SessionStore::load_latest_with_store` scans the root store and every owner directory below the root. It ranks snapshots with dirty buffers ahead of clean snapshots, then uses capture time and generation to break ties [@session-store]. That ranking is why a dirty older editor can beat a newer clean exit when the user runs [Resume after crash](../../guides/sessions/resume-after-crash).
 
 ## Atomic Rotation
 
@@ -42,7 +42,7 @@ The rotation logic is deliberately conservative. If `latest.json` is invalid or 
 
 ## Background Writes
 
-`SessionManager` owns the editor's snapshot cadence. Its default interval is five seconds, it tracks the last persisted editor/proposal generation, it holds an in-flight writer thread, and it stores the current recovery warning [@session-manager]. The interactive event loop services background work and then calls `persist_session_snapshot(false)`, while shutdown forces one final snapshot before plugin deactivation [@editor-session].
+`SessionManager` owns the editor's snapshot cadence. Its default interval is five seconds, it tracks the last persisted render generation, it holds an in-flight writer thread, and it stores the current recovery warning [@session-manager]. The interactive event loop services background work and then calls `persist_session_snapshot(false)`, while shutdown forces one final snapshot before plugin deactivation [@editor-session].
 
 Snapshot writes avoid blocking input on large buffers. The editor captures cheap per-buffer content snapshots on the main thread, builds the durable snapshot without contents, and then fills buffer contents plus trusted disk bases in a worker thread before calling `SessionStore::write` [@editor-session]. If the writer fails or panics, the editor sets the warning text `Crash recovery is not being saved; check free space and permissions or reduce open-buffer size` [@editor-session].
 
@@ -56,4 +56,4 @@ On resume, `detect_disk_divergence` compares each stored disk base with the curr
 
 `red --resume` loads the chosen snapshot, changes to its saved working directory when present, reconstructs buffers from the snapshot, restores the editor state, reports divergences, and assigns the resumed store back to the editor [@main-entry]. Recovered dirty contents remain in memory; the recovery documentation states that Red never writes them to disk until the user explicitly saves [@recovery-doc].
 
-Agent state follows the same boundary. The snapshot can restore transcript text and pending proposal files, but `agent_session_resumable` defaults to false, and restore reports archived transcript context rather than pretending that a Codex process survived a crash [@session-store] [@editor-session]. For the live-owner alternative, read [Detachable editor core](detachable-editor-core).
+Agent state follows the same boundary. The snapshot can restore structured conversation state and flat transcript text, but legacy transcript-only recovery is archived context and Red does not pretend that a Codex process survived a crash [@session-store] [@editor-session]. New snapshots derive `agent_session_resumable` from the presence of `agent_conversation`, while the legacy `agent_workspace` payload is accepted on load and not serialized back out [@session-store]. For the live-owner alternative, read [Detachable editor core](detachable-editor-core).

@@ -47,7 +47,7 @@ Decision pages record choices future maintainers must respect when changing subs
 
 ## Integration And Safety Decisions
 
-Read [Direct Codex app-server](agent/direct-codex-app-server) before changing Red's agent process model, dynamic tool contract, or proposal-first edit flow. That decision supersedes the earlier ACP foundation and keeps Codex behind Red-owned app-server process control and reviewable proposal state [@agent-decision].
+Read [Direct Codex app-server](agent/direct-codex-app-server) before changing Red's agent process model, dynamic tool contract, or editor-owned edit flow. That decision supersedes the earlier ACP foundation and keeps Codex behind Red-owned app-server process control and dynamic tools [@agent-decision].
 
 Read [Fail closed recovery](configuration/fail-closed-recovery) before loosening configuration recovery. Whole-file configuration failure intentionally disables AI, plugins, plugin permissions, LSP, language servers, and logging, while field-level user errors can recover more narrowly [@config-decision].
 

@@ -17,7 +17,7 @@ sources:
     path: src/editor.rs
 ---
 
-Red's detachable-session decision is to put mutable editor ownership in a long-lived headless owner process and keep the terminal UI as a replaceable local client. ADR 0002 accepts that boundary for Linux and macOS: the owner keeps the production editor, runtime services, LSP, persistence, proposal workspace, and Codex bridge, while the client owns terminal mode, input collection, and painting [@adr-0002]. Current startup code follows that split by spawning an internal `--core-session` process for `red --detach`, attaching the current terminal over local IPC, and routing later `--attach` and `--stop` requests to the existing owner [@main].
+Red's detachable-session decision is to put mutable editor ownership in a long-lived headless owner process and keep the terminal UI as a replaceable local client. ADR 0002 accepts that boundary for Linux and macOS: the owner keeps the production editor, runtime services, LSP, persistence, and Codex bridge, while the client owns terminal mode, input collection, and painting [@adr-0002]. Current startup code follows that split by spawning an internal `--core-session` process for `red --detach`, attaching the current terminal over local IPC, and routing later `--attach` and `--stop` requests to the existing owner [@main].
 
 ## Status
 
