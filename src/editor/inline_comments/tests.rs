@@ -10,7 +10,9 @@ use crate::{
         },
         Action, Mode, RenderBuffer,
     },
+    inline_assist::{InlineAssistResult, InlineCommentInput},
     lsp::LspManager,
+    plugin::Runtime,
     theme::{Style, Theme},
     undo::TextRange,
     unicode_utils::display_width,
@@ -469,4 +471,295 @@ fn clearing_inline_comments_preserves_cursor_near_eof() {
     editor.clear_inline_comments();
     editor.check_bounds();
     assert_eq!(editor.buffer_line(), 4);
+}
+
+#[test]
+fn inline_comment_navigation_preserves_treesitter_class_motions() {
+    let editor = editor("class Example {}\n", 60, 12, false);
+    let nested =
+        |map: &std::collections::HashMap<String, KeyAction>, prefix: &str, key: &str| match map
+            .get(prefix)
+        {
+            Some(KeyAction::Nested(keys)) => keys.get(key).cloned(),
+            _ => None,
+        };
+    assert_eq!(
+        nested(&editor.config.keys.normal, "]", "c"),
+        Some(KeyAction::Single(Action::MoveToNextClass))
+    );
+    assert_eq!(
+        nested(&editor.config.keys.normal, "[", "c"),
+        Some(KeyAction::Single(Action::MoveToPreviousClass))
+    );
+    let Some(KeyAction::Nested(leader)) = editor.config.keys.normal.get(" ") else {
+        panic!("missing leader");
+    };
+    assert_eq!(
+        nested(leader, "]", "c"),
+        Some(KeyAction::Single(Action::NextInlineComment))
+    );
+    assert_eq!(
+        nested(leader, "[", "c"),
+        Some(KeyAction::Single(Action::PreviousInlineComment))
+    );
+}
+
+fn begin_assist(editor: &mut Editor, range: TextRange, request: &str, group: &str) {
+    editor.inline_assist = Some(super::super::InlineAssistSession {
+        buffer_id: editor.current_buffer().id(),
+        window_id: editor.window_manager.active_stable_window_id().unwrap(),
+        expected_revision: editor.current_buffer().revision(),
+        expected_text: editor.current_buffer().text_in_range(range),
+        range,
+        scope: "test selection".into(),
+        request_id: Some(request.into()),
+        session_id: Some("test-session".into()),
+        transaction_id: None,
+        annotation_group_id: group.into(),
+        has_result: false,
+        result_request_id: None,
+    });
+}
+
+fn note(start: usize, end: usize, message: &str) -> InlineCommentInput {
+    InlineCommentInput {
+        start_line: start,
+        end_line: Some(end),
+        message: message.into(),
+    }
+}
+
+#[tokio::test]
+async fn inline_comment_only_result_is_kept_without_a_text_transaction() {
+    let mut editor = editor("alpha\nbeta\ngamma\n", 70, 16, false);
+    begin_assist(
+        &mut editor,
+        TextRange::new(TextPosition::new(0, 0), TextPosition::new(2, 0)),
+        "review",
+        "group",
+    );
+    let mut frame = RenderBuffer::new(70, 16, &Style::default());
+    let mut runtime = Runtime::new();
+    editor
+        .apply_inline_result(
+            "review",
+            "test-session",
+            &InlineAssistResult {
+                replacement: None,
+                comments: vec![note(1, 2, "Both lines")],
+            },
+            &mut frame,
+            &mut runtime,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        editor.inline_comments[0].lines(editor.current_buffer()),
+        (0, 1)
+    );
+    assert!(!editor.current_buffer().is_dirty());
+    assert!(editor
+        .current_buffer()
+        .undo_history
+        .latest_transaction()
+        .is_none());
+    assert_eq!(
+        editor.inline_assist_result_state(),
+        crate::ui::InlineAssistPopupState::Applied {
+            edited: false,
+            comments: 1
+        }
+    );
+    let accepted_id = editor.inline_comments[0].id;
+    assert!(editor
+        .apply_inline_result(
+            "review",
+            "test-session",
+            &InlineAssistResult {
+                replacement: None,
+                comments: vec![note(1, 1, "Duplicate")]
+            },
+            &mut frame,
+            &mut runtime
+        )
+        .await
+        .is_err());
+    assert_eq!(editor.inline_comments[0].id, accepted_id);
+    editor
+        .execute(&Action::KeepInlineAssist, &mut frame, &mut runtime)
+        .await
+        .unwrap();
+    assert!(editor.inline_assist.is_none());
+    assert_eq!(editor.inline_comments.len(), 1);
+    editor.dismiss_inline_comment();
+    assert!(editor.inline_comments.is_empty());
+}
+
+#[tokio::test]
+async fn inline_mixed_result_validates_before_editing_and_undo_removes_its_group() {
+    let mut editor = editor("old\ntail\n", 70, 16, false);
+    begin_assist(
+        &mut editor,
+        TextRange::new(TextPosition::new(0, 0), TextPosition::new(1, 0)),
+        "edit",
+        "group",
+    );
+    let mut frame = RenderBuffer::new(70, 16, &Style::default());
+    let mut runtime = Runtime::new();
+    let mut result = InlineAssistResult {
+        replacement: Some("one\ntwo\n".into()),
+        comments: vec![note(3, 3, "Outside")],
+    };
+    assert!(editor
+        .apply_inline_result("edit", "test-session", &result, &mut frame, &mut runtime)
+        .await
+        .is_err());
+    assert_eq!(editor.current_buffer().contents(), "old\ntail\n");
+    assert!(editor.inline_comments.is_empty());
+    result.comments = vec![note(2, 2, "Second new line")];
+    editor
+        .apply_inline_result("edit", "test-session", &result, &mut frame, &mut runtime)
+        .await
+        .unwrap();
+    assert_eq!(editor.current_buffer().contents(), "one\ntwo\ntail\n");
+    assert_eq!(
+        editor.inline_comments[0].lines(editor.current_buffer()),
+        (1, 1)
+    );
+    editor
+        .execute(&Action::UndoInlineAssist, &mut frame, &mut runtime)
+        .await
+        .unwrap();
+    assert_eq!(editor.current_buffer().contents(), "old\ntail\n");
+    assert!(editor.inline_comments.is_empty());
+}
+
+#[tokio::test]
+async fn inline_comment_refinement_replaces_only_its_own_group() {
+    let mut editor = editor("alpha\nbeta\n", 70, 16, false);
+    let range = TextRange::new(TextPosition::new(0, 0), TextPosition::new(2, 0));
+    let mut frame = RenderBuffer::new(70, 16, &Style::default());
+    let mut runtime = Runtime::new();
+    for (request, group, message) in [
+        ("one", "first", "First review"),
+        ("two", "second", "Second review"),
+    ] {
+        begin_assist(&mut editor, range, request, group);
+        editor
+            .apply_inline_result(
+                request,
+                "test-session",
+                &InlineAssistResult {
+                    replacement: None,
+                    comments: vec![note(1, 2, message)],
+                },
+                &mut frame,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(editor.inline_comments.len(), 2);
+    assert_eq!(
+        editor
+            .inline_comment_display_messages(editor.current_buffer())
+            .len(),
+        1
+    );
+    assert!(
+        editor.inline_comment_display_messages(editor.current_buffer())[0]
+            .1
+            .contains("[2/2]")
+    );
+    editor.inline_assist.as_mut().unwrap().request_id = Some("refine".into());
+    editor
+        .apply_inline_result(
+            "refine",
+            "test-session",
+            &InlineAssistResult {
+                replacement: None,
+                comments: vec![note(1, 1, "Refined")],
+            },
+            &mut frame,
+            &mut runtime,
+        )
+        .await
+        .unwrap();
+    assert_eq!(editor.inline_comments.len(), 2);
+    assert!(editor
+        .inline_comments
+        .iter()
+        .any(|comment| comment.message == "First review"));
+    assert!(!editor
+        .inline_comments
+        .iter()
+        .any(|comment| comment.message == "Second review"));
+    editor.navigate_inline_comment(true);
+    assert!(
+        editor.inline_comment_display_messages(editor.current_buffer())[0]
+            .1
+            .contains("First review")
+    );
+    editor
+        .execute(&Action::UndoInlineAssist, &mut frame, &mut runtime)
+        .await
+        .unwrap();
+    assert_eq!(editor.inline_comments.len(), 1);
+    assert_eq!(editor.inline_comments[0].message, "First review");
+}
+
+#[tokio::test]
+async fn inline_annotations_survive_source_edits_as_outdated() {
+    let mut editor = editor("alpha\nbeta\n", 70, 16, false);
+    editor.set_inline_comment("Review alpha");
+    let id = editor.inline_comments[0].id;
+    editor.begin_transaction("change annotated line");
+    editor.replace_range(
+        TextRange::new(TextPosition::new(0, 1), TextPosition::new(0, 2)),
+        "X",
+    );
+    editor.commit_transaction(editor.cursor_snapshot());
+    assert_eq!(editor.inline_comments[0].id, id);
+    assert!(editor.inline_comments[0].stale);
+    editor
+        .test_execute_production_action(Action::Undo)
+        .await
+        .unwrap();
+    assert!(!editor.inline_comments[0].stale);
+}
+
+#[tokio::test]
+async fn inline_annotation_range_survives_whole_target_replacement_and_undo() {
+    let original = "fn example() {\n    let total = 0;\n    use_value(total);\n}\n";
+    let replacement = "fn example() {\n    let sum = 0;\n    use_value(sum);\n}\n";
+    let mut editor = editor(original, 70, 16, false);
+    editor.replace_inline_comment_group(
+        "kept",
+        "session",
+        "review",
+        0,
+        &[note(2, 3, "Accumulator")],
+    );
+    let id = editor.inline_comments[0].id;
+    editor.begin_transaction("replace function");
+    editor.replace_range(
+        TextRange::new(TextPosition::new(0, 0), TextPosition::new(4, 0)),
+        replacement,
+    );
+    editor.commit_transaction(editor.cursor_snapshot());
+    assert_eq!(
+        editor.inline_comments[0].lines(editor.current_buffer()),
+        (1, 2)
+    );
+    assert!(editor.inline_comments[0].stale);
+    editor
+        .test_execute_production_action(Action::Undo)
+        .await
+        .unwrap();
+    assert_eq!(editor.inline_comments[0].id, id);
+    assert_eq!(
+        editor.inline_comments[0].lines(editor.current_buffer()),
+        (1, 2)
+    );
+    assert!(!editor.inline_comments[0].stale);
 }

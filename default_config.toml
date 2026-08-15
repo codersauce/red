@@ -378,6 +378,8 @@ Esc = { EnterMode = "Normal" }
 [keys.normal." "]
 "C" = "AddSampleInlineComment"
 "X" = "ClearInlineComments"
+"v" = "ShowInlineComment"
+"x" = "DismissInlineComment"
 " " = "NextBuffer"
 "a" = [ "MoveToTop", { EnterMode = "VisualLine" }, "MoveToBottom" ]
 "A" = { PluginCommand = "Agent" }
@@ -402,10 +404,12 @@ Esc = { EnterMode = "Normal" }
 "c" = { "c" = { PluginCommand = "GitSubmitMessage" }, "q" = { PluginCommand = "GitCancelMessage" } }
 
 [keys.normal." "."]"]
+"c" = "NextInlineComment"
 "a" = "SwapNextParameter"
 "m" = "SwapNextFunction"
 
 [keys.normal." "."["]
+"c" = "PreviousInlineComment"
 "a" = "SwapPreviousParameter"
 "m" = "SwapPreviousFunction"
 

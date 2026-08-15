@@ -21,7 +21,8 @@ Authentication is verified by `account/read` when the first session starts.
 
 ## Inline assist
 
-`Space i` is the limited-blast-radius path for iterative code changes. In
+`Space i` is the limited-blast-radius path for code changes, explanations, and
+inline reviews. In
 Normal mode its target is exactly the current line; in Visual and Visual-line
 mode its target is exactly the selection. Visual-block mode is intentionally
 unsupported. The popup prefers the space below the target and moves above it
@@ -30,19 +31,36 @@ never covers the rendered target. Long prompts soft-wrap and grow to six rows;
 after that the prompt scrolls internally to keep the cursor visible.
 
 Each invocation starts an ephemeral Codex thread with a read-only sandbox, no
-native tools, and one dynamic tool: `submit_replacement`. Codex cannot choose a
-file or range. Red supplies the immutable target plus at most 20 surrounding
+native tools, and two submission tools. `submit_comments` leaves annotations
+without editing code; `submit_replacement` submits a complete replacement and
+optional annotations about the resulting code. Exactly one submission is
+accepted per turn. Comment ranges are one-based and inclusive, relative to the
+supplied target or replacement, and cannot escape it. Codex cannot choose a
+file. Red supplies the immutable target plus at most 20 surrounding
 lines on either side, rejects sensitive/ignored/out-of-workspace and binary
-contexts, and accepts at most a 128 KiB complete replacement. Follow-up
+contexts, and accepts at most a 128 KiB complete replacement, 16 comments per
+result, and 4 KiB of plain text per comment. An empty comment list is a valid
+no-findings result. Follow-up
 refinements reuse that ephemeral thread while the popup remains open.
 
 Before applying a response, Red verifies the active buffer identity, revision,
 range, and original text. A stale response fails without changing the buffer.
-Successful output is applied only after it is complete, through one
-agent-attributed editor transaction, and is deliberately not saved. The result
-controls are Enter/`k` to keep, `u` to undo, `r` to refine, and `A` to select
-the changed range and open the full Agent workflow. Closing the popup destroys
-the ephemeral inline session.
+Successful output is applied only after a completed turn and full validation.
+Code changes use one agent-attributed editor transaction and are deliberately
+not saved. Comment-only results do not alter dirty state or text undo history.
+The result controls are Enter/`k` to keep, `u` to undo the latest inline edit
+and dismiss its comments (or just dismiss a comment-only result), `r` to
+refine, and `A` to open the full Agent workflow. Refinement replaces only that
+invocation's annotation group. Closing the popup destroys the ephemeral Codex
+session; kept comments remain in the editor until dismissed or the editor
+session ends.
+
+Use `Space ] c` and `Space [ c` to navigate comments, `Space v` to read the full
+message, `Space x` to dismiss one, and `Space X` to clear the current buffer.
+Overlapping annotations are retained and collapsed into a numbered group; the
+navigation commands select which range its gutter bracket shows. Comments
+follow edits above them and are marked outdated when their referenced source
+changes. They are not written into source files or persisted across restarts.
 
 To use a Codex executable outside `PATH`:
 

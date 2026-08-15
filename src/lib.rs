@@ -33,6 +33,7 @@ pub mod formatter;
 pub mod headless;
 pub mod highlighter;
 mod indent;
+pub mod inline_assist;
 pub mod language;
 pub mod logger;
 pub mod lsp;

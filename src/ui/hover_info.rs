@@ -30,6 +30,7 @@ pub enum HoverInfoFormat {
 }
 
 pub struct HoverInfo {
+    label: String,
     source: String,
     format: HoverInfoFormat,
     actions: Vec<HoverAction>,
@@ -87,6 +88,7 @@ impl HoverInfo {
         );
         let style = theme.ui_style.dialog.clone();
         let mut info = Self {
+            label: "Hover".to_string(),
             source,
             format,
             selected_action: (!actions.is_empty()).then_some(0),
@@ -121,6 +123,12 @@ impl HoverInfo {
         info
     }
 
+    pub(crate) fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self.update_chrome();
+        self
+    }
+
     fn content_height(&self) -> usize {
         self.height.saturating_sub(1)
     }
@@ -139,10 +147,11 @@ impl HoverInfo {
 
     fn update_chrome(&mut self) {
         let title = if self.max_scroll() == 0 {
-            "Hover".to_string()
+            self.label.clone()
         } else {
             format!(
-                "Hover · {}/{}",
+                "{} · {}/{}",
+                self.label,
                 self.scroll.saturating_add(1),
                 self.max_scroll().saturating_add(1)
             )

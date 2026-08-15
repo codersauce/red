@@ -93,6 +93,7 @@ use crate::{
     },
     highlighter::{Highlighter, LanguageRegistry},
     indent::{self, IndentDecision},
+    inline_assist::InlineAssistResult,
     log,
     lsp::{
         apply_workspace_resource_operations, file_path as lsp_file_path, get_client_capabilities,
@@ -1191,12 +1192,12 @@ fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
             "inline_assist:session_created",
             json!({ "request_id": request_id, "session_id": session_id }),
         ),
-        CodexEvent::InlineReplacement {
+        CodexEvent::InlineResult {
             request_id,
             session_id,
             ..
         } => (
-            "inline_assist:replacement",
+            "inline_assist:result",
             json!({ "request_id": request_id, "session_id": session_id }),
         ),
         CodexEvent::InlineFailed {
@@ -2100,8 +2101,14 @@ pub enum Action {
     InlineAssist,
     /// Adds a temporary sample annotation for the current line or visual range.
     AddSampleInlineComment,
-    /// Clears the current buffer's temporary inline annotations.
+    /// Clears the current buffer's session-local inline annotations.
     ClearInlineComments,
+    /// Shows the full annotation at the cursor.
+    ShowInlineComment,
+    /// Dismisses the selected annotation without changing source text.
+    DismissInlineComment,
+    NextInlineComment,
+    PreviousInlineComment,
     /// Submits the current inline instruction.
     SubmitInlineAssist(String),
     /// Cancels and destroys the ephemeral inline session.
@@ -2613,6 +2620,9 @@ struct InlineAssistSession {
     request_id: Option<String>,
     session_id: Option<String>,
     transaction_id: Option<String>,
+    annotation_group_id: String,
+    has_result: bool,
+    result_request_id: Option<String>,
 }
 
 struct StyleCursor<'a> {
@@ -2804,8 +2814,9 @@ pub struct Editor {
     /// One editor-owned bounded inline edit, including stale-response guards.
     inline_assist: Option<InlineAssistSession>,
 
-    /// UI-prototype annotations; never serialized into source or undo history.
+    /// Session-local annotations; never serialized into source or text undo history.
     inline_comments: Vec<inline_comments::InlineComment>,
+    active_inline_comment: Option<uuid::Uuid>,
 
     /// LSP client for code intelligence features
     lsp: Box<dyn LspClient>,
@@ -4169,6 +4180,7 @@ impl Editor {
             agent_manager,
             inline_assist: None,
             inline_comments: Vec::new(),
+            active_inline_comment: None,
             lsp,
             config,
             config_diagnostics: Vec::new(),
@@ -5368,16 +5380,10 @@ impl Editor {
             .filter_map(|line| buffer.get(line))
             .collect::<Vec<_>>();
 
-        let comments = self
-            .inline_comments
+        let comment_messages = self.inline_comment_display_messages(buffer);
+        let comments = comment_messages
             .iter()
-            .filter(|comment| comment.anchor.buffer_id == buffer.id())
-            .map(|comment| {
-                (
-                    buffer.char_idx_to_position(comment.anchor.char_index).line,
-                    comment.message.as_str(),
-                )
-            })
+            .map(|(line, message)| (*line, message.as_str()))
             .collect::<Vec<_>>();
         let layout = std::sync::Arc::new(
             layout_lines(
@@ -6982,8 +6988,18 @@ impl Editor {
         } else {
             diagnostics.join("\n")
         };
+        let numbered_target = if target.is_empty() {
+            "1: ".to_string()
+        } else {
+            target
+                .lines()
+                .enumerate()
+                .map(|(index, line)| format!("{}: {line}", index + 1))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         Ok(format!(
-            "File: {file}\nLanguage: {language}\nTarget range: {}:{} to {}:{} (zero-based, end exclusive)\nDiagnostics:\n{diagnostics}\n\n<target>\n{target}</target>\n\n<surrounding lines=\"{}-{}\">\n{surrounding}</surrounding>",
+            "File: {file}\nLanguage: {language}\nTarget range: {}:{} to {}:{} (zero-based, end exclusive)\nComment lines are one-based relative to the target below, not the file.\nDiagnostics:\n{diagnostics}\n\n<target>\n{target}</target>\n\n<target_lines>\n{numbered_target}\n</target_lines>\n\n<surrounding lines=\"{}-{}\">\n{surrounding}</surrounding>",
             range.start.line,
             range.start.character,
             range.end.line,
@@ -7060,24 +7076,26 @@ impl Editor {
         })
     }
 
-    async fn apply_inline_replacement(
+    fn inline_assist_result_state(&self) -> InlineAssistPopupState {
+        let edited = self
+            .inline_assist
+            .as_ref()
+            .is_some_and(|assist| assist.transaction_id.is_some());
+        let comments = self.inline_assist.as_ref().map_or(0, |assist| {
+            self.inline_comment_group_count(&assist.annotation_group_id)
+        });
+        InlineAssistPopupState::Applied { edited, comments }
+    }
+
+    async fn apply_inline_result(
         &mut self,
         request_id: &str,
         session_id: &str,
-        replacement: &str,
+        result: &InlineAssistResult,
         render_buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
-        const MAX_REPLACEMENT_BYTES: usize = 128 * 1024;
-        anyhow::ensure!(
-            replacement.len() <= MAX_REPLACEMENT_BYTES,
-            "inline replacement exceeds the 128 KiB limit"
-        );
-        anyhow::ensure!(
-            !replacement.contains('\0'),
-            "inline replacement contains binary data"
-        );
-        let (buffer_id, window_id, expected_revision, range, expected_text) = {
+        let (buffer_id, window_id, expected_revision, range, expected_text, group_id) = {
             let assist = self
                 .inline_assist
                 .as_ref()
@@ -7086,12 +7104,24 @@ impl Editor {
                 assist.request_id.as_deref() == Some(request_id),
                 "inline response is stale"
             );
+            anyhow::ensure!(
+                assist.result_request_id.as_deref() != Some(request_id),
+                "inline result was already applied"
+            );
+            anyhow::ensure!(
+                assist
+                    .session_id
+                    .as_deref()
+                    .is_none_or(|active| active == session_id),
+                "inline response belongs to another session"
+            );
             (
                 assist.buffer_id,
                 assist.window_id,
                 assist.expected_revision,
                 assist.range,
                 assist.expected_text.clone(),
+                assist.annotation_group_id.clone(),
             )
         };
         anyhow::ensure!(
@@ -7108,28 +7138,35 @@ impl Editor {
         );
         anyhow::ensure!(
             self.current_buffer().text_in_range(range) == expected_text,
-            "inline target changed while the replacement was generated"
+            "inline target changed while the result was generated"
         );
 
+        let replacement = result.replacement.as_deref().unwrap_or(&expected_text);
+        result.validate_for_target(replacement)?;
+        self.check_inline_comment_capacity(&group_id, result.comments.len())?;
+
         let start_char = self.current_buffer().position_to_char_idx(range.start);
-        self.begin_transaction_with_origin(
-            "inline assist",
-            EditOrigin::Agent {
-                session_id: session_id.to_string(),
-                turn_id: request_id.to_string(),
-            },
-        );
-        self.replace_range(range, replacement);
-        anyhow::ensure!(
-            self.commit_transaction(self.cursor_snapshot()),
-            "inline replacement did not change the target"
-        );
-        let transaction_id = self
-            .current_buffer()
-            .undo_history
-            .latest_transaction()
-            .map(|transaction| transaction.id.clone())
-            .ok_or_else(|| anyhow::anyhow!("inline transaction was not recorded"))?;
+        let changed = replacement != expected_text;
+        let transaction_id = if changed {
+            self.begin_transaction_with_origin(
+                "inline assist",
+                EditOrigin::Agent {
+                    session_id: session_id.to_string(),
+                    turn_id: request_id.to_string(),
+                },
+            );
+            self.replace_range(range, replacement);
+            anyhow::ensure!(
+                self.commit_transaction(self.cursor_snapshot()),
+                "inline transaction was not recorded"
+            );
+            self.current_buffer()
+                .undo_history
+                .latest_transaction()
+                .map(|transaction| transaction.id.clone())
+        } else {
+            None
+        };
         let end = self
             .current_buffer()
             .char_idx_to_position(start_char.saturating_add(replacement.chars().count()));
@@ -7138,16 +7175,33 @@ impl Editor {
         self.selection = None;
         self.selection_start = None;
         self.move_to_text_position(range.start);
+        self.refresh_cursor_goal();
+
+        self.replace_inline_comment_group(
+            &group_id,
+            session_id,
+            request_id,
+            range.start.line,
+            &result.comments,
+        );
 
         let revision = self.current_buffer().revision();
         if let Some(assist) = self.inline_assist.as_mut() {
             assist.expected_revision = revision;
             assist.range = new_range;
             assist.expected_text = replacement.to_string();
-            assist.transaction_id = Some(transaction_id);
+            if transaction_id.is_some() {
+                assist.transaction_id = transaction_id;
+            }
             assist.session_id = Some(session_id.to_string());
+            assist.has_result = true;
+            assist.result_request_id = Some(request_id.to_string());
         }
-        if let Err(error) = self.notify_change(runtime).await {
+        if let Err(error) = if changed {
+            self.notify_change(runtime).await
+        } else {
+            Ok(())
+        } {
             self.last_error = Some(format!(
                 "inline edit applied, but change notification failed: {error}"
             ));
@@ -7158,7 +7212,7 @@ impl Editor {
             .map(|assist| assist.scope.clone())
             .unwrap_or_else(|| "selection".to_string());
         self.current_dialog = Some(Box::new(
-            self.inline_assist_popup(scope, InlineAssistPopupState::Applied),
+            self.inline_assist_popup(scope, self.inline_assist_result_state()),
         ));
         self.render(render_buffer)?;
         Ok(())
@@ -8145,19 +8199,13 @@ impl Editor {
                     }
                     continue;
                 }
-                CodexEvent::InlineReplacement {
+                CodexEvent::InlineResult {
                     request_id,
                     session_id,
-                    replacement,
+                    result,
                 } => {
                     if let Err(error) = self
-                        .apply_inline_replacement(
-                            &request_id,
-                            &session_id,
-                            &replacement,
-                            buffer,
-                            runtime,
-                        )
+                        .apply_inline_result(&request_id, &session_id, &result, buffer, runtime)
                         .await
                     {
                         if let Some(scope) = self.inline_assist.as_ref().and_then(|assist| {
@@ -16223,6 +16271,21 @@ impl Editor {
                 self.clear_inline_comments();
                 self.render(buffer)?;
             }
+            Action::ShowInlineComment => {
+                add_to_history = false;
+                self.show_inline_comment();
+                self.render(buffer)?;
+            }
+            Action::DismissInlineComment => {
+                add_to_history = false;
+                self.dismiss_inline_comment();
+                self.render(buffer)?;
+            }
+            Action::NextInlineComment | Action::PreviousInlineComment => {
+                add_to_history = false;
+                self.navigate_inline_comment(matches!(action, Action::PreviousInlineComment));
+                self.render(buffer)?;
+            }
             Action::InlineAssist => {
                 add_to_history = false;
                 match self.inline_assist_target() {
@@ -16245,6 +16308,9 @@ impl Editor {
                             request_id: None,
                             session_id: None,
                             transaction_id: None,
+                            annotation_group_id: uuid::Uuid::new_v4().to_string(),
+                            has_result: false,
+                            result_request_id: None,
                         });
                         self.current_dialog = Some(Box::new(self.inline_assist_popup(
                             scope,
@@ -16346,7 +16412,7 @@ impl Editor {
                     .map(|assist| assist.scope.clone())
                 {
                     self.current_dialog = Some(Box::new(
-                        self.inline_assist_popup(scope, InlineAssistPopupState::Applied),
+                        self.inline_assist_popup(scope, self.inline_assist_result_state()),
                     ));
                 } else {
                     self.current_dialog = None;
@@ -16355,8 +16421,18 @@ impl Editor {
             }
             Action::KeepInlineAssist => {
                 add_to_history = false;
+                let result = self.inline_assist_result_state();
                 self.close_inline_assist_session();
-                self.last_error = Some("kept inline edit in the unsaved buffer".to_string());
+                self.last_error = Some(match result {
+                    InlineAssistPopupState::Applied {
+                        edited: true,
+                        comments,
+                    } => format!("kept unsaved inline edit and {comments} comment(s)"),
+                    InlineAssistPopupState::Applied { comments, .. } => format!(
+                        "kept {comments} inline comment(s) · Space v view · Space x dismiss"
+                    ),
+                    _ => "inline assist closed".to_string(),
+                });
                 self.render(buffer)?;
             }
             Action::UndoInlineAssist => {
@@ -16371,15 +16447,25 @@ impl Editor {
                         .latest_transaction()
                         .is_some_and(|latest| latest.id == transaction_id)
                 });
+                if let Some(group_id) = self
+                    .inline_assist
+                    .as_ref()
+                    .map(|assist| assist.annotation_group_id.clone())
+                {
+                    self.remove_inline_comment_group(&group_id);
+                }
                 self.close_inline_assist_session();
                 if is_latest {
                     self.undo_transaction(buffer, runtime).await?;
-                } else {
+                } else if transaction_id.is_some() {
                     self.last_error = Some(
                         "inline edit is no longer the latest change; use transaction history to revert it"
                             .to_string(),
                     );
-                    self.draw_commandline(buffer);
+                    self.render(buffer)?;
+                } else {
+                    self.last_error = Some("dismissed inline comments".to_string());
+                    self.render(buffer)?;
                 }
             }
             Action::RefineInlineAssist => {
@@ -16387,7 +16473,7 @@ impl Editor {
                 if let Some((scope, refining)) = self
                     .inline_assist
                     .as_ref()
-                    .map(|assist| (assist.scope.clone(), assist.transaction_id.is_some()))
+                    .map(|assist| (assist.scope.clone(), assist.has_result))
                 {
                     self.current_dialog = Some(Box::new(self.inline_assist_popup(
                         scope,
@@ -20731,6 +20817,9 @@ impl Editor {
 
         self.sync_to_window();
         let removed_id = self.current_buffer().id();
+        self.inline_comments
+            .retain(|comment| comment.anchor.buffer_id != removed_id);
+        self.layout_cache.borrow_mut().clear();
         self.forget_jumps_for_buffer(removed_id);
         self.scratch_buffers.remove(&removed_id);
         let removed_uri = self.current_buffer().uri()?;
@@ -21840,31 +21929,15 @@ impl Editor {
 
     fn update_anchors_for_edit(&mut self, edit: AppliedTextEdit) {
         let buffer_id = self.current_buffer().id();
-        self.inline_comments.retain_mut(|comment| {
+        let buffer = &self.buffer_manager[self.buffer_manager.active_index()];
+        for comment in &mut self.inline_comments {
             if comment.anchor.buffer_id != buffer_id {
-                return true;
+                continue;
             }
-            // This UI prototype drops comments whose range endpoints are replaced.
-            if edit.start_char < edit.end_char
-                && ((edit.start_char..edit.end_char).contains(&comment.anchor.char_index)
-                    || (edit.start_char..edit.end_char).contains(&comment.end_anchor.char_index))
-            {
-                return false;
-            }
-            Self::transform_anchor_for_edit(
-                &mut comment.anchor,
-                edit.start_char,
-                edit.end_char,
-                edit.new_char_len,
-            );
-            Self::transform_anchor_for_edit(
-                &mut comment.end_anchor,
-                edit.start_char,
-                edit.end_char,
-                edit.new_char_len,
-            );
-            true
-        });
+            Self::transform_inline_comment_anchor(&mut comment.anchor, edit, buffer);
+            Self::transform_inline_comment_anchor(&mut comment.end_anchor, edit, buffer);
+            comment.refresh_staleness(buffer);
+        }
         if let Some(marks) = self.local_marks.get_mut(&buffer_id) {
             for anchor in marks.values_mut() {
                 Self::transform_anchor_for_edit(
@@ -26779,6 +26852,9 @@ mod test {
             request_id: None,
             session_id: None,
             transaction_id: None,
+            annotation_group_id: "test-group".to_string(),
+            has_result: false,
+            result_request_id: None,
         });
 
         editor.window_manager.set_active(0);
@@ -26806,15 +26882,21 @@ mod test {
             request_id: Some("request-inline".to_string()),
             session_id: Some("session-inline".to_string()),
             transaction_id: None,
+            annotation_group_id: "test-group".to_string(),
+            has_result: false,
+            result_request_id: None,
         });
         let mut render_buffer = RenderBuffer::new(60, 12, &Style::default());
         let mut runtime = Runtime::new();
 
         editor
-            .apply_inline_replacement(
+            .apply_inline_result(
                 "request-inline",
                 "session-inline",
-                "let answer = 1;\n",
+                &InlineAssistResult {
+                    replacement: Some("let answer = 1;\n".to_string()),
+                    comments: Vec::new(),
+                },
                 &mut render_buffer,
                 &mut runtime,
             )
@@ -26861,6 +26943,9 @@ mod test {
             request_id: Some("stale-request".to_string()),
             session_id: Some("inline-session".to_string()),
             transaction_id: None,
+            annotation_group_id: "test-group".to_string(),
+            has_result: false,
+            result_request_id: None,
         });
         editor.begin_transaction("concurrent edit");
         editor.replace_range(range, "newer\n");
@@ -26869,10 +26954,13 @@ mod test {
         let mut runtime = Runtime::new();
 
         let error = editor
-            .apply_inline_replacement(
+            .apply_inline_result(
                 "stale-request",
                 "inline-session",
-                "model output\n",
+                &InlineAssistResult {
+                    replacement: Some("model output\n".to_string()),
+                    comments: Vec::new(),
+                },
                 &mut render_buffer,
                 &mut runtime,
             )
