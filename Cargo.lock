@@ -2271,6 +2271,7 @@ dependencies = [
  "regex",
  "reqwest",
  "ropey",
+ "same-file",
  "semver",
  "serde",
  "serde_json",

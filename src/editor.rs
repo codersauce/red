@@ -120,7 +120,7 @@ use crate::{
         PickerUpdate, ScreenRect, StatuslineLayoutPanel, WhatsNewPanel,
     },
     undo::{AppliedTextEdit, CursorSnapshot, EditOrigin, RevertEdit, TextPosition, TextRange},
-    utils::{expand_user_path, get_workspace_path},
+    utils::{expand_user_path, get_workspace_path, normalized_file_path, same_file_path},
     whats_new::ReleaseNotes,
     window::{WindowDivider, WindowId, WindowManager, WindowManagerSnapshot},
 };
@@ -1030,6 +1030,27 @@ struct PaneResizeMode {
 
 fn expanded_path_string(path: &str) -> anyhow::Result<String> {
     Ok(expand_user_path(path)?.to_string_lossy().into_owned())
+}
+
+fn snapshot_duplicate_file_count(snapshot: &SessionSnapshot) -> usize {
+    let mut unique_paths = Vec::<PathBuf>::new();
+    snapshot
+        .buffers
+        .iter()
+        .filter_map(|buffer| buffer.path.as_deref())
+        .filter_map(|path| normalized_file_path(path).ok())
+        .filter(|path| {
+            if unique_paths
+                .iter()
+                .any(|unique| same_file_path(unique, path))
+            {
+                true
+            } else {
+                unique_paths.push(path.clone());
+                false
+            }
+        })
+        .count()
 }
 
 fn open_external_url(url: &str) -> std::io::Result<tokio::process::Child> {
@@ -7129,28 +7150,40 @@ impl Editor {
         create: bool,
         render_buffer: &mut RenderBuffer,
     ) -> anyhow::Result<Option<usize>> {
-        let normalized = path.absolutize()?.to_path_buf();
-        if let Some(index) = self.buffer_manager.iter().position(|buffer| {
-            buffer.file.as_deref().is_some_and(|file| {
-                Path::new(file)
-                    .absolutize()
-                    .is_ok_and(|candidate| candidate == normalized)
-            })
-        }) {
-            if index != self.buffer_manager.active_index() {
-                self.set_current_buffer(render_buffer, index).await?;
-            }
-            return Ok(Some(index));
-        }
+        let normalized = normalized_file_path(&path.to_string_lossy())?;
         if !normalized.exists() && !create {
             return Ok(None);
         }
-        let buffer =
-            Buffer::load_or_create(Some(normalized.to_string_lossy().into_owned())).await?;
-        self.buffer_manager.push_buffer(buffer);
-        let index = self.buffer_manager.len() - 1;
+        let (index, _, _) = self
+            .load_or_reuse_file_buffer(&normalized.to_string_lossy())
+            .await?;
         self.set_current_buffer(render_buffer, index).await?;
         Ok(Some(index))
+    }
+
+    fn file_buffer_index(&self, path: &Path) -> Option<usize> {
+        self.buffer_manager.iter().position(|buffer| {
+            !self.scratch_buffers.contains_key(&buffer.id())
+                && buffer
+                    .file
+                    .as_deref()
+                    .is_some_and(|file| same_file_path(Path::new(file), path))
+        })
+    }
+
+    async fn load_or_reuse_file_buffer(
+        &mut self,
+        path: &str,
+    ) -> anyhow::Result<(usize, bool, String)> {
+        let normalized = normalized_file_path(path)?;
+        let normalized = normalized.to_string_lossy().into_owned();
+        if let Some(index) = self.file_buffer_index(Path::new(&normalized)) {
+            return Ok((index, false, normalized));
+        }
+
+        let buffer = Buffer::load_or_create(Some(normalized.clone())).await?;
+        self.buffer_manager.push_buffer(buffer);
+        Ok((self.buffer_manager.len() - 1, true, normalized))
     }
 
     async fn save_current_agent_buffer(
@@ -16955,7 +16988,7 @@ impl Editor {
             Action::ViewLogs => {
                 add_to_history = false;
                 if let Some(log_file) = self.config.log_file.clone() {
-                    let path = match expand_user_path(&log_file) {
+                    let path = match normalized_file_path(&log_file) {
                         Ok(path) => path,
                         Err(e) => {
                             self.last_error = Some(format!("Failed to open log file: {}", e));
@@ -16964,26 +16997,14 @@ impl Editor {
                     };
                     let log_file = path.to_string_lossy().into_owned();
                     if path.exists() {
-                        // Check if the log file is already open
-                        if let Some(index) = self
-                            .buffer_manager
-                            .iter()
-                            .position(|b| b.name() == log_file)
-                        {
-                            self.set_current_buffer(buffer, index).await?;
-                        } else {
-                            let new_buffer = match Buffer::load_or_create(Some(log_file)).await {
-                                Ok(buffer) => buffer,
-                                Err(e) => {
-                                    self.last_error =
-                                        Some(format!("Failed to open log file: {}", e));
-                                    return Ok(false);
-                                }
-                            };
-                            self.buffer_manager.push_buffer(new_buffer);
-                            self.set_current_buffer(buffer, self.buffer_manager.len() - 1)
-                                .await?;
-                        }
+                        let (index, _, _) = match self.load_or_reuse_file_buffer(&log_file).await {
+                            Ok(opened) => opened,
+                            Err(e) => {
+                                self.last_error = Some(format!("Failed to open log file: {}", e));
+                                return Ok(false);
+                            }
+                        };
+                        self.set_current_buffer(buffer, index).await?;
                     } else {
                         self.last_error = Some(format!("Log file not found: {}", log_file));
                     }
@@ -17793,36 +17814,14 @@ impl Editor {
                 }
             }
             Action::OpenLocation(location, target) => {
-                let path = match expanded_path_string(&location.path).and_then(|path| {
-                    Ok(Path::new(&path)
-                        .absolutize()?
-                        .to_string_lossy()
-                        .into_owned())
-                }) {
-                    Ok(path) => path,
-                    Err(error) => {
-                        self.last_error = Some(error.to_string());
-                        return Ok(false);
-                    }
-                };
-                let existing_index = self.buffer_manager.iter().position(|item| {
-                    Path::new(item.name())
-                        .absolutize()
-                        .is_ok_and(|candidate| candidate == Path::new(&path))
-                });
-                let (buffer_index, added_buffer) = if let Some(index) = existing_index {
-                    (index, false)
-                } else {
-                    let new_buffer = match Buffer::load_or_create(Some(path.clone())).await {
-                        Ok(new_buffer) => new_buffer,
+                let (buffer_index, added_buffer, path) =
+                    match self.load_or_reuse_file_buffer(&location.path).await {
+                        Ok(opened) => opened,
                         Err(error) => {
                             self.last_error = Some(error.to_string());
                             return Ok(false);
                         }
                     };
-                    self.buffer_manager.push_buffer(new_buffer);
-                    (self.buffer_manager.len() - 1, true)
-                };
 
                 let opened =
                     match target {
@@ -18273,31 +18272,19 @@ impl Editor {
                 self.delete_current_buffer(buffer, *force).await?;
             }
             Action::OpenFile(path) => {
-                let path = match expanded_path_string(path) {
-                    Ok(path) => path,
+                let (index, added_buffer, path) = match self.load_or_reuse_file_buffer(path).await {
+                    Ok(opened) => opened,
                     Err(e) => {
                         self.last_error = Some(e.to_string());
                         return Ok(false);
                     }
                 };
-                if let Some(index) = self.buffer_manager.iter().position(|b| b.name() == path) {
-                    self.set_current_buffer(buffer, index).await?;
-                } else {
-                    let new_buffer = match Buffer::load_or_create(Some(path.clone())).await {
-                        Ok(buffer) => buffer,
-                        Err(e) => {
-                            self.last_error = Some(e.to_string());
-                            return Ok(false);
-                        }
-                    };
-                    self.buffer_manager.push_buffer(new_buffer);
-                    self.set_current_buffer(buffer, self.buffer_manager.len() - 1)
-                        .await?;
-
+                self.set_current_buffer(buffer, index).await?;
+                if added_buffer {
                     // Notify plugins about file open
                     let open_info = serde_json::json!({
                         "file": path,
-                        "buffer_index": self.buffer_manager.len() - 1
+                        "buffer_index": index
                     });
                     self.plugin_registry
                         .notify(runtime, "file:opened", open_info)
@@ -18867,63 +18854,43 @@ impl Editor {
                     "SplitHorizontalWithFile action triggered with file: {}",
                     file
                 );
-                let file = match expanded_path_string(file) {
-                    Ok(file) => file,
-                    Err(e) => {
-                        self.last_error = Some(format!("Failed to open file: {}", e));
-                        return Ok(false);
-                    }
-                };
-                // Load or create the buffer for the file
-                match Buffer::load_or_create(Some(file.clone())).await {
-                    Ok(new_buffer) => {
-                        self.buffer_manager.push_buffer(new_buffer);
-                        let new_buffer_index = self.buffer_manager.len() - 1;
-                        if self.update_window_layout(|windows| {
-                            windows.split_horizontal(new_buffer_index)
-                        }) {
-                            log!("Window split with new file successful");
-                            self.request_diagnostics().await?;
-                            self.render(buffer)?;
-                        } else {
-                            log!("Window split failed");
-                            // Remove the buffer we just added
-                            self.buffer_manager.pop_buffer();
+                let (new_buffer_index, added_buffer, _) =
+                    match self.load_or_reuse_file_buffer(file).await {
+                        Ok(opened) => opened,
+                        Err(e) => {
+                            self.last_error = Some(format!("Failed to open file: {}", e));
+                            return Ok(false);
                         }
-                    }
-                    Err(e) => {
-                        self.last_error = Some(format!("Failed to open file: {}", e));
+                    };
+                if self.update_window_layout(|windows| windows.split_horizontal(new_buffer_index)) {
+                    log!("Window split with file successful");
+                    self.request_diagnostics().await?;
+                    self.render(buffer)?;
+                } else {
+                    log!("Window split failed");
+                    if added_buffer {
+                        self.buffer_manager.pop_buffer();
                     }
                 }
             }
             Action::SplitVerticalWithFile(file) => {
                 log!("SplitVerticalWithFile action triggered with file: {}", file);
-                let file = match expanded_path_string(file) {
-                    Ok(file) => file,
-                    Err(e) => {
-                        self.last_error = Some(format!("Failed to open file: {}", e));
-                        return Ok(false);
-                    }
-                };
-                // Load or create the buffer for the file
-                match Buffer::load_or_create(Some(file.clone())).await {
-                    Ok(new_buffer) => {
-                        self.buffer_manager.push_buffer(new_buffer);
-                        let new_buffer_index = self.buffer_manager.len() - 1;
-                        if self.update_window_layout(|windows| {
-                            windows.split_vertical(new_buffer_index)
-                        }) {
-                            log!("Vertical split with new file successful");
-                            self.request_diagnostics().await?;
-                            self.render(buffer)?;
-                        } else {
-                            log!("Vertical split failed");
-                            // Remove the buffer we just added
-                            self.buffer_manager.pop_buffer();
+                let (new_buffer_index, added_buffer, _) =
+                    match self.load_or_reuse_file_buffer(file).await {
+                        Ok(opened) => opened,
+                        Err(e) => {
+                            self.last_error = Some(format!("Failed to open file: {}", e));
+                            return Ok(false);
                         }
-                    }
-                    Err(e) => {
-                        self.last_error = Some(format!("Failed to open file: {}", e));
+                    };
+                if self.update_window_layout(|windows| windows.split_vertical(new_buffer_index)) {
+                    log!("Vertical split with file successful");
+                    self.request_diagnostics().await?;
+                    self.render(buffer)?;
+                } else {
+                    log!("Vertical split failed");
+                    if added_buffer {
+                        self.buffer_manager.pop_buffer();
                     }
                 }
             }
@@ -21908,14 +21875,35 @@ impl Editor {
     }
 
     pub fn buffers_from_session_snapshot(snapshot: &SessionSnapshot) -> Vec<Buffer> {
+        let mut restored_paths = Vec::<PathBuf>::new();
         snapshot
             .buffers
             .iter()
             .map(|saved| {
+                let mut detached_duplicate = false;
+                let path = saved.path.as_deref().and_then(|path| {
+                    match normalized_file_path(path) {
+                        Ok(normalized)
+                            if restored_paths
+                                .iter()
+                                .any(|restored| same_file_path(restored, &normalized)) =>
+                        {
+                            // Preserve the duplicate's recoverable contents without keeping a
+                            // second live document identity for the same file.
+                            detached_duplicate = true;
+                            None
+                        }
+                        Ok(normalized) => {
+                            restored_paths.push(normalized.clone());
+                            Some(normalized.to_string_lossy().into_owned())
+                        }
+                        Err(_) => Some(path.to_string()),
+                    }
+                });
                 let mut buffer = Buffer::from_session_snapshot(
-                    saved.path.clone(),
+                    path,
                     saved.contents.clone(),
-                    saved.dirty,
+                    saved.dirty || detached_duplicate,
                     saved.revision,
                     saved.undo_history.clone(),
                 );
@@ -21941,6 +21929,7 @@ impl Editor {
             self.buffer_manager.len() == snapshot.buffers.len(),
             "session buffer count does not match the reconstructed editor"
         );
+        let duplicate_file_count = snapshot_duplicate_file_count(snapshot);
         let divergences = detect_disk_divergence(snapshot);
         let buffer_map = snapshot
             .buffers
@@ -22122,6 +22111,15 @@ impl Editor {
                 warning.push_str("; agent transcript could not be persisted");
             }
             self.last_error = Some(warning);
+        }
+        if duplicate_file_count > 0 {
+            let warning = format!(
+                "Recovered {duplicate_file_count} duplicate file buffer(s) as unnamed buffers to preserve their contents"
+            );
+            self.last_error = Some(match self.last_error.take() {
+                Some(existing) => format!("{existing}; {warning}"),
+                None => warning,
+            });
         }
         self.recompute_window_cursor_goals();
         self.sync_with_window();
@@ -22506,6 +22504,8 @@ impl Editor {
         let mut skipped_files = Vec::new();
         let mut buffer_map = HashMap::new();
         let mut restored_buffers = Vec::new();
+        let mut warnings = Vec::new();
+        let mut restored_file_indices = Vec::<(PathBuf, usize)>::new();
         let has_live_snapshot_buffer = snapshot.buffers.iter().any(|saved_buffer| {
             self.buffer_manager
                 .iter()
@@ -22515,16 +22515,36 @@ impl Editor {
             has_live_snapshot_buffer || self.buffer_manager.iter().any(Buffer::is_dirty);
 
         for saved_buffer in &snapshot.buffers {
+            let path = match normalized_file_path(&saved_buffer.path) {
+                Ok(path) => path,
+                Err(error) => {
+                    skipped_files.push(SkippedFile {
+                        path: saved_buffer.path.clone(),
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+
+            if let Some((_, existing_index)) = restored_file_indices
+                .iter()
+                .find(|(restored, _)| same_file_path(restored, &path))
+            {
+                buffer_map.insert(saved_buffer.index, *existing_index);
+                warnings.push(format!(
+                    "Collapsed duplicate saved buffer {} onto the existing file buffer",
+                    saved_buffer.path
+                ));
+                continue;
+            }
+
             let live_index = preserve_live_buffers
-                .then(|| {
-                    self.buffer_manager
-                        .iter()
-                        .position(|buffer| saved_buffer.matches(buffer))
-                })
+                .then(|| self.file_buffer_index(&path))
                 .flatten();
             if let Some(index) = live_index {
                 saved_buffer.restore_view(&mut self.buffer_manager[index]);
                 buffer_map.insert(saved_buffer.index, index);
+                restored_file_indices.push((path, index));
                 opened_files.push(saved_buffer.path.clone());
                 continue;
             }
@@ -22538,7 +22558,7 @@ impl Editor {
                 continue;
             }
 
-            if !std::path::Path::new(&saved_buffer.path).exists() {
+            if !path.exists() {
                 skipped_files.push(SkippedFile {
                     path: saved_buffer.path.clone(),
                     reason: "file does not exist".to_string(),
@@ -22546,7 +22566,7 @@ impl Editor {
                 continue;
             }
 
-            match Buffer::load_or_create(Some(saved_buffer.path.clone())).await {
+            match Buffer::load_or_create(Some(path.to_string_lossy().into_owned())).await {
                 Ok(mut buffer) => {
                     saved_buffer.restore_view(&mut buffer);
 
@@ -22558,6 +22578,7 @@ impl Editor {
                         restored_buffers.len() - 1
                     };
                     buffer_map.insert(saved_buffer.index, restored_index);
+                    restored_file_indices.push((path, restored_index));
                     opened_files.push(saved_buffer.path.clone());
                 }
                 Err(err) => skipped_files.push(SkippedFile {
@@ -22585,7 +22606,10 @@ impl Editor {
                 restored: false,
                 opened_files,
                 skipped_files,
-                warnings: vec!["No saved files could be restored".to_string()],
+                warnings: {
+                    warnings.push("No saved files could be restored".to_string());
+                    warnings
+                },
             });
         }
 
@@ -22597,7 +22621,7 @@ impl Editor {
                 restored: true,
                 opened_files,
                 skipped_files,
-                warnings: Vec::new(),
+                warnings,
             });
         }
 
@@ -22640,7 +22664,7 @@ impl Editor {
             restored: true,
             opened_files,
             skipped_files,
-            warnings: Vec::new(),
+            warnings,
         })
     }
 
@@ -23923,6 +23947,25 @@ impl Editor {
                 Some("Scratch buffers cannot be written to disk; use :w to submit".to_string());
             return Ok(false);
         }
+        let target_path = normalized_file_path(new_file_name)?;
+        let active_index = self.buffer_manager.active_index();
+        if let Some(open_path) = self
+            .buffer_manager
+            .iter()
+            .enumerate()
+            .filter(|(index, buffer)| {
+                *index != active_index && !self.scratch_buffers.contains_key(&buffer.id())
+            })
+            .find_map(|(_, buffer)| {
+                let open_path = buffer.file.as_deref()?;
+                same_file_path(Path::new(open_path), &target_path).then_some(open_path)
+            })
+        {
+            self.last_error = Some(format!(
+                "Save As cancelled; destination is already open in another buffer: {open_path}"
+            ));
+            return Ok(false);
+        }
         let previous_uri = self.current_buffer().uri()?;
         let previous_file = self.current_buffer().file.clone();
         let resume_insert_transaction = self.commit_active_transaction_before_save();
@@ -24856,14 +24899,10 @@ pub struct BufferStateSnapshot {
 
 impl BufferStateSnapshot {
     fn matches(&self, buffer: &Buffer) -> bool {
-        buffer.file.as_deref().is_some_and(|file| {
-            file == self.path
-                || Path::new(file)
-                    .absolutize()
-                    .ok()
-                    .zip(Path::new(&self.path).absolutize().ok())
-                    .is_some_and(|(file, saved)| file == saved)
-        })
+        buffer
+            .file
+            .as_deref()
+            .is_some_and(|file| same_file_path(Path::new(file), Path::new(&self.path)))
     }
 
     fn restore_view(&self, buffer: &mut Buffer) {
@@ -32616,6 +32655,56 @@ builtin = "rust"
     }
 
     #[tokio::test]
+    async fn session_restore_repairs_persisted_file_aliases() {
+        let cwd = std::env::current_dir().unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("red-restore-alias-")
+            .tempdir_in(&cwd)
+            .unwrap();
+        let absolute = directory.path().join("main.c");
+        std::fs::write(&absolute, "int game = 1;\n").unwrap();
+        let relative = absolute
+            .strip_prefix(&cwd)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut source = lsp_test_editor(vec![
+            Buffer::new(
+                Some(absolute.to_string_lossy().into_owned()),
+                "int game = 1;\n".to_string(),
+            ),
+            Buffer::new(Some(relative), "unsaved duplicate\n".to_string()),
+        ]);
+
+        let recovery_snapshot = source.test_session_snapshot();
+        let recovered = Editor::buffers_from_session_snapshot(&recovery_snapshot);
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].file.as_deref(), absolute.to_str());
+        assert!(recovered[1].file.is_none());
+        assert!(recovered[1].is_dirty());
+        assert_eq!(recovered[1].contents(), "unsaved duplicate\n");
+
+        let editor_snapshot = source.editor_state_snapshot();
+        let mut restored = lsp_test_editor(vec![Buffer::new(None, String::new())]);
+        let mut render_buffer = RenderBuffer::new(60, 12, &Style::default());
+        let result = restored
+            .restore_editor_state(editor_snapshot, &mut render_buffer)
+            .await
+            .unwrap();
+
+        assert!(result.restored);
+        assert_eq!(restored.buffer_manager.len(), 1);
+        assert_eq!(
+            restored.buffer_manager[0].file.as_deref(),
+            absolute.to_str()
+        );
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Collapsed duplicate saved buffer")));
+    }
+
+    #[tokio::test]
     async fn restoring_editor_state_accepts_a_pane_only_clean_workspace() {
         let mut source = lsp_test_editor(vec![Buffer::new(None, String::new())]);
         source.panel_manager.create_text_panel(
@@ -34889,6 +34978,125 @@ while True:
         assert_eq!(editor.buffer_manager.len(), 2);
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn relative_and_absolute_open_requests_share_one_renameable_buffer() {
+        let cwd = std::env::current_dir().unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("red-open-alias-")
+            .tempdir_in(&cwd)
+            .unwrap();
+        let absolute = directory.path().join("main.c");
+        std::fs::write(&absolute, "int game = 1;\n").unwrap();
+        let relative = absolute
+            .strip_prefix(&cwd)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut editor = test_editor(60, 12);
+        let mut render_buffer = RenderBuffer::new(60, 12, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .execute(
+                &Action::OpenFile(absolute.to_string_lossy().into_owned()),
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        editor
+            .execute(
+                &Action::OpenFile(relative),
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.buffer_manager.len(), 2);
+        assert_eq!(editor.current_buffer().file.as_deref(), absolute.to_str());
+
+        let uri = crate::lsp::file_uri(&absolute).unwrap();
+        let operations = workspace_edit_operations(&serde_json::json!({
+            "changes": { (uri): [{
+                "range": { "start": { "line": 0, "character": 4 }, "end": { "line": 0, "character": 8 } },
+                "newText": "player"
+            }] }
+        }))
+        .unwrap();
+        editor
+            .test_execute_production_action(Action::ApplyLspWorkspaceEditOperations {
+                operations,
+                expected_revisions: Vec::new(),
+                command: None,
+                label: "rename symbol".to_string(),
+                response: None,
+                save_after_uri: None,
+                save_as: None,
+                save_previous_file: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), "int player = 1;\n");
+        assert!(!editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| { error.contains("duplicate open buffers") }));
+    }
+
+    #[tokio::test]
+    async fn file_targeted_splits_reuse_the_existing_buffer() {
+        let cwd = std::env::current_dir().unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("red-split-alias-")
+            .tempdir_in(&cwd)
+            .unwrap();
+        let absolute = directory.path().join("main.c");
+        std::fs::write(&absolute, "int main(void) { return 0; }\n").unwrap();
+        let relative = absolute
+            .strip_prefix(&cwd)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut editor = test_editor(80, 24);
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .execute(
+                &Action::OpenFile(absolute.to_string_lossy().into_owned()),
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        editor
+            .execute(
+                &Action::SplitHorizontalWithFile(relative.clone()),
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        editor
+            .execute(
+                &Action::SplitVerticalWithFile(relative),
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.buffer_manager.len(), 2);
+        assert_eq!(editor.test_window_count(), 3);
+        assert!(editor
+            .window_manager
+            .windows()
+            .iter()
+            .all(|window| window.buffer_index == 1));
     }
 
     #[test]
