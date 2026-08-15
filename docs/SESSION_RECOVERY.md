@@ -1,5 +1,12 @@
 # Session recovery
 
+On a normal clean exit, Red's bundled `session_restore` plugin remembers clean,
+file-backed buffers, cursor positions, viewports, and split layout. Starting
+`red` again without file arguments in the same working directory restores that
+lightweight workspace automatically. Supplying files starts the requested
+workspace instead, and dirty buffers remain the responsibility of core crash
+recovery.
+
 Red's core writes versioned recovery snapshots under `sessions/<owner>/latest.json` in the configuration directory. Each editor and named detached owner has an independent namespace, so concurrent sessions cannot replace one another's recovery point. Run `red --resume` after a crash to restore the newest valid snapshot containing dirty buffers, falling back to the newest clean snapshot when no work is pending; legacy `sessions/latest.json` snapshots remain supported. An interactive resume continues the selected owner namespace so a subsequent clean save replaces the stale dirty recovery point. Recovery is deliberately separate from opening files: restored dirty contents remain in memory and Red never writes them to disk until an explicit save. Do not resume an editor that is still running, since interactive owners do not currently hold an exclusive recovery lock.
 
 The snapshot includes open buffers and unsaved contents, the window tree and cursors, registers, marks, jumplist, per-buffer undo trees with attribution, and the agent conversation. New agent snapshots bind Red's clean structured transcript projection to a persisted Codex thread ID. On recovery, the Agent composer stays disabled until a replacement app-server rejoins that thread and reconciles the panel with the returned turns. Legacy flat transcripts and conversations whose Codex thread is missing are shown as archived context; their next prompt starts a visibly new session with bounded recovered context.

@@ -297,6 +297,9 @@ pub struct Config {
     /// Number of files supplied at startup; runtime-only context.
     #[serde(default, skip_serializing)]
     pub startup_file_count: usize,
+    /// Whether startup already restored a core-owned recovery snapshot.
+    #[serde(default, skip_serializing)]
+    pub startup_session_resumed: bool,
 }
 
 /// Direct Codex CLI launch configuration.
@@ -3957,6 +3960,16 @@ max_buffer_words = 20
         let permissions = config.plugin_permissions.get("project_search").unwrap();
         assert_eq!(permissions.process, vec!["rg".to_string()]);
         assert_eq!(config.log_file.as_deref(), Some("red.log"));
+    }
+
+    #[test]
+    fn default_config_enables_session_restore() {
+        let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+
+        assert_eq!(
+            config.plugins.get("session_restore").map(String::as_str),
+            Some("session_restore.hk")
+        );
     }
 
     #[test]

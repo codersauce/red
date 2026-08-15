@@ -201,6 +201,7 @@ async fn run() -> anyhow::Result<()> {
     let preferences = PreferencesStore::load(Config::path("preferences.json"));
 
     loaded.config.startup_file_count = args.files.len();
+    loaded.config.startup_session_resumed = args.resume;
 
     if let Some(root) = &args.root {
         // change to root directory

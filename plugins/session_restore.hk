@@ -13,6 +13,10 @@ struct StringConfigValue {
     value: String,
 }
 
+struct BooleanConfigValue {
+    value: bool,
+}
+
 struct SessionBuffer {
     path: String,
     dirty: bool,
@@ -54,6 +58,13 @@ fn state() -> SessionRestoreState {
 
 #[red::on("editor:ready")]
 fn ready(event: EmptyEvent) {
+    red::request("GetConfig", startup_resume_loaded, "startup_session_resumed");
+}
+
+fn startup_resume_loaded(event: BooleanConfigValue) {
+    if red::bool(event.value, false) {
+        return;
+    }
     red::request("GetConfig", startup_count_loaded, "startup_file_count");
 }
 
