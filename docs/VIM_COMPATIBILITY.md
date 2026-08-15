@@ -1,6 +1,6 @@
 # Red Vim compatibility matrix
 
-**Matrix version:** 1.5
+**Matrix version:** 1.6
 **Validated against:** Red 0.5.0, August 2026
 **Status vocabulary:** **supported**, **intentional difference**, **not yet supported**
 
@@ -15,8 +15,11 @@ the corresponding integration tests.
 | Counts | **supported** | Decimal prefixes apply to motions, joins, line-end edits, substitute/delete-character aliases, macro playback, dot-repeat, find/till, `r`, and pane or split resizing. Nested mappings preserve the prefix until their final key, including `5 Ctrl-w >`. |
 | Basic motions | **supported** | `h j k l`, arrows, `0`, `^`, `$`, `w`, `W`, `b`, `e`, `ge`, `B`, `E`, `gE`, `gg`, `G`, viewport-relative `H`, `M`, and `L`, screen-line motions, full/half-page motions, and file percentages use grapheme-safe cursor positions. Counted `H` and `L` honor the visible viewport. |
 | Character motions | **supported** | `f{char}`, `t{char}`, `F{char}`, `T{char}`, counted forms, `;` forward-repeat, and `,` reverse-repeat; delete, change, and yank accept the same suffixes. |
-| Operators | **supported** | `d`, `c`, and `y` with horizontal, line, vertical, file-boundary, line-start/end, small/big-word, previous-word-end, find/till, match, and supported text-object targets. Counted word operators treat blank lines as Neovim motion boundaries; `cw` and `cW` preserve trailing whitespace like Vim. |
+| Structural motions | **supported** | Tree-sitter-backed `]m`/`[m` move between calls, `]f`/`[f` between functions, and `]c`/`[c` between classes. Counts, operator-pending forms such as `d2]f`, Visual selections, and window-local jumps are supported without wrapping past the document boundary. |
+| Operators | **supported** | `d`, `c`, and `y` with horizontal, line, vertical, file-boundary, line-start/end, small/big-word, previous-word-end, find/till, match, supported text-object, and structural-motion targets. Counted word operators treat blank lines as Neovim motion boundaries; `cw` and `cW` preserve trailing whitespace like Vim. |
 | Text objects | **supported** | Inner/around small words, big words, paragraphs, parentheses, brackets, braces, single quotes, double quotes, and backticks. |
+| Structural text objects | **supported** | Syntax-aware `am`/`im` select calls, `af`/`if` functions, `ac`/`ic` classes, and `ak`/`ik` comments. Objects work in Visual mode and with delete, change, yank, and case transforms. Outer functions and classes produce linewise selections and registers. |
+| Structural swaps | **supported** | `Space ] a`/`Space [ a` exchange adjacent parameters and `Space ] m`/`Space [ m` exchange adjacent functions in the same syntax container. Separators remain in place; each swap supports one-step undo, dot-repeat, macros, and jumplist navigation. |
 | `r{char}` | **supported** | Replaces one or a counted run of graphemes and is one undoable change. A count longer than the remaining line is rejected without editing. |
 | Editing aliases | **supported** | `D`, `C`, and Neovim-style `Y` operate to line end; `S`, `s`, and `X` provide line/character substitute and backward-delete shortcuts. Counts, default-register kind, undo, and Insert transitions are preserved. `U` is an additional redo alias. |
 | Case changes | **supported** | `~`, `gu{motion}`, `gU{motion}`, `g~{motion}`, and the `guu`/`gUU`/`g~~` line forms transform Unicode text as one transaction. |
@@ -61,7 +64,7 @@ the corresponding integration tests.
 | Substitute syntax | **intentional difference** | Patterns and capture expansion use Rust `regex`; delimiters may be escaped. Vim magic modes, expression replacement, and omitted trailing delimiters are not supported. |
 | Undo/redo | **supported** | Linear, per-buffer transactions with dirty-state checkpoints. |
 | Undo tree | **supported** | Undo followed by a new edit creates a sibling branch. `g-`/`g+` select a sibling deterministically and redo traverses it; `:undotree` opens the small visual navigator. |
-| Jumplist | **supported** | Search and long/file motions record window-local jumps; splits copy their source window's list, positions follow edits, same-line entries are cleaned up, and `Ctrl-o` / `Ctrl-i` (`Tab`) traverse backward/forward without discarding the forward branch. |
+| Jumplist | **supported** | Search, long/file motions, structural motions, and structural swaps record window-local jumps; splits copy their source window's list, positions follow edits, same-line entries are cleaned up, and `Ctrl-o` / `Ctrl-i` (`Tab`) traverse backward/forward without discarding the forward branch. |
 | Local marks | **supported** | `ma`–`mz`, exact backtick jump, and first-nonblank apostrophe jump. They remain tied to the in-memory buffer and report an error after it is deleted. |
 | Global marks | **supported** | `mA`–`mZ`; an existing marked file is reopened after its buffer closes. A deleted file produces an error and is never recreated by a jump. |
 | Special marks | **supported** | Previous jump (`''`/````), last change (`'.`/``.` ``), and last visual bounds (`'<`, `'>`, `` `< ``, `` `> ``). |
@@ -75,7 +78,7 @@ the corresponding integration tests.
 | Empty buffers | **supported** | The synthetic editable line remains cursor-safe across insert, delete, render, and undo. |
 | Final line / trailing newline | **supported** | Both forms render and edit without exposing a phantom gutter line. |
 | Multi-window and docked panes | **supported** | Active-buffer cursor, viewport, wrapping, gutter width, and focus-cycle state are window-aware. `Ctrl-w h/j/k/l` moves between editor windows and panes; `Ctrl-w H/J/K/L` moves the focused editor window, row pane, or text pane to the corresponding outer edge without replacing its identity, content, or draft. |
-| Embedded plugin text areas | **supported** | Agent dialogs and text-panel composers reuse the editor's Unicode-aware word motions, character searches, text objects, and transactional replacement boundary. Counts, delete/change/yank operators, visual selections, local registers, undo/redo, dot-repeat, macros, and prompt-local search remain isolated from editor documents, application commands, and LSP. |
+| Embedded plugin text areas | **supported** | Agent dialogs and text-panel composers reuse Unicode-aware word motions, character searches, ordinary text objects, and transactional replacement. Counts, operators, Visual selections, local registers, undo/redo, dot-repeat, macros, and prompt-local search remain isolated. Tree-sitter structural objects and swaps stay editor-owned and are unavailable in grammar-free composers. |
 | Inline assist selection | **intentional difference** | `Space i` targets the complete current line in Normal mode or the exact character/linewise Visual selection. Visual-block targets are rejected. The popup has its own Insert-like, soft-wrapped prompt, remains within the initiating split, and its applied result is one unsaved, undoable editor transaction. |
 | Window and pane resizing | **supported** | `Ctrl-w >` / `<` grow or shrink vertical panes and editor splits; `Ctrl-w +` / `-` grow or shrink horizontal panes and editor splits. Counts are supported. `Ctrl-w =` balances editor splits or restores the focused pane's original size. Mouse dragging immediately highlights the captured pane or nested split divider without stealing focus; release or `Esc` restores its normal appearance. |
 | Multi-window Vim window command parity | **intentional difference** | Red supports the documented navigation, edge-movement, resizing, and balancing commands; arbitrary Vim layouts and undocumented window commands are not promised. |

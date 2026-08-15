@@ -968,6 +968,9 @@ pub struct LanguageGrammarConfig {
     /// Ordered paths to Tree-sitter highlight query files.
     #[serde(default)]
     pub highlights: Vec<PathBuf>,
+    /// Ordered paths to Tree-sitter structural text-object query files.
+    #[serde(default)]
+    pub textobjects: Vec<PathBuf>,
     /// Optional Tree-sitter injection query file.
     #[serde(default)]
     pub injections: Option<PathBuf>,
@@ -2021,7 +2024,14 @@ fn known_schema_path(path: &[String]) -> bool {
         ),
         ["languages", _, "grammar", field] => matches!(
             *field,
-            "builtin" | "path" | "symbol" | "highlights" | "injections" | "trusted" | "targets"
+            "builtin"
+                | "path"
+                | "symbol"
+                | "highlights"
+                | "textobjects"
+                | "injections"
+                | "trusted"
+                | "targets"
         ),
         ["languages", _, "grammar", "targets", _] => true,
         ["languages", _, "grammar", "targets", _, field] => {
@@ -4313,6 +4323,7 @@ indent_width = 2
 
 [languages.buildspec.grammar]
 builtin = "rust"
+textobjects = ["queries/buildspec/textobjects.scm"]
 
 [languages.buildspec.lsp]
 command = "build-language-server"
@@ -4339,6 +4350,10 @@ validate = true
                 .as_ref()
                 .and_then(|grammar| grammar.builtin.as_deref()),
             Some("rust")
+        );
+        assert_eq!(
+            definition.grammar.as_ref().unwrap().textobjects,
+            [PathBuf::from("queries/buildspec/textobjects.scm")]
         );
         assert_eq!(
             definition

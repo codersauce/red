@@ -19,6 +19,8 @@ indent_width = 2
 
 [languages.buildspec.grammar]
 builtin = "rust"
+# Optional: replace the bundled Rust structural queries.
+# textobjects = ["queries/buildspec/textobjects.scm"]
 
 [languages.buildspec.lsp]
 command = "build-language-server"
@@ -60,6 +62,7 @@ symbol = "tree_sitter_css"
 highlights = [
   "~/.local/share/nvim/lazy/nvim-treesitter/runtime/queries/css/highlights.scm",
 ]
+textobjects = ["~/.config/red/queries/css/textobjects.scm"]
 ```
 
 Native grammar shared libraries execute arbitrary code inside the editor. Red
@@ -83,6 +86,59 @@ Red copies approved bytes to an immutable digest-addressed grammar cache before
 loading them. Missing symbols, incompatible Tree-sitter ABIs, invalid queries,
 and unapproved or changed binaries quarantine only the affected language at
 startup.
+
+## Navigate syntax-aware text objects
+
+Red bundles structural Tree-sitter queries for Rust, Markdown, JavaScript, JSX,
+TypeScript, TSX, JSON, TOML, YAML, Bash, Fish, PowerShell, and Lua. Available
+objects depend on the language's query: not every language defines calls,
+functions, classes, comments, and parameters.
+
+First-party C, C#, C++, CSS, Go, HTML, Java, Kotlin, PHP, Python, Svelte,
+Swift, and Vue packs also receive compatible structural queries. Older installed
+packs use Red's bundled fallbacks immediately; newer releases declare and ship
+their own query files. Explicit package or user queries take precedence. These
+operations use Tree-sitter and do not require the optional language server.
+
+| Keys | Operation |
+| --- | --- |
+| `]m`, `[m` | Move to the next or previous call. |
+| `]f`, `[f` | Move to the next or previous function. |
+| `]c`, `[c` | Move to the next or previous class or equivalent declaration. |
+| `am`, `im` | Select an outer or inner call. |
+| `af`, `if` | Select an outer or inner function. |
+| `ac`, `ic` | Select an outer or inner class. |
+| `ak`, `ik` | Select an outer or inner comment. |
+| `Space ] a`, `Space [ a` | Swap a parameter with its next or previous sibling. |
+| `Space ] m`, `Space [ m` | Swap a function with its next or previous sibling. |
+
+Structural motions accept counts, work in Visual mode and after operators, and
+record jumps. Objects work with delete, change, yank, and case-change operators;
+outer functions and classes use linewise selections and registers. Swaps stay
+inside the same syntactic container, preserve separators, and form one undoable,
+repeatable edit. Existing `Space n` and `Space p` plugin/navigation bindings are
+unchanged.
+
+`:syntax off` disables structural operations. Languages without structural
+queries, including Husk and Git commit messages, remain editable without them.
+The editor lazily parses documents up to 2 MiB, caches their syntax trees,
+queries only the requested object kind, and progressively bounds directional
+searches in larger documents. Edits, syntax changes, and language reloads
+invalidate the affected cached state.
+
+Configure `languages.<id>.grammar.textobjects` with an ordered list of query
+files to replace a reused grammar's bundled structural queries or provide
+queries for a native grammar. Supported capture names are `@call.outer`,
+`@call.inner`, `@function.outer`, `@function.inner`, `@class.outer`,
+`@class.inner`, `@comment.outer`, `@comment.inner`, `@parameter.outer`, and
+`@parameter.inner`. Repeated captures in one match form a single range.
+
+Query files must already include any inherited patterns. Standard Tree-sitter
+predicates such as `#eq?` and `#match?` work; Neovim-specific `; inherits:`,
+`#offset!`, and Lua predicates are not interpreted. Unsupported custom
+predicates are rejected when the language configuration is loaded. Bundled
+upstream queries are normalized for this runtime, with comment and Fish function
+interiors supplied by Red when needed.
 
 ## Browse and install language packs
 
@@ -139,6 +195,7 @@ indent_width = 4
 [languages.acme.grammar]
 symbol = "tree_sitter_acme"
 highlights = ["queries/acme/highlights.scm"]
+textobjects = ["queries/acme/textobjects.scm"]
 
 [languages.acme.grammar.targets.aarch64-apple-darwin]
 path = "grammars/aarch64-apple-darwin/acme.dylib"

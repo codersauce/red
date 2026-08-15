@@ -2064,3 +2064,84 @@ async fn test_operator_delete_percent_deletes_through_match() {
     type_normal_keys(&mut harness, "d%").await;
     harness.assert_buffer_contents(" beta");
 }
+
+#[tokio::test]
+async fn structural_function_motions_support_counts_and_window_jumps() {
+    let contents = "// heading\nfn first() {}\nfn second() {}\nfn third() {}\n";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), contents.to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "2]f").await;
+    harness.assert_cursor_at(0, 2);
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 1);
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 0);
+    harness.execute_action(Action::JumpForward).await.unwrap();
+    harness.assert_cursor_at(0, 1);
+
+    type_normal_keys(&mut harness, "]f[f").await;
+    harness.assert_cursor_at(0, 1);
+}
+
+#[tokio::test]
+async fn structural_call_and_class_motions_resolve_nested_captures() {
+    let contents = "struct First {}\nfn ready() { alpha(); beta(); }\nstruct Second {}\n";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), contents.to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "]c").await;
+    harness.assert_cursor_at(0, 2);
+
+    harness
+        .execute_action(Action::SetCursor(0, 1))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "]m").await;
+    harness.assert_cursor_at(13, 1);
+    type_normal_keys(&mut harness, "]m").await;
+    harness.assert_cursor_at(22, 1);
+    type_normal_keys(&mut harness, "[m").await;
+    harness.assert_cursor_at(13, 1);
+}
+
+#[tokio::test]
+async fn structural_motions_extend_visual_selection() {
+    let contents = "fn first() {}\nfn second() {}\nfn third() {}\n";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), contents.to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "v]f").await;
+
+    harness.assert_mode(Mode::Visual);
+    harness.assert_cursor_at(0, 1);
+    assert_eq!(harness.selection(), Some((0, 0, 0, 1)));
+}
+
+#[tokio::test]
+async fn structural_motions_respect_disabled_syntax_and_no_wrap_boundaries() {
+    let contents = "fn only() {}";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), contents.to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "]f").await;
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.last_error(), Some("text object not found"));
+
+    harness
+        .execute_action(Action::Command("syntax off".to_string()))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "[f").await;
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.last_error(), Some("text object not found"));
+}

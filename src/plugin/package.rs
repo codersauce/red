@@ -316,6 +316,7 @@ impl PluginPackageManifest {
                 .path
                 .iter()
                 .chain(grammar.highlights.iter())
+                .chain(grammar.textobjects.iter())
                 .chain(grammar.injections.iter())
             {
                 validate_package_file(package_root, relative)?;
@@ -1602,7 +1603,7 @@ fn set_executable(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin::RED_HOST_API_VERSION;
+    use crate::{config::Config, language::merge_package_languages, plugin::RED_HOST_API_VERSION};
 
     fn catalog_package(artifact: CatalogArtifact) -> CatalogPackage {
         CatalogPackage {
@@ -2114,6 +2115,17 @@ symbol = "tree_sitter_buildspec"
         let config = tempfile::tempdir().unwrap();
         let package = tempfile::tempdir().unwrap();
         write_language_package(package.path(), "build-languages");
+        let query_dir = package.path().join("queries");
+        fs::create_dir_all(&query_dir).unwrap();
+        fs::write(
+            query_dir.join("textobjects.scm"),
+            "(function_item) @function.outer",
+        )
+        .unwrap();
+        let manifest_path = package.path().join(PLUGIN_MANIFEST_FILE);
+        let mut source = fs::read_to_string(&manifest_path).unwrap();
+        source.push_str("textobjects = [\"queries/textobjects.scm\"]\n");
+        fs::write(&manifest_path, source).unwrap();
         let manager = PluginPackageManager::new(config.path());
 
         let installed = manager.install_path(package.path()).await.unwrap();
@@ -2124,6 +2136,18 @@ symbol = "tree_sitter_buildspec"
         assert!(!installed.has_companion);
         assert_eq!(manifest.languages["buildspec"].filenames, ["Buildfile"]);
         assert!(manifest.husk_entry(&installed.package_root).is_none());
+
+        let mut loaded =
+            Config::load_user_toml("", &config.path().join("config.toml"), &[]).unwrap();
+        merge_package_languages(&mut loaded.config, &manifest, &installed.package_root);
+        assert_eq!(
+            loaded.config.languages["buildspec"]
+                .grammar
+                .as_ref()
+                .unwrap()
+                .textobjects,
+            [installed.package_root.join("queries/textobjects.scm")]
+        );
     }
 
     #[tokio::test]
@@ -2178,6 +2202,7 @@ comment = "// %s"
 path = "grammars/acme.so"
 symbol = "tree_sitter_acme"
 highlights = ["queries/highlights.scm"]
+textobjects = ["queries/textobjects.scm"]
 
 [languages.acme.lsp]
 command = "acme-language-server"
@@ -2199,6 +2224,10 @@ root_markers = ["Acmefile", ".git"]
             grammar.highlights,
             [PathBuf::from("queries/highlights.scm")]
         );
+        assert_eq!(
+            grammar.textobjects,
+            [PathBuf::from("queries/textobjects.scm")]
+        );
         assert_eq!(server.command.as_deref(), Some("acme-language-server"));
         assert_eq!(server.root_markers, ["Acmefile", ".git"]);
     }
@@ -2210,6 +2239,15 @@ root_markers = ["Acmefile", ".git"]
         let manifest_path = package.path().join(PLUGIN_MANIFEST_FILE);
         let mut source = fs::read_to_string(&manifest_path).unwrap();
         source.push_str("path = \"../unsafe.so\"\n");
+        fs::write(&manifest_path, source).unwrap();
+        assert!(PluginPackageManifest::load(package.path())
+            .unwrap_err()
+            .to_string()
+            .contains("unsafe component"));
+
+        write_language_package(package.path(), "build-languages");
+        let mut source = fs::read_to_string(&manifest_path).unwrap();
+        source.push_str("textobjects = [\"../unsafe.scm\"]\n");
         fs::write(&manifest_path, source).unwrap();
         assert!(PluginPackageManifest::load(package.path())
             .unwrap_err()
