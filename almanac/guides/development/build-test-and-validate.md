@@ -15,6 +15,9 @@ sources:
   - id: plugin-check
     type: file
     path: .github/workflows/plugin-check.yml
+  - id: test-performance
+    type: file
+    path: .github/workflows/test-performance.yml
   - id: editor
     type: file
     path: src/editor.rs
@@ -33,7 +36,26 @@ For ordinary Rust changes, run the normal test suite first:
 cargo test --all-targets --all-features
 ```
 
-CI runs that command with `--verbose` on Ubuntu, macOS, and Windows [@ci]. Add narrower or feature-specific local checks when the change touches feature-gated code, dependency declarations, CLI utility behavior, or anything that may compile differently under a non-default feature set.
+CI runs that command with `--verbose` on Ubuntu, macOS, and Windows [@ci]. It
+uses line-table debug information and a shared, toolchain-aware Rust cache in
+CI without changing local incremental compilation. Run an additional
+`cargo test --all-targets --no-default-features` pass locally when a change
+touches feature-gated code, dependency declarations, CLI utility behavior, or
+anything that may compile differently without default features.
+
+Keep normal local runs narrow when possible:
+
+```shell
+cargo test -p red --lib editor::tests::
+cargo test -p husk-runtime
+cargo test --workspace --exclude red --all-features --tests
+python3 scripts/doctest_packages.py --no-default-features
+```
+
+The doctest helper discovers Rust examples in workspace libraries and tests
+only the packages that contain them. Husk's current example does not need its
+default WebAssembly feature, so `--no-default-features` avoids compiling the
+Wasmtime and Cranelift dependency graph.
 
 For Rust changes that may be pushed, the repository policy is stricter than a test-only pass:
 
@@ -41,7 +63,10 @@ For Rust changes that may be pushed, the repository policy is stricter than a te
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-`AGENTS.md` requires this command before pushing Rust changes and requires every warning or error to be fixed [@agents]. The CI clippy job runs the same command across Ubuntu, macOS, and Windows [@ci].
+`AGENTS.md` requires this command before pushing Rust changes and requires every
+warning or error to be fixed [@agents]. The CI clippy job runs the same command
+on Ubuntu for pull requests and on Ubuntu, macOS, and Windows for other events
+[@ci].
 
 ## Match The Main CI Gates
 
@@ -55,11 +80,47 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 cargo run --locked -- --self-check
 cargo run --locked --release --example husk_cursor_bench -- --assert
+python3 scripts/doctest_packages.py --no-default-features
 python3 scripts/readme_release.py --check
-python3 -m unittest tests.test_discord_release
+python3 -m unittest tests.test_discord_release tests.test_doctest_packages tests.test_test_performance
 ```
 
-The workflow lint job validates GitHub Actions, checks the README release version, and runs Discord announcement tests [@ci]. The CI `fmt`, `self-check`, and `perf` jobs respectively run rustfmt, `cargo run --locked -- --self-check`, and the release-mode Husk cursor benchmark with `--assert` [@ci]. For the details of the CI surface, see [CI And Validation](../../reference/validation/ci-and-validation); for benchmark thresholds and workstation baselines, see [Performance Checks](../performance/performance-checks); for the runtime diagnostic itself, see [Self Check](../../reference/runtime/self-check).
+The workflow lint job validates GitHub Actions, checks the README release
+version, and runs Discord announcement and validation-helper tests [@ci]. The
+CI `fmt` and `self-check` jobs run rustfmt and
+`cargo run --locked -- --self-check`; the separate path-filtered Performance
+workflow runs the release-mode Husk cursor benchmark with `--assert`. For the
+details of the CI surface, see
+[CI And Validation](../../reference/validation/ci-and-validation); for benchmark
+thresholds and workstation baselines, see
+[Performance Checks](../performance/performance-checks); for the runtime
+diagnostic itself, see [Self Check](../../reference/runtime/self-check).
+
+## Compare Test Runners And Build Settings
+
+Keep `cargo test` as the normal runner: Red has many short tests, and its shared
+test-binary processes are faster than starting a separate process for every
+test. Install the optional runner with `cargo install cargo-nextest --locked`,
+then collect equivalent warmed runs and Cargo build timings:
+
+```shell
+python3 scripts/test_performance.py --runner both --runs 3 --timings
+python3 scripts/test_performance.py --runner both --package husk-lexer
+python3 scripts/test_performance.py --runner nextest --scope workspace
+cargo nextest run --all-targets --all-features --profile ci
+```
+
+The `ci` nextest profile reports slow tests, retries failures without treating
+flaky successes as passing, and writes JUnit XML to
+`target/nextest/ci/junit.xml`. The manually dispatched Rust Test Performance
+workflow compares runners on any supported operating system and can enable
+`sccache` or Linux `mold` for controlled compilation experiments
+[@test-performance]. These compiler and linker settings remain opt-in because
+`sccache` can interfere with the fast incremental local development path, and
+linker gains depend on the platform and workload.
+
+Focused package and workspace comparisons use `--tests` so Criterion benchmark
+binaries are not mistaken for unit tests or counted by only one runner.
 
 ## Handle Terminal Output Tests
 
@@ -79,13 +140,14 @@ If the change touches `crates/husk*`, `plugins/`, `src/plugin/`, `src/assets.rs`
 The workflow runs these families of commands:
 
 ```shell
-cargo test --all-features -p red husk
-cargo test --all-features -p red plugin::runtime::tests::lsp_symbols_
-cargo test --all-features -p red plugin::runtime::tests::git_
-cargo test --all-features -p red plugin::runtime::tests::embedded_git_core_
-cargo test --all-features -p red plugin::runtime::tests::neotree_
-cargo test --all-features -p red plugin::runtime::tests::embedded_neotree_core_
-cargo test --all-features -p husk -p husk-ast -p husk-diagnostics -p husk-lexer -p husk-package -p husk-parser -p husk-semantic -p husk-stdlib -p husk-types
+cargo test --all-features -p red --lib --bin red -- \
+  husk \
+  plugin::runtime::tests::lsp_symbols_ \
+  plugin::runtime::tests::git_ \
+  plugin::runtime::tests::embedded_git_core_ \
+  plugin::runtime::tests::neotree_ \
+  plugin::runtime::tests::embedded_neotree_core_
+cargo test --workspace --exclude red --all-features --tests
 cargo run --all-features -p husk-cli -- test --locked plugins/git_core
 cargo run --all-features -p husk-cli -- test --locked plugins/neotree_core
 python3 -m json.tool examples/example-plugin/package.json > /dev/null

@@ -33,6 +33,15 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  RUST_BACKTRACE: 1
+
 jobs:
   bundled-plugins:
     name: Parse and initialize bundled Husk plugins
@@ -46,16 +55,19 @@ jobs:
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: validation-${{ runner.os }}
 
       - name: Test the Husk runtime and plugin bridge
         run: |
-          cargo test --all-features -p red husk
-          cargo test --all-features -p red plugin::runtime::tests::lsp_symbols_
-          cargo test --all-features -p red plugin::runtime::tests::git_
-          cargo test --all-features -p red plugin::runtime::tests::embedded_git_core_
-          cargo test --all-features -p red plugin::runtime::tests::neotree_
-          cargo test --all-features -p red plugin::runtime::tests::embedded_neotree_core_
-          cargo test --all-features -p husk -p husk-ast -p husk-diagnostics -p husk-lexer -p husk-package -p husk-parser -p husk-semantic -p husk-stdlib -p husk-types
+          cargo test --all-features -p red --lib --bin red -- \
+            husk \
+            plugin::runtime::tests::lsp_symbols_ \
+            plugin::runtime::tests::git_ \
+            plugin::runtime::tests::embedded_git_core_ \
+            plugin::runtime::tests::neotree_ \
+            plugin::runtime::tests::embedded_neotree_core_
+          cargo test --workspace --exclude red --all-features --tests
           cargo run --all-features -p husk-cli -- test --locked plugins/git_core
           cargo run --all-features -p husk-cli -- test --locked plugins/neotree_core
 

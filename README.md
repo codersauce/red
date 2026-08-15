@@ -281,6 +281,23 @@ cargo test --all-targets --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+Use narrower commands while iterating on a specific crate or test:
+
+```shell
+cargo test -p red --lib editor::tests::
+cargo test --workspace --exclude red --all-features --tests
+python3 scripts/doctest_packages.py --no-default-features
+```
+
+`cargo test` is the default runner because Red's many short tests complete
+faster in shared test-binary processes. Install `cargo-nextest` when per-test
+isolation, timing, retries, or JUnit reports are useful, then compare both
+runners with `python3 scripts/test_performance.py --runner both --timings`.
+Add `--package husk-lexer` for a short, focused comparison.
+The manual **Rust Test Performance** GitHub Actions workflow provides the same
+comparison on Linux, macOS, or Windows and can optionally enable `sccache` or
+the Linux `mold` linker.
+
 Use `RED_RUNTIME=.` while iterating on bundled plugins or themes without
 rebuilding the executable:
 
