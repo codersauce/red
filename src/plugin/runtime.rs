@@ -11156,11 +11156,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        let open_push_confirmation = async |runtime: &mut Runtime| {
+        let open_push_confirmation = async |runtime: &mut Runtime, action: &str| {
             runtime
                 .notify(
                     "workspace:event:git-dashboard",
-                    serde_json::json!({ "action": "p", "row": null }),
+                    serde_json::json!({ "action": action, "row": null }),
                 )
                 .await
                 .unwrap();
@@ -11195,7 +11195,7 @@ mod tests {
             }
         };
 
-        let cancel_handle = open_push_confirmation(&mut runtime).await;
+        let cancel_handle = open_push_confirmation(&mut runtime, "y").await;
         runtime
             .notify_picker(cancel_handle, PickerCallback::Cancelled)
             .unwrap();
@@ -11208,7 +11208,7 @@ mod tests {
             .stdout;
         assert_eq!(remote_after_cancel, remote_before);
 
-        let accept_handle = open_push_confirmation(&mut runtime).await;
+        let accept_handle = open_push_confirmation(&mut runtime, "p").await;
         let accept = serde_json::from_value(serde_json::json!({
             "id": "accept",
             "label": "Push",
@@ -11451,6 +11451,12 @@ mod tests {
             .status()
             .unwrap()
             .success());
+        assert!(Command::new("git")
+            .args(["config", "commit.gpgsign", "false"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
         fs::write(root.join("staged.txt"), "hello\n").unwrap();
         assert!(Command::new("git")
             .args(["add", "staged.txt"])
@@ -11512,10 +11518,22 @@ mod tests {
         runtime
             .notify_picker(picker, PickerCallback::Selected(generate))
             .unwrap();
-        let request_id = match ACTION_DISPATCHER.recv_request() {
-            PluginRequest::GetEditorState { request_id } => request_id,
-            _ => panic!("expected an editor snapshot request"),
+        let mut generation_progress = false;
+        let request_id = loop {
+            match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::UpdateOverlayBusy { id, busy }
+                    if id == "git-operation-progress" && busy =>
+                {
+                    generation_progress = true;
+                }
+                PluginRequest::GetEditorState { request_id } => break request_id,
+                _ => {}
+            }
         };
+        assert!(
+            generation_progress,
+            "commit generation should show progress"
+        );
         let editor_snapshot = serde_json::json!({
             "version": 1,
             "cwd": root.display().to_string(),
@@ -11665,6 +11683,9 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut failure_reported = false;
+        let mut failure_overlay = false;
+        let mut commit_started = false;
+        let mut commit_busy = false;
         let mut retry_requested = false;
         loop {
             pump_process_events(&mut runtime).await.unwrap();
@@ -11687,6 +11708,22 @@ mod tests {
                     {
                         failure_reported = true;
                     }
+                    PluginRequest::CreateOverlay { id, .. } if id == "git-operation-progress" => {
+                        commit_started = true;
+                    }
+                    PluginRequest::UpdateOverlayBusy { id, busy }
+                        if id == "git-operation-progress" && busy =>
+                    {
+                        commit_busy = true;
+                    }
+                    PluginRequest::UpdateOverlay { id, lines }
+                        if id == "git-operation-progress"
+                            && lines.iter().any(|(line, _)| {
+                                line == "Git commit failed: blocked by commit feedback test"
+                            }) =>
+                    {
+                        failure_overlay = true;
+                    }
                     PluginRequest::GetEditorState { request_id } => {
                         runtime
                             .resolve_request(request_id, editor_snapshot.clone())
@@ -11697,7 +11734,12 @@ mod tests {
                     _ => {}
                 }
             }
-            if failure_reported && retry_requested {
+            if failure_reported
+                && failure_overlay
+                && commit_started
+                && commit_busy
+                && retry_requested
+            {
                 break;
             }
             assert!(Instant::now() < deadline, "commit failure was not reported");
@@ -11754,6 +11796,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut restored = false;
+        let mut success_overlay = false;
         let success = loop {
             pump_process_events(&mut runtime).await.unwrap();
             let mut success = false;
@@ -11773,9 +11816,17 @@ mod tests {
                         restored = true;
                     }
                     PluginRequest::Action(Action::Print(message))
-                        if message == "Commit created successfully" =>
+                        if message == "✓ Commit created successfully" =>
                     {
                         success = true;
+                    }
+                    PluginRequest::UpdateOverlay { id, lines }
+                        if id == "git-operation-progress"
+                            && lines
+                                .iter()
+                                .any(|(line, _)| line == "✓ Commit created successfully") =>
+                    {
+                        success_overlay = true;
                     }
                     _ => {}
                 }
@@ -11787,6 +11838,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
         assert!(success);
+        assert!(success_overlay);
         assert!(restored);
         assert_eq!(
             String::from_utf8(
@@ -11800,6 +11852,249 @@ mod tests {
             .unwrap()
             .trim(),
             "feat(git): describe staged files"
+        );
+
+        runtime.execute_command("GitDashboard").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            let mut rendered = false;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                if matches!(request, PluginRequest::UpdateWorkspace { .. }) {
+                    rendered = true;
+                }
+            }
+            if rendered {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Git dashboard did not reopen for amend"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        runtime
+            .notify(
+                "workspace:event:git-dashboard",
+                serde_json::json!({ "action": "c", "row": null }),
+            )
+            .await
+            .unwrap();
+        let (commit_picker, no_edit) = loop {
+            if let PluginRequest::OpenCallbackPicker {
+                handle,
+                title,
+                items,
+                ..
+            } = ACTION_DISPATCHER.recv_request()
+            {
+                if title.as_deref() == Some("Commit") {
+                    let no_edit = items
+                        .into_iter()
+                        .find(|item| item.id == "no-edit")
+                        .expect("commit picker should contain amend without editing");
+                    break (handle, no_edit);
+                }
+            }
+        };
+        runtime
+            .notify_picker(commit_picker, PickerCallback::Selected(no_edit))
+            .unwrap();
+        let (confirmation, proceed) = loop {
+            if let PluginRequest::OpenCallbackPicker {
+                handle,
+                title,
+                items,
+                ..
+            } = ACTION_DISPATCHER.recv_request()
+            {
+                if title.as_deref() == Some("Amend commit") {
+                    let proceed = items
+                        .into_iter()
+                        .find(|item| item.id == "proceed")
+                        .expect("amend confirmation should contain proceed");
+                    break (handle, proceed);
+                }
+            }
+        };
+        runtime
+            .notify_picker(confirmation, PickerCallback::Selected(proceed))
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut amend_started = false;
+        let mut amend_busy = false;
+        let mut amend_succeeded = false;
+        while !amend_started || !amend_busy || !amend_succeeded {
+            pump_process_events(&mut runtime).await.unwrap();
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                match request {
+                    PluginRequest::UpdateOverlay { id, lines }
+                        if id == "git-operation-progress"
+                            && lines.iter().any(|(line, _)| line == "Amending commit…") =>
+                    {
+                        amend_started = true;
+                    }
+                    PluginRequest::UpdateOverlayBusy { id, busy }
+                        if id == "git-operation-progress" && busy =>
+                    {
+                        amend_busy = true;
+                    }
+                    PluginRequest::UpdateOverlay { id, lines }
+                        if id == "git-operation-progress"
+                            && lines
+                                .iter()
+                                .any(|(line, _)| line == "✓ Commit amended successfully") =>
+                    {
+                        amend_succeeded = true;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "amend progress was not reported: started={amend_started} busy={amend_busy} succeeded={amend_succeeded}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            String::from_utf8(
+                Command::new("git")
+                    .args(["rev-list", "--count", "HEAD"])
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .stdout
+            )
+            .unwrap()
+            .trim(),
+            "2"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn git_user_operations_report_success_failure_and_cleanup() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        assert!(Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.join("tracked.txt"), "one\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.name=Red Test",
+                "-c",
+                "user.email=red@example.test",
+                "commit",
+                "-qm",
+                "feat: initial",
+            ])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+
+        let mut runtime = load_git_runtime(root).await;
+        runtime.execute_command("GitDashboard").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            let mut rendered = false;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                if matches!(request, PluginRequest::UpdateWorkspace { .. }) {
+                    rendered = true;
+                }
+            }
+            if rendered {
+                break;
+            }
+            assert!(Instant::now() < deadline, "Git dashboard did not render");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        runtime
+            .notify(
+                "workspace:event:git-dashboard",
+                serde_json::json!({ "action": "f", "row": null }),
+            )
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut fetch_succeeded = false;
+        let mut fetch_stopped_busy = false;
+        while !fetch_succeeded || !fetch_stopped_busy {
+            pump_process_events(&mut runtime).await.unwrap();
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                match request {
+                    PluginRequest::UpdateOverlay { id, lines }
+                        if id == "git-operation-progress"
+                            && lines.iter().any(|(line, _)| line == "✓ Fetch completed") =>
+                    {
+                        fetch_succeeded = true;
+                    }
+                    PluginRequest::UpdateOverlayBusy { id, busy }
+                        if id == "git-operation-progress" && !busy =>
+                    {
+                        fetch_stopped_busy = true;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(Instant::now() < deadline, "fetch success was not reported");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        runtime
+            .notify(
+                "workspace:event:git-dashboard",
+                serde_json::json!({ "action": "P", "row": null }),
+            )
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut pull_failed = false;
+        while !pull_failed {
+            pump_process_events(&mut runtime).await.unwrap();
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                if let PluginRequest::UpdateOverlay { id, lines } = request {
+                    if id == "git-operation-progress"
+                        && lines
+                            .iter()
+                            .any(|(line, _)| line.starts_with("Git operation failed:"))
+                    {
+                        pull_failed = true;
+                    }
+                }
+            }
+            assert!(Instant::now() < deadline, "pull failure was not reported");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        runtime.deactivate_all().await.unwrap();
+        let mut removed = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::RemoveOverlay { id } = request {
+                if id == "git-operation-progress" {
+                    removed = true;
+                }
+            }
+        }
+        assert!(
+            removed,
+            "Git operation overlay was not removed on deactivation"
         );
     }
 
