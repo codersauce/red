@@ -15,6 +15,9 @@ sources:
   - id: completion
     type: file
     path: src/ui/completion.rs
+  - id: confirmation
+    type: file
+    path: src/ui/confirmation.rs
   - id: agent-composer
     type: file
     path: src/ui/agent_composer.rs
@@ -58,6 +61,10 @@ Red's modal UI components implement a common `Component` trait above the editor 
 ## Diagnostic Popup
 
 `DiagnosticInfo` is the line-diagnostics popup opened by the editor action behind `ShowLineDiagnostics`. It draws rounded dialog chrome, formats numbered diagnostics with severity-colored message spans, diagnostic codes, multiline wrapping, and related information, then handles close, scroll, resize, and theme changes through the `Component` trait [@diagnostic-info]. The [Diagnostics UI](../../architecture/lsp/diagnostics-ui) page explains how this component is fed from the editor's LSP diagnostic snapshot.
+
+## Confirmation Dialogs
+
+`Confirmation` is the compact accept/cancel dialog used for callback-owned plugin confirmations and editor-owned terminal actions [@confirmation]. It defaults focus to Cancel, closes with the cancel action on `Esc` or `Ctrl-C`, accepts or cancels with `y` and `n`, and returns the selected terminal action on `Enter` [@confirmation]. Button focus moves to Accept with Left, `BackTab`, `h`, or `k`, and moves to Cancel with Right, `Tab`, `j`, or `l`; multiline confirmations keep Up and Down for scrolling instead of button focus changes [@confirmation]. The dialog returns callback selections through the owning picker handle or explicit editor actions, preserving the same resource-ownership boundary as other modal components [@confirmation] [@ui-core].
 
 ## Composer And Prompt Components
 

@@ -6,6 +6,9 @@ sources:
   - id: capabilities
     type: file
     path: src/lsp/capabilities.rs
+  - id: lsp-types
+    type: file
+    path: src/lsp/types.rs
   - id: vscode-fixture
     type: file
     path: src/lsp/fixtures/vscode-capabilities.json
@@ -15,7 +18,7 @@ LSP capabilities are Red's contract with language servers during `initialize`: t
 
 ## Conservative Advertisement
 
-Red advertises UTF-16 position encoding, static registration across text-document features, completion context support, snippets, commit characters, hover and signature documentation formats, code actions, formatting, rename, folding ranges, semantic tokens, inlay hints, and diagnostics [@capabilities]. These values match the surrounding [transport](../../architecture/lsp/transport) and editor paths: requests use JSON-RPC correlation, server responses are routed back by method, and edits are converted before mutation [@capabilities].
+Red advertises UTF-16 position encoding, static registration across text-document features, completion context support, snippets, commit characters, hover and signature documentation formats, code actions, formatting, on-type formatting, rename, folding ranges, semantic tokens, inlay hints, and diagnostics [@capabilities]. It also parses the server's `documentOnTypeFormattingProvider` options, including the first trigger character and optional additional trigger characters [@lsp-types]. These values match the surrounding [transport](../../architecture/lsp/transport) and editor paths: requests use JSON-RPC correlation, server responses are routed back by method, and edits are converted before mutation [@capabilities].
 
 The advertised omissions are as important as the positive features. Dynamic registration is disabled throughout the capability tree, save lifecycle flags are disabled, `window/showDocument` and work-done progress are not supported, diagnostics refresh is disabled, and completion/code-action resolve support is omitted [@capabilities]. This prevents servers from assuming Red can handle extra runtime registration flows or deferred resolution paths that are not implemented.
 
@@ -28,4 +31,3 @@ That capability shape reflects the [workspace edits](../../architecture/lsp/work
 ## Contrast With VS Code
 
 The `vscode-capabilities.json` fixture records a much larger client profile that includes dynamic registration, configuration notifications, workspace file operations, code-lens and semantic-token refresh, change annotation grouping, and multiple other refresh or resolution hooks [@vscode-fixture]. Red keeps that fixture as reference material, not as the advertised runtime contract. The code-generated contract is the source of truth for what Red tells servers today [@capabilities].
-

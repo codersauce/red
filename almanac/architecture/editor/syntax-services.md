@@ -15,6 +15,9 @@ sources:
   - id: matchit
     type: file
     path: src/matchit.rs
+  - id: default-config
+    type: file
+    path: default_config.toml
 ---
 
 Syntax services in Red are editor-owned helpers for language selection, highlighting, and matching-token navigation. `Highlighter` maps filenames, extensions, and language names to bundled syntax definitions, then returns `StyleInfo` spans over UTF-8 byte ranges for the text slice it was given [@highlighter]. The editor decides which language applies to a buffer, caches parsed viewport slices by buffer revision and syntax selection, and clears those caches when the user changes syntax mode [@editor]. Match navigation uses the same current language identity, but it returns editor text positions instead of byte spans, keeping syntax services connected to [Editor Coordinate Systems](../../concepts/editor/coordinate-systems) without owning text mutation [@matchit].
@@ -44,3 +47,9 @@ The cache deliberately parses more than the exact viewport when it can. Same-doc
 Matchit is separate from color highlighting but shares syntax identity. The editor calls `matchit::find_motion`, `find_unmatched_group`, and `select_around` with the current buffer contents, cursor text position, current language id, and `config.matchit` [@editor]. If a syntax language is forced, that language is used; otherwise the editor asks the highlighter to infer a language from the file and falls back to the buffer file type [@editor].
 
 `matchit.rs` combines always-available delimiter pairs with language-aware groups when matchit is enabled. It indexes single-character bracket pairs lazily by buffer id, revision, and configured pairs, skips string and comment ranges for normal token matching, includes builtin Bash `if`/`elif`/`else`/`fi` groups, accepts configured regex groups per language, and recognizes XML-like tags [@matchit]. Bracket matching remains available even when advanced matchit navigation is disabled, which lets ordinary delimiter feedback stay cheaper and more predictable than full token navigation [@matchit].
+
+## Structural Query Constraints
+
+Viewport highlighting is not a suitable cache for future Tree-sitter text objects or structural motions, because it intentionally parses only a window-sized slice plus a margin and may begin at a nonzero line [@editor]. A structural text-object service needs full-buffer parse and capture results keyed by buffer identity, revision, and language id, then must convert Tree-sitter byte ranges into Red text coordinates at the service boundary [@highlighter] [@editor]. That shape matches the existing separation: syntax services can answer positional questions, while text changes still enter through the editor's mutation boundary rather than through parser code [@editor].
+
+Default keymaps also constrain structural-navigation parity work. The `[` and `]` normal-mode groups already exist and have unused `m`, `f`, and `c` slots beside matchit, diagnostics, and Git hunk motions, but `Space n` and `Space p` are leaf mappings for next and previous buffer [@default-config]. With the current keymap model, those Space mappings cannot also be prefixes for Neovim-style tree-sitter swap bindings without moving the buffer-navigation leaves or changing prefix resolution [@default-config].
