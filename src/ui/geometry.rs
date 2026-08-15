@@ -9,6 +9,14 @@ pub(crate) struct ScreenRect {
     pub(crate) height: usize,
 }
 
+/// Terminal-space constraints for an editor-owned overlay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverlayLayout {
+    pub(crate) viewport: ScreenRect,
+    pub(crate) anchor: (usize, usize),
+    pub(crate) avoid_rows: Option<(usize, usize)>,
+}
+
 /// Fits a cursor-anchored popup inside the editor viewport.
 ///
 /// The popup prefers the side of the cursor with the most vertical room and

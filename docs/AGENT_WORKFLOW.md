@@ -25,7 +25,9 @@ Authentication is verified by `account/read` when the first session starts.
 Normal mode its target is exactly the current line; in Visual and Visual-line
 mode its target is exactly the selection. Visual-block mode is intentionally
 unsupported. The popup prefers the space below the target and moves above it
-when needed.
+when needed. It remains inside the editor split where the request started and
+never covers the rendered target. Long prompts soft-wrap and grow to six rows;
+after that the prompt scrolls internally to keep the cursor visible.
 
 Each invocation starts an ephemeral Codex thread with a read-only sandbox, no
 native tools, and one dynamic tool: `submit_replacement`. Codex cannot choose a

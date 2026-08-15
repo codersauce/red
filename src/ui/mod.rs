@@ -40,6 +40,7 @@ use crossterm::event::{Event, KeyCode, MouseEvent, MouseEventKind};
 pub use diagnostic_info::DiagnosticInfo;
 use dialog::Dialog;
 pub use file_picker::FilePicker;
+pub use geometry::OverlayLayout;
 pub(crate) use geometry::ScreenRect;
 pub use hover_info::{HoverInfo, HoverInfoFormat};
 pub(crate) use icons::IconCatalog;
@@ -98,6 +99,10 @@ pub trait Component: Send {
     }
 
     fn resize(&mut self, _viewport_width: usize, _viewport_height: usize) -> bool {
+        false
+    }
+
+    fn update_overlay_layout(&mut self, _layout: OverlayLayout) -> bool {
         false
     }
 

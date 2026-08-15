@@ -245,8 +245,9 @@ confirmation-gated.
 
 For a bounded one-range edit, put the cursor on a line or make a character or
 linewise visual selection and press `Space i`. Enter a request such as
-`extract the condition into a named boolean`. Red anchors a small prompt beside
-the target and applies the completed replacement as one unsaved transaction.
+`extract the condition into a named boolean`. Red anchors a small, auto-growing
+prompt inside the initiating editor split, beside but never over the target,
+and applies the completed replacement as one unsaved transaction.
 Press Enter to keep it, `u` to undo, `r` to refine, or `A` to continue in the
 full Agent panel. Visual-block selections are rejected in this first version.
 

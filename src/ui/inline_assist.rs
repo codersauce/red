@@ -6,17 +6,20 @@ use crate::{
     config::KeyAction,
     editor::{Action, Editor, Mode, RenderBuffer},
     theme::{Style, Theme},
-    unicode_utils::{display_width, grapheme_len, grapheme_to_byte, truncate_display_width},
+    unicode_utils::{grapheme_len, truncate_display_width},
 };
 
 use super::{
     dialog::{BorderStyle, Dialog, SurfaceRole},
     first_prompt_line,
     geometry::{anchored_popup_geometry, anchored_popup_geometry_avoiding_rows},
-    spinner_frame, Component, PromptBuffer, SPINNER_FRAME_INTERVAL_MS,
+    spinner_frame, wrap_text, Component, OverlayLayout, PromptBuffer, ScreenRect,
+    SPINNER_FRAME_INTERVAL_MS,
 };
 
 const MAX_WIDTH: usize = 72;
+const MAX_PROMPT_ROWS: usize = 6;
+const MAX_ERROR_ROWS: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InlineAssistPopupState {
@@ -29,9 +32,7 @@ pub enum InlineAssistPopupState {
 pub struct InlineAssistPopup {
     state: InlineAssistPopupState,
     prompt: PromptBuffer,
-    anchor: (usize, usize),
-    viewport_y_offset: usize,
-    avoid_rows: Option<(usize, usize)>,
+    layout: OverlayLayout,
     dialog: Dialog,
     style: Style,
     theme: Theme,
@@ -40,34 +41,68 @@ pub struct InlineAssistPopup {
 
 impl InlineAssistPopup {
     pub fn new(editor: &Editor, scope: impl Into<String>, state: InlineAssistPopupState) -> Self {
-        Self::new_avoiding_rows(editor, scope, state, None)
+        let local_anchor = editor.cursor_position();
+        let anchor = editor.render_cursor_position().unwrap_or(local_anchor);
+        let viewport_y_offset = anchor.1.saturating_sub(local_anchor.1);
+        Self::new_in_layout(
+            editor,
+            scope,
+            state,
+            OverlayLayout {
+                viewport: ScreenRect {
+                    x: 0,
+                    y: 0,
+                    width: editor.vwidth(),
+                    height: editor.vheight().saturating_add(viewport_y_offset),
+                },
+                anchor,
+                avoid_rows: None,
+            },
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_avoiding_rows(
         editor: &Editor,
         scope: impl Into<String>,
         state: InlineAssistPopupState,
         avoid_rows: Option<(usize, usize)>,
     ) -> Self {
+        let local_anchor = editor.cursor_position();
+        let anchor = editor.render_cursor_position().unwrap_or(local_anchor);
+        let viewport_y_offset = anchor.1.saturating_sub(local_anchor.1);
+        Self::new_in_layout(
+            editor,
+            scope,
+            state,
+            OverlayLayout {
+                viewport: ScreenRect {
+                    x: 0,
+                    y: 0,
+                    width: editor.vwidth(),
+                    height: editor.vheight().saturating_add(viewport_y_offset),
+                },
+                anchor,
+                avoid_rows,
+            },
+        )
+    }
+
+    pub(crate) fn new_in_layout(
+        editor: &Editor,
+        scope: impl Into<String>,
+        state: InlineAssistPopupState,
+        layout: OverlayLayout,
+    ) -> Self {
         let scope = scope.into();
         let initial = match &state {
             InlineAssistPopupState::Prompt { initial, .. } => initial.clone(),
             _ => String::new(),
         };
-        let local_anchor = editor.cursor_position();
-        let anchor = editor.render_cursor_position().unwrap_or(local_anchor);
-        let viewport_y_offset = anchor.1.saturating_sub(local_anchor.1);
-        let viewport_width = editor.vwidth();
-        let viewport_height = editor.vheight().saturating_add(viewport_y_offset);
-        let width = viewport_width.saturating_sub(2).clamp(1, MAX_WIDTH);
-        let (x, y, height) = Self::geometry(
-            anchor,
-            avoid_rows,
-            viewport_width,
-            viewport_height,
-            width,
-            Self::content_height(&state),
-        );
+        let prompt = PromptBuffer::new(&initial);
+        let width = Self::content_width(layout.viewport.width);
+        let desired_height = Self::content_height(&state, &prompt, width);
+        let (x, y, height) = Self::geometry(layout, width, desired_height);
         let style = editor.theme.ui_style.dialog.clone();
         let dialog = Dialog::new(
             Some(format!("Inline assist · {scope}")),
@@ -82,10 +117,8 @@ impl InlineAssistPopup {
         .with_surface_theme(&editor.theme, SurfaceRole::Dialog);
         Self {
             state,
-            prompt: PromptBuffer::new(&initial),
-            anchor,
-            viewport_y_offset,
-            avoid_rows,
+            prompt,
+            layout,
             dialog,
             style,
             theme: editor.theme.clone(),
@@ -93,35 +126,77 @@ impl InlineAssistPopup {
         }
     }
 
-    fn content_height(state: &InlineAssistPopupState) -> usize {
+    fn content_width(viewport_width: usize) -> usize {
+        viewport_width.saturating_sub(2).min(MAX_WIDTH)
+    }
+
+    fn prompt_width(width: usize) -> usize {
+        width.saturating_sub(2).max(1)
+    }
+
+    fn content_height(
+        state: &InlineAssistPopupState,
+        prompt: &PromptBuffer,
+        width: usize,
+    ) -> usize {
         match state {
-            InlineAssistPopupState::Prompt { .. } => 2,
+            InlineAssistPopupState::Prompt { .. } => {
+                wrap_text(&prompt.text(), Self::prompt_width(width))
+                    .rows
+                    .len()
+                    .clamp(1, MAX_PROMPT_ROWS)
+                    .saturating_add(1)
+            }
             InlineAssistPopupState::Working => 2,
             InlineAssistPopupState::Applied => 2,
-            InlineAssistPopupState::Failed(_) => 3,
+            InlineAssistPopupState::Failed(message) => wrap_text(message, width.max(1))
+                .rows
+                .len()
+                .clamp(1, MAX_ERROR_ROWS)
+                .saturating_add(2),
         }
     }
 
-    fn geometry(
-        anchor: (usize, usize),
-        avoid_rows: Option<(usize, usize)>,
-        viewport_width: usize,
-        viewport_height: usize,
-        width: usize,
-        height: usize,
-    ) -> (usize, usize, usize) {
-        avoid_rows.map_or_else(
-            || anchored_popup_geometry(anchor, viewport_width, viewport_height, width, height),
+    fn geometry(layout: OverlayLayout, width: usize, height: usize) -> (usize, usize, usize) {
+        let viewport = layout.viewport;
+        let anchor = (
+            layout
+                .anchor
+                .0
+                .saturating_sub(viewport.x)
+                .min(viewport.width.saturating_sub(1)),
+            layout
+                .anchor
+                .1
+                .saturating_sub(viewport.y)
+                .min(viewport.height.saturating_sub(1)),
+        );
+        let avoid_rows = layout.avoid_rows.and_then(|(start, end)| {
+            let viewport_end = viewport.y.saturating_add(viewport.height.saturating_sub(1));
+            let start = start.max(viewport.y);
+            let end = end.min(viewport_end);
+            (start <= end).then_some((
+                start.saturating_sub(viewport.y),
+                end.saturating_sub(viewport.y),
+            ))
+        });
+        let (x, y, height) = avoid_rows.map_or_else(
+            || anchored_popup_geometry(anchor, viewport.width, viewport.height, width, height),
             |avoid_rows| {
                 anchored_popup_geometry_avoiding_rows(
                     anchor,
                     avoid_rows,
-                    viewport_width,
-                    viewport_height,
+                    viewport.width,
+                    viewport.height,
                     width,
                     height,
                 )
             },
+        );
+        (
+            viewport.x.saturating_add(x),
+            viewport.y.saturating_add(y),
+            height,
         )
     }
 
@@ -133,21 +208,23 @@ impl InlineAssistPopup {
         Some(KeyAction::Single(Action::Refresh))
     }
 
-    fn reflow(&mut self, viewport_width: usize, viewport_height: usize) {
-        let viewport_height = viewport_height.saturating_add(self.viewport_y_offset);
-        let width = viewport_width.saturating_sub(2).clamp(1, MAX_WIDTH);
-        let (x, y, height) = Self::geometry(
-            self.anchor,
-            self.avoid_rows,
-            viewport_width,
-            viewport_height,
-            width,
-            Self::content_height(&self.state),
-        );
+    fn reflow(&mut self) {
+        let width = Self::content_width(self.layout.viewport.width);
+        let desired_height = Self::content_height(&self.state, &self.prompt, width);
+        let (x, y, height) = Self::geometry(self.layout, width, desired_height);
         self.dialog.x = x;
         self.dialog.y = y;
         self.dialog.width = width;
         self.dialog.height = height;
+    }
+
+    fn prompt_changed(&mut self) -> Option<KeyAction> {
+        self.reflow();
+        Self::refresh_action()
+    }
+
+    fn wrapped_prompt(&self) -> super::agent_composer::WrappedText {
+        wrap_text(&self.prompt.text(), Self::prompt_width(self.dialog.width))
     }
 
     fn inside(&self, column: usize, row: usize) -> bool {
@@ -176,57 +253,101 @@ impl Component for InlineAssistPopup {
         let width = self.dialog.width;
         match &self.state {
             InlineAssistPopupState::Prompt { .. } => {
-                let value = self.prompt.text();
-                let visible = truncate_display_width(&format!("> {value}"), width);
-                buffer.set_text(x, y, &visible, &self.style);
-                buffer.set_text(
-                    x,
-                    y.saturating_add(1),
-                    &truncate_display_width("Enter apply · Esc cancel", width),
-                    &self.theme.ui_style.muted,
-                );
+                let show_help = self.dialog.height > 1;
+                let body_height = self.dialog.height.saturating_sub(usize::from(show_help));
+                if body_height > 0 {
+                    let wrapped = self.wrapped_prompt();
+                    let cursor_row = wrapped
+                        .positions
+                        .get(self.prompt.cursor())
+                        .map_or(0, |position| position.0);
+                    let scroll = cursor_row.saturating_sub(body_height.saturating_sub(1));
+                    for (offset, row) in wrapped
+                        .rows
+                        .iter()
+                        .skip(scroll)
+                        .take(body_height)
+                        .enumerate()
+                    {
+                        let marker = if scroll.saturating_add(offset) == 0 {
+                            ">"
+                        } else {
+                            "│"
+                        };
+                        buffer.set_text(x, y.saturating_add(offset), marker, &self.style);
+                        buffer.set_text(
+                            x.saturating_add(2),
+                            y.saturating_add(offset),
+                            row,
+                            &self.style,
+                        );
+                    }
+                }
+                if show_help {
+                    buffer.set_text(
+                        x,
+                        y.saturating_add(self.dialog.height.saturating_sub(1)),
+                        &truncate_display_width("Enter apply · Esc cancel", width),
+                        &self.theme.ui_style.muted,
+                    );
+                }
             }
             InlineAssistPopupState::Working => {
                 let message = format!(
                     "{} Generating bounded replacement…",
                     spinner_frame(self.spinner_tick as u64 * SPINNER_FRAME_INTERVAL_MS)
                 );
-                buffer.set_text(x, y, &truncate_display_width(&message, width), &self.style);
-                buffer.set_text(
-                    x,
-                    y.saturating_add(1),
-                    &truncate_display_width("Esc cancel", width),
-                    &self.theme.ui_style.muted,
-                );
+                if self.dialog.height > 0 {
+                    buffer.set_text(x, y, &truncate_display_width(&message, width), &self.style);
+                }
+                if self.dialog.height > 1 {
+                    buffer.set_text(
+                        x,
+                        y.saturating_add(1),
+                        &truncate_display_width("Esc cancel", width),
+                        &self.theme.ui_style.muted,
+                    );
+                }
             }
             InlineAssistPopupState::Applied => {
-                buffer.set_text(x, y, "Applied to buffer (unsaved)", &self.style);
-                buffer.set_text(
-                    x,
-                    y.saturating_add(1),
-                    &truncate_display_width("Enter keep · u undo · r refine · A agent", width),
-                    &self.theme.ui_style.muted,
-                );
+                if self.dialog.height > 0 {
+                    buffer.set_text(x, y, "Applied to buffer (unsaved)", &self.style);
+                }
+                if self.dialog.height > 1 {
+                    buffer.set_text(
+                        x,
+                        y.saturating_add(1),
+                        &truncate_display_width("Enter keep · u undo · r refine · A agent", width),
+                        &self.theme.ui_style.muted,
+                    );
+                }
             }
             InlineAssistPopupState::Failed(message) => {
-                buffer.set_text(
-                    x,
-                    y,
-                    &truncate_display_width("Inline assist failed", width),
-                    &self.style,
-                );
-                buffer.set_text(
-                    x,
-                    y.saturating_add(1),
-                    &truncate_display_width(message, width),
-                    &self.style,
-                );
-                buffer.set_text(
-                    x,
-                    y.saturating_add(2),
-                    &truncate_display_width("r retry/refine · Esc close", width),
-                    &self.theme.ui_style.muted,
-                );
+                if self.dialog.height > 0 {
+                    buffer.set_text(
+                        x,
+                        y,
+                        &truncate_display_width("Inline assist failed", width),
+                        &self.style,
+                    );
+                }
+                let message_height = self.dialog.height.saturating_sub(2);
+                for (offset, row) in wrap_text(message, width.max(1))
+                    .rows
+                    .iter()
+                    .take(message_height)
+                    .enumerate()
+                {
+                    buffer.set_text(x, y.saturating_add(1 + offset), row, &self.style);
+                }
+                if self.dialog.height > 1 {
+                    buffer.set_text(
+                        x,
+                        y.saturating_add(self.dialog.height.saturating_sub(1)),
+                        &truncate_display_width("r retry/refine · Esc close", width),
+                        &self.theme.ui_style.muted,
+                    );
+                }
             }
         }
         Ok(())
@@ -243,7 +364,15 @@ impl Component for InlineAssistPopup {
     }
 
     fn resize(&mut self, viewport_width: usize, viewport_height: usize) -> bool {
-        self.reflow(viewport_width, viewport_height);
+        self.layout.viewport.width = viewport_width;
+        self.layout.viewport.height = viewport_height;
+        self.reflow();
+        true
+    }
+
+    fn update_overlay_layout(&mut self, layout: OverlayLayout) -> bool {
+        self.layout = layout;
+        self.reflow();
         true
     }
 
@@ -273,7 +402,7 @@ impl Component for InlineAssistPopup {
             InlineAssistPopupState::Prompt { refining, .. } => match event {
                 Event::Paste(text) => {
                     self.insert(text);
-                    Self::refresh_action()
+                    self.prompt_changed()
                 }
                 Event::Key(key) => match (key.code, key.modifiers) {
                     (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
@@ -308,17 +437,17 @@ impl Component for InlineAssistPopup {
                     }
                     (KeyCode::Backspace, _) => {
                         self.prompt.backspace();
-                        Self::refresh_action()
+                        self.prompt_changed()
                     }
                     (KeyCode::Delete, _) => {
                         self.prompt.delete();
-                        Self::refresh_action()
+                        self.prompt_changed()
                     }
                     (KeyCode::Char(character), modifiers)
                         if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                     {
                         self.insert(&character.to_string());
-                        Self::refresh_action()
+                        self.prompt_changed()
                     }
                     _ => None,
                 },
@@ -361,12 +490,37 @@ impl Component for InlineAssistPopup {
         if !matches!(self.state, InlineAssistPopupState::Prompt { .. }) {
             return None;
         }
-        let value = self.prompt.text();
-        let prefix = &value[..grapheme_to_byte(&value, self.prompt.cursor())];
-        let offset = display_width(prefix).min(self.dialog.width.saturating_sub(3));
+        let body_height = self
+            .dialog
+            .height
+            .saturating_sub(usize::from(self.dialog.height > 1));
+        if body_height == 0 {
+            return None;
+        }
+        let wrapped = self.wrapped_prompt();
+        let (row, column) = wrapped
+            .positions
+            .get(self.prompt.cursor())
+            .copied()
+            .unwrap_or_default();
+        let scroll = row.saturating_sub(body_height.saturating_sub(1));
         Some((
-            self.dialog.x.saturating_add(3 + offset),
-            self.dialog.y.saturating_add(1),
+            self.dialog.x.saturating_add(3).saturating_add(column).min(
+                self.layout
+                    .viewport
+                    .x
+                    .saturating_add(self.layout.viewport.width.saturating_sub(1)),
+            ),
+            self.dialog
+                .y
+                .saturating_add(1)
+                .saturating_add(row.saturating_sub(scroll))
+                .min(
+                    self.layout
+                        .viewport
+                        .y
+                        .saturating_add(self.layout.viewport.height.saturating_sub(1)),
+                ),
         ))
     }
 
@@ -467,5 +621,113 @@ mod tests {
             .saturating_add(1);
 
         assert!(popup_last_row < avoid_rows.0 || popup.dialog.y > avoid_rows.1);
+    }
+
+    #[test]
+    fn prompt_soft_wraps_grows_and_stays_inside_its_window() {
+        let editor = editor();
+        let viewport = ScreenRect {
+            x: 30,
+            y: 2,
+            width: 30,
+            height: 12,
+        };
+        let avoid_rows = (7, 7);
+        let mut popup = InlineAssistPopup::new_in_layout(
+            &editor,
+            "line 8",
+            InlineAssistPopupState::Prompt {
+                initial: String::new(),
+                refining: false,
+            },
+            OverlayLayout {
+                viewport,
+                anchor: (40, 7),
+                avoid_rows: Some(avoid_rows),
+            },
+        );
+        let initial_height = popup.dialog.height;
+
+        popup.handle_event(&Event::Paste(format!(
+            "{}TAIL",
+            "expand this request ".repeat(12)
+        )));
+
+        let popup_last_column = popup
+            .dialog
+            .x
+            .saturating_add(popup.dialog.width)
+            .saturating_add(1);
+        let popup_last_row = popup
+            .dialog
+            .y
+            .saturating_add(popup.dialog.height)
+            .saturating_add(1);
+        assert!(popup.dialog.height > initial_height);
+        assert!(popup.dialog.height <= MAX_PROMPT_ROWS + 1);
+        assert!(popup.dialog.x >= viewport.x);
+        assert!(popup_last_column < viewport.x + viewport.width);
+        assert!(popup.dialog.y >= viewport.y);
+        assert!(popup_last_row < viewport.y + viewport.height);
+        assert!(popup_last_row < avoid_rows.0 || popup.dialog.y > avoid_rows.1);
+        let cursor = popup.cursor_position().unwrap();
+        assert!((viewport.x..viewport.x + viewport.width).contains(&cursor.0));
+        assert!((viewport.y..viewport.y + viewport.height).contains(&cursor.1));
+        let mut buffer = RenderBuffer::new(60, 14, &Style::default());
+        popup.draw(&mut buffer).unwrap();
+        let rendered = buffer.cells.iter().map(|cell| cell.c).collect::<String>();
+        assert!(rendered.contains("TAIL"));
+    }
+
+    #[test]
+    fn applied_popup_uses_the_owning_split_coordinates() {
+        let editor = editor();
+        let viewport = ScreenRect {
+            x: 42,
+            y: 1,
+            width: 18,
+            height: 10,
+        };
+        let mut popup = InlineAssistPopup::new_in_layout(
+            &editor,
+            "line 4",
+            InlineAssistPopupState::Applied,
+            OverlayLayout {
+                viewport,
+                anchor: (48, 4),
+                avoid_rows: Some((4, 4)),
+            },
+        );
+
+        assert!(popup.dialog.x >= viewport.x);
+        assert!(
+            popup
+                .dialog
+                .x
+                .saturating_add(popup.dialog.width)
+                .saturating_add(2)
+                <= viewport.x + viewport.width
+        );
+
+        let resized_viewport = ScreenRect {
+            x: 24,
+            y: 2,
+            width: 14,
+            height: 8,
+        };
+        assert!(popup.update_overlay_layout(OverlayLayout {
+            viewport: resized_viewport,
+            anchor: (28, 4),
+            avoid_rows: Some((4, 4)),
+        }));
+        assert!(popup.dialog.x >= resized_viewport.x);
+        assert!(
+            popup
+                .dialog
+                .x
+                .saturating_add(popup.dialog.width)
+                .saturating_add(2)
+                <= resized_viewport.x + resized_viewport.width
+        );
     }
 }

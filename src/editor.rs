@@ -115,8 +115,8 @@ use crate::{
     ui::{
         AgentComposer, CompletionUI, Component, Confirmation, DiagnosticInfo, FilePicker,
         HoverInfo, HoverInfoFormat, Info, InlineAssistPopup, InlineAssistPopupState, InputPrompt,
-        LegacyPickerOptions, Picker, PickerItem, PickerOptions, PickerPreview, PickerUpdate,
-        StatuslineLayoutPanel, WhatsNewPanel,
+        LegacyPickerOptions, OverlayLayout, Picker, PickerItem, PickerOptions, PickerPreview,
+        PickerUpdate, ScreenRect, StatuslineLayoutPanel, WhatsNewPanel,
     },
     undo::{AppliedTextEdit, CursorSnapshot, EditOrigin, RevertEdit, TextPosition, TextRange},
     utils::{expand_user_path, get_workspace_path},
@@ -2494,6 +2494,7 @@ struct LayoutCacheKey {
 #[derive(Debug)]
 struct InlineAssistSession {
     buffer_id: BufferId,
+    window_id: WindowId,
     expected_revision: u64,
     range: TextRange,
     expected_text: String,
@@ -4960,8 +4961,12 @@ impl Editor {
 
         let viewport_width = self.vwidth();
         let viewport_height = self.vheight();
+        let overlay_layout = self.inline_assist_overlay_layout();
         let dialog_resized = if let Some(dialog) = &mut self.current_dialog {
-            dialog.resize(viewport_width, viewport_height)
+            match overlay_layout {
+                Some(layout) => dialog.update_overlay_layout(layout),
+                None => dialog.resize(viewport_width, viewport_height),
+            }
         } else {
             false
         };
@@ -6835,11 +6840,52 @@ impl Editor {
         scope: impl Into<String>,
         state: InlineAssistPopupState,
     ) -> InlineAssistPopup {
-        let avoid_rows = self
-            .inline_assist
-            .as_ref()
-            .and_then(|assist| self.render_text_range_rows(assist.range));
-        InlineAssistPopup::new_avoiding_rows(self, scope, state, avoid_rows)
+        let scope = scope.into();
+        match self.inline_assist_overlay_layout() {
+            Some(layout) => InlineAssistPopup::new_in_layout(self, scope, state, layout),
+            None => InlineAssistPopup::new(self, scope, state),
+        }
+    }
+
+    fn inline_assist_overlay_layout(&self) -> Option<OverlayLayout> {
+        let assist = self.inline_assist.as_ref()?;
+        let window = self.window_manager.window(assist.window_id)?;
+        let buffer = self.buffer_manager.get(window.buffer_index)?;
+        if buffer.id() != assist.buffer_id {
+            return None;
+        }
+        let viewport = ScreenRect {
+            x: window.position.x,
+            y: window
+                .position
+                .y
+                .saturating_add(self.window_content_top(window)),
+            width: window.inner_width(),
+            height: self.window_content_height(window),
+        };
+        let avoid_rows = self.render_text_range_rows_in_window(assist.window_id, assist.range);
+        let anchor = buffer
+            .get(assist.range.start.line)
+            .and_then(|line| {
+                let grapheme =
+                    char_to_grapheme(line.trim_end_matches('\n'), assist.range.start.character);
+                self.buffer_to_window_coords(window, grapheme, assist.range.start.line)
+            })
+            .map(|(x, y)| {
+                (
+                    self.window_to_terminal_x(window, x),
+                    self.window_to_terminal_y(window, y),
+                )
+            })
+            .unwrap_or((
+                viewport.x.saturating_add(1),
+                avoid_rows.map_or(viewport.y, |rows| rows.0),
+            ));
+        Some(OverlayLayout {
+            viewport,
+            anchor,
+            avoid_rows,
+        })
     }
 
     async fn apply_inline_replacement(
@@ -6859,7 +6905,7 @@ impl Editor {
             !replacement.contains('\0'),
             "inline replacement contains binary data"
         );
-        let (buffer_id, expected_revision, range, expected_text) = {
+        let (buffer_id, window_id, expected_revision, range, expected_text) = {
             let assist = self
                 .inline_assist
                 .as_ref()
@@ -6870,6 +6916,7 @@ impl Editor {
             );
             (
                 assist.buffer_id,
+                assist.window_id,
                 assist.expected_revision,
                 assist.range,
                 assist.expected_text.clone(),
@@ -6878,6 +6925,10 @@ impl Editor {
         anyhow::ensure!(
             self.current_buffer().id() == buffer_id,
             "active buffer changed while inline assist was running"
+        );
+        anyhow::ensure!(
+            self.window_manager.active_stable_window_id() == Some(window_id),
+            "active window changed while inline assist was running"
         );
         anyhow::ensure!(
             self.current_buffer().revision() == expected_revision,
@@ -15444,10 +15495,17 @@ impl Editor {
                 add_to_history = false;
                 match self.inline_assist_target() {
                     Ok((range, scope)) => {
+                        let Some(window_id) = self.window_manager.active_stable_window_id() else {
+                            self.last_error =
+                                Some("inline assist requires an active editor window".to_string());
+                            self.draw_commandline(buffer);
+                            return Ok(false);
+                        };
                         let expected_text = self.current_buffer().text_in_range(range);
                         self.close_inline_assist_session();
                         self.inline_assist = Some(InlineAssistSession {
                             buffer_id: self.current_buffer().id(),
+                            window_id,
                             expected_revision: self.current_buffer().revision(),
                             range,
                             expected_text,
@@ -25266,13 +25324,44 @@ mod test {
         assert!(editor.inline_assist_target().is_err());
     }
 
+    #[test]
+    fn inline_assist_layout_remains_owned_by_the_initiating_split() {
+        let mut editor = inline_test_editor("alpha\nbeta\n");
+        editor.window_manager.split_vertical(0).unwrap();
+        editor.window_manager.set_active(1);
+        editor.sync_with_window();
+        let right_window = editor.window_manager.active_window().unwrap().clone();
+        let range = TextRange::new(TextPosition::new(0, 0), TextPosition::new(1, 0));
+        editor.inline_assist = Some(InlineAssistSession {
+            buffer_id: editor.current_buffer().id(),
+            window_id: right_window.id,
+            expected_revision: editor.current_buffer().revision(),
+            range,
+            expected_text: "alpha\n".to_string(),
+            scope: "line 1".to_string(),
+            request_id: None,
+            session_id: None,
+            transaction_id: None,
+        });
+
+        editor.window_manager.set_active(0);
+        editor.sync_with_window();
+        let layout = editor.inline_assist_overlay_layout().unwrap();
+
+        assert_eq!(layout.viewport.x, right_window.position.x);
+        assert_eq!(layout.viewport.width, right_window.inner_width());
+        assert!(layout.anchor.0 >= right_window.position.x);
+    }
+
     #[tokio::test]
     async fn inline_replacement_is_unsaved_attributed_and_undoable() {
         let mut editor = inline_test_editor("let x = 1;\nnext();\n");
         editor.test_disable_terminal_output();
         let range = TextRange::new(TextPosition::new(0, 0), TextPosition::new(1, 0));
+        let window_id = editor.window_manager.active_stable_window_id().unwrap();
         editor.inline_assist = Some(InlineAssistSession {
             buffer_id: editor.current_buffer().id(),
+            window_id,
             expected_revision: editor.current_buffer().revision(),
             range,
             expected_text: "let x = 1;\n".to_string(),
@@ -25324,8 +25413,10 @@ mod test {
         editor.test_disable_terminal_output();
         let range = TextRange::new(TextPosition::new(0, 0), TextPosition::new(1, 0));
         let revision = editor.current_buffer().revision();
+        let window_id = editor.window_manager.active_stable_window_id().unwrap();
         editor.inline_assist = Some(InlineAssistSession {
             buffer_id: editor.current_buffer().id(),
+            window_id,
             expected_revision: revision,
             range,
             expected_text: "old\n".to_string(),
