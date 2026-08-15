@@ -8,6 +8,12 @@
       "migration_note": "docs/PLUGIN_API.md#agent-composer"
     },
     {
+      "version": "0.9.0",
+      "kind": "introduced",
+      "symbols": ["OpenConfirm.options", "UpdateOverlayBusy"],
+      "migration_note": "docs/PLUGIN_API.md#rich-confirmations-and-busy-overlays"
+    },
+    {
       "version": "0.8.0",
       "kind": "introduced",
       "symbols": ["OpenScratchBuffer.commands"],

@@ -293,6 +293,17 @@ struct GitPluginState {
     row_action_process: String,
     row_action_error: String,
     safe_sync_pending: bool,
+    push_preview_process: String,
+    push_preview_stage: String,
+    push_preview_output: String,
+    push_preview_error: String,
+    push_remote: String,
+    push_target: String,
+    push_args: [String],
+    push_count: i32,
+    push_process: String,
+    push_error: String,
+    push_done_timer: String,
     confirm_mode: String,
     confirm_args: [String],
     pending_commit_message: String,
@@ -396,6 +407,17 @@ fn initial_state() -> GitPluginState {
         row_action_process: "",
         row_action_error: "",
         safe_sync_pending: false,
+        push_preview_process: "",
+        push_preview_stage: "",
+        push_preview_output: "",
+        push_preview_error: "",
+        push_remote: "",
+        push_target: "",
+        push_args: [],
+        push_count: 0,
+        push_process: "",
+        push_error: "",
+        push_done_timer: "",
         confirm_mode: "",
         confirm_args: [],
         pending_commit_message: "",
@@ -507,6 +529,11 @@ fn schedule_refresh(event: EmptyEvent) {
 
 #[red::on("timeout:callback")]
 fn timeout_callback(event: TimerEvent) {
+    if event.timer_id == plugin_state().push_done_timer {
+        red::state_patch(GitPluginState { push_done_timer: "" });
+        red::execute("RemoveOverlay", "git-push-progress");
+        return;
+    }
     if event.timer_id == plugin_state().detail_timer {
         red::state_patch(GitPluginState { detail_timer: "" });
         let row = plugin_state().pending_detail_row;
@@ -1811,12 +1838,255 @@ fn safe_sync_after_refresh() {
 }
 
 fn push_menu() {
+    if red::string(plugin_state().push_preview_process, "") != "" {
+        red::execute("Print", "Preparing push details…");
+        return;
+    }
+    if red::string(plugin_state().push_process, "") != "" {
+        red::execute("Print", "A Git push is already in progress");
+        return;
+    }
     let state = plugin_state().state;
     if red::string(state.upstream, "") != "" {
-        run_simple_git(["push"]);
+        if red::int(state.ahead, 0) <= 0 {
+            red::execute("Print", "Already up to date with " + state.upstream);
+            return;
+        }
+        begin_push_log_preview("", state.upstream, ["push"], red::int(state.ahead, 0));
     } else {
         open_choices("push-remote", "Set upstream", ["origin", "Cancel"]);
     }
+}
+
+fn begin_push_remote_preview(remote: String) {
+    let state = plugin_state().state;
+    let head = red::string(state.head, "");
+    if head == "" {
+        red::execute("Print", "Cannot push a detached HEAD");
+        return;
+    }
+    red::state_patch(GitPluginState { push_remote: remote });
+    red::state_patch(GitPluginState { push_target: remote + "/" + head });
+    red::state_patch(GitPluginState { push_args: ["push", "--set-upstream", remote, head] });
+    spawn_push_preview("count", ["rev-list", "--count", "HEAD", "--not", "--remotes=" + remote]);
+}
+
+fn begin_push_log_preview(remote: String, target: String, args: [String], count: i32) {
+    red::state_patch(GitPluginState { push_remote: remote });
+    red::state_patch(GitPluginState { push_target: target });
+    red::state_patch(GitPluginState { push_args: args });
+    red::state_patch(GitPluginState { push_count: count });
+    let revision = target + "..HEAD";
+    if remote != "" {
+        revision = "HEAD";
+    }
+    let log_args = ["log", "--format=%h%x09%s", "--max-count=9", revision];
+    if remote != "" {
+        log_args = red::push(log_args, "--not");
+        log_args = red::push(log_args, "--remotes=" + remote);
+    }
+    spawn_push_preview("log", log_args);
+}
+
+fn spawn_push_preview(stage: String, args: [String]) {
+    red::state_patch(GitPluginState { push_preview_stage: stage });
+    red::state_patch(GitPluginState { push_preview_output: "" });
+    red::state_patch(GitPluginState { push_preview_error: "" });
+    let process_id = red::execute("SpawnProcess", Process {
+        command: "git",
+        args: args,
+        cwd: red::string(plugin_state().root, "."),
+        env: Json { GIT_PAGER: "cat", LC_ALL: "C" },
+        raw_output: true,
+    });
+    red::state_patch(GitPluginState { push_preview_process: process_id });
+    red::on("process:" + process_id, push_preview_event);
+}
+
+fn push_preview_event(event: ProcessEvent) {
+    match event {
+        ProcessEvent::Stdout { process_id, line, plugin_name } => {
+            if process_id == plugin_state().push_preview_process {
+                red::state_patch(GitPluginState {
+                    push_preview_output: plugin_state().push_preview_output + line,
+                });
+            }
+        }
+        ProcessEvent::Stderr { process_id, line, plugin_name } => {
+            if process_id == plugin_state().push_preview_process {
+                red::state_patch(GitPluginState {
+                    push_preview_error: plugin_state().push_preview_error + line,
+                });
+            }
+        }
+        ProcessEvent::Error { process_id, message, plugin_name } => {
+            fail_push_preview(process_id, message);
+        }
+        ProcessEvent::Exit { process_id, code, plugin_name } => {
+            if process_id != plugin_state().push_preview_process { return; }
+            let exit_code = 1;
+            if let Some(value) = code { exit_code = value; }
+            if exit_code != 0 {
+                fail_push_preview(process_id, "git exited with code " + exit_code);
+                return;
+            }
+            let stage = red::string(plugin_state().push_preview_stage, "");
+            let output = red::string(plugin_state().push_preview_output, "");
+            red::state_patch(GitPluginState { push_preview_process: "" });
+            if stage == "count" {
+                let count = red::int(red::trim(output), 0);
+                if count <= 0 {
+                    red::execute("Print", "Nothing to push to " + plugin_state().push_target);
+                    return;
+                }
+                begin_push_log_preview(
+                    red::string(plugin_state().push_remote, ""),
+                    red::string(plugin_state().push_target, ""),
+                    plugin_state().push_args,
+                    count
+                );
+            } else {
+                show_push_confirmation(output);
+            }
+        }
+    }
+}
+
+fn fail_push_preview(process_id: String, fallback: String) {
+    if process_id != plugin_state().push_preview_process { return; }
+    red::state_patch(GitPluginState { push_preview_process: "" });
+    let error = red::trim(red::string(plugin_state().push_preview_error, ""));
+    if error == "" { error = fallback; }
+    red::execute("Print", "Could not prepare push: " + bounded_push_error(error));
+}
+
+fn show_push_confirmation(output: String) {
+    let state = plugin_state().state;
+    let target = red::string(plugin_state().push_target, "");
+    let count = red::int(plugin_state().push_count, 0);
+    let rows = [];
+    rows = red::push(rows, [
+        Json { text: red::string(state.head, "HEAD"), style: branch_style() },
+        Json { text: "  →  ", style: muted_style() },
+        Json { text: target, style: heading_style() },
+    ]);
+    rows = red::push(rows, [Json {
+        text: count + if count == 1 { " outgoing commit" } else { " outgoing commits" },
+        style: success_style(),
+    }]);
+    if red::int(state.behind, 0) > 0 && red::string(state.upstream, "") != "" {
+        rows = red::push(rows, [Json {
+            text: "Remote is also ahead by " + state.behind + "; the push may be rejected.",
+            style: warning_style(),
+        }]);
+    }
+    rows = red::push(rows, [Json { text: "", style: normal_style() }]);
+    let shown = 0;
+    for line in red::split(output, "\n") {
+        if red::trim(line) != "" && shown < 8 {
+            let fields = red::split(red::trim(line), "\t");
+            let subject = "";
+            if red::len(fields) > 1 { subject = fields[1]; }
+            rows = red::push(rows, [
+                Json { text: fields[0] + "  ", style: muted_style() },
+                Json { text: subject, style: normal_style() },
+            ]);
+            shown = shown + 1;
+        }
+    }
+    if count > shown {
+        rows = red::push(rows, [Json {
+            text: "… and " + (count - shown) + " more",
+            style: muted_style(),
+        }]);
+    }
+    red::execute("OpenConfirm", "Push changes", "Review the outgoing commits before pushing.", PickerHandlers {
+        selected: push_confirmed,
+    }, Json {
+        accept_label: "Push",
+        cancel_label: "Cancel",
+        rows: rows,
+    });
+}
+
+fn push_confirmed(item: PickerItem) {
+    if item.id != "accept" { return; }
+    let done_timer = red::string(plugin_state().push_done_timer, "");
+    if done_timer != "" {
+        red::execute("CancelTimeout", done_timer);
+        red::state_patch(GitPluginState { push_done_timer: "" });
+    }
+    let args = plugin_state().push_args;
+    let target = red::string(plugin_state().push_target, "remote");
+    let count = red::int(plugin_state().push_count, 0);
+    let commit_label = if count == 1 { "commit" } else { "commits" };
+    record_command(args);
+    red::execute("CreateOverlay", "git-push-progress", OverlayConfig {
+        align: "bottom",
+        x_padding: 1,
+        y_padding: 0,
+        relative: "editor",
+    });
+    red::execute("UpdateOverlay", "git-push-progress", [("Pushing " + count + " " + commit_label + " to " + target + "…", heading_style())]);
+    red::execute("UpdateOverlayBusy", "git-push-progress", true);
+    red::state_patch(GitPluginState { push_error: "" });
+    let process_id = red::execute("SpawnProcess", Process {
+        command: "git",
+        args: args,
+        cwd: red::string(plugin_state().root, "."),
+        env: Json { LC_ALL: "C" },
+    });
+    red::state_patch(GitPluginState { push_process: process_id });
+    red::on("process:" + process_id, push_event);
+}
+
+fn push_event(event: ProcessEvent) {
+    match event {
+        ProcessEvent::Stderr { process_id, line, plugin_name } => {
+            if process_id == plugin_state().push_process {
+                red::state_patch(GitPluginState { push_error: plugin_state().push_error + line });
+            }
+        }
+        ProcessEvent::Error { process_id, message, plugin_name } => {
+            finish_push(process_id, false, message);
+        }
+        ProcessEvent::Exit { process_id, code, plugin_name } => {
+            if process_id != plugin_state().push_process { return; }
+            let exit_code = 1;
+            if let Some(value) = code { exit_code = value; }
+            finish_push(process_id, exit_code == 0, "git push exited with code " + exit_code);
+        }
+        ProcessEvent::Stdout { process_id, line, plugin_name } => {}
+    }
+}
+
+fn finish_push(process_id: String, succeeded: bool, fallback: String) {
+    if process_id != plugin_state().push_process { return; }
+    red::state_patch(GitPluginState { push_process: "" });
+    red::execute("UpdateOverlayBusy", "git-push-progress", false);
+    let target = red::string(plugin_state().push_target, "remote");
+    if succeeded {
+        let count = red::int(plugin_state().push_count, 0);
+        let commit_label = if count == 1 { "commit" } else { "commits" };
+        let message = "✓ Pushed " + count + " " + commit_label + " to " + target;
+        red::execute("UpdateOverlay", "git-push-progress", [(message, success_style())]);
+        red::execute("Print", message);
+        red::state_patch(GitPluginState { push_done_timer: red::execute("SetTimeout", 2500) });
+        force_refresh();
+    } else {
+        let error = red::trim(red::string(plugin_state().push_error, ""));
+        if error == "" { error = fallback; }
+        let message = "Push failed: " + bounded_push_error(error);
+        red::execute("UpdateOverlay", "git-push-progress", [(message, warning_style())]);
+        red::execute("Print", message);
+        red::state_patch(GitPluginState { push_done_timer: red::execute("SetTimeout", 5000) });
+    }
+}
+
+fn bounded_push_error(error: String) -> String {
+    let compact = red::trim(red::split(error, "\n")[0]);
+    if red::len(compact) <= 240 { return compact; }
+    return red::slice(compact, 0, 237) + "…";
 }
 
 fn help_menu() {
@@ -2313,7 +2583,7 @@ fn menu_selected(item: PickerItem) {
     } else if kind == "operation-menu" {
         operation_item_selected(value);
     } else if kind == "push-remote" {
-        run_simple_git(["push", "--set-upstream", value, red::string(plugin_state().state.head, "")]);
+        begin_push_remote_preview(value);
     } else if kind == "log-select" || kind == "log-action" {
         log_item_selected(kind, item, value);
     } else if kind == "rebase-choice" {
@@ -3273,11 +3543,25 @@ fn deactivate() {
     if poll_timer != "" {
         red::execute("CancelTimeout", poll_timer);
     }
+    let push_done_timer = red::string(plugin_state().push_done_timer, "");
+    if push_done_timer != "" {
+        red::execute("CancelTimeout", push_done_timer);
+    }
+    let push_preview_process = red::string(plugin_state().push_preview_process, "");
+    if push_preview_process != "" {
+        red::execute("KillProcess", push_preview_process);
+    }
+    let push_process = red::string(plugin_state().push_process, "");
+    if push_process != "" {
+        red::execute("KillProcess", push_process);
+    }
     red::state_patch(GitPluginState { refresh_timer: "" });
     red::state_patch(GitPluginState { poll_timer: "" });
+    red::state_patch(GitPluginState { push_done_timer: "" });
     if red::string(plugin_state().watch_path, "") != "" {
         red::execute("UnwatchDirectory", 1502);
     }
     red::execute("ClearGutterSigns", "git-signs");
     red::execute("CloseWorkspace", "git-dashboard");
+    red::execute("RemoveOverlay", "git-push-progress");
 }

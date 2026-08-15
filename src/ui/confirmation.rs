@@ -1,6 +1,7 @@
 //! Compact, reusable Accept/Cancel confirmation dialog.
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
@@ -19,6 +20,22 @@ use super::{
 
 const BUTTON_GAP: usize = 2;
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConfirmationOptions {
+    pub accept_label: Option<String>,
+    pub cancel_label: Option<String>,
+    pub rows: Vec<Vec<ConfirmationSegment>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmationSegment {
+    pub text: String,
+    #[serde(default)]
+    pub style: Style,
+}
+
 enum ConfirmationTarget {
     Callback(PickerHandle),
     Actions {
@@ -31,6 +48,7 @@ enum ConfirmationTarget {
 pub struct Confirmation {
     dialog: Dialog,
     message: String,
+    rows: Vec<Vec<ConfirmationSegment>>,
     accept_selected: bool,
     target: ConfirmationTarget,
     accept_label: String,
@@ -48,13 +66,33 @@ impl Confirmation {
         message: impl Into<String>,
         callback_handle: PickerHandle,
     ) -> Self {
+        Self::new_callback_with_options(
+            editor,
+            title,
+            message,
+            callback_handle,
+            ConfirmationOptions::default(),
+        )
+    }
+
+    pub fn new_callback_with_options(
+        editor: &Editor,
+        title: impl Into<String>,
+        message: impl Into<String>,
+        callback_handle: PickerHandle,
+        options: ConfirmationOptions,
+    ) -> Self {
+        let accept_label = options.accept_label.as_deref().unwrap_or("Accept");
+        let cancel_label = options.cancel_label.as_deref().unwrap_or("Cancel");
+        let multiline = !options.rows.is_empty();
         Self::with_target(
             editor,
             title.into(),
             message.into(),
-            "Accept",
-            "Cancel",
-            false,
+            accept_label,
+            cancel_label,
+            multiline,
+            options.rows,
             ConfirmationTarget::Callback(callback_handle),
         )
     }
@@ -78,6 +116,7 @@ impl Confirmation {
             &accept_label,
             &cancel_label,
             true,
+            Vec::new(),
             ConfirmationTarget::Actions {
                 accept: Box::new(accept),
                 cancel: Box::new(cancel),
@@ -93,6 +132,7 @@ impl Confirmation {
         accept_label: &str,
         cancel_label: &str,
         multiline: bool,
+        rows: Vec<Vec<ConfirmationSegment>>,
         target: ConfirmationTarget,
     ) -> Self {
         let style = editor.theme.ui_style.dialog.clone();
@@ -105,6 +145,7 @@ impl Confirmation {
             &accept_label,
             &cancel_label,
             multiline,
+            &rows,
         );
         let x = editor.vwidth().saturating_sub(width + 2) / 2;
         let y = editor.vheight().saturating_sub(height + 2) / 2;
@@ -121,6 +162,7 @@ impl Confirmation {
             )
             .with_surface_theme(&editor.theme, SurfaceRole::Dialog),
             message,
+            rows,
             accept_selected: false,
             target,
             accept_label,
@@ -167,12 +209,26 @@ impl Confirmation {
         }
     }
 
-    fn body_rows(&self) -> Vec<String> {
-        if self.multiline {
-            wrap_text(&self.message, self.dialog.width).rows
+    fn body_rows(&self) -> Vec<Vec<ConfirmationSegment>> {
+        let mut rows = if self.multiline {
+            wrap_text(&self.message, self.dialog.width)
+                .rows
+                .into_iter()
+                .map(|text| {
+                    vec![ConfirmationSegment {
+                        text,
+                        style: self.style.clone(),
+                    }]
+                })
+                .collect()
         } else {
-            vec![truncate_display_width(&self.message, self.dialog.width)]
-        }
+            vec![vec![ConfirmationSegment {
+                text: truncate_display_width(&self.message, self.dialog.width),
+                style: self.style.clone(),
+            }]]
+        };
+        rows.extend(self.rows.clone());
+        rows
     }
 
     fn body_height(&self) -> usize {
@@ -206,6 +262,7 @@ impl Component for Confirmation {
             &self.accept_label,
             &self.cancel_label,
             self.multiline,
+            &self.rows,
         );
         self.dialog.x = viewport_width.saturating_sub(self.dialog.width + 2) / 2;
         self.dialog.y = viewport_height.saturating_sub(self.dialog.height + 2) / 2;
@@ -222,12 +279,21 @@ impl Component for Confirmation {
             .take(self.body_height())
             .enumerate()
         {
-            buffer.set_text(
-                self.dialog.x + 1,
-                self.dialog.y + 1 + offset,
-                row,
-                &self.style,
-            );
+            let mut x = self.dialog.x + 1;
+            let mut remaining = self.dialog.width;
+            for segment in row {
+                if remaining == 0 {
+                    break;
+                }
+                let text = truncate_display_width(&segment.text, remaining);
+                let width = display_width(&text);
+                let mut style = segment.style.clone();
+                style.fg = style.fg.or(self.style.fg);
+                style.bg = self.style.bg;
+                buffer.set_text(x, self.dialog.y + 1 + offset, &text, &style);
+                x = x.saturating_add(width);
+                remaining = remaining.saturating_sub(width);
+            }
         }
 
         let buttons_width =
@@ -301,14 +367,16 @@ fn confirmation_size(
     accept_label: &str,
     cancel_label: &str,
     multiline: bool,
+    rows: &[Vec<ConfirmationSegment>],
 ) -> (usize, usize) {
     let buttons_width = display_width(accept_label) + BUTTON_GAP + display_width(cancel_label);
-    let desired_width = message
-        .lines()
-        .map(display_width)
+    let message_width = message.lines().map(display_width).max().unwrap_or_default();
+    let rows_width = rows
+        .iter()
+        .map(|row| row.iter().map(|segment| display_width(&segment.text)).sum())
         .max()
-        .unwrap_or_default()
-        .max(buttons_width);
+        .unwrap_or_default();
+    let desired_width = message_width.max(rows_width).max(buttons_width);
     let max_width = if multiline { 76 } else { 60 };
     let width = desired_width
         .min(max_width)
@@ -317,7 +385,11 @@ fn confirmation_size(
     if !multiline {
         return (width, 2.min(viewport_height.saturating_sub(2)));
     }
-    let body_rows = wrap_text(message, width).rows.len().max(1);
+    let body_rows = wrap_text(message, width)
+        .rows
+        .len()
+        .max(1)
+        .saturating_add(rows.len());
     let height = body_rows
         .saturating_add(1)
         .min(viewport_height.saturating_sub(2))
@@ -330,7 +402,7 @@ mod tests {
     use crossterm::event::{KeyEvent, KeyModifiers};
 
     use super::*;
-    use crate::{buffer::Buffer, config::Config, lsp::LspManager};
+    use crate::{buffer::Buffer, color::Color, config::Config, lsp::LspManager};
 
     fn editor() -> Editor {
         let config = Config::default();
@@ -459,5 +531,49 @@ mod tests {
 
         confirmation.handle_event(&key(KeyCode::Down));
         assert_eq!(confirmation.scroll, 1);
+    }
+
+    #[test]
+    fn callback_confirmation_renders_structured_rows_and_custom_labels() {
+        let editor = editor();
+        let accent = Color::Rgb {
+            r: 24,
+            g: 180,
+            b: 90,
+        };
+        let confirmation = Confirmation::new_callback_with_options(
+            &editor,
+            "Push changes",
+            "Review outgoing commits.",
+            PickerHandle::from_raw(3),
+            ConfirmationOptions {
+                accept_label: Some("Push".to_string()),
+                cancel_label: Some("Back".to_string()),
+                rows: vec![vec![
+                    ConfirmationSegment {
+                        text: "main".to_string(),
+                        style: Style {
+                            fg: Some(accent),
+                            ..Style::default()
+                        },
+                    },
+                    ConfirmationSegment {
+                        text: " → origin/main".to_string(),
+                        style: Style::default(),
+                    },
+                ]],
+            },
+        );
+        let mut buffer = RenderBuffer::new(80, 20, &Style::default());
+
+        confirmation.draw(&mut buffer).unwrap();
+
+        assert_eq!(confirmation.accept_label, "[ Push ]");
+        assert_eq!(confirmation.cancel_label, "[ Back ]");
+        assert!(confirmation.dialog.height > 2);
+        assert!(buffer
+            .cells
+            .iter()
+            .any(|cell| cell.c == 'm' && cell.style.fg == Some(accent)));
     }
 }
