@@ -241,6 +241,18 @@ jobs:
           normalize_markdown generated-release-changes.md > normalized-generated-release-changes.md
           diff -u normalized-release-changes.md normalized-generated-release-changes.md
 
+      - name: Generate GitHub release notes
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5
+        with:
+          version: v2.13.1
+          config: cliff.release.toml
+          args: --current --github-repo ${{ github.repository }}
+          github_token: ${{ github.token }}
+        env:
+          OUTPUT: RELEASE_NOTES.md
+          GITHUB_REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ github.token }}
+
       - name: Generate checksums
         run: |
           set -euo pipefail
@@ -264,9 +276,7 @@ jobs:
             changelog_url="https://github.com/${{ github.repository }}/compare/${previous_tag}...${tag}"
           fi
 
-          {
-          cat release-changes.md
-          cat <<EOF
+          cat <<EOF >> RELEASE_NOTES.md
 
           ## Installation
 
@@ -304,7 +314,6 @@ jobs:
 
           ${changelog_url}
           EOF
-          } > RELEASE_NOTES.md
 
           {
             echo "tag_name=$tag"

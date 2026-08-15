@@ -233,6 +233,15 @@ jobs:
         env:
           OUTPUT: changelog-preview.md
 
+      - name: Validate GitHub release notes configuration
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5
+        with:
+          version: v2.13.1
+          config: cliff.release.toml
+          args: --unreleased
+        env:
+          OUTPUT: release-notes-preview.md
+
       - name: Read release PR version
         if: startsWith(github.head_ref, 'release/v')
         id: release

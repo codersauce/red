@@ -332,7 +332,7 @@ mod tests {
         let fallback = ReleaseNotes::from_changelog(CHANGELOG, "0.5.0", Some("0.3.0"));
         let payload = serde_json::json!({
             "tag_name": "v0.5.0",
-            "body": "## [0.5.0](https://example.test)\n\n### Features\n\n- Published improvement\n\n## Installation\n\nDo not show this.",
+            "body": "## What's Changed\n\n### Features\n\n- Published improvement by @contributor in #42\n\n## Contributors\n\n- @contributor in #42 (first-time contributor)\n\n## Installation\n\nDo not show this.",
             "html_url": "https://github.com/codersauce/red/releases/tag/v0.5.0",
             "published_at": "2026-08-13T21:03:28Z",
             "draft": false
@@ -346,8 +346,12 @@ mod tests {
         .unwrap();
 
         assert!(notes.markdown.contains("Published improvement"));
+        assert!(notes.markdown.contains("first-time contributor"));
         assert!(notes.markdown.contains("Previous thing"));
         assert!(!notes.markdown.contains("Do not show this"));
+        let highlights = notes.highlights_markdown();
+        assert!(highlights.contains("Published improvement"));
+        assert!(!highlights.contains("first-time contributor"));
         assert_eq!(notes.published_at.as_deref(), Some("Aug 13, 2026"));
     }
 
