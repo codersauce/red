@@ -98,6 +98,9 @@ pub struct SessionSnapshot {
     /// Current position in [`Self::jumps`].
     #[serde(default)]
     pub jump_index: usize,
+    /// Per-window jumplists in split-tree order.
+    #[serde(default)]
+    pub window_jumps: Vec<SessionWindowJumps>,
     /// Buffer-local marks.
     #[serde(default)]
     pub local_marks: Vec<SessionMark>,
@@ -173,6 +176,23 @@ pub struct SessionJump {
     pub x: usize,
     /// Zero-based line.
     pub y: usize,
+    /// Saved buffer index, which distinguishes unnamed buffers.
+    #[serde(default)]
+    pub buffer_index: Option<usize>,
+    /// Absolute Unicode scalar position used by edit-tracked jump entries.
+    #[serde(default)]
+    pub char_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// One window's durable jumplist state.
+pub struct SessionWindowJumps {
+    /// Window position in split-tree traversal order.
+    pub window_index: usize,
+    /// Jump destinations in traversal order.
+    pub jumps: Vec<SessionJump>,
+    /// Current position in [`Self::jumps`].
+    pub jump_index: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2289,6 +2309,7 @@ mod tests {
             registers: HashMap::new(),
             jumps: Vec::new(),
             jump_index: 0,
+            window_jumps: Vec::new(),
             local_marks: Vec::new(),
             global_marks: Vec::new(),
             special_marks: Vec::new(),

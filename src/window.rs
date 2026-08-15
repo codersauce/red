@@ -9,7 +9,11 @@
 //! columns. Buffer mutation and cursor validity remain editor responsibilities; this
 //! module only owns per-window presentation and split topology.
 
-use crate::editor::{CursorGoal, Point};
+use crate::{
+    buffer::BufferId,
+    editor::{CursorGoal, Point},
+    undo::TextPosition,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -158,6 +162,24 @@ pub struct Window {
 
     /// X offset of the viewport (for horizontal positioning)
     pub vx: usize,
+
+    /// Cursor locations remembered for CTRL-O/CTRL-I navigation in this window.
+    pub(crate) jump_list: Box<JumpList>,
+}
+
+/// One edit-tracked destination in a window's jumplist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JumpEntry {
+    pub(crate) buffer_id: BufferId,
+    pub(crate) char_index: usize,
+    pub(crate) fallback: TextPosition,
+}
+
+/// Window-local jumplist and its current traversal position.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct JumpList {
+    pub(crate) entries: Vec<JumpEntry>,
+    pub(crate) index: usize,
 }
 
 impl Window {
@@ -186,6 +208,7 @@ impl Window {
             cursor_goal: CursorGoal::default(),
             active: false,
             vx: 0,
+            jump_list: Box::default(),
         }
     }
 
@@ -962,13 +985,13 @@ impl Split {
     }
 
     /// Removes a leaf without recreating windows or changing surviving split ratios.
-    fn detach_window(self, target_id: WindowId) -> Result<(Option<Self>, Window), Self> {
+    fn detach_window(self, target_id: WindowId) -> Result<(Option<Self>, Window), Box<Self>> {
         match self {
             Self::Window(window) => {
                 if window.id == target_id {
                     Ok((None, window))
                 } else {
-                    Err(Self::Window(window))
+                    Err(Box::new(Self::Window(window)))
                 }
             }
             Self::Horizontal { top, bottom, ratio } => match (*top).detach_window(target_id) {
@@ -984,18 +1007,14 @@ impl Split {
                 Err(top) => match (*bottom).detach_window(target_id) {
                     Ok((Some(bottom), window)) => Ok((
                         Some(Self::Horizontal {
-                            top: Box::new(top),
+                            top,
                             bottom: Box::new(bottom),
                             ratio,
                         }),
                         window,
                     )),
-                    Ok((None, window)) => Ok((Some(top), window)),
-                    Err(bottom) => Err(Self::Horizontal {
-                        top: Box::new(top),
-                        bottom: Box::new(bottom),
-                        ratio,
-                    }),
+                    Ok((None, window)) => Ok((Some(*top), window)),
+                    Err(bottom) => Err(Box::new(Self::Horizontal { top, bottom, ratio })),
                 },
             },
             Self::Vertical { left, right, ratio } => match (*left).detach_window(target_id) {
@@ -1011,18 +1030,14 @@ impl Split {
                 Err(left) => match (*right).detach_window(target_id) {
                     Ok((Some(right), window)) => Ok((
                         Some(Self::Vertical {
-                            left: Box::new(left),
+                            left,
                             right: Box::new(right),
                             ratio,
                         }),
                         window,
                     )),
-                    Ok((None, window)) => Ok((Some(left), window)),
-                    Err(right) => Err(Self::Vertical {
-                        left: Box::new(left),
-                        right: Box::new(right),
-                        ratio,
-                    }),
+                    Ok((None, window)) => Ok((Some(*left), window)),
+                    Err(right) => Err(Box::new(Self::Vertical { left, right, ratio })),
                 },
             },
         }
@@ -1755,7 +1770,7 @@ impl WindowManager {
                 return None;
             }
             Err(root) => {
-                self.root = root;
+                self.root = *root;
                 return None;
             }
         };
@@ -2446,6 +2461,7 @@ impl WindowManager {
                     );
                     new_window.active = false;
                     new_window.wrap = window.wrap;
+                    new_window.jump_list = window.jump_list.clone();
 
                     let mut old_window = window.clone();
                     old_window.active = false;
