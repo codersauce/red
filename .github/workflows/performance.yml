@@ -1,0 +1,50 @@
+name: Performance
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - '.github/workflows/performance.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/husk*/**'
+      - 'examples/husk_cursor_bench.rs'
+      - 'plugins/indent_guides.hk'
+      - 'src/plugin/**'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - '.github/workflows/performance.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/husk*/**'
+      - 'examples/husk_cursor_bench.rs'
+      - 'plugins/indent_guides.hk'
+      - 'src/plugin/**'
+  schedule:
+    - cron: '47 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  perf:
+    name: Deterministic performance gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check bundled Husk callback budget
+        run: cargo run --locked --release --example husk_cursor_bench -- --assert
