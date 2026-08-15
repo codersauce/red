@@ -403,6 +403,7 @@ Esc = { EnterMode = "Normal" }
 
 [keys.visual]
 Esc = { EnterMode = "Normal" }
+":" = { EnterMode = "Command" }
 "y" = [ "Yank", { EnterMode = "Normal" } ]
 "x" = [ "Delete", { EnterMode = "Normal" } ]
 "c" = "ChangeSelection"

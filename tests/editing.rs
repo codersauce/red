@@ -1233,6 +1233,56 @@ async fn substitute_supports_current_whole_numeric_and_visual_ranges() {
 }
 
 #[tokio::test]
+async fn visual_colon_prefills_last_visual_range_and_can_be_cancelled() {
+    for mode in [Mode::Visual, Mode::VisualLine, Mode::VisualBlock] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, "one\ntwo\nthree".to_string()),
+            default_key_config(),
+        );
+        harness
+            .execute_action(Action::EnterMode(mode))
+            .await
+            .unwrap();
+        harness.execute_action(Action::MoveDown).await.unwrap();
+
+        command_key(&mut harness, KeyCode::Char(':')).await;
+
+        harness.assert_mode(Mode::Command);
+        assert_eq!(harness.commandline_text(), "'<,'>");
+
+        command_key(&mut harness, KeyCode::Backspace).await;
+        assert_eq!(harness.commandline_text(), "'<,'");
+        command_key(&mut harness, KeyCode::Esc).await;
+        harness.assert_mode(Mode::Normal);
+        assert_eq!(harness.commandline_text(), "");
+    }
+}
+
+#[tokio::test]
+async fn visual_colon_substitute_is_line_scoped_for_every_visual_mode() {
+    for mode in [Mode::Visual, Mode::VisualLine, Mode::VisualBlock] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, "foo foo\nFoo foo\nfoo foo".to_string()),
+            default_key_config(),
+        );
+        harness
+            .execute_action(Action::EnterMode(mode))
+            .await
+            .unwrap();
+        harness.execute_action(Action::MoveDown).await.unwrap();
+
+        command_key(&mut harness, KeyCode::Char(':')).await;
+        type_normal_keys(&mut harness, "s/foo/bar/gi").await;
+        command_key(&mut harness, KeyCode::Enter).await;
+
+        harness.assert_mode(Mode::Normal);
+        harness.assert_buffer_contents("bar bar\nbar bar\nfoo foo");
+        harness.execute_action(Action::Undo).await.unwrap();
+        harness.assert_buffer_contents("foo foo\nFoo foo\nfoo foo");
+    }
+}
+
+#[tokio::test]
 async fn confirmed_substitute_tracks_each_match_and_is_one_undo_transaction() {
     let mut harness = EditorHarness::with_content("foo foo\nalpha beta\nfoo gamma");
     harness
@@ -3850,6 +3900,55 @@ async fn join_ex_command_supports_count_and_bang() {
 
         harness.assert_buffer_contents(expected);
     }
+}
+
+#[tokio::test]
+async fn join_ex_command_supports_numeric_and_visual_ranges() {
+    for (contents, command, expected) in [
+        ("one\ntwo\nthree\nfour", "2join", "one\ntwo three\nfour"),
+        (
+            "one\ntwo\n  three\nfour",
+            "2,3join!",
+            "one\ntwo  three\nfour",
+        ),
+        ("one\n  two\nthree", "%join", "one two three"),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        harness
+            .execute_action(Action::Command(command.to_string()))
+            .await
+            .unwrap();
+
+        harness.assert_buffer_contents(expected);
+    }
+
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "one\n  two\nthree".to_string()),
+        default_key_config(),
+    );
+    type_normal_keys(&mut harness, "Vj:join").await;
+    command_key(&mut harness, KeyCode::Enter).await;
+    harness.assert_buffer_contents("one two\nthree");
+}
+
+#[tokio::test]
+async fn unsupported_ranged_command_reports_a_specific_error() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "one\ntwo".to_string()),
+        default_key_config(),
+    );
+    type_normal_keys(&mut harness, "Vj:w").await;
+    command_key(&mut harness, KeyCode::Enter).await;
+
+    assert_eq!(
+        harness.last_error(),
+        Some("command \"w\" does not support a line range")
+    );
+    harness.assert_buffer_contents("one\ntwo");
 }
 
 #[tokio::test]
