@@ -1147,6 +1147,13 @@ impl Editor {
         // and overlays so prompts and transient menus stay interactive.
         self.workspace_manager
             .render(buffer, &self.theme, self.picker_icons());
+        if self.workspace_manager.is_active()
+            && (self.last_error.is_some()
+                || self.session_manager.warning().is_some()
+                || self.config_diagnostics_banner().is_some())
+        {
+            self.draw_commandline(buffer);
+        }
         self.render_dialog(buffer)?;
 
         // Render all plugins
@@ -3292,6 +3299,45 @@ mod tests {
             Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![source]).unwrap();
         editor.test_disable_terminal_output();
         editor
+    }
+
+    #[test]
+    fn workspace_render_keeps_commandline_messages_visible() {
+        let mut editor = rendering_test_editor(Buffer::new(None, String::new()));
+        editor.workspace_manager.open(
+            "git-dashboard".to_string(),
+            crate::plugin::WorkspaceConfig {
+                title: "Git".to_string(),
+                ..crate::plugin::WorkspaceConfig::default()
+            },
+        );
+        editor.workspace_manager.update(
+            "git-dashboard",
+            crate::plugin::WorkspaceModel {
+                footer: vec![crate::plugin::PanelSegment {
+                    text: "s stage  q close".to_string(),
+                    style: None,
+                    semantic: None,
+                }],
+                ..crate::plugin::WorkspaceModel::default()
+            },
+            &editor.theme,
+        );
+        editor.last_error = Some("fatal: index.lock already exists".to_string());
+        let mut buffer = RenderBuffer::new(60, 12, &Style::default());
+
+        editor.render(&mut buffer).unwrap();
+
+        let commandline = buffer
+            .cells
+            .chunks(buffer.width)
+            .last()
+            .unwrap()
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>();
+        assert!(commandline.contains("fatal: index.lock already exists"));
+        assert!(!commandline.contains("s stage"));
     }
 
     #[test]

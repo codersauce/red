@@ -18484,6 +18484,7 @@ impl Editor {
             }
             Action::Print(msg) => {
                 self.last_error = Some(msg.clone());
+                self.draw_commandline(buffer);
             }
             Action::OpenPicker(title, items, id) => {
                 let history_key = Self::picker_history_key(title, *id);
@@ -29392,6 +29393,27 @@ builtin = "rust"
         editor.open_config_diagnostics();
         assert!(editor.config_diagnostics_acknowledged);
         assert!(editor.current_dialog.is_some());
+    }
+
+    #[tokio::test]
+    async fn print_action_draws_its_message_immediately() {
+        let mut editor = test_editor(60, 8);
+        let mut buffer = RenderBuffer::new(60, 8, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .execute(
+                &Action::Print("fatal: index.lock already exists".to_string()),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        assert!(render_text_rows(&buffer)
+            .last()
+            .unwrap()
+            .contains("fatal: index.lock already exists"));
     }
 
     #[test]
