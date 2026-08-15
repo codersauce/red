@@ -37,7 +37,7 @@ impl IconCatalog {
     #[must_use]
     pub(crate) fn completion(kind: &CompletionItemKind) -> IconSpec {
         let glyph = match kind {
-            CompletionItemKind::Text => "abc",
+            CompletionItemKind::Text => "≡",
             CompletionItemKind::Method => "ƒ",
             CompletionItemKind::Function => "λ",
             CompletionItemKind::Constructor => "⚡",
@@ -98,6 +98,14 @@ mod tests {
         assert_eq!(
             IconCatalog::completion(&CompletionItemKind::File).glyph,
             "📄"
+        );
+    }
+
+    #[test]
+    fn lsp_text_completion_uses_an_icon_that_fits_the_icon_column() {
+        assert_eq!(
+            IconCatalog::completion(&CompletionItemKind::Text).glyph,
+            "≡"
         );
     }
 }
