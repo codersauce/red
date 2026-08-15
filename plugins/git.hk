@@ -147,6 +147,7 @@ struct GitScratchOpenedEvent {
 }
 
 struct ScratchBufferOptions {
+    syntax: String,
     submit: String,
     cancel: String,
 }
@@ -2833,7 +2834,11 @@ fn open_commit_editor(message: String) {
         commit_scratch_opened,
         "[Git Commit].gitcommit",
         text,
-        ScratchBufferOptions { submit: "GitSubmitMessage", cancel: "GitCancelMessage" }
+        ScratchBufferOptions {
+            syntax: "gitcommit",
+            submit: "GitSubmitMessage",
+            cancel: "GitCancelMessage"
+        }
     );
 }
 
@@ -2896,7 +2901,9 @@ fn commit_message(text: String) -> String {
 
 fn commit_editor_text(message: String, staged_diff: String) -> String {
     let text = message;
-    if text != "" && !red::ends_with(text, "\n") {
+    if text == "" {
+        text = "\n";
+    } else if !red::ends_with(text, "\n") {
         text = text + "\n";
     }
     text = text + "\n" + commit_context_marker() + "\n";

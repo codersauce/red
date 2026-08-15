@@ -31,9 +31,17 @@ use crate::{
 struct BundledLanguageDefinition {
     id: &'static str,
     extensions: &'static [&'static str],
-    language: fn() -> Language,
+    filenames: &'static [&'static str],
+    language: Option<fn() -> Language>,
     highlight_queries: &'static [&'static str],
     injection_query: Option<&'static str>,
+    specialized: Option<SpecializedHighlighter>,
+}
+
+#[derive(Clone, Copy)]
+enum SpecializedHighlighter {
+    Husk,
+    GitCommit,
 }
 
 #[derive(Clone)]
@@ -57,6 +65,7 @@ struct RuntimeLanguageDefinition {
     grammar: Option<GrammarSource>,
     highlight_queries: Vec<String>,
     injection_query: Option<String>,
+    specialized: Option<SpecializedHighlighter>,
 }
 
 /// Immutable language routing and grammar definitions shared by all render surfaces.
@@ -86,19 +95,24 @@ impl LanguageRegistry {
                     .iter()
                     .map(ToString::to_string)
                     .collect(),
-                filenames: Vec::new(),
+                filenames: definition
+                    .filenames
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
                 aliases: LANGUAGE_NAMES
                     .iter()
                     .filter(|(_, language)| *language == definition.id)
                     .map(|(alias, _)| (*alias).to_string())
                     .collect(),
-                grammar: Some(GrammarSource::Bundled(definition.language)),
+                grammar: definition.language.map(GrammarSource::Bundled),
                 highlight_queries: definition
                     .highlight_queries
                     .iter()
                     .map(ToString::to_string)
                     .collect(),
                 injection_query: definition.injection_query.map(ToString::to_string),
+                specialized: definition.specialized,
             });
         }
         registry
@@ -142,6 +156,7 @@ impl LanguageRegistry {
             grammar: None,
             highlight_queries: Vec::new(),
             injection_query: None,
+            specialized: None,
         });
         if !config.extensions.is_empty() {
             definition.extensions = config
@@ -167,6 +182,7 @@ impl LanguageRegistry {
                 definition
                     .injection_query
                     .clone_from(&bundled.injection_query);
+                definition.specialized = None;
             }
             if let Some(path) = grammar_path(grammar, config_dir)? {
                 let trust = GrammarTrustStore::new(config_dir);
@@ -180,6 +196,7 @@ impl LanguageRegistry {
                     &symbol,
                     grammar.trusted,
                 )?);
+                definition.specialized = None;
             }
             if !grammar.highlights.is_empty() {
                 definition.highlight_queries = grammar
@@ -327,6 +344,7 @@ pub struct Highlighter {
     registry: Arc<LanguageRegistry>,
     theme: Theme,
     husk_styles: HuskStyles,
+    git_commit_styles: GitCommitStyles,
 }
 
 struct HuskStyles {
@@ -351,6 +369,34 @@ impl HuskStyles {
             string: theme.get_style("string"),
             type_builtin: theme.get_style("type.builtin"),
             operator: theme.get_style("operator"),
+        }
+    }
+}
+
+struct GitCommitStyles {
+    comment: Option<Style>,
+    heading: Option<Style>,
+    reference: Option<Style>,
+    status: Option<Style>,
+    inserted: Option<Style>,
+    deleted: Option<Style>,
+    changed: Option<Style>,
+}
+
+impl GitCommitStyles {
+    fn new(theme: &Theme) -> Self {
+        Self {
+            comment: theme.get_style("comment"),
+            heading: theme
+                .get_style("markup.heading")
+                .or_else(|| theme.get_style("keyword")),
+            reference: theme.get_style("string"),
+            status: theme.get_style("keyword"),
+            inserted: theme.get_style("markup.inserted.diff"),
+            deleted: theme.get_style("markup.deleted.diff"),
+            changed: theme
+                .get_style("markup.changed.diff")
+                .or_else(|| theme.get_style("keyword")),
         }
     }
 }
@@ -385,6 +431,9 @@ const LANGUAGE_NAMES: &[(&str, &str)] = &[
     ("lua", "lua"),
     ("hk", "husk"),
     ("husk", "husk"),
+    ("gitcommit", "gitcommit"),
+    ("git-commit", "gitcommit"),
+    ("commit", "gitcommit"),
 ];
 
 const YAML_ADDITIONAL_HIGHLIGHTS_QUERY: &str = r#"
@@ -409,6 +458,7 @@ impl Highlighter {
             registry,
             theme: theme.clone(),
             husk_styles: HuskStyles::new(theme),
+            git_commit_styles: GitCommitStyles::new(theme),
         })
     }
 
@@ -518,13 +568,17 @@ impl Highlighter {
         code: &str,
         depth: usize,
     ) -> anyhow::Result<Vec<StyleInfo>> {
-        if language_id == "husk" {
-            return Ok(highlight_husk(code, &self.husk_styles));
-        }
-
         let Some(definition) = self.registry.languages.get(language_id).cloned() else {
             return Ok(Vec::new());
         };
+        if let Some(specialized) = definition.specialized {
+            return Ok(match specialized {
+                SpecializedHighlighter::Husk => highlight_husk(code, &self.husk_styles),
+                SpecializedHighlighter::GitCommit => {
+                    highlight_git_commit(code, &self.git_commit_styles)
+                }
+            });
+        }
         let Some(grammar) = &definition.grammar else {
             return Ok(Vec::new());
         };
@@ -704,105 +758,263 @@ fn language_definitions() -> Vec<BundledLanguageDefinition> {
         BundledLanguageDefinition {
             id: "rust",
             extensions: &["rs"],
-            language: || tree_sitter_rust::LANGUAGE.into(),
+            filenames: &[],
+            language: Some(|| tree_sitter_rust::LANGUAGE.into()),
             highlight_queries: &[tree_sitter_rust::HIGHLIGHTS_QUERY],
             injection_query: None,
+            specialized: None,
         },
         BundledLanguageDefinition {
             id: "markdown",
             extensions: &["md", "markdown"],
-            language: || tree_sitter_md::LANGUAGE.into(),
+            filenames: &[],
+            language: Some(|| tree_sitter_md::LANGUAGE.into()),
             highlight_queries: &[MARKDOWN_HIGHLIGHT_QUERY],
             injection_query: Some(MARKDOWN_INJECTION_QUERY),
+            specialized: None,
         },
         BundledLanguageDefinition {
             id: "javascript",
             extensions: &["js", "mjs", "cjs"],
-            language: || tree_sitter_javascript::LANGUAGE.into(),
+            filenames: &[],
+            language: Some(|| tree_sitter_javascript::LANGUAGE.into()),
             highlight_queries: JAVASCRIPT_HIGHLIGHT_QUERIES,
             injection_query: None,
+            specialized: None,
         },
         BundledLanguageDefinition {
             id: "jsx",
             extensions: &["jsx"],
-            language: || tree_sitter_javascript::LANGUAGE.into(),
+            filenames: &[],
+            language: Some(|| tree_sitter_javascript::LANGUAGE.into()),
             highlight_queries: JSX_HIGHLIGHT_QUERIES,
             injection_query: None,
+            specialized: None,
         },
         BundledLanguageDefinition {
             id: "typescript",
             extensions: &["ts"],
-            language: || tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            filenames: &[],
+            language: Some(|| tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
             highlight_queries: TYPESCRIPT_HIGHLIGHT_QUERIES,
             injection_query: None,
+            specialized: None,
         },
         BundledLanguageDefinition {
             id: "tsx",
             extensions: &["tsx"],
-            language: || tree_sitter_typescript::LANGUAGE_TSX.into(),
+            filenames: &[],
+            language: Some(|| tree_sitter_typescript::LANGUAGE_TSX.into()),
             highlight_queries: TSX_HIGHLIGHT_QUERIES,
             injection_query: None,
+            specialized: None,
         },
         BundledLanguageDefinition {
             id: "json",
             extensions: &["json"],
-            language: || tree_sitter_json::LANGUAGE.into(),
+            filenames: &[],
+            language: Some(|| tree_sitter_json::LANGUAGE.into()),
             highlight_queries: &[tree_sitter_json::HIGHLIGHTS_QUERY],
             injection_query: None,
+            specialized: None,
         },
         BundledLanguageDefinition {
             id: "toml",
             extensions: &["toml"],
-            language: || tree_sitter_toml_ng::LANGUAGE.into(),
+            filenames: &[],
+            language: Some(|| tree_sitter_toml_ng::LANGUAGE.into()),
             highlight_queries: &[tree_sitter_toml_ng::HIGHLIGHTS_QUERY],
             injection_query: None,
+            specialized: None,
         },
         BundledLanguageDefinition {
             id: "yaml",
             extensions: &["yml", "yaml"],
-            language: || tree_sitter_yaml::LANGUAGE.into(),
+            filenames: &[],
+            language: Some(|| tree_sitter_yaml::LANGUAGE.into()),
             highlight_queries: &[
                 tree_sitter_yaml::HIGHLIGHTS_QUERY,
                 YAML_ADDITIONAL_HIGHLIGHTS_QUERY,
             ],
             injection_query: None,
+            specialized: None,
         },
         BundledLanguageDefinition {
             id: "bash",
             extensions: &["sh", "bash", "zsh"],
-            language: || tree_sitter_bash::LANGUAGE.into(),
+            filenames: &[],
+            language: Some(|| tree_sitter_bash::LANGUAGE.into()),
             highlight_queries: &[tree_sitter_bash::HIGHLIGHT_QUERY],
             injection_query: None,
+            specialized: None,
         },
         BundledLanguageDefinition {
             id: "fish",
             extensions: &["fish"],
-            language: tree_sitter_fish::language,
+            filenames: &[],
+            language: Some(tree_sitter_fish::language),
             highlight_queries: &[tree_sitter_fish::HIGHLIGHTS_QUERY],
             injection_query: None,
+            specialized: None,
         },
         BundledLanguageDefinition {
             id: "powershell",
             extensions: &["ps1", "psm1", "psd1"],
-            language: || tree_sitter_powershell::LANGUAGE.into(),
+            filenames: &[],
+            language: Some(|| tree_sitter_powershell::LANGUAGE.into()),
             highlight_queries: &[tree_sitter_powershell::HIGHLIGHTS_QUERY],
             injection_query: None,
+            specialized: None,
         },
         BundledLanguageDefinition {
             id: "lua",
             extensions: &["lua"],
-            language: || tree_sitter_lua::LANGUAGE.into(),
+            filenames: &[],
+            language: Some(|| tree_sitter_lua::LANGUAGE.into()),
             highlight_queries: &[tree_sitter_lua::HIGHLIGHTS_QUERY],
             injection_query: None,
+            specialized: None,
         },
         BundledLanguageDefinition {
             id: "husk",
             extensions: &["hk", "husk"],
-            language: || tree_sitter_rust::LANGUAGE.into(),
+            filenames: &[],
+            language: None,
             highlight_queries: &[],
             injection_query: None,
+            specialized: Some(SpecializedHighlighter::Husk),
+        },
+        BundledLanguageDefinition {
+            id: "gitcommit",
+            extensions: &["gitcommit"],
+            filenames: &["COMMIT_EDITMSG", "MERGE_MSG", "SQUASH_MSG", "TAG_EDITMSG"],
+            language: None,
+            highlight_queries: &[],
+            injection_query: None,
+            specialized: Some(SpecializedHighlighter::GitCommit),
         },
     ]
+}
+
+fn highlight_git_commit(code: &str, theme: &GitCommitStyles) -> Vec<StyleInfo> {
+    let mut styles = Vec::new();
+    let mut offset = 0;
+
+    for line_with_ending in code.split_inclusive('\n') {
+        let line = line_with_ending.trim_end_matches(['\r', '\n']);
+        if let Some(comment) = line.strip_prefix('#') {
+            let line_end = offset + line.len();
+            push_style(theme.comment.as_ref(), offset..line_end, &mut styles);
+
+            let leading = comment.len() - comment.trim_start().len();
+            let body = comment.trim_start();
+            let body_start = offset + 1 + leading;
+            highlight_git_commit_comment(body, body_start, theme, &mut styles);
+        }
+        offset += line_with_ending.len();
+    }
+
+    styles
+}
+
+fn highlight_git_commit_comment(
+    body: &str,
+    body_start: usize,
+    theme: &GitCommitStyles,
+    styles: &mut Vec<StyleInfo>,
+) {
+    if body.is_empty() {
+        return;
+    }
+
+    if body == "--- Red commit context (not part of the commit message) ---"
+        || body == "Commands:"
+        || body == "Staged diff:"
+        || body.ends_with("files:")
+        || body.ends_with("paths:")
+        || body.ends_with("committed:")
+        || body.ends_with("commit:")
+    {
+        push_style(
+            theme.heading.as_ref(),
+            body_start..body_start + body.len(),
+            styles,
+        );
+    }
+
+    if let Some(branch) = body.strip_prefix("On branch ") {
+        let prefix_len = "On branch ".len();
+        push_style(
+            theme.status.as_ref(),
+            body_start..body_start + prefix_len,
+            styles,
+        );
+        push_style(
+            theme.reference.as_ref(),
+            body_start + prefix_len..body_start + prefix_len + branch.len(),
+            styles,
+        );
+    }
+
+    for prefix in ["new file:", "modified:", "deleted:", "renamed:"] {
+        if let Some(path) = body.strip_prefix(prefix) {
+            let path_leading = path.len() - path.trim_start().len();
+            push_style(
+                theme.status.as_ref(),
+                body_start..body_start + prefix.len(),
+                styles,
+            );
+            push_style(
+                theme.reference.as_ref(),
+                body_start + prefix.len() + path_leading..body_start + body.len(),
+                styles,
+            );
+        }
+    }
+
+    if let Some((status, path)) = body.split_once("  ") {
+        if matches!(status, "A" | "M" | "D" | "R" | "C" | "U" | "??") && !path.is_empty() {
+            push_style(
+                theme.status.as_ref(),
+                body_start..body_start + status.len(),
+                styles,
+            );
+            push_style(
+                theme.reference.as_ref(),
+                body_start + status.len() + 2..body_start + body.len(),
+                styles,
+            );
+        }
+    }
+
+    for quoted in body.match_indices('\'') {
+        let quote_start = quoted.0;
+        let rest = &body[quote_start + 1..];
+        if let Some(relative_end) = rest.find('\'') {
+            push_style(
+                theme.reference.as_ref(),
+                body_start + quote_start..body_start + quote_start + relative_end + 2,
+                styles,
+            );
+            break;
+        }
+    }
+
+    let diff_style = if body.starts_with('+') && !body.starts_with("+++") {
+        theme.inserted.as_ref()
+    } else if body.starts_with('-') && !body.starts_with("---") {
+        theme.deleted.as_ref()
+    } else if body.starts_with("diff --git ")
+        || body.starts_with("index ")
+        || body.starts_with("@@")
+        || body.starts_with("--- ")
+        || body.starts_with("+++ ")
+    {
+        theme.changed.as_ref()
+    } else {
+        None
+    };
+    push_style(diff_style, body_start..body_start + body.len(), styles);
 }
 
 fn highlight_husk(code: &str, theme: &HuskStyles) -> Vec<StyleInfo> {
@@ -1207,8 +1419,77 @@ mod tests {
             highlighter.language_id_for_file(Some("plugin.hk")),
             Some("husk")
         );
+        assert_eq!(
+            highlighter.language_id_for_file(Some("[Git Commit].gitcommit")),
+            Some("gitcommit")
+        );
+        assert_eq!(
+            highlighter.language_id_for_file(Some(".git/COMMIT_EDITMSG")),
+            Some("gitcommit")
+        );
+        assert_eq!(
+            highlighter.language_id_for_file(Some(".git/MERGE_MSG")),
+            Some("gitcommit")
+        );
+        assert_eq!(
+            highlighter.language_id_for_name("commit"),
+            Some("gitcommit")
+        );
         assert_eq!(highlighter.language_id_for_file(Some("main.py")), None);
         assert_eq!(highlighter.language_id_for_file(Some("LICENSE")), None);
+    }
+
+    #[test]
+    fn git_commit_highlighter_styles_comments_and_semantic_details() {
+        let theme = theme_with_scopes(&[
+            "comment",
+            "markup.heading",
+            "string",
+            "keyword",
+            "markup.inserted.diff",
+            "markup.deleted.diff",
+            "markup.changed.diff",
+        ]);
+        let mut highlighter = Highlighter::new(&theme).unwrap();
+        let code = "feat(git): keep café readable\n\n\
+# --- Red commit context (not part of the commit message) ---\n\
+# On branch fëat/commit-style\n\
+# Changes to be committed:\n\
+#   A  src/café.rs\n\
+# diff --git a/src/café.rs b/src/café.rs\n\
+# +let ready = true;\n\
+# -let ready = false;\n";
+
+        let styles = highlighter.highlight("gitcommit", code).unwrap();
+
+        assert!(effective_style_at(&styles, 0).is_none());
+        for token in [
+            "# --- Red commit context (not part of the commit message) ---",
+            "fëat/commit-style",
+            "Changes to be committed:",
+            "A",
+            "src/café.rs",
+            "diff --git a/src/café.rs b/src/café.rs",
+            "+let ready = true;",
+            "-let ready = false;",
+        ] {
+            assert_token_highlighted(&styles, code, token);
+        }
+
+        for token in [
+            "fëat/commit-style",
+            "src/café.rs",
+            "+let ready = true;",
+            "-let ready = false;",
+        ] {
+            let start = code.find(token).unwrap();
+            assert!(
+                styles
+                    .iter()
+                    .any(|style| style.start == start && style.end == start + token.len()),
+                "`{token}` should have a precise semantic highlight span"
+            );
+        }
     }
 
     #[test]
@@ -1553,6 +1834,7 @@ mod tests {
             vec![
                 "bash",
                 "fish",
+                "gitcommit",
                 "husk",
                 "javascript",
                 "json",

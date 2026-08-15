@@ -1935,6 +1935,10 @@ impl RedHost {
                     request_id,
                     name: args.first().map(value_to_string).unwrap_or_default(),
                     text: args.get(1).map(value_to_string).unwrap_or_default(),
+                    syntax: commands
+                        .get("syntax")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
                     submit_command: commands
                         .get("submit")
                         .and_then(serde_json::Value::as_str)
@@ -4066,7 +4070,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scratch_buffer_requests_preserve_submit_and_cancel_commands() {
+    async fn scratch_buffer_requests_preserve_syntax_submit_and_cancel_commands() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
@@ -4074,14 +4078,18 @@ mod tests {
             .load_plugin(
                 "scratch_owner",
                 r#"
-                    struct ScratchCommands { submit: String, cancel: String }
+                    struct ScratchCommands { syntax: String, submit: String, cancel: String }
                     pub fn activate() {
                         red::request(
                             "OpenScratchBuffer",
                             opened,
                             "[Prompt].txt",
                             "draft",
-                            ScratchCommands { submit: "SubmitPrompt", cancel: "CancelPrompt" }
+                            ScratchCommands {
+                                syntax: "gitcommit",
+                                submit: "SubmitPrompt",
+                                cancel: "CancelPrompt"
+                            }
                         );
                     }
                     fn opened(event: Json) {}
@@ -4094,12 +4102,14 @@ mod tests {
             PluginRequest::OpenScratchBuffer {
                 name,
                 text,
+                syntax,
                 submit_command,
                 cancel_command,
                 ..
             } => {
                 assert_eq!(name, "[Prompt].txt");
                 assert_eq!(text, "draft");
+                assert_eq!(syntax.as_deref(), Some("gitcommit"));
                 assert_eq!(submit_command.as_deref(), Some("SubmitPrompt"));
                 assert_eq!(cancel_command.as_deref(), Some("CancelPrompt"));
             }
@@ -11232,18 +11242,27 @@ mod tests {
                     request_id,
                     name,
                     text,
+                    syntax,
                     submit_command,
                     cancel_command,
                 } = request
                 {
-                    scratch = Some((request_id, name, text, submit_command, cancel_command));
+                    scratch = Some((
+                        request_id,
+                        name,
+                        text,
+                        syntax,
+                        submit_command,
+                        cancel_command,
+                    ));
                 }
             }
-            if let Some((request_id, name, text, submit, cancel)) = scratch {
+            if let Some((request_id, name, text, syntax, submit, cancel)) = scratch {
                 assert_eq!(name, "[Git Commit].gitcommit");
+                assert_eq!(syntax.as_deref(), Some("gitcommit"));
                 assert_eq!(submit.as_deref(), Some("GitSubmitMessage"));
                 assert_eq!(cancel.as_deref(), Some("GitCancelMessage"));
-                assert!(text.starts_with("feat(git): describe staged files\n"));
+                assert!(text.starts_with("feat(git): describe staged files\n\n#"));
                 assert!(text.contains("# --- Red commit context"));
                 assert!(text.contains("# Changes to be committed:"));
                 assert!(text.contains("staged.txt"));
