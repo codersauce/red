@@ -20,6 +20,8 @@ mod buffer_manager;
 mod diagnostics_picker;
 mod display_layout;
 mod lsp_coordinator;
+#[cfg(test)]
+mod navigation_perf_tests;
 pub(crate) mod perf;
 pub mod render_buffer;
 pub mod rendering;
@@ -180,6 +182,8 @@ impl ActionDispatcher {
 pub const DEFAULT_REGISTER: char = '"';
 const JUMPLIST_SIZE: usize = 100;
 const REPEATED_MOTION_DRAIN_BUDGET_MS: u64 = 50;
+const INPUT_BATCH_BUDGET: Duration = Duration::from_millis(8);
+const SCROLL_EVENTS_PER_BATCH: usize = 64;
 const TERMINAL_SIZE_RECONCILE_INTERVAL: Duration = Duration::from_millis(100);
 const PLUGIN_REQUESTS_PER_TICK: usize = 64;
 const AGENT_EVENTS_PER_TICK: usize = 64;
@@ -966,7 +970,7 @@ struct SubstituteConfirmation {
     accepted: Vec<PlannedSubstitution>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ProcessedEvent {
     quit: bool,
     drain_repeated_motion: bool,
@@ -977,6 +981,17 @@ struct ProcessedEvent {
 enum EventRenderMode {
     Immediate,
     DeferredMotion,
+}
+
+/// Strongest repaint requested while navigation is being coalesced.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum MotionRender {
+    #[default]
+    None,
+    Cursor,
+    Window,
+    EditorWindows,
+    Full,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2850,6 +2865,9 @@ pub struct Editor {
     #[cfg(test)]
     terminal_flush_generation: u64,
 
+    #[cfg(test)]
+    full_render_count: u64,
+
     /// Whether the terminal window currently has focus.
     is_focused: bool,
 
@@ -2859,6 +2877,9 @@ pub struct Editor {
 
     /// Incremented after full renders so event handling can avoid duplicate frames.
     render_generation: u64,
+
+    /// Active window represented by the last committed frame.
+    last_rendered_window: Option<WindowId>,
 
     /// True once the startup splash has been drawn at least once.
     splash_shown: bool,
@@ -2891,8 +2912,8 @@ pub struct Editor {
     /// Suppresses per-step repainting while queued repeated motions are drained.
     defer_motion_render: bool,
 
-    /// Tracks whether deferred motion changed the visible viewport.
-    deferred_motion_needs_full_render: bool,
+    /// Repaint scope accumulated by deferred navigation.
+    deferred_motion_render: MotionRender,
 
     /// Earliest state before a repeated-motion batch and the latest cause.
     /// The final snapshot is read when the batch flushes, so state events are
@@ -4167,9 +4188,12 @@ impl Editor {
             flushed_terminal_cursor: None,
             #[cfg(test)]
             terminal_flush_generation: 0,
+            #[cfg(test)]
+            full_render_count: 0,
             is_focused: true,
             suppress_reactivation_click: false,
             render_generation: 0,
+            last_rendered_window: None,
             splash_shown: false,
             splash_dismissed: false,
             previous_render_buffer: None,
@@ -4178,7 +4202,7 @@ impl Editor {
             last_rendered_bracket_rows: Vec::new(),
             last_rendered_cursor_surface: None,
             defer_motion_render: false,
-            deferred_motion_needs_full_render: false,
+            deferred_motion_render: MotionRender::None,
             deferred_plugin_event: None,
             block_replay_depth: 0,
             block_replay_change_deferred: false,
@@ -4426,14 +4450,16 @@ impl Editor {
         self.sync_to_window();
 
         if self.defer_motion_render {
-            if self.editor_view_state() != before {
-                self.deferred_motion_needs_full_render = true;
-            }
+            self.request_motion_render(if self.editor_view_state() != before {
+                MotionRender::Window
+            } else {
+                MotionRender::Cursor
+            });
             return Ok(());
         }
 
         if self.editor_view_state() != before {
-            self.render(buffer)
+            self.render_motion_frame(buffer)
         } else if self.can_render_cursor_motion_delta() {
             self.render_cursor_motion_delta(buffer)
         } else if self.relative_line_numbers_enabled()
@@ -7743,7 +7769,20 @@ impl Editor {
                 event::poll(Duration::from_millis(10))?;
             }
 
+            let input_started = Instant::now();
+            let mut serviced_background = false;
             while let Some(ev) = Self::read_ready_event(&mut pending_events)? {
+                if self.can_batch_scroll(&ev) {
+                    let events = Self::read_scroll_batch(ev, &mut pending_events)?;
+                    if self
+                        .process_scroll_batch(events, &mut buffer, &mut runtime)
+                        .await?
+                    {
+                        break 'editor_loop;
+                    }
+                    serviced_background = true;
+                    break;
+                }
                 let processed = self
                     .process_editor_event(ev, &mut buffer, &mut runtime, EventRenderMode::Immediate)
                     .await?;
@@ -7771,6 +7810,9 @@ impl Editor {
                     // before another held-key batch is drained.
                     break;
                 }
+                if input_started.elapsed() >= INPUT_BATCH_BUDGET {
+                    break;
+                }
             }
             self.suppress_reactivation_click = false;
 
@@ -7781,7 +7823,9 @@ impl Editor {
                     .await?;
             }
 
-            self.service_background(&mut buffer, &mut runtime).await?;
+            if !serviced_background {
+                self.service_background(&mut buffer, &mut runtime).await?;
+            }
             if self.persist_session_snapshot(/*force*/ false) {
                 self.render(&mut buffer)?;
             }
@@ -8350,6 +8394,7 @@ impl Editor {
         // single render at the end of the tick instead of one per item.
         let mut needs_render = false;
         let mut needs_motion_render = false;
+        let mut needs_editor_windows_render = false;
 
         // Always pump LSP responses. `recv_response` completes the
         // initialize handshake and flushes queued didOpen/change
@@ -8999,11 +9044,16 @@ impl Editor {
                     decorations,
                 } => {
                     let current_buffer_index = self.buffer_manager.active_index();
-                    let active_buffer_only = decorations.iter().all(|decoration| {
-                        decoration
-                            .buffer_index
-                            .is_none_or(|buffer_index| buffer_index == current_buffer_index)
-                    });
+                    let active_buffer_only = self
+                        .decoration_manager
+                        .buffers_for_namespace(&namespace)
+                        .iter()
+                        .all(|buffer_index| *buffer_index == current_buffer_index)
+                        && decorations.iter().all(|decoration| {
+                            decoration
+                                .buffer_index
+                                .is_none_or(|buffer_index| buffer_index == current_buffer_index)
+                        });
                     let decorations = decorations
                         .into_iter()
                         .map(|mut decoration| {
@@ -9012,10 +9062,10 @@ impl Editor {
                         })
                         .collect();
                     if self.decoration_manager.set(namespace, decorations) {
-                        if active_buffer_only && self.window_manager.windows().len() == 1 {
+                        if active_buffer_only && self.active_buffer_visible_once() {
                             needs_motion_render = true;
                         } else {
-                            needs_render = true;
+                            needs_editor_windows_render = true;
                         }
                     }
                 }
@@ -9024,7 +9074,7 @@ impl Editor {
                         if self.window_manager.windows().len() == 1 {
                             needs_motion_render = true;
                         } else {
-                            needs_render = true;
+                            needs_editor_windows_render = true;
                         }
                     }
                 }
@@ -9033,7 +9083,7 @@ impl Editor {
                         if self.window_manager.windows().len() == 1 {
                             needs_motion_render = true;
                         } else {
-                            needs_render = true;
+                            needs_editor_windows_render = true;
                         }
                     }
                 }
@@ -9042,7 +9092,7 @@ impl Editor {
                         if self.window_manager.windows().len() == 1 {
                             needs_motion_render = true;
                         } else {
-                            needs_render = true;
+                            needs_editor_windows_render = true;
                         }
                     }
                 }
@@ -9820,6 +9870,8 @@ impl Editor {
         }
         if needs_render {
             self.render(buffer)?;
+        } else if needs_editor_windows_render {
+            self.render_editor_windows_frame(buffer)?;
         } else if needs_motion_render {
             self.render_motion_frame(buffer)?;
         }
@@ -9859,6 +9911,16 @@ impl Editor {
             };
             perf::PerfSpan::with_detail("event", detail)
         });
+        let mouse_moved = matches!(
+            ev,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                ..
+            })
+        );
+        if mouse_moved && self.current_dialog.is_none() {
+            return Ok(ProcessedEvent::default());
+        }
         let initial_bounds_span = perf::PerfSpan::start("event:initial_bounds");
         self.check_bounds();
         drop(initial_bounds_span);
@@ -9888,6 +9950,7 @@ impl Editor {
         }
 
         let render_generation = self.render_generation;
+        let window_before = self.window_manager.active_stable_window_id();
         let repeat_signature = Self::key_signature(&ev);
         let mut drain_repeated_motion = false;
 
@@ -9927,6 +9990,7 @@ impl Editor {
             );
         }
         drop(resolve_span);
+        let navigation_action = action.as_ref().is_some_and(Self::key_action_is_navigation);
         if let Some(action) = action {
             drain_repeated_motion =
                 !from_waiting_key_action && self.should_drain_repeated_motion(&ev, &action);
@@ -9948,7 +10012,10 @@ impl Editor {
         self.finish_semantic_change_event();
         drop(semantic_span);
 
-        if render_mode == EventRenderMode::Immediate && self.render_generation == render_generation
+        if render_mode == EventRenderMode::Immediate
+            && self.render_generation == render_generation
+            && (!mouse_moved && !navigation_action
+                || window_before != self.window_manager.active_stable_window_id())
         {
             self.render(buffer)?;
         }
@@ -9984,6 +10051,108 @@ impl Editor {
         )
         .await?;
         Ok(true)
+    }
+
+    fn request_motion_render(&mut self, request: MotionRender) {
+        self.deferred_motion_render = self.deferred_motion_render.max(request);
+    }
+
+    fn active_buffer_visible_once(&self) -> bool {
+        let active = self.buffer_manager.active_index();
+        self.window_manager
+            .windows()
+            .iter()
+            .filter(|window| window.buffer_index == active)
+            .count()
+            == 1
+    }
+
+    fn can_batch_scroll(&self, event: &Event) -> bool {
+        let Event::Mouse(mouse) = event else {
+            return false;
+        };
+        matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) && self.is_normal()
+            && self.current_dialog.is_none()
+            && self.waiting_key_action.is_none()
+            && self.pending_operator.is_none()
+            && self.divider_drag.is_none()
+            && self.pane_resize_mode.is_none()
+            && !self.workspace_manager.is_active()
+            && !self.panel_manager.has_focused_panel()
+            && self
+                .window_manager
+                .window_at_position(usize::from(mouse.column), usize::from(mouse.row))
+                .is_some()
+    }
+
+    fn scroll_batch_accepts(first: &Event, next: &Event) -> bool {
+        matches!(
+            next,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                ..
+            })
+        ) || first == next
+    }
+
+    fn read_scroll_batch(
+        first: Event,
+        pending: &mut VecDeque<Event>,
+    ) -> anyhow::Result<Vec<Event>> {
+        let mut events = vec![first];
+        let started = Instant::now();
+        while events.len() < SCROLL_EVENTS_PER_BATCH && started.elapsed() < INPUT_BATCH_BUDGET {
+            let Some(next) = Self::read_ready_event(pending)? else {
+                break;
+            };
+            if !Self::scroll_batch_accepts(&events[0], &next) {
+                pending.push_front(next);
+                break;
+            }
+            events.push(next);
+        }
+        Ok(events)
+    }
+
+    /// Preserve every wheel delta, but publish only the final navigation frame.
+    /// Nonmatching input stays queued so pointer targets and ordering are stable.
+    async fn process_scroll_batch(
+        &mut self,
+        events: Vec<Event>,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<bool> {
+        perf::increment("scroll_batches", 1);
+        perf::increment("scroll_batch_events", events.len() as u64);
+        self.defer_motion_render = true;
+        let result: anyhow::Result<bool> = async {
+            for event in events {
+                if self
+                    .process_editor_event(event, buffer, runtime, EventRenderMode::DeferredMotion)
+                    .await?
+                    .quit
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        .await;
+        self.defer_motion_render = false;
+        let quit = result?;
+        self.flush_deferred_plugin_event(runtime).await?;
+        let generation = self.render_generation;
+        self.service_background(buffer, runtime).await?;
+        if self.render_generation == generation {
+            self.flush_deferred_motion_render(buffer)?;
+        } else {
+            // Background effects already painted the final editor state.
+            self.deferred_motion_render = MotionRender::None;
+        }
+        Ok(quit)
     }
 
     async fn drain_repeated_motion_events(
@@ -10099,10 +10268,14 @@ impl Editor {
 
     fn flush_deferred_motion_render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.defer_motion_render = false;
-        if self.deferred_motion_needs_full_render {
-            self.deferred_motion_needs_full_render = false;
-            self.render(buffer)
-        } else if self.can_render_cursor_motion_delta() {
+        match std::mem::take(&mut self.deferred_motion_render) {
+            MotionRender::None => return Ok(()),
+            MotionRender::Full => return self.render(buffer),
+            MotionRender::EditorWindows => return self.render_editor_windows_frame(buffer),
+            MotionRender::Window => return self.render_motion_frame(buffer),
+            MotionRender::Cursor => {}
+        }
+        if self.can_render_cursor_motion_delta() {
             self.render_cursor_motion_delta(buffer)
         } else if self.relative_line_numbers_enabled()
             || self.uses_synthetic_block_cursor()
@@ -10144,7 +10317,13 @@ impl Editor {
     ) -> anyhow::Result<bool> {
         // A count is one input command even though KeyAction expands it internally.
         // Keep that render boundary for both direct input and replayed events.
-        if self.should_defer_counted_relative_motion(action) {
+        if self.should_defer_counted_relative_motion(action)
+            || (self.is_normal()
+                && self.current_dialog.is_none()
+                && !self.panel_manager.has_focused_panel()
+                && !self.workspace_manager.is_active()
+                && Self::key_action_is_navigation(action))
+        {
             self.handle_key_action_with_deferred_motion(ev, action, buffer, runtime)
                 .await
         } else {
@@ -10287,6 +10466,22 @@ impl Editor {
             KeyAction::Repeating(_, action) => Self::key_action_is_pure_motion(action),
             KeyAction::None | KeyAction::Nested(_) => false,
         }
+    }
+
+    fn key_action_is_navigation(action: &KeyAction) -> bool {
+        match action {
+            KeyAction::Single(action) => Self::action_is_navigation(action),
+            KeyAction::Multiple(actions) => {
+                !actions.is_empty() && actions.iter().all(Self::action_is_navigation)
+            }
+            KeyAction::Repeating(_, action) => Self::key_action_is_navigation(action),
+            KeyAction::None | KeyAction::Nested(_) => false,
+        }
+    }
+
+    fn action_is_navigation(action: &Action) -> bool {
+        Self::action_is_pure_motion(action)
+            || matches!(action, Action::ScrollUp | Action::ScrollDown)
     }
 
     fn action_is_pure_motion(action: &Action) -> bool {
@@ -11815,6 +12010,23 @@ impl Editor {
         ev: &event::Event,
         runtime: Option<&Runtime>,
     ) -> anyhow::Result<Option<KeyAction>> {
+        // Pointer motion has no editor/pane action. Let dialogs opt into hover
+        // handling without clearing an in-progress key sequence or its hints.
+        if matches!(
+            ev,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                ..
+            })
+        ) {
+            return Ok(if self.waiting_key_action.is_some() {
+                None
+            } else {
+                self.current_dialog
+                    .as_mut()
+                    .and_then(|dialog| dialog.handle_event(ev))
+            });
+        }
         if self.divider_drag.is_some()
             && matches!(
                 ev,
@@ -18158,7 +18370,7 @@ impl Editor {
                     let max_cy = viewport_height.saturating_sub(scrolloff).saturating_sub(1);
                     self.cy = self.cy.saturating_add(scrolled_lines).min(max_cy);
                     self.sync_to_window();
-                    self.render(buffer)?;
+                    self.render_motion_frame(buffer)?;
                 }
             }
             Action::ScrollDown => {
@@ -18182,7 +18394,7 @@ impl Editor {
                         .min(viewport_height.saturating_sub(1));
                     self.cy = self.cy.saturating_sub(scrolled_lines).max(scrolloff);
                     self.sync_to_window();
-                    self.render(buffer)?;
+                    self.render_motion_frame(buffer)?;
                 }
             }
             Action::ScrollViewLeft => {
@@ -19334,7 +19546,11 @@ impl Editor {
         drop(bounds_span);
 
         if bounds_changed {
-            self.render(buffer)?;
+            if Self::action_is_navigation(action) {
+                self.render_motion_frame(buffer)?;
+            } else {
+                self.render(buffer)?;
+            }
         }
 
         if self.is_visual() && Self::action_is_selection_motion(action) {
@@ -19356,8 +19572,9 @@ impl Editor {
         // This ensures window state is updated even for actions that don't trigger a full render
         self.sync_to_window();
 
-        // Always render after actions when in multi-window mode to ensure changes are visible
-        if self.window_manager.windows().len() > 1 {
+        // Navigation repaints its active window; other actions may affect shared
+        // buffers, layout, focus, or chrome in any editor window.
+        if self.window_manager.window_count() > 1 && !Self::action_is_navigation(action) {
             self.render(buffer)?;
         }
 
@@ -30620,13 +30837,13 @@ builtin = "rust"
     }
 
     #[tokio::test]
-    async fn counted_motion_keeps_the_existing_render_path_without_relative_numbers() {
+    async fn counted_motion_renders_only_the_final_frame_without_relative_numbers() {
         let (editor, _, generation_before_motion) = run_counted_down_motion(false).await;
 
         assert_eq!(editor.buffer_line(), 10);
         assert_eq!(
             editor.render_generation,
-            generation_before_motion.wrapping_add(10)
+            generation_before_motion.wrapping_add(1)
         );
     }
 
