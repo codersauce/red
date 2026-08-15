@@ -1,6 +1,6 @@
 # Red Vim compatibility matrix
 
-**Matrix version:** 1.4
+**Matrix version:** 1.5
 **Validated against:** Red 0.5.0, August 2026
 **Status vocabulary:** **supported**, **intentional difference**, **not yet supported**
 
@@ -20,8 +20,8 @@ the corresponding integration tests.
 | `r{char}` | **supported** | Replaces one or a counted run of graphemes and is one undoable change. A count longer than the remaining line is rejected without editing. |
 | Editing aliases | **supported** | `D`, `C`, and Neovim-style `Y` operate to line end; `S`, `s`, and `X` provide line/character substitute and backward-delete shortcuts. Counts, default-register kind, undo, and Insert transitions are preserved. `U` is an additional redo alias. |
 | Case changes | **supported** | `~`, `gu{motion}`, `gU{motion}`, `g~{motion}`, and the `guu`/`gUU`/`g~~` line forms transform Unicode text as one transaction. |
-| Join | **supported** | `J` joins at least two lines, removes following indentation, and inserts a space unless trailing whitespace or `)` makes it unnecessary; `gJ` preserves whitespace. Normal counts, Visual joins, `:j[oin][!] [count]`, undo, dot-repeat, and macros are covered. |
-| Ex commands and default-key differences | **intentional difference** | Red implements a documented Ex subset, uses `gW` to toggle wrapping, and uses `Ctrl-e` for NeoTree; these Red-specific defaults can be remapped. `:` enters the command line, while `;` and `W` retain their Vim meanings. Red does not implement Vimscript. |
+| Join | **supported** | `J` joins at least two lines, removes following indentation, and inserts a space unless trailing whitespace or `)` makes it unnecessary; `gJ` preserves whitespace. Normal counts, Visual joins, `:j[oin][!] [count]`, and `%`, numeric, or last-Visual Ex ranges without a separate count are covered alongside undo, dot-repeat, and macros. |
+| Ex commands and default-key differences | **intentional difference** | Red implements a documented Ex subset, uses `gW` to toggle wrapping, and uses `Ctrl-e` for NeoTree; these Red-specific defaults can be remapped. `:` enters the command line and prefills `'<,'>` from Visual mode, while `;` and `W` retain their Vim meanings. Red does not implement Vimscript. |
 
 ## Registers, repeat, and macros
 
@@ -47,6 +47,7 @@ the corresponding integration tests.
 | Restore Visual selection | **supported** | `gv` restores the previous buffer-local Visual area with its character, line, or block shape and original direction. In Visual mode it exchanges the current and previous areas. Selection metadata survives session recovery, while `<` and `>` continue to track edits. |
 | Visual indent | **supported** | `[count]>` and `[count]<` shift every covered line right or left by `count × shiftwidth` in one undoable transaction for character, line, and block selections. Empty lines remain empty, indentation saturates at column zero, and `gv` restores the shifted range. |
 | Visual `r` replace and case changes | **supported** | Visual `r{char}`, `u`, `U`, and `~` replace/change the selection in one transaction, including shifted terminal key events and Visual-line/block selections. |
+| Visual command line | **supported** | `:` captures the selection as `'<` and `'>`, opens Command mode with `'<,'>` prefilled, and supports normal command-line editing and cancellation. Character, line, and block selections produce line-oriented Ex ranges. |
 | Wrapped-line motions | **supported** | `gj`, `gk`, `g0`, `g^`, and `g$`; scroll and cursor state are window-local. |
 
 ## Search, substitution, history, and marks
@@ -55,7 +56,7 @@ the corresponding integration tests.
 |---|---|---|
 | Search | **supported** | `/`, `?`, incremental preview, `n`, `N`, `*`, wrapscan, smartcase/ignorecase, cancellation, and highlight clearing. |
 | Search syntax | **intentional difference** | Patterns use Rust `regex` syntax rather than Vim's regex dialect. |
-| Substitute ranges | **supported** | Current line, `%`, one-based numeric line/range, and `'<,'>` last-visual range. |
+| Substitute ranges | **supported** | Current line, `%`, one-based numeric line/range, and `'<,'>` last-Visual range. Visual `:` prefills that range, so substitution applies to every line touched by character, line, or block selections. |
 | Substitute flags | **supported** | `g`, `i`, and explicit `c` confirmation with `y/n/a/q/l`. All accepted replacements from one command form one transaction. |
 | Substitute syntax | **intentional difference** | Patterns and capture expansion use Rust `regex`; delimiters may be escaped. Vim magic modes, expression replacement, and omitted trailing delimiters are not supported. |
 | Undo/redo | **supported** | Linear, per-buffer transactions with dirty-state checkpoints. |

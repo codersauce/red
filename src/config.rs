@@ -3602,6 +3602,10 @@ input_position = "left"
         assert_eq!(normal_g.get("v"), restore);
         assert_eq!(visual_g.get("v"), restore);
         assert_eq!(
+            config.keys.visual.get(":"),
+            Some(&KeyAction::Single(Action::EnterMode(Mode::Command)))
+        );
+        assert_eq!(
             config.keys.visual.get(">"),
             Some(&KeyAction::Single(Action::IndentSelection(1)))
         );

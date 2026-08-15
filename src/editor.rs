@@ -930,6 +930,12 @@ pub struct SubstituteCommand {
     confirm: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExLineRange {
+    start_line: usize,
+    end_line: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// User response while confirming individual substitute matches.
 pub enum SubstituteDecision {
@@ -2197,6 +2203,11 @@ pub enum Action {
     ChangeCharsAtCursor(u16),
     JoinLines(u16),
     JoinLinesKeepSpaces(u16),
+    JoinLinesInRange {
+        start_line: usize,
+        end_line: usize,
+        keep_spaces: bool,
+    },
     ToggleCharCase(u16),
     StartCommentOperator(u16),
     ToggleCommentLines(u16),
@@ -12589,22 +12600,85 @@ impl Editor {
         false
     }
 
-    fn parse_substitute_command(&self, command: &str) -> anyhow::Result<Option<SubstituteCommand>> {
-        let Some(substitute_index) = command.find('s') else {
-            return Ok(None);
-        };
-        let range = &command[..substitute_index];
-        let valid_range = range.is_empty()
-            || range == "%"
-            || range == "'<,'>"
-            || range
-                .split(',')
-                .all(|value| !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()));
-        if !valid_range {
-            return Ok(None);
+    fn split_ex_line_range(command: &str) -> (&str, &str) {
+        if let Some(command) = command.strip_prefix('%') {
+            return ("%", command);
+        }
+        if let Some(command) = command.strip_prefix("'<,'>") {
+            return ("'<,'>", command);
         }
 
-        let body = &command[substitute_index + 1..];
+        let bytes = command.as_bytes();
+        let mut end = bytes
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if end == 0 {
+            return ("", command);
+        }
+        if bytes.get(end) == Some(&b',') {
+            let second_start = end + 1;
+            end = second_start
+                + bytes[second_start..]
+                    .iter()
+                    .take_while(|byte| byte.is_ascii_digit())
+                    .count();
+            if end == second_start {
+                return ("", command);
+            }
+        }
+
+        command.split_at(end)
+    }
+
+    fn resolve_ex_line_range(&self, range: &str, operation: &str) -> anyhow::Result<ExLineRange> {
+        let (start_line, end_line) = if range == "%" {
+            (0, self.last_navigable_line())
+        } else if range == "'<,'>" {
+            let buffer_id = self.current_buffer().id();
+            let start = self
+                .special_marks
+                .get(&(buffer_id, '<'))
+                .ok_or_else(|| anyhow::anyhow!("last visual range is not set"))?;
+            let end = self
+                .special_marks
+                .get(&(buffer_id, '>'))
+                .ok_or_else(|| anyhow::anyhow!("last visual range is not set"))?;
+            (
+                start.fallback.line.min(end.fallback.line),
+                start.fallback.line.max(end.fallback.line),
+            )
+        } else {
+            let lines = range
+                .split(',')
+                .map(str::parse::<usize>)
+                .collect::<Result<Vec<_>, _>>()?;
+            let start = lines[0];
+            let end = *lines.get(1).unwrap_or(&start);
+            anyhow::ensure!(
+                start > 0 && end > 0,
+                "{operation} line numbers are one-based"
+            );
+            anyhow::ensure!(start <= end, "{operation} range start exceeds its end");
+            (start - 1, end - 1)
+        };
+
+        anyhow::ensure!(
+            start_line <= self.last_navigable_line(),
+            "{operation} range starts past the end of the buffer"
+        );
+        Ok(ExLineRange {
+            start_line,
+            end_line: end_line.min(self.last_navigable_line()),
+        })
+    }
+
+    fn parse_substitute_command(&self, command: &str) -> anyhow::Result<Option<SubstituteCommand>> {
+        let (range, command) = Self::split_ex_line_range(command);
+        let command = command.trim_start();
+        let Some(body) = command.strip_prefix('s') else {
+            return Ok(None);
+        };
         let Some(delimiter) = body.chars().next() else {
             anyhow::bail!("substitute is missing a delimiter");
         };
@@ -12620,40 +12694,19 @@ impl Editor {
             "unsupported substitute flags: {flags}"
         );
 
-        let (start_line, end_line) = if range.is_empty() {
+        let range = if range.is_empty() {
             let line = self.buffer_line();
-            (line, line)
-        } else if range == "%" {
-            (0, self.last_navigable_line())
-        } else if range == "'<,'>" {
-            let buffer_id = self.current_buffer().id();
-            let start = self
-                .special_marks
-                .get(&(buffer_id, '<'))
-                .ok_or_else(|| anyhow::anyhow!("last visual range is not set"))?;
-            let end = self
-                .special_marks
-                .get(&(buffer_id, '>'))
-                .ok_or_else(|| anyhow::anyhow!("last visual range is not set"))?;
-            (start.fallback.line, end.fallback.line)
+            ExLineRange {
+                start_line: line,
+                end_line: line,
+            }
         } else {
-            let lines = range
-                .split(',')
-                .map(str::parse::<usize>)
-                .collect::<Result<Vec<_>, _>>()?;
-            let start = lines[0];
-            let end = *lines.get(1).unwrap_or(&start);
-            anyhow::ensure!(
-                start > 0 && end > 0,
-                "substitute line numbers are one-based"
-            );
-            anyhow::ensure!(start <= end, "substitute range start exceeds its end");
-            (start - 1, end - 1)
+            self.resolve_ex_line_range(range, "substitute")?
         };
 
         Ok(Some(SubstituteCommand {
-            start_line,
-            end_line,
+            start_line: range.start_line,
+            end_line: range.end_line,
             pattern,
             replacement,
             replace_all: flags.contains('g'),
@@ -12691,6 +12744,55 @@ impl Editor {
                 self.last_error = Some(error.to_string());
                 return Vec::new();
             }
+        }
+
+        let (range, ranged_command) = Self::split_ex_line_range(cmd);
+        let ranged_command = ranged_command.trim_start();
+        let (name, arguments) = ranged_command
+            .split_once(' ')
+            .unwrap_or((ranged_command, ""));
+        let keep_spaces = name.ends_with('!');
+        let name = name.strip_suffix('!').unwrap_or(name);
+        if matches!(name, "j" | "join") {
+            if range.is_empty() {
+                let count = if arguments.trim().is_empty() {
+                    2
+                } else if let Ok(count) = arguments.trim().parse::<u16>() {
+                    count.max(2)
+                } else {
+                    self.last_error = Some("join count must be a positive integer".to_string());
+                    return Vec::new();
+                };
+                return vec![if keep_spaces {
+                    Action::JoinLinesKeepSpaces(count)
+                } else {
+                    Action::JoinLines(count)
+                }];
+            }
+            if !arguments.trim().is_empty() {
+                self.last_error = Some("join count cannot be combined with a range".to_string());
+                return Vec::new();
+            }
+            let range = match self.resolve_ex_line_range(range, "join") {
+                Ok(range) => range,
+                Err(error) => {
+                    self.last_error = Some(error.to_string());
+                    return Vec::new();
+                }
+            };
+            return vec![Action::JoinLinesInRange {
+                start_line: range.start_line,
+                end_line: range.end_line,
+                keep_spaces,
+            }];
+        }
+        if !range.is_empty() {
+            self.last_error = Some(if ranged_command.is_empty() {
+                "line range requires a command".to_string()
+            } else {
+                format!("command {name:?} does not support a line range")
+            });
+            return Vec::new();
         }
 
         if matches!(cmd, "commands" | "command-palette") {
@@ -12759,23 +12861,7 @@ impl Editor {
         }
 
         let (name, arguments) = cmd.split_once(' ').unwrap_or((cmd, ""));
-        let keep_spaces = name.ends_with('!');
         let name = name.strip_suffix('!').unwrap_or(name);
-        if matches!(name, "j" | "join") {
-            let count = if arguments.trim().is_empty() {
-                2
-            } else if let Ok(count) = arguments.trim().parse::<u16>() {
-                count.max(2)
-            } else {
-                self.last_error = Some("join count must be a positive integer".to_string());
-                return Vec::new();
-            };
-            return vec![if keep_spaces {
-                Action::JoinLinesKeepSpaces(count)
-            } else {
-                Action::JoinLines(count)
-            }];
-        }
 
         if matches!(name, "syntax" | "syn" | "ft") {
             let mut arguments = arguments.split_whitespace();
@@ -15846,6 +15932,12 @@ impl Editor {
                 if matches!(new_mode, Mode::Command) {
                     self.reset_command_history_navigation();
                     self.reset_command_completion();
+                    if matches!(
+                        old_mode,
+                        Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+                    ) {
+                        self.command = "'<,'>".to_string();
+                    }
                 }
 
                 self.mode = *new_mode;
@@ -16105,6 +16197,20 @@ impl Editor {
             Action::JoinLines(count) | Action::JoinLinesKeepSpaces(count) => {
                 let keep_spaces = matches!(action, Action::JoinLinesKeepSpaces(_));
                 if self.join_lines(*count, keep_spaces) {
+                    self.notify_change(runtime).await?;
+                }
+                self.render(buffer)?;
+            }
+            Action::JoinLinesInRange {
+                start_line,
+                end_line,
+                keep_spaces,
+            } => {
+                if self.join_line_range(
+                    *start_line,
+                    (*end_line).max(start_line.saturating_add(1)),
+                    *keep_spaces,
+                ) {
                     self.notify_change(runtime).await?;
                 }
                 self.render(buffer)?;
@@ -21449,6 +21555,15 @@ impl Editor {
                 start.saturating_add(usize::from(count.max(2).saturating_sub(1))),
             )
         };
+        self.join_line_range(start_line, requested_last_line, keep_spaces)
+    }
+
+    fn join_line_range(
+        &mut self,
+        start_line: usize,
+        requested_last_line: usize,
+        keep_spaces: bool,
+    ) -> bool {
         let last_line = requested_last_line.min(self.last_navigable_line());
         if last_line <= start_line {
             return false;
