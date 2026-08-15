@@ -180,7 +180,7 @@ impl CompletionUI {
             .iter()
             .filter_map(|index| self.all_items.get(*index))
             .map(|item| {
-                let label_width = display_width(&item.label)
+                let label_width = display_width(Self::item_display_name(item))
                     + item
                         .label_details
                         .as_ref()
@@ -208,7 +208,8 @@ impl CompletionUI {
             return Some((0, 0, Vec::new()));
         }
 
-        let candidate = item.filter_text.as_deref().unwrap_or(&item.label);
+        let display_name = Self::item_display_name(item);
+        let candidate = item.filter_text.as_deref().unwrap_or(display_name);
         let (score, _) = matcher.fuzzy_indices(candidate, filter)?;
         let normalized_candidate = candidate.to_lowercase();
         let normalized_filter = filter.to_lowercase();
@@ -220,7 +221,7 @@ impl CompletionUI {
             1
         };
         let label_indices = matcher
-            .fuzzy_indices(&item.label, filter)
+            .fuzzy_indices(display_name, filter)
             .map(|(_, indices)| indices)
             .unwrap_or_default();
         Some((match_class, score, label_indices))
@@ -376,8 +377,13 @@ impl CompletionUI {
             .and_then(|details| details.description.as_deref())
     }
 
+    fn item_display_name(item: &CompletionResponseItem) -> &str {
+        item.label
+            .trim_start_matches(|character: char| character.is_whitespace() || character == '•')
+    }
+
     fn item_label(item: &CompletionResponseItem) -> String {
-        let mut label = item.label.clone();
+        let mut label = Self::item_display_name(item).to_string();
         if let Some(detail) = item
             .label_details
             .as_ref()
@@ -790,6 +796,35 @@ mod tests {
             .iter()
             .any(|(_, _, row, _)| row.contains("returns 世界")));
         assert_segments_within_popup(&ui, &rows);
+    }
+
+    #[test]
+    fn completion_removes_server_label_markers_before_rendering() {
+        let mut function = item("•assert", Some(CompletionItemKind::Function));
+        function.label_details = Some(crate::lsp::types::CompletionItemLabelDetails {
+            detail: Some("(e)".to_string()),
+            description: None,
+        });
+        let items = vec![
+            item("asteroids", Some(CompletionItemKind::Text)),
+            item(" Asteroid", Some(CompletionItemKind::Class)),
+            function,
+        ];
+
+        let mut ui = CompletionUI::new();
+        ui.show(items, 0, 0);
+        let rows = ui.render_completion();
+        let label_x = ui.x + 1 + LEFT_PADDING + ICON_COLUMN_WIDTH;
+
+        for expected in ["asteroids", "Asteroid", "assert(e)"] {
+            assert!(
+                rows.iter()
+                    .any(|(x, _, text, _)| { *x == label_x && text == expected }),
+                "{expected:?} did not render at the shared label column"
+            );
+        }
+        assert!(!rows.iter().any(|(_, _, text, _)| text.contains('•')));
+        assert!(!rows.iter().any(|(_, _, text, _)| text == " Asteroid"));
     }
 
     #[test]

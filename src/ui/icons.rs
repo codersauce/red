@@ -33,14 +33,14 @@ impl IconCatalog {
         }
     }
 
-    /// Preserves LSP completion's deliberately distinct, protocol-specific glyphs.
+    /// Resolves LSP completion kinds to single-column glyphs for aligned menu rows.
     #[must_use]
     pub(crate) fn completion(kind: &CompletionItemKind) -> IconSpec {
         let glyph = match kind {
             CompletionItemKind::Text => "≡",
             CompletionItemKind::Method => "ƒ",
             CompletionItemKind::Function => "λ",
-            CompletionItemKind::Constructor => "⚡",
+            CompletionItemKind::Constructor => "◇",
             CompletionItemKind::Field => "◆",
             CompletionItemKind::Variable => "𝑥",
             CompletionItemKind::Class => "○",
@@ -50,16 +50,16 @@ impl IconCatalog {
             CompletionItemKind::Unit => "∅",
             CompletionItemKind::Value => "=",
             CompletionItemKind::Enum => "ℰ",
-            CompletionItemKind::Keyword => "🔑",
+            CompletionItemKind::Keyword => "κ",
             CompletionItemKind::Snippet => "✂",
-            CompletionItemKind::Color => "🎨",
-            CompletionItemKind::File => "📄",
+            CompletionItemKind::Color => "◉",
+            CompletionItemKind::File => "▤",
             CompletionItemKind::Reference => "→",
-            CompletionItemKind::Folder => "📁",
+            CompletionItemKind::Folder => "▸",
             CompletionItemKind::EnumMember => "ℯ",
             CompletionItemKind::Constant => "π",
-            CompletionItemKind::Struct => "⚪",
-            CompletionItemKind::Event => "⚡",
+            CompletionItemKind::Struct => "▦",
+            CompletionItemKind::Event => "↯",
             CompletionItemKind::Operator => "±",
             CompletionItemKind::TypeParameter => "𝑇",
         };
@@ -69,7 +69,9 @@ impl IconCatalog {
 
 #[cfg(test)]
 mod tests {
-    use crate::{config::PickerIconStyle, lsp::types::CompletionItemKind};
+    use crate::{
+        config::PickerIconStyle, lsp::types::CompletionItemKind, unicode_utils::display_width,
+    };
 
     use super::IconCatalog;
 
@@ -94,10 +96,10 @@ mod tests {
     }
 
     #[test]
-    fn lsp_completion_retains_its_protocol_specific_file_icon() {
+    fn lsp_completion_uses_a_compact_file_icon() {
         assert_eq!(
             IconCatalog::completion(&CompletionItemKind::File).glyph,
-            "📄"
+            "▤"
         );
     }
 
@@ -107,5 +109,41 @@ mod tests {
             IconCatalog::completion(&CompletionItemKind::Text).glyph,
             "≡"
         );
+    }
+
+    #[test]
+    fn every_lsp_completion_icon_occupies_one_terminal_column() {
+        let kinds = [
+            CompletionItemKind::Text,
+            CompletionItemKind::Method,
+            CompletionItemKind::Function,
+            CompletionItemKind::Constructor,
+            CompletionItemKind::Field,
+            CompletionItemKind::Variable,
+            CompletionItemKind::Class,
+            CompletionItemKind::Interface,
+            CompletionItemKind::Module,
+            CompletionItemKind::Property,
+            CompletionItemKind::Unit,
+            CompletionItemKind::Value,
+            CompletionItemKind::Enum,
+            CompletionItemKind::Keyword,
+            CompletionItemKind::Snippet,
+            CompletionItemKind::Color,
+            CompletionItemKind::File,
+            CompletionItemKind::Reference,
+            CompletionItemKind::Folder,
+            CompletionItemKind::EnumMember,
+            CompletionItemKind::Constant,
+            CompletionItemKind::Struct,
+            CompletionItemKind::Event,
+            CompletionItemKind::Operator,
+            CompletionItemKind::TypeParameter,
+        ];
+
+        for kind in kinds {
+            let glyph = IconCatalog::completion(&kind).glyph;
+            assert_eq!(display_width(glyph), 1, "{kind:?} uses {glyph:?}");
+        }
     }
 }
