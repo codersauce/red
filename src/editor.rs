@@ -2538,6 +2538,7 @@ pub struct HighlightSpan {
 /// of re-parsing per scrolled line.
 #[derive(Debug, Clone)]
 struct ViewportHighlightEntry {
+    buffer_id: BufferId,
     revision: u64,
     file: Option<String>,
     language_id: Option<String>,
@@ -2556,9 +2557,9 @@ struct ViewportHighlightEntry {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct LayoutCacheKey {
     buffer_index: usize,
+    buffer_id: BufferId,
     revision: u64,
-    /// Distinguishes different buffers reusing an index (`revision` restarts
-    /// at 0 for a fresh buffer), mirroring `HighlightCacheKey`.
+    /// Tracks filename-dependent layout settings when a buffer is renamed.
     file: Option<String>,
     vtop: usize,
     vleft: usize,
@@ -5280,6 +5281,7 @@ impl Editor {
         let break_indent = self.break_indent_options_for_buffer_index(window.buffer_index);
         let key = LayoutCacheKey {
             buffer_index: window.buffer_index,
+            buffer_id: buffer.id(),
             revision: buffer.revision(),
             file: buffer.file.clone(),
             vtop: window.vtop,
@@ -5676,6 +5678,7 @@ impl Editor {
         let Some(buffer) = self.buffer_manager.get(buffer_index) else {
             return Ok(Vec::new());
         };
+        let buffer_id = buffer.id();
         let revision = buffer.revision();
         let file = buffer.file.clone();
         let language_id = self.highlight_language_id_for_buffer_index(buffer_index);
@@ -5690,7 +5693,10 @@ impl Editor {
 
         let cached = self.highlight_cache.get(&buffer_index);
         let same_document = cached.is_some_and(|entry| {
-            entry.revision == revision && entry.file == file && entry.language_id == language_id
+            entry.buffer_id == buffer_id
+                && entry.revision == revision
+                && entry.file == file
+                && entry.language_id == language_id
         });
         let covered = same_document
             && cached.is_some_and(|entry| {
@@ -5741,6 +5747,7 @@ impl Editor {
             self.highlight_cache.insert(
                 buffer_index,
                 ViewportHighlightEntry {
+                    buffer_id,
                     revision,
                     file,
                     language_id,
@@ -29646,6 +29653,24 @@ builtin = "rust"
         editor.current_buffer_mut().insert_str(0, 10, "// ");
         let after = editor.viewport_highlight_spans(0, 10, 20).unwrap();
         assert_ne!(span_shape(&before), span_shape(&after));
+    }
+
+    #[test]
+    fn viewport_highlight_cache_distinguishes_reopened_buffers_with_the_same_name() {
+        let mut editor = rust_test_editor(1, 120, 22);
+        let original = editor.viewport_highlight_spans(0, 0, 1).unwrap();
+        let name = editor.current_buffer().file.clone();
+        let replacement = "// the replacement is entirely a comment\n".to_string();
+
+        editor.buffer_manager[0] = Buffer::new(name.clone(), replacement.clone());
+        let reopened = editor.viewport_highlight_spans(0, 0, 1).unwrap();
+
+        let mut fresh = rust_test_editor(1, 120, 22);
+        fresh.buffer_manager[0] = Buffer::new(name, replacement);
+        let expected = fresh.viewport_highlight_spans(0, 0, 1).unwrap();
+
+        assert_ne!(span_shape(&original), span_shape(&reopened));
+        assert_eq!(span_shape(&reopened), span_shape(&expected));
     }
 
     #[test]

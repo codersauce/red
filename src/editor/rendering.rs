@@ -3617,6 +3617,22 @@ mod tests {
     }
 
     #[test]
+    fn reopening_a_shorter_commit_buffer_does_not_reuse_stale_layout_bytes() {
+        let name = "[Git Commit].gitcommit";
+        let mut editor = rendering_test_editor(Buffer::new(Some(name.to_string()), "x".repeat(61)));
+        let mut buffer = RenderBuffer::new(60, 12, &Style::default());
+
+        editor.render(&mut buffer).unwrap();
+        editor.buffer_manager[0] = Buffer::new(Some(name.to_string()), "y".repeat(60));
+
+        editor.render(&mut buffer).unwrap();
+
+        assert!(rendered_rows(&buffer)
+            .iter()
+            .any(|row| row.contains("yyyy")));
+    }
+
+    #[test]
     fn edited_window_rows_preserve_completion_dialog() {
         let source = Buffer::new(None, "hello\nworld\n".to_string());
         let mut editor = rendering_test_editor(source);
