@@ -13784,6 +13784,10 @@ impl Editor {
     }
 
     fn handle_visual_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        if self.pending_replace {
+            return self.handle_replace_event(ev);
+        }
+
         if let Some(action) = self.handle_character_motion_event(ev) {
             return Some(action);
         }
@@ -13925,6 +13929,10 @@ impl Editor {
     }
 
     fn handle_normal_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        if self.pending_replace {
+            return self.handle_replace_event(ev);
+        }
+
         if let Some(action) = self.handle_operator_event(ev) {
             return Some(action);
         }
