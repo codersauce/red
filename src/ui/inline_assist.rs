@@ -12,7 +12,7 @@ use crate::{
 use super::{
     dialog::{BorderStyle, Dialog, SurfaceRole},
     first_prompt_line,
-    geometry::anchored_popup_geometry,
+    geometry::{anchored_popup_geometry, anchored_popup_geometry_avoiding_rows},
     spinner_frame, Component, PromptBuffer, SPINNER_FRAME_INTERVAL_MS,
 };
 
@@ -31,6 +31,7 @@ pub struct InlineAssistPopup {
     prompt: PromptBuffer,
     anchor: (usize, usize),
     viewport_y_offset: usize,
+    avoid_rows: Option<(usize, usize)>,
     dialog: Dialog,
     style: Style,
     theme: Theme,
@@ -39,6 +40,15 @@ pub struct InlineAssistPopup {
 
 impl InlineAssistPopup {
     pub fn new(editor: &Editor, scope: impl Into<String>, state: InlineAssistPopupState) -> Self {
+        Self::new_avoiding_rows(editor, scope, state, None)
+    }
+
+    pub(crate) fn new_avoiding_rows(
+        editor: &Editor,
+        scope: impl Into<String>,
+        state: InlineAssistPopupState,
+        avoid_rows: Option<(usize, usize)>,
+    ) -> Self {
         let scope = scope.into();
         let initial = match &state {
             InlineAssistPopupState::Prompt { initial, .. } => initial.clone(),
@@ -50,8 +60,9 @@ impl InlineAssistPopup {
         let viewport_width = editor.vwidth();
         let viewport_height = editor.vheight().saturating_add(viewport_y_offset);
         let width = viewport_width.saturating_sub(2).clamp(1, MAX_WIDTH);
-        let (x, y, height) = anchored_popup_geometry(
+        let (x, y, height) = Self::geometry(
             anchor,
+            avoid_rows,
             viewport_width,
             viewport_height,
             width,
@@ -74,6 +85,7 @@ impl InlineAssistPopup {
             prompt: PromptBuffer::new(&initial),
             anchor,
             viewport_y_offset,
+            avoid_rows,
             dialog,
             style,
             theme: editor.theme.clone(),
@@ -90,6 +102,29 @@ impl InlineAssistPopup {
         }
     }
 
+    fn geometry(
+        anchor: (usize, usize),
+        avoid_rows: Option<(usize, usize)>,
+        viewport_width: usize,
+        viewport_height: usize,
+        width: usize,
+        height: usize,
+    ) -> (usize, usize, usize) {
+        avoid_rows.map_or_else(
+            || anchored_popup_geometry(anchor, viewport_width, viewport_height, width, height),
+            |avoid_rows| {
+                anchored_popup_geometry_avoiding_rows(
+                    anchor,
+                    avoid_rows,
+                    viewport_width,
+                    viewport_height,
+                    width,
+                    height,
+                )
+            },
+        )
+    }
+
     fn insert(&mut self, text: &str) {
         self.prompt.insert(&first_prompt_line(text));
     }
@@ -101,8 +136,9 @@ impl InlineAssistPopup {
     fn reflow(&mut self, viewport_width: usize, viewport_height: usize) {
         let viewport_height = viewport_height.saturating_add(self.viewport_y_offset);
         let width = viewport_width.saturating_sub(2).clamp(1, MAX_WIDTH);
-        let (x, y, height) = anchored_popup_geometry(
+        let (x, y, height) = Self::geometry(
             self.anchor,
+            self.avoid_rows,
             viewport_width,
             viewport_height,
             width,
@@ -412,5 +448,24 @@ mod tests {
                 Some(KeyAction::Single(action))
             );
         }
+    }
+
+    #[test]
+    fn popup_avoids_the_rendered_target_rows() {
+        let editor = editor();
+        let avoid_rows = (4, 7);
+        let popup = InlineAssistPopup::new_avoiding_rows(
+            &editor,
+            "lines 5–8 selection",
+            InlineAssistPopupState::Applied,
+            Some(avoid_rows),
+        );
+        let popup_last_row = popup
+            .dialog
+            .y
+            .saturating_add(popup.dialog.height)
+            .saturating_add(1);
+
+        assert!(popup_last_row < avoid_rows.0 || popup.dialog.y > avoid_rows.1);
     }
 }

@@ -6830,6 +6830,18 @@ impl Editor {
         self.current_dialog = None;
     }
 
+    fn inline_assist_popup(
+        &self,
+        scope: impl Into<String>,
+        state: InlineAssistPopupState,
+    ) -> InlineAssistPopup {
+        let avoid_rows = self
+            .inline_assist
+            .as_ref()
+            .and_then(|assist| self.render_text_range_rows(assist.range));
+        InlineAssistPopup::new_avoiding_rows(self, scope, state, avoid_rows)
+    }
+
     async fn apply_inline_replacement(
         &mut self,
         request_id: &str,
@@ -6922,11 +6934,9 @@ impl Editor {
             .as_ref()
             .map(|assist| assist.scope.clone())
             .unwrap_or_else(|| "selection".to_string());
-        self.current_dialog = Some(Box::new(InlineAssistPopup::new(
-            self,
-            scope,
-            InlineAssistPopupState::Applied,
-        )));
+        self.current_dialog = Some(Box::new(
+            self.inline_assist_popup(scope, InlineAssistPopupState::Applied),
+        ));
         self.render(render_buffer)?;
         Ok(())
     }
@@ -7886,8 +7896,7 @@ impl Editor {
                             (assist.request_id.as_deref() == Some(request_id.as_str()))
                                 .then(|| assist.scope.clone())
                         }) {
-                            self.current_dialog = Some(Box::new(InlineAssistPopup::new(
-                                self,
+                            self.current_dialog = Some(Box::new(self.inline_assist_popup(
                                 scope,
                                 InlineAssistPopupState::Failed(error.to_string()),
                             )));
@@ -7915,11 +7924,11 @@ impl Editor {
                         }
                     });
                     if let Some(scope) = scope {
-                        self.current_dialog = Some(Box::new(InlineAssistPopup::new(
-                            self,
-                            scope,
-                            InlineAssistPopupState::Failed(message),
-                        )));
+                        self.current_dialog =
+                            Some(Box::new(self.inline_assist_popup(
+                                scope,
+                                InlineAssistPopupState::Failed(message),
+                            )));
                         self.render(buffer)?;
                     }
                     continue;
@@ -8054,11 +8063,11 @@ impl Editor {
                 if let Some(assist) = self.inline_assist.as_mut() {
                     assist.session_id = None;
                 }
-                self.current_dialog = Some(Box::new(InlineAssistPopup::new(
-                    self,
-                    scope,
-                    InlineAssistPopupState::Failed(message.clone()),
-                )));
+                self.current_dialog =
+                    Some(Box::new(self.inline_assist_popup(
+                        scope,
+                        InlineAssistPopupState::Failed(message.clone()),
+                    )));
                 self.render(buffer)?;
             }
             if let Some(conversation) = self.agent_manager.conversation_snapshot() {
@@ -15447,8 +15456,7 @@ impl Editor {
                             session_id: None,
                             transaction_id: None,
                         });
-                        self.current_dialog = Some(Box::new(InlineAssistPopup::new(
-                            self,
+                        self.current_dialog = Some(Box::new(self.inline_assist_popup(
                             scope,
                             InlineAssistPopupState::Prompt {
                                 initial: String::new(),
@@ -15486,8 +15494,7 @@ impl Editor {
                 };
                 let cwd = get_workspace_path();
                 if let Err(error) = self.ensure_agent_bridge(&cwd) {
-                    self.current_dialog = Some(Box::new(InlineAssistPopup::new(
-                        self,
+                    self.current_dialog = Some(Box::new(self.inline_assist_popup(
                         scope,
                         InlineAssistPopupState::Failed(error.to_string()),
                     )));
@@ -15525,17 +15532,14 @@ impl Editor {
                     if let Some(assist) = self.inline_assist.as_mut() {
                         assist.session_id = None;
                     }
-                    self.current_dialog = Some(Box::new(InlineAssistPopup::new(
-                        self,
+                    self.current_dialog = Some(Box::new(self.inline_assist_popup(
                         scope,
                         InlineAssistPopupState::Failed(error.to_string()),
                     )));
                 } else {
-                    self.current_dialog = Some(Box::new(InlineAssistPopup::new(
-                        self,
-                        scope,
-                        InlineAssistPopupState::Working,
-                    )));
+                    self.current_dialog = Some(Box::new(
+                        self.inline_assist_popup(scope, InlineAssistPopupState::Working),
+                    ));
                 }
                 self.render(buffer)?;
             }
@@ -15551,11 +15555,9 @@ impl Editor {
                     .as_ref()
                     .map(|assist| assist.scope.clone())
                 {
-                    self.current_dialog = Some(Box::new(InlineAssistPopup::new(
-                        self,
-                        scope,
-                        InlineAssistPopupState::Applied,
-                    )));
+                    self.current_dialog = Some(Box::new(
+                        self.inline_assist_popup(scope, InlineAssistPopupState::Applied),
+                    ));
                 } else {
                     self.current_dialog = None;
                 }
@@ -15597,8 +15599,7 @@ impl Editor {
                     .as_ref()
                     .map(|assist| (assist.scope.clone(), assist.transaction_id.is_some()))
                 {
-                    self.current_dialog = Some(Box::new(InlineAssistPopup::new(
-                        self,
+                    self.current_dialog = Some(Box::new(self.inline_assist_popup(
                         scope,
                         InlineAssistPopupState::Prompt {
                             initial: String::new(),
