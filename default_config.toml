@@ -376,6 +376,8 @@ Esc = { EnterMode = "Normal" }
 "o" = "OnlyWindow"
 
 [keys.normal." "]
+"C" = "AddSampleInlineComment"
+"X" = "ClearInlineComments"
 " " = "NextBuffer"
 "a" = [ "MoveToTop", { EnterMode = "VisualLine" }, "MoveToBottom" ]
 "A" = { PluginCommand = "Agent" }

@@ -19,6 +19,7 @@ mod agent_manager;
 mod buffer_manager;
 mod diagnostics_picker;
 mod display_layout;
+mod inline_comments;
 mod lsp_coordinator;
 #[cfg(test)]
 mod navigation_perf_tests;
@@ -2097,6 +2098,10 @@ pub enum Action {
     RestoreLastVisualSelection,
     /// Opens a bounded inline edit for the current line or visual selection.
     InlineAssist,
+    /// Adds a temporary sample annotation above the current source line.
+    AddSampleInlineComment,
+    /// Clears the current buffer's temporary inline annotations.
+    ClearInlineComments,
     /// Submits the current inline instruction.
     SubmitInlineAssist(String),
     /// Cancels and destroys the ephemeral inline session.
@@ -2798,6 +2803,9 @@ pub struct Editor {
 
     /// One editor-owned bounded inline edit, including stale-response guards.
     inline_assist: Option<InlineAssistSession>,
+
+    /// UI-prototype annotations; never serialized into source or undo history.
+    inline_comments: Vec<inline_comments::InlineComment>,
 
     /// LSP client for code intelligence features
     lsp: Box<dyn LspClient>,
@@ -4160,6 +4168,7 @@ impl Editor {
             lsp_coordinator,
             agent_manager,
             inline_assist: None,
+            inline_comments: Vec::new(),
             lsp,
             config,
             config_diagnostics: Vec::new(),
@@ -5322,7 +5331,7 @@ impl Editor {
 
     fn layout_for_window(&self, window: &crate::window::Window) -> std::sync::Arc<DisplayLayout> {
         let Some(buffer) = self.buffer_manager.get(window.buffer_index) else {
-            return std::sync::Arc::new(DisplayLayout { rows: Vec::new() });
+            return std::sync::Arc::new(DisplayLayout::default());
         };
         let mut line_count = buffer.navigable_line_count();
         let mut line_count_override = None;
@@ -5359,19 +5368,37 @@ impl Editor {
             .filter_map(|line| buffer.get(line))
             .collect::<Vec<_>>();
 
-        let layout = std::sync::Arc::new(layout_lines(
-            &lines,
-            line_count,
-            LayoutConfig {
-                content_width: self.window_content_width(window),
-                height: self.window_content_height(window),
-                wrap: window.wrap,
-                vtop: window.vtop,
-                vleft: window.vleft,
-                skipcol: window.skipcol,
-                break_indent,
-            },
-        ));
+        let comments = self
+            .inline_comments
+            .iter()
+            .filter(|comment| comment.anchor.buffer_id == buffer.id())
+            .map(|comment| {
+                (
+                    buffer.char_idx_to_position(comment.anchor.char_index).line,
+                    comment.message.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let layout = std::sync::Arc::new(
+            layout_lines(
+                &lines,
+                line_count,
+                LayoutConfig {
+                    content_width: self.window_content_width(window),
+                    height: self.window_content_height(window),
+                    wrap: window.wrap,
+                    vtop: window.vtop,
+                    vleft: window.vleft,
+                    skipcol: window.skipcol,
+                    break_indent,
+                },
+            )
+            .with_inline_comments(
+                &comments,
+                self.window_content_width(window),
+                self.window_content_height(window),
+            ),
+        );
 
         let mut cache = self.layout_cache.borrow_mut();
         if cache.len() >= 32 {
@@ -6643,21 +6670,21 @@ impl Editor {
 
     fn check_bounds(&mut self) -> bool {
         let old_position = (self.cx, self.cy, self.vtop);
+        let has_comments = self.has_inline_comments(self.current_buffer().id());
         let last_line = if self.is_insert() {
             self.current_buffer().len()
         } else {
             self.last_navigable_line()
         };
         let viewport_height = self.vheight().max(1);
-        let max_vtop = if self.wrap {
+        let max_vtop = if self.wrap || has_comments {
             last_line
         } else {
             last_line.saturating_sub(viewport_height.saturating_sub(1))
         };
 
-        self.vtop = self.vtop.min(max_vtop);
-
         let buffer_line = (self.vtop + self.cy).min(last_line);
+        self.vtop = self.vtop.min(max_vtop);
         self.cy = buffer_line
             .saturating_sub(self.vtop)
             .min(viewport_height.saturating_sub(1));
@@ -6683,13 +6710,18 @@ impl Editor {
             }
 
             scrolloff_vtop = scrolloff_vtop.min(max_vtop);
-            if !self.wrap || self.buffer_line_visible_from(scrolloff_vtop, buffer_line) {
+            if (!self.wrap && !has_comments)
+                || self.buffer_line_visible_from(scrolloff_vtop, buffer_line)
+            {
                 self.vtop = scrolloff_vtop;
                 self.cy = buffer_line.saturating_sub(self.vtop);
             }
         }
 
         self.clamp_cursor_to_line();
+        if has_comments {
+            self.ensure_inline_comment_cursor_visible();
+        }
         old_position != (self.cx, self.cy, self.vtop)
     }
 
@@ -16064,7 +16096,12 @@ impl Editor {
                     return Ok(false);
                 };
                 let layout = self.layout_for_window(&window);
-                if let Some(segment) = layout.rows.get(layout.rows.len().saturating_sub(1) / 2) {
+                let middle = layout.screen_height().saturating_sub(1) / 2;
+                if let Some(segment) = layout
+                    .rows
+                    .iter()
+                    .min_by_key(|segment| segment.row.abs_diff(middle))
+                {
                     self.move_to_text_position(TextPosition::new(segment.line, 0));
                     self.move_to_first_non_blank_on_current_line();
                     self.finish_cursor_motion(buffer, false)?;
@@ -16155,6 +16192,20 @@ impl Editor {
                     self.last_error = Some("last visual selection is not set".to_string());
                     self.draw_commandline(buffer);
                 }
+            }
+            Action::AddSampleInlineComment => {
+                add_to_history = false;
+                if self.is_normal() {
+                    self.add_sample_inline_comment();
+                    self.last_error =
+                        Some("sample comment · Space C replace · Space X clear".to_string());
+                    self.render(buffer)?;
+                }
+            }
+            Action::ClearInlineComments => {
+                add_to_history = false;
+                self.clear_inline_comments();
+                self.render(buffer)?;
             }
             Action::InlineAssist => {
                 add_to_history = false;
@@ -18377,7 +18428,8 @@ impl Editor {
                 let scroll_lines = self.config.mouse_scroll_lines.unwrap_or(3);
                 let viewport_height = self.vheight().max(1);
                 let last_line = self.last_navigable_line();
-                let max_vtop = if self.wrap {
+                let max_vtop = if self.wrap || self.has_inline_comments(self.current_buffer().id())
+                {
                     last_line
                 } else {
                     last_line.saturating_sub(viewport_height.saturating_sub(1))
@@ -21426,6 +21478,8 @@ impl Editor {
                                         ),
                                         segment.line,
                                     )
+                                } else if let Some(comment) = layout.inline_comment_row(local_y) {
+                                    (0, comment.line)
                                 } else {
                                     (content_x, window_vtop + local_y)
                                 };
@@ -21771,6 +21825,24 @@ impl Editor {
 
     fn update_anchors_for_edit(&mut self, edit: AppliedTextEdit) {
         let buffer_id = self.current_buffer().id();
+        self.inline_comments.retain_mut(|comment| {
+            if comment.anchor.buffer_id != buffer_id {
+                return true;
+            }
+            // This UI prototype drops comments whose anchor is replaced.
+            if edit.start_char < edit.end_char
+                && (edit.start_char..edit.end_char).contains(&comment.anchor.char_index)
+            {
+                return false;
+            }
+            Self::transform_anchor_for_edit(
+                &mut comment.anchor,
+                edit.start_char,
+                edit.end_char,
+                edit.new_char_len,
+            );
+            true
+        });
         if let Some(marks) = self.local_marks.get_mut(&buffer_id) {
             for anchor in marks.values_mut() {
                 Self::transform_anchor_for_edit(

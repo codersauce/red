@@ -12,11 +12,86 @@
 
 use unicode_segmentation::UnicodeSegmentation as _;
 
-use crate::unicode_utils::{char_display_width, display_width, trim_line_ending};
+use crate::unicode_utils::{
+    char_display_width, display_width, trim_line_ending, truncate_display_width,
+};
 
 /// Minimum number of text columns kept on a wrapped row after applying
 /// break-indent, mirroring vim's `breakindentopt` `min:20` default.
 const BREAK_INDENT_MIN_TEXT_WIDTH: usize = 20;
+const MAX_INLINE_COMMENT_TEXT_ROWS: usize = 4;
+const INLINE_COMMENT_HORIZONTAL_PADDING: usize = 2;
+
+pub(super) fn wrap_inline_comment(message: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    textwrap::wrap(
+        message,
+        textwrap::Options::new(width)
+            .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit)
+            .word_splitter(textwrap::WordSplitter::NoHyphenation),
+    )
+    .into_iter()
+    .map(|row| row.into_owned())
+    .collect()
+}
+
+/// Geometry shared by viewport composition and cursor visibility checks.
+#[derive(Debug, Default)]
+pub(super) struct InlineCommentBlock {
+    pub rows: Vec<InlineCommentContent>,
+    pub width: usize,
+    pub text_offset: usize,
+}
+
+pub(super) fn inline_comment_block(
+    message: &str,
+    width: usize,
+    available_rows: usize,
+) -> InlineCommentBlock {
+    if width == 0 || available_rows == 0 {
+        return InlineCommentBlock::default();
+    }
+    // Tiny splits shed padding before sacrificing the source line or text.
+    let horizontal_padding = INLINE_COMMENT_HORIZONTAL_PADDING.min(width.saturating_sub(1) / 2);
+    let vertical_padding = usize::from(available_rows >= 3);
+    let text_width = width - horizontal_padding * 2;
+    let limit = MAX_INLINE_COMMENT_TEXT_ROWS.min(available_rows - vertical_padding * 2);
+    let wrapped = wrap_inline_comment(message, text_width);
+    let truncated = wrapped.len() > limit;
+    let text_rows = wrapped
+        .into_iter()
+        .take(limit)
+        .enumerate()
+        .map(|(index, text)| {
+            if truncated && index + 1 == limit {
+                format!("{}…", truncate_display_width(&text, text_width - 1))
+            } else {
+                truncate_display_width(&text, text_width)
+            }
+        })
+        .collect::<Vec<_>>();
+    let block_width = text_rows
+        .iter()
+        .map(|text| display_width(text))
+        .max()
+        .unwrap_or(0)
+        + horizontal_padding * 2;
+    let mut rows = Vec::with_capacity(text_rows.len() + vertical_padding * 2);
+    if vertical_padding > 0 {
+        rows.push(InlineCommentContent::TopEdge);
+    }
+    rows.extend(text_rows.into_iter().map(InlineCommentContent::Text));
+    if vertical_padding > 0 {
+        rows.push(InlineCommentContent::BottomEdge);
+    }
+    InlineCommentBlock {
+        rows,
+        width: block_width,
+        text_offset: horizontal_padding,
+    }
+}
 
 /// How wrapped continuation rows are indented, mirroring vim's
 /// 'breakindent' option: continuations start with a blank virtual indent
@@ -119,14 +194,106 @@ impl LineSegment {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Content or a half-height edge in a display-only comment block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InlineCommentContent {
+    TopEdge,
+    Text(String),
+    BottomEdge,
+}
+
+impl InlineCommentContent {
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Text(text) => text,
+            Self::TopEdge | Self::BottomEdge => "",
+        }
+    }
+}
+
+/// A non-editable screen row attached immediately above a source line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineCommentRow {
+    pub line: usize,
+    pub row: usize,
+    pub content: InlineCommentContent,
+    pub block_width: usize,
+    pub text_offset: usize,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct DisplayLayout {
+    /// Source segments only. `segment.row` is the physical screen row and may
+    /// have gaps occupied by inline comments.
     pub rows: Vec<LineSegment>,
+    pub inline_comments: Vec<InlineCommentRow>,
 }
 
 impl DisplayLayout {
     pub fn row(&self, row: usize) -> Option<&LineSegment> {
-        self.rows.get(row)
+        if self.inline_comments.is_empty() {
+            return self.rows.get(row);
+        }
+        self.rows
+            .binary_search_by_key(&row, |segment| segment.row)
+            .ok()
+            .map(|index| &self.rows[index])
+    }
+
+    pub fn inline_comment_row(&self, row: usize) -> Option<&InlineCommentRow> {
+        self.inline_comments
+            .binary_search_by_key(&row, |comment| comment.row)
+            .ok()
+            .map(|index| &self.inline_comments[index])
+    }
+
+    pub fn screen_height(&self) -> usize {
+        self.rows.last().map_or(0, |segment| segment.row + 1).max(
+            self.inline_comments
+                .last()
+                .map_or(0, |comment| comment.row + 1),
+        )
+    }
+
+    /// Inserts bounded display-only comments without changing syntax offsets
+    /// or the source-only sequence used by Vim motions.
+    pub fn with_inline_comments(
+        self,
+        comments: &[(usize, &str)],
+        width: usize,
+        height: usize,
+    ) -> Self {
+        if comments.is_empty() || width == 0 || height == 0 {
+            return self;
+        }
+        let mut layout = Self::default();
+        let mut row = 0;
+        for mut segment in self.rows {
+            if row >= height {
+                break;
+            }
+            if segment.first_segment {
+                for &(_, message) in comments.iter().filter(|(line, _)| *line == segment.line) {
+                    // Always leave room for the source line itself.
+                    let block =
+                        inline_comment_block(message, width, height.saturating_sub(row + 1));
+                    for content in block.rows {
+                        layout.inline_comments.push(InlineCommentRow {
+                            line: segment.line,
+                            row,
+                            content,
+                            block_width: block.width,
+                            text_offset: block.text_offset,
+                        });
+                        row += 1;
+                    }
+                }
+            }
+            segment.row = row;
+            layout.rows.push(segment);
+            row += 1;
+        }
+        layout
     }
 
     pub fn segment_for_cursor(&self, line: usize, display_col: usize) -> Option<&LineSegment> {
@@ -150,7 +317,7 @@ pub struct LayoutConfig {
 
 pub fn layout_lines(lines: &[String], line_count: usize, config: LayoutConfig) -> DisplayLayout {
     if config.content_width == 0 || config.height == 0 {
-        return DisplayLayout { rows: Vec::new() };
+        return DisplayLayout::default();
     }
     let mut rows = Vec::with_capacity(config.height);
 
@@ -206,7 +373,10 @@ pub fn layout_lines(lines: &[String], line_count: usize, config: LayoutConfig) -
         line_index += 1;
     }
 
-    DisplayLayout { rows }
+    DisplayLayout {
+        rows,
+        ..DisplayLayout::default()
+    }
 }
 
 pub fn wrap_line_segments(

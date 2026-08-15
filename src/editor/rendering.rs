@@ -46,8 +46,10 @@ use crate::{
 
 use super::{
     adjust_color_brightness, diagnostic_foreground, diagnostic_priority,
-    display_layout::DisplayLayout, render_buffer::Change, Editor, Mode, Point, Rect, RenderBuffer,
-    StatuslineGitChanges, StyleCursor, GUTTER_SIGN_COLUMN_WIDTH, MAX_HIGHLIGHT_SLICE_BYTES,
+    display_layout::{DisplayLayout, InlineCommentContent},
+    render_buffer::Change,
+    Editor, Mode, Point, Rect, RenderBuffer, StatuslineGitChanges, StyleCursor,
+    GUTTER_SIGN_COLUMN_WIDTH, MAX_HIGHLIGHT_SLICE_BYTES,
 };
 
 fn diagnostic_row(diagnostics: &[&Diagnostic], available_width: usize) -> Option<String> {
@@ -1455,6 +1457,26 @@ impl Editor {
         line_count: usize,
         row: usize,
     ) {
+        if layout.inline_comment_row(row).is_some() {
+            let style = &self.theme.style;
+            let term_y = self.window_to_terminal_y(window, row);
+            let width = self.gutter_width_for_window(window) + 1;
+            buffer.fill_rect(window.position.x, term_y, width, 1, ' ', style, &self.theme);
+            if width > 1 {
+                let guide = if self.config.window_borders_ascii {
+                    ":"
+                } else {
+                    "┆"
+                };
+                buffer.set_text(
+                    window.position.x + width - 2,
+                    term_y,
+                    guide,
+                    &self.theme.inline_comment_guide_style(),
+                );
+            }
+            return;
+        }
         let number_width = self.line_number_width_for_window(window);
         let gutter_style = self.theme.gutter_style.fallback_bg(&self.theme.style);
         let segment = layout.row(row).filter(|segment| segment.first_segment);
@@ -1539,6 +1561,11 @@ impl Editor {
         for &row in local_rows {
             let term_y = self.window_to_terminal_y(window, row);
             let term_x = self.window_to_terminal_x(window, content_start);
+
+            if let Some(comment) = layout.inline_comment_row(row) {
+                self.render_inline_comment_row_in_window(buffer, window, comment);
+                continue;
+            }
             self.fill_line_in_window(buffer, term_x, term_y, content_width, &theme_style);
 
             let Some(segment) = layout.row(row) else {
@@ -2072,13 +2099,62 @@ impl Editor {
             );
         }
 
-        for y in layout.rows.len()..self.window_content_height(window) {
+        for comment in &layout.inline_comments {
+            self.render_inline_comment_row_in_window(buffer, window, comment);
+        }
+
+        for y in layout.screen_height()..self.window_content_height(window) {
             let term_y = self.window_to_terminal_y(window, y);
             let term_x = self.window_to_terminal_x(window, gutter_width + 1);
             self.fill_line_in_window(buffer, term_x, term_y, content_width, &theme_style);
         }
 
         Ok(())
+    }
+
+    fn render_inline_comment_row_in_window(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        window: &crate::window::Window,
+        comment: &super::display_layout::InlineCommentRow,
+    ) {
+        let term_y = self.window_to_terminal_y(window, comment.row);
+        let content_start = self.gutter_width_for_window(window) + 1;
+        let term_x = self.window_to_terminal_x(window, content_start);
+        let content_width = self.window_content_width(window);
+        let editor_style = self.theme.style.clone();
+        let comment_style = self.theme.inline_comment_style();
+        let block_width = comment.block_width.min(content_width);
+        self.fill_line_in_window(buffer, term_x, term_y, content_width, &editor_style);
+        let half_block = match comment.content {
+            InlineCommentContent::TopEdge => Some('▄'),
+            InlineCommentContent::BottomEdge => Some('▀'),
+            InlineCommentContent::Text(_) => None,
+        };
+        if let Some(glyph) = half_block.filter(|_| !self.config.window_borders_ascii) {
+            let edge_style = Style {
+                fg: comment_style.bg,
+                bg: editor_style.bg,
+                ..Style::default()
+            };
+            buffer.fill_rect(
+                term_x,
+                term_y,
+                block_width,
+                1,
+                glyph,
+                &edge_style,
+                &self.theme,
+            );
+            return;
+        }
+        self.fill_line_in_window(buffer, term_x, term_y, block_width, &comment_style);
+        buffer.set_text(
+            term_x + comment.text_offset,
+            term_y,
+            comment.content.text(),
+            &comment_style,
+        );
     }
 
     fn render_decorations_for_segment(
@@ -3362,6 +3438,57 @@ mod tests {
             Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![source]).unwrap();
         editor.test_disable_terminal_output();
         editor
+    }
+
+    #[test]
+    fn partial_inline_comment_repaint_fills_only_the_padded_block() {
+        let mut editor = rendering_test_editor(Buffer::new(None, "alpha\nbeta\n".to_string()));
+        editor.cy = 1;
+        editor.add_sample_inline_comment();
+        editor.inline_comments[0].message = "note".to_string();
+        editor.layout_cache.borrow_mut().clear();
+        editor.sync_to_window();
+        let window = editor.active_window_with_editor_view().unwrap();
+        let layout = editor.layout_for_window(&window);
+        let rows = layout
+            .inline_comments
+            .iter()
+            .map(|comment| comment.row)
+            .collect::<Vec<_>>();
+        let mut frame = RenderBuffer::new(60, 12, &editor.theme.inline_comment_style());
+        editor.render_gutter_rows_in_window(&mut frame, &window, 0, &rows);
+        editor
+            .render_main_content_rows_in_window(&mut frame, &window, &rows)
+            .unwrap();
+        let background = editor.theme.inline_comment_style().bg;
+        let content_start = editor.gutter_width_for_window(&window) + 1;
+        for comment in &layout.inline_comments {
+            let y = editor.window_to_terminal_y(&window, comment.row);
+            let cells = &frame.cells[y * 60..(y + 1) * 60];
+            assert!(cells[..content_start]
+                .iter()
+                .all(|cell| cell.style.bg == editor.theme.style.bg));
+            let block_cells = &cells[content_start..content_start + comment.block_width];
+            match &comment.content {
+                InlineCommentContent::Text(_) => {
+                    assert!(block_cells.iter().all(|cell| cell.style.bg == background))
+                }
+                InlineCommentContent::TopEdge | InlineCommentContent::BottomEdge => {
+                    let glyph = if comment.content == InlineCommentContent::TopEdge {
+                        '▄'
+                    } else {
+                        '▀'
+                    };
+                    assert!(block_cells.iter().all(|cell| cell.c == glyph
+                        && cell.style.fg == background
+                        && cell.style.bg == editor.theme.style.bg));
+                }
+            }
+            assert!(cells[content_start + comment.block_width..]
+                .iter()
+                .all(|cell| cell.style.bg == editor.theme.style.bg));
+            assert_eq!(cells[content_start - 2].text, "┆");
+        }
     }
 
     #[test]

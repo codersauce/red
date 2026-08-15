@@ -2467,17 +2467,14 @@ impl RedHost {
                 let Some((red, green, blue)) = args.first().and_then(red_color_channels) else {
                     return Ok(Value::Bool(false));
                 };
-                let linear = |channel: u8| {
-                    let value = f64::from(channel) / 255.0;
-                    if value <= 0.04045 {
-                        value / 12.92
-                    } else {
-                        ((value + 0.055) / 1.055).powf(2.4)
+                Ok(Value::Bool(
+                    crate::color::Color::Rgb {
+                        r: red,
+                        g: green,
+                        b: blue,
                     }
-                };
-                let luminance =
-                    0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue);
-                Ok(Value::Bool(luminance > 0.5))
+                    .is_light(),
+                ))
             }
             "red::char_at" => {
                 let value = red_required_string(args, 0, path)?;
