@@ -11,6 +11,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Plugin host tests share the process-global ACTION_DISPATCHER.
+  RUST_TEST_THREADS: 1
 
 jobs:
   test:
