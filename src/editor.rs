@@ -18199,11 +18199,22 @@ impl Editor {
                     return Ok(false);
                 }
 
-                match self.current_buffer_mut().reload_from_file() {
-                    Ok(msg) => {
-                        self.last_error = Some(msg);
+                match self.current_buffer().read_backing_file() {
+                    Ok((file, contents)) => {
+                        let byte_count = contents.len();
+                        let end = self.current_buffer().char_idx_to_position(usize::MAX);
+                        self.begin_transaction("reload file");
+                        self.replace_range(TextRange::new(TextPosition::new(0, 0), end), &contents);
+                        self.current_buffer_mut().file = Some(file.clone());
                         self.check_bounds();
                         self.sync_to_window();
+                        self.commit_transaction(self.cursor_snapshot());
+                        self.current_buffer_mut().mark_saved();
+                        self.last_error = Some(format!(
+                            "{file:?} {}L, {}B read",
+                            self.current_buffer().len(),
+                            byte_count
+                        ));
                         self.render(buffer)?;
                     }
                     Err(e) => {
@@ -22372,8 +22383,38 @@ impl Editor {
         let mut skipped_files = Vec::new();
         let mut buffer_map = HashMap::new();
         let mut restored_buffers = Vec::new();
+        let has_live_snapshot_buffer = snapshot.buffers.iter().any(|saved_buffer| {
+            self.buffer_manager
+                .iter()
+                .any(|buffer| saved_buffer.matches(buffer))
+        });
+        let preserve_live_buffers =
+            has_live_snapshot_buffer || self.buffer_manager.iter().any(Buffer::is_dirty);
 
         for saved_buffer in &snapshot.buffers {
+            let live_index = preserve_live_buffers
+                .then(|| {
+                    self.buffer_manager
+                        .iter()
+                        .position(|buffer| saved_buffer.matches(buffer))
+                })
+                .flatten();
+            if let Some(index) = live_index {
+                saved_buffer.restore_view(&mut self.buffer_manager[index]);
+                buffer_map.insert(saved_buffer.index, index);
+                opened_files.push(saved_buffer.path.clone());
+                continue;
+            }
+
+            if saved_buffer.dirty {
+                skipped_files.push(SkippedFile {
+                    path: saved_buffer.path.clone(),
+                    reason: "dirty buffer is no longer open and cannot be restored safely"
+                        .to_string(),
+                });
+                continue;
+            }
+
             if !std::path::Path::new(&saved_buffer.path).exists() {
                 skipped_files.push(SkippedFile {
                     path: saved_buffer.path.clone(),
@@ -22384,23 +22425,17 @@ impl Editor {
 
             match Buffer::load_or_create(Some(saved_buffer.path.clone())).await {
                 Ok(mut buffer) => {
-                    let viewport_top = saved_buffer.viewport_top.min(buffer.last_navigable_line());
-                    let cursor_y = saved_buffer.cursor.y.min(buffer.last_navigable_line());
-                    let cursor_x = buffer
-                        .get(cursor_y)
-                        .map(|line| {
-                            saved_buffer
-                                .cursor
-                                .x
-                                .min(line.trim_end_matches('\n').chars().count())
-                        })
-                        .unwrap_or(0);
-                    buffer.vtop = viewport_top;
-                    buffer.pos = (cursor_x, cursor_y.saturating_sub(viewport_top));
+                    saved_buffer.restore_view(&mut buffer);
 
-                    buffer_map.insert(saved_buffer.index, restored_buffers.len());
+                    let restored_index = if preserve_live_buffers {
+                        self.buffer_manager.push_buffer(buffer);
+                        self.buffer_manager.len() - 1
+                    } else {
+                        restored_buffers.push(buffer);
+                        restored_buffers.len() - 1
+                    };
+                    buffer_map.insert(saved_buffer.index, restored_index);
                     opened_files.push(saved_buffer.path.clone());
-                    restored_buffers.push(buffer);
                 }
                 Err(err) => skipped_files.push(SkippedFile {
                     path: saved_buffer.path.clone(),
@@ -22409,7 +22444,20 @@ impl Editor {
             }
         }
 
-        if restored_buffers.is_empty() && !has_panel_restore {
+        if preserve_live_buffers {
+            let snapshot_buffer_indices = snapshot
+                .buffers
+                .iter()
+                .map(|buffer| buffer.index)
+                .collect::<HashSet<_>>();
+            for index in 0..self.buffer_manager.len() {
+                if !snapshot_buffer_indices.contains(&index) {
+                    buffer_map.entry(index).or_insert(index);
+                }
+            }
+        }
+
+        if buffer_map.is_empty() && !has_panel_restore {
             return Ok(RestoreResult {
                 restored: false,
                 opened_files,
@@ -22418,7 +22466,7 @@ impl Editor {
             });
         }
 
-        if restored_buffers.is_empty() {
+        if buffer_map.is_empty() {
             self.apply_panel_layout();
             self.sync_with_window();
             self.render(render_buffer)?;
@@ -22430,9 +22478,11 @@ impl Editor {
             });
         }
 
-        self.buffer_manager.replace_buffers(restored_buffers);
+        if !preserve_live_buffers {
+            self.buffer_manager.replace_buffers(restored_buffers);
+            self.lsp_coordinator.clear_opened_documents();
+        }
         self.sync_diagnostic_gutter_signs();
-        self.lsp_coordinator.clear_opened_documents();
         self.buffer_manager.set_active_index(
             buffer_map
                 .get(&snapshot.current_buffer_index)
@@ -24679,6 +24729,34 @@ pub struct BufferStateSnapshot {
     /// First buffer line visible in the active viewport.
     #[serde(alias = "viewportTop")]
     pub viewport_top: usize,
+}
+
+impl BufferStateSnapshot {
+    fn matches(&self, buffer: &Buffer) -> bool {
+        buffer.file.as_deref().is_some_and(|file| {
+            file == self.path
+                || Path::new(file)
+                    .absolutize()
+                    .ok()
+                    .zip(Path::new(&self.path).absolutize().ok())
+                    .is_some_and(|(file, saved)| file == saved)
+        })
+    }
+
+    fn restore_view(&self, buffer: &mut Buffer) {
+        let viewport_top = self.viewport_top.min(buffer.last_navigable_line());
+        let cursor_y = self.cursor.y.min(buffer.last_navigable_line());
+        let cursor_x = buffer
+            .get(cursor_y)
+            .map(|line| {
+                self.cursor
+                    .x
+                    .min(line.trim_end_matches('\n').chars().count())
+            })
+            .unwrap_or(0);
+        buffer.vtop = viewport_top;
+        buffer.pos = (cursor_x, cursor_y.saturating_sub(viewport_top));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32303,6 +32381,77 @@ builtin = "rust"
             Some("I")
         );
         assert!(editor.gutter_sign_manager.visible_sign(1, 0).is_none());
+    }
+
+    #[tokio::test]
+    async fn restoring_editor_state_preserves_live_dirty_buffer_and_undo_history() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("dirty.rs");
+        std::fs::write(&path, "disk\n").unwrap();
+
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "disk\n".to_string(),
+        )]);
+        editor.begin_transaction("dirty edit");
+        editor.replace_range(TextRange::insertion(TextPosition::new(0, 0)), "dirty ");
+        editor.commit_transaction(editor.cursor_snapshot());
+        let buffer_id = editor.current_buffer().id();
+        let snapshot = editor.editor_state_snapshot();
+        let mut render_buffer = RenderBuffer::new(60, 12, &Style::default());
+
+        let result = editor
+            .restore_editor_state(snapshot, &mut render_buffer)
+            .await
+            .unwrap();
+
+        assert!(result.restored);
+        assert_eq!(editor.current_buffer().id(), buffer_id);
+        assert_eq!(editor.current_buffer().contents(), "dirty disk\n");
+        assert!(editor.current_buffer().is_dirty());
+        assert_eq!(editor.current_buffer().undo_history.node_count(), 1);
+
+        editor
+            .test_execute_production_action(Action::Undo)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), "disk\n");
+        assert!(!editor.current_buffer().is_dirty());
+    }
+
+    #[tokio::test]
+    async fn restoring_editor_state_does_not_recreate_missing_dirty_buffer_from_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let saved = root.path().join("saved.rs");
+        let current = root.path().join("current.rs");
+        std::fs::write(&saved, "disk\n").unwrap();
+        std::fs::write(&current, "current\n").unwrap();
+
+        let mut source = lsp_test_editor(vec![Buffer::new(
+            Some(saved.to_string_lossy().into_owned()),
+            "dirty disk\n".to_string(),
+        )]);
+        source.current_buffer_mut().dirty = true;
+        let snapshot = source.editor_state_snapshot();
+        let mut editor = lsp_test_editor(vec![Buffer::new(
+            Some(current.to_string_lossy().into_owned()),
+            "current\n".to_string(),
+        )]);
+        let buffer_id = editor.current_buffer().id();
+        let mut render_buffer = RenderBuffer::new(60, 12, &Style::default());
+
+        let result = editor
+            .restore_editor_state(snapshot, &mut render_buffer)
+            .await
+            .unwrap();
+
+        assert!(!result.restored);
+        assert_eq!(result.skipped_files.len(), 1);
+        assert!(result.skipped_files[0]
+            .reason
+            .contains("dirty buffer is no longer open"));
+        assert_eq!(editor.current_buffer().id(), buffer_id);
+        assert_eq!(editor.current_buffer().contents(), "current\n");
     }
 
     #[tokio::test]
