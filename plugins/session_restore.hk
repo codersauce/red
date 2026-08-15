@@ -26,6 +26,7 @@ struct SessionSnapshot {
     version: i32,
     cwd: String,
     buffers: [SessionBuffer],
+    panels: Option<Json>,
 }
 
 struct StoredSessionSnapshot {
@@ -77,8 +78,15 @@ fn startup_count_loaded(event: IntegerConfigValue) {
 
 fn snapshot_loaded(event: StoredSessionSnapshot) {
     let snapshot = event.value;
-    if snapshot == red::null() || red::int(snapshot.version, 0) != 1 {
+    if snapshot == red::null() {
         return;
+    }
+    let version = red::int(snapshot.version, 0);
+    if version != 1 && version != 2 {
+        return;
+    }
+    if version == 1 {
+        snapshot.panels = Some(Json { panels: [], focused: red::null() });
     }
     red::state_patch(SessionRestoreState { snapshot: Some(snapshot) });
     red::request("GetConfig", cwd_loaded, "cwd");

@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     agent_conversation::AgentConversationSnapshot,
     editor::Content,
+    plugin::PanelManagerSnapshot,
     undo::{TextPosition, UndoHistory},
     window::WindowManagerSnapshot,
 };
@@ -85,6 +86,9 @@ pub struct SessionSnapshot {
     pub current_buffer_index: usize,
     /// Split tree, focused window, and per-window view state.
     pub window_layout: WindowManagerSnapshot,
+    /// Plugin pane shells and editor-owned interaction state, keyed by stable IDs.
+    #[serde(default)]
+    pub panels: PanelManagerSnapshot,
     /// Named editor registers.
     #[serde(default)]
     pub registers: HashMap<char, Content>,
@@ -2281,6 +2285,7 @@ mod tests {
                     vx: 0,
                 },
             },
+            panels: PanelManagerSnapshot::default(),
             registers: HashMap::new(),
             jumps: Vec::new(),
             jump_index: 0,
@@ -2317,6 +2322,16 @@ mod tests {
             encoded.get("former_plugin"),
             Some(&serde_json::json!({ "version": 1, "reviews": [1, 2] }))
         );
+    }
+
+    #[test]
+    fn older_session_snapshots_default_missing_pane_state() {
+        let mut value = serde_json::to_value(snapshot("source")).unwrap();
+        value.as_object_mut().unwrap().remove("panels");
+
+        let restored: SessionSnapshot = serde_json::from_value(value).unwrap();
+
+        assert_eq!(restored.panels, PanelManagerSnapshot::default());
     }
 
     #[test]

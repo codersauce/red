@@ -38,9 +38,10 @@ pub use location::{LocationColumnEncoding, OpenLocationTarget, PluginLocation};
 pub use metadata::PluginMetadata;
 pub use overlay::{OverlayAlignment, OverlayConfig, OverlayManager};
 pub use panel::{
-    PanelConfig, PanelManager, PanelRow, PanelRowKind, PanelSegment, PanelSide, TextPanelBlock,
-    TextPanelBlockFormat, TextPanelBlockKind, TextPanelComposerConfig, TextPanelHeaderAction,
-    TextPanelStatus,
+    PanelConfig, PanelManager, PanelManagerSnapshot, PanelRow, PanelRowKind, PanelSegment,
+    PanelSessionSnapshot, PanelSide, PanelSnapshotKind, TextPanelBlock, TextPanelBlockFormat,
+    TextPanelBlockKind, TextPanelComposerConfig, TextPanelComposerSnapshot, TextPanelHeaderAction,
+    TextPanelSessionSnapshot, TextPanelSnapshotFocus, TextPanelStatus,
 };
 pub use registry::{PluginRegistry, PluginStatus, RED_HOST_API_VERSION};
 pub use runtime::{

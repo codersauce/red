@@ -3062,6 +3062,7 @@ impl DetachedEditorCore {
             .notify(&mut runtime, "editor:ready", json!({}))
             .await?;
         editor.restore_agent_plugin_state(&mut runtime).await?;
+        editor.notify_pane_restore_intents(&mut runtime).await?;
         editor.ensure_current_buffer_lsp_opened().await?;
         let mut render_buffer = RenderBuffer::new(
             editor.size.0 as usize,
@@ -7598,6 +7599,7 @@ impl Editor {
                 .notify(&mut runtime, "editor:ready", json!({}))
                 .await?;
             self.restore_agent_plugin_state(&mut runtime).await?;
+            self.notify_pane_restore_intents(&mut runtime).await?;
             drop(plugin_startup);
         }
 
@@ -7795,6 +7797,20 @@ impl Editor {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn notify_pane_restore_intents(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
+        let snapshot = self.panel_manager.pending_restore_snapshot();
+        if snapshot.panels.is_empty() {
+            return Ok(());
+        }
+        self.plugin_registry
+            .notify(
+                runtime,
+                "editor:panes_restore",
+                serde_json::to_value(snapshot)?,
+            )
+            .await
     }
 
     async fn finish_agent_bridge(&mut self, fallback: &str) -> String {
@@ -9006,6 +9022,7 @@ impl Editor {
                         self.plugin_registry
                             .notify(runtime, "editor:state_restored", restored_payload)
                             .await?;
+                        self.notify_pane_restore_intents(runtime).await?;
                     }
                     let payload = match result {
                         Ok(result) => serde_json::to_value(result)?,
@@ -9367,16 +9384,23 @@ impl Editor {
                 PluginRequest::CreatePanel { id, config } => {
                     self.panel_manager.create_panel(id.clone(), config);
                     self.restore_panel_layout(&id);
+                    self.panel_manager.apply_pending_shell_restore(&id);
                     self.apply_panel_layout();
                     needs_render = true;
                 }
                 PluginRequest::UpdatePanel { id, rows } => {
                     self.panel_manager.update_panel(&id, rows);
+                    self.panel_manager.apply_pending_content_restore(
+                        &id,
+                        usize::from(self.size.1.saturating_sub(2)),
+                        usize::from(self.size.0),
+                    );
                     needs_render = true;
                 }
                 PluginRequest::CreateTextPanel { id, config } => {
                     self.panel_manager.create_text_panel(id.clone(), config);
                     self.restore_panel_layout(&id);
+                    self.panel_manager.apply_pending_shell_restore(&id);
                     self.apply_panel_layout();
                     needs_render = true;
                 }
@@ -9384,6 +9408,11 @@ impl Editor {
                     self.panel_manager.update_text_panel(
                         &id,
                         blocks,
+                        usize::from(self.size.1.saturating_sub(2)),
+                        usize::from(self.size.0),
+                    );
+                    self.panel_manager.apply_pending_content_restore(
+                        &id,
                         usize::from(self.size.1.saturating_sub(2)),
                         usize::from(self.size.0),
                     );
@@ -21927,6 +21956,7 @@ impl Editor {
                 (self.size.0 as usize, self.size.1 as usize),
             )
         });
+        self.panel_manager.stage_restore(snapshot.panels.clone());
         self.registers = snapshot.registers.clone();
         self.jump_list = snapshot
             .jumps
@@ -22237,6 +22267,7 @@ impl Editor {
                 buffers,
                 current_buffer_index: self.buffer_manager.active_index(),
                 window_layout: self.window_manager.snapshot(),
+                panels: self.panel_manager.snapshot(usize::from(self.size.0)),
                 registers: self.registers.clone(),
                 jumps: self
                     .jump_list
@@ -22428,12 +22459,13 @@ impl Editor {
             .collect();
 
         EditorStateSnapshot {
-            version: 1,
+            version: 2,
             cwd,
             saved_at,
             buffers,
             current_buffer_index: self.buffer_manager.active_index(),
             window_layout: self.window_manager.snapshot(),
+            panels: self.panel_manager.snapshot(usize::from(self.size.0)),
         }
     }
 
@@ -22442,7 +22474,7 @@ impl Editor {
         snapshot: EditorStateSnapshot,
         render_buffer: &mut RenderBuffer,
     ) -> anyhow::Result<RestoreResult> {
-        if snapshot.version != 1 {
+        if !matches!(snapshot.version, 1 | 2) {
             return Ok(RestoreResult {
                 restored: false,
                 opened_files: Vec::new(),
@@ -22453,6 +22485,13 @@ impl Editor {
                 )],
             });
         }
+
+        let has_panel_restore = !snapshot.panels.panels.is_empty();
+        self.panel_manager.stage_restore(snapshot.panels.clone());
+        self.panel_manager.apply_pending_to_existing(
+            usize::from(self.size.1.saturating_sub(2)),
+            usize::from(self.size.0),
+        );
 
         let mut opened_files = Vec::new();
         let mut skipped_files = Vec::new();
@@ -22495,12 +22534,24 @@ impl Editor {
             }
         }
 
-        if restored_buffers.is_empty() {
+        if restored_buffers.is_empty() && !has_panel_restore {
             return Ok(RestoreResult {
                 restored: false,
                 opened_files,
                 skipped_files,
                 warnings: vec!["No saved files could be restored".to_string()],
+            });
+        }
+
+        if restored_buffers.is_empty() {
+            self.apply_panel_layout();
+            self.sync_with_window();
+            self.render(render_buffer)?;
+            return Ok(RestoreResult {
+                restored: true,
+                opened_files,
+                skipped_files,
+                warnings: Vec::new(),
             });
         }
 
@@ -24297,6 +24348,9 @@ pub struct EditorStateSnapshot {
     /// Split layout and per-window viewport state.
     #[serde(alias = "windowLayout")]
     pub window_layout: WindowManagerSnapshot,
+    /// Stable plugin panes and editor-owned interaction state.
+    #[serde(default)]
+    pub panels: plugin::PanelManagerSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31885,6 +31939,44 @@ builtin = "rust"
         assert!(result.restored);
         assert_eq!(editor.buffer_manager[0].file.as_deref(), restored.to_str());
         assert!(editor.gutter_sign_manager.visible_sign(0, 0).is_none());
+    }
+
+    #[tokio::test]
+    async fn restoring_editor_state_accepts_a_pane_only_clean_workspace() {
+        let mut source = lsp_test_editor(vec![Buffer::new(None, String::new())]);
+        source.panel_manager.create_text_panel(
+            "agent-conversation".to_string(),
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Right,
+                width: 42,
+                composer: Some(plugin::TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 3,
+                }),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        let snapshot = source.editor_state_snapshot();
+        assert!(snapshot.buffers.is_empty());
+        assert_eq!(snapshot.panels.panels.len(), 1);
+
+        let mut restored = lsp_test_editor(vec![Buffer::new(None, String::new())]);
+        let mut render_buffer = RenderBuffer::new(60, 12, &Style::default());
+        let result = restored
+            .restore_editor_state(snapshot, &mut render_buffer)
+            .await
+            .unwrap();
+
+        assert!(result.restored);
+        assert_eq!(
+            restored
+                .panel_manager
+                .pending_restore_snapshot()
+                .panels
+                .first()
+                .map(|panel| panel.id.as_str()),
+            Some("agent-conversation")
+        );
     }
 
     #[tokio::test]
