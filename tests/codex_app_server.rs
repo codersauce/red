@@ -133,6 +133,137 @@ for line in sys.stdin:
     path
 }
 
+fn mock_inline_codex(directory: &std::path::Path) -> std::path::PathBuf {
+    let path = directory.join("codex-inline");
+    std::fs::write(
+        &path,
+        r#"#!/usr/bin/env python3
+import json, sys
+
+def send(value):
+    print(json.dumps(value), flush=True)
+
+turn = 0
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    ident = message.get("id")
+    if method == "initialize":
+        send({"id": ident, "result": {"userAgent": "mock"}})
+    elif method == "initialized":
+        pass
+    elif method == "account/read":
+        send({"id": ident, "result": {"account": {"type": "chatgpt"}}})
+    elif method == "config/read":
+        send({"id": ident, "result": {"config": {"mcp_servers": {}}, "origins": {}}})
+    elif method == "configRequirements/read":
+        send({"id": ident, "result": {"requirements": None}})
+    elif method == "thread/start":
+        assert message["params"]["ephemeral"] is True
+        assert message["params"]["sandbox"] == "read-only"
+        tools = message["params"]["dynamicTools"]
+        assert len(tools) == 1
+        assert tools[0]["name"] == "submit_replacement"
+        assert "inline code editor" in message["params"]["baseInstructions"]
+        send({"id": ident, "result": {"thread": {"id": "inline-red"}}})
+    elif method == "turn/start":
+        turn += 1
+        text = message["params"]["input"][0]["text"]
+        assert "Editor-owned target and context" in text
+        assert "submit_replacement" in text
+        turn_id = f"inline-turn-{turn}"
+        send({"id": ident, "result": {"turn": {"id": turn_id}}})
+        send({"id": f"inline-tool-{turn}", "method": "item/tool/call", "params": {
+            "threadId": "inline-red", "turnId": turn_id,
+            "tool": "submit_replacement",
+            "arguments": {"replacement": "let answer = 42;\n" if turn == 1 else "let answer: u64 = 42;\n"}
+        }})
+    elif str(ident).startswith("inline-tool-"):
+        assert message["result"]["success"] is True
+        current = str(ident).split("-")[-1]
+        send({"method": "turn/completed", "params": {
+            "threadId": "inline-red",
+            "turn": {"id": f"inline-turn-{current}", "status": "completed"}
+        }})
+"#,
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+async fn next_event(bridge: &mut red::codex::CodexBridge) -> CodexEvent {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(event) = bridge.try_recv() {
+                break event;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn inline_app_server_is_ephemeral_tool_limited_and_supports_followups() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex = mock_inline_codex(directory.path());
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let host = RecordingHost {
+        writes: Arc::clone(&writes),
+    };
+    let (mut bridge, task) = start_codex(
+        CodexProcessSpec::new(codex, directory.path()),
+        host,
+        NonZeroUsize::new(32).unwrap(),
+    )
+    .unwrap();
+
+    bridge
+        .send(CodexCommand::InlineAssist {
+            request_id: "request-1".to_string(),
+            cwd: directory.path().to_path_buf(),
+            prompt: "use a descriptive value".to_string(),
+            context: "<target>let x = 1;</target>".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_event(&mut bridge).await,
+        CodexEvent::InlineSessionCreated { request_id, session_id }
+            if request_id == "request-1" && session_id == "inline-red"
+    ));
+    assert!(matches!(
+        next_event(&mut bridge).await,
+        CodexEvent::InlineReplacement { request_id, session_id, replacement }
+            if request_id == "request-1"
+                && session_id == "inline-red"
+                && replacement == "let answer = 42;\n"
+    ));
+
+    bridge
+        .send(CodexCommand::InlineAssistFollowup {
+            request_id: "request-2".to_string(),
+            session_id: "inline-red".to_string(),
+            prompt: "give it an explicit type".to_string(),
+            context: "<target>let answer = 42;</target>".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_event(&mut bridge).await,
+        CodexEvent::InlineReplacement { request_id, replacement, .. }
+            if request_id == "request-2" && replacement == "let answer: u64 = 42;\n"
+    ));
+    assert!(writes.lock().unwrap().is_empty());
+
+    drop(bridge);
+    task.await.unwrap().unwrap();
+}
+
 fn mock_commit_codex(directory: &std::path::Path) -> std::path::PathBuf {
     let path = directory.join("codex-commit");
     std::fs::write(

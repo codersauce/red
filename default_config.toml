@@ -364,6 +364,7 @@ Esc = { EnterMode = "Normal" }
 " " = "NextBuffer"
 "a" = [ "MoveToTop", { EnterMode = "VisualLine" }, "MoveToBottom" ]
 "A" = { PluginCommand = "Agent" }
+"i" = "InlineAssist"
 "n" = "NextBuffer"
 "p" = "PreviousBuffer"
 "P" = "ListPlugins"
@@ -411,6 +412,7 @@ Esc = { EnterMode = "Normal" }
 
 [keys.visual." "]
 "A" = { PluginCommand = "Agent" }
+"i" = "InlineAssist"
 "h" = { "s" = { PluginCommand = "GitHunkStage" }, "u" = { PluginCommand = "GitHunkUnstage" }, "r" = { PluginCommand = "GitHunkReset" } }
 
 # TODO: "i" = "SelectInside"
