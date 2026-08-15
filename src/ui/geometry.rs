@@ -9,6 +9,14 @@ pub(crate) struct ScreenRect {
     pub(crate) height: usize,
 }
 
+/// Terminal-space constraints for an editor-owned overlay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverlayLayout {
+    pub(crate) viewport: ScreenRect,
+    pub(crate) anchor: (usize, usize),
+    pub(crate) avoid_rows: Option<(usize, usize)>,
+}
+
 /// Fits a cursor-anchored popup inside the editor viewport.
 ///
 /// The popup prefers the side of the cursor with the most vertical room and
@@ -16,6 +24,29 @@ pub(crate) struct ScreenRect {
 /// height is the visible content height; callers add their own border cells.
 pub(crate) fn anchored_popup_geometry(
     anchor: (usize, usize),
+    viewport_width: usize,
+    viewport_height: usize,
+    content_width: usize,
+    content_height: usize,
+) -> (usize, usize, usize) {
+    anchored_popup_geometry_avoiding_rows(
+        anchor,
+        (anchor.1, anchor.1),
+        viewport_width,
+        viewport_height,
+        content_width,
+        content_height,
+    )
+}
+
+/// Fits a popup above or below a rendered row band without covering it.
+///
+/// The inclusive `avoid_rows` band replaces the single cursor row used by
+/// [`anchored_popup_geometry`]. This is useful for editor actions whose target
+/// can span multiple rendered rows or grow after an edit.
+pub(crate) fn anchored_popup_geometry_avoiding_rows(
+    anchor: (usize, usize),
+    avoid_rows: (usize, usize),
     viewport_width: usize,
     viewport_height: usize,
     content_width: usize,
@@ -29,8 +60,13 @@ pub(crate) fn anchored_popup_geometry(
     } else {
         anchor.0.min(max_x)
     };
-    let below = viewport_height.saturating_sub(anchor.1.saturating_add(3));
-    let above = anchor.1.saturating_sub(2);
+    let (avoid_start, avoid_end) = if avoid_rows.0 <= avoid_rows.1 {
+        avoid_rows
+    } else {
+        (avoid_rows.1, avoid_rows.0)
+    };
+    let below = viewport_height.saturating_sub(avoid_end.saturating_add(3));
+    let above = avoid_start.saturating_sub(2);
     let capacity = if below >= content_height || below >= above {
         below
     } else {
@@ -38,9 +74,9 @@ pub(crate) fn anchored_popup_geometry(
     };
     let height = content_height.min(capacity);
     let y = if capacity == above && above > below {
-        anchor.1.saturating_sub(height.saturating_add(2))
+        avoid_start.saturating_sub(height.saturating_add(2))
     } else {
-        anchor.1.saturating_add(1)
+        avoid_end.saturating_add(1)
     };
     (x, y, height)
 }
@@ -72,7 +108,7 @@ impl ScreenRect {
 
 #[cfg(test)]
 mod tests {
-    use super::{anchored_popup_geometry, ScreenRect};
+    use super::{anchored_popup_geometry, anchored_popup_geometry_avoiding_rows, ScreenRect};
 
     #[test]
     fn rectangle_uses_exclusive_saturating_edges() {
@@ -110,5 +146,17 @@ mod tests {
         assert_eq!(anchored_popup_geometry((8, 1), 20, 10, 8, 3), (8, 2, 3));
         assert_eq!(anchored_popup_geometry((18, 8), 20, 10, 8, 3), (10, 3, 3));
         assert_eq!(anchored_popup_geometry((0, 0), 1, 1, 8, 3), (0, 1, 0));
+    }
+
+    #[test]
+    fn anchored_popup_can_avoid_a_multi_row_target() {
+        assert_eq!(
+            anchored_popup_geometry_avoiding_rows((8, 4), (4, 7), 20, 14, 8, 2),
+            (8, 8, 2)
+        );
+        assert_eq!(
+            anchored_popup_geometry_avoiding_rows((8, 10), (8, 11), 20, 14, 8, 2),
+            (8, 4, 2)
+        );
     }
 }

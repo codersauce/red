@@ -114,8 +114,9 @@ use crate::{
     theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
     ui::{
         AgentComposer, CompletionUI, Component, Confirmation, DiagnosticInfo, FilePicker,
-        HoverInfo, HoverInfoFormat, Info, InputPrompt, LegacyPickerOptions, Picker, PickerItem,
-        PickerOptions, PickerPreview, PickerUpdate, StatuslineLayoutPanel, WhatsNewPanel,
+        HoverInfo, HoverInfoFormat, Info, InlineAssistPopup, InlineAssistPopupState, InputPrompt,
+        LegacyPickerOptions, OverlayLayout, Picker, PickerItem, PickerOptions, PickerPreview,
+        PickerUpdate, ScreenRect, StatuslineLayoutPanel, WhatsNewPanel,
     },
     undo::{AppliedTextEdit, CursorSnapshot, EditOrigin, RevertEdit, TextPosition, TextRange},
     utils::{expand_user_path, get_workspace_path},
@@ -1098,6 +1099,29 @@ fn render_marked_string(marked: MarkedString) -> String {
 
 fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
     match event {
+        CodexEvent::InlineSessionCreated {
+            request_id,
+            session_id,
+        } => (
+            "inline_assist:session_created",
+            json!({ "request_id": request_id, "session_id": session_id }),
+        ),
+        CodexEvent::InlineReplacement {
+            request_id,
+            session_id,
+            ..
+        } => (
+            "inline_assist:replacement",
+            json!({ "request_id": request_id, "session_id": session_id }),
+        ),
+        CodexEvent::InlineFailed {
+            request_id,
+            session_id,
+            message,
+        } => (
+            "inline_assist:error",
+            json!({ "request_id": request_id, "session_id": session_id, "message": message }),
+        ),
         CodexEvent::SessionCreated { session_id } => (
             "agent:session_created",
             json!({ "session_id": session_id.to_string() }),
@@ -1987,6 +2011,22 @@ pub enum Action {
     SaveAs(String),
     EnterMode(Mode),
     RestoreLastVisualSelection,
+    /// Opens a bounded inline edit for the current line or visual selection.
+    InlineAssist,
+    /// Submits the current inline instruction.
+    SubmitInlineAssist(String),
+    /// Cancels and destroys the ephemeral inline session.
+    CancelInlineAssist,
+    /// Leaves refinement and returns to the applied-result controls.
+    CancelInlineAssistRefine,
+    /// Keeps the unsaved inline edit and closes its ephemeral session.
+    KeepInlineAssist,
+    /// Undoes the latest inline-assist transaction.
+    UndoInlineAssist,
+    /// Opens a follow-up prompt scoped to the current inline result.
+    RefineInlineAssist,
+    /// Hands the edited range to the full Agent workflow.
+    EscalateInlineAssist,
     EnterSearch(SearchDirection),
 
     Undo,
@@ -2457,6 +2497,19 @@ struct LayoutCacheKey {
     break_indent: BreakIndentOptions,
 }
 
+#[derive(Debug)]
+struct InlineAssistSession {
+    buffer_id: BufferId,
+    window_id: WindowId,
+    expected_revision: u64,
+    range: TextRange,
+    expected_text: String,
+    scope: String,
+    request_id: Option<String>,
+    session_id: Option<String>,
+    transaction_id: Option<String>,
+}
+
 struct StyleCursor<'a> {
     spans: &'a [HighlightSpan],
     next: usize,
@@ -2642,6 +2695,9 @@ pub struct Editor {
 
     /// Domain sub-controller managing background AI agent state and tool channels
     agent_manager: agent_manager::AgentManager,
+
+    /// One editor-owned bounded inline edit, including stale-response guards.
+    inline_assist: Option<InlineAssistSession>,
 
     /// LSP client for code intelligence features
     lsp: Box<dyn LspClient>,
@@ -3981,6 +4037,7 @@ impl Editor {
             session_manager,
             lsp_coordinator,
             agent_manager,
+            inline_assist: None,
             lsp,
             config,
             config_diagnostics: Vec::new(),
@@ -4910,8 +4967,12 @@ impl Editor {
 
         let viewport_width = self.vwidth();
         let viewport_height = self.vheight();
+        let overlay_layout = self.inline_assist_overlay_layout();
         let dialog_resized = if let Some(dialog) = &mut self.current_dialog {
-            dialog.resize(viewport_width, viewport_height)
+            match overlay_layout {
+                Some(layout) => dialog.update_overlay_layout(layout),
+                None => dialog.resize(viewport_width, viewport_height),
+            }
         } else {
             false
         };
@@ -6655,6 +6716,288 @@ impl Editor {
         })
     }
 
+    fn inline_assist_target(&self) -> anyhow::Result<(TextRange, String)> {
+        let range = match self.mode {
+            Mode::VisualBlock => anyhow::bail!(
+                "inline assist does not support block selections yet; use a character or line selection"
+            ),
+            Mode::VisualLine => {
+                let selection = self
+                    .selection
+                    .ok_or_else(|| anyhow::anyhow!("visual selection is empty"))?;
+                let (_, y0, _, y1): (usize, usize, usize, usize) = selection.into();
+                let end = if y1 < self.current_buffer().len() {
+                    TextPosition::new(y1 + 1, 0)
+                } else {
+                    TextPosition::new(y1, self.line_character_len(y1))
+                };
+                TextRange::new(TextPosition::new(y0, 0), end)
+            }
+            Mode::Visual => {
+                let selection = self
+                    .selection
+                    .ok_or_else(|| anyhow::anyhow!("visual selection is empty"))?;
+                let (x0, y0, x1, y1): (usize, usize, usize, usize) = selection.into();
+                TextRange::new(
+                    TextPosition::new(y0, self.grapheme_to_char_on_line(x0, y0)),
+                    TextPosition::new(
+                        y1,
+                        self.grapheme_to_char_on_line(x1.saturating_add(1), y1),
+                    ),
+                )
+            }
+            _ => self.current_line_range(1, true),
+        };
+        let scope = if matches!(self.mode, Mode::Visual | Mode::VisualLine) {
+            if range.start.line == range.end.line {
+                format!("line {} selection", range.start.line + 1)
+            } else {
+                format!(
+                    "lines {}–{} selection",
+                    range.start.line + 1,
+                    range.end.line + usize::from(range.end.character > 0)
+                )
+            }
+        } else {
+            format!("line {}", range.start.line + 1)
+        };
+        Ok((range, scope))
+    }
+
+    fn inline_assist_context(&self, range: TextRange) -> anyhow::Result<String> {
+        const MAX_TARGET_BYTES: usize = 64 * 1024;
+        const MAX_CONTEXT_CHARS: usize = 40_000;
+        const CONTEXT_LINES: usize = 20;
+
+        let safe_context = self.agent_context_payload();
+        anyhow::ensure!(
+            safe_context["included"].as_bool() == Some(true),
+            "{}",
+            safe_context["summary"]
+                .as_str()
+                .unwrap_or("editor context is unavailable")
+        );
+        let target = self.current_buffer().text_in_range(range);
+        anyhow::ensure!(
+            target.len() <= MAX_TARGET_BYTES,
+            "inline target exceeds the 64 KiB limit"
+        );
+        anyhow::ensure!(!target.contains('\0'), "inline target contains binary data");
+        let first_line = range.start.line.saturating_sub(CONTEXT_LINES);
+        let target_last_line = range.end.line.saturating_sub(usize::from(
+            range.end.character == 0 && range.end.line > range.start.line,
+        ));
+        let last_line = target_last_line
+            .saturating_add(CONTEXT_LINES)
+            .min(self.current_buffer().len());
+        let surrounding_source = self
+            .current_buffer()
+            .line_range_contents(first_line, last_line.saturating_add(1));
+        let surrounding = truncate_chars(&surrounding_source, MAX_CONTEXT_CHARS);
+        let file = safe_context["file"].as_str().unwrap_or("[No Name]");
+        let language = self
+            .current_language_id()
+            .unwrap_or_else(|| "plain text".to_string());
+        let diagnostics = safe_context["diagnostics"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|diagnostic| {
+                format!(
+                    "- line {} {}: {}",
+                    diagnostic["line"].as_u64().unwrap_or_default(),
+                    diagnostic["severity"].as_str().unwrap_or("Diagnostic"),
+                    diagnostic["message"].as_str().unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let diagnostics = if diagnostics.is_empty() {
+            "none".to_string()
+        } else {
+            diagnostics.join("\n")
+        };
+        Ok(format!(
+            "File: {file}\nLanguage: {language}\nTarget range: {}:{} to {}:{} (zero-based, end exclusive)\nDiagnostics:\n{diagnostics}\n\n<target>\n{target}</target>\n\n<surrounding lines=\"{}-{}\">\n{surrounding}</surrounding>",
+            range.start.line,
+            range.start.character,
+            range.end.line,
+            range.end.character,
+            first_line + 1,
+            last_line + 1,
+        ))
+    }
+
+    fn close_inline_assist_session(&mut self) {
+        if let Some(session_id) = self
+            .inline_assist
+            .as_ref()
+            .and_then(|assist| assist.session_id.clone())
+        {
+            if let Some(bridge) = self.agent_manager.bridge() {
+                let _ = bridge.try_send(CodexCommand::CloseSession { session_id });
+            }
+        }
+        self.inline_assist = None;
+        self.current_dialog = None;
+    }
+
+    fn inline_assist_popup(
+        &self,
+        scope: impl Into<String>,
+        state: InlineAssistPopupState,
+    ) -> InlineAssistPopup {
+        let scope = scope.into();
+        match self.inline_assist_overlay_layout() {
+            Some(layout) => InlineAssistPopup::new_in_layout(self, scope, state, layout),
+            None => InlineAssistPopup::new(self, scope, state),
+        }
+    }
+
+    fn inline_assist_overlay_layout(&self) -> Option<OverlayLayout> {
+        let assist = self.inline_assist.as_ref()?;
+        let window = self.window_manager.window(assist.window_id)?;
+        let buffer = self.buffer_manager.get(window.buffer_index)?;
+        if buffer.id() != assist.buffer_id {
+            return None;
+        }
+        let viewport = ScreenRect {
+            x: window.position.x,
+            y: window
+                .position
+                .y
+                .saturating_add(self.window_content_top(window)),
+            width: window.inner_width(),
+            height: self.window_content_height(window),
+        };
+        let avoid_rows = self.render_text_range_rows_in_window(assist.window_id, assist.range);
+        let anchor = buffer
+            .get(assist.range.start.line)
+            .and_then(|line| {
+                let grapheme =
+                    char_to_grapheme(line.trim_end_matches('\n'), assist.range.start.character);
+                self.buffer_to_window_coords(window, grapheme, assist.range.start.line)
+            })
+            .map(|(x, y)| {
+                (
+                    self.window_to_terminal_x(window, x),
+                    self.window_to_terminal_y(window, y),
+                )
+            })
+            .unwrap_or((
+                viewport.x.saturating_add(1),
+                avoid_rows.map_or(viewport.y, |rows| rows.0),
+            ));
+        Some(OverlayLayout {
+            viewport,
+            anchor,
+            avoid_rows,
+        })
+    }
+
+    async fn apply_inline_replacement(
+        &mut self,
+        request_id: &str,
+        session_id: &str,
+        replacement: &str,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        const MAX_REPLACEMENT_BYTES: usize = 128 * 1024;
+        anyhow::ensure!(
+            replacement.len() <= MAX_REPLACEMENT_BYTES,
+            "inline replacement exceeds the 128 KiB limit"
+        );
+        anyhow::ensure!(
+            !replacement.contains('\0'),
+            "inline replacement contains binary data"
+        );
+        let (buffer_id, window_id, expected_revision, range, expected_text) = {
+            let assist = self
+                .inline_assist
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("inline request is no longer active"))?;
+            anyhow::ensure!(
+                assist.request_id.as_deref() == Some(request_id),
+                "inline response is stale"
+            );
+            (
+                assist.buffer_id,
+                assist.window_id,
+                assist.expected_revision,
+                assist.range,
+                assist.expected_text.clone(),
+            )
+        };
+        anyhow::ensure!(
+            self.current_buffer().id() == buffer_id,
+            "active buffer changed while inline assist was running"
+        );
+        anyhow::ensure!(
+            self.window_manager.active_stable_window_id() == Some(window_id),
+            "active window changed while inline assist was running"
+        );
+        anyhow::ensure!(
+            self.current_buffer().revision() == expected_revision,
+            "buffer changed while inline assist was running"
+        );
+        anyhow::ensure!(
+            self.current_buffer().text_in_range(range) == expected_text,
+            "inline target changed while the replacement was generated"
+        );
+
+        let start_char = self.current_buffer().position_to_char_idx(range.start);
+        self.begin_transaction_with_origin(
+            "inline assist",
+            EditOrigin::Agent {
+                session_id: session_id.to_string(),
+                turn_id: request_id.to_string(),
+            },
+        );
+        self.replace_range(range, replacement);
+        anyhow::ensure!(
+            self.commit_transaction(self.cursor_snapshot()),
+            "inline replacement did not change the target"
+        );
+        let transaction_id = self
+            .current_buffer()
+            .undo_history
+            .latest_transaction()
+            .map(|transaction| transaction.id.clone())
+            .ok_or_else(|| anyhow::anyhow!("inline transaction was not recorded"))?;
+        let end = self
+            .current_buffer()
+            .char_idx_to_position(start_char.saturating_add(replacement.chars().count()));
+        let new_range = TextRange::new(range.start, end);
+        self.mode = Mode::Normal;
+        self.selection = None;
+        self.selection_start = None;
+        self.move_to_text_position(range.start);
+
+        let revision = self.current_buffer().revision();
+        if let Some(assist) = self.inline_assist.as_mut() {
+            assist.expected_revision = revision;
+            assist.range = new_range;
+            assist.expected_text = replacement.to_string();
+            assist.transaction_id = Some(transaction_id);
+            assist.session_id = Some(session_id.to_string());
+        }
+        if let Err(error) = self.notify_change(runtime).await {
+            self.last_error = Some(format!(
+                "inline edit applied, but change notification failed: {error}"
+            ));
+        }
+        let scope = self
+            .inline_assist
+            .as_ref()
+            .map(|assist| assist.scope.clone())
+            .unwrap_or_else(|| "selection".to_string());
+        self.current_dialog = Some(Box::new(
+            self.inline_assist_popup(scope, InlineAssistPopupState::Applied),
+        ));
+        self.render(render_buffer)?;
+        Ok(())
+    }
+
     fn agent_editor_state(&self) -> Value {
         let context = self.agent_context_payload();
         let included = context
@@ -7574,6 +7917,81 @@ impl Editor {
                     .await?;
                 continue;
             }
+            let event = match event {
+                CodexEvent::InlineSessionCreated {
+                    request_id,
+                    session_id,
+                } => {
+                    let active = self.inline_assist.as_ref().is_some_and(|assist| {
+                        assist.request_id.as_deref() == Some(request_id.as_str())
+                    });
+                    if active {
+                        if let Some(assist) = self.inline_assist.as_mut() {
+                            assist.session_id = Some(session_id);
+                        }
+                    } else if let Some(bridge) = self.agent_manager.bridge() {
+                        let _ = bridge.try_send(CodexCommand::CloseSession { session_id });
+                    }
+                    continue;
+                }
+                CodexEvent::InlineReplacement {
+                    request_id,
+                    session_id,
+                    replacement,
+                } => {
+                    if let Err(error) = self
+                        .apply_inline_replacement(
+                            &request_id,
+                            &session_id,
+                            &replacement,
+                            buffer,
+                            runtime,
+                        )
+                        .await
+                    {
+                        if let Some(scope) = self.inline_assist.as_ref().and_then(|assist| {
+                            (assist.request_id.as_deref() == Some(request_id.as_str()))
+                                .then(|| assist.scope.clone())
+                        }) {
+                            self.current_dialog = Some(Box::new(self.inline_assist_popup(
+                                scope,
+                                InlineAssistPopupState::Failed(error.to_string()),
+                            )));
+                            self.render(buffer)?;
+                        }
+                    }
+                    continue;
+                }
+                CodexEvent::InlineFailed {
+                    request_id,
+                    session_id,
+                    message,
+                } => {
+                    let scope = self.inline_assist.as_mut().and_then(|assist| {
+                        let active = request_id.as_deref().is_none_or(|request_id| {
+                            assist.request_id.as_deref() == Some(request_id)
+                        });
+                        if active {
+                            if assist.session_id.is_none() {
+                                assist.session_id = session_id;
+                            }
+                            Some(assist.scope.clone())
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(scope) = scope {
+                        self.current_dialog =
+                            Some(Box::new(self.inline_assist_popup(
+                                scope,
+                                InlineAssistPopupState::Failed(message),
+                            )));
+                        self.render(buffer)?;
+                    }
+                    continue;
+                }
+                event => event,
+            };
             match &event {
                 CodexEvent::SessionCreated { session_id } => {
                     let root = self
@@ -7682,6 +8100,10 @@ impl Editor {
                 .is_none_or(|bridge| !bridge.has_pending_events())
         {
             let pending_commit_messages = self.agent_manager.take_pending_commit_messages();
+            let inline_scope = self
+                .inline_assist
+                .as_ref()
+                .map(|assist| assist.scope.clone());
             let message = self
                 .finish_agent_bridge("Codex app-server stopped unexpectedly")
                 .await;
@@ -7693,6 +8115,17 @@ impl Editor {
                         json!({ "message": "", "error": message.clone() }),
                     )
                     .await?;
+            }
+            if let Some(scope) = inline_scope {
+                if let Some(assist) = self.inline_assist.as_mut() {
+                    assist.session_id = None;
+                }
+                self.current_dialog =
+                    Some(Box::new(self.inline_assist_popup(
+                        scope,
+                        InlineAssistPopupState::Failed(message.clone()),
+                    )));
+                self.render(buffer)?;
             }
             if let Some(conversation) = self.agent_manager.conversation_snapshot() {
                 self.plugin_registry
@@ -14783,6 +15216,7 @@ impl Editor {
         // log!("Action: {action:?}");
         self.last_error = None;
         let sensitive_action = matches!(action, Action::NotifyPlugin(_, _, _))
+            || matches!(action, Action::SubmitInlineAssist(_))
             || matches!(action, Action::NotifyPlugins(method, _) if method.starts_with("composer:"));
         if !sensitive_action {
             self.actions.push(action.clone());
@@ -15076,6 +15510,192 @@ impl Editor {
                     self.last_error = Some("last visual selection is not set".to_string());
                     self.draw_commandline(buffer);
                 }
+            }
+            Action::InlineAssist => {
+                add_to_history = false;
+                match self.inline_assist_target() {
+                    Ok((range, scope)) => {
+                        let Some(window_id) = self.window_manager.active_stable_window_id() else {
+                            self.last_error =
+                                Some("inline assist requires an active editor window".to_string());
+                            self.draw_commandline(buffer);
+                            return Ok(false);
+                        };
+                        let expected_text = self.current_buffer().text_in_range(range);
+                        self.close_inline_assist_session();
+                        self.inline_assist = Some(InlineAssistSession {
+                            buffer_id: self.current_buffer().id(),
+                            window_id,
+                            expected_revision: self.current_buffer().revision(),
+                            range,
+                            expected_text,
+                            scope: scope.clone(),
+                            request_id: None,
+                            session_id: None,
+                            transaction_id: None,
+                        });
+                        self.current_dialog = Some(Box::new(self.inline_assist_popup(
+                            scope,
+                            InlineAssistPopupState::Prompt {
+                                initial: String::new(),
+                                refining: false,
+                            },
+                        )));
+                        self.render(buffer)?;
+                    }
+                    Err(error) => {
+                        self.last_error = Some(error.to_string());
+                        self.draw_commandline(buffer);
+                    }
+                }
+            }
+            Action::SubmitInlineAssist(prompt) => {
+                add_to_history = false;
+                let Some((range, scope, existing_session)) =
+                    self.inline_assist.as_ref().map(|assist| {
+                        (
+                            assist.range,
+                            assist.scope.clone(),
+                            assist.session_id.clone(),
+                        )
+                    })
+                else {
+                    self.last_error = Some("inline assist is no longer active".to_string());
+                    return Ok(false);
+                };
+                let context = match self.inline_assist_context(range) {
+                    Ok(context) => context,
+                    Err(error) => {
+                        self.last_error = Some(error.to_string());
+                        return Ok(false);
+                    }
+                };
+                let cwd = get_workspace_path();
+                if let Err(error) = self.ensure_agent_bridge(&cwd) {
+                    self.current_dialog = Some(Box::new(self.inline_assist_popup(
+                        scope,
+                        InlineAssistPopupState::Failed(error.to_string()),
+                    )));
+                    self.render(buffer)?;
+                    return Ok(false);
+                }
+                let request_id = uuid::Uuid::new_v4().to_string();
+                let revision = self.current_buffer().revision();
+                let expected_text = self.current_buffer().text_in_range(range);
+                if let Some(assist) = self.inline_assist.as_mut() {
+                    assist.expected_revision = revision;
+                    assist.expected_text = expected_text;
+                    assist.request_id = Some(request_id.clone());
+                }
+                let command = existing_session.map_or_else(
+                    || CodexCommand::InlineAssist {
+                        request_id: request_id.clone(),
+                        cwd,
+                        prompt: prompt.clone(),
+                        context: context.clone(),
+                    },
+                    |session_id| CodexCommand::InlineAssistFollowup {
+                        request_id: request_id.clone(),
+                        session_id,
+                        prompt: prompt.clone(),
+                        context: context.clone(),
+                    },
+                );
+                let send_result = if let Some(bridge) = self.agent_manager.bridge() {
+                    bridge.send(command).await
+                } else {
+                    Err(anyhow::anyhow!("Codex bridge is unavailable"))
+                };
+                if let Err(error) = send_result {
+                    if let Some(assist) = self.inline_assist.as_mut() {
+                        assist.session_id = None;
+                    }
+                    self.current_dialog = Some(Box::new(self.inline_assist_popup(
+                        scope,
+                        InlineAssistPopupState::Failed(error.to_string()),
+                    )));
+                } else {
+                    self.current_dialog = Some(Box::new(
+                        self.inline_assist_popup(scope, InlineAssistPopupState::Working),
+                    ));
+                }
+                self.render(buffer)?;
+            }
+            Action::CancelInlineAssist => {
+                add_to_history = false;
+                self.close_inline_assist_session();
+                self.render(buffer)?;
+            }
+            Action::CancelInlineAssistRefine => {
+                add_to_history = false;
+                if let Some(scope) = self
+                    .inline_assist
+                    .as_ref()
+                    .map(|assist| assist.scope.clone())
+                {
+                    self.current_dialog = Some(Box::new(
+                        self.inline_assist_popup(scope, InlineAssistPopupState::Applied),
+                    ));
+                } else {
+                    self.current_dialog = None;
+                }
+                self.render(buffer)?;
+            }
+            Action::KeepInlineAssist => {
+                add_to_history = false;
+                self.close_inline_assist_session();
+                self.last_error = Some("kept inline edit in the unsaved buffer".to_string());
+                self.render(buffer)?;
+            }
+            Action::UndoInlineAssist => {
+                add_to_history = false;
+                let transaction_id = self
+                    .inline_assist
+                    .as_ref()
+                    .and_then(|assist| assist.transaction_id.clone());
+                let is_latest = transaction_id.as_deref().is_some_and(|transaction_id| {
+                    self.current_buffer()
+                        .undo_history
+                        .latest_transaction()
+                        .is_some_and(|latest| latest.id == transaction_id)
+                });
+                self.close_inline_assist_session();
+                if is_latest {
+                    self.undo_transaction(buffer, runtime).await?;
+                } else {
+                    self.last_error = Some(
+                        "inline edit is no longer the latest change; use transaction history to revert it"
+                            .to_string(),
+                    );
+                    self.draw_commandline(buffer);
+                }
+            }
+            Action::RefineInlineAssist => {
+                add_to_history = false;
+                if let Some((scope, refining)) = self
+                    .inline_assist
+                    .as_ref()
+                    .map(|assist| (assist.scope.clone(), assist.transaction_id.is_some()))
+                {
+                    self.current_dialog = Some(Box::new(self.inline_assist_popup(
+                        scope,
+                        InlineAssistPopupState::Prompt {
+                            initial: String::new(),
+                            refining,
+                        },
+                    )));
+                    self.render(buffer)?;
+                }
+            }
+            Action::EscalateInlineAssist => {
+                add_to_history = false;
+                let range = self.inline_assist.as_ref().map(|assist| assist.range);
+                self.close_inline_assist_session();
+                if let Some(range) = range {
+                    self.mode = Mode::Visual;
+                    self.select_text_range(range);
+                }
+                self.plugin_registry.execute(runtime, "Agent").await?;
             }
             Action::EnterMode(new_mode) => {
                 add_to_history = false;
@@ -24671,6 +25291,179 @@ mod test {
         let error = commit_message_prompt("main", "  \n", "fix: prior").unwrap_err();
 
         assert!(error.to_string().contains("no staged changes"));
+    }
+
+    fn inline_test_editor(contents: &str) -> Editor {
+        let config = Config::default();
+        Editor::with_size(
+            Box::new(crate::lsp::LspManager::new(config.lsp.clone())),
+            60,
+            12,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, contents.to_string())],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn inline_assist_targets_the_current_line_or_exact_visual_selection() {
+        let mut editor = inline_test_editor("alpha\nβeta\nomega\n");
+        editor.cy = 1;
+        let (line, scope) = editor.inline_assist_target().unwrap();
+        assert_eq!(
+            line,
+            TextRange::new(TextPosition::new(1, 0), TextPosition::new(2, 0))
+        );
+        assert_eq!(editor.current_buffer().text_in_range(line), "βeta\n");
+        assert_eq!(scope, "line 2");
+
+        editor.mode = Mode::Visual;
+        editor.selection = Some(Rect::new(1, 1, 2, 1));
+        let (selection, scope) = editor.inline_assist_target().unwrap();
+        assert_eq!(
+            selection,
+            TextRange::new(TextPosition::new(1, 1), TextPosition::new(1, 3))
+        );
+        assert_eq!(editor.current_buffer().text_in_range(selection), "et");
+        assert_eq!(scope, "line 2 selection");
+
+        editor.mode = Mode::VisualLine;
+        editor.selection = Some(Rect::new(0, 0, 0, 1));
+        let (lines, _) = editor.inline_assist_target().unwrap();
+        assert_eq!(
+            lines,
+            TextRange::new(TextPosition::new(0, 0), TextPosition::new(2, 0))
+        );
+        assert_eq!(
+            editor.current_buffer().text_in_range(lines),
+            "alpha\nβeta\n"
+        );
+
+        editor.mode = Mode::VisualBlock;
+        assert!(editor.inline_assist_target().is_err());
+    }
+
+    #[test]
+    fn inline_assist_layout_remains_owned_by_the_initiating_split() {
+        let mut editor = inline_test_editor("alpha\nbeta\n");
+        editor.window_manager.split_vertical(0).unwrap();
+        editor.window_manager.set_active(1);
+        editor.sync_with_window();
+        let right_window = editor.window_manager.active_window().unwrap().clone();
+        let range = TextRange::new(TextPosition::new(0, 0), TextPosition::new(1, 0));
+        editor.inline_assist = Some(InlineAssistSession {
+            buffer_id: editor.current_buffer().id(),
+            window_id: right_window.id,
+            expected_revision: editor.current_buffer().revision(),
+            range,
+            expected_text: "alpha\n".to_string(),
+            scope: "line 1".to_string(),
+            request_id: None,
+            session_id: None,
+            transaction_id: None,
+        });
+
+        editor.window_manager.set_active(0);
+        editor.sync_with_window();
+        let layout = editor.inline_assist_overlay_layout().unwrap();
+
+        assert_eq!(layout.viewport.x, right_window.position.x);
+        assert_eq!(layout.viewport.width, right_window.inner_width());
+        assert!(layout.anchor.0 >= right_window.position.x);
+    }
+
+    #[tokio::test]
+    async fn inline_replacement_is_unsaved_attributed_and_undoable() {
+        let mut editor = inline_test_editor("let x = 1;\nnext();\n");
+        editor.test_disable_terminal_output();
+        let range = TextRange::new(TextPosition::new(0, 0), TextPosition::new(1, 0));
+        let window_id = editor.window_manager.active_stable_window_id().unwrap();
+        editor.inline_assist = Some(InlineAssistSession {
+            buffer_id: editor.current_buffer().id(),
+            window_id,
+            expected_revision: editor.current_buffer().revision(),
+            range,
+            expected_text: "let x = 1;\n".to_string(),
+            scope: "line 1".to_string(),
+            request_id: Some("request-inline".to_string()),
+            session_id: Some("session-inline".to_string()),
+            transaction_id: None,
+        });
+        let mut render_buffer = RenderBuffer::new(60, 12, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .apply_inline_replacement(
+                "request-inline",
+                "session-inline",
+                "let answer = 1;\n",
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            editor.current_buffer().contents(),
+            "let answer = 1;\nnext();\n"
+        );
+        assert!(editor.current_buffer().is_dirty());
+        assert!(matches!(
+            editor
+                .current_buffer()
+                .undo_history
+                .latest_transaction()
+                .map(|transaction| &transaction.origin),
+            Some(EditOrigin::Agent { session_id, turn_id })
+                if session_id == "session-inline" && turn_id == "request-inline"
+        ));
+
+        editor
+            .execute(&Action::UndoInlineAssist, &mut render_buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), "let x = 1;\nnext();\n");
+        assert!(!editor.current_buffer().is_dirty());
+    }
+
+    #[tokio::test]
+    async fn inline_replacement_rejects_a_stale_buffer_without_mutating_it() {
+        let mut editor = inline_test_editor("old\n");
+        editor.test_disable_terminal_output();
+        let range = TextRange::new(TextPosition::new(0, 0), TextPosition::new(1, 0));
+        let revision = editor.current_buffer().revision();
+        let window_id = editor.window_manager.active_stable_window_id().unwrap();
+        editor.inline_assist = Some(InlineAssistSession {
+            buffer_id: editor.current_buffer().id(),
+            window_id,
+            expected_revision: revision,
+            range,
+            expected_text: "old\n".to_string(),
+            scope: "line 1".to_string(),
+            request_id: Some("stale-request".to_string()),
+            session_id: Some("inline-session".to_string()),
+            transaction_id: None,
+        });
+        editor.begin_transaction("concurrent edit");
+        editor.replace_range(range, "newer\n");
+        editor.commit_transaction(editor.cursor_snapshot());
+        let mut render_buffer = RenderBuffer::new(60, 12, &Style::default());
+        let mut runtime = Runtime::new();
+
+        let error = editor
+            .apply_inline_replacement(
+                "stale-request",
+                "inline-session",
+                "model output\n",
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("buffer changed"));
+        assert_eq!(editor.current_buffer().contents(), "newer\n");
     }
 
     fn catalog_test_package() -> plugin::catalog::CatalogPackage {

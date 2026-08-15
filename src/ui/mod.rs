@@ -17,6 +17,7 @@ mod geometry;
 mod hover_info;
 mod icons;
 mod info;
+mod inline_assist;
 mod input_prompt;
 mod keymap_hints;
 mod list;
@@ -39,10 +40,12 @@ use crossterm::event::{Event, KeyCode, MouseEvent, MouseEventKind};
 pub use diagnostic_info::DiagnosticInfo;
 use dialog::Dialog;
 pub use file_picker::FilePicker;
+pub use geometry::OverlayLayout;
 pub(crate) use geometry::ScreenRect;
 pub use hover_info::{HoverInfo, HoverInfoFormat};
 pub(crate) use icons::IconCatalog;
 pub use info::Info;
+pub use inline_assist::{InlineAssistPopup, InlineAssistPopupState};
 pub use input_prompt::InputPrompt;
 pub(crate) use keymap_hints::draw_keymap_hints;
 use list::List;
@@ -96,6 +99,10 @@ pub trait Component: Send {
     }
 
     fn resize(&mut self, _viewport_width: usize, _viewport_height: usize) -> bool {
+        false
+    }
+
+    fn update_overlay_layout(&mut self, _layout: OverlayLayout) -> bool {
         false
     }
 

@@ -19,6 +19,31 @@ The check is offline. It locates `codex`, reads `codex --version`, and reports
 whether the installed version supports Red's app-server contract.
 Authentication is verified by `account/read` when the first session starts.
 
+## Inline assist
+
+`Space i` is the limited-blast-radius path for iterative code changes. In
+Normal mode its target is exactly the current line; in Visual and Visual-line
+mode its target is exactly the selection. Visual-block mode is intentionally
+unsupported. The popup prefers the space below the target and moves above it
+when needed. It remains inside the editor split where the request started and
+never covers the rendered target. Long prompts soft-wrap and grow to six rows;
+after that the prompt scrolls internally to keep the cursor visible.
+
+Each invocation starts an ephemeral Codex thread with a read-only sandbox, no
+native tools, and one dynamic tool: `submit_replacement`. Codex cannot choose a
+file or range. Red supplies the immutable target plus at most 20 surrounding
+lines on either side, rejects sensitive/ignored/out-of-workspace and binary
+contexts, and accepts at most a 128 KiB complete replacement. Follow-up
+refinements reuse that ephemeral thread while the popup remains open.
+
+Before applying a response, Red verifies the active buffer identity, revision,
+range, and original text. A stale response fails without changing the buffer.
+Successful output is applied only after it is complete, through one
+agent-attributed editor transaction, and is deliberately not saved. The result
+controls are Enter/`k` to keep, `u` to undo, `r` to refine, and `A` to select
+the changed range and open the full Agent workflow. Closing the popup destroys
+the ephemeral inline session.
+
 To use a Codex executable outside `PATH`:
 
 ```toml
@@ -119,6 +144,7 @@ protocol is unavailable; it does not fall back to `codex exec` or native edits.
 
 | Command | Purpose |
 | --- | --- |
+| `Space i` | Edit the current line or visual selection in a bounded popup. |
 | `:Agent` / `:AgentPrompt` | Open the prompt composer. |
 | `:AgentOpen` | Show and focus the conversation pane without opening a prompt. |
 | `:AgentCancel` | Interrupt the active Codex turn. |

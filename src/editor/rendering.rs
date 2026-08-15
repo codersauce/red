@@ -35,12 +35,13 @@ use crate::{
     splash,
     theme::{SelectionForegroundPriority, Style, Theme},
     ui::IconCatalog,
-    undo::TextPosition,
+    undo::{TextPosition, TextRange},
     unicode_utils::{
         char_prefix, display_width, display_width_with_tabs, fit_display_width,
         grapheme_to_column_with_tabs, trim_line_ending, truncate_display_width,
     },
     utils::{expand_user_path, get_workspace_path},
+    window::WindowId,
 };
 
 use super::{
@@ -3176,6 +3177,32 @@ impl Editor {
                 Some(((self.vx + display_col), self.cy))
             }
         }
+    }
+
+    /// Returns the inclusive terminal rows occupied by the visible part of a text range.
+    pub(crate) fn render_text_range_rows_in_window(
+        &self,
+        window_id: WindowId,
+        range: TextRange,
+    ) -> Option<(usize, usize)> {
+        let window = self.window_manager.window(window_id)?;
+        let layout = self.layout_for_window(window);
+        let last_line = range.end.line.saturating_sub(usize::from(
+            range.end.character == 0 && range.end.line > range.start.line,
+        ));
+        let first = layout
+            .rows
+            .iter()
+            .find(|segment| (range.start.line..=last_line).contains(&segment.line))?;
+        let last = layout
+            .rows
+            .iter()
+            .rev()
+            .find(|segment| (range.start.line..=last_line).contains(&segment.line))?;
+        Some((
+            self.window_to_terminal_y(window, first.row),
+            self.window_to_terminal_y(window, last.row),
+        ))
     }
 
     pub(crate) fn active_cursor_shape(&self) -> CursorShape {

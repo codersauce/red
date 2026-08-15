@@ -110,6 +110,7 @@ is fine: the embedded defaults, plugins, and themes are enough to start editing.
 | `Ctrl-p` | Find a file with fuzzy search and live preview |
 | `Space G` | Open the Git status workspace |
 | `Space A` | Ask the agent with editor context |
+| `Space i` | Refactor the current line or visual selection inline |
 | `Space t` | Browse themes with live preview |
 
 See [Getting started](docs/GETTING_STARTED.md) for editing, navigation,
@@ -137,6 +138,13 @@ controls. Ignored, out-of-workspace, binary, and common secret files are
 excluded from context. Read the
 [agent workflow and safety contract](docs/AGENT_WORKFLOW.md) for prerequisites,
 limits, commands, and failure behavior.
+
+For a smaller blast radius, press `Space i` on a line or visual selection.
+Inline assist opens beside the target, gives an ephemeral Codex thread only the
+selected text and bounded surroundings, and accepts only one complete
+replacement. The result is an unsaved, agent-attributed editor transaction;
+keep it, undo it, refine it in the same popup, or escalate the changed range to
+the full Agent panel.
 
 ## What Red ships today
 
