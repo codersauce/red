@@ -11137,6 +11137,184 @@ mod tests {
 
     #[cfg(not(windows))]
     #[tokio::test]
+    async fn git_dashboard_renders_untracked_file_contents() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(
+            root.join("new-file.txt"),
+            "first new line\nsecond new line\n",
+        )
+        .unwrap();
+
+        let mut runtime = load_git_runtime(root).await;
+        runtime.execute_command("GitDashboard").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let document = loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            let mut document = None;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                if let PluginRequest::UpdateWorkspace { model, .. } = request {
+                    if let Some(detail) = model.detail_document {
+                        document = Some(detail);
+                    }
+                }
+            }
+            if let Some(document) = document {
+                break document;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "untracked file contents did not render"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(document.path, "new-file.txt");
+        let added = document
+            .lines
+            .iter()
+            .filter(|line| line.kind == "added")
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(added, ["first new line", "second new line"]);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn git_dashboard_reopens_with_unchanged_status() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.join("new-file.txt"), "new contents\n").unwrap();
+
+        let mut runtime = load_git_runtime(root).await;
+        runtime.execute_command("GitDashboard").await.unwrap();
+        let wait_for_row = async |runtime: &mut Runtime, failure: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                pump_process_events(runtime).await.unwrap();
+                let mut found = false;
+                while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                    if let PluginRequest::UpdateWorkspace { model, .. } = request {
+                        found = model
+                            .rows
+                            .iter()
+                            .any(|row| row.id == "untracked:new-file.txt");
+                    }
+                }
+                if found {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "{failure}");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        wait_for_row(&mut runtime, "first Git dashboard did not render").await;
+
+        runtime
+            .notify(
+                "workspace:event:git-dashboard",
+                serde_json::json!({ "action": "q", "row": null }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+        runtime.execute_command("GitDashboard").await.unwrap();
+        wait_for_row(
+            &mut runtime,
+            "reopened Git dashboard did not restore unchanged status",
+        )
+        .await;
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn git_dashboard_reports_failed_row_actions() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.join("new-file.txt"), "new contents\n").unwrap();
+
+        let mut runtime = load_git_runtime(root).await;
+        fs::write(root.join(".git/index.lock"), "").unwrap();
+        runtime
+            .notify(
+                "workspace:event:git-dashboard",
+                serde_json::json!({
+                    "action": "s",
+                    "focus": "rows",
+                    "row": {
+                        "id": "untracked:new-file.txt",
+                        "selectable": true,
+                        "depth": 1,
+                        "path": "new-file.txt",
+                        "segments": [],
+                        "right_segments": [],
+                        "data": {
+                            "section": "untracked",
+                            "path": "new-file.txt",
+                            "entry": null
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let error = loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            let mut error = None;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                if let PluginRequest::Action(Action::Print(message)) = request {
+                    error = Some(message);
+                }
+            }
+            if let Some(error) = error {
+                break error;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "failed Git row action did not report its error"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(
+            error.contains("index.lock"),
+            "unexpected Git error: {error}"
+        );
+        assert!(Command::new("git")
+            .args(["status", "--short"])
+            .current_dir(root)
+            .output()
+            .unwrap()
+            .stdout
+            .starts_with(b"?? new-file.txt"));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
     async fn git_dashboard_renders_structured_diff_and_stages_one_selected_line() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();

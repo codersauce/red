@@ -50,6 +50,19 @@ pub fn sign_diff_args(staged: bool, paths: [String]) -> [String] {
 }
 
 pub fn detail_diff_args(section: String, path: String) -> [String] {
+    if section == "untracked" {
+        return [
+            "diff",
+            "--no-index",
+            "--no-ext-diff",
+            "--color=never",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--",
+            "/dev/null",
+            path,
+        ];
+    }
     let target = diff_target(section);
     let mut args = ["diff"];
     match target {
@@ -175,6 +188,7 @@ fn builds_bounded_noninteractive_status_and_diff_commands() {
     assert(sign_diff_args(true, ["src/a.rs", "src/b.rs"]).join(" ") == "-c core.quotePath=false diff --cached --no-ext-diff --no-prefix --unified=0 -- src/a.rs src/b.rs");
     assert(detail_diff_args("staged", "src/a.rs").join(" ") == "diff --cached --no-ext-diff --color=never -- src/a.rs");
     assert(detail_diff_args("unstaged", "src/a.rs").join(" ") == "diff --no-ext-diff --color=never -- src/a.rs");
+    assert(detail_diff_args("untracked", "src/new file.rs").join(" ") == "diff --no-index --no-ext-diff --color=never --src-prefix=a/ --dst-prefix=b/ -- /dev/null src/new file.rs");
 }
 
 #[test]
