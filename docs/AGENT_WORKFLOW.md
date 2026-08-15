@@ -51,16 +51,51 @@ not saved. Comment-only results do not alter dirty state or text undo history.
 The result controls are Enter/`k` to keep, `u` to undo the latest inline edit
 and dismiss its comments (or just dismiss a comment-only result), `r` to
 refine, and `A` to open the full Agent workflow. Refinement replaces only that
-invocation's annotation group. Closing the popup destroys the ephemeral Codex
-session; kept comments remain in the editor until dismissed or the editor
-session ends.
+invocation's visible annotation group. Earlier turns remain in Inline History.
+Closing the popup destroys the ephemeral Codex session, not the retained
+conversation. Kept comments remain available until hidden or resolved.
 
 Use `Space ] c` and `Space [ c` to navigate comments, `Space v` to read the full
 message, `Space x` to dismiss one, and `Space X` to clear the current buffer.
 Overlapping annotations are retained and collapsed into a numbered group; the
 navigation commands select which range its gutter bracket shows. Comments
 follow edits above them and are marked outdated when their referenced source
-changes. They are not written into source files or persisted across restarts.
+changes. They are never written into source files. Hiding or clearing comments
+does not delete the question or answer.
+
+### Inline history
+
+Press `Space H` or run `:InlineHistory` to browse retained questions, answers,
+edits, and outcomes. The bottom panel initially shows the current file; `w`
+switches to the workspace session. `j`/`k` previews conversations in the editor,
+`l` expands earlier turns, `h` collapses them, and `/` searches their text.
+`Enter` keeps the selected location; `Esc` restores the original location and
+comment visibility. Browsing never applies an edit or modifies a source file.
+
+Within history, `v` cycles through the conversation, reviewed source, before-edit
+source, and a reviewed/current comparison. `Ctrl-d`/`Ctrl-u` or Page Down/Up
+scroll the detail. `r` continues the selected discussion, while `R` prepares a
+recheck against current source. Both use a new ephemeral provider thread with
+bounded recovered conversation context and the usual fresh-target guards.
+Detached source must be selected again explicitly in the editor.
+
+`d` toggles resolved state. `D` asks before forgetting the whole conversation.
+`:InlineHistoryExport path.json` writes a new local JSON export without
+overwriting an existing file. Exports contain prompts and reviewed source;
+treat them as private workspace data.
+
+History belongs to the editor core and is included in normal recovery snapshots.
+Set top-level `persist_inline_history = false` to keep it in memory only. Pending
+requests become cancelled on recovery; Red never pretends an ephemeral provider
+thread survived a restart. The store is bounded to 32 MiB and refuses new turns
+before silently dropping old ones. Large repeated annotation source snapshots
+are content-addressed. User-visible assistant prose is retained up to 64 KiB
+per turn, with an explicit truncation marker.
+
+Each turn and each comment has its own tracked source location. History labels
+source as unchanged, changed, or detached; unchanged means matching source text,
+not that an old answer is semantically guaranteed correct. Deleted or ambiguous
+targets remain readable in history without an arrow on unrelated code.
 
 To use a Codex executable outside `PATH`:
 

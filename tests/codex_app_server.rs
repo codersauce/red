@@ -176,6 +176,10 @@ for line in sys.stdin:
         assert "submit_replacement" in text
         turn_id = f"inline-turn-{turn}"
         send({"id": ident, "result": {"turn": {"id": turn_id}}})
+        if turn == 1:
+            send({"method": "item/agentMessage/delta", "params": {
+                "threadId": "inline-red", "turnId": turn_id, "delta": "Renamed the value."
+            }})
         tool = "submit_comments" if turn in (3, 5) else "submit_replacement"
         if turn == 3:
             arguments = {"comments": [{"start_line": 1, "end_line": 2, "message": "Review both lines"}]}
@@ -259,6 +263,11 @@ async fn inline_app_server_is_ephemeral_tool_limited_and_supports_followups() {
         next_event(&mut bridge, &mut task).await,
         CodexEvent::InlineSessionCreated { request_id, session_id }
             if request_id == "request-1" && session_id == "inline-red"
+    ));
+    assert!(matches!(
+        next_event(&mut bridge, &mut task).await,
+        CodexEvent::InlineAnswerDelta { request_id, text }
+            if request_id == "request-1" && text == "Renamed the value."
     ));
     assert!(matches!(
         next_event(&mut bridge, &mut task).await,

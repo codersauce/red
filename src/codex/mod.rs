@@ -175,6 +175,8 @@ pub enum CodexCommand {
 /// Events delivered from the Codex worker to the editor owner.
 #[derive(Debug, Clone)]
 pub enum CodexEvent {
+    /// User-visible prose from an inline turn, retained separately from its result.
+    InlineAnswerDelta { request_id: String, text: String },
     /// An ephemeral inline-edit thread is ready and its first turn has started.
     InlineSessionCreated {
         /// Editor request that launched the thread.
@@ -1102,7 +1104,14 @@ async fn handle_message<H: CodexToolHost>(
                 }) {
                     match &mut session.kind {
                         SessionKind::Agent => agent_update = Some(text.to_string()),
-                        SessionKind::Inline { .. } => {}
+                        SessionKind::Inline { request_id, .. } => {
+                            let _ = events
+                                .send(CodexEvent::InlineAnswerDelta {
+                                    request_id: request_id.clone(),
+                                    text: text.to_string(),
+                                })
+                                .await;
+                        }
                         SessionKind::CommitMessage {
                             output,
                             exceeded_limit,

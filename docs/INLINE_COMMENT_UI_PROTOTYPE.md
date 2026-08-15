@@ -10,6 +10,7 @@ Run `cargo run --bin red -- path/to/file` in this worktree.
 | Key | Action |
 | --- | --- |
 | `Space i` | Ask inline assist to edit, explain, or review the current target. |
+| `Space H` | Browse retained inline conversations and preview their comments. |
 | `Space ] c` / `Space [ c` | Select the next/previous annotation, including overlapping comments. |
 | `Space v` | Read the full comment in a scrollable plain-text popup. |
 | `Space x` | Dismiss the selected comment. |
@@ -36,12 +37,14 @@ dirty state stay unchanged.
 Clicking a comment moves to its source line. Splits show the same buffer's
 comments at their own widths.
 
-The comments are in memory only. Edits above them move both range anchors;
+Questions, answers, and comments are retained in editor-session history. Edits above them move both range anchors;
 changes to their source mark them outdated. Overlapping comments remain stored
 and collapse to one numbered box; navigation selects the visible annotation.
 Refinement replaces only comments from the same inline-assist invocation.
-The sample keys remain available for UI development. Persistence across editor
-restarts, threaded replies, and regular-assistant tools are not implemented yet.
+The sample keys remain available for UI development. `Space H` provides earlier
+turns, reviewed-source snapshots, continuation, and rechecking. Normal editor
+recovery restores retained conversations; `persist_inline_history = false`
+disables disk retention. Regular-assistant annotation tools are not exposed yet.
 
 To preview a range, press `V`, extend the selection with `j`/`k`, then press
 `Space C`. The status message identifies the inclusive line range. Model tools

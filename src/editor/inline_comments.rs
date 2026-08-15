@@ -18,10 +18,15 @@ const MAX_FINGERPRINT_BYTES: usize = 256 * 1024;
 #[derive(Debug, Clone)]
 pub(super) enum InlineCommentOrigin {
     Sample,
+    HistoryPreview {
+        request_id: String,
+        comment_index: usize,
+    },
     Assist {
         group_id: String,
         session_id: String,
         request_id: String,
+        comment_index: usize,
     },
 }
 
@@ -33,7 +38,8 @@ pub(super) struct InlineComment {
     pub message: String,
     pub origin: InlineCommentOrigin,
     pub stale: bool,
-    expected_fingerprint: Option<[u8; 32]>,
+    pub detached: bool,
+    pub(super) expected_fingerprint: Option<[u8; 32]>,
 }
 
 impl InlineComment {
@@ -193,7 +199,7 @@ impl Editor {
         self.layout_cache.borrow_mut().clear();
     }
 
-    fn make_inline_comment(
+    pub(super) fn make_inline_comment(
         &self,
         start: usize,
         end: usize,
@@ -217,6 +223,7 @@ impl Editor {
             message,
             origin,
             stale: false,
+            detached: false,
             expected_fingerprint: fingerprint(buffer, start, end),
         }
     }
@@ -251,7 +258,8 @@ impl Editor {
     ) {
         let added = comments
             .iter()
-            .map(|comment| {
+            .enumerate()
+            .map(|(comment_index, comment)| {
                 self.make_inline_comment(
                     start_line + comment.start_line - 1,
                     start_line + comment.last_line() - 1,
@@ -260,6 +268,7 @@ impl Editor {
                         group_id: group_id.to_string(),
                         session_id: session_id.to_string(),
                         request_id: request_id.to_string(),
+                        comment_index,
                     },
                 )
             })
@@ -292,7 +301,9 @@ impl Editor {
             .inline_comments
             .iter()
             .enumerate()
-            .filter(|(_, comment)| comment.anchor.buffer_id == buffer.id())
+            .filter(|(_, comment)| {
+                comment.anchor.buffer_id == buffer.id() && self.inline_comment_visible(comment)
+            })
             .map(|(index, comment)| (index, comment.lines(buffer)))
             .collect::<Vec<_>>();
         indices.sort_by_key(|&(index, (start, _))| (start, index));
@@ -351,7 +362,10 @@ impl Editor {
         let line = self.buffer_line();
         let at_line = |comment: &InlineComment| {
             let (start, end) = comment.lines(buffer);
-            comment.anchor.buffer_id == buffer.id() && start <= line && line <= end
+            comment.anchor.buffer_id == buffer.id()
+                && self.inline_comment_visible(comment)
+                && start <= line
+                && line <= end
         };
         self.inline_comments
             .iter()
@@ -370,7 +384,9 @@ impl Editor {
             .inline_comments
             .iter()
             .enumerate()
-            .filter(|(_, comment)| comment.anchor.buffer_id == buffer.id())
+            .filter(|(_, comment)| {
+                comment.anchor.buffer_id == buffer.id() && self.inline_comment_visible(comment)
+            })
             .map(|(index, comment)| (index, comment.lines(buffer).0))
             .collect::<Vec<_>>();
         indices.sort_by_key(|&(index, start)| (start, index));
@@ -409,6 +425,18 @@ impl Editor {
 
     pub(super) fn dismiss_inline_comment(&mut self) {
         if let Some(index) = self.current_inline_comment_index() {
+            if let InlineCommentOrigin::Assist {
+                request_id,
+                comment_index,
+                ..
+            } = &self.inline_comments[index].origin
+            {
+                if let Some(turn) = self.inline_history.turn_mut(request_id) {
+                    if !turn.hidden_comments.contains(comment_index) {
+                        turn.hidden_comments.push(*comment_index);
+                    }
+                }
+            }
             self.inline_comments.remove(index);
             self.active_inline_comment = None;
             self.layout_cache.borrow_mut().clear();
@@ -426,6 +454,7 @@ impl Editor {
         let (start, end) = comment.lines(self.current_buffer());
         let provenance = match &comment.origin {
             InlineCommentOrigin::Sample => "sample".to_string(),
+            InlineCommentOrigin::HistoryPreview { .. } => "history preview".to_string(),
             InlineCommentOrigin::Assist {
                 session_id,
                 request_id,
@@ -448,6 +477,22 @@ impl Editor {
 
     pub(super) fn clear_inline_comments(&mut self) {
         let buffer_id = self.current_buffer().id();
+        for comment in &self.inline_comments {
+            if comment.anchor.buffer_id == buffer_id {
+                if let InlineCommentOrigin::Assist {
+                    request_id,
+                    comment_index,
+                    ..
+                } = &comment.origin
+                {
+                    if let Some(turn) = self.inline_history.turn_mut(request_id) {
+                        if !turn.hidden_comments.contains(comment_index) {
+                            turn.hidden_comments.push(*comment_index);
+                        }
+                    }
+                }
+            }
+        }
         self.inline_comments
             .retain(|comment| comment.anchor.buffer_id != buffer_id);
         self.active_inline_comment = None;
@@ -455,9 +500,15 @@ impl Editor {
     }
 
     pub(super) fn has_inline_comments(&self, buffer_id: BufferId) -> bool {
-        self.inline_comments
-            .iter()
-            .any(|comment| comment.anchor.buffer_id == buffer_id)
+        self.inline_comments.iter().any(|comment| {
+            comment.anchor.buffer_id == buffer_id && self.inline_comment_visible(comment)
+        })
+    }
+
+    fn inline_comment_visible(&self, comment: &InlineComment) -> bool {
+        !comment.detached
+            && matches!(comment.origin, InlineCommentOrigin::HistoryPreview { .. })
+                == self.inline_history_browser.is_some()
     }
 
     /// Reserves a connector and a trailing space without consuming source cells.

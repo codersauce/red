@@ -20,6 +20,7 @@ mod buffer_manager;
 mod diagnostics_picker;
 mod display_layout;
 mod inline_comments;
+mod inline_history;
 mod lsp_coordinator;
 #[cfg(test)]
 mod navigation_perf_tests;
@@ -94,6 +95,7 @@ use crate::{
     highlighter::{Highlighter, LanguageRegistry},
     indent::{self, IndentDecision},
     inline_assist::InlineAssistResult,
+    inline_history::{InlineDisposition, InlineHistory, InlineTurnState},
     log,
     lsp::{
         apply_workspace_resource_operations, file_path as lsp_file_path, get_client_capabilities,
@@ -1185,6 +1187,9 @@ fn render_marked_string(marked: MarkedString) -> String {
 
 fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
     match event {
+        CodexEvent::InlineAnswerDelta { request_id, .. } => {
+            ("inline_assist:answer", json!({ "request_id": request_id }))
+        }
         CodexEvent::InlineSessionCreated {
             request_id,
             session_id,
@@ -2339,6 +2344,8 @@ pub enum Action {
     ReloadLanguages,
     ShowDialog,
     CloseDialog,
+    OpenInlineHistory,
+    InlineHistoryAction(crate::inline_history::HistoryAction),
     ClearDiagnostics(String, Vec<usize>),
     RefreshDiagnostics,
     Refresh,
@@ -2817,6 +2824,8 @@ pub struct Editor {
     /// Session-local annotations; never serialized into source or text undo history.
     inline_comments: Vec<inline_comments::InlineComment>,
     active_inline_comment: Option<uuid::Uuid>,
+    inline_history: InlineHistory,
+    inline_history_browser: Option<inline_history::HistoryBrowser>,
 
     /// LSP client for code intelligence features
     lsp: Box<dyn LspClient>,
@@ -4181,6 +4190,8 @@ impl Editor {
             inline_assist: None,
             inline_comments: Vec::new(),
             active_inline_comment: None,
+            inline_history: InlineHistory::default(),
+            inline_history_browser: None,
             lsp,
             config,
             config_diagnostics: Vec::new(),
@@ -5113,7 +5124,11 @@ impl Editor {
         self.invalidate_terminal_render_state(buffer);
 
         let viewport_width = self.vwidth();
-        let viewport_height = self.vheight();
+        let viewport_height = if self.inline_history_browser.is_some() {
+            self.inline_history_viewport_height()
+        } else {
+            self.vheight()
+        };
         let overlay_layout = self.inline_assist_overlay_layout();
         let dialog_resized = if let Some(dialog) = &mut self.current_dialog {
             match overlay_layout {
@@ -5262,6 +5277,10 @@ impl Editor {
             .active_window()
             .map(|window| self.window_content_height(window))
             .unwrap_or_else(|| (self.size.1 as usize).saturating_sub(2))
+    }
+
+    pub(crate) fn inline_history_viewport_height(&self) -> usize {
+        usize::from(self.size.1).saturating_sub(2)
     }
 
     pub(crate) fn picker_input_position(&self) -> crate::config::PickerInputPosition {
@@ -7010,6 +7029,17 @@ impl Editor {
     }
 
     fn close_inline_assist_session(&mut self) {
+        if let Some(request) = self
+            .inline_assist
+            .as_ref()
+            .and_then(|assist| assist.request_id.as_deref())
+        {
+            self.inline_history.finish(
+                request,
+                InlineTurnState::Cancelled,
+                Some("Request closed before completion.".into()),
+            );
+        }
         if let Some(session_id) = self
             .inline_assist
             .as_ref()
@@ -7197,6 +7227,7 @@ impl Editor {
             assist.has_result = true;
             assist.result_request_id = Some(request_id.to_string());
         }
+        self.complete_inline_history_turn(request_id, session_id, result, new_range);
         if let Err(error) = if changed {
             self.notify_change(runtime).await
         } else {
@@ -7315,6 +7346,7 @@ impl Editor {
 
         let buffer = Buffer::load_or_create(Some(normalized.clone())).await?;
         self.buffer_manager.push_buffer(buffer);
+        self.rebind_inline_history_file(&normalized);
         Ok((self.buffer_manager.len() - 1, true, normalized))
     }
 
@@ -8183,6 +8215,10 @@ impl Editor {
                 continue;
             }
             let event = match event {
+                CodexEvent::InlineAnswerDelta { request_id, text } => {
+                    self.inline_history.append_answer(&request_id, &text);
+                    continue;
+                }
                 CodexEvent::InlineSessionCreated {
                     request_id,
                     session_id,
@@ -8208,6 +8244,19 @@ impl Editor {
                         .apply_inline_result(&request_id, &session_id, &result, buffer, runtime)
                         .await
                     {
+                        if let Some(turn) = self
+                            .inline_history
+                            .turn_mut(&request_id)
+                            .filter(|turn| turn.state == InlineTurnState::Pending)
+                        {
+                            turn.result = Some(result);
+                            turn.session_id = Some(session_id);
+                        }
+                        self.inline_history.finish(
+                            &request_id,
+                            InlineTurnState::Rejected,
+                            Some(error.to_string()),
+                        );
                         if let Some(scope) = self.inline_assist.as_ref().and_then(|assist| {
                             (assist.request_id.as_deref() == Some(request_id.as_str()))
                                 .then(|| assist.scope.clone())
@@ -8226,6 +8275,18 @@ impl Editor {
                     session_id,
                     message,
                 } => {
+                    let history_request = request_id.clone().or_else(|| {
+                        self.inline_assist
+                            .as_ref()
+                            .and_then(|assist| assist.request_id.clone())
+                    });
+                    if let Some(request) = history_request {
+                        self.inline_history.finish(
+                            &request,
+                            InlineTurnState::Failed,
+                            Some(message.clone()),
+                        );
+                    }
                     let scope = self.inline_assist.as_mut().and_then(|assist| {
                         let active = request_id.as_deref().is_none_or(|request_id| {
                             assist.request_id.as_deref() == Some(request_id)
@@ -13161,6 +13222,14 @@ impl Editor {
         if cmd == "config-diagnostics" {
             return vec![Action::ConfigDiagnostics];
         }
+        if matches!(cmd, "InlineHistory" | "inline-history") {
+            return vec![Action::OpenInlineHistory];
+        }
+        if let Some(path) = cmd.strip_prefix("InlineHistoryExport ") {
+            return vec![Action::InlineHistoryAction(
+                crate::inline_history::HistoryAction::Export(path.to_string()),
+            )];
+        }
 
         // Handle debug commands first (these don't go through normal command parsing)
         match cmd {
@@ -16341,15 +16410,32 @@ impl Editor {
                     self.last_error = Some("inline assist is no longer active".to_string());
                     return Ok(false);
                 };
-                let context = match self.inline_assist_context(range) {
+                let mut context = match self.inline_assist_context(range) {
                     Ok(context) => context,
                     Err(error) => {
                         self.last_error = Some(error.to_string());
                         return Ok(false);
                     }
                 };
+                if existing_session.is_none() {
+                    if let Some(assist) = &self.inline_assist {
+                        context
+                            .push_str(&self.recovered_inline_context(&assist.annotation_group_id));
+                    }
+                }
+                let request_id = uuid::Uuid::new_v4().to_string();
+                if let Err(error) = self.begin_inline_history_turn(&request_id, prompt, range) {
+                    self.last_error = Some(error.to_string());
+                    self.render(buffer)?;
+                    return Ok(false);
+                }
                 let cwd = get_workspace_path();
                 if let Err(error) = self.ensure_agent_bridge(&cwd) {
+                    self.inline_history.finish(
+                        &request_id,
+                        InlineTurnState::Failed,
+                        Some(error.to_string()),
+                    );
                     self.current_dialog = Some(Box::new(self.inline_assist_popup(
                         scope,
                         InlineAssistPopupState::Failed(error.to_string()),
@@ -16357,7 +16443,6 @@ impl Editor {
                     self.render(buffer)?;
                     return Ok(false);
                 }
-                let request_id = uuid::Uuid::new_v4().to_string();
                 let revision = self.current_buffer().revision();
                 let expected_text = self.current_buffer().text_in_range(range);
                 if let Some(assist) = self.inline_assist.as_mut() {
@@ -16385,6 +16470,11 @@ impl Editor {
                     Err(anyhow::anyhow!("Codex bridge is unavailable"))
                 };
                 if let Err(error) = send_result {
+                    self.inline_history.finish(
+                        &request_id,
+                        InlineTurnState::Failed,
+                        Some(error.to_string()),
+                    );
                     if let Some(assist) = self.inline_assist.as_mut() {
                         assist.session_id = None;
                     }
@@ -16447,6 +16537,32 @@ impl Editor {
                         .latest_transaction()
                         .is_some_and(|latest| latest.id == transaction_id)
                 });
+                if let Some(request) = self
+                    .inline_assist
+                    .as_ref()
+                    .and_then(|assist| assist.result_request_id.as_deref())
+                {
+                    if let Some(turn) = self.inline_history.turn_mut(request) {
+                        if is_latest || transaction_id.is_none() {
+                            turn.disposition = InlineDisposition::Undone;
+                        }
+                        if let Some(result) = &turn.result {
+                            turn.hidden_comments = (0..result.comments.len()).collect();
+                        }
+                    }
+                }
+                if is_latest {
+                    for turn in self
+                        .inline_history
+                        .conversations
+                        .iter_mut()
+                        .flat_map(|conversation| &mut conversation.turns)
+                    {
+                        if turn.transaction_id.as_deref() == transaction_id.as_deref() {
+                            turn.disposition = InlineDisposition::Undone;
+                        }
+                    }
+                }
                 if let Some(group_id) = self
                     .inline_assist
                     .as_ref()
@@ -19113,10 +19229,28 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::CloseDialog => {
+                if self.inline_history_browser.is_some() {
+                    self.handle_inline_history_action(
+                        &crate::inline_history::HistoryAction::Close,
+                        buffer,
+                        runtime,
+                    )
+                    .await?;
+                    return Ok(false);
+                }
                 self.release_current_dialog_callbacks(runtime);
                 self.current_dialog = None;
                 self.completion_snapshot = None;
                 self.render(buffer)?;
+            }
+            Action::OpenInlineHistory => {
+                add_to_history = false;
+                self.open_inline_history(buffer, runtime).await?;
+            }
+            Action::InlineHistoryAction(action) => {
+                add_to_history = false;
+                self.handle_inline_history_action(action, buffer, runtime)
+                    .await?;
             }
             Action::RefreshDiagnostics => {
                 add_to_history = false;
@@ -20817,6 +20951,7 @@ impl Editor {
 
         self.sync_to_window();
         let removed_id = self.current_buffer().id();
+        self.detach_inline_history_buffer(removed_id);
         self.inline_comments
             .retain(|comment| comment.anchor.buffer_id != removed_id);
         self.layout_cache.borrow_mut().clear();
@@ -20949,6 +21084,7 @@ impl Editor {
         previous_uri: Option<&str>,
         buffer_index: usize,
     ) -> anyhow::Result<()> {
+        self.refresh_inline_history_paths();
         let current_uri = self
             .buffer_manager
             .get(buffer_index)
@@ -21928,6 +22064,7 @@ impl Editor {
     }
 
     fn update_anchors_for_edit(&mut self, edit: AppliedTextEdit) {
+        self.transform_inline_history_for_edit(edit);
         let buffer_id = self.current_buffer().id();
         let buffer = &self.buffer_manager[self.buffer_manager.active_index()];
         for comment in &mut self.inline_comments {
@@ -21938,6 +22075,7 @@ impl Editor {
             Self::transform_inline_comment_anchor(&mut comment.end_anchor, edit, buffer);
             comment.refresh_staleness(buffer);
         }
+        self.refresh_history_annotation_states();
         if let Some(marks) = self.local_marks.get_mut(&buffer_id) {
             for anchor in marks.values_mut() {
                 Self::transform_anchor_for_edit(
@@ -22574,6 +22712,11 @@ impl Editor {
         render_buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        let transaction = self
+            .current_buffer()
+            .undo_history
+            .latest_transaction()
+            .map(|transaction| transaction.id.clone());
         let buffer = self.current_buffer_mut();
         let mut history = std::mem::take(&mut buffer.undo_history);
         let outcome = history.undo(buffer);
@@ -22585,11 +22728,15 @@ impl Editor {
             self.draw_commandline(render_buffer);
             return Ok(());
         };
+        if let Some(transaction) = transaction {
+            self.set_inline_history_transaction_applied(&transaction, false);
+        }
         for edit in edits {
             self.update_anchors_for_edit(edit);
             self.set_special_mark_at_char('.', edit.start_char, AnchorAffinity::Left);
         }
         self.restore_cursor_snapshot(cursor);
+        self.restore_inline_history_comments();
         self.notify_change(runtime).await?;
         self.render(render_buffer)?;
 
@@ -22612,11 +22759,20 @@ impl Editor {
             self.draw_commandline(render_buffer);
             return Ok(());
         };
+        if let Some(transaction) = self
+            .current_buffer()
+            .undo_history
+            .latest_transaction()
+            .map(|transaction| transaction.id.clone())
+        {
+            self.set_inline_history_transaction_applied(&transaction, true);
+        }
         for edit in edits {
             self.update_anchors_for_edit(edit);
             self.set_special_mark_at_char('.', edit.start_char, AnchorAffinity::Left);
         }
         self.restore_cursor_snapshot(cursor);
+        self.restore_inline_history_comments();
         self.notify_change(runtime).await?;
         self.render(render_buffer)?;
 
@@ -22830,6 +22986,11 @@ impl Editor {
         if let Some(conversation) = snapshot.agent_conversation.clone() {
             self.agent_manager.restore_conversation(conversation);
         }
+        if self.config.persist_inline_history.unwrap_or(true) {
+            self.inline_history = snapshot.inline_history.clone();
+            self.inline_history.recover();
+            self.restore_inline_history_comments();
+        }
         if let Err(error) = self
             .preferences
             .merge_plugin_storage_snapshot(&snapshot.plugin_extensions)
@@ -22996,6 +23157,7 @@ impl Editor {
         &mut self,
         include_disk_contents: bool,
     ) -> (SessionSnapshot, Vec<Option<SessionDiskFingerprint>>) {
+        self.refresh_inline_history_paths();
         self.sync_to_window();
         let cwd = std::env::current_dir()
             .ok()
@@ -23159,6 +23321,11 @@ impl Editor {
                 last_visual_selections,
                 agent_transcript,
                 agent_conversation,
+                inline_history: if self.config.persist_inline_history.unwrap_or(true) {
+                    self.inline_history.clone()
+                } else {
+                    InlineHistory::default()
+                },
                 legacy_agent_workspace: None,
                 agent_session_resumable,
                 plugin_extensions: self.preferences.plugin_storage_snapshot(),
