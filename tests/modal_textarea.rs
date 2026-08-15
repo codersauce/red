@@ -66,6 +66,23 @@ async fn embedded_textareas_match_file_editor_for_shared_vim_sequences() {
 }
 
 #[test]
+fn embedded_textareas_do_not_claim_editor_owned_structural_objects() {
+    let mut area = TextArea::new("fn first() { value(); }");
+    area.set_mode(Mode::Normal);
+
+    for character in "dif".chars() {
+        assert_eq!(
+            area.handle_event(&event(character), 80),
+            TextAreaOutcome::Changed
+        );
+    }
+
+    assert_eq!(area.text(), "fn first() { value(); }");
+    assert_eq!(area.mode(), Mode::Normal);
+    assert_eq!(area.register().text, "");
+}
+
+#[test]
 fn separate_textareas_keep_mode_history_registers_and_undo_independent() {
     let mut first = TextArea::new("one two");
     let mut second = TextArea::new("alpha beta");

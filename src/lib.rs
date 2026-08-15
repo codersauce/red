@@ -44,6 +44,7 @@ mod self_check;
 pub mod session;
 pub mod splash;
 pub mod sync;
+mod textobjects;
 pub mod theme;
 pub mod ui;
 pub mod undo;

@@ -630,6 +630,12 @@ impl Buffer {
         line_start + position.character.min(line_len)
     }
 
+    /// Converts a canonical line and scalar position to its UTF-8 byte offset.
+    pub(crate) fn position_to_byte_idx(&self, position: TextPosition) -> usize {
+        self.content
+            .char_to_byte(self.position_to_char_idx(position))
+    }
+
     /// Converts an absolute Ropey character index to a canonical line and scalar position.
     ///
     /// Indexes beyond the current buffer clamp to its final character boundary.
@@ -638,6 +644,14 @@ impl Buffer {
         let line = self.content.char_to_line(char_index);
         let line_start = self.content.line_to_char(line);
         TextPosition::new(line, char_index.saturating_sub(line_start))
+    }
+
+    /// Converts a UTF-8 byte boundary to Red's canonical line/scalar position.
+    pub(crate) fn byte_idx_to_position(&self, byte_index: usize) -> Option<TextPosition> {
+        self.content
+            .try_byte_to_char(byte_index)
+            .ok()
+            .map(|char_index| self.char_idx_to_position(char_index))
     }
 
     /// Inserts a new line at the given line number

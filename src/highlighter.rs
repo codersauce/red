@@ -34,6 +34,7 @@ struct BundledLanguageDefinition {
     filenames: &'static [&'static str],
     language: Option<fn() -> Language>,
     highlight_queries: &'static [&'static str],
+    textobject_queries: &'static [&'static str],
     injection_query: Option<&'static str>,
     specialized: Option<SpecializedHighlighter>,
 }
@@ -64,6 +65,7 @@ struct RuntimeLanguageDefinition {
     aliases: Vec<String>,
     grammar: Option<GrammarSource>,
     highlight_queries: Vec<String>,
+    textobject_queries: Vec<String>,
     injection_query: Option<String>,
     specialized: Option<SpecializedHighlighter>,
 }
@@ -111,6 +113,11 @@ impl LanguageRegistry {
                     .iter()
                     .map(ToString::to_string)
                     .collect(),
+                textobject_queries: definition
+                    .textobject_queries
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
                 injection_query: definition.injection_query.map(ToString::to_string),
                 specialized: definition.specialized,
             });
@@ -155,6 +162,7 @@ impl LanguageRegistry {
             aliases: Vec::new(),
             grammar: None,
             highlight_queries: Vec::new(),
+            textobject_queries: Vec::new(),
             injection_query: None,
             specialized: None,
         });
@@ -179,6 +187,9 @@ impl LanguageRegistry {
                 definition
                     .highlight_queries
                     .clone_from(&bundled.highlight_queries);
+                definition
+                    .textobject_queries
+                    .clone_from(&bundled.textobject_queries);
                 definition
                     .injection_query
                     .clone_from(&bundled.injection_query);
@@ -205,6 +216,13 @@ impl LanguageRegistry {
                     .map(|path| read_query(path, config_dir, "highlight"))
                     .collect::<anyhow::Result<_>>()?;
             }
+            if !grammar.textobjects.is_empty() {
+                definition.textobject_queries = grammar
+                    .textobjects
+                    .iter()
+                    .map(|path| read_query(path, config_dir, "text object"))
+                    .collect::<anyhow::Result<_>>()?;
+            }
             if let Some(path) = &grammar.injections {
                 definition.injection_query = Some(read_query(path, config_dir, "injection")?);
             }
@@ -216,9 +234,31 @@ impl LanguageRegistry {
             parser.set_language(&language).with_context(|| {
                 format!("language `{id}` uses an incompatible Tree-sitter grammar")
             })?;
+            if definition.textobject_queries.is_empty() {
+                if let Some(fallback) = package_textobject_fallback(id) {
+                    // Older language packs have no structural-query declaration. A stale or
+                    // incompatible fallback must never quarantine their grammar, highlights,
+                    // or optional language server.
+                    if Query::new(&language, fallback).is_ok() {
+                        definition.textobject_queries.push(fallback.to_string());
+                    }
+                }
+            }
             if !definition.highlight_queries.is_empty() {
                 Query::new(&language, &definition.highlight_queries.join("\n"))
                     .with_context(|| format!("language `{id}` has an invalid highlight query"))?;
+            }
+            if !definition.textobject_queries.is_empty() {
+                let query = Query::new(&language, &definition.textobject_queries.join("\n"))
+                    .with_context(|| format!("language `{id}` has an invalid text-object query"))?;
+                for pattern in 0..query.pattern_count() {
+                    if let Some(predicate) = query.general_predicates(pattern).first() {
+                        anyhow::bail!(
+                            "language `{id}` uses unsupported text-object predicate `#{}`",
+                            predicate.operator
+                        );
+                    }
+                }
             }
             if let Some(query) = &definition.injection_query {
                 Query::new(&language, query)
@@ -251,6 +291,39 @@ impl LanguageRegistry {
         }
         self.languages.insert(id, definition);
     }
+
+    /// Returns the grammar and normalized structural queries for one language.
+    pub(crate) fn textobject_language(&self, id: &str) -> Option<(Language, String)> {
+        let definition = self.languages.get(id)?;
+        let source = definition.grammar.as_ref()?;
+        (!definition.textobject_queries.is_empty()).then(|| {
+            (
+                grammar_language(source),
+                definition.textobject_queries.join("\n"),
+            )
+        })
+    }
+}
+
+fn package_textobject_fallback(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "c" => include_str!("queries/textobjects/c.scm"),
+        "c-sharp" | "c_sharp" => include_str!("queries/textobjects/c-sharp.scm"),
+        "cpp" => include_str!("queries/textobjects/cpp.scm"),
+        "css" => include_str!("queries/textobjects/css.scm"),
+        "go" => include_str!("queries/textobjects/go.scm"),
+        "html" => include_str!("queries/textobjects/html.scm"),
+        "java" => include_str!("queries/textobjects/java.scm"),
+        "json" => include_str!("queries/textobjects/json.scm"),
+        "kotlin" => include_str!("queries/textobjects/kotlin.scm"),
+        "php" => include_str!("queries/textobjects/php.scm"),
+        "powershell" => include_str!("queries/textobjects/powershell.scm"),
+        "python" => include_str!("queries/textobjects/python.scm"),
+        "svelte" => include_str!("queries/textobjects/svelte.scm"),
+        "swift" => include_str!("queries/textobjects/swift.scm"),
+        "vue" => include_str!("queries/textobjects/vue.scm"),
+        _ => return None,
+    })
 }
 
 fn grammar_path(
@@ -445,6 +518,25 @@ const YAML_ADDITIONAL_HIGHLIGHTS_QUERY: &str = r#"
   (reserved_directive)
 ] @keyword.directive
 "#;
+
+const RUST_TEXTOBJECT_QUERIES: &[&str] = &[include_str!("queries/textobjects/rust.scm")];
+const ECMA_TEXTOBJECT_QUERY: &str = include_str!("queries/textobjects/ecma.scm");
+const JSX_TEXTOBJECT_QUERY: &str = include_str!("queries/textobjects/jsx.scm");
+const JAVASCRIPT_TEXTOBJECT_QUERIES: &[&str] = &[
+    ECMA_TEXTOBJECT_QUERY,
+    JSX_TEXTOBJECT_QUERY,
+    include_str!("queries/textobjects/javascript.scm"),
+];
+const JSX_TEXTOBJECT_QUERIES: &[&str] = &[ECMA_TEXTOBJECT_QUERY, JSX_TEXTOBJECT_QUERY];
+const TYPESCRIPT_TEXTOBJECT_QUERY: &str = include_str!("queries/textobjects/typescript.scm");
+const TYPESCRIPT_TEXTOBJECT_QUERIES: &[&str] =
+    &[ECMA_TEXTOBJECT_QUERY, TYPESCRIPT_TEXTOBJECT_QUERY];
+const TSX_TEXTOBJECT_QUERIES: &[&str] = &[
+    ECMA_TEXTOBJECT_QUERY,
+    TYPESCRIPT_TEXTOBJECT_QUERY,
+    JSX_TEXTOBJECT_QUERY,
+    include_str!("queries/textobjects/tsx.scm"),
+];
 
 impl Highlighter {
     pub fn new(theme: &Theme) -> anyhow::Result<Self> {
@@ -761,6 +853,7 @@ fn language_definitions() -> Vec<BundledLanguageDefinition> {
             filenames: &[],
             language: Some(|| tree_sitter_rust::LANGUAGE.into()),
             highlight_queries: &[tree_sitter_rust::HIGHLIGHTS_QUERY],
+            textobject_queries: RUST_TEXTOBJECT_QUERIES,
             injection_query: None,
             specialized: None,
         },
@@ -770,6 +863,7 @@ fn language_definitions() -> Vec<BundledLanguageDefinition> {
             filenames: &[],
             language: Some(|| tree_sitter_md::LANGUAGE.into()),
             highlight_queries: &[MARKDOWN_HIGHLIGHT_QUERY],
+            textobject_queries: &[include_str!("queries/textobjects/markdown.scm")],
             injection_query: Some(MARKDOWN_INJECTION_QUERY),
             specialized: None,
         },
@@ -779,6 +873,7 @@ fn language_definitions() -> Vec<BundledLanguageDefinition> {
             filenames: &[],
             language: Some(|| tree_sitter_javascript::LANGUAGE.into()),
             highlight_queries: JAVASCRIPT_HIGHLIGHT_QUERIES,
+            textobject_queries: JAVASCRIPT_TEXTOBJECT_QUERIES,
             injection_query: None,
             specialized: None,
         },
@@ -788,6 +883,7 @@ fn language_definitions() -> Vec<BundledLanguageDefinition> {
             filenames: &[],
             language: Some(|| tree_sitter_javascript::LANGUAGE.into()),
             highlight_queries: JSX_HIGHLIGHT_QUERIES,
+            textobject_queries: JSX_TEXTOBJECT_QUERIES,
             injection_query: None,
             specialized: None,
         },
@@ -797,6 +893,7 @@ fn language_definitions() -> Vec<BundledLanguageDefinition> {
             filenames: &[],
             language: Some(|| tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
             highlight_queries: TYPESCRIPT_HIGHLIGHT_QUERIES,
+            textobject_queries: TYPESCRIPT_TEXTOBJECT_QUERIES,
             injection_query: None,
             specialized: None,
         },
@@ -806,6 +903,7 @@ fn language_definitions() -> Vec<BundledLanguageDefinition> {
             filenames: &[],
             language: Some(|| tree_sitter_typescript::LANGUAGE_TSX.into()),
             highlight_queries: TSX_HIGHLIGHT_QUERIES,
+            textobject_queries: TSX_TEXTOBJECT_QUERIES,
             injection_query: None,
             specialized: None,
         },
@@ -815,6 +913,7 @@ fn language_definitions() -> Vec<BundledLanguageDefinition> {
             filenames: &[],
             language: Some(|| tree_sitter_json::LANGUAGE.into()),
             highlight_queries: &[tree_sitter_json::HIGHLIGHTS_QUERY],
+            textobject_queries: &[include_str!("queries/textobjects/json.scm")],
             injection_query: None,
             specialized: None,
         },
@@ -824,6 +923,7 @@ fn language_definitions() -> Vec<BundledLanguageDefinition> {
             filenames: &[],
             language: Some(|| tree_sitter_toml_ng::LANGUAGE.into()),
             highlight_queries: &[tree_sitter_toml_ng::HIGHLIGHTS_QUERY],
+            textobject_queries: &[include_str!("queries/textobjects/toml.scm")],
             injection_query: None,
             specialized: None,
         },
@@ -836,6 +936,7 @@ fn language_definitions() -> Vec<BundledLanguageDefinition> {
                 tree_sitter_yaml::HIGHLIGHTS_QUERY,
                 YAML_ADDITIONAL_HIGHLIGHTS_QUERY,
             ],
+            textobject_queries: &[include_str!("queries/textobjects/yaml.scm")],
             injection_query: None,
             specialized: None,
         },
@@ -845,6 +946,7 @@ fn language_definitions() -> Vec<BundledLanguageDefinition> {
             filenames: &[],
             language: Some(|| tree_sitter_bash::LANGUAGE.into()),
             highlight_queries: &[tree_sitter_bash::HIGHLIGHT_QUERY],
+            textobject_queries: &[include_str!("queries/textobjects/bash.scm")],
             injection_query: None,
             specialized: None,
         },
@@ -854,6 +956,7 @@ fn language_definitions() -> Vec<BundledLanguageDefinition> {
             filenames: &[],
             language: Some(tree_sitter_fish::language),
             highlight_queries: &[tree_sitter_fish::HIGHLIGHTS_QUERY],
+            textobject_queries: &[include_str!("queries/textobjects/fish.scm")],
             injection_query: None,
             specialized: None,
         },
@@ -863,6 +966,7 @@ fn language_definitions() -> Vec<BundledLanguageDefinition> {
             filenames: &[],
             language: Some(|| tree_sitter_powershell::LANGUAGE.into()),
             highlight_queries: &[tree_sitter_powershell::HIGHLIGHTS_QUERY],
+            textobject_queries: &[include_str!("queries/textobjects/powershell.scm")],
             injection_query: None,
             specialized: None,
         },
@@ -872,6 +976,7 @@ fn language_definitions() -> Vec<BundledLanguageDefinition> {
             filenames: &[],
             language: Some(|| tree_sitter_lua::LANGUAGE.into()),
             highlight_queries: &[tree_sitter_lua::HIGHLIGHTS_QUERY],
+            textobject_queries: &[include_str!("queries/textobjects/lua.scm")],
             injection_query: None,
             specialized: None,
         },
@@ -881,6 +986,7 @@ fn language_definitions() -> Vec<BundledLanguageDefinition> {
             filenames: &[],
             language: None,
             highlight_queries: &[],
+            textobject_queries: &[],
             injection_query: None,
             specialized: Some(SpecializedHighlighter::Husk),
         },
@@ -890,6 +996,7 @@ fn language_definitions() -> Vec<BundledLanguageDefinition> {
             filenames: &["COMMIT_EDITMSG", "MERGE_MSG", "SQUASH_MSG", "TAG_EDITMSG"],
             language: None,
             highlight_queries: &[],
+            textobject_queries: &[],
             injection_query: None,
             specialized: Some(SpecializedHighlighter::GitCommit),
         },
@@ -1533,6 +1640,103 @@ mod tests {
             .highlight_for_file(Some("Buildfile"), "fn main() {}")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn configurable_languages_can_replace_bundled_structural_queries() {
+        let directory = tempfile::tempdir().unwrap();
+        let query_path = directory.path().join("textobjects.scm");
+        let query_source = "(function_item) @function.outer";
+        fs::write(&query_path, query_source).unwrap();
+        let languages = HashMap::from([(
+            "buildspec".to_string(),
+            LanguageConfig {
+                grammar: Some(LanguageGrammarConfig {
+                    builtin: Some("rust".to_string()),
+                    textobjects: vec![query_path],
+                    ..LanguageGrammarConfig::default()
+                }),
+                ..LanguageConfig::default()
+            },
+        )]);
+
+        let registry = LanguageRegistry::from_config(&languages, directory.path()).unwrap();
+        let (_, loaded_query) = registry.textobject_language("buildspec").unwrap();
+
+        assert_eq!(loaded_query, query_source);
+    }
+
+    #[test]
+    fn older_language_definitions_receive_compatible_structural_fallbacks() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut registry = LanguageRegistry::bundled();
+        registry
+            .languages
+            .get_mut("json")
+            .unwrap()
+            .textobject_queries
+            .clear();
+
+        registry
+            .insert_configured("json", &LanguageConfig::default(), directory.path())
+            .unwrap();
+
+        let (_, query) = registry.textobject_language("json").unwrap();
+        assert!(query.contains("@comment.outer"));
+    }
+
+    #[test]
+    fn incompatible_structural_fallbacks_do_not_quarantine_a_language() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut registry = LanguageRegistry::bundled();
+        let mut definition = registry.languages.get("rust").unwrap().clone();
+        definition.id = "c".to_string();
+        definition.extensions = vec!["c".to_string()];
+        definition.textobject_queries.clear();
+        registry.insert(definition);
+
+        registry
+            .insert_configured("c", &LanguageConfig::default(), directory.path())
+            .unwrap();
+
+        assert!(registry.languages.contains_key("c"));
+        assert!(registry.textobject_language("c").is_none());
+        assert_eq!(registry.extensions.get("c").map(String::as_str), Some("c"));
+    }
+
+    #[test]
+    fn configurable_languages_reject_invalid_structural_queries_and_predicates() {
+        let directory = tempfile::tempdir().unwrap();
+        let query_path = directory.path().join("textobjects.scm");
+        let languages = HashMap::from([(
+            "buildspec".to_string(),
+            LanguageConfig {
+                grammar: Some(LanguageGrammarConfig {
+                    builtin: Some("rust".to_string()),
+                    textobjects: vec![query_path.clone()],
+                    ..LanguageGrammarConfig::default()
+                }),
+                ..LanguageConfig::default()
+            },
+        )]);
+
+        fs::write(&query_path, "(missing_node) @function.outer").unwrap();
+        let error = LanguageRegistry::from_config(&languages, directory.path())
+            .err()
+            .expect("invalid structural queries must be rejected");
+        assert!(error.to_string().contains("invalid text-object query"));
+
+        fs::write(
+            &query_path,
+            "((function_item) @function.outer (#offset! @function.outer 0 0 0 0))",
+        )
+        .unwrap();
+        let error = LanguageRegistry::from_config(&languages, directory.path())
+            .err()
+            .expect("unsupported structural predicates must be rejected");
+        assert!(error
+            .to_string()
+            .contains("unsupported text-object predicate"));
     }
 
     #[test]

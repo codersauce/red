@@ -542,6 +542,96 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Action::RepeatLastChange,
         ),
         builtin(
+            "syntax.next_call",
+            "Go to next function call",
+            "Editor",
+            "Jump to the next Tree-sitter function call",
+            None,
+            &["text object", "syntax motion"],
+            Action::MoveToNextCall,
+        ),
+        builtin(
+            "syntax.previous_call",
+            "Go to previous function call",
+            "Editor",
+            "Jump to the previous Tree-sitter function call",
+            None,
+            &["text object", "syntax motion"],
+            Action::MoveToPreviousCall,
+        ),
+        builtin(
+            "syntax.next_function",
+            "Go to next function",
+            "Editor",
+            "Jump to the next Tree-sitter function declaration",
+            None,
+            &["text object", "syntax motion"],
+            Action::MoveToNextFunction,
+        ),
+        builtin(
+            "syntax.previous_function",
+            "Go to previous function",
+            "Editor",
+            "Jump to the previous Tree-sitter function declaration",
+            None,
+            &["text object", "syntax motion"],
+            Action::MoveToPreviousFunction,
+        ),
+        builtin(
+            "syntax.next_class",
+            "Go to next class",
+            "Editor",
+            "Jump to the next Tree-sitter class or type declaration",
+            None,
+            &["text object", "syntax motion"],
+            Action::MoveToNextClass,
+        ),
+        builtin(
+            "syntax.previous_class",
+            "Go to previous class",
+            "Editor",
+            "Jump to the previous Tree-sitter class or type declaration",
+            None,
+            &["text object", "syntax motion"],
+            Action::MoveToPreviousClass,
+        ),
+        builtin(
+            "syntax.swap_next_parameter",
+            "Swap with next parameter",
+            "Edit",
+            "Swap the current parameter with its next sibling",
+            None,
+            &["argument", "text object"],
+            Action::SwapNextParameter,
+        ),
+        builtin(
+            "syntax.swap_previous_parameter",
+            "Swap with previous parameter",
+            "Edit",
+            "Swap the current parameter with its previous sibling",
+            None,
+            &["argument", "text object"],
+            Action::SwapPreviousParameter,
+        ),
+        builtin(
+            "syntax.swap_next_function",
+            "Swap with next function",
+            "Edit",
+            "Swap the current function with its next sibling",
+            None,
+            &["method", "text object"],
+            Action::SwapNextFunction,
+        ),
+        builtin(
+            "syntax.swap_previous_function",
+            "Swap with previous function",
+            "Edit",
+            "Swap the current function with its previous sibling",
+            None,
+            &["method", "text object"],
+            Action::SwapPreviousFunction,
+        ),
+        builtin(
             "edit.join",
             "Join lines",
             "Edit",
@@ -1105,6 +1195,16 @@ fn action_label(action: &Action) -> String {
         Action::ToggleCommentRange(_) => "Toggle range comments".to_string(),
         Action::ToggleCommentSelection => "Toggle selected comments".to_string(),
         Action::RepeatLastChange => "Repeat last change".to_string(),
+        Action::MoveToNextCall => "Go to next function call".to_string(),
+        Action::MoveToPreviousCall => "Go to previous function call".to_string(),
+        Action::MoveToNextFunction => "Go to next function".to_string(),
+        Action::MoveToPreviousFunction => "Go to previous function".to_string(),
+        Action::MoveToNextClass => "Go to next class".to_string(),
+        Action::MoveToPreviousClass => "Go to previous class".to_string(),
+        Action::SwapNextParameter => "Swap with next parameter".to_string(),
+        Action::SwapPreviousParameter => "Swap with previous parameter".to_string(),
+        Action::SwapNextFunction => "Swap with next function".to_string(),
+        Action::SwapPreviousFunction => "Swap with previous function".to_string(),
         Action::NextBuffer => "Next buffer".to_string(),
         Action::PreviousBuffer => "Previous buffer".to_string(),
         Action::FilePicker => "Find file".to_string(),
@@ -1371,6 +1471,55 @@ mod tests {
         assert_eq!(comment.category, "Edit");
         assert_eq!(comment.title, "Toggle line comments");
         assert!(comment.aliases.iter().any(|alias| alias == "gcc"));
+    }
+
+    #[test]
+    fn palette_lists_structural_motions_and_non_conflicting_swap_shortcuts() {
+        let entries = entries(&default_keys(), &[]);
+
+        for (id, shortcut, action) in [
+            ("syntax.next_call", "] m", Action::MoveToNextCall),
+            ("syntax.previous_call", "[ m", Action::MoveToPreviousCall),
+            ("syntax.next_function", "] f", Action::MoveToNextFunction),
+            (
+                "syntax.previous_function",
+                "[ f",
+                Action::MoveToPreviousFunction,
+            ),
+            ("syntax.next_class", "] c", Action::MoveToNextClass),
+            ("syntax.previous_class", "[ c", Action::MoveToPreviousClass),
+            (
+                "syntax.swap_next_parameter",
+                "Space ] a",
+                Action::SwapNextParameter,
+            ),
+            (
+                "syntax.swap_previous_parameter",
+                "Space [ a",
+                Action::SwapPreviousParameter,
+            ),
+            (
+                "syntax.swap_next_function",
+                "Space ] m",
+                Action::SwapNextFunction,
+            ),
+            (
+                "syntax.swap_previous_function",
+                "Space [ m",
+                Action::SwapPreviousFunction,
+            ),
+        ] {
+            let entry = entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .unwrap_or_else(|| panic!("missing command palette entry {id}"));
+            assert_eq!(entry.action, action);
+            assert!(
+                entry.shortcuts.iter().any(|value| value == shortcut),
+                "{id} should advertise {shortcut:?}, found {:?}",
+                entry.shortcuts
+            );
+        }
     }
 
     #[test]

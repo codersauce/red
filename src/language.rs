@@ -63,6 +63,9 @@ pub fn merge_package_languages(
             for path in &mut grammar.highlights {
                 *path = package_root.join(&*path);
             }
+            for path in &mut grammar.textobjects {
+                *path = package_root.join(&*path);
+            }
             if let Some(path) = grammar.injections.as_mut() {
                 *path = package_root.join(&*path);
             }

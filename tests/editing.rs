@@ -8389,3 +8389,177 @@ async fn vim_half_page_keys_move_the_cursor_by_half_a_viewport() {
         .unwrap();
     assert_eq!(harness.buffer_line(), 0);
 }
+
+#[tokio::test]
+async fn structural_text_objects_support_inner_outer_and_linewise_operators() {
+    let contents = "fn first() {\n    alpha();\n    beta();\n}\nfn second() {}\n";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), contents.to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "dif").await;
+    harness.assert_buffer_contents("fn first() {\n    \n}\nfn second() {}\n");
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents(contents);
+
+    type_normal_keys(&mut harness, "daf").await;
+    harness.assert_buffer_contents("fn second() {}\n");
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents(contents);
+
+    type_normal_keys(&mut harness, "yaf]fP").await;
+    harness.assert_buffer_contents(
+        "fn first() {\n    alpha();\n    beta();\n}\nfn first() {\n    alpha();\n    beta();\n}\nfn second() {}\n",
+    );
+}
+
+#[tokio::test]
+async fn structural_comment_objects_synthesize_rust_inner_capture() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(
+            Some("sample.rs".to_string()),
+            "let café = 1; // comentário\n".to_string(),
+        ),
+        default_key_config(),
+    );
+    harness
+        .execute_action(Action::SetCursor(18, 0))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "dik").await;
+
+    harness.assert_buffer_contents("let café = 1; // \n");
+}
+
+#[tokio::test]
+async fn structural_function_objects_support_change_and_case_operators() {
+    let contents = "fn first() {\n    alpha();\n}\n";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), contents.to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "gUif").await;
+    harness.assert_buffer_contents("fn first() {\n    ALPHA();\n}\n");
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents(contents);
+
+    type_normal_keys(&mut harness, "cifupdated();").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    harness.assert_buffer_contents("fn first() {\n    updated();\n}\n");
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents(contents);
+}
+
+#[tokio::test]
+async fn structural_operator_motions_accept_prefix_and_motion_counts() {
+    let contents = "// header\nfn first() {}\nfn second() {}\nfn third() {}\n";
+    for keys in ["d2]f", "2d]f"] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(Some("sample.rs".to_string()), contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents("fn second() {}\nfn third() {}\n");
+        type_normal_keys(&mut harness, "u").await;
+        harness.assert_buffer_contents(contents);
+    }
+}
+
+#[tokio::test]
+async fn structural_visual_function_selection_is_linewise() {
+    let contents = "fn first() {\n    alpha();\n}\nfn second() {}\n";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), contents.to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "vaf").await;
+
+    harness.assert_mode(Mode::VisualLine);
+    assert_eq!(harness.selection(), Some((0, 0, 0, 2)));
+    type_normal_keys(&mut harness, "y").await;
+    harness.assert_mode(Mode::Normal);
+    type_normal_keys(&mut harness, "]fP").await;
+    harness.assert_buffer_contents(
+        "fn first() {\n    alpha();\n}\nfn first() {\n    alpha();\n}\nfn second() {}\n",
+    );
+}
+
+#[tokio::test]
+async fn parameter_swaps_preserve_separators_undo_and_dot_repeat() {
+    let original = "fn call(alpha: i32, beta: i32, gamma: i32) {}\n";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), original.to_string()),
+        default_key_config(),
+    );
+    harness
+        .execute_action(Action::SetCursor(8, 0))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, " ]a").await;
+    harness.assert_buffer_contents("fn call(beta: i32, alpha: i32, gamma: i32) {}\n");
+    type_normal_keys(&mut harness, ".").await;
+    harness.assert_buffer_contents("fn call(beta: i32, gamma: i32, alpha: i32) {}\n");
+    type_normal_keys(&mut harness, "uu").await;
+    harness.assert_buffer_contents(original);
+}
+
+#[tokio::test]
+async fn parameter_swaps_record_and_replay_inside_macros() {
+    let original = "fn call(alpha: i32, beta: i32, gamma: i32) {}\n";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), original.to_string()),
+        default_key_config(),
+    );
+    harness
+        .execute_action(Action::SetCursor(8, 0))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "qa ]aq@a").await;
+
+    harness.assert_buffer_contents("fn call(beta: i32, gamma: i32, alpha: i32) {}\n");
+    type_normal_keys(&mut harness, "uu").await;
+    harness.assert_buffer_contents(original);
+}
+
+#[tokio::test]
+async fn parameter_swaps_do_not_cross_argument_containers() {
+    let original = "fn first(alpha: i32) {}\nfn second(beta: i32) {}\n";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), original.to_string()),
+        default_key_config(),
+    );
+    harness
+        .execute_action(Action::SetCursor(9, 0))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, " ]a").await;
+
+    harness.assert_buffer_contents(original);
+    assert_eq!(harness.last_error(), Some("adjacent text object not found"));
+}
+
+#[tokio::test]
+async fn function_swaps_preserve_scope_multiline_ranges_and_jump_history() {
+    let original = "fn first() {\n    one();\n}\nfn second() { two(); }\n";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), original.to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, " ]m").await;
+    harness.assert_buffer_contents("fn second() { two(); }\nfn first() {\n    one();\n}\n");
+    harness.assert_cursor_at(0, 1);
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 0);
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents(original);
+}

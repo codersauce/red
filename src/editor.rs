@@ -112,6 +112,7 @@ use crate::{
         SessionJump, SessionMark, SessionSnapshot, SessionStore, SessionVisualMode,
         SessionVisualSelection, SessionWindowJumps, SESSION_SCHEMA_VERSION,
     },
+    textobjects::{ResolvedTextObject, SyntaxObjectKind, SyntaxTextObjectService},
     theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
     ui::{
         AgentComposer, CompletionUI, Component, Confirmation, DiagnosticInfo, FilePicker,
@@ -2178,6 +2179,12 @@ pub enum Action {
     MoveToNextBigWordEnd,
     MoveToPreviousBigWord,
     MoveToPreviousBigWordEnd,
+    MoveToNextCall,
+    MoveToPreviousCall,
+    MoveToNextFunction,
+    MoveToPreviousFunction,
+    MoveToNextClass,
+    MoveToPreviousClass,
     MoveToFilePercent(usize),
     MatchitForward,
     MatchitBackward,
@@ -2230,6 +2237,10 @@ pub enum Action {
         keep_spaces: bool,
     },
     ToggleCharCase(u16),
+    SwapNextParameter,
+    SwapPreviousParameter,
+    SwapNextFunction,
+    SwapPreviousFunction,
     StartCommentOperator(u16),
     ToggleCommentLines(u16),
     ToggleCommentRange(TextRange),
@@ -2804,6 +2815,9 @@ pub struct Editor {
 
     /// Syntax highlighting engine
     highlighter: Highlighter,
+
+    /// Full-document structural queries, independent from viewport highlighting.
+    syntax_textobjects: SyntaxTextObjectService,
 
     /// Cached syntax highlight spans per buffer for the most recently parsed
     /// viewport-plus-margin slice.
@@ -3712,6 +3726,7 @@ enum PendingOperatorStep {
     TillForward,
     FindBackward,
     TillBackward,
+    StructuralMotion { backward: bool },
     TextObjectScope(TextObjectScope),
 }
 
@@ -3742,6 +3757,15 @@ impl PendingOperator {
     fn count(self) -> u16 {
         self.operator_count
             .saturating_mul(self.motion_count.unwrap_or(1))
+    }
+}
+
+fn structural_motion_kind(key: char) -> Option<SyntaxObjectKind> {
+    match key {
+        'm' => Some(SyntaxObjectKind::Call),
+        'f' => Some(SyntaxObjectKind::Function),
+        'c' => Some(SyntaxObjectKind::Class),
+        _ => None,
     }
 }
 
@@ -3913,6 +3937,7 @@ impl Editor {
         self.config_diagnostics = loaded.diagnostics;
         self.config_diagnostics_acknowledged = self.config_diagnostics.is_empty();
         self.highlighter = highlighter;
+        self.syntax_textobjects.reset(Arc::clone(&registry));
         self.indentation = indentation;
         self.highlight_cache.clear();
         self.bracket_match_cache = None;
@@ -4086,7 +4111,8 @@ impl Editor {
             &config.languages,
             &Config::config_dir(),
         )?);
-        let highlighter = Highlighter::with_registry(&theme, registry)?;
+        let highlighter = Highlighter::with_registry(&theme, Arc::clone(&registry))?;
+        let syntax_textobjects = SyntaxTextObjectService::new(registry);
 
         let mut plugin_registry = PluginRegistry::new();
         let indentation = Self::configured_indentation(&config);
@@ -4128,6 +4154,7 @@ impl Editor {
                 plugin::companion::CompanionManager::new(Config::config_dir()),
             )),
             highlighter,
+            syntax_textobjects,
             highlight_cache: HashMap::new(),
             bracket_match_cache: None,
             layout_cache: std::cell::RefCell::new(HashMap::new()),
@@ -10285,6 +10312,12 @@ impl Editor {
                 | Action::MoveToNextBigWordEnd
                 | Action::MoveToPreviousBigWord
                 | Action::MoveToPreviousBigWordEnd
+                | Action::MoveToNextCall
+                | Action::MoveToPreviousCall
+                | Action::MoveToNextFunction
+                | Action::MoveToPreviousFunction
+                | Action::MoveToNextClass
+                | Action::MoveToPreviousClass
                 | Action::FindCharForward { .. }
                 | Action::TillCharForward { .. }
                 | Action::FindCharBackward { .. }
@@ -10333,6 +10366,12 @@ impl Editor {
                 | Action::MoveToNextBigWordEnd
                 | Action::MoveToPreviousBigWord
                 | Action::MoveToPreviousBigWordEnd
+                | Action::MoveToNextCall
+                | Action::MoveToPreviousCall
+                | Action::MoveToNextFunction
+                | Action::MoveToPreviousFunction
+                | Action::MoveToNextClass
+                | Action::MoveToPreviousClass
                 | Action::FindCharForward { .. }
                 | Action::TillCharForward { .. }
                 | Action::FindCharBackward { .. }
@@ -13899,6 +13938,10 @@ impl Editor {
             return self.handle_replace_event(ev);
         }
 
+        if self.pending_visual_text_object_scope.is_some() {
+            return self.handle_visual_text_object_event(ev);
+        }
+
         if let Some(action) = self.handle_character_motion_event(ev) {
             return Some(action);
         }
@@ -13936,6 +13979,24 @@ impl Editor {
             };
 
             self.waiting_command = None;
+            if let Some(kind) = SyntaxObjectKind::for_text_object_key(*c) {
+                let Some(object) = self.syntax_text_object(scope, kind) else {
+                    if self.last_error.is_none() {
+                        self.last_error = Some("text object not found".to_string());
+                    }
+                    return Some(KeyAction::None);
+                };
+                let selected = if object.linewise {
+                    self.select_linewise_text_range(self.linewise_text_object_range(object.range))
+                } else {
+                    self.select_text_range(object.range)
+                };
+                if selected {
+                    return Some(KeyAction::Single(Action::Refresh));
+                }
+                self.last_error = Some("text object not found".to_string());
+                return Some(KeyAction::None);
+            }
             let Some(kind) = text_object_kind_for_key(*c) else {
                 if *c == '%' {
                     let Some(range) = self.matchit_select_around_range() else {
@@ -14615,6 +14676,14 @@ impl Editor {
                     });
                     Some(KeyAction::None)
                 }
+                '[' | ']' => {
+                    self.waiting_command = Some(format!("{}{}", pending.operator.as_str(), c));
+                    self.pending_operator = Some(PendingOperator {
+                        step: PendingOperatorStep::StructuralMotion { backward: c == '[' },
+                        ..pending
+                    });
+                    Some(KeyAction::None)
+                }
                 _ => self.pending_operator_invalid(),
             },
             PendingOperatorStep::GPrefix => match c {
@@ -14683,7 +14752,37 @@ impl Editor {
                     "character not found",
                 )
             }
+            PendingOperatorStep::StructuralMotion { backward } => {
+                let Some(kind) = structural_motion_kind(c) else {
+                    return self.pending_operator_invalid();
+                };
+                let range = self.syntax_motion_range(kind, backward, pending.count());
+                self.operator_action_for_range(pending.operator, range, "text object not found")
+            }
             PendingOperatorStep::TextObjectScope(scope) => {
+                if let Some(kind) = SyntaxObjectKind::for_text_object_key(c) {
+                    let Some(object) = self.syntax_text_object(scope, kind) else {
+                        return self.operator_action_for_range(
+                            pending.operator,
+                            None,
+                            "text object not found",
+                        );
+                    };
+                    return if object.linewise {
+                        let range = self.linewise_text_object_range(object.range);
+                        self.operator_action_for_linewise_range(
+                            pending.operator,
+                            Some(range),
+                            "text object not found",
+                        )
+                    } else {
+                        self.operator_action_for_range(
+                            pending.operator,
+                            Some(object.range),
+                            "text object not found",
+                        )
+                    };
+                }
                 let Some(kind) = text_object_kind_for_key(c) else {
                     return self.pending_operator_invalid();
                 };
@@ -15110,6 +15209,137 @@ impl Editor {
             .language_id_for_file(self.current_buffer().file.as_deref())
             .map(str::to_string)
             .or_else(|| self.current_buffer().file_type())
+    }
+
+    fn syntax_text_object(
+        &mut self,
+        scope: TextObjectScope,
+        kind: SyntaxObjectKind,
+    ) -> Option<ResolvedTextObject> {
+        let language_id =
+            self.highlight_language_id_for_buffer_index(self.buffer_manager.active_index())?;
+        let position = self.cursor_text_position();
+        let buffer = self.buffer_manager.active_buffer()?;
+        match self
+            .syntax_textobjects
+            .select(buffer, &language_id, position, kind, scope)
+        {
+            Ok(object) => object,
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                None
+            }
+        }
+    }
+
+    fn syntax_motion_target(
+        &mut self,
+        kind: SyntaxObjectKind,
+        backward: bool,
+        count: u16,
+    ) -> Option<TextPosition> {
+        let language_id =
+            self.highlight_language_id_for_buffer_index(self.buffer_manager.active_index())?;
+        let position = self.cursor_text_position();
+        let buffer = self.buffer_manager.active_buffer()?;
+        match self.syntax_textobjects.motion_target(
+            buffer,
+            &language_id,
+            position,
+            kind,
+            backward,
+            count,
+        ) {
+            Ok(target) => target,
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                None
+            }
+        }
+    }
+
+    fn syntax_motion_range(
+        &mut self,
+        kind: SyntaxObjectKind,
+        backward: bool,
+        count: u16,
+    ) -> Option<TextRange> {
+        let origin = self.cursor_text_position();
+        let target = self.syntax_motion_target(kind, backward, count)?;
+        Some(if backward {
+            TextRange::new(target, origin)
+        } else {
+            TextRange::new(origin, target)
+        })
+    }
+
+    fn linewise_text_object_range(&self, range: TextRange) -> TextRange {
+        let start = TextPosition::new(range.start.line, 0);
+        let end = if range.end.character == 0 {
+            range.end
+        } else if range.end.line < self.current_buffer().len() {
+            TextPosition::new(range.end.line + 1, 0)
+        } else {
+            TextPosition::new(range.end.line, self.line_character_len(range.end.line))
+        };
+        TextRange::new(start, end)
+    }
+
+    fn swap_syntax_objects(&mut self, kind: SyntaxObjectKind, backward: bool) -> bool {
+        let Some(language_id) =
+            self.highlight_language_id_for_buffer_index(self.buffer_manager.active_index())
+        else {
+            return false;
+        };
+        let cursor = self.cursor_text_position();
+        let Some(buffer) = self.buffer_manager.active_buffer() else {
+            return false;
+        };
+        let (current, adjacent) =
+            match self
+                .syntax_textobjects
+                .swap_ranges(buffer, &language_id, cursor, kind, backward)
+            {
+                Ok(Some(ranges)) => ranges,
+                Ok(None) => return false,
+                Err(error) => {
+                    self.last_error = Some(error.to_string());
+                    return false;
+                }
+            };
+
+        let (left, right, current_is_left) =
+            if self.current_buffer().position_to_char_idx(current.start)
+                < self.current_buffer().position_to_char_idx(adjacent.start)
+            {
+                (current, adjacent, true)
+            } else {
+                (adjacent, current, false)
+            };
+        let left_text = self.current_buffer().text_in_range(left);
+        let right_text = self.current_buffer().text_in_range(right);
+        let left_start = self.current_buffer().position_to_char_idx(left.start);
+        let right_start = self.current_buffer().position_to_char_idx(right.start);
+        let left_length = left_text.chars().count();
+        let right_length = right_text.chars().count();
+        let destination = if current_is_left {
+            right_start
+                .saturating_add(right_length)
+                .saturating_sub(left_length)
+        } else {
+            left_start
+        };
+
+        self.begin_transaction(match kind {
+            SyntaxObjectKind::Parameter => "swap parameters",
+            SyntaxObjectKind::Function => "swap functions",
+            _ => "swap structural objects",
+        });
+        self.replace_range(right, &left_text);
+        self.replace_range(left, &right_text);
+        let destination = self.current_buffer().char_idx_to_position(destination);
+        self.move_to_text_position(destination);
+        self.commit_transaction(self.cursor_snapshot())
     }
 
     fn text_object_range(&self, scope: TextObjectScope, kind: TextObjectKind) -> Option<TextRange> {
@@ -16255,6 +16485,24 @@ impl Editor {
                     self.notify_change(runtime).await?;
                 }
                 self.render(buffer)?;
+            }
+            Action::SwapNextParameter
+            | Action::SwapPreviousParameter
+            | Action::SwapNextFunction
+            | Action::SwapPreviousFunction => {
+                let (kind, backward) = match action {
+                    Action::SwapNextParameter => (SyntaxObjectKind::Parameter, false),
+                    Action::SwapPreviousParameter => (SyntaxObjectKind::Parameter, true),
+                    Action::SwapNextFunction => (SyntaxObjectKind::Function, false),
+                    Action::SwapPreviousFunction => (SyntaxObjectKind::Function, true),
+                    _ => unreachable!(),
+                };
+                if self.swap_syntax_objects(kind, backward) {
+                    self.notify_change(runtime).await?;
+                    self.finish_cursor_motion(buffer, false)?;
+                } else if self.last_error.is_none() {
+                    self.last_error = Some("adjacent text object not found".to_string());
+                }
             }
             Action::StartCommentOperator(count)
             | Action::StartLowercaseOperator(count)
@@ -18044,6 +18292,28 @@ impl Editor {
                     self.finish_cursor_motion(buffer, false)?;
                 }
             }
+            Action::MoveToNextCall
+            | Action::MoveToPreviousCall
+            | Action::MoveToNextFunction
+            | Action::MoveToPreviousFunction
+            | Action::MoveToNextClass
+            | Action::MoveToPreviousClass => {
+                let (kind, backward) = match action {
+                    Action::MoveToNextCall => (SyntaxObjectKind::Call, false),
+                    Action::MoveToPreviousCall => (SyntaxObjectKind::Call, true),
+                    Action::MoveToNextFunction => (SyntaxObjectKind::Function, false),
+                    Action::MoveToPreviousFunction => (SyntaxObjectKind::Function, true),
+                    Action::MoveToNextClass => (SyntaxObjectKind::Class, false),
+                    Action::MoveToPreviousClass => (SyntaxObjectKind::Class, true),
+                    _ => unreachable!(),
+                };
+                if let Some(position) = self.syntax_motion_target(kind, backward, 1) {
+                    self.move_to_text_position(position);
+                    self.finish_cursor_motion(buffer, false)?;
+                } else if self.last_error.is_none() {
+                    self.last_error = Some("text object not found".to_string());
+                }
+            }
             Action::MoveToFilePercent(percent) => {
                 let percent = (*percent).clamp(1, 100);
                 let line_count = self.current_buffer().navigable_line_count();
@@ -18392,6 +18662,8 @@ impl Editor {
                 self.current_buffer_mut().set_syntax_selection(selection);
                 self.highlight_cache
                     .remove(&self.buffer_manager.active_index());
+                self.syntax_textobjects
+                    .invalidate(self.current_buffer().id());
                 self.bracket_match_cache = None;
                 self.force_full_redraw = true;
                 self.last_error = Some(format!("syntax: {label}"));
@@ -19172,6 +19444,16 @@ impl Editor {
                 | Action::MatchitBackward
                 | Action::MatchitPreviousUnmatched
                 | Action::MatchitNextUnmatched
+                | Action::MoveToNextCall
+                | Action::MoveToPreviousCall
+                | Action::MoveToNextFunction
+                | Action::MoveToPreviousFunction
+                | Action::MoveToNextClass
+                | Action::MoveToPreviousClass
+                | Action::SwapNextParameter
+                | Action::SwapPreviousParameter
+                | Action::SwapNextFunction
+                | Action::SwapPreviousFunction
                 | Action::NextDiagnostic
                 | Action::PreviousDiagnostic
                 | Action::MoveTo(_, _)
