@@ -12,7 +12,7 @@ RELEASE = {
     "tagName": "v0.2.4",
     "url": "https://github.com/codersauce/red/releases/tag/v0.2.4",
     "publishedAt": "2026-07-25T14:05:22Z",
-    "body": """## [0.2.4]
+    "body": """## What's Changed
 
 ### Features
 
@@ -22,6 +22,10 @@ RELEASE = {
 ### Bug Fixes
 
 - **lsp:** Prevent pathological batching hangs ([7b126be](https://example.test/commit))
+
+## Contributors
+
+- @new-contributor in #138 (first-time contributor)
 
 ## Installation
 
@@ -45,6 +49,7 @@ class DiscordReleaseTest(unittest.TestCase):
             sections["Bug Fixes"],
             ["**lsp:** Prevent pathological batching hangs"],
         )
+        self.assertNotIn("new-contributor", str(sections))
         self.assertNotIn("This must not", str(sections))
 
     def test_builds_a_branded_safe_embed(self) -> None:

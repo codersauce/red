@@ -16,6 +16,10 @@ The release workflow uses the repository `GITHUB_TOKEN` to create a draft
 release, so `.github/workflows/release.yml` grants `contents: write` only to
 the release publishing job.
 
+`cliff.toml` generates the versioned `CHANGELOG.md` embedded in Red as an
+offline fallback. `cliff.release.toml` separately generates the public GitHub
+release notes, including pull request authors and first-time contributors.
+
 ## Release Process
 
 1. Choose the next semantic version, for example `0.2.0`.
@@ -50,12 +54,15 @@ the release publishing job.
 
 6. Watch the **Release** workflow in GitHub Actions. It verifies the package version
    and matching `CHANGELOG.md` section, builds all four archives, and runs the
-   extracted editor's embedded-runtime self-check on each target platform.
+   extracted editor's embedded-runtime self-check on each target platform. It also
+   generates GitHub release notes with grouped changes, pull request authors, and a
+   contributors section that identifies first-time contributors.
 7. Review the draft GitHub release and confirm:
    - all four archives are attached
    - `SHA256SUMS.txt` is attached
    - `install.sh` and `install.ps1` are attached
    - install instructions match the release tag
+   - change authors, pull requests, and first-time contributors are credited correctly
 8. Publish the draft release.
 9. Watch the **Release** workflow run triggered by the `release.published`
    event. This updates `Formula/red.rb` in `codersauce/homebrew-tap`.

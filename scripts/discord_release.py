@@ -48,6 +48,9 @@ def release_sections(body: str) -> dict[str, list[str]]:
     for line in body.splitlines():
         if line.startswith("## Installation"):
             break
+        if line.startswith("## "):
+            current = None
+            continue
         heading = SECTION.match(line)
         if heading:
             current = heading.group(1)
