@@ -3,6 +3,9 @@ title: "Vim Compatibility"
 summary: "Red documents a supported Vim-style editing subset, intentional differences, and test gates for motions, operators, registers, macros, modes, search, marks, undo, and edge cases."
 topics: [reference, vim, editor, testing]
 sources:
+  - id: default-config
+    type: file
+    path: default_config.toml
   - id: vim-doc
     type: file
     path: docs/VIM_COMPATIBILITY.md
@@ -46,6 +49,12 @@ Visual indentation is a line-range operation even for characterwise and blockwis
 Search supports `/`, `?`, incremental preview, `n`, `N`, `*`, wrapscan, smartcase and ignorecase, cancellation, and highlight clearing, but search patterns use Rust `regex` syntax instead of Vim's regex dialect [@vim-doc]. Substitution supports current-line, whole-file, numeric, and last-visual ranges with `g`, `i`, and confirmation flags, while replacement syntax also follows Rust `regex` capture expansion rather than Vim magic modes or expression replacement [@vim-doc]. Tests cover search previews, failed searches, invalid regex reporting, Rust regex case options, substitution ranges, confirmation flow, and escaped delimiters [@editing-tests] [@movement-tests].
 
 Local marks, global marks, previous-jump marks, last-change marks, and last-visual-bound marks are supported [@vim-doc]. Mark edit affinity is an intentional difference: named marks have right insertion affinity, while last-visual start has left affinity and end has right affinity [@vim-doc]. Tests cover named marks through insertions and undo/redo, jumplist participation, and last-change or last-visual marks [@editing-tests].
+
+## Jumplist
+
+The default normal keymap binds `Ctrl-o` to `JumpBack` and binds both `Ctrl-i` and `Tab` to `JumpForward` [@default-config]. Red documents jumplist support for search and long/file motions, with window-local lists, split windows copying their source list, edit-tracked positions, cleanup of same-line entries, and forward/back traversal that does not discard the forward branch [@vim-doc].
+
+Integration coverage matches that contract. Movement tests cover the default key bindings, split-window independence, edit-tracked positions, same-line cleanup, per-window session recovery, boundary no-ops, and page scrolling that does not create jump entries [@movement-tests]. Editing tests cover buffer deletion removing invalid jump targets while preserving usable jumps to remaining buffers [@editing-tests].
 
 ## Intentional Differences
 

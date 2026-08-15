@@ -33,7 +33,7 @@ For ordinary Rust changes, run the normal test suite first:
 cargo test --all-targets --all-features
 ```
 
-CI runs that command with `--verbose` on Ubuntu, macOS, and Windows, then runs a second no-default-features test pass with `cargo test --all-targets --no-default-features --verbose` [@ci]. Run the no-default-features pass locally when the change touches feature-gated code, dependency declarations, CLI utility behavior, or anything that may compile differently without default features.
+CI runs that command with `--verbose` on Ubuntu, macOS, and Windows [@ci]. Add narrower or feature-specific local checks when the change touches feature-gated code, dependency declarations, CLI utility behavior, or anything that may compile differently under a non-default feature set.
 
 For Rust changes that may be pushed, the repository policy is stricter than a test-only pass:
 
@@ -51,7 +51,6 @@ Run these local equivalents when the changed area warrants them:
 
 ```shell
 cargo test --all-targets --all-features
-cargo test --all-targets --no-default-features
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 cargo run --locked -- --self-check

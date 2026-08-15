@@ -1,6 +1,6 @@
 ---
 title: "Buffers And Windows"
-summary: "Buffers and windows separate editable text identity from split-tree presentation while the editor synchronizes active cursor, viewport, and plugin-visible window state."
+summary: "Buffers and windows separate editable text identity from split-tree presentation while the editor synchronizes active cursor, viewport, jumplist, and plugin-visible window state."
 topics: [architecture, editor, buffers, windows, sessions, plugins]
 sources:
   - id: buffer
@@ -15,9 +15,15 @@ sources:
   - id: editor
     type: file
     path: src/editor.rs
+  - id: session-store
+    type: file
+    path: src/session.rs
+  - id: movement-tests
+    type: file
+    path: tests/movement.rs
 ---
 
-Red separates editable text from the window tree that presents it. A `Buffer` owns Ropey text, a stable process-local `BufferId`, file association, dirty state, content revision, fallback cursor state, and undo history [@buffer]. A `Window` owns a stable `WindowId`, a buffer index, terminal bounds, viewport offsets, wrapping state, cursor position, and active flag [@window]. `Editor` coordinates both sides: buffers hold content identity, windows hold per-view presentation, and rendering plus plugin snapshots synchronize the active view with the state exposed to integrations [@editor].
+Red separates editable text from the window tree that presents it. A `Buffer` owns Ropey text, a stable process-local `BufferId`, file association, dirty state, content revision, fallback cursor state, and undo history [@buffer]. A `Window` owns a stable `WindowId`, a buffer index, terminal bounds, viewport offsets, wrapping state, cursor position, jump list, and active flag [@window]. `Editor` coordinates both sides: buffers hold content identity, windows hold per-view presentation, and rendering plus plugin snapshots synchronize the active view with the state exposed to integrations [@editor].
 
 ## Buffer Identity And Selection
 
@@ -36,6 +42,12 @@ Window operations mutate the split tree and then recompute layout. Horizontal an
 The editor keeps an active-window view in its own fields while windows retain per-window state. When switching buffers, `set_current_buffer` saves the outgoing buffer's viewport and cursor fallback, changes the active buffer index, restores the selected buffer's fallback position, resets horizontal viewport fields, updates the gutter-derived visual x offset, and requests diagnostics [@editor]. During rendering, `render` fixes cursor bounds, checks viewport bounds, and calls `sync_to_window` before drawing windows [@editor].
 
 Per-window state is also serialized. `SplitSnapshot` records each leaf's saved buffer index, viewport top, horizontal offset, wrapped-line skip column, wrap mode, cursor grapheme index, cursor row, and legacy x offset [@window]. `WindowManagerSnapshot` stores the split topology and active tree-order index; restore remaps saved buffer indexes to current indexes, rebuilds fresh stable window IDs, recomputes layout for current terminal size, and activates a valid window [@window].
+
+## Window-Local Jumplists
+
+Jumplists are window state, not editor-global state. Each `Window` owns a `JumpList`, and editor actions resolve backward or forward traversal through the active window's list [@window] [@editor]. Split tests assert that a new split copies the source window's list and then traverses independently, which matches the window-local ownership model instead of sharing a global history [@movement-tests].
+
+Session snapshots store per-window jumplists in split-tree order as `window_jumps` [@session-store]. Restore rebuilds each jump entry against current buffer IDs, drops entries that no longer map to an open buffer, and falls back from legacy global `jumps`/`jump_index` fields when `window_jumps` is absent [@editor]. Snapshot construction still writes legacy active-window jump fields alongside `window_jumps`, so older readers have a compatibility path while current recovery preserves each window's list [@editor] [@session-store].
 
 ## Plugin And Render Visibility
 

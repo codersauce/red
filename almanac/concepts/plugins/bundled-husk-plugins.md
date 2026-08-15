@@ -33,6 +33,8 @@ Git and Neo-tree have an extra split. `plugins/git.hk` remains the editor-facing
 
 That split keeps public plugin compatibility small. A shell can continue to use Red events and UI calls, while pure package code can use typed data models without becoming a public host API. The user-facing host contract for plugin authors belongs in [Plugin host API](../../reference/plugins/host-api), not in the internal bridge operation names [@runtime].
 
+The Git shell owns the user-facing operation workflow around those pure helpers. User-triggered mutating operations such as commit, pull, merge, rebase, cherry-pick, revert, and safe-sync branches display transient progress through a plugin overlay, use host-managed busy animation, and then show bounded success or failure text [@plugins-dir]. Background refresh and hunk application stay quiet, while the safe-sync ahead branch routes into the normal push menu instead of bypassing its existing confirmation and progress flow [@plugins-dir].
+
 Neo-tree's shell also owns the user-facing create/reveal flow. A successful file create records that the result should be selected, waits for the `FileOperation` result's canonical `created` path, resets the tree through its existing reveal machinery, expands parent directories as needed, and finally calls `SelectPanelRow` for the created file [@plugins-dir] [@runtime]. Directory creation, cancelled prompts, and failed file operations clear the pending selection intent so a later refresh cannot highlight a stale row [@plugins-dir] [@runtime].
 
 ## Relationship To Runtime Assets

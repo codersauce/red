@@ -1,6 +1,6 @@
 ---
 title: "Crash Recovery Snapshots"
-summary: "Red persists editor-owned session snapshots so a later `red --resume` can recover dirty buffers, layout, undo history, plugin storage, and agent conversation context without writing recovered text to disk."
+summary: "Red persists editor-owned session snapshots so a later `red --resume` can recover dirty buffers, layout, undo history, plugin pane state, plugin storage, and agent conversation context without writing recovered text to disk."
 topics: [sessions, recovery, architecture]
 sources:
   - id: session-store
@@ -12,6 +12,9 @@ sources:
   - id: editor-session
     type: file
     path: src/editor.rs
+  - id: panel-manager
+    type: file
+    path: src/plugin/panel.rs
   - id: main-entry
     type: file
     path: src/main.rs
@@ -24,9 +27,11 @@ Crash recovery snapshots are Red's disk-backed answer to losing the editor owner
 
 ## Snapshot Contents
 
-`SessionSnapshot` is a durable schema rather than an editor cache. It records the schema version, generation, working directory, capture time, open buffers, active buffer index, window layout, registers, jumps, local marks, global marks, special marks, last visual selections, optional agent transcript text, optional structured agent conversation, a legacy `agent_workspace` compatibility field, an agent resumability flag, plugin extensions, and unknown legacy extensions [@session-store]. Each buffer entry stores the buffer index, canonical path when present, full in-memory contents, dirty bit, revision, cursor, viewport, undo tree, and the disk text observed at capture time [@session-store].
+`SessionSnapshot` is a durable schema rather than an editor cache. It records the schema version, generation, working directory, capture time, open buffers, active buffer index, window layout, plugin panel state, registers, jumps, local marks, global marks, special marks, last visual selections, optional agent transcript text, optional structured agent conversation, a legacy `agent_workspace` compatibility field, an agent resumability flag, plugin extensions, and unknown legacy extensions [@session-store]. Each buffer entry stores the buffer index, canonical path when present, full in-memory contents, dirty bit, revision, cursor, viewport, undo tree, and the disk text observed at capture time [@session-store].
 
-The editor builds the snapshot from live editor state. It synchronizes the window state, commits buffer undo transactions with the visible cursor, snapshots marks and last-visual-selection metadata through buffer IDs, captures agent transcript storage, captures the `AgentManager` conversation snapshot, and records plugin storage extensions [@editor-session]. On restore, Red reconstructs buffers first, then reapplies the window layout, registers, jumps, marks, last visual selections, agent conversation, plugin storage extensions, legacy plugin imports, and archived transcript warning state [@editor-session].
+The `panels` field stores a `PanelManagerSnapshot` keyed by stable plugin resource IDs. It captures editor-owned shell and interaction state such as visibility, stacking, side, sizes, row selection and scroll, text-panel scroll and follow-tail state, scrollback cursor, focus region, and composer draft/cursor state [@session-store] [@panel-manager]. The field has a Serde default, so older snapshots without pane state load as an empty panel snapshot instead of failing recovery [@session-store].
+
+The editor builds the snapshot from live editor state. It synchronizes the window state, commits buffer undo transactions with the visible cursor, snapshots marks and last-visual-selection metadata through buffer IDs, captures panel state, captures agent transcript storage, captures the `AgentManager` conversation snapshot, and records plugin storage extensions [@editor-session]. On restore, Red reconstructs buffers first, then reapplies the window layout, stages panel restore state for plugins to recreate, restores registers, jumps, marks, last visual selections, agent conversation, plugin storage extensions, legacy plugin imports, and archived transcript warning state [@editor-session] [@panel-manager].
 
 ## Owner Namespaces
 

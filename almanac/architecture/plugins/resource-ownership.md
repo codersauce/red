@@ -27,6 +27,15 @@ sources:
   - id: schema
     type: file
     path: src/plugin/host_api.json
+  - id: agent-plugin
+    type: file
+    path: plugins/agent.hk
+  - id: neotree-plugin
+    type: file
+    path: plugins/neotree.hk
+  - id: project-search-plugin
+    type: file
+    path: plugins/project_search.hk
 ---
 
 Plugin resource ownership is the editor-side contract behind Red's plugin UI surfaces. Husk plugins call the [Red host API](red-host-api) with stable IDs, models, namespaces, callbacks, or segments, and the runtime turns those calls into [plugin host requests](../editor/plugin-host-requests) [@runtime] [@schema]. The editor-side managers then own focus, layout, hit testing, rendering, replacement semantics, and stale-resource cleanup. This shape lets plugins describe UI intent without letting plugin VMs mutate editor buffers, windows, render buffers, or long-lived UI state directly.
@@ -54,6 +63,12 @@ Gutter signs use the same namespace replacement model with stricter display vali
 Window bars are semantic chrome attached to editor windows. `WindowBarManager` selects at most one bar per window; higher priority wins, and the most recently created bar breaks ties [@window-bar]. Segment clipping is display-width aware, action hit regions are retained only for visible text, and styles can resolve through theme semantics before concrete overrides are applied [@window-bar]. A selected bar also reserves one top row for that window [@window-bar].
 
 Overlays are floating resources positioned against terminal bounds. `PluginOverlay` stores full content, dimensions, alignment, dirty state, optional busy state, and the last computed position, while `OverlayManager` updates each overlay position and renders visible content in z-order [@overlay]. `UpdateOverlayBusy` lets a plugin toggle host-driven spinner animation on an existing overlay; the host owns frame timing, reserves display width for the spinner, and redraws when the visible frame changes [@schema] [@overlay]. The current implementation positions each overlay independently and avoids the status line when rendering [@overlay]. That makes overlays useful for progress or transient status without changing the layout reservations used by panels and window bars.
+
+## Snapshot Restore Keeps Ownership Split
+
+Session recovery snapshots panel state, but it does not let the editor recreate arbitrary plugin panes by itself. `PanelManager` stages restored panel state by stable resource ID, leaves focus on the editor while panes are missing, and reapplies shell layout plus content interaction state only after the owning plugin recreates a matching row panel or text panel [@panel]. That staged state includes visibility, stacking order, side, sizes, row selection and scroll, text-panel follow-tail and scroll anchor, scrollback cursor, focus region, and composer draft/cursor state [@panel].
+
+Bundled pane-owning plugins participate in that boundary. The agent, Neo-tree, and project-search shells receive restored-pane events, recreate their own visible panes from plugin-owned data, and then let `PanelManager` reapply the editor-owned pane state [@agent-plugin] [@neotree-plugin] [@project-search-plugin]. This keeps plugin data reconstruction in plugin code while preserving the editor's ownership of focus, sizing, scroll, and composer state.
 
 ## Callback Resources Stay Owner-Scoped
 

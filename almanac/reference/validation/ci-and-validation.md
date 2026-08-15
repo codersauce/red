@@ -35,7 +35,7 @@ The main CI workflow runs on pushes and pull requests targeting `main` or `devel
 | Job | Main checks |
 | --- | --- |
 | `workflow-lint` | Checks out the repository, validates GitHub Actions workflows with actionlint, verifies the README release version, and runs Discord release announcement tests [@ci]. |
-| `test` | Runs on Ubuntu, macOS, and Windows for stable Rust; installs rustfmt and clippy components, installs ripgrep per OS, caches Cargo data, limits Windows test concurrency, then runs all-target all-feature tests and all-target no-default-feature tests [@ci]. |
+| `test` | Runs on Ubuntu, macOS, and Windows for stable Rust; installs ripgrep per OS, caches Cargo data, and runs all-target all-feature tests with verbose Cargo output [@ci]. |
 | `clippy` | Runs clippy on Ubuntu, macOS, and Windows with all targets and all features, denying every warning [@ci]. |
 | `perf` | Runs the release-mode `husk_cursor_bench` example with `--assert` as a deterministic performance gate [@ci]. |
 | `fmt` | Runs `cargo fmt --all -- --check` [@ci]. |
@@ -52,7 +52,7 @@ The `bundled-plugins` job runs targeted Rust tests for Husk and plugin runtime a
 
 ## Nightly Rust Workflow
 
-The Nightly Rust workflow runs on a scheduled Monday cron and can be started manually [@nightly]. It installs the nightly toolchain on Ubuntu, installs ripgrep, caches Cargo data, and runs the same all-target all-feature and no-default-feature test commands used by the main CI test job [@nightly].
+The Nightly Rust workflow runs on a scheduled Monday cron and can be started manually [@nightly]. It installs the nightly toolchain on Ubuntu, installs ripgrep, caches Cargo data, and runs the all-target all-feature test command with verbose Cargo output [@nightly].
 
 ## Release Workflow
 
