@@ -30,12 +30,14 @@ packages that declare those minors continue to load. New packages should target
 
 ## Scratch-buffer workflows
 
-`OpenScratchBuffer(callback, name, text, commands?)` accepts optional `submit` and
-`cancel` plugin command names. In a managed scratch buffer, `:w` and `:wq` invoke the
-submit command without writing the display name to disk, while `:q` and `:q!` invoke
-the cancel command without quitting Red. `Save`, `Quit`, and configured key bindings
-follow the same routing. The options were added in host API `0.8.0`; calls using the
-original three required arguments remain compatible.
+`OpenScratchBuffer(callback, name, text, commands?)` accepts an optional `syntax`
+language name plus optional `submit` and `cancel` plugin command names. The syntax
+selection is local to the scratch buffer and falls back to automatic filename
+detection when omitted or unknown. In a managed scratch buffer, `:w` and `:wq` invoke
+the submit command without writing the display name to disk, while `:q` and `:q!`
+invoke the cancel command without quitting Red. `Save`, `Quit`, and configured key
+bindings follow the same routing. The options were added in host API `0.8.0`; calls
+using the original three required arguments remain compatible.
 
 ## External package primitives
 

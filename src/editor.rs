@@ -1519,6 +1519,7 @@ pub enum PluginRequest {
         request_id: RequestId,
         name: String,
         text: String,
+        syntax: Option<String>,
         submit_command: Option<String>,
         cancel_command: Option<String>,
     },
@@ -8367,10 +8368,19 @@ impl Editor {
                     request_id,
                     name,
                     text,
+                    syntax,
                     submit_command,
                     cancel_command,
                 } => {
-                    let scratch_buffer = Buffer::new(Some(name), text);
+                    let syntax = syntax.and_then(|name| {
+                        self.highlighter
+                            .language_id_for_name(&name)
+                            .map(ToString::to_string)
+                    });
+                    let mut scratch_buffer = Buffer::new(Some(name), text);
+                    if let Some(language) = syntax {
+                        scratch_buffer.set_syntax_selection(SyntaxSelection::Language(language));
+                    }
                     self.scratch_buffers.insert(
                         scratch_buffer.id(),
                         ScratchBufferCommands {
