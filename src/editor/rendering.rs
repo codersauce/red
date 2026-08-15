@@ -28,7 +28,7 @@ use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::{
     color::{blend_color, ensure_minimum_contrast, Color},
-    config::{CursorShape, KeyAction, PickerIconStyle, StatuslineSection},
+    config::{CursorShape, FormattingProvider, KeyAction, PickerIconStyle, StatuslineSection},
     editor::RenderCommand,
     lsp::{Diagnostic, DiagnosticSeverity},
     plugin::DecorationAnchor,
@@ -121,7 +121,7 @@ struct StatuslineAccent {
     minimum_contrast: Option<f32>,
 }
 
-struct StatuslineContext {
+struct StatuslineContext<'a> {
     mode: String,
     filename: String,
     file_path: Option<String>,
@@ -146,13 +146,13 @@ struct StatuslineContext {
     window_index: String,
     file_size: String,
     agent_activity: Option<String>,
-    formatter: Option<&'static str>,
+    formatter: Option<&'a str>,
     clock: String,
 }
 
 fn statusline_segment(
     section: StatuslineSection,
-    context: &StatuslineContext,
+    context: &StatuslineContext<'_>,
     theme: &Theme,
     icon_style: PickerIconStyle,
     color_icons: bool,
@@ -525,7 +525,7 @@ pub(crate) fn statusline_slot_style(theme: &Theme, index: usize) -> Style {
 
 fn statusline_segments(
     sections: impl IntoIterator<Item = StatuslineSection>,
-    context: &StatuslineContext,
+    context: &StatuslineContext<'_>,
     theme: &Theme,
     icon_style: PickerIconStyle,
     color_icons: bool,
@@ -2804,6 +2804,21 @@ impl Editor {
         let formatter = configured(StatuslineSection::Formatter)
             .then(|| {
                 let file = file_path.as_deref()?;
+                if self.config.formatting.provider != FormattingProvider::Lsp {
+                    if let Some(definition) = self.formatter_definition_for_file(file) {
+                        let path = expand_user_path(file).ok()?;
+                        if crate::formatter::is_available(definition, &path) {
+                            return Some(if definition.name.trim().is_empty() {
+                                definition.command.as_str()
+                            } else {
+                                definition.name.as_str()
+                            });
+                        }
+                        if self.config.formatting.provider == FormattingProvider::External {
+                            return Some("no fmt");
+                        }
+                    }
+                }
                 self.lsp.server_capabilities_for_file(file).map(|_| {
                     if self.lsp.supports_document_formatting(file) {
                         "fmt"

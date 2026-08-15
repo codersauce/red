@@ -52,6 +52,7 @@ use crossterm::{
     },
     terminal, ExecutableCommand,
 };
+use futures::future::BoxFuture;
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 #[cfg(unix)]
 use nix::sys::signal::{self, Signal};
@@ -79,8 +80,8 @@ use crate::{
     command, command_palette,
     comment::CommentSyntax,
     config::{
-        Config, ConfigDiagnostic, ConfigDiagnosticSource, ConfigRecovery, KeyAction,
-        PickerIconStyle, StatuslineConfig,
+        Config, ConfigDiagnostic, ConfigDiagnosticSource, ConfigRecovery, FormattingProvider,
+        KeyAction, LanguageFormatterConfig, PickerIconStyle, StatuslineConfig,
     },
     dispatcher::Dispatcher,
     editing::{
@@ -3541,6 +3542,19 @@ enum FormatOnSaveRequest {
     Cancelled,
 }
 
+enum ExternalFormatOutcome {
+    NotConfigured,
+    Unavailable { name: String },
+    Unchanged { name: String },
+    Applied { name: String },
+}
+
+struct ExternalFormatOnSave {
+    use_lsp: bool,
+    warning: Option<String>,
+    changed: bool,
+}
+
 impl HistoryEntry {
     fn new(file: Option<String>, x: usize, y: usize) -> Self {
         Self { file, x, y }
@@ -3835,6 +3849,7 @@ impl Editor {
         let count = loaded.config.languages.len();
         self.config.languages = loaded.config.languages;
         self.config.lsp = loaded.config.lsp;
+        self.config.formatting = loaded.config.formatting;
         self.config.commenting = loaded.config.commenting;
         self.config_diagnostics = loaded.diagnostics;
         self.config_diagnostics_acknowledged = self.config_diagnostics.is_empty();
@@ -17406,32 +17421,7 @@ impl Editor {
                 self.execute_lsp_command(command, None).await?;
             }
             Action::FormatDocument => {
-                if let Some(file) = self.current_buffer().file.clone() {
-                    let Some(uri) = self.current_buffer().uri()? else {
-                        return Ok(false);
-                    };
-                    let pending = PendingLspEdit {
-                        buffer_id: self.current_buffer().id(),
-                        revision: self.current_buffer().revision(),
-                        uri,
-                    };
-                    self.ensure_current_buffer_lsp_opened().await?;
-                    let indentation = self.indentation();
-                    let request_id = self
-                        .lsp
-                        .format_document_with_options(
-                            &file,
-                            indentation.tab_width,
-                            indentation.expand_tab,
-                        )
-                        .await?;
-                    if request_id > 0 {
-                        self.pending_lsp_edit_requests.insert(request_id, pending);
-                    } else {
-                        self.last_error =
-                            Some("no language server is available for this file".to_string());
-                    }
-                }
+                self.format_document_action(buffer, runtime).await?;
             }
             Action::CodeAction => {
                 if let Some(file) = self.current_buffer().file.clone() {
@@ -17986,167 +17976,13 @@ impl Editor {
                 }
             }
             Action::Save => {
-                let scratch_command = self
-                    .scratch_buffers
-                    .get(&self.current_buffer().id())
-                    .and_then(|commands| commands.submit.clone());
-                if let Some(command) = scratch_command {
-                    self.plugin_registry.execute(runtime, &command).await?;
+                if !self.save_action(buffer, runtime).await? {
                     return Ok(false);
-                }
-                let resume_insert_transaction = self.commit_active_transaction_before_save();
-                let format_warning = if self.config.lsp.format_on_save {
-                    let request = self.request_format_on_save(None).await;
-                    let request = match request {
-                        Ok(request) => request,
-                        Err(error) => {
-                            self.resume_insert_transaction_after_save(resume_insert_transaction);
-                            return Err(error);
-                        }
-                    };
-                    match request {
-                        FormatOnSaveRequest::Pending => {
-                            self.resume_insert_transaction_after_save(resume_insert_transaction);
-                            return Ok(false);
-                        }
-                        FormatOnSaveRequest::Save { warning } => warning,
-                        FormatOnSaveRequest::Cancelled => {
-                            self.resume_insert_transaction_after_save(resume_insert_transaction);
-                            return Ok(false);
-                        }
-                    }
-                } else {
-                    None
-                };
-                let save_result = self.current_buffer_mut().save();
-                self.resume_insert_transaction_after_save(resume_insert_transaction);
-
-                match save_result {
-                    Ok(msg) => {
-                        // TODO: use last_message instead of last_error
-                        self.last_error = Some(format_warning.unwrap_or(msg));
-
-                        // Notify plugins about file save
-                        if let Some(file) = &self.current_buffer().file {
-                            let save_info = serde_json::json!({
-                                "file": file,
-                                "buffer_index": self.buffer_manager.active_index()
-                            });
-                            self.plugin_registry
-                                .notify(runtime, "file:saved", save_info)
-                                .await?;
-                        }
-                    }
-                    Err(e) => {
-                        self.last_error = Some(e.to_string());
-                    }
                 }
             }
             Action::SaveAs(new_file_name) => {
-                if self
-                    .scratch_buffers
-                    .contains_key(&self.current_buffer().id())
-                {
-                    self.last_error = Some(
-                        "Scratch buffers cannot be written to disk; use :w to submit".to_string(),
-                    );
+                if !self.save_as_action(new_file_name, buffer, runtime).await? {
                     return Ok(false);
-                }
-                let previous_uri = self.current_buffer().uri()?;
-                let previous_file = self.current_buffer().file.clone();
-                let resume_insert_transaction = self.commit_active_transaction_before_save();
-                let format_warning = if self.config.lsp.format_on_save {
-                    let request = self
-                        .request_format_on_save(Some(new_file_name.clone()))
-                        .await;
-                    let request = match request {
-                        Ok(request) => request,
-                        Err(error) => {
-                            self.resume_insert_transaction_after_save(resume_insert_transaction);
-                            return Err(error);
-                        }
-                    };
-                    match request {
-                        FormatOnSaveRequest::Pending => {
-                            self.resume_insert_transaction_after_save(resume_insert_transaction);
-                            return Ok(false);
-                        }
-                        FormatOnSaveRequest::Save { warning } => warning,
-                        FormatOnSaveRequest::Cancelled => {
-                            self.resume_insert_transaction_after_save(resume_insert_transaction);
-                            return Ok(false);
-                        }
-                    }
-                } else {
-                    None
-                };
-                let save_result = self.current_buffer_mut().save_as(new_file_name);
-                self.resume_insert_transaction_after_save(resume_insert_transaction);
-
-                match save_result {
-                    Ok(msg) => {
-                        // TODO: use last_message instead of last_error
-                        self.last_error = Some(format_warning.unwrap_or(msg));
-                        if let Err(error) = self
-                            .sync_lsp_document_identity(
-                                previous_uri.as_deref(),
-                                self.buffer_manager.active_index(),
-                            )
-                            .await
-                        {
-                            if !self.config.lsp.format_on_save
-                                || !matches!(
-                                    error.downcast_ref::<crate::lsp::LspError>(),
-                                    Some(
-                                        crate::lsp::LspError::ProtocolError(_)
-                                            | crate::lsp::LspError::RequestTimeout(_)
-                                    )
-                                )
-                            {
-                                return Err(error);
-                            }
-                            log!(
-                                "{}",
-                                json!({
-                                    "event": "lsp_format_on_save_fallback",
-                                    "level": "warn",
-                                    "service": "red",
-                                    "stage": "sync_document_identity",
-                                    "error": error.to_string(),
-                                })
-                            );
-                            self.last_error = Some(format!(
-                                "format-on-save unavailable; saved unformatted: {error}"
-                            ));
-                        }
-                        let saved_file = self
-                            .current_buffer()
-                            .file
-                            .clone()
-                            .unwrap_or_else(|| new_file_name.clone());
-
-                        // Notify plugins about file save
-                        let save_info = serde_json::json!({
-                            "file": saved_file,
-                            "buffer_index": self.buffer_manager.active_index()
-                        });
-                        self.plugin_registry
-                            .notify(runtime, "file:saved", save_info)
-                            .await?;
-                    }
-                    Err(e) => {
-                        if self.config.lsp.format_on_save {
-                            if let Some(target_uri) = self.current_buffer().uri()? {
-                                self.restore_lsp_format_save_identity(
-                                    self.current_buffer().id(),
-                                    &target_uri,
-                                    previous_file,
-                                )
-                                .await;
-                            }
-                        }
-                        self.last_error = Some(e.to_string());
-                    }
                 }
             }
             Action::CommitSearch => {
@@ -23765,6 +23601,442 @@ impl Editor {
             runtime,
         )
         .await
+    }
+
+    #[inline(never)]
+    fn save_action<'a>(
+        &'a mut self,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<bool>> {
+        Box::pin(self.save_action_impl(buffer, runtime))
+    }
+
+    async fn save_action_impl(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<bool> {
+        let scratch_command = self
+            .scratch_buffers
+            .get(&self.current_buffer().id())
+            .and_then(|commands| commands.submit.clone());
+        if let Some(command) = scratch_command {
+            self.plugin_registry.execute(runtime, &command).await?;
+            return Ok(false);
+        }
+        let resume_insert_transaction = self.commit_active_transaction_before_save();
+        let format_on_save = self.config.formatting.on_save || self.config.lsp.format_on_save;
+        let mut format_warning = None;
+        let mut use_lsp = format_on_save;
+        if format_on_save && self.config.formatting.provider != FormattingProvider::Lsp {
+            let file = self.current_buffer().file.clone();
+            let external = self.external_format_on_save(file.as_deref(), runtime).await;
+            use_lsp = external.use_lsp;
+            format_warning = external.warning;
+            if external.changed {
+                self.render(buffer)?;
+            }
+        }
+        if format_on_save && use_lsp {
+            let request = self.request_format_on_save(None).await;
+            let request = match request {
+                Ok(request) => request,
+                Err(error) => {
+                    self.resume_insert_transaction_after_save(resume_insert_transaction);
+                    return Err(error);
+                }
+            };
+            match request {
+                FormatOnSaveRequest::Pending => {
+                    self.resume_insert_transaction_after_save(resume_insert_transaction);
+                    return Ok(false);
+                }
+                FormatOnSaveRequest::Save { warning } => {
+                    format_warning = warning.or(format_warning);
+                }
+                FormatOnSaveRequest::Cancelled => {
+                    self.resume_insert_transaction_after_save(resume_insert_transaction);
+                    return Ok(false);
+                }
+            }
+        }
+        let save_result = self.current_buffer_mut().save();
+        self.resume_insert_transaction_after_save(resume_insert_transaction);
+
+        match save_result {
+            Ok(msg) => {
+                // TODO: use last_message instead of last_error
+                self.last_error = Some(format_warning.unwrap_or(msg));
+
+                // Notify plugins about file save
+                if let Some(file) = &self.current_buffer().file {
+                    let save_info = serde_json::json!({
+                        "file": file,
+                        "buffer_index": self.buffer_manager.active_index()
+                    });
+                    self.plugin_registry
+                        .notify(runtime, "file:saved", save_info)
+                        .await?;
+                }
+            }
+            Err(e) => {
+                self.last_error = Some(e.to_string());
+            }
+        }
+        Ok(true)
+    }
+
+    #[inline(never)]
+    fn save_as_action<'a>(
+        &'a mut self,
+        new_file_name: &'a str,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<bool>> {
+        Box::pin(self.save_as_action_impl(new_file_name, buffer, runtime))
+    }
+
+    async fn save_as_action_impl(
+        &mut self,
+        new_file_name: &str,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<bool> {
+        if self
+            .scratch_buffers
+            .contains_key(&self.current_buffer().id())
+        {
+            self.last_error =
+                Some("Scratch buffers cannot be written to disk; use :w to submit".to_string());
+            return Ok(false);
+        }
+        let previous_uri = self.current_buffer().uri()?;
+        let previous_file = self.current_buffer().file.clone();
+        let resume_insert_transaction = self.commit_active_transaction_before_save();
+        let format_on_save = self.config.formatting.on_save || self.config.lsp.format_on_save;
+        let mut format_warning = None;
+        let mut use_lsp = format_on_save;
+        if format_on_save && self.config.formatting.provider != FormattingProvider::Lsp {
+            let external = self
+                .external_format_on_save(Some(new_file_name), runtime)
+                .await;
+            use_lsp = external.use_lsp;
+            format_warning = external.warning;
+            if external.changed {
+                self.render(buffer)?;
+            }
+        }
+        if format_on_save && use_lsp {
+            let request = self
+                .request_format_on_save(Some(new_file_name.to_string()))
+                .await;
+            let request = match request {
+                Ok(request) => request,
+                Err(error) => {
+                    self.resume_insert_transaction_after_save(resume_insert_transaction);
+                    return Err(error);
+                }
+            };
+            match request {
+                FormatOnSaveRequest::Pending => {
+                    self.resume_insert_transaction_after_save(resume_insert_transaction);
+                    return Ok(false);
+                }
+                FormatOnSaveRequest::Save { warning } => {
+                    format_warning = warning.or(format_warning);
+                }
+                FormatOnSaveRequest::Cancelled => {
+                    self.resume_insert_transaction_after_save(resume_insert_transaction);
+                    return Ok(false);
+                }
+            }
+        }
+        let save_result = self.current_buffer_mut().save_as(new_file_name);
+        self.resume_insert_transaction_after_save(resume_insert_transaction);
+
+        match save_result {
+            Ok(msg) => {
+                // TODO: use last_message instead of last_error
+                self.last_error = Some(format_warning.unwrap_or(msg));
+                if let Err(error) = self
+                    .sync_lsp_document_identity(
+                        previous_uri.as_deref(),
+                        self.buffer_manager.active_index(),
+                    )
+                    .await
+                {
+                    if !format_on_save
+                        || !use_lsp
+                        || !matches!(
+                            error.downcast_ref::<crate::lsp::LspError>(),
+                            Some(
+                                crate::lsp::LspError::ProtocolError(_)
+                                    | crate::lsp::LspError::RequestTimeout(_)
+                            )
+                        )
+                    {
+                        return Err(error);
+                    }
+                    log!(
+                        "{}",
+                        json!({
+                            "event": "lsp_format_on_save_fallback",
+                            "level": "warn",
+                            "service": "red",
+                            "stage": "sync_document_identity",
+                            "error": error.to_string(),
+                        })
+                    );
+                    self.last_error = Some(format!(
+                        "format-on-save unavailable; saved unformatted: {error}"
+                    ));
+                }
+                let saved_file = self
+                    .current_buffer()
+                    .file
+                    .clone()
+                    .unwrap_or_else(|| new_file_name.to_string());
+
+                // Notify plugins about file save
+                let save_info = serde_json::json!({
+                    "file": saved_file,
+                    "buffer_index": self.buffer_manager.active_index()
+                });
+                self.plugin_registry
+                    .notify(runtime, "file:saved", save_info)
+                    .await?;
+            }
+            Err(e) => {
+                if format_on_save && use_lsp {
+                    if let Some(target_uri) = self.current_buffer().uri()? {
+                        self.restore_lsp_format_save_identity(
+                            self.current_buffer().id(),
+                            &target_uri,
+                            previous_file,
+                        )
+                        .await;
+                    }
+                }
+                self.last_error = Some(e.to_string());
+            }
+        }
+        Ok(true)
+    }
+
+    #[inline(never)]
+    fn format_document_action<'a>(
+        &'a mut self,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(self.format_document_action_impl(buffer, runtime))
+    }
+
+    async fn format_document_action_impl(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let Some(file) = self.current_buffer().file.clone() else {
+            return Ok(());
+        };
+        let provider = self.config.formatting.provider;
+        if provider != FormattingProvider::Lsp {
+            match self
+                .format_current_buffer_with_external(&file, runtime)
+                .await
+            {
+                Ok(ExternalFormatOutcome::Applied { name }) => {
+                    self.last_error = Some(format!("formatted with {name}"));
+                    self.render(buffer)?;
+                    return Ok(());
+                }
+                Ok(ExternalFormatOutcome::Unchanged { name }) => {
+                    self.last_error = Some(format!("already formatted with {name}"));
+                    return Ok(());
+                }
+                Ok(ExternalFormatOutcome::Unavailable { name })
+                    if provider == FormattingProvider::External =>
+                {
+                    self.last_error = Some(format!(
+                        "formatter {name} is not installed or not executable"
+                    ));
+                    return Ok(());
+                }
+                Ok(ExternalFormatOutcome::NotConfigured)
+                    if provider == FormattingProvider::External =>
+                {
+                    self.last_error =
+                        Some("no external formatter is configured for this language".to_string());
+                    return Ok(());
+                }
+                Err(error) => {
+                    self.last_error = Some(error.to_string());
+                    return Ok(());
+                }
+                Ok(
+                    ExternalFormatOutcome::Unavailable { .. }
+                    | ExternalFormatOutcome::NotConfigured,
+                ) => {}
+            }
+        }
+        let Some(uri) = self.current_buffer().uri()? else {
+            return Ok(());
+        };
+        let pending = PendingLspEdit {
+            buffer_id: self.current_buffer().id(),
+            revision: self.current_buffer().revision(),
+            uri,
+        };
+        self.ensure_current_buffer_lsp_opened().await?;
+        let indentation = self.indentation();
+        let request_id = self
+            .lsp
+            .format_document_with_options(&file, indentation.tab_width, indentation.expand_tab)
+            .await?;
+        if request_id > 0 {
+            self.pending_lsp_edit_requests.insert(request_id, pending);
+        } else {
+            self.last_error = Some("no language server is available for this file".to_string());
+        }
+        Ok(())
+    }
+
+    fn formatter_definition_for_file(&self, file: &str) -> Option<&LanguageFormatterConfig> {
+        let language = self
+            .highlighter
+            .language_id_for_file(Some(file))
+            .map(str::to_string)
+            .or_else(|| self.current_language_id())?;
+        self.config
+            .languages
+            .get(&language)
+            .and_then(|definition| definition.formatter.as_ref())
+    }
+
+    fn formatter_for_file(&self, file: &str) -> Option<LanguageFormatterConfig> {
+        self.formatter_definition_for_file(file).cloned()
+    }
+
+    async fn format_current_buffer_with_external(
+        &mut self,
+        file: &str,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<ExternalFormatOutcome> {
+        let Some(definition) = self.formatter_for_file(file) else {
+            return Ok(ExternalFormatOutcome::NotConfigured);
+        };
+        let name = if definition.name.trim().is_empty() {
+            definition.command.clone()
+        } else {
+            definition.name.clone()
+        };
+        let file_path = expand_user_path(file)?;
+        let revision = self.current_buffer().revision();
+        let contents = self.current_buffer().contents();
+        let Some(formatted) =
+            crate::formatter::format_document(&definition, &file_path, &contents).await?
+        else {
+            return Ok(ExternalFormatOutcome::Unavailable { name });
+        };
+        anyhow::ensure!(
+            self.current_buffer().revision() == revision,
+            "formatter result is stale because the document changed"
+        );
+        if formatted.contents == contents {
+            return Ok(ExternalFormatOutcome::Unchanged {
+                name: formatted.name,
+            });
+        }
+
+        let end = self.current_buffer().char_idx_to_position(usize::MAX);
+        self.begin_transaction_with_origin(
+            format!("format with {}", formatted.name),
+            EditOrigin::Formatter {
+                name: formatted.name.clone(),
+            },
+        );
+        self.replace_range(
+            TextRange::new(TextPosition::new(0, 0), end),
+            &formatted.contents,
+        );
+        self.check_bounds();
+        self.refresh_cursor_goal();
+        self.commit_transaction(self.cursor_snapshot());
+        self.notify_change(runtime).await?;
+        Ok(ExternalFormatOutcome::Applied {
+            name: formatted.name,
+        })
+    }
+
+    async fn external_format_on_save(
+        &mut self,
+        file: Option<&str>,
+        runtime: &mut Runtime,
+    ) -> ExternalFormatOnSave {
+        let provider = self.config.formatting.provider;
+        let outcome = match file {
+            Some(file) => {
+                self.format_current_buffer_with_external(file, runtime)
+                    .await
+            }
+            None => Ok(ExternalFormatOutcome::NotConfigured),
+        };
+        match outcome {
+            Ok(ExternalFormatOutcome::Applied { .. }) => ExternalFormatOnSave {
+                use_lsp: false,
+                warning: None,
+                changed: true,
+            },
+            Ok(ExternalFormatOutcome::Unchanged { .. }) => ExternalFormatOnSave {
+                use_lsp: false,
+                warning: None,
+                changed: false,
+            },
+            Ok(ExternalFormatOutcome::Unavailable { name }) => {
+                if provider == FormattingProvider::Auto {
+                    ExternalFormatOnSave {
+                        use_lsp: true,
+                        warning: None,
+                        changed: false,
+                    }
+                } else {
+                    ExternalFormatOnSave {
+                        use_lsp: false,
+                        warning: Some(format!(
+                            "format-on-save unavailable; saved unformatted: formatter {name} is not installed or not executable"
+                        )),
+                        changed: false,
+                    }
+                }
+            }
+            Ok(ExternalFormatOutcome::NotConfigured) => {
+                if provider == FormattingProvider::Auto {
+                    ExternalFormatOnSave {
+                        use_lsp: true,
+                        warning: None,
+                        changed: false,
+                    }
+                } else {
+                    ExternalFormatOnSave {
+                        use_lsp: false,
+                        warning: Some(
+                            "format-on-save unavailable; saved unformatted: no external formatter is configured for this language"
+                                .to_string(),
+                        ),
+                        changed: false,
+                    }
+                }
+            }
+            Err(error) => ExternalFormatOnSave {
+                use_lsp: false,
+                warning: Some(format!(
+                    "format-on-save unavailable; saved unformatted: {error}"
+                )),
+                changed: false,
+            },
+        }
     }
 
     async fn request_format_on_save(
@@ -31535,6 +31807,120 @@ builtin = "rust"
         let mut editor = Editor::with_size(lsp, 60, 12, config, Theme::default(), buffers).unwrap();
         editor.test_disable_terminal_output();
         editor
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_formatter_is_undoable_and_runs_before_save() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("document.testfmt");
+        std::fs::write(&path, "hello\n").unwrap();
+        let formatter = root.path().join("uppercase-format");
+        std::fs::write(&formatter, "#!/bin/sh\ntr 'a-z' 'A-Z'\n").unwrap();
+        let mut permissions = std::fs::metadata(&formatter).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&formatter, permissions).unwrap();
+
+        let mut config = Config::default();
+        config.lsp.enabled = false;
+        config.languages.insert(
+            "testfmt".to_string(),
+            crate::config::LanguageConfig {
+                extensions: vec!["testfmt".to_string()],
+                formatter: Some(LanguageFormatterConfig {
+                    name: "Uppercase".to_string(),
+                    command: formatter.to_string_lossy().into_owned(),
+                    root_markers: vec![],
+                    args: vec![],
+                    env: Default::default(),
+                }),
+                ..Default::default()
+            },
+        );
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "hello\n".to_string(),
+        );
+        let mut editor =
+            Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+
+        editor
+            .test_execute_production_action(Action::FormatDocument)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), "HELLO\n");
+        assert_eq!(
+            editor.last_error.as_deref(),
+            Some("formatted with Uppercase")
+        );
+
+        editor
+            .test_execute_production_action(Action::Undo)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), "hello\n");
+
+        editor.config.formatting.on_save = true;
+        editor
+            .test_execute_production_action(Action::Save)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), "HELLO\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "HELLO\n");
+        assert!(!editor.current_buffer().is_dirty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failing_external_formatter_saves_unformatted_without_lsp_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("document.testfmt");
+        std::fs::write(&path, "disk\n").unwrap();
+        let formatter = root.path().join("failing-format");
+        std::fs::write(&formatter, "#!/bin/sh\necho 'invalid syntax' >&2\nexit 7\n").unwrap();
+        let mut permissions = std::fs::metadata(&formatter).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&formatter, permissions).unwrap();
+
+        let mut config = Config::default();
+        config.lsp.enabled = false;
+        config.formatting.on_save = true;
+        config.languages.insert(
+            "testfmt".to_string(),
+            crate::config::LanguageConfig {
+                extensions: vec!["testfmt".to_string()],
+                formatter: Some(LanguageFormatterConfig {
+                    name: "Failing".to_string(),
+                    command: formatter.to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let buffer = Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "unformatted\n".to_string(),
+        );
+        let mut editor =
+            Editor::with_size(lsp, 60, 12, config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+
+        editor
+            .test_execute_production_action(Action::Save)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "unformatted\n");
+        assert!(editor.last_error.as_deref().is_some_and(|message| {
+            message.contains("saved unformatted") && message.contains("invalid syntax")
+        }));
     }
 
     fn line_diagnostic(

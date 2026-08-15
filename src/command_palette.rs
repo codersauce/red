@@ -868,8 +868,8 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
         builtin(
             "lsp.format",
             "Format document",
-            "LSP",
-            "Format the current document",
+            "Editing",
+            "Format the current document with its configured formatter",
             None,
             &["formatter"],
             Action::FormatDocument,
@@ -1250,7 +1250,7 @@ mod tests {
             .iter()
             .find(|entry| entry.id == "lsp.format")
             .unwrap();
-        assert_eq!(format.category, "LSP");
+        assert_eq!(format.category, "Editing");
         assert_eq!(format.title, "Format document");
         assert!(format
             .shortcuts
@@ -1531,7 +1531,7 @@ mod tests {
         assert_eq!(
             format.icon,
             Some(PickerIcon::Symbol {
-                kind: "CommandLsp".to_string(),
+                kind: "Command".to_string(),
                 role: Some("Command".to_string()),
             })
         );
@@ -1543,14 +1543,14 @@ mod tests {
             })
         );
         assert_eq!(format.label, "Format document");
-        assert_eq!(format.annotation.as_deref().map(str::trim), Some("LSP"));
+        assert_eq!(format.annotation.as_deref().map(str::trim), Some("Editing"));
         assert!(format
             .detail
             .as_deref()
             .is_some_and(|detail| detail.contains("Space f")));
         assert_eq!(
             format.data["description"].as_str(),
-            Some("Format the current document")
+            Some("Format the current document with its configured formatter")
         );
         assert_eq!(save.data["colon"].as_str(), Some(":w"));
         assert_eq!(format.data["primary_shortcut"].as_str(), Some("Space f"));
