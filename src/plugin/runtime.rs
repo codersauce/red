@@ -35,9 +35,10 @@ use uuid::Uuid;
 use crate::{
     assets::RuntimeAssetKind,
     config::{Config, PluginPermissions},
+    dispatcher::Dispatcher,
     editor::{
         Action, ComposerCallback, ComposerCallbackKind, PickerCallback, PickerCallbackKind,
-        PluginRequest, ACTION_DISPATCHER,
+        PluginRequest, PluginResponse, ACTION_DISPATCHER,
     },
     log,
     plugin::process::{ProcessManager, ProcessSpawnOptions},
@@ -54,10 +55,6 @@ use super::{WorkspaceConfig, WorkspaceModel};
 struct PendingTimeout {
     id: String,
     expires_at: Instant,
-}
-
-lazy_static::lazy_static! {
-    static ref PENDING_TIMEOUTS: Mutex<Vec<PendingTimeout>> = Mutex::new(Vec::new());
 }
 
 const PLUGIN_INSTRUCTION_BUDGET: usize = 100_000;
@@ -267,28 +264,10 @@ extern "red" {
 
 static RED_HOST_AST: OnceLock<husk_ast::File> = OnceLock::new();
 
-/// Poll timer callbacks scheduled by Husk plugins.
-pub fn poll_timer_callbacks() -> Vec<PluginRequest> {
-    let mut requests = Vec::new();
-    let now = Instant::now();
-
-    let mut timeouts = PENDING_TIMEOUTS.lock().unwrap();
-    timeouts.retain(|timeout| {
-        if timeout.expires_at <= now {
-            requests.push(PluginRequest::TimeoutCallback {
-                timer_id: timeout.id.clone(),
-            });
-            false
-        } else {
-            true
-        }
-    });
-
-    requests
-}
-
 struct RedHost {
+    dispatcher: Arc<Dispatcher<PluginRequest, PluginResponse>>,
     process_manager: ProcessManager,
+    pending_timeouts: Vec<PendingTimeout>,
     snapshots: HashMap<String, Value>,
     policy: RedPluginPolicy,
     staged_policy: Option<RedPluginPolicy>,
@@ -858,9 +837,19 @@ enum StagedHostEffect {
 }
 
 impl RedHost {
+    #[cfg(test)]
     fn new(process_permissions: HashMap<String, PluginPermissions>) -> Self {
+        Self::with_dispatcher(process_permissions, Arc::new(Dispatcher::new()))
+    }
+
+    fn with_dispatcher(
+        process_permissions: HashMap<String, PluginPermissions>,
+        dispatcher: Arc<Dispatcher<PluginRequest, PluginResponse>>,
+    ) -> Self {
         Self {
+            dispatcher,
             process_manager: ProcessManager::new(process_permissions),
+            pending_timeouts: Vec::new(),
             snapshots: HashMap::new(),
             policy: RedPluginPolicy::default(),
             staged_policy: None,
@@ -915,12 +904,12 @@ impl RedHost {
         }
         for effect in effects {
             match effect {
-                StagedHostEffect::Request(request) => ACTION_DISPATCHER.send_request(*request),
+                StagedHostEffect::Request(request) => self.dispatcher.send_request(*request),
                 StagedHostEffect::Log(message) => log!("[PLUGIN:HUSK] {}", message),
                 StagedHostEffect::ScheduleTimeout { id, delay_ms } => {
-                    schedule_timeout_with_id(id, delay_ms);
+                    self.schedule_timeout_with_id(id, delay_ms);
                 }
-                StagedHostEffect::CancelTimeout(id) => cancel_timeout(&id),
+                StagedHostEffect::CancelTimeout(id) => self.cancel_timeout(&id),
             }
         }
     }
@@ -971,7 +960,7 @@ impl RedHost {
         if let Some(effects) = &mut self.staged_effects {
             effects.push(StagedHostEffect::Request(Box::new(request)));
         } else {
-            ACTION_DISPATCHER.send_request(request);
+            self.dispatcher.send_request(request);
         }
     }
 
@@ -983,7 +972,7 @@ impl RedHost {
                 delay_ms,
             });
         } else {
-            schedule_timeout_with_id(id.clone(), delay_ms);
+            self.schedule_timeout_with_id(id.clone(), delay_ms);
         }
         id
     }
@@ -992,8 +981,36 @@ impl RedHost {
         if let Some(effects) = &mut self.staged_effects {
             effects.push(StagedHostEffect::CancelTimeout(timer_id.to_string()));
         } else {
-            cancel_timeout(timer_id);
+            self.cancel_timeout_now(timer_id);
         }
+    }
+
+    fn schedule_timeout_with_id(&mut self, id: String, delay_ms: u64) {
+        self.pending_timeouts.push(PendingTimeout {
+            id,
+            expires_at: Instant::now() + Duration::from_millis(delay_ms),
+        });
+    }
+
+    fn cancel_timeout_now(&mut self, timer_id: &str) {
+        self.pending_timeouts
+            .retain(|timeout| timeout.id != timer_id);
+    }
+
+    fn poll_timer_callbacks(&mut self) -> Vec<PluginRequest> {
+        let mut requests = Vec::new();
+        let now = Instant::now();
+        self.pending_timeouts.retain(|timeout| {
+            if timeout.expires_at <= now {
+                requests.push(PluginRequest::TimeoutCallback {
+                    timer_id: timeout.id.clone(),
+                });
+                false
+            } else {
+                true
+            }
+        });
+        requests
     }
 }
 
@@ -3336,27 +3353,6 @@ fn json_usize_at(value: &serde_json::Value, path: &[&str]) -> usize {
     cursor.as_u64().map_or(0, |value| value as usize)
 }
 
-fn schedule_timeout_with_id(id: String, delay_ms: u64) {
-    PENDING_TIMEOUTS.lock().unwrap().push(PendingTimeout {
-        id: id.clone(),
-        expires_at: Instant::now() + Duration::from_millis(delay_ms),
-    });
-}
-
-#[cfg(test)]
-fn schedule_timeout(delay_ms: u64) -> String {
-    let id = Uuid::new_v4().to_string();
-    schedule_timeout_with_id(id.clone(), delay_ms);
-    id
-}
-
-fn cancel_timeout(timer_id: &str) {
-    PENDING_TIMEOUTS
-        .lock()
-        .unwrap()
-        .retain(|timeout| timeout.id != timer_id);
-}
-
 fn value_to_string(value: &Value) -> String {
     match value {
         Value::Unit | Value::Null | Value::Missing(_) => String::new(),
@@ -3451,6 +3447,7 @@ fn value_to_i32(value: &Value) -> Option<i32> {
 #[derive(Clone)]
 pub struct Runtime {
     inner: Arc<Mutex<RuntimeInner>>,
+    dispatcher: Arc<Dispatcher<PluginRequest, PluginResponse>>,
 }
 
 /// A command currently registered by an active Husk plugin.
@@ -3494,14 +3491,25 @@ impl Runtime {
     pub fn try_new_with_permissions(
         process_permissions: HashMap<String, PluginPermissions>,
     ) -> anyhow::Result<Self> {
+        let dispatcher = Arc::new(Dispatcher::new());
+        ACTION_DISPATCHER.bind(dispatcher.clone());
         Ok(Self {
             inner: Arc::new(Mutex::new(RuntimeInner {
                 plugins: HashMap::new(),
-                host: RedHost::new(process_permissions),
+                host: RedHost::with_dispatcher(process_permissions, dispatcher.clone()),
                 anonymous_module_count: 0,
                 typecheck_enabled: true,
             })),
+            dispatcher,
         })
+    }
+
+    pub(crate) fn send_request(&self, request: PluginRequest) {
+        self.dispatcher.send_request(request);
+    }
+
+    pub(crate) fn try_recv_request(&self) -> Option<PluginRequest> {
+        self.dispatcher.try_recv_request()
     }
 
     pub fn set_typecheck_enabled(&mut self, enabled: bool) {
@@ -3884,6 +3892,25 @@ impl Runtime {
         inner.host.poll_process_events()
     }
 
+    pub fn poll_timer_callbacks(&mut self) -> Vec<PluginRequest> {
+        self.inner.lock().unwrap().host.poll_timer_callbacks()
+    }
+
+    #[cfg(test)]
+    fn pending_timeout_count(&self) -> usize {
+        self.inner.lock().unwrap().host.pending_timeouts.len()
+    }
+
+    #[cfg(test)]
+    fn schedule_test_timeout(&mut self, delay_ms: u64) -> String {
+        self.inner.lock().unwrap().host.schedule_timeout(delay_ms)
+    }
+
+    #[cfg(test)]
+    fn cancel_test_timeout(&mut self, timer_id: &str) {
+        self.inner.lock().unwrap().host.cancel_timeout(timer_id);
+    }
+
     pub async fn before_exit(&mut self, snapshot: serde_json::Value) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
         let RuntimeInner { plugins, host, .. } = &mut *inner;
@@ -4075,11 +4102,7 @@ mod tests {
     use std::{fs, process::Command};
 
     use super::*;
-    use crate::{
-        color::Color,
-        editor::{PluginRequest, PLUGIN_DISPATCHER_TEST_LOCK},
-        ui::PickerPresentation,
-    };
+    use crate::{color::Color, editor::PluginRequest, ui::PickerPresentation};
 
     fn drain_requests() {
         while ACTION_DISPATCHER.try_recv_request().is_some() {}
@@ -4087,7 +4110,6 @@ mod tests {
 
     #[tokio::test]
     async fn scratch_buffer_requests_preserve_syntax_submit_and_cancel_commands() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -4802,14 +4824,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn runtimes_own_independent_request_queues() {
+        let first = Runtime::new();
+        let second = Runtime::new();
+
+        first.send_request(PluginRequest::Action(Action::Print("first".to_string())));
+        second.send_request(PluginRequest::Action(Action::Print("second".to_string())));
+
+        assert!(matches!(
+            first.try_recv_request(),
+            Some(PluginRequest::Action(Action::Print(message))) if message == "first"
+        ));
+        assert!(matches!(
+            second.try_recv_request(),
+            Some(PluginRequest::Action(Action::Print(message))) if message == "second"
+        ));
+        assert!(first.try_recv_request().is_none());
+        assert!(second.try_recv_request().is_none());
+    }
+
     #[tokio::test]
     async fn cancelled_timeout_never_reaches_the_editor_queue() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
-        let timer_id = schedule_timeout(0);
+        let mut runtime = Runtime::new();
+        let timer_id = runtime.schedule_test_timeout(0);
 
-        cancel_timeout(&timer_id);
+        runtime.cancel_test_timeout(&timer_id);
 
-        assert!(!poll_timer_callbacks().into_iter().any(|request| {
+        assert!(!runtime.poll_timer_callbacks().into_iter().any(|request| {
             matches!(
                 request,
                 PluginRequest::TimeoutCallback { timer_id: id } if id == timer_id
@@ -4819,11 +4861,14 @@ mod tests {
 
     #[tokio::test]
     async fn polling_due_timeouts_preserves_order_and_pending_timers() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
-        let due = (0..128).map(|_| schedule_timeout(0)).collect::<Vec<_>>();
-        let pending = schedule_timeout(60_000);
+        let mut runtime = Runtime::new();
+        let due = (0..128)
+            .map(|_| runtime.schedule_test_timeout(0))
+            .collect::<Vec<_>>();
+        let pending = runtime.schedule_test_timeout(60_000);
 
-        let callbacks = poll_timer_callbacks()
+        let callbacks = runtime
+            .poll_timer_callbacks()
             .into_iter()
             .filter_map(|request| match request {
                 PluginRequest::TimeoutCallback { timer_id } if due.contains(&timer_id) => {
@@ -4834,17 +4879,13 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(callbacks, due);
-        assert!(PENDING_TIMEOUTS
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|timeout| timeout.id == pending));
-        cancel_timeout(&pending);
+        assert_eq!(runtime.pending_timeout_count(), 1);
+        runtime.cancel_test_timeout(&pending);
+        assert_eq!(runtime.pending_timeout_count(), 0);
     }
 
     #[tokio::test]
     async fn executes_husk_command_through_host() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let source = r#"
@@ -4902,7 +4943,6 @@ mod tests {
 
     #[tokio::test]
     async fn registered_commands_include_owner_and_discovery_metadata() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         let source = r#"
             pub fn activate() {
                 red::add_command("ProjectSearch", search, Json {
@@ -4950,7 +4990,6 @@ mod tests {
 
     #[tokio::test]
     async fn annotated_commands_and_events_register_before_activation() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let source = r#"
             pub fn activate() {
@@ -5021,7 +5060,6 @@ mod tests {
 
     #[tokio::test]
     async fn typed_state_configuration_lifecycle_and_hidden_commands_work_together() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let source = r#"
             struct PluginState { count: i32 }
@@ -5111,7 +5149,6 @@ mod tests {
 
     #[tokio::test]
     async fn failed_typed_initializer_discards_staged_commands_and_config_requests() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         let error = runtime
@@ -5143,7 +5180,6 @@ mod tests {
 
     #[tokio::test]
     async fn typed_state_patches_reject_wrong_records_and_unknown_fields() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -5222,7 +5258,6 @@ mod tests {
 
     #[tokio::test]
     async fn event_callbacks_decode_nested_records_arrays_and_optional_fields() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -5277,7 +5312,6 @@ mod tests {
 
     #[tokio::test]
     async fn event_callbacks_decode_tagged_variants_and_preserve_unknown_payloads() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -5372,7 +5406,6 @@ mod tests {
 
     #[tokio::test]
     async fn process_callbacks_decode_host_variants_and_optional_exit_codes() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -5452,7 +5485,6 @@ mod tests {
 
     #[tokio::test]
     async fn request_callbacks_decode_optional_record_responses() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -5538,7 +5570,6 @@ mod tests {
 
     #[tokio::test]
     async fn git_core_status_preserves_typed_rename_options_across_host_boundaries() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -5609,7 +5640,6 @@ mod tests {
 
     #[tokio::test]
     async fn git_core_diff_preserves_typed_optional_line_and_hunk_metadata() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -5698,7 +5728,6 @@ mod tests {
 
     #[tokio::test]
     async fn annotated_lifecycle_state_migration_preserves_reload_order() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -5740,7 +5769,6 @@ mod tests {
 
     #[tokio::test]
     async fn annotated_command_collisions_preserve_the_existing_owner() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -5780,7 +5808,6 @@ mod tests {
 
     #[tokio::test]
     async fn failed_annotated_reload_preserves_previous_commands_and_events() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -5841,7 +5868,6 @@ mod tests {
 
     #[tokio::test]
     async fn annotation_validation_remains_safe_without_static_typechecking() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime.set_typecheck_enabled(false);
@@ -5864,7 +5890,6 @@ mod tests {
 
     #[tokio::test]
     async fn annotated_package_module_commands_register_and_execute() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let directory = tempfile::tempdir().unwrap();
         let source_directory = directory.path().join("src");
@@ -5930,7 +5955,6 @@ mod tests {
 
     #[tokio::test]
     async fn external_hello_package_registers_its_declarative_command() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("examples/external-hello-plugin/Husk.toml");
@@ -5961,7 +5985,6 @@ mod tests {
 
     #[tokio::test]
     async fn husk_can_drive_the_native_agent_bridge() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let source = r#"
@@ -6008,7 +6031,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_command_opens_prompt_and_lazily_starts_session() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -6102,7 +6124,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_activity_decodes_typed_updates_and_ignores_future_variants() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -6224,7 +6245,6 @@ mod tests {
     #[tokio::test]
     async fn bundled_agent_completion_moves_muted_summary_after_markdown_response_and_persists_it()
     {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -6315,7 +6335,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_preserves_conversations_larger_than_the_legacy_limit() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -6395,7 +6414,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_plugin_creates_prompts_streams_and_cancels() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -6549,7 +6567,7 @@ mod tests {
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(70)).await;
-        for callback in poll_timer_callbacks() {
+        for callback in runtime.poll_timer_callbacks() {
             if let PluginRequest::TimeoutCallback { timer_id } = callback {
                 runtime
                     .notify(
@@ -6587,7 +6605,7 @@ mod tests {
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(70)).await;
-        for callback in poll_timer_callbacks() {
+        for callback in runtime.poll_timer_callbacks() {
             if let PluginRequest::TimeoutCallback { timer_id } = callback {
                 runtime
                     .notify(
@@ -6623,7 +6641,7 @@ mod tests {
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(70)).await;
-        for callback in poll_timer_callbacks() {
+        for callback in runtime.poll_timer_callbacks() {
             if let PluginRequest::TimeoutCallback { timer_id } = callback {
                 runtime
                     .notify(
@@ -6770,7 +6788,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_rejects_a_concurrent_prompt_without_closing_the_active_stream() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -6974,7 +6991,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_panel_submits_and_drains_followups_in_fifo_order() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -7196,7 +7212,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_clear_only_resets_the_visible_view_and_stream_timer() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -7267,7 +7282,7 @@ mod tests {
         assert!(cleared);
         assert!(status);
         tokio::time::sleep(Duration::from_millis(70)).await;
-        assert!(poll_timer_callbacks().is_empty());
+        assert!(runtime.poll_timer_callbacks().is_empty());
 
         runtime
             .notify(
@@ -7288,7 +7303,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_open_creates_and_focuses_panel_without_starting_a_session() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -7324,7 +7338,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_toggle_focuses_new_composer_and_restores_reopened_panel() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -7372,7 +7385,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_close_reopens_without_recreating_and_new_resets_the_session() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -7480,7 +7492,6 @@ mod tests {
 
     #[tokio::test]
     async fn host_accepts_explicit_agent_context_and_exposes_context_requests() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let source = r#"
             pub fn activate() {
@@ -7517,7 +7528,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_rotates_a_cancelled_session_before_the_next_prompt() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -7592,7 +7602,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_rotates_when_completion_wins_the_cancellation_race() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -7676,7 +7685,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_rotates_when_cancellation_wins_the_completion_race() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -7783,8 +7791,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_rotates_a_cancelled_session_after_other_terminal_events() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
-
         for (event, payload, transcript_suffix) in [
             (
                 "agent:completed",
@@ -7856,7 +7862,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_start_keeps_the_previous_session_until_replacement_is_created() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -7919,7 +7924,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_retries_an_unsent_prompt_after_the_live_session_is_lost() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -8050,7 +8054,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_opens_setup_when_the_adapter_exits_during_lazy_start() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -8155,7 +8158,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_ignores_late_events_from_a_replaced_session() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -8213,7 +8215,6 @@ mod tests {
 
     #[tokio::test]
     async fn composer_submission_is_delivered_only_to_the_plugin_that_opened_it() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -8283,7 +8284,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_plugin_bounds_history_preserves_text_and_ignores_picker_events() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -8355,7 +8355,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_plugin_lazily_starts_and_preserves_prompt() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -8542,7 +8541,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_plugin_setup_actions_dispatch_and_cancel_keeps_prompt() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -8583,7 +8581,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_plugin_legacy_start_failure_opens_setup() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -8663,7 +8660,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_plugin_restores_markdown_tables_and_blank_lines() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -8705,7 +8701,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_plugin_recreates_only_a_visible_restored_pane() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -8745,7 +8740,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_plugin_restores_a_truncated_leading_response_as_markdown() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -8794,7 +8788,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_plugin_restores_every_turn_in_a_multi_turn_transcript() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -8862,7 +8855,6 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_agent_plugin_restores_the_bound_codex_thread_before_enabling_input() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -8937,7 +8929,6 @@ mod tests {
 
     #[tokio::test]
     async fn pinned_example_plugin_typechecks_and_activates() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -8991,7 +8982,6 @@ mod tests {
 
     #[tokio::test]
     async fn transactional_reload_uses_explicit_state_migration_hooks() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -9027,7 +9017,6 @@ mod tests {
 
     #[tokio::test]
     async fn successful_reload_commits_old_teardown_before_replacement_activation_and_import() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -9079,7 +9068,6 @@ mod tests {
 
     #[tokio::test]
     async fn failed_teardown_discards_replacement_effects_and_keeps_the_previous_plugin() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -9128,7 +9116,6 @@ mod tests {
 
     #[tokio::test]
     async fn failed_export_discards_staged_effects_and_keeps_live_plugin_state() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -9168,10 +9155,9 @@ mod tests {
 
     #[tokio::test]
     async fn failed_initial_activation_discards_all_staged_host_effects() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
-        let timeout_count = PENDING_TIMEOUTS.lock().unwrap().len();
         let mut runtime = Runtime::new();
+        let timeout_count = runtime.pending_timeout_count();
 
         let error = runtime
             .load_plugin(
@@ -9195,15 +9181,14 @@ mod tests {
         assert!(error.contains("integer division by zero"));
         assert_eq!(runtime.command_plugin("Leaked"), None);
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
-        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count);
+        assert_eq!(runtime.pending_timeout_count(), timeout_count);
     }
 
     #[tokio::test]
     async fn failed_reload_discards_staged_host_effects_and_keeps_previous_command() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
-        let timeout_count = PENDING_TIMEOUTS.lock().unwrap().len();
         let mut runtime = Runtime::new();
+        let timeout_count = runtime.pending_timeout_count();
         runtime
             .load_plugin(
                 "transactional",
@@ -9233,7 +9218,7 @@ mod tests {
             .to_string();
         assert!(error.contains("integer division by zero"));
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
-        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count);
+        assert_eq!(runtime.pending_timeout_count(), timeout_count);
 
         runtime.execute_command("Stable").await.unwrap();
         assert!(matches!(
@@ -9245,7 +9230,6 @@ mod tests {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn failed_reload_cannot_kill_the_live_plugins_process() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new_with_permissions(HashMap::from([(
             "transactional-process".to_string(),
@@ -9306,7 +9290,6 @@ mod tests {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn unloading_a_failing_plugin_teardown_closes_its_session_and_kills_its_process() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new_with_permissions(HashMap::from([(
             "quarantined-process".to_string(),
@@ -9371,7 +9354,6 @@ mod tests {
 
     #[tokio::test]
     async fn husk_can_request_correlated_buffer_text() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let source = r#"
@@ -9406,7 +9388,6 @@ mod tests {
 
     #[tokio::test]
     async fn buffer_picker_lists_and_opens_existing_buffers() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -9467,7 +9448,6 @@ mod tests {
 
     #[tokio::test]
     async fn cool_search_clears_search_highlight_on_non_search_movement() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -9514,7 +9494,6 @@ mod tests {
 
     #[tokio::test]
     async fn cool_search_clears_search_highlight_on_insert_mode() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -9559,7 +9538,6 @@ mod tests {
 
     #[tokio::test]
     async fn indent_guides_reads_the_latest_viewport_snapshot() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -9608,7 +9586,6 @@ mod tests {
 
     #[tokio::test]
     async fn indent_guides_renders_decorations_from_viewport_layout_response() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -9654,7 +9631,6 @@ mod tests {
 
     #[tokio::test]
     async fn indent_guides_handles_non_tabstop_indentation() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -9697,7 +9673,6 @@ mod tests {
 
     #[tokio::test]
     async fn indent_guides_reuses_precomputed_widths_and_infers_blank_runs() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut layout = sample_indent_layout();
@@ -9765,7 +9740,6 @@ mod tests {
 
     #[tokio::test]
     async fn indent_guides_rebuild_theme_styles_without_layout_changes() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let original = Color::Rgb {
@@ -9831,7 +9805,6 @@ mod tests {
 
     #[tokio::test]
     async fn indent_guides_clears_decorations_on_deactivate() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -9872,7 +9845,6 @@ mod tests {
 
     #[tokio::test]
     async fn inlay_hints_requests_visible_range_and_sets_eol_decorations() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -9952,7 +9924,6 @@ mod tests {
 
     #[tokio::test]
     async fn inlay_hints_bound_pathological_same_line_results() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -10012,7 +9983,6 @@ mod tests {
 
     #[tokio::test]
     async fn inlay_hints_ignore_stale_layout_and_render_configured_parameter_hints() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -10098,7 +10068,6 @@ mod tests {
 
     #[tokio::test]
     async fn fidget_renders_lsp_progress_in_overlay() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -10158,7 +10127,6 @@ mod tests {
 
     #[tokio::test]
     async fn fidget_handles_numeric_tokens_typed_overrides_and_future_progress_variants() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -10225,10 +10193,9 @@ mod tests {
 
     #[tokio::test]
     async fn fidget_cancels_animation_and_completion_timers() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
-        let timeout_count = PENDING_TIMEOUTS.lock().unwrap().len();
         let mut runtime = Runtime::new();
+        let timeout_count = runtime.pending_timeout_count();
         runtime
             .load_plugin("fidget", include_str!("../../plugins/fidget.hk"))
             .await
@@ -10256,7 +10223,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count + 1);
+        assert_eq!(runtime.pending_timeout_count(), timeout_count + 1);
 
         runtime
             .notify(
@@ -10268,16 +10235,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count + 1);
+        assert_eq!(runtime.pending_timeout_count(), timeout_count + 1);
 
         runtime.deactivate_all().await.unwrap();
 
-        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count);
+        assert_eq!(runtime.pending_timeout_count(), timeout_count);
     }
 
     #[tokio::test]
     async fn bundled_plugin_deactivation_cancels_pending_refresh_timers() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         for (name, source, event, payload) in [
@@ -10294,8 +10260,8 @@ mod tests {
                 serde_json::json!({}),
             ),
         ] {
-            let timeout_count = PENDING_TIMEOUTS.lock().unwrap().len();
             let mut runtime = Runtime::new();
+            let timeout_count = runtime.pending_timeout_count();
             runtime.set_snapshot("viewport_layout", sample_indent_layout());
             runtime.set_snapshot("windows", serde_json::json!({ "windows": [] }));
             runtime.set_snapshot(
@@ -10309,20 +10275,19 @@ mod tests {
             drain_requests();
 
             runtime.notify(event, payload).await.unwrap();
-            assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count + 1);
+            assert_eq!(runtime.pending_timeout_count(), timeout_count + 1);
 
             runtime.deactivate_all().await.unwrap();
-            assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count);
+            assert_eq!(runtime.pending_timeout_count(), timeout_count);
             drain_requests();
         }
     }
 
     #[tokio::test]
     async fn project_search_cancels_pending_debounce_when_picker_closes() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
-        let timeout_count = PENDING_TIMEOUTS.lock().unwrap().len();
         let mut runtime = Runtime::new();
+        let timeout_count = runtime.pending_timeout_count();
         runtime
             .load_plugin(
                 "project_search",
@@ -10336,13 +10301,13 @@ mod tests {
         runtime
             .notify_picker(handle, PickerCallback::Query("needle".to_string()))
             .unwrap();
-        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count + 1);
+        assert_eq!(runtime.pending_timeout_count(), timeout_count + 1);
 
         runtime
             .notify_picker(handle, PickerCallback::Cancelled)
             .unwrap();
 
-        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count);
+        assert_eq!(runtime.pending_timeout_count(), timeout_count);
         assert!(runtime.picker_plugin(handle).is_none());
         assert!(!runtime
             .notify_picker(handle, PickerCallback::Query("stale".to_string()))
@@ -10352,7 +10317,6 @@ mod tests {
 
     #[tokio::test]
     async fn project_search_recreates_a_restored_export_without_stealing_focus() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -10416,10 +10380,9 @@ mod tests {
 
     #[tokio::test]
     async fn project_search_deactivation_cancels_debounce_and_releases_picker() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
-        let timeout_count = PENDING_TIMEOUTS.lock().unwrap().len();
         let mut runtime = Runtime::new();
+        let timeout_count = runtime.pending_timeout_count();
         runtime
             .load_plugin(
                 "project_search",
@@ -10432,18 +10395,17 @@ mod tests {
         runtime
             .notify_picker(handle, PickerCallback::Query("needle".to_string()))
             .unwrap();
-        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count + 1);
+        assert_eq!(runtime.pending_timeout_count(), timeout_count + 1);
 
         runtime.deactivate_all().await.unwrap();
 
-        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count);
+        assert_eq!(runtime.pending_timeout_count(), timeout_count);
         assert!(runtime.picker_plugin(handle).is_none());
         drain_requests();
     }
 
     #[tokio::test]
     async fn barbecue_handles_large_symbol_lists_and_opens_symbol_action() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -10651,7 +10613,6 @@ mod tests {
 
     #[tokio::test]
     async fn barbecue_debounced_refresh_uses_live_window_cursor() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let stale_windows = serde_json::json!({
@@ -10813,7 +10774,7 @@ mod tests {
                 .expect("expected Barbecue refresh timer")
                 .to_string()
         };
-        cancel_timeout(&timer_id);
+        runtime.cancel_test_timeout(&timer_id);
         runtime
             .notify(
                 "timeout:callback",
@@ -10935,7 +10896,6 @@ mod tests {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn git_dashboard_bounds_pathological_porcelain_status() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let repository = tempfile::tempdir().unwrap();
         let root = repository.path();
@@ -11053,7 +11013,6 @@ mod tests {
 
     #[tokio::test]
     async fn git_menus_and_prompts_use_scoped_picker_callbacks() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new_with_permissions(HashMap::from([(
@@ -11174,7 +11133,6 @@ mod tests {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn git_push_previews_outgoing_commits_cancels_safely_and_reports_success() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let remote = tempfile::tempdir().unwrap();
         let repository = tempfile::tempdir().unwrap();
@@ -11512,7 +11470,6 @@ mod tests {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn git_generated_commit_reports_failure_retry_and_success() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let repository = tempfile::tempdir().unwrap();
         let root = repository.path();
@@ -12025,42 +11982,47 @@ mod tests {
             .notify_picker(confirmation, PickerCallback::Selected(proceed))
             .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(5);
         let mut amend_started = false;
         let mut amend_busy = false;
         let mut amend_succeeded = false;
-        while !amend_started || !amend_busy || !amend_succeeded {
-            pump_process_events(&mut runtime).await.unwrap();
-            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
-                match request {
-                    PluginRequest::UpdateOverlay { id, lines }
-                        if id == "git-operation-progress"
-                            && lines.iter().any(|(line, _)| line == "Amending commit…") =>
-                    {
-                        amend_started = true;
+        let mut amend_messages = Vec::new();
+        let amend_result = tokio::time::timeout(Duration::from_secs(30), async {
+            while !amend_started || !amend_busy || !amend_succeeded {
+                pump_process_events(&mut runtime).await.unwrap();
+                while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                    match request {
+                        PluginRequest::UpdateOverlayBusy { id, busy }
+                            if id == "git-operation-progress" && busy =>
+                        {
+                            amend_busy = true;
+                        }
+                        PluginRequest::UpdateOverlay { id, lines }
+                            if id == "git-operation-progress" =>
+                        {
+                            for (line, _) in lines {
+                                amend_started |= line == "Amending commit…";
+                                amend_succeeded |= line == "✓ Commit amended successfully";
+                                assert!(
+                                    !line.starts_with("Git commit failed:"),
+                                    "amend failed: {line}"
+                                );
+                                amend_messages.push(line);
+                            }
+                        }
+                        PluginRequest::Action(Action::Print(message)) => {
+                            amend_messages.push(message);
+                        }
+                        _ => {}
                     }
-                    PluginRequest::UpdateOverlayBusy { id, busy }
-                        if id == "git-operation-progress" && busy =>
-                    {
-                        amend_busy = true;
-                    }
-                    PluginRequest::UpdateOverlay { id, lines }
-                        if id == "git-operation-progress"
-                            && lines
-                                .iter()
-                                .any(|(line, _)| line == "✓ Commit amended successfully") =>
-                    {
-                        amend_succeeded = true;
-                    }
-                    _ => {}
                 }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            assert!(
-                Instant::now() < deadline,
-                "amend progress was not reported: started={amend_started} busy={amend_busy} succeeded={amend_succeeded}"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        })
+        .await;
+        assert!(
+            amend_result.is_ok(),
+            "amend progress was not reported: started={amend_started} busy={amend_busy} succeeded={amend_succeeded} messages={amend_messages:?}"
+        );
         assert_eq!(
             String::from_utf8(
                 Command::new("git")
@@ -12079,7 +12041,6 @@ mod tests {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn git_user_operations_report_success_failure_and_cleanup() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let repository = tempfile::tempdir().unwrap();
         let root = repository.path();
@@ -12205,7 +12166,6 @@ mod tests {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn git_dashboard_renders_untracked_file_contents() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let repository = tempfile::tempdir().unwrap();
         let root = repository.path();
@@ -12256,7 +12216,6 @@ mod tests {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn git_dashboard_reopens_with_unchanged_status() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let repository = tempfile::tempdir().unwrap();
         let root = repository.path();
@@ -12311,7 +12270,6 @@ mod tests {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn git_dashboard_reports_failed_row_actions() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let repository = tempfile::tempdir().unwrap();
         let root = repository.path();
@@ -12383,7 +12341,6 @@ mod tests {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn git_dashboard_renders_structured_diff_and_stages_one_selected_line() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let repository = tempfile::tempdir().unwrap();
         let root = repository.path();
@@ -12513,7 +12470,6 @@ mod tests {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn git_dashboard_debounces_rapid_detail_selection_to_one_process() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let repository = tempfile::tempdir().unwrap();
         let root = repository.path();
@@ -12626,7 +12582,7 @@ mod tests {
         );
 
         tokio::time::sleep(Duration::from_millis(70)).await;
-        let callbacks = poll_timer_callbacks();
+        let callbacks = runtime.poll_timer_callbacks();
         assert!(
             !callbacks.is_empty(),
             "the final detail timer should remain"
@@ -12677,7 +12633,6 @@ mod tests {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn git_signs_deduplicate_split_windows_and_apply_staged_configuration() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let repository = tempfile::tempdir().unwrap();
         let root = repository.path();
@@ -12866,7 +12821,6 @@ mod tests {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn git_hunk_navigation_targets_changed_lines_and_reports_boundaries() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let repository = tempfile::tempdir().unwrap();
         let root = repository.path();
@@ -13055,7 +13009,6 @@ mod tests {
 
     #[tokio::test]
     async fn project_search_streams_rg_matches_into_picker() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new_with_permissions(HashMap::from([(
@@ -13080,7 +13033,7 @@ mod tests {
             .unwrap();
 
         tokio::time::sleep(Duration::from_millis(120)).await;
-        for callback in poll_timer_callbacks() {
+        for callback in runtime.poll_timer_callbacks() {
             if let PluginRequest::TimeoutCallback { timer_id } = callback {
                 runtime
                     .notify(
@@ -13112,7 +13065,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let item = loop {
             pump_process_events(&mut runtime).await.unwrap();
-            for callback in poll_timer_callbacks() {
+            for callback in runtime.poll_timer_callbacks() {
                 if let PluginRequest::TimeoutCallback { timer_id } = callback {
                     runtime
                         .notify(
@@ -13213,7 +13166,6 @@ mod tests {
 
     #[tokio::test]
     async fn session_restore_loads_matching_snapshot_and_saves_only_clean_buffers() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let snapshot = serde_json::json!({
@@ -13357,7 +13309,6 @@ mod tests {
 
     #[tokio::test]
     async fn session_restore_does_not_override_core_recovery() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -13390,7 +13341,6 @@ mod tests {
 
     #[tokio::test]
     async fn neotree_renders_a_panel_expands_directories_and_opens_files() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -13600,7 +13550,6 @@ mod tests {
 
     #[tokio::test]
     async fn neotree_recreates_a_restored_pane_without_stealing_focus() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -13655,7 +13604,6 @@ mod tests {
 
     #[tokio::test]
     async fn neotree_emits_create_and_multi_item_delete_file_operations() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -13775,7 +13723,6 @@ mod tests {
 
     #[tokio::test]
     async fn neotree_selects_a_new_file_after_refreshing_its_parent() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -13903,7 +13850,6 @@ mod tests {
 
     #[tokio::test]
     async fn neotree_handles_optional_selection_and_nullable_file_operation_errors() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -13974,7 +13920,6 @@ mod tests {
 
     #[tokio::test]
     async fn neotree_reveals_the_active_file_and_renders_git_status() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -14135,7 +14080,6 @@ mod tests {
 
     #[tokio::test]
     async fn neotree_renders_a_large_git_status_listing_within_the_instruction_budget() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -14243,7 +14187,6 @@ mod tests {
 
     #[tokio::test]
     async fn neotree_caps_a_pathological_visible_listing_within_the_instruction_budget() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -14306,7 +14249,6 @@ mod tests {
 
     #[tokio::test]
     async fn neotree_renders_git_status_for_a_filesystem_root_repository() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -14379,7 +14321,6 @@ mod tests {
 
     #[tokio::test]
     async fn theme_browser_previews_restores_and_sets_selected_theme() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -14532,7 +14473,6 @@ mod tests {
 
     #[tokio::test]
     async fn callback_pickers_are_owner_isolated_and_cleaned_up() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let source = |command: &str, prefix: &str| {
@@ -14603,7 +14543,6 @@ mod tests {
 
     #[tokio::test]
     async fn callback_composers_are_typed_one_shot_and_cleaned_up() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let source = r#"
             pub fn activate() { red::add_command("ScopedComposer", open); }
@@ -14676,7 +14615,6 @@ mod tests {
 
     #[tokio::test]
     async fn callback_picker_handles_from_an_old_plugin_generation_are_stale() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let source = r#"
             pub fn activate() { red::add_command("OpenGenerationPicker", open); }
@@ -14709,7 +14647,6 @@ mod tests {
 
     #[tokio::test]
     async fn callback_picker_rejects_non_function_handlers_before_publishing_dialog() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         let error = runtime
@@ -14733,7 +14670,6 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_picker_handler_is_consumed_before_callback_failure() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         runtime
@@ -14767,7 +14703,6 @@ mod tests {
 
     #[tokio::test]
     async fn lsp_symbols_annotations_preserve_all_command_discovery_metadata() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let mut runtime = Runtime::new();
         load_lsp_symbols(&mut runtime).await;
@@ -14801,7 +14736,6 @@ mod tests {
 
     #[tokio::test]
     async fn lsp_symbols_requests_document_symbols_and_opens_picker() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -14849,7 +14783,6 @@ mod tests {
 
     #[tokio::test]
     async fn lsp_symbols_batches_pathological_document_symbol_results() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -14882,7 +14815,7 @@ mod tests {
         let mut final_items = Vec::new();
         let mut final_status = None;
         for _ in 0..80 {
-            let callbacks = poll_timer_callbacks();
+            let callbacks = runtime.poll_timer_callbacks();
             assert!(!callbacks.is_empty(), "expected a pending symbol batch");
             for callback in callbacks {
                 if let PluginRequest::TimeoutCallback { timer_id } = callback {
@@ -14920,7 +14853,7 @@ mod tests {
             Some("4096 symbols (results truncated)")
         );
 
-        let timeout_count = PENDING_TIMEOUTS.lock().unwrap().len();
+        let timeout_count = runtime.pending_timeout_count();
         runtime.execute_command("LspDocumentSymbols").await.unwrap();
         match ACTION_DISPATCHER.recv_request() {
             PluginRequest::ClosePicker { id } => assert_eq!(id, first_handle.get()),
@@ -14938,12 +14871,12 @@ mod tests {
             PluginRequest::OpenCallbackPicker { handle, .. } => handle,
             _ => panic!("expected another document-symbol picker"),
         };
-        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count + 1);
+        assert_eq!(runtime.pending_timeout_count(), timeout_count + 1);
 
         runtime
             .notify_picker(second_handle, PickerCallback::Cancelled)
             .unwrap();
-        assert_eq!(PENDING_TIMEOUTS.lock().unwrap().len(), timeout_count);
+        assert_eq!(runtime.pending_timeout_count(), timeout_count);
         assert!(runtime.picker_plugin(second_handle).is_none());
         assert!(!runtime
             .notify_picker(second_handle, PickerCallback::Cancelled)
@@ -14952,7 +14885,6 @@ mod tests {
 
     #[tokio::test]
     async fn lsp_symbols_batches_pathological_reference_results() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -14991,7 +14923,7 @@ mod tests {
         let mut final_items = Vec::new();
         let mut final_status = None;
         for _ in 0..80 {
-            let callbacks = poll_timer_callbacks();
+            let callbacks = runtime.poll_timer_callbacks();
             assert!(!callbacks.is_empty(), "expected a pending reference batch");
             for callback in callbacks {
                 if let PluginRequest::TimeoutCallback { timer_id } = callback {
@@ -15028,7 +14960,7 @@ mod tests {
             final_status.as_deref(),
             Some("4096 references (results truncated)")
         );
-        assert!(poll_timer_callbacks().is_empty());
+        assert!(runtime.poll_timer_callbacks().is_empty());
         assert!(runtime
             .notify_picker(reference_handle, PickerCallback::Cancelled)
             .unwrap());
@@ -15036,7 +14968,6 @@ mod tests {
 
     #[tokio::test]
     async fn lsp_symbols_workspace_query_updates_picker() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -15124,7 +15055,6 @@ mod tests {
 
     #[tokio::test]
     async fn lsp_symbols_picker_selection_opens_symbol_location() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();
@@ -15165,7 +15095,6 @@ mod tests {
 
     #[tokio::test]
     async fn lsp_symbols_reference_picker_ignores_replaced_request_and_opens_selection() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let mut runtime = Runtime::new();

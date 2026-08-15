@@ -91,11 +91,10 @@ pub async fn run() -> anyhow::Result<SelfCheckReport> {
 
 #[cfg(test)]
 mod tests {
-    use crate::editor::{ACTION_DISPATCHER, PLUGIN_DISPATCHER_TEST_LOCK};
+    use crate::editor::ACTION_DISPATCHER;
 
     #[tokio::test]
     async fn bundled_runtime_initializes_with_production_snapshots() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         while ACTION_DISPATCHER.try_recv_request().is_some() {}
 
         let result = super::run().await;

@@ -1000,7 +1000,7 @@ fn plugin_display_path(plugin: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::editor::{Action, PluginRequest, ACTION_DISPATCHER, PLUGIN_DISPATCHER_TEST_LOCK};
+    use crate::editor::{Action, PluginRequest, ACTION_DISPATCHER};
     use std::time::Duration;
 
     fn drain_requests() {
@@ -1026,7 +1026,6 @@ mod tests {
 
     #[tokio::test]
     async fn executes_husk_command() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let dir = tempfile_dir("husk-command");
@@ -1061,7 +1060,6 @@ mod tests {
 
     #[tokio::test]
     async fn lazily_activates_external_package_with_nested_husk_manifest() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
 
         let root = tempfile_dir("external-husk-package");
@@ -1319,7 +1317,6 @@ mod tests {
 
     #[tokio::test]
     async fn failed_request_callback_quarantines_only_its_owner_and_runs_teardown() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let owner_dir = tempfile_dir("request-owner");
         let owner = owner_dir.join("plugin.hk");
@@ -1391,7 +1388,6 @@ mod tests {
 
     #[tokio::test]
     async fn bad_plugin_is_quarantined_while_unrelated_plugin_starts() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let dir = tempfile_dir("isolated-load");
         let bad = dir.join("bad.hk");
@@ -1519,7 +1515,6 @@ mod tests {
 
     #[tokio::test]
     async fn example_package_metadata_and_husk_entrypoint_activate_together() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example-plugin");
         let entrypoint = root.join("index.hk");
@@ -1554,7 +1549,6 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_commands_have_deterministic_plugin_name_precedence() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let first_dir = tempfile_dir("duplicate-a");
         let first = first_dir.join("plugin.hk");
@@ -1602,7 +1596,6 @@ mod tests {
 
     #[tokio::test]
     async fn broken_hot_reload_keeps_the_previous_plugin_active() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let dir = tempfile_dir("transactional-reload");
         let plugin = dir.join("plugin.hk");
@@ -1642,7 +1635,6 @@ mod tests {
 
     #[tokio::test]
     async fn reload_revalidates_api_metadata_and_recovers_a_fixed_quarantined_plugin() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let dir = tempfile_dir("reload-api-metadata");
         let plugin = dir.join("plugin.hk");
@@ -1692,7 +1684,6 @@ mod tests {
 
     #[tokio::test]
     async fn reload_revalidates_dependency_versions_in_dependency_order_and_recovers() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let dependency_dir = tempfile_dir("reload-dependency");
         let dependency = dependency_dir.join("plugin.hk");
@@ -1766,7 +1757,6 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_is_rolled_back_when_an_active_plugins_source_reload_fails() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let dependency_dir = tempfile_dir("metadata-rollback-dependency");
         let dependency = dependency_dir.join("plugin.hk");
@@ -1832,7 +1822,6 @@ mod tests {
 
     #[tokio::test]
     async fn hot_reload_revalidates_and_recovers_transitive_dependents() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let leaf_dir = tempfile_dir("hot-reload-leaf");
         let leaf = leaf_dir.join("plugin.hk");
@@ -1911,7 +1900,6 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_only_hot_reload_quarantines_incompatible_active_plugin() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let dir = tempfile_dir("reload-metadata-only");
         let plugin = dir.join("plugin.hk");

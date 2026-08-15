@@ -26,6 +26,7 @@ pub mod rendering;
 mod session_manager;
 
 use std::{
+    cell::RefCell,
     cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ffi::OsStr,
@@ -58,7 +59,6 @@ use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use nix::sys::signal::{self, Signal};
 #[cfg(unix)]
 use nix::unistd::Pid;
-use once_cell::sync::Lazy;
 use path_absolutize::Absolutize;
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
@@ -130,11 +130,51 @@ use self::display_layout::{
     DisplayLayout, LayoutConfig,
 };
 
-pub static ACTION_DISPATCHER: Lazy<Dispatcher<PluginRequest, PluginResponse>> =
-    Lazy::new(Dispatcher::new);
-#[cfg(test)]
-pub(crate) static PLUGIN_DISPATCHER_TEST_LOCK: Lazy<tokio::sync::Mutex<()>> =
-    Lazy::new(|| tokio::sync::Mutex::new(()));
+thread_local! {
+    static CURRENT_ACTION_DISPATCHER: RefCell<Option<Arc<Dispatcher<PluginRequest, PluginResponse>>>> =
+        const { RefCell::new(None) };
+}
+
+/// Compatibility facade for tests and external harnesses that inject plugin requests.
+///
+/// Production request ownership lives on [`Runtime`]. The facade is thread-scoped so
+/// independently running tests cannot drain or enqueue requests for another runtime.
+#[doc(hidden)]
+pub struct ActionDispatcher;
+
+#[doc(hidden)]
+pub static ACTION_DISPATCHER: ActionDispatcher = ActionDispatcher;
+
+impl ActionDispatcher {
+    pub(crate) fn bind(&self, dispatcher: Arc<Dispatcher<PluginRequest, PluginResponse>>) {
+        CURRENT_ACTION_DISPATCHER.with(|current| {
+            *current.borrow_mut() = Some(dispatcher);
+        });
+    }
+
+    fn with_dispatcher<T>(
+        &self,
+        callback: impl FnOnce(&Dispatcher<PluginRequest, PluginResponse>) -> T,
+    ) -> T {
+        CURRENT_ACTION_DISPATCHER.with(|current| {
+            let mut current = current.borrow_mut();
+            let dispatcher = current.get_or_insert_with(|| Arc::new(Dispatcher::new()));
+            callback(dispatcher)
+        })
+    }
+
+    pub fn send_request(&self, request: PluginRequest) {
+        self.with_dispatcher(|dispatcher| dispatcher.send_request(request));
+    }
+
+    pub fn recv_request(&self) -> PluginRequest {
+        self.with_dispatcher(Dispatcher::recv_request)
+    }
+
+    pub fn try_recv_request(&self) -> Option<PluginRequest> {
+        self.with_dispatcher(Dispatcher::try_recv_request)
+    }
+}
 
 pub const DEFAULT_REGISTER: char = '"';
 const JUMPLIST_SIZE: usize = 100;
@@ -7704,7 +7744,7 @@ impl Editor {
         if let Err(err) = self.plugin_registry.before_exit(runtime, snapshot).await {
             log!("Plugin beforeExit failed: {}", err);
         }
-        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+        while let Some(request) = runtime.try_recv_request() {
             match request {
                 PluginRequest::SetPluginStorage { plugin, key, value } => {
                     let key = scoped_plugin_storage_key(&plugin, &key);
@@ -7904,7 +7944,7 @@ impl Editor {
         }
 
         // Poll for timer callbacks
-        let timer_callbacks = crate::plugin::poll_timer_callbacks();
+        let timer_callbacks = runtime.poll_timer_callbacks();
         for callback_request in timer_callbacks {
             if let PluginRequest::TimeoutCallback { timer_id } = callback_request {
                 self.plugin_registry
@@ -8285,7 +8325,7 @@ impl Editor {
             if self.agent_manager.is_task_finished() {
                 break;
             }
-            let Some(req) = ACTION_DISPATCHER.try_recv_request() else {
+            let Some(req) = runtime.try_recv_request() else {
                 break;
             };
             let _span = perf::PerfSpan::with_detail("drain", req.label());
@@ -16855,13 +16895,14 @@ impl Editor {
                 let picker = language_pack_picker(self, items, "Loading official catalog…", true);
                 self.current_dialog = Some(Box::new(picker));
                 let catalog_url = plugin::catalog::catalog_url();
+                let runtime = runtime.clone();
                 tokio::spawn(async move {
                     let (packages, error) =
                         match plugin::catalog::PluginCatalog::fetch(&catalog_url).await {
                             Ok(catalog) => (catalog.packages, None),
                             Err(error) => (Vec::new(), Some(error.to_string())),
                         };
-                    ACTION_DISPATCHER.send_request(PluginRequest::Action(
+                    runtime.send_request(PluginRequest::Action(
                         Action::PluginManagerCatalogLoaded {
                             catalog_url,
                             packages,
@@ -16946,7 +16987,7 @@ impl Editor {
                 add_to_history = false;
                 if selection == "retry-catalog" {
                     self.last_error = Some("Retrying official language-pack catalog…".to_string());
-                    ACTION_DISPATCHER.send_request(PluginRequest::Action(Action::ListPlugins));
+                    runtime.send_request(PluginRequest::Action(Action::ListPlugins));
                 } else if selection == "custom-source" {
                     self.current_dialog = Some(Box::new(InputPrompt::new(
                         self,
@@ -17181,6 +17222,7 @@ impl Editor {
                 let package = package.clone();
                 let digests = digests.clone();
                 self.last_error = Some("Approving native grammar bytes…".to_string());
+                let runtime = runtime.clone();
                 tokio::spawn(async move {
                     let manager = plugin::package::PluginPackageManager::new(Config::config_dir());
                     let result = (|| -> anyhow::Result<PluginManagerOperationOutcome> {
@@ -17210,13 +17252,11 @@ impl Editor {
                             false,
                         ),
                     };
-                    ACTION_DISPATCHER.send_request(PluginRequest::Action(
-                        Action::PluginManagerFinished {
-                            message,
-                            reload_languages,
-                            restart_plugins,
-                        },
-                    ));
+                    runtime.send_request(PluginRequest::Action(Action::PluginManagerFinished {
+                        message,
+                        reload_languages,
+                        restart_plugins,
+                    }));
                 });
             }
             Action::PluginManagerCatalogInstall {
@@ -17229,6 +17269,7 @@ impl Editor {
                 let catalog_url = catalog_url.clone();
                 let package = (**package).clone();
                 self.last_error = Some(format!("Installing {}…", package.name));
+                let runtime = runtime.clone();
                 tokio::spawn(async move {
                     let manager = plugin::package::PluginPackageManager::new(Config::config_dir());
                     let result = manager
@@ -17252,13 +17293,11 @@ impl Editor {
                         }
                         Err(error) => (format!("Language pack install failed: {error}"), false),
                     };
-                    ACTION_DISPATCHER.send_request(PluginRequest::Action(
-                        Action::PluginManagerFinished {
-                            message,
-                            reload_languages,
-                            restart_plugins: false,
-                        },
-                    ));
+                    runtime.send_request(PluginRequest::Action(Action::PluginManagerFinished {
+                        message,
+                        reload_languages,
+                        restart_plugins: false,
+                    }));
                 });
             }
             Action::PluginManagerInstall(source) => {
@@ -17268,6 +17307,7 @@ impl Editor {
                     self.last_error = Some("plugin source cannot be empty".to_string());
                 } else {
                     self.last_error = Some(format!("Installing plugin from {source}…"));
+                    let runtime = runtime.clone();
                     tokio::spawn(async move {
                         let manager =
                             plugin::package::PluginPackageManager::new(Config::config_dir());
@@ -17296,7 +17336,7 @@ impl Editor {
                             ),
                             Err(error) => (format!("Plugin install failed: {error}"), false, false),
                         };
-                        ACTION_DISPATCHER.send_request(PluginRequest::Action(
+                        runtime.send_request(PluginRequest::Action(
                             Action::PluginManagerFinished {
                                 message,
                                 reload_languages,
@@ -17310,6 +17350,7 @@ impl Editor {
                 add_to_history = false;
                 let operation = operation.clone();
                 self.last_error = Some("Updating plugin installation…".to_string());
+                let runtime = runtime.clone();
                 tokio::spawn(async move {
                     let manager = plugin::package::PluginPackageManager::new(Config::config_dir());
                     let result = apply_plugin_manager_operation(&manager, &operation).await;
@@ -17321,13 +17362,11 @@ impl Editor {
                         ),
                         Err(error) => (format!("Plugin operation failed: {error}"), false, false),
                     };
-                    ACTION_DISPATCHER.send_request(PluginRequest::Action(
-                        Action::PluginManagerFinished {
-                            message,
-                            reload_languages,
-                            restart_plugins,
-                        },
-                    ));
+                    runtime.send_request(PluginRequest::Action(Action::PluginManagerFinished {
+                        message,
+                        reload_languages,
+                        restart_plugins,
+                    }));
                 });
             }
             Action::PluginManagerFinished {
@@ -26282,7 +26321,6 @@ mod test {
 
     #[tokio::test]
     async fn agent_composer_never_uses_picker_history_or_records_prompt_input() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 14);
         editor.macro_recording = Some(MacroRecording {
@@ -26353,7 +26391,6 @@ mod test {
 
     #[tokio::test]
     async fn opening_a_custom_agent_composer_preserves_unrelated_picker_history() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 14);
         editor
@@ -26473,7 +26510,6 @@ builtin = "rust"
 
     #[tokio::test]
     async fn colon_language_reload_dispatches_the_explicit_reload_action() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let directory = tempfile::tempdir().unwrap();
         let config_path = directory.path().join("config.toml");
@@ -26499,7 +26535,6 @@ builtin = "rust"
 
     #[tokio::test]
     async fn command_tab_completes_registered_plugin_names() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 10);
         let mut buffer =
@@ -26559,7 +26594,6 @@ builtin = "rust"
 
     #[tokio::test]
     async fn colon_commands_dispatch_registered_plugins_and_preserve_builtin_precedence() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 10);
         let mut buffer =
@@ -26954,7 +26988,6 @@ builtin = "rust"
 
     #[tokio::test]
     async fn syntax_picker_opens_from_colon_command_and_applies_selected_language() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let mut editor = test_editor(/*width*/ 100, /*height*/ 14);
         editor.buffer_manager.replace_buffers(vec![Buffer::new(
@@ -27003,7 +27036,6 @@ builtin = "rust"
 
     #[tokio::test]
     async fn command_palette_searches_and_runs_a_registered_plugin_command() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let mut editor = test_editor(/*width*/ 140, /*height*/ 16);
         editor.config.keys = toml::from_str::<Config>(include_str!("../default_config.toml"))
@@ -27083,7 +27115,6 @@ builtin = "rust"
 
     #[tokio::test]
     async fn command_palette_opens_from_leader_and_colon_entrypoints() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let mut editor = test_editor(/*width*/ 100, /*height*/ 14);
         editor.config.keys = toml::from_str::<Config>(include_str!("../default_config.toml"))
@@ -27128,7 +27159,6 @@ builtin = "rust"
 
     #[tokio::test]
     async fn command_palette_opens_from_combined_modifier_alt_and_quick_open_entrypoints() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let mut editor = test_editor(/*width*/ 100, /*height*/ 14);
         editor.config.keys = toml::from_str::<Config>(include_str!("../default_config.toml"))
@@ -27193,7 +27223,6 @@ builtin = "rust"
 
     #[tokio::test]
     async fn unknown_colon_command_leaves_a_visible_error() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 10);
         let mut buffer =
@@ -27217,7 +27246,6 @@ builtin = "rust"
 
     #[tokio::test]
     async fn plugin_buffer_text_requests_preserve_full_and_ranged_contents() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         for (contents, range, expected) in [
             ("", None, ""),
             ("a", None, "a"),
@@ -27557,7 +27585,6 @@ builtin = "rust"
 
     #[tokio::test]
     async fn detached_mouse_drag_resizes_each_docked_pane_without_stealing_focus() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let accent = Color::Rgb {
             r: 203,
@@ -27671,7 +27698,6 @@ builtin = "rust"
 
     #[tokio::test]
     async fn detached_mouse_drag_resizes_vertical_and_horizontal_editor_splits() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let accent = Color::Rgb {
             r: 203,
@@ -27769,7 +27795,6 @@ builtin = "rust"
 
     #[tokio::test]
     async fn detached_focus_loss_and_terminal_resize_cancel_active_divider_highlights() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let accent = Color::Rgb {
             r: 203,
@@ -27829,7 +27854,6 @@ builtin = "rust"
 
     #[tokio::test]
     async fn detached_agent_composer_wraps_paste_and_keeps_the_cursor_in_bounds_after_resize() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
             .await
@@ -27864,7 +27888,6 @@ builtin = "rust"
 
     #[tokio::test]
     async fn detached_plugin_cursor_requests_render_immediately() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let config = Config::default();
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
@@ -27886,7 +27909,6 @@ builtin = "rust"
 
     #[tokio::test]
     async fn detached_input_processes_only_a_bounded_batch_of_agent_events() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
             .await
@@ -27923,7 +27945,6 @@ builtin = "rust"
 
     #[tokio::test]
     async fn finished_agent_task_drains_all_buffered_events_before_session_loss() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let plugin_root = tempfile::tempdir().unwrap();
         let plugin = plugin_root.path().join("agent-event-recorder.hk");
@@ -28042,7 +28063,6 @@ builtin = "rust"
 
     #[tokio::test]
     async fn stale_permission_does_not_block_input_when_the_agent_command_queue_is_full() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
             .await
@@ -28094,7 +28114,6 @@ builtin = "rust"
 
     #[tokio::test]
     async fn detached_paste_chunks_render_once_and_form_one_undoable_edit() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let mut editor = test_editor(80, 24);
         editor.mode = Mode::Insert;
@@ -28138,7 +28157,6 @@ builtin = "rust"
 
     #[tokio::test]
     async fn detached_resize_notifies_plugins_through_the_native_event_path() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let plugin_path =
             std::env::temp_dir().join(format!("red-detached-resize-{}.hk", uuid::Uuid::new_v4()));
@@ -29040,7 +29058,6 @@ builtin = "rust"
 
     #[tokio::test]
     async fn buffer_change_flush_is_revisioned_and_idempotent() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
 
         let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
@@ -29800,7 +29817,6 @@ builtin = "rust"
 
     #[tokio::test]
     async fn macro_replayed_counted_relative_line_motion_renders_only_the_final_frame() {
-        let _guard = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         let (mut editor, mut render_buffer, mut runtime) = counted_down_motion_editor(true);
         install_event_recorder(&mut editor, &mut runtime).await;
         editor.set_register('a', Content::charwise("10j".to_string()));
@@ -34439,7 +34455,6 @@ while True:
 
     #[tokio::test]
     async fn cursor_moved_event_fires_for_next_word_motion() {
-        let _guard = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         let config = Config::default();
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
         let buffer = Buffer::new(None, "alpha beta".to_string());
@@ -34462,7 +34477,6 @@ while True:
 
     #[tokio::test]
     async fn repeated_motion_coalesces_plugin_cursor_events() {
-        let _guard = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         let config = Config::default();
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
         let buffer = Buffer::new(None, "zero\none\ntwo\nthree".to_string());
@@ -34494,7 +34508,6 @@ while True:
 
     #[tokio::test]
     async fn search_highlight_and_clear_emit_plugin_events() {
-        let _guard = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         let config = Config::default();
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
         let buffer = Buffer::new(None, "alpha beta\nalpha gamma".to_string());
@@ -34532,7 +34545,6 @@ while True:
 
     #[tokio::test]
     async fn cancel_search_emits_mode_changed_event() {
-        let _guard = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         let config = Config::default();
         let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
         let buffer = Buffer::new(None, "alpha".to_string());
@@ -35002,7 +35014,6 @@ while True:
 
     #[tokio::test]
     async fn focused_panel_resolves_nested_lazy_commands_before_exposing_prefixes() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let root = tempfile::tempdir().unwrap();
         let husk_root = root.path().join("husk");
@@ -35166,7 +35177,6 @@ while True:
 
     #[tokio::test]
     async fn theme_changed_plugins_receive_the_updated_editor_info_snapshot() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         let mut editor = test_editor(40, 10);
         let mut runtime = Runtime::new();
         editor
@@ -35527,7 +35537,6 @@ while True:
 
     #[tokio::test]
     async fn moving_window_to_edge_refreshes_layout_without_closing_or_refocusing_it() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         let mut editor = test_editor(80, 24);
         editor.window_manager.split_vertical(0).unwrap();
         editor.window_manager.set_active(0);
@@ -35781,7 +35790,6 @@ while True:
 
     #[tokio::test]
     async fn delayed_keymap_hints_render_and_clear_after_a_continuation() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 12);
         editor.config.keys.normal.insert(
@@ -35840,7 +35848,6 @@ while True:
 
     #[tokio::test]
     async fn mouse_events_preserve_pending_and_visible_keymap_hints() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 12);
         editor.config.keys.normal.insert(
@@ -35952,7 +35959,6 @@ while True:
 
     #[tokio::test]
     async fn nested_keymap_hints_keep_the_full_prefix_and_honor_disable() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
         let mut editor = test_editor(/*width*/ 80, /*height*/ 12);
         editor.config.keys.normal.insert(

@@ -1671,12 +1671,10 @@ mod tests {
         use crate::{
             buffer::Buffer,
             config::Config,
-            editor::{DetachedEditorCore, Editor, ACTION_DISPATCHER, PLUGIN_DISPATCHER_TEST_LOCK},
+            editor::{DetachedEditorCore, Editor, ACTION_DISPATCHER},
             lsp::LspManager,
             theme::Theme,
         };
-
-        let _dispatcher_guard = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         while ACTION_DISPATCHER.try_recv_request().is_some() {}
         let config = Config::from_user_toml_with_overrides("", &[]).unwrap();
         let lsp = Box::new(LspManager::new(config.lsp.clone()));
@@ -1785,12 +1783,10 @@ mod tests {
         use crate::{
             buffer::Buffer,
             config::Config,
-            editor::{DetachedEditorCore, Editor, ACTION_DISPATCHER, PLUGIN_DISPATCHER_TEST_LOCK},
+            editor::{DetachedEditorCore, Editor, ACTION_DISPATCHER},
             lsp::LspManager,
             theme::Theme,
         };
-
-        let _dispatcher_guard = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         while ACTION_DISPATCHER.try_recv_request().is_some() {}
         let config = Config::from_user_toml_with_overrides("", &[]).unwrap();
         let lsp = Box::new(LspManager::new(config.lsp.clone()));

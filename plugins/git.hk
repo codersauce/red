@@ -601,6 +601,7 @@ fn refresh() {
         args: red::git_core("status_args"),
         env: Json {
             GIT_PAGER: "cat",
+            GIT_OPTIONAL_LOCKS: "0",
             GIT_TERMINAL_PROMPT: "0",
             LC_ALL: "C",
         },
