@@ -124,6 +124,54 @@ async fn wheel_batch_preserves_scroll_distance_and_reuses_unchanged_surfaces() {
 }
 
 #[tokio::test]
+async fn wheel_batches_keep_inline_comments_identical_to_a_full_frame() {
+    for shared in [false, true] {
+        for (relative, wrap) in [(false, false), (true, false), (true, true)] {
+            let (mut editor, mut buffer, mut runtime) = workspace(shared, relative, wrap);
+            let original = editor.current_buffer().contents();
+            for (start, end) in [(2, 4), (9, 12), (27, 29), (55, 57)] {
+                let comment = editor.make_inline_comment(
+                    start,
+                    end,
+                    "A source-linked note that wraps in a narrow editor split.".to_string(),
+                    inline_comments::InlineCommentOrigin::Sample,
+                );
+                editor.inline_comments.push(comment);
+            }
+            editor.layout_cache.borrow_mut().clear();
+            editor.render(&mut buffer).unwrap();
+            let window = editor.active_window_with_editor_view().unwrap();
+            assert!(!editor.layout_for_window(&window).inline_comments.is_empty());
+            let annotated_gutter = editor.gutter_width_for_window(&window);
+
+            for kind in [
+                MouseEventKind::ScrollDown,
+                MouseEventKind::ScrollDown,
+                MouseEventKind::ScrollUp,
+            ] {
+                let full_renders = editor.full_render_count;
+                let events = (0..4)
+                    .flat_map(|_| [mouse(kind, 12, 3), mouse(MouseEventKind::Moved, 16, 4)])
+                    .collect();
+                editor
+                    .process_scroll_batch(events, &mut buffer, &mut runtime)
+                    .await
+                    .unwrap();
+                assert_eq!(editor.full_render_count, full_renders);
+                assert_matches_full_frame(&mut editor, &buffer);
+            }
+
+            editor.clear_inline_comments();
+            editor.render(&mut buffer).unwrap();
+            let window = editor.active_window_with_editor_view().unwrap();
+            assert!(editor.gutter_width_for_window(&window) < annotated_gutter);
+            assert_eq!(editor.current_buffer().contents(), original);
+            assert_matches_full_frame(&mut editor, &buffer);
+        }
+    }
+}
+
+#[tokio::test]
 async fn wheel_focus_change_repaints_the_previous_active_window() {
     let (mut editor, mut buffer, mut runtime) = workspace(false, false, false);
     let old_window = editor.window_manager.active_stable_window_id();
