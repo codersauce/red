@@ -258,13 +258,17 @@ struct GitPluginState {
     commit_snapshot: Json,
     commit_buffer: i32,
     commit_retry_text: String,
+    commit_process: String,
+    commit_error: String,
     commit_draft_text: String,
     commit_context_process: String,
     commit_context_output: String,
+    commit_context_error: String,
     commit_generate_message: bool,
     commit_history_count: i32,
     commit_history_process: String,
     commit_history_output: String,
+    commit_history_error: String,
     signs: [GitGutterSign],
     sign_jobs: [SignJob],
     prompt_kind: String,
@@ -354,13 +358,17 @@ fn initial_state() -> GitPluginState {
         commit_snapshot: red::null(),
         commit_buffer: -1,
         commit_retry_text: "",
+        commit_process: "",
+        commit_error: "",
         commit_draft_text: "",
         commit_context_process: "",
         commit_context_output: "",
+        commit_context_error: "",
         commit_generate_message: false,
         commit_history_count: 20,
         commit_history_process: "",
         commit_history_output: "",
+        commit_history_error: "",
         signs: [],
         sign_jobs: [],
         prompt_kind: "",
@@ -2655,7 +2663,9 @@ fn commit_snapshot_loaded(snapshot: Json) {
         red::state_patch(GitPluginState { commit_generate_message: false });
     }
     red::state_patch(GitPluginState { commit_context_output: "" });
+    red::state_patch(GitPluginState { commit_context_error: "" });
     red::state_patch(GitPluginState { commit_history_output: "" });
+    red::state_patch(GitPluginState { commit_history_error: "" });
     let process_id = red::execute("SpawnProcess", Process {
         command: "git",
         args: ["diff", "--cached", "--stat", "--patch", "--no-ext-diff", "--color=never"],
@@ -2676,10 +2686,35 @@ fn commit_context_event(event: ProcessEvent) {
                 });
             }
         }
-        ProcessEvent::Exit { process_id, code, plugin_name } => finish_commit_context(process_id),
-        ProcessEvent::Error { process_id, message, plugin_name } => finish_commit_context(process_id),
-        ProcessEvent::Stderr { process_id, line, plugin_name } => {}
+        ProcessEvent::Stderr { process_id, line, plugin_name } => {
+            if process_id == plugin_state().commit_context_process {
+                red::state_patch(GitPluginState {
+                    commit_context_error: plugin_state().commit_context_error + line,
+                });
+            }
+        }
+        ProcessEvent::Exit { process_id, code, plugin_name } => {
+            let exit_code = 1;
+            if let Some(value) = code { exit_code = value; }
+            if exit_code == 0 {
+                finish_commit_context(process_id);
+            } else {
+                fail_commit_context(process_id, "git diff exited with code " + exit_code);
+            }
+        }
+        ProcessEvent::Error { process_id, message, plugin_name } => {
+            fail_commit_context(process_id, message);
+        }
     }
+}
+
+fn fail_commit_context(process_id: String, fallback: String) {
+    if process_id != plugin_state().commit_context_process { return; }
+    red::state_patch(GitPluginState { commit_context_process: "" });
+    let error = red::trim(red::string(plugin_state().commit_context_error, ""));
+    if error == "" { error = fallback; }
+    red::execute("Print", "Could not read staged changes: " + error);
+    open_commit_editor(red::string(plugin_state().commit_draft_text, ""));
 }
 
 fn finish_commit_context(process_id: String) {
@@ -2722,10 +2757,38 @@ fn commit_history_event(event: ProcessEvent) {
                 });
             }
         }
-        ProcessEvent::Exit { process_id, code, plugin_name } => finish_commit_history(process_id),
-        ProcessEvent::Error { process_id, message, plugin_name } => finish_commit_history(process_id),
-        ProcessEvent::Stderr { process_id, line, plugin_name } => {}
+        ProcessEvent::Stderr { process_id, line, plugin_name } => {
+            if process_id == plugin_state().commit_history_process {
+                red::state_patch(GitPluginState {
+                    commit_history_error: plugin_state().commit_history_error + line,
+                });
+            }
+        }
+        ProcessEvent::Exit { process_id, code, plugin_name } => {
+            let exit_code = 1;
+            if let Some(value) = code { exit_code = value; }
+            if exit_code != 0 {
+                warn_commit_history(process_id, "git log exited with code " + exit_code);
+            } else {
+                finish_commit_history(process_id);
+            }
+        }
+        ProcessEvent::Error { process_id, message, plugin_name } => {
+            warn_commit_history(process_id, message);
+        }
     }
+}
+
+fn warn_commit_history(process_id: String, fallback: String) {
+    if process_id != plugin_state().commit_history_process { return; }
+    let error = red::trim(red::string(plugin_state().commit_history_error, ""));
+    if error == "" { error = fallback; }
+    red::execute(
+        "Print",
+        "Could not read recent commit history; generating from staged changes only: " + error
+    );
+    red::state_patch(GitPluginState { commit_history_output: "" });
+    finish_commit_history(process_id);
 }
 
 fn finish_commit_history(process_id: String) {
@@ -2896,22 +2959,53 @@ fn run_commit(mode: String, message: String) {
         cwd: red::string(plugin_state().root, "."),
     });
     red::state_patch(GitPluginState { commit_retry_text: message });
+    red::state_patch(GitPluginState { commit_process: process_id });
+    red::state_patch(GitPluginState { commit_error: "" });
     red::on("process:" + process_id, commit_finished);
 }
 
 fn commit_finished(event: ProcessEvent) {
-    let ProcessEvent::Exit { process_id, code, plugin_name } = event else {
-        return;
-    };
-    let exit_code = 1;
-    if let Some(value) = code {
-        exit_code = value;
+    match event {
+        ProcessEvent::Stderr { process_id, line, plugin_name } => {
+            if process_id == plugin_state().commit_process {
+                red::state_patch(GitPluginState {
+                    commit_error: plugin_state().commit_error + line + "\n",
+                });
+            }
+        }
+        ProcessEvent::Error { process_id, message, plugin_name } => {
+            fail_commit(process_id, message);
+        }
+        ProcessEvent::Exit { process_id, code, plugin_name } => {
+            if process_id != plugin_state().commit_process { return; }
+            let exit_code = 1;
+            if let Some(value) = code { exit_code = value; }
+            if exit_code == 0 {
+                let mode = red::string(plugin_state().commit_mode, "");
+                red::state_patch(GitPluginState { commit_process: "" });
+                red::state_patch(GitPluginState { commit_error: "" });
+                red::state_patch(GitPluginState { commit_retry_text: "" });
+                if mode == "amend" || mode == "--amend" {
+                    red::execute("Print", "Commit amended successfully");
+                } else {
+                    red::execute("Print", "Commit created successfully");
+                }
+                force_refresh();
+            } else {
+                fail_commit(process_id, "git commit exited with code " + exit_code);
+            }
+        }
+        ProcessEvent::Stdout { process_id, line, plugin_name } => {}
     }
-    if exit_code == 0 {
-        red::state_patch(GitPluginState { commit_retry_text: "" });
-        force_refresh();
-        return;
-    }
+}
+
+fn fail_commit(process_id: String, fallback: String) {
+    if process_id != plugin_state().commit_process { return; }
+    let error = red::trim(red::string(plugin_state().commit_error, ""));
+    if error == "" { error = fallback; }
+    red::state_patch(GitPluginState { commit_process: "" });
+    red::state_patch(GitPluginState { commit_error: "" });
+    red::execute("Print", "Git commit failed: " + error);
     red::request("GetEditorState", commit_snapshot_loaded);
 }
 
