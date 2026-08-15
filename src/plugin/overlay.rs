@@ -5,13 +5,14 @@
 //! existing ID replaces its configuration; removal is idempotent from the caller's
 //! perspective.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use serde::Deserialize;
 
 use crate::{
     editor::{render_buffer::RenderBuffer, Point},
     theme::Style,
+    ui::{spinner_frame, SPINNER_FRAME_INTERVAL_MS},
     unicode_utils::display_width,
 };
 
@@ -57,6 +58,8 @@ pub struct PluginOverlay {
     pub position: Option<Point>,
     pub width: usize,
     pub height: usize,
+    busy_since: Option<Instant>,
+    busy_frame: u64,
 }
 
 impl PluginOverlay {
@@ -71,6 +74,8 @@ impl PluginOverlay {
             position: None,
             width: 0,
             height: 0,
+            busy_since: None,
+            busy_frame: 0,
         }
     }
 
@@ -83,7 +88,11 @@ impl PluginOverlay {
         self.content.lines = lines;
         self.content.dirty = true;
 
-        // Update dimensions
+        self.update_dimensions();
+        true
+    }
+
+    fn update_dimensions(&mut self) {
         self.height = self.content.lines.len();
         self.width = self
             .content
@@ -92,6 +101,34 @@ impl PluginOverlay {
             .map(|(text, _)| display_width(text))
             .max()
             .unwrap_or(0);
+        if self.busy_since.is_some() && self.has_content() {
+            self.width = self.width.saturating_add(2);
+        }
+    }
+
+    /// Enables or disables host-driven spinner animation for this overlay.
+    pub fn set_busy(&mut self, busy: bool) -> bool {
+        if busy == self.busy_since.is_some() {
+            return false;
+        }
+        self.busy_since = busy.then(Instant::now);
+        self.busy_frame = 0;
+        self.update_dimensions();
+        self.content.dirty = true;
+        true
+    }
+
+    /// Advances the spinner when its visible frame changes.
+    pub fn poll_animation(&mut self) -> bool {
+        let Some(started) = self.busy_since else {
+            return false;
+        };
+        let frame = started.elapsed().as_millis() as u64 / SPINNER_FRAME_INTERVAL_MS;
+        if frame == self.busy_frame {
+            return false;
+        }
+        self.busy_frame = frame;
+        self.content.dirty = true;
         true
     }
 
@@ -159,9 +196,21 @@ impl PluginOverlay {
                     break;
                 }
 
-                let text_width = display_width(text);
+                let rendered = if i == 0 {
+                    self.busy_since
+                        .map(|started| {
+                            format!(
+                                "{} {text}",
+                                spinner_frame(started.elapsed().as_millis() as u64)
+                            )
+                        })
+                        .unwrap_or_else(|| text.clone())
+                } else {
+                    text.clone()
+                };
+                let text_width = display_width(&rendered);
                 let text_x = pos.x.saturating_add(self.width.saturating_sub(text_width));
-                buffer.set_text(text_x, y, text, style);
+                buffer.set_text(text_x, y, &rendered, style);
             }
         }
     }
@@ -232,6 +281,14 @@ impl OverlayManager {
         self.overlays.values().any(|o| o.is_dirty())
     }
 
+    pub fn poll_animation(&mut self) -> bool {
+        let mut changed = false;
+        for overlay in self.overlays.values_mut() {
+            changed |= overlay.poll_animation();
+        }
+        changed
+    }
+
     pub fn is_empty(&self) -> bool {
         self.overlays.is_empty()
     }
@@ -251,13 +308,15 @@ impl OverlayManager {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use crate::{
         editor::{render_buffer::RenderBuffer, Point},
         plugin::{OverlayAlignment, OverlayConfig},
         theme::Style,
     };
 
-    use super::{OverlayManager, PluginOverlay};
+    use super::{OverlayManager, PluginOverlay, SPINNER_FRAME_INTERVAL_MS};
 
     fn render_row(buffer: &RenderBuffer, y: usize) -> String {
         buffer.cells[y * buffer.width..(y + 1) * buffer.width]
@@ -381,6 +440,7 @@ mod tests {
                 },
             );
             overlay.update_content(vec![("hidden".to_string(), Style::default())]);
+            overlay.set_busy(true);
             overlays.update_positions(8, height, None);
 
             let mut buffer = RenderBuffer::new(8, height, &Style::default());
@@ -417,5 +477,30 @@ mod tests {
         let mut buffer = RenderBuffer::new(10, 6, &Style::default());
         overlays.render_all(&mut buffer);
         assert!(render_row(&buffer, 0).ends_with("first"));
+    }
+
+    #[test]
+    fn busy_overlay_reserves_spinner_width_and_advances_frames() {
+        let mut overlay = PluginOverlay::new(
+            "push".to_string(),
+            OverlayConfig {
+                align: OverlayAlignment::Top,
+                ..OverlayConfig::default()
+            },
+        );
+        overlay.update_content(vec![("Pushing".to_string(), Style::default())]);
+        assert!(overlay.set_busy(true));
+        assert_eq!(overlay.width, 9);
+
+        overlay.busy_since =
+            Some(Instant::now() - Duration::from_millis(SPINNER_FRAME_INTERVAL_MS * 2));
+        assert!(overlay.poll_animation());
+        overlay.calculate_position(20, 5, None);
+        let mut buffer = RenderBuffer::new(20, 5, &Style::default());
+        overlay.render(&mut buffer);
+
+        assert!(render_row(&buffer, 0).contains("⠹ Pushing"));
+        assert!(overlay.set_busy(false));
+        assert_eq!(overlay.width, 7);
     }
 }

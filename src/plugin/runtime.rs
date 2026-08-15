@@ -1316,6 +1316,12 @@ impl RedHost {
                     .get(2)
                     .ok_or_else(|| anyhow::anyhow!("OpenConfirm requires PickerHandlers"))
                     .and_then(|value| red_picker_handlers(plugin, value, "OpenConfirm"))?;
+                let options = args
+                    .get(3)
+                    .map(value_to_json)
+                    .map(serde_json::from_value::<crate::ui::ConfirmationOptions>)
+                    .transpose()?
+                    .unwrap_or_default();
                 let handle = self.policy_mut().allocate_picker_handle();
                 self.policy_mut().picker_handlers.insert(
                     handle,
@@ -1329,6 +1335,7 @@ impl RedHost {
                     handle,
                     title,
                     message,
+                    options,
                 });
                 return Ok(Value::Int(i64::from(handle.get())));
             }
@@ -1529,6 +1536,15 @@ impl RedHost {
                     .transpose()?
                     .unwrap_or_default();
                 self.send_request(PluginRequest::UpdateOverlay { id, lines });
+            }
+            "UpdateOverlayBusy" => {
+                let id = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("UpdateOverlayBusy requires an overlay id"))?
+                    .to_string();
+                let busy = args.get(1).and_then(Value::as_bool).unwrap_or(false);
+                self.send_request(PluginRequest::UpdateOverlayBusy { id, busy });
             }
             "RemoveOverlay" => {
                 let id = args
@@ -11053,6 +11069,344 @@ mod tests {
 
     #[cfg(not(windows))]
     #[tokio::test]
+    async fn git_push_previews_outgoing_commits_cancels_safely_and_reports_success() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let remote = tempfile::tempdir().unwrap();
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        assert!(Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .current_dir(remote.path())
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        for args in [
+            vec!["config", "user.name", "Red Tests"],
+            vec!["config", "user.email", "red@example.com"],
+            vec!["remote", "add", "origin", remote.path().to_str().unwrap()],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success());
+        }
+        fs::write(root.join("tracked.txt"), "one\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-qm", "feat: initial"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["push", "-qu", "origin", "main"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        let remote_before = Command::new("git")
+            .args(["rev-parse", "refs/heads/main"])
+            .current_dir(remote.path())
+            .output()
+            .unwrap()
+            .stdout;
+        fs::write(root.join("tracked.txt"), "one\ntwo\n").unwrap();
+        assert!(Command::new("git")
+            .args(["commit", "-qam", "feat: add second line"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+
+        let mut runtime = load_git_runtime(root).await;
+        runtime.execute_command("GitDashboard").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            let mut ahead = false;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                if let PluginRequest::UpdateWorkspace { model, .. } = request {
+                    ahead = model
+                        .header
+                        .iter()
+                        .any(|segment| segment.text.contains("↑1"));
+                }
+            }
+            if ahead {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Git status did not report one outgoing commit"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let open_push_confirmation = async |runtime: &mut Runtime| {
+            runtime
+                .notify(
+                    "workspace:event:git-dashboard",
+                    serde_json::json!({ "action": "p", "row": null }),
+                )
+                .await
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                pump_process_events(runtime).await.unwrap();
+                while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                    if let PluginRequest::OpenCallbackConfirmation {
+                        handle,
+                        title,
+                        options,
+                        ..
+                    } = request
+                    {
+                        assert_eq!(title, "Push changes");
+                        assert_eq!(options.accept_label.as_deref(), Some("Push"));
+                        assert_eq!(options.cancel_label.as_deref(), Some("Cancel"));
+                        let text = options
+                            .rows
+                            .iter()
+                            .flatten()
+                            .map(|segment| segment.text.as_str())
+                            .collect::<String>();
+                        assert!(text.contains("main  →  origin/main"));
+                        assert!(text.contains("1 outgoing commit"));
+                        assert!(text.contains("feat: add second line"));
+                        return handle;
+                    }
+                }
+                assert!(Instant::now() < deadline, "push confirmation did not open");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+
+        let cancel_handle = open_push_confirmation(&mut runtime).await;
+        runtime
+            .notify_picker(cancel_handle, PickerCallback::Cancelled)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let remote_after_cancel = Command::new("git")
+            .args(["rev-parse", "refs/heads/main"])
+            .current_dir(remote.path())
+            .output()
+            .unwrap()
+            .stdout;
+        assert_eq!(remote_after_cancel, remote_before);
+
+        let accept_handle = open_push_confirmation(&mut runtime).await;
+        let accept = serde_json::from_value(serde_json::json!({
+            "id": "accept",
+            "label": "Push",
+        }))
+        .unwrap();
+        runtime
+            .notify_picker(accept_handle, PickerCallback::Selected(accept))
+            .unwrap();
+        let mut created = false;
+        let mut busy = false;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            match request {
+                PluginRequest::CreateOverlay { id, .. } if id == "git-push-progress" => {
+                    created = true;
+                }
+                PluginRequest::UpdateOverlayBusy { id, busy: value }
+                    if id == "git-push-progress" && value =>
+                {
+                    busy = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(created && busy, "push should start with a busy overlay");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut succeeded = false;
+        while !succeeded {
+            pump_process_events(&mut runtime).await.unwrap();
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                match request {
+                    PluginRequest::UpdateOverlay { id, lines }
+                        if id == "git-push-progress"
+                            && lines
+                                .iter()
+                                .any(|(line, _)| line.contains("✓ Pushed 1 commit")) =>
+                    {
+                        succeeded = true;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(Instant::now() < deadline, "push did not report success");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let local_head = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(root)
+            .output()
+            .unwrap()
+            .stdout;
+        let remote_head = Command::new("git")
+            .args(["rev-parse", "refs/heads/main"])
+            .current_dir(remote.path())
+            .output()
+            .unwrap()
+            .stdout;
+        assert_eq!(remote_head, local_head);
+
+        assert!(Command::new("git")
+            .args(["branch", "--unset-upstream"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.join("tracked.txt"), "one\ntwo\nthree\n").unwrap();
+        assert!(Command::new("git")
+            .args(["commit", "-qam", "feat: add third line"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        runtime
+            .notify(
+                "workspace:event:git-dashboard",
+                serde_json::json!({ "action": "r", "row": null }),
+            )
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            let mut without_upstream = false;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                if let PluginRequest::UpdateWorkspace { model, .. } = request {
+                    without_upstream = !model
+                        .header
+                        .iter()
+                        .any(|segment| segment.text.contains("origin/main"));
+                }
+            }
+            if without_upstream {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Git status retained a removed upstream"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        runtime
+            .notify(
+                "workspace:event:git-dashboard",
+                serde_json::json!({ "action": "p", "row": null }),
+            )
+            .await
+            .unwrap();
+        let (remote_handle, origin_item) = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::OpenCallbackPicker {
+                handle,
+                title,
+                items,
+                ..
+            } => {
+                assert_eq!(title.as_deref(), Some("Set upstream"));
+                let origin = items
+                    .into_iter()
+                    .find(|item| item.id == "origin")
+                    .expect("origin remote choice");
+                (handle, origin)
+            }
+            _ => panic!("expected set-upstream picker"),
+        };
+        runtime
+            .notify_picker(remote_handle, PickerCallback::Selected(origin_item))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let set_upstream_handle = loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            let mut found = None;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                if let PluginRequest::OpenCallbackConfirmation {
+                    handle, options, ..
+                } = request
+                {
+                    let text = options
+                        .rows
+                        .iter()
+                        .flatten()
+                        .map(|segment| segment.text.as_str())
+                        .collect::<String>();
+                    assert!(text.contains("main  →  origin/main"));
+                    assert!(text.contains("feat: add third line"));
+                    found = Some(handle);
+                }
+            }
+            if let Some(handle) = found {
+                break handle;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "set-upstream confirmation did not open"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let accept = serde_json::from_value(serde_json::json!({
+            "id": "accept",
+            "label": "Push",
+        }))
+        .unwrap();
+        runtime
+            .notify_picker(set_upstream_handle, PickerCallback::Selected(accept))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            let mut done = false;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                if let PluginRequest::UpdateOverlay { id, lines } = request {
+                    done = id == "git-push-progress"
+                        && lines
+                            .iter()
+                            .any(|(line, _)| line.contains("✓ Pushed 1 commit"));
+                }
+            }
+            if done {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "set-upstream push did not complete"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let upstream = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(upstream.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&upstream.stdout).trim(),
+            "origin/main"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
     async fn git_generated_commit_reports_failure_retry_and_success() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -12875,6 +13229,7 @@ mod tests {
                 title,
                 message,
                 owner,
+                options,
             } => {
                 assert_eq!(owner, "neotree");
                 assert_eq!(title, "Confirm delete");
@@ -12882,6 +13237,8 @@ mod tests {
                     message,
                     "Permanently delete selected items. This cannot be undone."
                 );
+                assert!(options.rows.is_empty());
+                assert!(options.accept_label.is_none());
                 handle
             }
             _ => panic!("expected Neo-tree delete confirmation"),

@@ -1450,6 +1450,7 @@ pub enum PluginRequest {
         handle: PickerHandle,
         title: String,
         message: String,
+        options: crate::ui::ConfirmationOptions,
     },
     UpdatePickerItems {
         id: i32,
@@ -1618,6 +1619,10 @@ pub enum PluginRequest {
     UpdateOverlay {
         id: String,
         lines: Vec<(String, Style)>,
+    },
+    UpdateOverlayBusy {
+        id: String,
+        busy: bool,
     },
     RemoveOverlay {
         id: String,
@@ -1820,6 +1825,7 @@ impl PluginRequest {
             Self::DocumentUndo { .. } => "DocumentUndo",
             Self::CreateOverlay { .. } => "CreateOverlay",
             Self::UpdateOverlay { .. } => "UpdateOverlay",
+            Self::UpdateOverlayBusy { .. } => "UpdateOverlayBusy",
             Self::RemoveOverlay { .. } => "RemoveOverlay",
             Self::CreatePanel { .. } => "CreatePanel",
             Self::UpdatePanel { .. } => "UpdatePanel",
@@ -7747,11 +7753,13 @@ impl Editor {
             self.keymap_hints_visible = true;
         }
         let panel_animation_changed = self.panel_manager.poll_animation();
+        let overlay_animation_changed = self.overlay_manager.poll_animation();
         if completion_changed
             || startup_release_changed
             || dialog_changed
             || keymap_hints_changed
             || panel_animation_changed
+            || overlay_animation_changed
         {
             self.render(buffer)?;
             if startup_release_changed {
@@ -8186,6 +8194,7 @@ impl Editor {
                     handle,
                     title,
                     message,
+                    options,
                 } => {
                     if runtime.picker_plugin(handle).as_deref() != Some(owner.as_str()) {
                         runtime.release_picker(handle);
@@ -8197,8 +8206,8 @@ impl Editor {
                         continue;
                     }
                     self.release_current_dialog_callbacks(runtime);
-                    self.current_dialog = Some(Box::new(Confirmation::new_callback(
-                        self, title, message, handle,
+                    self.current_dialog = Some(Box::new(Confirmation::new_callback_with_options(
+                        self, title, message, handle, options,
                     )));
                     needs_render = true;
                 }
@@ -8901,6 +8910,13 @@ impl Editor {
                 PluginRequest::UpdateOverlay { id, lines } => {
                     if let Some(overlay) = self.overlay_manager.get_overlay_mut(&id) {
                         if overlay.update_content(lines) {
+                            needs_render = true;
+                        }
+                    }
+                }
+                PluginRequest::UpdateOverlayBusy { id, busy } => {
+                    if let Some(overlay) = self.overlay_manager.get_overlay_mut(&id) {
+                        if overlay.set_busy(busy) {
                             needs_render = true;
                         }
                     }

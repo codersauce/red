@@ -84,14 +84,27 @@ item identities.
 compact, single-line input used by LSP rename. It submits through
 `ComposerHandlers.submitted` and cancels through `ComposerHandlers.cancelled`.
 
-`OpenConfirm(title: String, message: String, handlers: PickerHandlers)` opens a compact
-Accept/Cancel dialog. Cancel is selected by default; Left or `y` selects Accept, Right or
-`n` selects Cancel, Enter confirms the selection, and Escape cancels. Accept invokes
-`PickerHandlers.selected` with an item whose `id` is `accept`; cancellation invokes
-`PickerHandlers.cancelled`.
+`OpenConfirm(title: String, message: String, handlers: PickerHandlers, options?: Json)`
+opens a compact Accept/Cancel dialog. Cancel is selected by default; Left or `y` selects
+Accept, Right or `n` selects Cancel, Enter confirms the selection, and Escape cancels.
+Accept invokes `PickerHandlers.selected` with an item whose `id` is `accept`;
+cancellation invokes `PickerHandlers.cancelled`.
 
 Both calls were introduced in host API `0.4.0`, and their callback handles remain owned
 and released by the calling plugin.
+
+## Rich confirmations and busy overlays
+
+The optional `OpenConfirm` options object accepts `accept_label`, `cancel_label`, and
+`rows`. Each row is an array of `{ text, style }` segments, allowing a plugin to present
+bounded, theme-aware details while retaining the host dialog's safe default and input
+behavior. Calls without options keep the original compact presentation.
+
+`UpdateOverlayBusy(id: String, busy: bool)` adds host-driven spinner animation before
+the first visible line of an existing overlay. The host owns frame timing and redraws;
+plugins only toggle busy state and replace the overlay content when work completes.
+
+These additions were introduced in host API `0.9.0`.
 
 ## Declarative plugin authoring
 
