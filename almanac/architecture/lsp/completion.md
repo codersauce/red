@@ -6,6 +6,9 @@ sources:
   - id: completion-ui
     type: file
     path: src/ui/completion.rs
+  - id: completion-icons
+    type: file
+    path: src/ui/icons.rs
   - id: editor
     type: file
     path: src/editor.rs
@@ -37,7 +40,7 @@ The active-session snapshot can advance during ordinary typed characters and bac
 
 `CompletionUI` stores all response items, the filtered item indexes, selected row, scroll offset, visible bounds, commit characters, and theme-derived styles [@completion-ui]. Showing the menu collects unique commit characters from all items, sorts items by `preselect`, `sortText` or label, and then label, chooses the first preselected item when present, clamps width and row count to terminal bounds, and positions the popup above the cursor when there is not enough room below [@completion-ui]. The renderer derives a display label by trimming leading whitespace and bullet glyphs from the item label while keeping the original completion item as the insertion payload, so server-provided presentation markers do not shift the label column or change the accepted edit [@completion-ui]. The fixture response shows the kind of server payload this path handles: incomplete lists with labels, kinds, sort and filter text, preselected items, text edits, and additional text edits [@completion-fixture].
 
-Filtering scores prefix matches ahead of contains matches against `filterText` when present, otherwise against the label; `sortText` and `insertText` do not make an item match a typed prefix [@completion-ui]. Refiltering resets selection and scroll to the top of the filtered list, recomputes the visible height from the current match count, and leaves zero-match popups non-rendering but still active until a key action closes them [@completion-ui]. The UI renders labels, details, documentation previews, icons, selected-row styling, and scroll indicators on the border rows, but it does not mutate a buffer itself [@completion-ui].
+Filtering scores prefix matches ahead of contains matches against `filterText` when present, otherwise against the label; `sortText` and `insertText` do not make an item match a typed prefix [@completion-ui]. Refiltering resets selection and scroll to the top of the filtered list, recomputes the visible height from the current match count, and leaves zero-match popups non-rendering but still active until a key action closes them [@completion-ui]. The UI renders labels, details, documentation previews, icons, selected-row styling, and scroll indicators on the border rows, but it does not mutate a buffer itself [@completion-ui]. Completion kind icons come from `IconCatalog::completion`, and its tests require every LSP completion-kind glyph to occupy exactly one terminal column because `CompletionUI` renders each row with a fixed icon cell before the aligned label [@completion-icons] [@completion-ui].
 
 Completion key handling preserves modal editing behavior when filtering removes every visible candidate. `Enter` applies the selected item and closes the dialog when a match is selected, but with no selected item it closes the dialog and inserts a newline in the same action [@completion-ui]. `Esc` always closes the completion dialog and enters Normal mode in one action, whether candidates are visible or filtered to zero [@completion-ui]. Tests cover both the Python call newline regression and the invisible completion `Esc` regression through editor-level event handling [@editor].
 
