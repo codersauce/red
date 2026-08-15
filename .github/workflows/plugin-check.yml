@@ -2,6 +2,7 @@ name: Husk Plugin Check
 
 on:
   push:
+    branches: [main, develop]
     paths:
       - '.github/workflows/plugin-check.yml'
       - 'Cargo.lock'
@@ -27,6 +28,10 @@ on:
       - 'src/config.rs'
       - 'src/plugin/**'
       - 'src/self_check.rs'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   bundled-plugins:

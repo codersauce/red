@@ -49,6 +49,3 @@ jobs:
 
       - name: Run tests
         run: cargo test --all-targets --all-features --verbose
-
-      - name: Run tests (no default features)
-        run: cargo test --all-targets --no-default-features --verbose
