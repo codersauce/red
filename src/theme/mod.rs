@@ -154,6 +154,17 @@ impl Theme {
         style
     }
 
+    pub(crate) fn inline_comment_arrow_style(&self) -> Style {
+        let mut style = self.inline_comment_style();
+        let background = self.style.bg.unwrap_or_default();
+        style.fg = style
+            .fg
+            .map(|foreground| ensure_minimum_contrast(foreground, background, 4.5));
+        style.bg = self.style.bg;
+        style.italic = false;
+        style
+    }
+
     pub(crate) fn current_line_number_style(&self) -> Style {
         let mut style = self.gutter_style.fallback_bg(&self.style);
         style.fg = self

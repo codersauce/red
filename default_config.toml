@@ -437,6 +437,8 @@ Esc = { EnterMode = "Normal" }
 "~" = [ { TransformSelection = "Toggle" }, { EnterMode = "Normal" } ]
 
 [keys.visual." "]
+"C" = "AddSampleInlineComment"
+"X" = [ "ClearInlineComments", { EnterMode = "Normal" } ]
 "A" = { PluginCommand = "Agent" }
 "i" = "InlineAssist"
 "h" = { "s" = { PluginCommand = "GitHunkStage" }, "u" = { PluginCommand = "GitHunkUnstage" }, "r" = { PluginCommand = "GitHunkReset" } }

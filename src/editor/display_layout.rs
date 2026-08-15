@@ -217,6 +217,8 @@ pub struct InlineCommentRow {
     pub line: usize,
     pub row: usize,
     pub content: InlineCommentContent,
+    /// The first text row is where the gutter rail joins the comment box.
+    pub starts_connection: bool,
     pub block_width: usize,
     pub text_offset: usize,
 }
@@ -277,11 +279,18 @@ impl DisplayLayout {
                     // Always leave room for the source line itself.
                     let block =
                         inline_comment_block(message, width, height.saturating_sub(row + 1));
+                    let mut waiting_for_text = true;
                     for content in block.rows {
+                        let starts_connection =
+                            waiting_for_text && matches!(content, InlineCommentContent::Text(_));
+                        if starts_connection {
+                            waiting_for_text = false;
+                        }
                         layout.inline_comments.push(InlineCommentRow {
                             line: segment.line,
                             row,
                             content,
+                            starts_connection,
                             block_width: block.width,
                             text_offset: block.text_offset,
                         });

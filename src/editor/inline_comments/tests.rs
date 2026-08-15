@@ -162,7 +162,7 @@ fn inline_comment_rendering_is_not_a_text_edit() {
             .take(x)
             .filter(|ch| !ch.is_whitespace())
             .collect::<String>(),
-        "┆"
+        "╭───"
     );
     let comment_style = editor.theme.inline_comment_style();
     assert_ne!(comment_style.bg, editor.theme.style.bg);
@@ -274,9 +274,19 @@ fn inline_comment_surfaces_and_faded_guides_follow_dark_and_light_themes() {
             assert!(cells[gutter_width + comment.block_width..]
                 .iter()
                 .all(|cell| cell.style.bg == Some(background)));
-            assert_eq!(cells[gutter_width - 2].text, "┆");
-            assert_eq!(cells[gutter_width - 2].style, guide);
-            assert!(cells[..gutter_width - 2].iter().all(|cell| cell.c == ' '));
+            let guide_x = gutter_width - editor.inline_comment_lane_width(&window);
+            let expected = if comment.starts_connection {
+                "╭"
+            } else if comment.content == InlineCommentContent::TopEdge {
+                " "
+            } else {
+                "┆"
+            };
+            assert_eq!(cells[guide_x].text, expected);
+            if expected != " " {
+                assert_eq!(cells[guide_x].style, guide);
+            }
+            assert!(cells[..guide_x].iter().all(|cell| cell.c == ' '));
         }
     }
 }
@@ -295,7 +305,17 @@ fn inline_comment_half_height_edges_fall_back_to_solid_padding_in_ascii_mode() {
     for comment in &layout.inline_comments {
         let y = editor.window_to_terminal_y(&window, comment.row);
         let cells = &frame.cells[y * 40..(y + 1) * 40];
-        assert_eq!(cells[x - 2].c, ':');
+        let expected = if comment.starts_connection {
+            '+'
+        } else if comment.content == InlineCommentContent::TopEdge {
+            ' '
+        } else {
+            ':'
+        };
+        assert_eq!(
+            cells[x - editor.inline_comment_lane_width(&window)].c,
+            expected
+        );
         assert!(cells[x..x + comment.block_width]
             .iter()
             .all(|cell| cell.style.bg == editor.theme.inline_comment_style().bg));

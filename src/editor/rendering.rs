@@ -47,6 +47,7 @@ use crate::{
 use super::{
     adjust_color_brightness, diagnostic_foreground, diagnostic_priority,
     display_layout::{DisplayLayout, InlineCommentContent},
+    inline_comments::InlineCommentConnector,
     render_buffer::Change,
     Editor, Mode, Point, Rect, RenderBuffer, StatuslineGitChanges, StyleCursor,
     GUTTER_SIGN_COLUMN_WIDTH, MAX_HIGHLIGHT_SLICE_BYTES,
@@ -1457,19 +1458,29 @@ impl Editor {
         line_count: usize,
         row: usize,
     ) {
-        if layout.inline_comment_row(row).is_some() {
+        let lane_width = self.inline_comment_lane_width(window);
+        let lane_x =
+            window.position.x + self.gutter_width_for_buffer_index(window.buffer_index) + 1;
+        let term_y = self.window_to_terminal_y(window, row);
+        if let Some(comment) = layout.inline_comment_row(row) {
             let style = &self.theme.style;
-            let term_y = self.window_to_terminal_y(window, row);
             let width = self.gutter_width_for_window(window) + 1;
             buffer.fill_rect(window.position.x, term_y, width, 1, ' ', style, &self.theme);
-            if width > 1 {
-                let guide = if self.config.window_borders_ascii {
+            if lane_width > 0 && comment.content != InlineCommentContent::TopEdge {
+                let guide = if comment.starts_connection {
+                    match (self.config.window_borders_ascii, lane_width >= 4) {
+                        (false, true) => "╭───",
+                        (false, false) => "╭─",
+                        (true, true) => "+---",
+                        (true, false) => "+-",
+                    }
+                } else if self.config.window_borders_ascii {
                     ":"
                 } else {
                     "┆"
                 };
                 buffer.set_text(
-                    window.position.x + width - 2,
+                    lane_x,
                     term_y,
                     guide,
                     &self.theme.inline_comment_guide_style(),
@@ -1507,7 +1518,6 @@ impl Editor {
             .unwrap_or_else(|| " ".repeat(number_width + 1));
         let text = format!("{}{number_text}", " ".repeat(GUTTER_SIGN_COLUMN_WIDTH));
         let term_x = window.position.x;
-        let term_y = self.window_to_terminal_y(window, row);
         buffer.set_text(term_x, term_y, &text, &gutter_style);
         if is_cursor_line {
             buffer.set_text(
@@ -1516,6 +1526,24 @@ impl Editor {
                 &number_text,
                 &self.theme.current_line_number_style(),
             );
+        }
+
+        if lane_width > 0 {
+            buffer.fill_rect(
+                lane_x,
+                term_y,
+                lane_width,
+                1,
+                ' ',
+                &self.theme.style,
+                &self.theme,
+            );
+            if let Some(connector) = layout
+                .row(row)
+                .and_then(|segment| self.inline_comment_connector_for_segment(window, segment))
+            {
+                self.render_inline_comment_connector(buffer, lane_x, term_y, lane_width, connector);
+            }
         }
 
         let Some(segment) = segment else {
@@ -1533,6 +1561,43 @@ impl Editor {
             &sign.text,
             &sign.style.fallback_bg(&gutter_style),
         );
+    }
+
+    fn render_inline_comment_connector(
+        &self,
+        buffer: &mut RenderBuffer,
+        x: usize,
+        y: usize,
+        lane_width: usize,
+        connector: InlineCommentConnector,
+    ) {
+        use InlineCommentConnector::{End, Middle, Single, Start};
+
+        let ascii = self.config.window_borders_ascii;
+        let full = lane_width >= 4;
+        let text = match (ascii, full, connector) {
+            (false, true, Single) => "╰─›",
+            (false, true, Start) => "├─›",
+            (false, true, End) => "╰──",
+            (false, _, Middle) => "│",
+            (false, false, Single | Start) => "›",
+            (false, false, End) => "╰",
+            (true, true, Single) => "`->",
+            (true, true, Start) => "+->",
+            (true, true, End) => "`--",
+            (true, _, Middle) => "|",
+            (true, false, Single | Start) => ">",
+            (true, false, End) => "`",
+        };
+        buffer.set_text(x, y, text, &self.theme.inline_comment_guide_style());
+        if matches!(connector, Single | Start) {
+            buffer.set_text(
+                x + if full { 2 } else { 0 },
+                y,
+                if ascii { ">" } else { "›" },
+                &self.theme.inline_comment_arrow_style(),
+            );
+        }
     }
 
     fn render_main_content_rows_in_window(
@@ -3487,7 +3552,17 @@ mod tests {
             assert!(cells[content_start + comment.block_width..]
                 .iter()
                 .all(|cell| cell.style.bg == editor.theme.style.bg));
-            assert_eq!(cells[content_start - 2].text, "┆");
+            let expected = if comment.starts_connection {
+                "╭"
+            } else if comment.content == InlineCommentContent::TopEdge {
+                " "
+            } else {
+                "┆"
+            };
+            assert_eq!(
+                cells[content_start - editor.inline_comment_lane_width(&window)].text,
+                expected
+            );
         }
     }
 

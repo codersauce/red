@@ -2098,7 +2098,7 @@ pub enum Action {
     RestoreLastVisualSelection,
     /// Opens a bounded inline edit for the current line or visual selection.
     InlineAssist,
-    /// Adds a temporary sample annotation above the current source line.
+    /// Adds a temporary sample annotation for the current line or visual range.
     AddSampleInlineComment,
     /// Clears the current buffer's temporary inline annotations.
     ClearInlineComments,
@@ -5683,31 +5683,33 @@ impl Editor {
     }
 
     fn gutter_width(&self) -> usize {
-        GUTTER_SIGN_COLUMN_WIDTH
-            + self
-                .current_buffer()
-                .len()
-                .saturating_add(1)
-                .to_string()
-                .len()
+        let buffer_index = self.buffer_manager.active_index();
+        let window_width = self
+            .window_manager
+            .active_window()
+            .map_or(self.vwidth(), |window| window.inner_width());
+        self.gutter_width_for_buffer_index(buffer_index)
+            + self.inline_comment_lane_width_for_buffer(buffer_index, window_width)
     }
 
+    /// Sign and line-number columns, excluding the annotation lane and separator.
     fn gutter_width_for_buffer_index(&self, buffer_index: usize) -> usize {
         self.buffer_manager
             .get(buffer_index)
             .map(|buffer| {
                 GUTTER_SIGN_COLUMN_WIDTH + buffer.len().saturating_add(1).to_string().len()
             })
-            .unwrap_or_else(|| self.gutter_width())
+            .unwrap_or(GUTTER_SIGN_COLUMN_WIDTH)
     }
 
     fn line_number_width_for_window(&self, window: &crate::window::Window) -> usize {
-        self.gutter_width_for_window(window)
+        self.gutter_width_for_buffer_index(window.buffer_index)
             .saturating_sub(GUTTER_SIGN_COLUMN_WIDTH)
     }
 
     fn gutter_width_for_window(&self, window: &crate::window::Window) -> usize {
         self.gutter_width_for_buffer_index(window.buffer_index)
+            + self.inline_comment_lane_width(window)
     }
 
     pub fn highlight(&mut self, file: Option<&str>, code: &str) -> anyhow::Result<Vec<StyleInfo>> {
@@ -16195,10 +16197,24 @@ impl Editor {
             }
             Action::AddSampleInlineComment => {
                 add_to_history = false;
-                if self.is_normal() {
+                if matches!(self.mode, Mode::Normal | Mode::Visual | Mode::VisualLine) {
+                    let (start_line, end_line) = self.inline_comment_target_lines();
+                    let was_visual = self.is_visual();
                     self.add_sample_inline_comment();
-                    self.last_error =
-                        Some("sample comment · Space C replace · Space X clear".to_string());
+                    if was_visual {
+                        self.execute(&Action::EnterMode(Mode::Normal), buffer, runtime)
+                            .await?;
+                        self.move_to_text_position(TextPosition::new(start_line, 0));
+                        self.refresh_cursor_goal();
+                    }
+                    let scope = if start_line == end_line {
+                        format!("line {}", start_line + 1)
+                    } else {
+                        format!("lines {}–{}", start_line + 1, end_line + 1)
+                    };
+                    self.last_error = Some(format!(
+                        "sample comment · {scope} · Space C replace · Space X clear"
+                    ));
                     self.render(buffer)?;
                 }
             }
@@ -21456,8 +21472,7 @@ impl Editor {
                             {
                                 let local_y = local_y - self.window_content_top(&window);
                                 // Adjust for the clicked window's gutter, not the active buffer's.
-                                let gutter_width =
-                                    self.gutter_width_for_buffer_index(window_buffer_index);
+                                let gutter_width = self.gutter_width_for_window(&window);
                                 let content_x = local_x.saturating_sub(gutter_width + 1);
                                 let layout = self.layout_for_window(&window);
                                 let (buffer_x, buffer_y) = if let Some(segment) =
@@ -21829,14 +21844,21 @@ impl Editor {
             if comment.anchor.buffer_id != buffer_id {
                 return true;
             }
-            // This UI prototype drops comments whose anchor is replaced.
+            // This UI prototype drops comments whose range endpoints are replaced.
             if edit.start_char < edit.end_char
-                && (edit.start_char..edit.end_char).contains(&comment.anchor.char_index)
+                && ((edit.start_char..edit.end_char).contains(&comment.anchor.char_index)
+                    || (edit.start_char..edit.end_char).contains(&comment.end_anchor.char_index))
             {
                 return false;
             }
             Self::transform_anchor_for_edit(
                 &mut comment.anchor,
+                edit.start_char,
+                edit.end_char,
+                edit.new_char_len,
+            );
+            Self::transform_anchor_for_edit(
+                &mut comment.end_anchor,
                 edit.start_char,
                 edit.end_char,
                 edit.new_char_len,
