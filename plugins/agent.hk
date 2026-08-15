@@ -36,6 +36,15 @@ struct AgentPanelEvent {
     text: String,
 }
 
+struct RestoredPane {
+    id: String,
+    visible: bool,
+}
+
+struct RestoredPanesEvent {
+    panels: [RestoredPane],
+}
+
 struct AgentTranscriptEvent {
     transcript: String,
 }
@@ -402,6 +411,20 @@ fn ensure_conversation_panel() {
     if !state().panel_open {
         red::execute("SetPanelVisible", "agent-conversation", true);
         red::state_patch(AgentState { panel_open: true });
+    }
+}
+
+#[red::on("editor:panes_restore")]
+fn restore_conversation_pane(event: RestoredPanesEvent) {
+    for pane in event.panels {
+        if pane.id == "agent-conversation" && red::bool(pane.visible, false) {
+            let was_created = state().panel_created;
+            ensure_conversation_panel();
+            if !was_created {
+                render_conversation();
+            }
+            return;
+        }
     }
 }
 

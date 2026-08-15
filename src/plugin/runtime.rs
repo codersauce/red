@@ -8704,6 +8704,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundled_agent_plugin_recreates_only_a_visible_restored_pane() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("agent", include_str!("../../plugins/agent.hk"))
+            .await
+            .unwrap();
+
+        runtime
+            .notify(
+                "editor:panes_restore",
+                serde_json::json!({
+                    "panels": [{ "id": "agent-conversation", "visible": false }]
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+
+        runtime
+            .notify(
+                "editor:panes_restore",
+                serde_json::json!({
+                    "panels": [{ "id": "agent-conversation", "visible": true }]
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::CreateTextPanel { id, .. } if id == "agent-conversation"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdateTextPanel { id, .. } if id == "agent-conversation"
+        ));
+    }
+
+    #[tokio::test]
     async fn bundled_agent_plugin_restores_a_truncated_leading_response_as_markdown() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
@@ -10307,6 +10347,70 @@ mod tests {
         assert!(!runtime
             .notify_picker(handle, PickerCallback::Query("stale".to_string()))
             .unwrap());
+        assert!(ACTION_DISPATCHER.try_recv_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn project_search_recreates_a_restored_export_without_stealing_focus() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "project_search",
+                include_str!("../../plugins/project_search.hk"),
+            )
+            .await
+            .unwrap();
+
+        runtime
+            .notify(
+                "editor:panes_restore",
+                serde_json::json!({
+                    "panels": [{ "id": "project-search-results", "visible": true }]
+                }),
+            )
+            .await
+            .unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetPluginStorage {
+                plugin,
+                key,
+                request_id,
+            } => {
+                assert_eq!(plugin, "project_search");
+                assert_eq!(key, "exported_panel");
+                request_id
+            }
+            _ => panic!("expected exported-panel storage request"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "value": {
+                        "items": [],
+                        "query": "needle",
+                        "hidden": false,
+                        "ignored": false,
+                        "follow": false,
+                        "regex": true,
+                        "preview": true,
+                        "truncated": false
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::CreatePanel { id, .. } if id == "project-search-results"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePanel { id, .. } if id == "project-search-results"
+        ));
         assert!(ACTION_DISPATCHER.try_recv_request().is_none());
     }
 
@@ -12818,7 +12922,7 @@ mod tests {
         drain_requests();
 
         let snapshot = serde_json::json!({
-            "version": 1,
+            "version": 2,
             "cwd": "/tmp/project",
             "saved_at": 1,
             "buffers": [
@@ -12849,6 +12953,16 @@ mod tests {
                     "cy": 0,
                     "vx": 0,
                 }
+            },
+            "panels": {
+                "panels": [{
+                    "id": "agent-conversation",
+                    "kind": "text",
+                    "visible": true,
+                    "z_index": 0,
+                    "side": "right"
+                }],
+                "focused": "agent-conversation"
             }
         });
         let mut runtime = Runtime::new();
@@ -12926,6 +13040,7 @@ mod tests {
             } => {
                 assert!(request_id.get() > 0);
                 assert_eq!(snapshot.buffers.len(), 2);
+                assert_eq!(snapshot.panels.panels.len(), 1);
             }
             _ => panic!("unexpected plugin request"),
         }
@@ -12939,6 +13054,7 @@ mod tests {
                 assert_eq!(key, "latest");
                 assert_eq!(value["buffers"].as_array().unwrap().len(), 1);
                 assert_eq!(value["buffers"][0]["path"], "src/main.rs");
+                assert_eq!(value["panels"]["panels"][0]["id"], "agent-conversation");
             }
             _ => panic!("unexpected plugin request"),
         }
@@ -13185,6 +13301,61 @@ mod tests {
             PluginRequest::FocusEditor => {}
             _ => panic!("unexpected plugin request"),
         }
+    }
+
+    #[tokio::test]
+    async fn neotree_recreates_a_restored_pane_without_stealing_focus() {
+        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("neotree", include_str!("../../plugins/neotree.hk"))
+            .await
+            .unwrap();
+
+        runtime
+            .notify(
+                "editor:panes_restore",
+                serde_json::json!({
+                    "panels": [{ "id": "neotree", "visible": true }]
+                }),
+            )
+            .await
+            .unwrap();
+        let request_id = match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetPluginStorage {
+                plugin,
+                key,
+                request_id,
+            } => {
+                assert_eq!(plugin, "neotree");
+                assert_eq!(key, "pane_session");
+                request_id
+            }
+            _ => panic!("expected Neo-tree storage request"),
+        };
+        runtime
+            .resolve_request(
+                request_id,
+                serde_json::json!({
+                    "value": { "expanded": [".", "src"], "selected": [] }
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::CreatePanel { id, .. } if id == "neotree"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::UpdatePanel { id, .. } if id == "neotree"
+        ));
+        assert!(matches!(
+            ACTION_DISPATCHER.recv_request(),
+            PluginRequest::GetConfig { .. }
+        ));
     }
 
     #[tokio::test]

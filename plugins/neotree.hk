@@ -30,6 +30,24 @@ struct NeoTreePanelEvent {
     row: Option<TreePanelRow>,
 }
 
+struct RestoredPane {
+    id: String,
+    visible: bool,
+}
+
+struct RestoredPanesEvent {
+    panels: [RestoredPane],
+}
+
+struct NeoTreeStoredSession {
+    expanded: [String],
+    selected: [String],
+}
+
+struct NeoTreeStoredSessionEvent {
+    value: Option<NeoTreeStoredSession>,
+}
+
 struct DirectoryEntry {
     name: String,
     path: String,
@@ -219,6 +237,10 @@ fn neotree() {
 }
 
 fn show() {
+    show_panel(true);
+}
+
+fn show_panel(focus: bool) {
     red::state_patch(NeoTreeState { created: true });
     red::execute("CreatePanel", "neotree", PanelConfig {
         side: "left",
@@ -233,12 +255,32 @@ fn show() {
         },
     });
     red::execute("UpdatePanel", "neotree", loading_rows());
-    red::execute("FocusPanel", "neotree");
+    if focus {
+        red::execute("FocusPanel", "neotree");
+    }
 
     red::request("GetConfig", cwd_loaded, "cwd");
     red::request("GetWindows", windows_loaded);
     request_directory(".");
     request_git_status();
+}
+
+#[red::on("editor:panes_restore")]
+fn restore_neotree_pane(event: RestoredPanesEvent) {
+    for pane in event.panels {
+        if pane.id == "neotree" && red::bool(pane.visible, false) {
+            red::request("GetStorage", neotree_session_loaded, "pane_session");
+            return;
+        }
+    }
+}
+
+fn neotree_session_loaded(event: NeoTreeStoredSessionEvent) {
+    if let Some(saved) = event.value {
+        red::state_patch(NeoTreeState { expanded: saved.expanded });
+        red::state_patch(NeoTreeState { selected: saved.selected });
+    }
+    show_panel(false);
 }
 
 fn close() {
@@ -258,6 +300,14 @@ fn close() {
 #[red::lifecycle("deactivate")]
 fn deactivate() {
     close();
+}
+
+#[red::lifecycle("before_exit")]
+fn before_exit(snapshot: Json) {
+    red::execute("SetStorage", "pane_session", NeoTreeStoredSession {
+        expanded: state().expanded,
+        selected: state().selected,
+    });
 }
 
 #[red::on("panel:event:neotree")]

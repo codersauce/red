@@ -35,6 +35,30 @@ struct ProjectSearchPanelEvent {
     row: ProjectSearchPanelRow,
 }
 
+struct RestoredPane {
+    id: String,
+    visible: bool,
+}
+
+struct RestoredPanesEvent {
+    panels: [RestoredPane],
+}
+
+struct ProjectSearchStoredPanel {
+    items: [ProjectSearchItem],
+    query: String,
+    hidden: bool,
+    ignored: bool,
+    follow: bool,
+    regex: bool,
+    preview: bool,
+    truncated: bool,
+}
+
+struct ProjectSearchStoredPanelEvent {
+    value: Option<ProjectSearchStoredPanel>,
+}
+
 struct ProjectSearchItem {
     id: String,
     label: String,
@@ -70,6 +94,7 @@ struct ProjectSearchState {
     regex: bool,
     preview: bool,
     truncated: bool,
+    panel_open: bool,
 }
 
 #[red::state]
@@ -96,6 +121,7 @@ fn initial_state() -> ProjectSearchState {
         regex: true,
         preview: true,
         truncated: false,
+        panel_open: false,
     };
 }
 
@@ -571,6 +597,10 @@ fn rebuild_items() {
 }
 
 fn export_results() {
+    export_results_panel(true);
+}
+
+fn export_results_panel(focus: bool) {
     let rows = [];
     for item in state().items {
         rows = red::push(rows, PanelRow {
@@ -593,13 +623,42 @@ fn export_results() {
         title: "Project Search Results",
     });
     red::execute("UpdatePanel", "project-search-results", rows);
-    red::execute("FocusPanel", "project-search-results");
+    red::state_patch(ProjectSearchState { panel_open: true });
+    if focus {
+        red::execute("FocusPanel", "project-search-results");
+    }
+}
+
+#[red::on("editor:panes_restore")]
+fn restore_project_search_pane(event: RestoredPanesEvent) {
+    for pane in event.panels {
+        if pane.id == "project-search-results" && red::bool(pane.visible, false) {
+            red::request("GetStorage", project_search_panel_loaded, "exported_panel");
+            return;
+        }
+    }
+}
+
+fn project_search_panel_loaded(event: ProjectSearchStoredPanelEvent) {
+    let Some(saved) = event.value else {
+        return;
+    };
+    red::state_patch(ProjectSearchState { items: saved.items });
+    red::state_patch(ProjectSearchState { query: saved.query });
+    red::state_patch(ProjectSearchState { hidden: saved.hidden });
+    red::state_patch(ProjectSearchState { ignored: saved.ignored });
+    red::state_patch(ProjectSearchState { follow: saved.follow });
+    red::state_patch(ProjectSearchState { regex: saved.regex });
+    red::state_patch(ProjectSearchState { preview: saved.preview });
+    red::state_patch(ProjectSearchState { truncated: saved.truncated });
+    export_results_panel(false);
 }
 
 #[red::on("panel:event:project-search-results")]
 fn export_panel_event(event: ProjectSearchPanelEvent) {
     if event.action == "close" {
         red::execute("ClosePanel", "project-search-results");
+        red::state_patch(ProjectSearchState { panel_open: false });
         return;
     }
     if event.action != "activate" || event.row == red::null() {
@@ -633,4 +692,22 @@ fn deactivate() {
     cancel_process();
     cancel_timers();
     red::execute("ClosePanel", "project-search-results");
+}
+
+#[red::lifecycle("before_exit")]
+fn before_exit(snapshot: Json) {
+    if !state().panel_open {
+        red::execute("SetStorage", "exported_panel", red::null());
+        return;
+    }
+    red::execute("SetStorage", "exported_panel", ProjectSearchStoredPanel {
+        items: state().items,
+        query: state().query,
+        hidden: state().hidden,
+        ignored: state().ignored,
+        follow: state().follow,
+        regex: state().regex,
+        preview: state().preview,
+        truncated: state().truncated,
+    });
 }

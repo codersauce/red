@@ -44,6 +44,76 @@ pub enum PanelSide {
     Bottom,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PanelSnapshotKind {
+    Row,
+    Text,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextPanelSnapshotFocus {
+    #[default]
+    Scrollback,
+    Composer,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextPanelComposerSnapshot {
+    pub text: String,
+    pub cursor: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextPanelSessionSnapshot {
+    #[serde(default)]
+    pub follow_tail: bool,
+    #[serde(default)]
+    pub scroll_anchor: Option<usize>,
+    #[serde(default)]
+    pub cursor: usize,
+    #[serde(default)]
+    pub focus: TextPanelSnapshotFocus,
+    #[serde(default)]
+    pub composer: Option<TextPanelComposerSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PanelSessionSnapshot {
+    pub id: String,
+    pub kind: PanelSnapshotKind,
+    #[serde(default)]
+    pub visible: bool,
+    #[serde(default)]
+    pub z_index: Option<usize>,
+    pub side: PanelSide,
+    #[serde(default)]
+    pub vertical_size: Option<usize>,
+    #[serde(default)]
+    pub horizontal_size: Option<usize>,
+    #[serde(default)]
+    pub selected_row_id: Option<String>,
+    #[serde(default)]
+    pub row_scroll: usize,
+    #[serde(default)]
+    pub text: Option<TextPanelSessionSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PanelManagerSnapshot {
+    #[serde(default)]
+    pub panels: Vec<PanelSessionSnapshot>,
+    #[serde(default)]
+    pub focused: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPanelRestore {
+    snapshot: PanelSessionSnapshot,
+    shell_applied: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PanelConfig {
@@ -1663,9 +1733,259 @@ pub struct PanelManager {
     z_order: Vec<String>,
     focused: Option<String>,
     animation_state: Vec<(String, u8, u64)>,
+    pending_restore: HashMap<String, PendingPanelRestore>,
+    pending_focused: Option<String>,
 }
 
 impl PanelManager {
+    /// Captures durable, plugin-independent pane state by stable resource ID.
+    pub fn snapshot(&self, terminal_width: usize) -> PanelManagerSnapshot {
+        let panels = self
+            .panel_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let config = self.panel_config(&id)?;
+                let visible = self.z_order.iter().position(|candidate| candidate == &id);
+                let sizes = self.preferred_sizes.get(&id).copied().unwrap_or_default();
+                let vertical_size = sizes.vertical.preferred.or_else(|| {
+                    matches!(config.side, PanelSide::Left | PanelSide::Right)
+                        .then_some(config.width)
+                });
+                let horizontal_size = sizes.horizontal.preferred.or_else(|| {
+                    matches!(config.side, PanelSide::Top | PanelSide::Bottom)
+                        .then_some(config.width)
+                });
+
+                if let Some(panel) = self.panels.get(&id) {
+                    return Some(PanelSessionSnapshot {
+                        id,
+                        kind: PanelSnapshotKind::Row,
+                        visible: visible.is_some(),
+                        z_index: visible,
+                        side: config.side,
+                        vertical_size,
+                        horizontal_size,
+                        selected_row_id: panel.selected_row().map(|row| row.id),
+                        row_scroll: panel.scroll,
+                        text: None,
+                    });
+                }
+
+                let panel = self.text_panels.get(&id)?;
+                let width = effective_panel_width(&panel.config, terminal_width);
+                let layout = panel.layout(width);
+                let scroll_anchor = (!panel.follow_tail).then(|| {
+                    (panel.scroll..layout.lines.len())
+                        .find_map(|row| layout.offset_at(row, 0))
+                        .unwrap_or(0)
+                });
+                let focus = if panel
+                    .composer
+                    .as_ref()
+                    .is_some_and(|composer| composer.focused)
+                    || panel.last_focused_region == TextPanelFocusRegion::Composer
+                {
+                    TextPanelSnapshotFocus::Composer
+                } else {
+                    TextPanelSnapshotFocus::Scrollback
+                };
+                let composer = panel
+                    .composer
+                    .as_ref()
+                    .map(|composer| TextPanelComposerSnapshot {
+                        text: composer.prompt.text(),
+                        cursor: composer.prompt.cursor(),
+                    });
+                Some(PanelSessionSnapshot {
+                    id,
+                    kind: PanelSnapshotKind::Text,
+                    visible: visible.is_some(),
+                    z_index: visible,
+                    side: config.side,
+                    vertical_size,
+                    horizontal_size,
+                    selected_row_id: None,
+                    row_scroll: 0,
+                    text: Some(TextPanelSessionSnapshot {
+                        follow_tail: panel.follow_tail,
+                        scroll_anchor,
+                        cursor: panel.scrollback.cursor,
+                        focus,
+                        composer,
+                    }),
+                })
+            })
+            .collect();
+        PanelManagerSnapshot {
+            panels,
+            focused: self.focused.clone(),
+        }
+    }
+
+    /// Stages pane state until the owning plugins recreate their resources.
+    pub fn stage_restore(&mut self, snapshot: PanelManagerSnapshot) {
+        self.pending_restore = snapshot
+            .panels
+            .into_iter()
+            .map(|snapshot| {
+                (
+                    snapshot.id.clone(),
+                    PendingPanelRestore {
+                        snapshot,
+                        shell_applied: false,
+                    },
+                )
+            })
+            .collect();
+        self.pending_focused = snapshot.focused;
+        self.focus_editor();
+    }
+
+    /// Returns the still-unclaimed restoration intents sent to plugin owners.
+    pub fn pending_restore_snapshot(&self) -> PanelManagerSnapshot {
+        let mut panels = self
+            .pending_restore
+            .values()
+            .map(|pending| pending.snapshot.clone())
+            .collect::<Vec<_>>();
+        panels.sort_by(|left, right| left.id.cmp(&right.id));
+        PanelManagerSnapshot {
+            panels,
+            focused: self.pending_focused.clone(),
+        }
+    }
+
+    /// Applies layout, visibility, and stacking after a plugin recreates a pane.
+    pub fn apply_pending_shell_restore(&mut self, id: &str) -> bool {
+        let Some(pending) = self.pending_restore.get(id) else {
+            return false;
+        };
+        let snapshot = pending.snapshot.clone();
+        let live_kind = if self.panels.contains_key(id) {
+            PanelSnapshotKind::Row
+        } else if self.text_panels.contains_key(id) {
+            PanelSnapshotKind::Text
+        } else {
+            return false;
+        };
+        if live_kind != snapshot.kind {
+            self.pending_restore.remove(id);
+            return false;
+        }
+
+        let size = if matches!(snapshot.side, PanelSide::Left | PanelSide::Right) {
+            snapshot.vertical_size
+        } else {
+            snapshot.horizontal_size
+        }
+        .or_else(|| self.panel_layout(id).map(|(_, size)| size))
+        .unwrap_or_default();
+        self.restore_panel_layout(
+            id,
+            snapshot.side,
+            size,
+            snapshot.vertical_size,
+            snapshot.horizontal_size,
+        );
+
+        self.z_order.retain(|candidate| candidate != id);
+        if snapshot.visible {
+            let index = snapshot.z_index.unwrap_or(self.z_order.len());
+            self.z_order
+                .insert(index.min(self.z_order.len()), id.to_string());
+        }
+        if let Some(pending) = self.pending_restore.get_mut(id) {
+            pending.shell_applied = true;
+        }
+        true
+    }
+
+    /// Applies content-relative state once the plugin has repopulated the pane.
+    pub fn apply_pending_content_restore(
+        &mut self,
+        id: &str,
+        panel_height: usize,
+        terminal_width: usize,
+    ) -> bool {
+        let Some(pending) = self.pending_restore.get(id) else {
+            return false;
+        };
+        if !pending.shell_applied {
+            return false;
+        }
+        let snapshot = pending.snapshot.clone();
+
+        let applied = match snapshot.kind {
+            PanelSnapshotKind::Row => {
+                let Some(panel) = self.panels.get_mut(id) else {
+                    return false;
+                };
+                if let Some(row_id) = snapshot.selected_row_id.as_deref() {
+                    if !panel.select_row_by_id(row_id, panel_height) {
+                        return false;
+                    }
+                }
+                panel.scroll = snapshot.row_scroll.min(panel.selected);
+                true
+            }
+            PanelSnapshotKind::Text => {
+                let Some(saved) = snapshot.text else {
+                    return false;
+                };
+                let Some(panel) = self.text_panels.get_mut(id) else {
+                    return false;
+                };
+                let width = effective_panel_width(&panel.config, terminal_width);
+                let panel_height = effective_panel_height(&panel.config, panel_height);
+                if let (Some(composer), Some(saved_composer)) =
+                    (panel.composer.as_mut(), saved.composer)
+                {
+                    composer.prompt.set_text(&saved_composer.text);
+                    composer.prompt.set_cursor(saved_composer.cursor);
+                }
+
+                let layout = panel.layout(width);
+                panel.scrollback.mode = TextPanelScrollbackMode::Normal;
+                panel.scrollback.selection_anchor = None;
+                panel.scrollback.cursor = layout.clamp(saved.cursor);
+                panel.last_focused_region = match saved.focus {
+                    TextPanelSnapshotFocus::Scrollback => TextPanelFocusRegion::Scrollback,
+                    TextPanelSnapshotFocus::Composer => TextPanelFocusRegion::Composer,
+                };
+                if saved.follow_tail {
+                    panel.scroll_to_bottom(panel_height, width);
+                } else {
+                    let row = saved
+                        .scroll_anchor
+                        .and_then(|anchor| layout.position(layout.clamp(anchor)))
+                        .map_or(0, |(row, _, _)| row);
+                    panel.scroll = row;
+                    panel.follow_tail = false;
+                    panel.clamp_scroll(panel_height, width);
+                }
+                true
+            }
+        };
+
+        if applied {
+            let should_focus = self.pending_focused.as_deref() == Some(id);
+            self.pending_restore.remove(id);
+            if should_focus {
+                self.pending_focused = None;
+                self.restore_panel_focus(id);
+            }
+        }
+        applied
+    }
+
+    /// Applies a staged snapshot to resources that were already live when it loaded.
+    pub fn apply_pending_to_existing(&mut self, panel_height: usize, terminal_width: usize) {
+        for id in self.panel_ids() {
+            self.apply_pending_shell_restore(&id);
+            self.apply_pending_content_restore(&id, panel_height, terminal_width);
+        }
+    }
+
     pub fn create_panel(&mut self, id: String, config: PanelConfig) {
         self.default_layouts
             .insert(id.clone(), (config.side, config.width));
@@ -4165,6 +4485,97 @@ mod tests {
             assert_eq!(config.side, side);
             assert_eq!(serde_json::to_value(&config).unwrap()["side"], name);
         }
+    }
+
+    #[test]
+    fn pane_snapshot_restores_deferred_visibility_focus_selection_and_draft() {
+        let mut original = PanelManager::default();
+        original.create_panel(
+            "tree".to_string(),
+            PanelConfig {
+                side: PanelSide::Left,
+                width: 24,
+                ..PanelConfig::default()
+            },
+        );
+        original.update_panel("tree", vec![row("src"), row("tests")]);
+        assert!(original.select_row_by_id("tree", "tests", 20));
+        assert!(original.set_panel_visible("tree", false));
+
+        let agent_config = PanelConfig {
+            side: PanelSide::Right,
+            width: 42,
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 3,
+            }),
+            ..PanelConfig::default()
+        };
+        original.create_text_panel("agent".to_string(), agent_config.clone());
+        original.update_text_panel(
+            "agent",
+            vec![TextPanelBlock {
+                id: "answer".to_string(),
+                kind: TextPanelBlockKind::Agent,
+                format: TextPanelBlockFormat::Markdown,
+                text: "restored answer".to_string(),
+            }],
+            20,
+            100,
+        );
+        let composer = original
+            .text_panels
+            .get_mut("agent")
+            .unwrap()
+            .composer
+            .as_mut()
+            .unwrap();
+        assert!(composer.prompt.set_text("keep this draft"));
+        composer.prompt.set_cursor(5);
+        assert!(original.focus_text_panel_composer("agent"));
+
+        let encoded = serde_json::to_vec(&original.snapshot(100)).unwrap();
+        let snapshot: PanelManagerSnapshot = serde_json::from_slice(&encoded).unwrap();
+        let mut restored = PanelManager::default();
+        restored.stage_restore(snapshot);
+
+        restored.create_text_panel("agent".to_string(), agent_config);
+        assert!(restored.apply_pending_shell_restore("agent"));
+        restored.update_text_panel(
+            "agent",
+            vec![TextPanelBlock {
+                id: "answer".to_string(),
+                kind: TextPanelBlockKind::Agent,
+                format: TextPanelBlockFormat::Markdown,
+                text: "restored answer".to_string(),
+            }],
+            20,
+            100,
+        );
+        assert!(restored.apply_pending_content_restore("agent", 20, 100));
+
+        restored.create_panel(
+            "tree".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 10,
+                ..PanelConfig::default()
+            },
+        );
+        assert!(restored.apply_pending_shell_restore("tree"));
+        restored.update_panel("tree", vec![row("src")]);
+        assert!(!restored.apply_pending_content_restore("tree", 20, 100));
+        restored.update_panel("tree", vec![row("src"), row("tests")]);
+        assert!(restored.apply_pending_content_restore("tree", 20, 100));
+
+        assert_eq!(restored.focused.as_deref(), Some("agent"));
+        assert!(!restored.z_order.iter().any(|id| id == "tree"));
+        assert_eq!(restored.panels["tree"].selected_row().unwrap().id, "tests");
+        assert_eq!(restored.panel_layout("tree"), Some((PanelSide::Left, 24)));
+        let composer = restored.text_panels["agent"].composer.as_ref().unwrap();
+        assert_eq!(composer.prompt.text(), "keep this draft");
+        assert_eq!(composer.prompt.cursor(), 5);
+        assert!(composer.focused);
     }
 
     #[test]
