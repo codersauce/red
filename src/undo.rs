@@ -37,6 +37,11 @@ pub enum EditOrigin {
         /// Managed language-server key.
         server: String,
     },
+    /// A whole-document change returned by an external formatter.
+    Formatter {
+        /// Human-readable formatter name from the active language pack.
+        name: String,
+    },
 }
 
 /// Zero-based line and Unicode-scalar position used by the canonical edit boundary.

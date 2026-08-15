@@ -1,6 +1,6 @@
 # Husk plugin compatibility
 
-Red host API version `0.9.0` is defined by
+Red host API version `0.10.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -24,9 +24,33 @@ required/optional arity (`HUSK-A0002`) and obvious literal argument types
 annotations use `HUSK-A0004`. `--no-typecheck` is an unsupported development
 escape hatch; compatibility guarantees do not apply while it is enabled.
 
-Red `0.9.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`, and `0.8.0` contracts, so existing
-packages that declare those minors continue to load. New packages should target
-`"red_api_version": "^0.9.0"`.
+Red `0.10.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, and `0.9.0`
+contracts, so existing packages that declare those minors continue to load. New
+packages should target `"red_api_version": "^0.10.0"`.
+
+## Language-pack formatters
+
+Host API `0.10.0` adds an optional `formatter` table to each language definition:
+
+```toml
+[languages.python.formatter]
+name = "Black"
+command = "black"
+args = ["--quiet", "--stdin-filename", "{file}", "-"]
+root_markers = ["pyproject.toml", ".git"]
+```
+
+Red launches the command directly, sends the document on standard input, and replaces
+the document with UTF-8 standard output. `{file}` and `{workspace}` placeholders are
+expanded in arguments and environment values. Project-local executables under
+`node_modules/.bin`, `.venv/bin`, `venv/bin`, and `vendor/bin` take precedence over
+`PATH`.
+
+The global `[formatting]` table supports `on_save` and a `provider` of `auto`,
+`external`, or `lsp`. `auto` prefers an installed language-pack formatter and falls
+back to LSP when the formatter is absent; a formatter that starts and fails does not
+silently switch engines. The legacy `lsp.format_on_save` flag remains accepted as an
+on-save enablement alias.
 
 ## Scratch-buffer workflows
 

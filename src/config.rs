@@ -267,6 +267,9 @@ pub struct Config {
     /// Language-server routing and behavior.
     #[serde(default)]
     pub lsp: LspConfig,
+    /// Document formatting behavior shared by language servers and external tools.
+    #[serde(default)]
+    pub formatting: FormattingConfig,
     /// User-defined syntax, grammar, formatting, and language-server definitions.
     #[serde(default)]
     pub languages: HashMap<String, LanguageConfig>,
@@ -875,6 +878,31 @@ pub struct LspConfig {
     pub servers: HashMap<String, LanguageServerConfig>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+/// Selects the formatting backend used for explicit and save-time formatting.
+pub enum FormattingProvider {
+    /// Prefer a configured external formatter and otherwise ask the language server.
+    #[default]
+    Auto,
+    /// Use only the language pack's external formatter.
+    External,
+    /// Use only language-server formatting.
+    Lsp,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+/// Global document formatting behavior.
+pub struct FormattingConfig {
+    /// Format supported documents immediately before saving them.
+    #[serde(default)]
+    pub on_save: bool,
+    /// Backend selected for explicit and save-time formatting.
+    #[serde(default)]
+    pub provider: FormattingProvider,
+}
+
 /// One configurable language shared by highlighting, editing, and LSP routing.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -900,6 +928,28 @@ pub struct LanguageConfig {
     /// Language-server launch and settings associated with this language.
     #[serde(default)]
     pub lsp: Option<LanguageLspConfig>,
+    /// External stdin-to-stdout formatter supplied by the language pack.
+    #[serde(default)]
+    pub formatter: Option<LanguageFormatterConfig>,
+}
+
+/// One external formatter launched directly with the document on stdin.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LanguageFormatterConfig {
+    /// Human-readable formatter name shown in editor feedback.
+    pub name: String,
+    /// Formatter executable launched without a shell.
+    pub command: String,
+    /// Arguments with optional `{file}` and `{workspace}` placeholders.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Files or directories searched upward to select the working directory.
+    #[serde(default)]
+    pub root_markers: Vec<String>,
+    /// Environment additions supplied only to the formatter process.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 /// Source, highlighting queries, and platform artifacts for one grammar.
@@ -1774,6 +1824,7 @@ fn known_top_level_field(field: &str) -> bool {
             | "key_hints"
             | "clipboard"
             | "lsp"
+            | "formatting"
             | "languages"
             | "commenting"
             | "matchit"
@@ -1937,6 +1988,7 @@ fn known_schema_path(path: &[String]) -> bool {
             matches!(*field, "enabled" | "sync_on_yank" | "sync_on_paste")
         }
         ["lsp", field] => matches!(*field, "enabled" | "format_on_save" | "servers"),
+        ["formatting", field] => matches!(*field, "on_save" | "provider"),
         ["lsp", "servers", _] => true,
         ["lsp", "servers", _, field] => matches!(
             *field,
@@ -1958,7 +2010,14 @@ fn known_schema_path(path: &[String]) -> bool {
         ["languages", _] => true,
         ["languages", _, field] => matches!(
             *field,
-            "extensions" | "filenames" | "aliases" | "comment" | "indent_width" | "grammar" | "lsp"
+            "extensions"
+                | "filenames"
+                | "aliases"
+                | "comment"
+                | "indent_width"
+                | "grammar"
+                | "lsp"
+                | "formatter"
         ),
         ["languages", _, "grammar", field] => matches!(
             *field,
@@ -1982,6 +2041,10 @@ fn known_schema_path(path: &[String]) -> bool {
         ["languages", _, "lsp", "env", _]
         | ["languages", _, "lsp", "initialization_options", ..]
         | ["languages", _, "lsp", "settings", ..] => true,
+        ["languages", _, "formatter", field] => {
+            matches!(*field, "name" | "command" | "args" | "root_markers" | "env")
+        }
+        ["languages", _, "formatter", "env", _] => true,
         ["commenting", "languages"] | ["commenting", "languages", _] => true,
         ["matchit", field] => matches!(*field, "enabled" | "pairs" | "languages"),
         ["matchit", "languages", _] | ["matchit", "languages", _, "groups"] => true,
@@ -4147,6 +4210,46 @@ workspace_name = "frontend"
         assert_eq!(server.documents()[0].file_extensions, vec!["ts", "tsx"]);
         assert_eq!(server.root_markers, vec!["package.json", ".git"]);
         assert_eq!(server.workspace_name.as_deref(), Some("frontend"));
+    }
+
+    #[test]
+    fn formatting_config_accepts_external_language_formatter() {
+        let config: Config = toml::from_str(
+            r#"
+theme = "theme/nightfox.json"
+
+[keys]
+
+[formatting]
+on_save = true
+provider = "external"
+
+[languages.python]
+extensions = ["py"]
+
+[languages.python.formatter]
+name = "Black"
+command = "black"
+args = ["--quiet", "--stdin-filename", "{file}", "-"]
+root_markers = ["pyproject.toml", ".git"]
+
+[languages.python.formatter.env]
+BLACK_CACHE_DIR = "{workspace}/.cache/black"
+"#,
+        )
+        .unwrap();
+
+        assert!(config.formatting.on_save);
+        assert_eq!(config.formatting.provider, FormattingProvider::External);
+        let formatter = config.languages["python"].formatter.as_ref().unwrap();
+        assert_eq!(formatter.name, "Black");
+        assert_eq!(formatter.command, "black");
+        assert_eq!(
+            formatter.args,
+            ["--quiet", "--stdin-filename", "{file}", "-"]
+        );
+        assert_eq!(formatter.root_markers, ["pyproject.toml", ".git"]);
+        assert_eq!(formatter.env["BLACK_CACHE_DIR"], "{workspace}/.cache/black");
     }
 
     #[test]

@@ -146,6 +146,13 @@ waiting = "steady_underscore"
 # [lsp]
 # format_on_save = true
 #
+# `lsp.format_on_save` remains supported. New configurations can select an
+# external language-pack formatter, LSP formatting, or automatic fallback:
+#
+# [formatting]
+# on_save = true
+# provider = "auto" # "auto", "external", or "lsp"
+#
 # [lsp.servers.rust]
 # command = "rust-analyzer"
 # args = ["-v"]
