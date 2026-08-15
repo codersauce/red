@@ -712,6 +712,11 @@ impl TextPanel {
         self.follow_tail = self.viewport.is_following();
     }
 
+    fn resume_tail_following(&mut self) {
+        self.viewport.restore(self.scroll, true);
+        self.follow_tail = true;
+    }
+
     fn clamp_scroll(&mut self, panel_height: usize, panel_width: usize) {
         self.viewport.restore(self.scroll, self.follow_tail);
         self.viewport
@@ -2855,7 +2860,10 @@ impl PanelManager {
                 ("composer_input", None)
             }
             PromptInput::Submit => match composer.take_submission() {
-                Some(text) => ("submit", Some(text)),
+                Some(text) => {
+                    panel.resume_tail_following();
+                    ("submit", Some(text))
+                }
                 None => ("composer_input", None),
             },
             PromptInput::Cancel => {
@@ -5380,6 +5388,87 @@ mod tests {
         let restored = manager.text_panels["agent"].composer.as_ref().unwrap();
         assert_eq!(restored.prompt.text(), "draft");
         assert!(manager.focused_text_panel_cursor_position(80, 20).is_some());
+    }
+
+    #[test]
+    fn text_panel_submission_resumes_tail_following_after_manual_scroll() {
+        use crossterm::event::KeyEvent;
+
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 32,
+                title: Some("Agent".to_string()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 3,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        let history = TextPanelBlock {
+            id: "history".to_string(),
+            kind: TextPanelBlockKind::Agent,
+            format: TextPanelBlockFormat::Plain,
+            text: (1..=20)
+                .map(|line| format!("history line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+        manager.update_text_panel("agent", vec![history.clone()], 8, 80);
+        assert!(manager.focus_text_panel_composer("agent"));
+        manager.handle_focused_key("top", 8, 80, 0).unwrap();
+        assert_eq!(manager.text_panels["agent"].scroll, 0);
+        assert!(!manager.text_panels["agent"].follow_tail);
+
+        let empty = manager
+            .handle_focused_text_input(
+                &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+                80,
+            )
+            .unwrap();
+        assert_eq!(empty.action, "composer_input");
+        assert!(!manager.text_panels["agent"].follow_tail);
+
+        manager.handle_focused_text_input(&Event::Paste("next question".to_string()), 80);
+        let submitted = manager
+            .handle_focused_text_input(
+                &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+                80,
+            )
+            .unwrap();
+        assert_eq!(submitted.action, "submit");
+        assert_eq!(submitted.text.as_deref(), Some("next question"));
+        assert!(manager.text_panels["agent"].follow_tail);
+
+        manager.update_text_panel(
+            "agent",
+            vec![
+                history,
+                TextPanelBlock {
+                    id: "question".to_string(),
+                    kind: TextPanelBlockKind::User,
+                    format: TextPanelBlockFormat::Plain,
+                    text: "next question".to_string(),
+                },
+            ],
+            8,
+            80,
+        );
+        let panel = &manager.text_panels["agent"];
+        assert_eq!(panel.scroll, panel.max_scroll(8, 32));
+
+        manager.append_text_panel("agent", "answer", "streamed answer", 8, 80);
+        let panel = &manager.text_panels["agent"];
+        assert_eq!(panel.scroll, panel.max_scroll(8, 32));
+
+        manager.handle_focused_key("up", 8, 80, 0).unwrap();
+        let manual_scroll = manager.text_panels["agent"].scroll;
+        assert!(!manager.text_panels["agent"].follow_tail);
+        manager.append_text_panel("agent", "answer", "\nmore output", 8, 80);
+        assert_eq!(manager.text_panels["agent"].scroll, manual_scroll);
     }
 
     #[test]
