@@ -24,7 +24,7 @@ The Codex app-server workflow is Red's direct integration with the installed Cod
 
 ## Process And Session Ownership
 
-`CodexProcessSpec` records the exact executable, literal extra arguments, environment overrides, and working directory used to launch one Codex app-server worker [@codex]. The worker command appends `app-server --stdio`, disables apps, connectors, plugins, and remote plugins through Codex config overrides, redirects stderr to null, and kills the child on drop [@codex]. After startup, Red sends `initialize`, `initialized`, and `account/read`; the worker refuses to continue if account information does not show an authenticated Codex session [@codex].
+`CodexProcessSpec` records the exact executable, literal extra arguments, environment overrides, and working directory used to launch one Codex app-server worker [@codex]. The worker command appends `app-server --stdio`, disables apps, connectors, plugins, and remote plugins through Codex config overrides, pipes stderr into a bounded sanitized diagnostic tail, and kills the child on drop [@codex]. After startup, Red sends `initialize`, `initialized`, and `account/read`; the worker refuses to continue if account information does not show an authenticated Codex session [@codex].
 
 The user-visible lifecycle follows the workflow document: `Space A` or `:Agent` opens the prompt, Red lazily starts the app-server, creates a thread, submits a turn, streams assistant deltas, and sends `turn/interrupt` for cancellation [@workflow]. The implementation mirrors that flow through `CodexCommand::NewSession`, `Prompt`, `PromptWithContext`, `Cancel`, and `CloseSession`; responses from `thread/start` become `SessionCreated`, responses from `turn/start` set the active turn id, assistant deltas become `Update`, and `turn/completed` becomes `Completed` [@codex].
 
@@ -45,6 +45,12 @@ Prompt dispatch begins in the editor. Before sending a turn, `dispatch_agent_pro
 The worker keeps app-server reading, command handling, response correlation, and dynamic-tool results in one async loop [@codex]. It reads stdout frames on a separate task, uses a pending-request table keyed by JSON-RPC id, tracks sessions by Codex thread id, and drops tool results if the referenced turn is no longer active or has been cancelled [@codex]. Tool arguments, tool responses, app-server frames, per-turn tool-call count, tool runtime, file listing, search matches, and search bytes are bounded [@codex] [@workflow].
 
 The editor polls both directions from `service_background`. It services a bounded batch of pending editor-tool requests, then a bounded batch of Codex events; inactive-session updates are ignored, stale permission requests are denied, terminal events mark sessions inactive, and all user-facing Codex events are translated to plugin notifications such as `agent:update`, `agent:activity`, `agent:completed`, `agent:cancelled`, and `agent:error` [@editor]. Proposal-related sessions are coalesced and published as `agent:proposals_changed` after Codex events are drained for that tick [@editor].
+
+## Conversation UI State
+
+The bundled agent plugin keeps three related states separate: the live Codex `session_id`, a `pending_prompt` that has not safely become part of a turn, and a persisted human-readable `transcript` [@agent-plugin]. `Space A` opens and focuses the conversation panel when a live session exists, but it also opens the panel for a restored transcript when there is no pending prompt; that avoids treating archived context as an unsent retry prompt [@agent-plugin].
+
+The editor replays persisted transcript text to the plugin during detached-core creation and session restoration by sending `agent:transcript_restored`, while crash recovery stores restored transcript text back into agent plugin storage and reports archived context when the snapshot is not resumable [@editor]. The plugin converts restored plain transcript text back into conversation blocks and renders the panel without inventing a Codex session [@agent-plugin]. This is the UI counterpart to [Crash Recovery Snapshots](../sessions/crash-recovery-snapshots): transcript recovery preserves context, not app-server continuity.
 
 ## Failure Behavior
 

@@ -1,7 +1,7 @@
 # Input, action, and edit pipeline
 
 This document defines the production path for user input and buffer mutation. Features
-such as macros, dot-repeat, marks, agent proposals, attribution, LSP synchronization, and
+such as macros, dot-repeat, marks, agent edits, attribution, LSP synchronization, and
 undo must extend these seams rather than create a second executor.
 
 ## Production flow
@@ -36,7 +36,7 @@ The roadmap requires three related but non-interchangeable representations:
   operator/motion or text object, inserted text, and mode transitions. Dot-repeat uses
   these because repeating a change is not the same as replaying arbitrary navigation.
 - **Recorded edits** are character-coordinate replacements inside `EditTransaction`.
-  Undo, attribution, anchors, persistence, and agent proposal application use these.
+  Undo, attribution, anchors, persistence, and agent edit application use these.
 
 An input event may produce no action. One action may produce several recorded edits. One
 semantic change may span several actions and one transaction, particularly insert mode.

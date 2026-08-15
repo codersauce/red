@@ -2,9 +2,17 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use tokio::sync::{mpsc, oneshot};
+use std::time::Duration;
 
-/// Maximum number of edits accepted in one atomic proposal operation.
+use async_trait::async_trait;
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::timeout,
+};
+
+use crate::codex::CodexToolHost;
+
+/// Maximum number of edits accepted in one atomic editor operation.
 pub const MAX_EDITOR_EDITS: usize = 128;
 
 /// A zero-based UTF-16 position, compatible with LSP coordinates.
@@ -64,10 +72,24 @@ pub enum EditorActionName {
     PreviousBuffer,
 }
 
-/// Semantic editor operation. Text changes always stage a proposal.
+/// Semantic operation executed by Red's editor owner task.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "tool", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EditorToolCall {
+    /// Read the authoritative visible contents of a workspace file.
+    ReadFile {
+        /// Workspace-relative or accepted absolute path.
+        path: String,
+    },
+    /// Replace a file with complete contents and persist it.
+    WriteFile {
+        /// Workspace-relative or accepted absolute path.
+        path: String,
+        /// Visible buffer revision returned by the preceding read.
+        expected_revision: u64,
+        /// Complete replacement contents.
+        content: String,
+    },
     /// Read a bounded snapshot of active editor state.
     GetEditorState {},
     /// Open a workspace file and reveal a UTF-16 position.
@@ -96,7 +118,7 @@ pub enum EditorToolCall {
         #[serde(default)]
         kind: EditorSelectionKind,
     },
-    /// Stage atomic, revision-checked replacements as a reviewable proposal.
+    /// Apply atomic, revision-checked replacements and persist them.
     ApplyEdits {
         /// Workspace file to change.
         path: String,
@@ -128,20 +150,22 @@ impl EditorToolCall {
     }
 
     #[must_use]
-    /// Returns whether the call stages textual edits.
+    /// Returns whether the call changes text.
     pub fn is_edit(&self) -> bool {
-        matches!(self, Self::ApplyEdits { .. })
+        matches!(self, Self::WriteFile { .. } | Self::ApplyEdits { .. })
     }
 
     #[must_use]
     /// Formats a bounded user-facing description of the in-progress call.
     pub fn activity_title(&self) -> String {
         match self {
+            Self::ReadFile { path } => format!("Reading {path}"),
+            Self::WriteFile { path, .. } => format!("Writing {path}"),
             Self::GetEditorState {} => "Inspecting editor state".to_string(),
             Self::OpenFile { path, .. } => format!("Opening {path}"),
             Self::SelectText { path, .. } => format!("Selecting text in {path}"),
             Self::ApplyEdits { path, edits, .. } => {
-                format!("Proposing {} edit(s) in {path}", edits.len())
+                format!("Editing {path} ({} change(s))", edits.len())
             }
             Self::RunEditorAction { action } => format!("Running editor action {action:?}"),
         }
@@ -165,11 +189,78 @@ pub enum EditorOpenTarget {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EditorToolRequest {
-    /// Active Codex session that owns the call and any resulting proposal.
+    /// Active Codex session that owns the call.
     pub session_id: String,
     /// Strictly parsed semantic operation.
     #[serde(flatten)]
     pub call: EditorToolCall,
+}
+
+/// Codex tool host that forwards all editor-aware reads and writes to Red's owner task.
+#[derive(Debug, Clone)]
+pub struct EditorToolHost {
+    sender: mpsc::Sender<PendingEditorTool>,
+}
+
+impl EditorToolHost {
+    #[must_use]
+    pub fn new(sender: mpsc::Sender<PendingEditorTool>) -> Self {
+        Self { sender }
+    }
+
+    async fn request(&self, request: EditorToolRequest) -> anyhow::Result<Value> {
+        let (response_tx, response_rx) = oneshot::channel();
+        timeout(
+            Duration::from_secs(30),
+            self.sender.send(PendingEditorTool {
+                request,
+                response: response_tx,
+            }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("editor tool dispatcher is backpressured"))?
+        .map_err(|_| anyhow::anyhow!("editor tool dispatcher stopped"))?;
+        timeout(Duration::from_secs(30), response_rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("editor tool request timed out"))?
+            .map_err(|_| anyhow::anyhow!("editor tool dispatcher dropped the response"))?
+            .map_err(anyhow::Error::msg)
+    }
+}
+
+#[async_trait]
+impl CodexToolHost for EditorToolHost {
+    async fn read_file(&mut self, session_id: &str, path: &str) -> anyhow::Result<Value> {
+        self.request(EditorToolRequest {
+            session_id: session_id.to_string(),
+            call: EditorToolCall::ReadFile {
+                path: path.to_string(),
+            },
+        })
+        .await
+    }
+
+    async fn write_file(
+        &mut self,
+        session_id: &str,
+        path: &str,
+        expected_revision: u64,
+        content: String,
+    ) -> anyhow::Result<Value> {
+        self.request(EditorToolRequest {
+            session_id: session_id.to_string(),
+            call: EditorToolCall::WriteFile {
+                path: path.to_string(),
+                expected_revision,
+                content,
+            },
+        })
+        .await
+    }
+
+    async fn editor_tool(&mut self, request: EditorToolRequest) -> anyhow::Result<Value> {
+        self.request(request).await
+    }
 }
 
 /// One bounded request waiting for the editor main loop to produce a result.
@@ -179,6 +270,13 @@ pub struct PendingEditorTool {
     pub request: EditorToolRequest,
     /// One-shot result channel back to the Codex worker.
     pub response: oneshot::Sender<Result<Value, String>>,
+}
+
+/// Completed editor tool held briefly so its visible result can be followed.
+#[derive(Debug)]
+pub struct PendingEditorToolResponse {
+    pub response: oneshot::Sender<Result<Value, String>>,
+    pub result: Result<Value, String>,
 }
 
 /// Create the bounded editor-tool request channel owned by one editor instance.
@@ -242,7 +340,7 @@ pub fn editor_tool_schemas(schema_key: &str) -> Vec<Value> {
         ),
         (
             "apply_edits",
-            "Atomically stage up to 128 non-overlapping, half-open UTF-16 text edits as a reviewable editor proposal. This never saves or writes to disk.",
+            "Atomically apply up to 128 non-overlapping, half-open UTF-16 text edits through Red and save the file.",
             json!({
                 "type": "object",
                 "properties": {

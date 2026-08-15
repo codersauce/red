@@ -24,7 +24,7 @@ LSP configuration in Red is the TOML-backed contract for enabling language-serve
 | `lsp.format_on_save` | boolean | `false` | Requests server formatting before saving supported documents [@config]. |
 | `lsp.servers` | table of named server configs | embedded defaults | Launch and routing definitions keyed by server name [@config]. |
 
-The default config comments show the public TOML shape and note that language servers are selected by file extension [@defaults]. Existing single-language configs remain supported through `language_id` and `file_extensions`, while servers that handle more than one language can use repeated `documents` entries [@defaults].
+The default config comments show the public TOML shape and note that language servers are selected by file extension [@defaults]. Existing single-language configs remain supported through `language_id` with `file_extensions` or `filenames`, while servers that handle more than one language can use repeated `documents` entries [@defaults] [@config].
 
 ## Server Fields
 
@@ -34,13 +34,15 @@ The default config comments show the public TOML shape and note that language se
 | `args` | array of strings | no | Arguments passed to the command [@config]. |
 | `language_id` | string | legacy selector | LSP language id for single-selector configs [@config]. |
 | `file_extensions` | array of strings | legacy selector | Extensions for single-selector configs [@config]. |
+| `filenames` | array of strings | legacy selector | Exact file names for single-selector configs [@config]. |
 | `documents` | array of tables | no | Preferred selector list for one server handling one or more language ids [@config]. |
 | `root_markers` | array of strings | no | Files or directories searched upward to choose a workspace root [@config]. |
 | `env` | table | no | Environment additions supplied only to the server process [@config]. |
 | `initialization_options` | JSON value | no | Options passed during LSP initialization; this field is runtime-only in serialization [@config]. |
+| `settings` | JSON value | no | Settings returned to server `workspace/configuration` requests [@config]. |
 | `workspace_name` | string | no | Display name reported for the workspace folder [@config]. |
 
-`LanguageServerConfig::documents()` normalizes the two selector styles. If explicit `documents` exist, they are returned as-is; otherwise a non-empty `language_id` with non-empty `file_extensions` becomes a single `LanguageDocumentConfig` [@config]. Tests cover additional server definitions, `format_on_save`, legacy selector adaptation, `workspace_name`, and multi-document selector parsing [@config].
+`LanguageServerConfig::documents()` normalizes the two selector styles. If explicit `documents` exist, they are returned as-is; otherwise a non-empty `language_id` with non-empty `file_extensions` or `filenames` becomes a single `LanguageDocumentConfig` [@config]. Tests cover additional server definitions, `format_on_save`, legacy selector adaptation, `workspace_name`, settings round-tripping, and multi-document selector parsing [@config].
 
 ## Default Servers
 

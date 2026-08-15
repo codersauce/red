@@ -3,7 +3,7 @@
 Red launches the installed Codex CLI as an app-server and speaks its JSONL
 protocol directly. There is no ACP client, adapter, or companion executable.
 The bundled Husk plugin owns the terminal UI; Rust core owns the Codex process,
-thread and turn lifecycle, dynamic tools, proposal state, review, and attributed
+thread and turn lifecycle, dynamic tools, paced following, saving, and attributed
 application.
 
 ## Prerequisites
@@ -30,7 +30,7 @@ command = "/path/to/codex"
 
 Open a workspace, press `Space A` (or run `:Agent`), type a request, and press
 Enter. Red lazily starts `codex app-server --stdio`, initializes the connection,
-checks the account, starts an ephemeral thread, and submits turns with
+checks the account, starts a persisted thread, and submits turns with
 `turn/start`. Follow-up text and the busy indicator render before dispatch;
 follow-ups submitted during an active turn appear immediately and remain queued
 in FIFO order. Assistant deltas stream into the conversation footer. `Ctrl-c`
@@ -42,7 +42,17 @@ Install or update Codex, run `codex login`, then retry without retyping.
 The app-server process is owned by the detachable editor core, so disconnecting
 and reattaching does not intentionally replace a healthy process.
 
-## Reviewable editing
+Red snapshots the Codex thread ID together with a structured, clean projection
+of the model-visible user and assistant messages. After an owner or machine
+restart, the Agent composer remains disabled while Red starts a replacement
+app-server and calls `thread/resume`. The returned turns reconcile the panel to
+the history Codex actually loaded; Red's projection keeps injected editor
+context out of the visible user message. If the persisted thread is missing or
+cannot be loaded, Red marks the transcript as archived and makes the next prompt
+start a new thread with bounded recovered context instead of pretending the old
+session is live.
+
+## Followed editing
 
 Every Codex thread is started with:
 
@@ -53,7 +63,7 @@ Every Codex thread is started with:
 - apps, connectors, plugins, orchestrator MCP, and notifications disabled
 - hooks disabled unless the managed Codex policy requires them; when required,
   Codex may also load trusted user, workspace, or plugin hooks
-- Red's bounded dynamic tools and reviewable-edit instructions
+- Red's bounded dynamic tools and live-edit instructions
 
 Native command, file-change, and permission escalation requests are denied.
 Red never asks Codex to edit the workspace directly.
@@ -64,28 +74,30 @@ Codex receives nine dynamic tools:
 | --- | --- |
 | `list_files` | Lists at most 4,096 workspace files while respecting ignore files. |
 | `search_files` | Searches bounded text content and returns at most 200 matches. |
-| `read_file` | Reads through Red so unsaved buffers and staged proposals are authoritative. |
-| `write_file` | Stages complete contents in the proposal workspace without touching disk. |
+| `read_file` | Reveals and reads the authoritative Red buffer, returning its revision. |
+| `write_file` | Replaces revision-checked contents through Red and saves the buffer. |
 | `get_editor_state` | Returns bounded active-file, cursor, selection, window, and diagnostic state. |
 | `open_file` | Opens a safe workspace file in the requested split. |
 | `select_text` | Creates a UTF-16-addressed editor selection. |
-| `apply_edits` | Stages atomic, revision-checked UTF-16 edits as a proposal. |
+| `apply_edits` | Applies atomic, revision-checked UTF-16 edits and saves the buffer. |
 | `run_editor_action` | Runs an allow-listed navigation or LSP action. |
 
-Tool paths must remain below the physical workspace root. Proposal reads and
-writes reject parent traversal, symlink components, special files, unsafe roots,
-oversized content, stale revisions, and overlapping edits. Later reads in the
-same session see staged proposal contents.
+Tool paths must remain below the physical workspace root. Reads and writes
+reject parent traversal, symlink components, special files, unsafe roots,
+oversized content, stale revisions, and overlapping edits. Reads always see the
+latest visible editor contents, including unsaved user changes.
 
 On Unix, content search uses descriptor-relative, nonblocking, no-follow reads
 from the physical workspace root. It fails closed on symlinks and special files.
 Content search is unavailable on platforms without that safe read boundary;
 Codex must use `read_file` through Red instead.
 
-Run `:AgentReview` to inspect pending files and hunks. Accepting a proposal
-passes through the editor's transaction boundary and receives agent attribution.
-Rejecting it discards only the selected proposal. Unaccepted proposals never
-mutate a visible buffer or disk.
+Following is mandatory in this first iteration. Before a file tool runs, Red
+opens the target, moves the cursor to the first affected range when available,
+renders it, and waits briefly. The operation then passes through the editor's
+transaction boundary with session/turn attribution and saves through the editor.
+Tool calls remain serialized, which provides a natural future boundary for
+pause, resume, and single-step controls.
 
 ## Limits and failure behavior
 
@@ -95,8 +107,9 @@ queues, and callback duration are bounded. Oversized or malformed frames stop
 the Codex runtime without being rendered into the terminal.
 
 App-server stderr is isolated from the TUI. Structured failures appear in the
-conversation and status line. A stopped process archives pending proposals and
-preserves the submitted prompt for retry.
+conversation and status line. A stopped process is restarted and the persisted
+thread is resumed when possible; otherwise the transcript becomes explicit
+archived context and the submitted prompt remains available for retry.
 
 Dynamic tools are part of Codex app-server's experimental capability surface.
 Red pins a minimum tested CLI version and fails closed when the required
@@ -112,5 +125,4 @@ protocol is unavailable; it does not fall back to `codex exec` or native edits.
 | `:AgentClear` | Clear visible conversation while retaining current context. |
 | `:AgentNew` | Close the current thread and start a new one. |
 | `:AgentClose` | Hide the conversation panel without discarding state. |
-| `:AgentReview` | Review pending proposal files and hunks. |
-| `:AgentHistory` | Inspect attributed accepted/rejected transactions. |
+| `:AgentHistory` | Inspect attributed agent transactions. |

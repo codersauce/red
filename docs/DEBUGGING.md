@@ -39,15 +39,15 @@ For missing UI, identify the stable resource ID and owning manager: panels, work
 
 For a process failure, inspect the requesting plugin's configured allowlist and direct argument vector. The process API does not invoke a shell, and unapproved environment variables are removed. Process events are polled by the editor; child exit alone does not update plugin UI until its event handler runs.
 
-## Codex and reviewable proposals
+## Codex live editing and follow mode
 
 Run `red --agent-check` for the installed executable and minimum-version report, or `red --agent-check --strict` when readiness should control an automated check. Authentication is verified when the app-server starts, not by the offline prerequisite report.
 
-`src/codex/mod.rs` owns bounded JSONL transport, sessions, turns, cancellation, and dynamic-tool dispatch. `src/agent_tools.rs` validates editor tool shapes and UTF-16 edits. `src/agent_workspace.rs` owns session-scoped proposed contents and physical workspace confinement. Reads in one session see its staged proposal, but visible buffers and disk remain unchanged until the editor accepts a staged result through its transaction boundary.
+`src/codex/mod.rs` owns bounded JSONL transport, sessions, turns, cancellation, and dynamic-tool dispatch. `src/agent_tools.rs` validates editor tool shapes and UTF-16 edits. The editor resolves every tool path within the physical workspace, reveals the target, serializes a short follow delay, applies revision-checked edits through its transaction boundary, and saves the attributed buffer.
 
-When review reports a conflict, compare the proposal base revision and contents with the current visible buffer. Do not bypass the conflict by writing the proposed text directly: that would discard user work and lose agent attribution. Recovered proposals are archived and do not imply that a prior Codex thread or process is still live.
+When an edit reports a stale revision, compare the revision returned by `read_file` with the current visible buffer. Do not bypass the check by writing directly: that could discard user work and lose agent attribution. During recovery, distinguish a newly started app-server process from the persisted Codex thread it rejoins. The composer is not enabled until `thread/resume` returns and Red reconciles the visible transcript with those turns.
 
-Structured `agent_proposal_notification_failed` records mean the attributed buffer change committed but a later notification, workspace sync, plugin event, or render failed. The editor reports that partial operational failure instead of rolling back an already accepted user decision.
+If an attributed edit reaches the buffer but saving fails, the dynamic-tool result reports `applied: true`, `saved: false`, and the error. The dirty buffer remains visible and recoverable.
 
 ## Recovery snapshots
 
@@ -79,6 +79,6 @@ With `RED_PERF=summary`, `detach:idle_tick` should rise while idle without match
 | Workspace edit rejected | LSP edit preparation and resource-operation validation |
 | Plugin missing after reload | `PluginRegistry::statuses` and quarantine diagnostic |
 | Plugin process has no output | process permission, process ID, and polled process events |
-| Agent changed disk before review | proposal workspace boundary; treat as a safety defect |
+| Agent edit is not visible before application | follow queue and pre-action render |
 | Snapshot not advancing | session worker result, generation tuple, and structured failure log |
 | Attach paints stale content | headless revision handshake and detached-core render generation |

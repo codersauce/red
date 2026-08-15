@@ -48,7 +48,7 @@ The top-level schema accepts keys for editor behavior, keymaps, theme, cursor, p
 | `[picker]` | `input_position = "bottom"` [@defaults] [@config]. |
 | `[picker.icons]` | `style = "nerd_font"`, `color = true`; code also accepts `unicode`, `ascii`, and `none` icon styles [@defaults] [@config]. |
 | `[diagnostics]` | `gutter_signs = true`, `icon_style = "nerd_font"`; code also accepts `unicode`, `ascii`, and `none` icon styles for diagnostic gutter signs [@defaults] [@config]. |
-| `[statusline]` | `left = ["mode", "diagnostics", "git_branch", "filename"]`, `right = ["position", "syntax"]`; the configuration schema lets all 25 statusline sections move between sides [@defaults] [@config]. |
+| `[statusline]` | `left = ["mode", "diagnostics", "git_branch", "filename"]`, `right = ["position", "syntax"]`; the configuration schema lets supported statusline sections move between sides [@defaults] [@config]. |
 | `[statusline.icons]` | `style = "nerd_font"`, `color = true`; the same `unicode`, `ascii`, and `none` icon styles are accepted for statusline icons [@defaults] [@config]. |
 | `[key_hints]` | `enabled = true`, `delay_ms = 250` [@defaults] [@config]. |
 | `[clipboard]` | Defaults are enabled, sync on yank, and sync on paste when omitted [@config]. |

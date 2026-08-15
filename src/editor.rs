@@ -34,7 +34,7 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -68,11 +68,9 @@ pub use render_buffer::RenderBuffer;
 
 use crate::{
     agent_tools::{
-        editor_tool_channel, utf16_byte_offset, EditorActionName, EditorOpenTarget,
-        EditorSelectionKind, EditorToolCall, EditorToolRequest,
-    },
-    agent_workspace::{
-        ProposalDisposition, ProposalToolHost, ProposalWorkspace, StagedProposalAcceptance,
+        apply_text_edits, editor_tool_channel, utf16_byte_offset, EditorActionName,
+        EditorOpenTarget, EditorSelectionKind, EditorToolCall, EditorToolHost, EditorToolRequest,
+        PendingEditorToolResponse,
     },
     buffer::{Buffer, BufferId, SearchMatch, SyntaxSelection},
     clipboard::{ClipboardProvider, DisabledClipboardProvider, NativeClipboardProvider},
@@ -1112,17 +1110,28 @@ fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
                 )
             }),
         ),
+        CodexEvent::SessionRestored { session_id, thread } => (
+            "agent:session_restored",
+            json!({ "session_id": session_id, "thread": plugin_json(thread) }),
+        ),
+        CodexEvent::SessionRestoreFailed {
+            session_id,
+            message,
+        } => (
+            "agent:session_restore_failed",
+            json!({ "session_id": session_id, "message": message }),
+        ),
         CodexEvent::Update { session_id, text } => (
             "agent:update",
             json!({ "session_id": session_id.to_string(), "text": text }),
         ),
+        CodexEvent::MessageCompleted { session_id, text } => (
+            "agent:message_completed",
+            json!({ "session_id": session_id, "text": text }),
+        ),
         CodexEvent::Activity { session_id, update } => (
             "agent:activity",
             json!({ "session_id": session_id.to_string(), "update": plugin_json(update) }),
-        ),
-        CodexEvent::ProposalsChanged { session_id } => (
-            "agent:proposals_changed",
-            json!({ "session_id": session_id.to_string() }),
         ),
         CodexEvent::Completed {
             session_id,
@@ -1266,6 +1275,58 @@ fn agent_context_path_is_ignored(path: &Path, root: &Path) -> bool {
     ignored
 }
 
+fn resolve_agent_tool_path(root: &Path, path: &str) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(!path.is_empty(), "editor tool path cannot be empty");
+    let path = Path::new(path);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                anyhow::ensure!(normalized.pop(), "agent path escapes filesystem root");
+            }
+            std::path::Component::Normal(value) => normalized.push(value),
+        }
+    }
+    anyhow::ensure!(
+        normalized.starts_with(root),
+        "agent path {} is outside workspace {}",
+        normalized.display(),
+        root.display()
+    );
+    let mut current = root.to_path_buf();
+    for component in normalized.strip_prefix(root)?.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "agent path contains symlink component: {}",
+                    current.display()
+                )
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    anyhow::ensure!(
+        !agent_context_path_is_sensitive(&normalized),
+        "editor tool path is a sensitive file"
+    );
+    anyhow::ensure!(
+        !agent_context_path_is_ignored(&normalized, root),
+        "editor tool path is ignored by the workspace"
+    );
+    Ok(normalized)
+}
+
 fn scoped_plugin_storage_key(plugin: &str, key: &str) -> String {
     if plugin == "agent" && matches!(key, "transcript" | "prompt_history") {
         format!("{key}:{}", get_workspace_path().display())
@@ -1304,6 +1365,10 @@ pub enum PluginRequest {
     AgentNewSession {
         cwd: PathBuf,
     },
+    AgentResumeSession {
+        cwd: PathBuf,
+        session_id: String,
+    },
     AgentPrompt {
         session_id: String,
         text: String,
@@ -1323,10 +1388,6 @@ pub enum PluginRequest {
     AgentArchiveSession {
         session_id: String,
     },
-    AgentProposals {
-        session_id: String,
-        request_id: RequestId,
-    },
     GenerateCommitMessage {
         request_id: RequestId,
         cwd: PathBuf,
@@ -1334,15 +1395,8 @@ pub enum PluginRequest {
         staged_diff: String,
         recent_commits: String,
     },
-    AgentAcceptProposal {
+    AgentForgetSession {
         session_id: String,
-        path: PathBuf,
-        hunk_id: Option<String>,
-    },
-    AgentRejectProposal {
-        session_id: String,
-        path: PathBuf,
-        hunk_id: Option<String>,
     },
     AgentPermissionResponse {
         request_id: String,
@@ -1699,15 +1753,14 @@ impl PluginRequest {
         match self {
             Self::Action(_) => "Action",
             Self::AgentNewSession { .. } => "AgentNewSession",
+            Self::AgentResumeSession { .. } => "AgentResumeSession",
             Self::AgentPrompt { .. } => "AgentPrompt",
             Self::AgentPromptWithContext { .. } => "AgentPromptWithContext",
             Self::AgentCancel { .. } => "AgentCancel",
             Self::AgentCloseSession { .. } => "AgentCloseSession",
             Self::AgentArchiveSession { .. } => "AgentArchiveSession",
-            Self::AgentProposals { .. } => "AgentProposals",
             Self::GenerateCommitMessage { .. } => "GenerateCommitMessage",
-            Self::AgentAcceptProposal { .. } => "AgentAcceptProposal",
-            Self::AgentRejectProposal { .. } => "AgentRejectProposal",
+            Self::AgentForgetSession { .. } => "AgentForgetSession",
             Self::AgentPermissionResponse { .. } => "AgentPermissionResponse",
             Self::EditHistory { .. } => "EditHistory",
             Self::EditorInfo(_) => "EditorInfo",
@@ -2565,7 +2618,7 @@ struct StatuslineGitChanges {
 /// Single-task owner of Red's interactive application state.
 ///
 /// The editor coordinates buffers, windows, rendering, LSP, plugins,
-/// persistence, and agent proposals. External tasks communicate through
+/// persistence, and live agent edits. External tasks communicate through
 /// messages; they do not mutate this state directly.
 pub struct Editor {
     /// Domain sub-controller managing open buffers and tab selection.
@@ -2945,20 +2998,7 @@ impl DetachedEditorCore {
             .plugin_registry
             .notify(&mut runtime, "editor:ready", json!({}))
             .await?;
-        if let Some(transcript) = editor
-            .preferences
-            .plugin_storage("agent", &scoped_plugin_storage_key("agent", "transcript"))
-            .and_then(Value::as_str)
-        {
-            editor
-                .plugin_registry
-                .notify(
-                    &mut runtime,
-                    "agent:transcript_restored",
-                    json!({ "transcript": transcript }),
-                )
-                .await?;
-        }
+        editor.restore_agent_plugin_state(&mut runtime).await?;
         editor.ensure_current_buffer_lsp_opened().await?;
         let mut render_buffer = RenderBuffer::new(
             editor.size.0 as usize,
@@ -6466,43 +6506,6 @@ impl Editor {
             .any(|segment| segment.line == buffer_line)
     }
 
-    fn sync_agent_visible_buffers(
-        &self,
-        workspace: &Arc<Mutex<ProposalWorkspace>>,
-    ) -> anyhow::Result<()> {
-        let mut workspace = workspace
-            .lock()
-            .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
-        let root = workspace.root().to_path_buf();
-        let mut skipped = 0;
-        let files = self.buffer_manager.iter().filter_map(|buffer| {
-            let file = buffer.file.as_deref()?;
-            let path = match Path::new(file).absolutize() {
-                Ok(path) => path.to_path_buf(),
-                Err(_) => {
-                    skipped += 1;
-                    return None;
-                }
-            };
-            path.starts_with(&root)
-                .then(|| (path, buffer.revision(), buffer.contents()))
-        });
-        skipped += workspace.replace_visible_files(files)?;
-        if skipped > 0 {
-            log!(
-                "{}",
-                json!({
-                    "event": "agent_visible_buffers_skipped",
-                    "level": "warn",
-                    "service": "red",
-                    "workspace": root,
-                    "count": skipped,
-                })
-            );
-        }
-        Ok(())
-    }
-
     fn agent_context_payload(&self) -> Value {
         const CONTEXT_LINES: usize = 40;
         const MAX_CONTEXT_CHARS: usize = 40_000;
@@ -6511,13 +6514,8 @@ impl Editor {
         let buffer = self.current_buffer();
         let root = self
             .agent_manager
-            .workspace()
-            .and_then(|workspace| {
-                workspace
-                    .lock()
-                    .ok()
-                    .map(|workspace| workspace.root().to_path_buf())
-            })
+            .root()
+            .map(Path::to_path_buf)
             .unwrap_or_else(get_workspace_path);
         let path = buffer.file.as_deref().and_then(|file| {
             Path::new(file)
@@ -6686,21 +6684,14 @@ impl Editor {
             .as_array()
             .cloned()
             .unwrap_or_default();
-        if let Some(workspace) = self.agent_manager.workspace() {
-            if let Ok(workspace) = workspace.lock() {
-                windows.retain(|window| {
-                    window
-                        .get("file")
-                        .and_then(Value::as_str)
-                        .and_then(|path| workspace.resolve_tool_path(path).ok())
-                        .is_some_and(|path| {
-                            !agent_context_path_is_sensitive(&path)
-                                && !agent_context_path_is_ignored(&path, workspace.root())
-                        })
-                });
-            } else {
-                windows.clear();
-            }
+        if let Some(root) = self.agent_manager.root() {
+            windows.retain(|window| {
+                window
+                    .get("file")
+                    .and_then(Value::as_str)
+                    .and_then(|path| resolve_agent_tool_path(root, path).ok())
+                    .is_some()
+            });
         }
         json!({
             "ok": true,
@@ -6715,6 +6706,142 @@ impl Editor {
         })
     }
 
+    async fn open_agent_buffer(
+        &mut self,
+        path: &Path,
+        create: bool,
+        render_buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<Option<usize>> {
+        let normalized = path.absolutize()?.to_path_buf();
+        if let Some(index) = self.buffer_manager.iter().position(|buffer| {
+            buffer.file.as_deref().is_some_and(|file| {
+                Path::new(file)
+                    .absolutize()
+                    .is_ok_and(|candidate| candidate == normalized)
+            })
+        }) {
+            if index != self.buffer_manager.active_index() {
+                self.set_current_buffer(render_buffer, index).await?;
+            }
+            return Ok(Some(index));
+        }
+        if !normalized.exists() && !create {
+            return Ok(None);
+        }
+        let buffer =
+            Buffer::load_or_create(Some(normalized.to_string_lossy().into_owned())).await?;
+        self.buffer_manager.push_buffer(buffer);
+        let index = self.buffer_manager.len() - 1;
+        self.set_current_buffer(render_buffer, index).await?;
+        Ok(Some(index))
+    }
+
+    async fn save_current_agent_buffer(
+        &mut self,
+        root: &Path,
+        path: &Path,
+        runtime: &mut Runtime,
+    ) -> Value {
+        #[cfg(unix)]
+        let result = {
+            let contents = self.current_buffer().contents();
+            crate::lsp::workspace_edit::secure_write_workspace_file(root, path, contents.as_bytes())
+                .map(|()| {
+                    self.current_buffer_mut().mark_saved();
+                    format!(
+                        "{:?} {}L, {}B written",
+                        path.to_string_lossy(),
+                        self.current_buffer().len(),
+                        contents.len()
+                    )
+                })
+                .map_err(anyhow::Error::new)
+        };
+        #[cfg(not(unix))]
+        let result = {
+            let _ = (root, path);
+            self.current_buffer_mut().save()
+        };
+        match result {
+            Ok(message) => {
+                if let Some(file) = self.current_buffer().file.clone() {
+                    let _ = self
+                        .plugin_registry
+                        .notify(
+                            runtime,
+                            "file:saved",
+                            json!({
+                                "file": file,
+                                "buffer_index": self.buffer_manager.active_index(),
+                            }),
+                        )
+                        .await;
+                }
+                json!({ "saved": true, "message": message })
+            }
+            Err(error) => json!({
+                "saved": false,
+                "error": error.to_string(),
+            }),
+        }
+    }
+
+    async fn apply_agent_contents(
+        &mut self,
+        session_id: &str,
+        path: &Path,
+        expected_revision: u64,
+        contents: String,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<Value> {
+        self.open_agent_buffer(path, /*create*/ true, render_buffer)
+            .await?;
+        let current_revision = self.current_buffer().revision();
+        anyhow::ensure!(
+            current_revision == expected_revision,
+            "stale editor revision: expected {expected_revision}, current {current_revision}"
+        );
+        anyhow::ensure!(
+            !contents.contains('\0'),
+            "agent file contents cannot contain NUL bytes"
+        );
+        let turn_id = self
+            .agent_manager
+            .turn_id(session_id)
+            .unwrap_or("unattributed")
+            .to_string();
+        let end = self.current_buffer().char_idx_to_position(usize::MAX);
+        self.begin_transaction_with_origin(
+            format!("agent edit {}", path.display()),
+            EditOrigin::Agent {
+                session_id: session_id.to_string(),
+                turn_id,
+            },
+        );
+        self.replace_range(TextRange::new(TextPosition::new(0, 0), end), &contents);
+        self.commit_transaction(self.cursor_snapshot());
+        let root = self
+            .agent_manager
+            .root()
+            .ok_or_else(|| anyhow::anyhow!("no agent workspace is active"))?
+            .to_path_buf();
+        let notification_error = self.notify_change(runtime).await.err();
+        let persistence = self.save_current_agent_buffer(&root, path, runtime).await;
+        let render_error = self.render(render_buffer).err();
+        let operational_error = notification_error
+            .map(|error| format!("change notification failed: {error}"))
+            .or_else(|| render_error.map(|error| format!("render failed: {error}")));
+        Ok(json!({
+            "ok": persistence["saved"].as_bool().unwrap_or(false) && operational_error.is_none(),
+            "applied": true,
+            "saved": persistence["saved"],
+            "error": persistence.get("error").cloned().filter(|error| !error.is_null()).or_else(|| operational_error.map(Value::String)),
+            "path": path,
+            "revision": self.current_buffer().revision(),
+        }))
+    }
+
     async fn dispatch_agent_editor_tool(
         &mut self,
         request: EditorToolRequest,
@@ -6725,29 +6852,52 @@ impl Editor {
             self.agent_manager.is_session_active(&request.session_id),
             "editor tool references an inactive session"
         );
-        let workspace = self
+        let root = self
             .agent_manager
-            .workspace_cloned()
-            .ok_or_else(|| anyhow::anyhow!("no proposal workspace is active"))?;
-        self.sync_agent_visible_buffers(&workspace)?;
+            .root()
+            .ok_or_else(|| anyhow::anyhow!("no agent workspace is active"))?
+            .to_path_buf();
 
-        let resolve_path = |path: &str| -> anyhow::Result<PathBuf> {
-            let workspace = workspace
-                .lock()
-                .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
-            let path = workspace.resolve_tool_path(path)?;
-            anyhow::ensure!(
-                !agent_context_path_is_sensitive(&path),
-                "editor tool path is a sensitive file"
-            );
-            anyhow::ensure!(
-                !agent_context_path_is_ignored(&path, workspace.root()),
-                "editor tool path is ignored by the workspace"
-            );
-            Ok(path)
-        };
+        let resolve_path =
+            |path: &str| -> anyhow::Result<PathBuf> { resolve_agent_tool_path(&root, path) };
 
         match request.call {
+            EditorToolCall::ReadFile { path } => {
+                let path = resolve_path(&path)?;
+                let exists = path.exists();
+                if self
+                    .open_agent_buffer(&path, /*create*/ false, render_buffer)
+                    .await?
+                    .is_none()
+                {
+                    return Ok(json!({
+                        "content": "",
+                        "revision": 0,
+                        "exists": false,
+                    }));
+                }
+                Ok(json!({
+                    "content": self.current_buffer().contents(),
+                    "revision": self.current_buffer().revision(),
+                    "exists": exists,
+                }))
+            }
+            EditorToolCall::WriteFile {
+                path,
+                expected_revision,
+                content,
+            } => {
+                let path = resolve_path(&path)?;
+                self.apply_agent_contents(
+                    &request.session_id,
+                    &path,
+                    expected_revision,
+                    content,
+                    render_buffer,
+                    runtime,
+                )
+                .await
+            }
             EditorToolCall::GetEditorState {} => Ok(self.agent_editor_state()),
             EditorToolCall::OpenFile {
                 path,
@@ -6859,25 +7009,23 @@ impl Editor {
                 edits,
             } => {
                 let path = resolve_path(&path)?;
-                let (path, hunks) = {
-                    let mut workspace = workspace
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
-                    let hunks = workspace.apply_editor_edits(
-                        &request.session_id,
-                        &path,
-                        expected_revision,
-                        &edits,
-                    )?;
-                    (path, hunks)
-                };
-                Ok(json!({
-                    "ok": true,
-                    "status": "proposal staged for review",
-                    "path": path,
-                    "revision": expected_revision,
-                    "hunks": hunks,
-                }))
+                self.open_agent_buffer(&path, /*create*/ true, render_buffer)
+                    .await?;
+                let current_revision = self.current_buffer().revision();
+                anyhow::ensure!(
+                    current_revision == expected_revision,
+                    "stale editor revision: expected {expected_revision}, current {current_revision}"
+                );
+                let contents = apply_text_edits(&self.current_buffer().contents(), &edits)?;
+                self.apply_agent_contents(
+                    &request.session_id,
+                    &path,
+                    expected_revision,
+                    contents,
+                    render_buffer,
+                    runtime,
+                )
+                .await
             }
             EditorToolCall::RunEditorAction { action } => {
                 let action = match action {
@@ -6896,56 +7044,71 @@ impl Editor {
         }
     }
 
-    fn ensure_codex_bridge(&mut self, cwd: &Path) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !self.config.disable_ai,
-            "agent support is disabled by `disable_ai = true`"
-        );
-        if let Some(workspace) = self.agent_manager.workspace() {
-            let workspace = workspace
-                .lock()
-                .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
-            let cwd = cwd.absolutize()?;
-            anyhow::ensure!(
-                workspace.root() == cwd.as_ref(),
-                "Codex request root `{}` does not match the active proposal workspace `{}`",
-                cwd.display(),
-                workspace.root().display(),
-            );
-        }
-        if self.agent_manager.has_bridge() {
-            return Ok(());
-        }
-        let configured = self.config.agent.command.as_deref().unwrap_or("codex");
-        let command = crate::codex::find_executable(configured).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Codex CLI was not found; install Codex, run `codex login`, and try again"
-            )
-        })?;
-        let workspace = match self.agent_manager.workspace() {
-            Some(workspace) => Arc::clone(workspace),
-            None => Arc::new(Mutex::new(ProposalWorkspace::new(cwd)?)),
+    async fn prepare_agent_follow_step(
+        &mut self,
+        request: &EditorToolRequest,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<Duration> {
+        let Some(root) = self.agent_manager.root().map(Path::to_path_buf) else {
+            anyhow::bail!("no agent workspace is active");
         };
-        self.sync_agent_visible_buffers(&workspace)?;
-        let mut spec = CodexProcessSpec::new(command, cwd).args(self.config.agent.args.clone());
-        spec.environment.extend(
-            self.config
-                .agent
-                .env
-                .clone()
-                .into_iter()
-                .map(|(key, value)| (key.into(), value.into())),
-        );
-        let capacity =
-            NonZeroUsize::new(AGENT_BRIDGE_CAPACITY).expect("agent bridge capacity is non-zero");
-        let (tool_sender, tool_requests) = editor_tool_channel(AGENT_BRIDGE_CAPACITY);
-        let host = ProposalToolHost::new(Arc::clone(&workspace)).with_editor_tools(tool_sender);
-        let (bridge, task) = start_codex(spec, host, capacity)?;
-        self.agent_manager.set_workspace(Some(workspace));
-        self.agent_manager.set_bridge(bridge);
-        self.agent_manager.set_task(task);
-        self.agent_manager.set_tool_requests(tool_requests);
-        Ok(())
+        let (path, position, create, delay) = match &request.call {
+            EditorToolCall::ReadFile { path } => {
+                (Some(path.as_str()), None, false, Duration::from_millis(300))
+            }
+            EditorToolCall::WriteFile { path, .. } => {
+                (Some(path.as_str()), None, true, Duration::from_millis(700))
+            }
+            EditorToolCall::ApplyEdits { path, edits, .. } => (
+                Some(path.as_str()),
+                edits.first().map(|edit| edit.start),
+                true,
+                Duration::from_millis(700),
+            ),
+            EditorToolCall::OpenFile {
+                path,
+                line,
+                character,
+                ..
+            } => (
+                Some(path.as_str()),
+                Some(crate::agent_tools::EditorPosition {
+                    line: *line,
+                    character: *character,
+                }),
+                false,
+                Duration::from_millis(300),
+            ),
+            EditorToolCall::SelectText { path, start, .. } => (
+                Some(path.as_str()),
+                Some(*start),
+                false,
+                Duration::from_millis(300),
+            ),
+            EditorToolCall::GetEditorState {} | EditorToolCall::RunEditorAction { .. } => {
+                (None, None, false, Duration::ZERO)
+            }
+        };
+        let Some(path) = path else {
+            return Ok(delay);
+        };
+        let path = resolve_agent_tool_path(&root, path)?;
+        if self
+            .open_agent_buffer(&path, create, render_buffer)
+            .await?
+            .is_none()
+        {
+            return Ok(delay);
+        }
+        if let Some(position) = position {
+            let line = self.current_buffer().get(position.line).unwrap_or_default();
+            let x = utf16_to_grapheme(line.trim_end_matches(['\r', '\n']), position.character);
+            self.execute(&Action::SetCursor(x, position.line), render_buffer, runtime)
+                .await?;
+        }
+        self.render(render_buffer)?;
+        Ok(delay)
     }
 
     async fn dispatch_agent_prompt(
@@ -6992,22 +7155,10 @@ impl Editor {
             return Ok(true);
         }
         let turn_id = uuid::Uuid::new_v4().to_string();
-        if let Some(workspace) = self.agent_manager.workspace_cloned() {
-            if let Err(error) = self.sync_agent_visible_buffers(&workspace) {
-                self.plugin_registry
-                    .notify(
-                        runtime,
-                        "agent:error",
-                        json!({ "session_id": session_id, "message": error.to_string() }),
-                    )
-                    .await?;
-                return Ok(false);
-            }
-            workspace
-                .lock()
-                .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?
-                .begin_turn(&session_id, turn_id.clone());
-        }
+        self.agent_manager
+            .set_turn_id(session_id.clone(), turn_id.clone());
+        self.agent_manager
+            .record_user_message(&session_id, &turn_id, &text);
         self.plugin_registry
             .notify(
                 runtime,
@@ -7049,278 +7200,6 @@ impl Editor {
                 .await?;
         }
         Ok(false)
-    }
-
-    fn agent_file_state(
-        &self,
-        workspace: &ProposalWorkspace,
-        path: &Path,
-    ) -> anyhow::Result<(u64, String)> {
-        let normalized = path.absolutize()?.to_path_buf();
-        if let Some(buffer) = self.buffer_manager.iter().find(|buffer| {
-            buffer.file.as_deref().is_some_and(|file| {
-                Path::new(file)
-                    .absolutize()
-                    .is_ok_and(|candidate| candidate == normalized)
-            })
-        }) {
-            return Ok((buffer.revision(), buffer.contents()));
-        }
-        Ok((
-            0,
-            workspace
-                .read_current_file(&normalized)?
-                .unwrap_or_default(),
-        ))
-    }
-
-    fn agent_proposals_payload(&mut self, session_id: &str) -> anyhow::Result<Value> {
-        let Some(workspace) = self.agent_manager.workspace_cloned() else {
-            self.gutter_sign_manager.clear("agent-proposals");
-            self.decoration_manager.clear("agent-proposals");
-            return Ok(json!({ "files": [] }));
-        };
-        self.sync_agent_visible_buffers(&workspace)?;
-        let mut workspace = workspace
-            .lock()
-            .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
-        workspace.adopt_recovered_sessions(session_id);
-        let mut files = Vec::new();
-        let mut signs = Vec::new();
-        let mut decorations = Vec::new();
-        for proposal_session in workspace.review_sessions(session_id) {
-            for path in workspace.pending_files(&proposal_session) {
-                let (revision, contents) = match self.agent_file_state(&workspace, &path) {
-                    Ok(state) => state,
-                    Err(_) => {
-                        files.push(json!({
-                            "session_id": proposal_session,
-                            "path": path,
-                            "revision": 0,
-                            "conflict": true,
-                            "message": "Unable to review this agent proposal safely; pending changes were left intact",
-                            "hunks": [],
-                        }));
-                        continue;
-                    }
-                };
-                match workspace.hunks(&proposal_session, &path, &contents) {
-                    Ok(hunks) => {
-                        if let Some(buffer_index) = self.buffer_manager.iter().position(|buffer| {
-                            buffer.file.as_deref().is_some_and(|file| {
-                                Path::new(file)
-                                    .absolutize()
-                                    .is_ok_and(|candidate| candidate == path)
-                            })
-                        }) {
-                            for hunk in &hunks {
-                                let line = self.buffer_manager[buffer_index]
-                                    .char_idx_to_position(hunk.old_start)
-                                    .line;
-                                signs.push(plugin::GutterSign {
-                                    buffer_index,
-                                    line,
-                                    text: "A".to_string(),
-                                    style: Style::default(),
-                                    priority: 50,
-                                });
-                                let preview = hunk.new_text.lines().next().unwrap_or_default();
-                                decorations.push(plugin::Decoration {
-                                    buffer_index: Some(buffer_index),
-                                    anchor: plugin::DecorationAnchor::Eol,
-                                    line,
-                                    column: 0,
-                                    text: format!("  + {}", char_prefix(preview, 80)),
-                                    style: Style::default(),
-                                    priority: 50,
-                                    repeat_linebreak: false,
-                                    only_whitespace: false,
-                                });
-                            }
-                        }
-                        files.push(json!({
-                            "session_id": proposal_session,
-                            "path": path,
-                            "revision": revision,
-                            "conflict": false,
-                            "hunks": hunks,
-                        }));
-                    }
-                    Err(error) => {
-                        if let Some(buffer_index) = self.buffer_manager.iter().position(|buffer| {
-                            buffer.file.as_deref().is_some_and(|file| {
-                                Path::new(file)
-                                    .absolutize()
-                                    .is_ok_and(|candidate| candidate == path)
-                            })
-                        }) {
-                            signs.push(plugin::GutterSign {
-                                buffer_index,
-                                line: 0,
-                                text: "!".to_string(),
-                                style: Style::default(),
-                                priority: 60,
-                            });
-                        }
-                        files.push(json!({
-                            "session_id": proposal_session,
-                            "path": path,
-                            "revision": revision,
-                            "conflict": true,
-                            "message": error.to_string(),
-                            "hunks": [],
-                        }));
-                    }
-                }
-            }
-        }
-        drop(workspace);
-        self.gutter_sign_manager
-            .set("agent-proposals".to_string(), signs);
-        self.decoration_manager
-            .set("agent-proposals".to_string(), decorations);
-        Ok(json!({ "files": files }))
-    }
-
-    async fn apply_agent_disposition(
-        &mut self,
-        acceptance: StagedProposalAcceptance,
-        render_buffer: &mut RenderBuffer,
-        runtime: &mut Runtime,
-    ) -> anyhow::Result<()> {
-        match acceptance.disposition().clone() {
-            ProposalDisposition::Applied {
-                path,
-                contents,
-                current_contents,
-                session_id,
-                turn_id,
-                created,
-                ..
-            } => {
-                let normalized = path.absolutize()?.to_path_buf();
-                let index = self.buffer_manager.iter().position(|buffer| {
-                    buffer.file.as_deref().is_some_and(|file| {
-                        Path::new(file)
-                            .absolutize()
-                            .is_ok_and(|candidate| candidate == normalized)
-                    })
-                });
-                let index = if let Some(index) = index {
-                    index
-                } else {
-                    self.buffer_manager.push_buffer(Buffer::new(
-                        Some(normalized.to_string_lossy().into_owned()),
-                        current_contents,
-                    ));
-                    self.buffer_manager.len() - 1
-                };
-                if index != self.buffer_manager.active_index() {
-                    self.set_current_buffer(render_buffer, index).await?;
-                }
-                self.commit_agent_acceptance(acceptance)?;
-                let end = self.current_buffer().char_idx_to_position(usize::MAX);
-                self.begin_transaction_with_origin(
-                    "accept agent proposal",
-                    EditOrigin::Agent {
-                        session_id: session_id.clone(),
-                        turn_id: turn_id.clone(),
-                    },
-                );
-                self.replace_range(
-                    TextRange::new(TextPosition::new(/*line*/ 0, /*character*/ 0), end),
-                    &contents,
-                );
-                self.commit_transaction(self.cursor_snapshot());
-                if let Err(error) = self.notify_change(runtime).await {
-                    self.warn_agent_proposal_post_apply("buffer_changed", &error.to_string());
-                }
-                if let Err(error) = self.render(render_buffer) {
-                    self.warn_agent_proposal_post_apply("render", &error.to_string());
-                }
-                if let Some(workspace) = self.agent_manager.workspace_cloned() {
-                    if let Err(error) = self.sync_agent_visible_buffers(&workspace) {
-                        self.warn_agent_proposal_post_apply("workspace_sync", &error.to_string());
-                    }
-                }
-                if let Err(error) = self
-                    .plugin_registry
-                    .notify(
-                        runtime,
-                        "agent:proposal_applied",
-                        json!({
-                            "session_id": session_id,
-                            "turn_id": turn_id,
-                            "path": path,
-                            "created": created,
-                        }),
-                    )
-                    .await
-                {
-                    self.warn_agent_proposal_post_apply("plugin_notification", &error.to_string());
-                }
-            }
-            ProposalDisposition::Conflict {
-                path,
-                base,
-                current,
-                proposed,
-            } => {
-                self.commit_agent_acceptance(acceptance)?;
-                self.plugin_registry
-                    .notify(
-                        runtime,
-                        "agent:proposal_conflict",
-                        json!({
-                            "path": path,
-                            "base": base,
-                            "current": current,
-                            "proposed": proposed,
-                        }),
-                    )
-                    .await?;
-            }
-            ProposalDisposition::NoChanges => {
-                self.commit_agent_acceptance(acceptance)?;
-                self.plugin_registry
-                    .notify(runtime, "agent:proposal_unchanged", json!({}))
-                    .await?;
-            }
-        }
-        Ok(())
-    }
-
-    fn warn_agent_proposal_post_apply(&mut self, stage: &str, error: &str) {
-        log!(
-            "{}",
-            json!({
-                "event": "agent_proposal_notification_failed",
-                "level": "warn",
-                "service": "red",
-                "stage": stage,
-                "error": error,
-            })
-        );
-        let action = match stage {
-            "buffer_changed" => "change notification",
-            "workspace_sync" => "workspace sync",
-            "plugin_notification" => "plugin notification",
-            other => other,
-        };
-        self.last_error = Some(format!(
-            "Agent proposal applied, but {action} failed: {error}"
-        ));
-    }
-
-    fn commit_agent_acceptance(&self, acceptance: StagedProposalAcceptance) -> anyhow::Result<()> {
-        let workspace = self
-            .agent_manager
-            .workspace()
-            .ok_or_else(|| anyhow::anyhow!("no proposal workspace is active"))?;
-        workspace
-            .lock()
-            .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?
-            .commit_acceptance(acceptance)
     }
 
     /// Starts the main editor loop
@@ -7368,19 +7247,7 @@ impl Editor {
             self.plugin_registry
                 .notify(&mut runtime, "editor:ready", json!({}))
                 .await?;
-            if let Some(transcript) = self
-                .preferences
-                .plugin_storage("agent", &scoped_plugin_storage_key("agent", "transcript"))
-                .and_then(Value::as_str)
-            {
-                self.plugin_registry
-                    .notify(
-                        &mut runtime,
-                        "agent:transcript_restored",
-                        json!({ "transcript": transcript }),
-                    )
-                    .await?;
-            }
+            self.restore_agent_plugin_state(&mut runtime).await?;
             drop(plugin_startup);
         }
 
@@ -7501,6 +7368,83 @@ impl Editor {
         self.agent_manager.clear_active_sessions();
         self.agent_manager.clear_turns();
         self.agent_manager.clear_tool_requests();
+        self.agent_manager.set_root(None);
+    }
+
+    fn ensure_agent_bridge(&mut self, cwd: &Path) -> anyhow::Result<()> {
+        if self.config.disable_ai {
+            anyhow::bail!("agent support is disabled by `disable_ai = true`");
+        }
+        let cwd = cwd.absolutize()?.into_owned();
+        if let Some(root) = self.agent_manager.root() {
+            anyhow::ensure!(
+                root == cwd,
+                "Codex session root `{}` does not match the active agent workspace `{}`",
+                cwd.display(),
+                root.display()
+            );
+        }
+        if self.agent_manager.has_bridge() {
+            return Ok(());
+        }
+        let configured = self.config.agent.command.as_deref().unwrap_or("codex");
+        let command = crate::codex::find_executable(configured).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Codex CLI was not found; install Codex, run `codex login`, and try again"
+            )
+        })?;
+        let mut spec =
+            CodexProcessSpec::new(command, cwd.clone()).args(self.config.agent.args.clone());
+        spec.environment.extend(
+            self.config
+                .agent
+                .env
+                .clone()
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into())),
+        );
+        let capacity =
+            NonZeroUsize::new(AGENT_BRIDGE_CAPACITY).expect("agent bridge capacity is non-zero");
+        let (tool_sender, tool_requests) = editor_tool_channel(AGENT_BRIDGE_CAPACITY);
+        let host = EditorToolHost::new(tool_sender);
+        let (bridge, task) = start_codex(spec, host, capacity)?;
+        self.agent_manager.set_root(Some(cwd));
+        self.agent_manager.set_bridge(bridge);
+        self.agent_manager.set_task(task);
+        self.agent_manager.set_tool_requests(tool_requests);
+        Ok(())
+    }
+
+    async fn restore_agent_plugin_state(&mut self, runtime: &mut Runtime) -> anyhow::Result<()> {
+        if let Some(conversation) = self.agent_manager.conversation_snapshot() {
+            let event = if self.agent_manager.has_bridge() {
+                "agent:session_restored"
+            } else {
+                "agent:conversation_restore_pending"
+            };
+            self.plugin_registry
+                .notify(
+                    runtime,
+                    event,
+                    plugin_json(serde_json::to_value(conversation)?),
+                )
+                .await?;
+            return Ok(());
+        }
+        if let Some(transcript) = self
+            .preferences
+            .plugin_storage("agent", &scoped_plugin_storage_key("agent", "transcript"))
+            .and_then(Value::as_str)
+        {
+            self.plugin_registry
+                .notify(
+                    runtime,
+                    "agent:transcript_restored",
+                    json!({ "transcript": transcript }),
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     async fn finish_agent_bridge(&mut self, fallback: &str) -> String {
@@ -7512,6 +7456,7 @@ impl Editor {
         self.agent_manager.clear_active_sessions();
         self.agent_manager.clear_turns();
         self.agent_manager.clear_tool_requests();
+        self.agent_manager.set_root(None);
 
         let message = match result {
             Some(Ok(Err(error))) => {
@@ -7533,15 +7478,48 @@ impl Editor {
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
-        for _ in 0..AGENT_EVENTS_PER_TICK {
-            let Some(pending) = self.agent_manager.try_recv_tool_request() else {
-                break;
+        if let Some(completed) = self
+            .agent_manager
+            .take_ready_playback_response(Instant::now())
+        {
+            let _ = completed.response.send(completed.result);
+        }
+        if !self.agent_manager.has_playback_work() {
+            if let Some(pending) = self.agent_manager.try_recv_tool_request() {
+                match self
+                    .prepare_agent_follow_step(&pending.request, buffer, runtime)
+                    .await
+                {
+                    Ok(delay) => self
+                        .agent_manager
+                        .stage_playback_tool(pending, Instant::now() + delay),
+                    Err(error) => {
+                        let _ = pending.response.send(Err(error.to_string()));
+                    }
+                }
+            }
+        }
+        if let Some(pending) = self.agent_manager.take_ready_playback_tool(Instant::now()) {
+            let post_delay = if pending.request.call.is_edit() {
+                Duration::from_millis(700)
+            } else {
+                Duration::ZERO
             };
             let result = self
                 .dispatch_agent_editor_tool(pending.request, buffer, runtime)
                 .await
                 .map_err(|error| error.to_string());
-            let _ = pending.response.send(result);
+            if post_delay.is_zero() {
+                let _ = pending.response.send(result);
+            } else {
+                self.agent_manager.stage_playback_response(
+                    PendingEditorToolResponse {
+                        response: pending.response,
+                        result,
+                    },
+                    Instant::now() + post_delay,
+                );
+            }
         }
 
         // Poll for timer callbacks
@@ -7570,7 +7548,6 @@ impl Editor {
         }
         self.plugin_registry.poll_hot_reload(runtime).await;
 
-        let mut proposal_sessions = Vec::new();
         for _ in 0..AGENT_EVENTS_PER_TICK {
             let Some(event) = self
                 .agent_manager
@@ -7579,16 +7556,66 @@ impl Editor {
             else {
                 break;
             };
-            if let CodexEvent::CommitMessageGenerated { request_id, result } = event {
-                self.agent_manager.finish_commit_message(request_id);
+            if let CodexEvent::CommitMessageGenerated { request_id, result } = &event {
+                self.agent_manager.finish_commit_message(*request_id);
                 let payload = match result {
                     Ok(message) => json!({ "message": message, "error": "" }),
                     Err(error) => json!({ "message": "", "error": error }),
                 };
                 self.plugin_registry
-                    .resolve_request(runtime, RequestId::from_raw(request_id), payload)
+                    .resolve_request(runtime, RequestId::from_raw(*request_id), payload)
                     .await?;
                 continue;
+            }
+            match &event {
+                CodexEvent::SessionCreated { session_id } => {
+                    let root = self
+                        .agent_manager
+                        .root()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_default();
+                    self.agent_manager.begin_conversation(session_id, &root);
+                }
+                CodexEvent::SessionRestored { session_id, thread } => {
+                    if self.agent_manager.take_forgotten_conversation(session_id) {
+                        if let Some(bridge) = self.agent_manager.bridge() {
+                            let _ = bridge.try_send(CodexCommand::CloseSession {
+                                session_id: session_id.clone(),
+                            });
+                        }
+                        continue;
+                    }
+                    let root = self
+                        .agent_manager
+                        .root()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_default();
+                    let conversation = self
+                        .agent_manager
+                        .reconcile_conversation(session_id, &root, thread)
+                        .cloned();
+                    if let Some(conversation) = conversation {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:session_restored",
+                                plugin_json(serde_json::to_value(conversation)?),
+                            )
+                            .await?;
+                    }
+                    continue;
+                }
+                CodexEvent::Update { session_id, text }
+                    if self.agent_manager.is_session_active(session_id) =>
+                {
+                    self.agent_manager.record_agent_delta(session_id, text);
+                }
+                CodexEvent::MessageCompleted { session_id, text }
+                    if self.agent_manager.is_session_active(session_id) =>
+                {
+                    self.agent_manager.complete_agent_message(session_id, text);
+                }
+                _ => {}
             }
             if let CodexEvent::Completed { session_id, .. }
             | CodexEvent::Failed {
@@ -7599,7 +7626,9 @@ impl Editor {
                 self.agent_manager.mark_session_inactive(session_id);
             }
             match &event {
-                CodexEvent::Update { session_id, .. } | CodexEvent::Activity { session_id, .. }
+                CodexEvent::Update { session_id, .. }
+                | CodexEvent::MessageCompleted { session_id, .. }
+                | CodexEvent::Activity { session_id, .. }
                     if !self.agent_manager.is_session_active(session_id) =>
                 {
                     continue;
@@ -7618,19 +7647,6 @@ impl Editor {
                     continue;
                 }
                 _ => {}
-            }
-            if let CodexEvent::Update { session_id, .. }
-            | CodexEvent::Activity { session_id, .. }
-            | CodexEvent::Completed { session_id, .. }
-            | CodexEvent::ProposalsChanged { session_id } = &event
-            {
-                let session_id = session_id.to_string();
-                if !proposal_sessions.contains(&session_id) {
-                    proposal_sessions.push(session_id);
-                }
-            }
-            if matches!(event, CodexEvent::ProposalsChanged { .. }) {
-                continue;
             }
             let turn_elapsed_ms = match &event {
                 CodexEvent::Completed { session_id, .. } => self
@@ -7652,15 +7668,6 @@ impl Editor {
             }
             self.plugin_registry.notify(runtime, name, payload).await?;
         }
-        for session_id in proposal_sessions {
-            self.plugin_registry
-                .notify(
-                    runtime,
-                    "agent:proposals_changed",
-                    json!({ "session_id": session_id }),
-                )
-                .await?;
-        }
         if self.agent_manager.is_task_finished()
             && self
                 .agent_manager
@@ -7680,9 +7687,20 @@ impl Editor {
                     )
                     .await?;
             }
-            self.plugin_registry
-                .notify(runtime, "agent:session_lost", json!({ "message": message }))
-                .await?;
+            if let Some(conversation) = self.agent_manager.conversation_snapshot() {
+                self.plugin_registry
+                    .notify(
+                        runtime,
+                        "agent:conversation_restore_pending",
+                        plugin_json(serde_json::to_value(conversation)?),
+                    )
+                    .await?;
+                self.last_error = Some(format!("{message}; restoring the persisted agent session"));
+            } else {
+                self.plugin_registry
+                    .notify(runtime, "agent:session_lost", json!({ "message": message }))
+                    .await?;
+            }
         }
 
         let completion_changed = if self
@@ -7757,7 +7775,6 @@ impl Editor {
         // single render at the end of the tick instead of one per item.
         let mut needs_render = false;
         let mut needs_motion_render = false;
-        let mut agent_proposal_applied = false;
 
         // Always pump LSP responses. `recv_response` completes the
         // initialize handshake and flushes queued didOpen/change
@@ -7815,8 +7832,7 @@ impl Editor {
                             .notify(runtime, "agent:session_lost", json!({ "message": message }))
                             .await?;
                     }
-                    let result = self.ensure_codex_bridge(&cwd);
-                    if let Err(error) = result {
+                    if let Err(error) = self.ensure_agent_bridge(&cwd) {
                         self.plugin_registry
                             .notify(
                                 runtime,
@@ -7837,6 +7853,50 @@ impl Editor {
                             .await;
                         self.plugin_registry
                             .notify(runtime, "agent:session_lost", json!({ "message": message }))
+                            .await?;
+                    }
+                }
+                PluginRequest::AgentResumeSession { cwd, session_id } => {
+                    if self.agent_manager.is_task_finished() {
+                        let _ = self
+                            .finish_agent_bridge("Codex app-server stopped before restoration")
+                            .await;
+                    }
+                    if let Err(error) = self.ensure_agent_bridge(&cwd) {
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:session_restore_failed",
+                                json!({
+                                    "session_id": session_id,
+                                    "message": error.to_string()
+                                }),
+                            )
+                            .await?;
+                        continue;
+                    }
+                    let Some(bridge) = self.agent_manager.bridge() else {
+                        continue;
+                    };
+                    if bridge
+                        .send(CodexCommand::ResumeSession {
+                            cwd,
+                            session_id: session_id.clone(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        let message = self
+                            .finish_agent_bridge(
+                                "Codex app-server stopped while restoring the session",
+                            )
+                            .await;
+                        self.plugin_registry
+                            .notify(
+                                runtime,
+                                "agent:session_restore_failed",
+                                json!({ "session_id": session_id, "message": message }),
+                            )
                             .await?;
                     }
                 }
@@ -7881,12 +7941,6 @@ impl Editor {
                 }
                 PluginRequest::AgentCloseSession { session_id } => {
                     self.agent_manager.mark_session_inactive(&session_id);
-                    if let Some(workspace) = self.agent_manager.workspace() {
-                        workspace
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?
-                            .archive_session(&session_id);
-                    }
                     let Some(bridge) = self.agent_manager.bridge() else {
                         continue;
                     };
@@ -7906,31 +7960,10 @@ impl Editor {
                 }
                 PluginRequest::AgentArchiveSession { session_id } => {
                     self.agent_manager.mark_session_inactive(&session_id);
-                    if let Some(workspace) = self.agent_manager.workspace() {
-                        workspace
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?
-                            .archive_session(&session_id);
-                    }
                 }
-                PluginRequest::AgentProposals {
-                    session_id,
-                    request_id,
-                } => {
-                    let mut payload = match self.agent_proposals_payload(&session_id) {
-                        Ok(payload) => payload,
-                        Err(_) => {
-                            let message =
-                                "Unable to review agent proposals safely; pending changes were left intact";
-                            self.last_error = Some(message.to_string());
-                            needs_render = true;
-                            json!({ "files": [], "error": message })
-                        }
-                    };
-                    payload["request_id"] = json!(request_id.get());
-                    self.plugin_registry
-                        .resolve_request(runtime, request_id, payload)
-                        .await?;
+                PluginRequest::AgentForgetSession { session_id } => {
+                    self.agent_manager.mark_session_inactive(&session_id);
+                    self.agent_manager.forget_conversation(&session_id);
                 }
                 PluginRequest::GenerateCommitMessage {
                     request_id,
@@ -7948,7 +7981,7 @@ impl Editor {
                                     .finish_agent_bridge("Codex app-server stopped unexpectedly")
                                     .await;
                             }
-                            self.ensure_codex_bridge(&get_workspace_path())
+                            self.ensure_agent_bridge(&get_workspace_path())
                                 .and_then(|()| {
                                     let bridge = self.agent_manager.bridge().ok_or_else(|| {
                                         anyhow::anyhow!("Codex app-server did not start")
@@ -7973,106 +8006,6 @@ impl Editor {
                         self.agent_manager
                             .mark_commit_message_pending(request_id.get());
                     }
-                }
-                PluginRequest::AgentAcceptProposal {
-                    session_id,
-                    path,
-                    hunk_id,
-                } => {
-                    let acceptance = (|| -> anyhow::Result<_> {
-                        let workspace = self
-                            .agent_manager
-                            .workspace_cloned()
-                            .ok_or_else(|| anyhow::anyhow!("no proposal workspace is active"))?;
-                        self.sync_agent_visible_buffers(&workspace)?;
-                        let workspace = workspace
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
-                        let (revision, contents) = self.agent_file_state(&workspace, &path)?;
-                        Ok(if let Some(hunk_id) = hunk_id.as_deref() {
-                            workspace.stage_accept_hunk(
-                                &session_id,
-                                &path,
-                                hunk_id,
-                                revision,
-                                &contents,
-                            )?
-                        } else {
-                            workspace.stage_accept_all(&session_id, &path, revision, &contents)?
-                        })
-                    })();
-                    let acceptance = match acceptance {
-                        Ok(acceptance) => acceptance,
-                        Err(_) => {
-                            self.last_error = Some(
-                                "Unable to accept agent proposal safely; pending changes were left intact"
-                                    .to_string(),
-                            );
-                            needs_render = true;
-                            continue;
-                        }
-                    };
-                    let applied = matches!(
-                        acceptance.disposition(),
-                        ProposalDisposition::Applied { .. }
-                    );
-                    if self
-                        .apply_agent_disposition(acceptance, buffer, runtime)
-                        .await
-                        .is_err()
-                    {
-                        self.last_error = Some(
-                            "Unable to accept agent proposal safely; pending changes were left intact"
-                                .to_string(),
-                        );
-                        needs_render = true;
-                        continue;
-                    }
-                    agent_proposal_applied |= applied;
-                }
-                PluginRequest::AgentRejectProposal {
-                    session_id,
-                    path,
-                    hunk_id,
-                } => {
-                    let rejected = (|| -> anyhow::Result<()> {
-                        let workspace = self
-                            .agent_manager
-                            .workspace_cloned()
-                            .ok_or_else(|| anyhow::anyhow!("no proposal workspace is active"))?;
-                        self.sync_agent_visible_buffers(&workspace)?;
-                        let mut workspace = workspace
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
-                        let (revision, contents) = self.agent_file_state(&workspace, &path)?;
-                        if let Some(hunk_id) = hunk_id.as_deref() {
-                            workspace.reject_hunk(
-                                &session_id,
-                                &path,
-                                hunk_id,
-                                revision,
-                                &contents,
-                            )?;
-                        } else {
-                            workspace.reject_all(&session_id, &path, revision, &contents)?;
-                        }
-                        Ok(())
-                    })();
-                    if rejected.is_err() {
-                        self.last_error = Some(
-                            "Unable to reject agent proposal safely; pending changes were left intact"
-                                .to_string(),
-                        );
-                        needs_render = true;
-                        continue;
-                    }
-                    self.plugin_registry
-                        .notify(
-                            runtime,
-                            "agent:proposals_changed",
-                            json!({ "session_id": session_id }),
-                        )
-                        .await?;
                 }
                 PluginRequest::AgentPermissionResponse {
                     request_id,
@@ -9277,13 +9210,7 @@ impl Editor {
             }
         }
         if needs_render {
-            if let Err(error) = self.render(buffer) {
-                if agent_proposal_applied {
-                    self.warn_agent_proposal_post_apply("render", &error.to_string());
-                } else {
-                    return Err(error);
-                }
-            }
+            self.render(buffer)?;
         } else if needs_motion_render {
             self.render_motion_frame(buffer)?;
         }
@@ -21404,12 +21331,11 @@ impl Editor {
                 },
             );
         }
-        self.agent_manager.set_workspace(
-            snapshot
-                .agent_workspace
-                .clone()
-                .map(|workspace| Arc::new(Mutex::new(ProposalWorkspace::from_snapshot(workspace)))),
-        );
+        self.agent_manager
+            .set_root(Some(PathBuf::from(snapshot.cwd.clone())));
+        if let Some(conversation) = snapshot.agent_conversation.clone() {
+            self.agent_manager.restore_conversation(conversation);
+        }
         if let Err(error) = self
             .preferences
             .merge_plugin_storage_snapshot(&snapshot.plugin_extensions)
@@ -21479,7 +21405,7 @@ impl Editor {
             } else {
                 true
             };
-            if !snapshot.agent_session_resumable {
+            if snapshot.agent_conversation.is_none() && !snapshot.agent_session_resumable {
                 self.last_error = Some(if transcript_persisted {
                     "Recovered agent transcript as archived context; start a new session to continue"
                         .to_string()
@@ -21644,15 +21570,13 @@ impl Editor {
                 })
             })
             .collect();
-        let agent_workspace = self
-            .agent_manager
-            .workspace()
-            .and_then(|workspace| workspace.lock().ok().map(|workspace| workspace.snapshot()));
         let agent_transcript = self
             .preferences
             .plugin_storage("agent", &scoped_plugin_storage_key("agent", "transcript"))
             .and_then(Value::as_str)
             .map(str::to_string);
+        let agent_conversation = self.agent_manager.conversation_snapshot();
+        let agent_session_resumable = agent_conversation.is_some();
 
         (
             SessionSnapshot {
@@ -21679,8 +21603,9 @@ impl Editor {
                 special_marks,
                 last_visual_selections,
                 agent_transcript,
-                agent_workspace,
-                agent_session_resumable: false,
+                agent_conversation,
+                legacy_agent_workspace: None,
+                agent_session_resumable,
                 plugin_extensions: self.preferences.plugin_storage_snapshot(),
                 legacy_extensions: std::collections::BTreeMap::new(),
             },
@@ -21724,15 +21649,7 @@ impl Editor {
             return warning_changed;
         }
         self.session_manager.mark_snapshot_taken();
-        let snapshot_generation = (
-            self.render_generation,
-            self.agent_manager.workspace().and_then(|workspace| {
-                workspace
-                    .lock()
-                    .ok()
-                    .map(|workspace| workspace.generation())
-            }),
-        );
+        let snapshot_generation = (self.render_generation, None);
         if !force
             && self
                 .session_manager
@@ -24341,8 +24258,8 @@ impl Editor {
     }
 
     #[doc(hidden)]
-    pub fn test_set_agent_workspace(&mut self, workspace: Arc<Mutex<ProposalWorkspace>>) {
-        self.agent_manager.set_workspace(Some(workspace));
+    pub fn test_set_agent_root(&mut self, root: impl Into<PathBuf>) {
+        self.agent_manager.set_root(Some(root.into()));
     }
 
     #[doc(hidden)]
@@ -24363,71 +24280,10 @@ impl Editor {
     }
 
     #[doc(hidden)]
-    pub fn test_agent_proposals_payload(&mut self, session_id: &str) -> anyhow::Result<Value> {
-        self.agent_proposals_payload(session_id)
-    }
-
-    #[doc(hidden)]
     pub fn test_agent_gutter_sign(&self, line: usize) -> Option<&str> {
         self.gutter_sign_manager
             .visible_sign(self.buffer_manager.active_index(), line)
             .map(|sign| sign.text.as_str())
-    }
-
-    #[doc(hidden)]
-    pub async fn test_accept_agent_proposal(
-        &mut self,
-        session_id: &str,
-        path: &Path,
-        hunk_id: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let workspace = self
-            .agent_manager
-            .workspace_cloned()
-            .ok_or_else(|| anyhow::anyhow!("no proposal workspace is active"))?;
-        self.sync_agent_visible_buffers(&workspace)?;
-        let acceptance = {
-            let workspace = workspace
-                .lock()
-                .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
-            let (revision, contents) = self.agent_file_state(&workspace, path)?;
-            if let Some(hunk_id) = hunk_id {
-                workspace.stage_accept_hunk(session_id, path, hunk_id, revision, &contents)?
-            } else {
-                workspace.stage_accept_all(session_id, path, revision, &contents)?
-            }
-        };
-        let mut render_buffer = RenderBuffer::new(
-            self.size.0 as usize,
-            self.size.1 as usize,
-            &Style::default(),
-        );
-        let mut runtime = Runtime::new();
-        self.apply_agent_disposition(acceptance, &mut render_buffer, &mut runtime)
-            .await
-    }
-
-    #[doc(hidden)]
-    pub fn test_reject_agent_proposal(
-        &mut self,
-        session_id: &str,
-        path: &Path,
-        hunk_id: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let workspace = self
-            .agent_manager
-            .workspace_cloned()
-            .ok_or_else(|| anyhow::anyhow!("no proposal workspace is active"))?;
-        self.sync_agent_visible_buffers(&workspace)?;
-        let mut workspace = workspace
-            .lock()
-            .map_err(|_| anyhow::anyhow!("proposal workspace lock is poisoned"))?;
-        let (revision, contents) = self.agent_file_state(&workspace, path)?;
-        if let Some(hunk_id) = hunk_id {
-            workspace.reject_hunk(session_id, path, hunk_id, revision, &contents)
-        } else {
-            workspace.reject_all(session_id, path, revision, &contents)
-        }
     }
 
     #[doc(hidden)]
@@ -25088,9 +24944,9 @@ mod test {
             Some(path.to_string_lossy().into_owned()),
             "first\nselected value\nlast\n".to_string(),
         )]);
-        editor.agent_manager.set_workspace(Some(Arc::new(Mutex::new(
-            ProposalWorkspace::new(root.path()).unwrap(),
-        ))));
+        editor
+            .agent_manager
+            .set_root(Some(root.path().to_path_buf()));
         editor.mode = Mode::Visual;
         editor.selection = Some(Rect::new(
             /*x0*/ 0, /*y0*/ 1, /*x1*/ 7, /*y1*/ 1,
@@ -25133,8 +24989,6 @@ mod test {
         std::fs::write(root.path().join(".gitignore"), "ignored.txt\n").unwrap();
         std::fs::create_dir_all(root.path().join(".git/info")).unwrap();
         std::fs::write(root.path().join(".git/info/exclude"), "excluded.txt\n").unwrap();
-        let workspace = Arc::new(Mutex::new(ProposalWorkspace::new(root.path()).unwrap()));
-
         for (path, contents, reason) in [
             (
                 root.path().join(".env.local"),
@@ -25165,7 +25019,7 @@ mod test {
             )]);
             editor
                 .agent_manager
-                .set_workspace(Some(Arc::clone(&workspace)));
+                .set_root(Some(root.path().to_path_buf()));
 
             let context = editor.agent_context_payload();
 
@@ -25193,7 +25047,7 @@ mod test {
             )]);
             editor
                 .agent_manager
-                .set_workspace(Some(Arc::clone(&workspace)));
+                .set_root(Some(root.path().to_path_buf()));
 
             let context = editor.agent_context_payload();
 
@@ -25204,6 +25058,60 @@ mod test {
                 .unwrap()
                 .contains("linked outside contents"));
         }
+    }
+
+    #[tokio::test]
+    async fn agent_follow_reveals_the_edit_location_before_its_mandatory_dwell() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first.rs");
+        let second = root.path().join("second.rs");
+        std::fs::write(&first, "first\n").unwrap();
+        std::fs::write(&second, "zero\none\ntwo\n").unwrap();
+        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
+        editor.buffer_manager.replace_buffers(vec![Buffer::new(
+            Some(first.to_string_lossy().into_owned()),
+            "first\n".to_string(),
+        )]);
+        editor
+            .agent_manager
+            .set_root(Some(root.path().to_path_buf()));
+        editor.agent_manager.mark_session_active("session-1");
+        let mut render_buffer =
+            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
+        let mut runtime = Runtime::new();
+        let delay = editor
+            .prepare_agent_follow_step(
+                &EditorToolRequest {
+                    session_id: "session-1".to_string(),
+                    call: EditorToolCall::ApplyEdits {
+                        path: "second.rs".to_string(),
+                        expected_revision: 0,
+                        edits: vec![crate::agent_tools::EditorTextEdit {
+                            start: crate::agent_tools::EditorPosition {
+                                line: 1,
+                                character: 0,
+                            },
+                            end: crate::agent_tools::EditorPosition {
+                                line: 1,
+                                character: 3,
+                            },
+                            new_text: "changed".to_string(),
+                        }],
+                    },
+                },
+                &mut render_buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(delay, Duration::from_millis(700));
+        assert_eq!(
+            editor.current_buffer().file.as_deref(),
+            Some(second.to_string_lossy().as_ref())
+        );
+        assert_eq!(editor.buffer_line(), 1);
+        assert_eq!(editor.current_buffer().contents(), "zero\none\ntwo\n");
     }
 
     #[test]
@@ -25454,11 +25362,11 @@ builtin = "rust"
                 r#"
                     pub fn activate() {
                         red::add_command("Agent", agent);
-                        red::add_command("AgentReview", review);
+                        red::add_command("AgentInspect", inspect);
                     }
 
                     fn agent() {}
-                    fn review() {}
+                    fn inspect() {}
                 "#,
             )
             .await
@@ -25485,7 +25393,7 @@ builtin = "rust"
             )
             .await
             .unwrap();
-        assert_eq!(editor.command, "AgentReview");
+        assert_eq!(editor.command, "AgentInspect");
 
         editor.test_set_commandline(Mode::Command, "ag");
         editor
@@ -26806,113 +26714,6 @@ builtin = "rust"
     }
 
     #[tokio::test]
-    async fn detached_agent_proposal_acceptance_survives_a_failed_review_refresh_render() {
-        struct FailingDialog;
-
-        impl crate::ui::Component for FailingDialog {
-            fn draw(&self, _buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-                anyhow::bail!("injected render failure")
-            }
-        }
-
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
-        drain_plugin_requests();
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("proposal.txt");
-        std::fs::write(&path, "disk base\n").unwrap();
-        let mut workspace = ProposalWorkspace::new(root.path()).unwrap();
-        workspace
-            .sync_visible_file(&path, 0, "disk base\n".to_string())
-            .unwrap();
-        workspace.begin_turn("session-1", "turn-1".to_string());
-        workspace
-            .write("session-1", &path, "agent replacement\n".to_string())
-            .unwrap();
-        let workspace = Arc::new(Mutex::new(workspace));
-
-        let mut config = Config::from_user_toml_with_overrides("", &[]).unwrap();
-        config.plugins.retain(|name, _| name == "agent");
-        config.lsp.enabled = false;
-        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
-        let store = SessionStore::new(root.path().join("session"));
-        let mut editor = Editor::with_size(
-            lsp,
-            /*width*/ 100,
-            /*height*/ 24,
-            config,
-            Theme::default(),
-            vec![Buffer::new(
-                Some(path.to_string_lossy().into_owned()),
-                "disk base\n".to_string(),
-            )],
-        )
-        .unwrap();
-        editor.test_set_agent_workspace(Arc::clone(&workspace));
-        editor.set_session_store(store.clone());
-        let mut core = DetachedEditorCore::new(editor).await.unwrap();
-
-        core.editor
-            .plugin_registry
-            .notify(
-                &mut core.runtime,
-                "agent:session_created",
-                json!({ "session_id": "session-1" }),
-            )
-            .await
-            .unwrap();
-        core.tick().await.unwrap();
-        core.editor
-            .plugin_registry
-            .execute(&mut core.runtime, "AgentReview")
-            .await
-            .unwrap();
-        core.tick().await.unwrap();
-        core.editor.current_dialog = Some(Box::new(FailingDialog));
-        core.editor.session_manager.force_snapshot_due();
-        ACTION_DISPATCHER.send_request(PluginRequest::AgentAcceptProposal {
-            session_id: "session-1".to_string(),
-            path: path.clone(),
-            hunk_id: None,
-        });
-
-        core.tick()
-            .await
-            .expect("a post-accept review render failure must not terminate the detached editor");
-        core.editor.test_finish_session_snapshot();
-
-        assert_eq!(
-            core.editor.current_buffer().contents(),
-            "agent replacement\n"
-        );
-        assert!(core.editor.current_buffer().is_dirty());
-        assert!(workspace
-            .lock()
-            .unwrap()
-            .pending_files("session-1")
-            .is_empty());
-        assert!(core.editor.last_error.as_deref().is_some_and(|error| {
-            error.contains("Agent proposal applied, but render failed")
-                && error.contains("injected render failure")
-        }));
-        let snapshot = store.load().unwrap();
-        assert_eq!(snapshot.buffers[0].contents, "agent replacement\n");
-        assert!(snapshot.buffers[0].dirty);
-        assert!(
-            ProposalWorkspace::from_snapshot(snapshot.agent_workspace.unwrap())
-                .pending_files("session-1")
-                .is_empty()
-        );
-
-        ACTION_DISPATCHER.send_request(PluginRequest::OpenWorkspace {
-            id: "normal-render".to_string(),
-            config: crate::plugin::WorkspaceConfig::default(),
-        });
-        let error = core.tick().await.unwrap_err();
-        assert!(error.to_string().contains("injected render failure"));
-        drain_plugin_requests();
-    }
-
-    #[tokio::test]
     async fn detached_plugin_cursor_requests_render_immediately() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
@@ -26934,160 +26735,6 @@ builtin = "rust"
         drain_plugin_requests();
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn detached_agent_proposal_actions_keep_unsafe_pending_changes_recoverable() {
-        use nix::{sys::stat::Mode as UnixMode, unistd::mkfifo};
-
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
-        for source in ["symlink", "fifo", "oversized"] {
-            drain_plugin_requests();
-            let root = tempfile::tempdir().unwrap();
-            let path = root.path().join("proposal.txt");
-            let safe_path = root.path().join("safe.txt");
-            std::fs::write(&path, "disk base\n").unwrap();
-            std::fs::write(&safe_path, "safe disk base\n").unwrap();
-            let mut workspace = ProposalWorkspace::new(root.path()).unwrap();
-            workspace.begin_turn("session-1", "turn-1".to_string());
-            workspace
-                .write("session-1", &path, "agent replacement\n".to_string())
-                .unwrap();
-            workspace
-                .write(
-                    "session-1",
-                    &safe_path,
-                    "safe agent replacement\n".to_string(),
-                )
-                .unwrap();
-            let workspace = Arc::new(Mutex::new(workspace));
-
-            let mut config = Config::from_user_toml_with_overrides("", &[]).unwrap();
-            config.plugins.retain(|name, _| name == "agent");
-            config.lsp.enabled = false;
-            let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
-            let mut editor = Editor::with_size(
-                lsp,
-                /*width*/ 100,
-                /*height*/ 24,
-                config,
-                Theme::default(),
-                vec![Buffer::new(None, "scratch".to_string())],
-            )
-            .unwrap();
-            editor.test_set_agent_workspace(Arc::clone(&workspace));
-            let mut core = DetachedEditorCore::new(editor).await.unwrap();
-
-            ACTION_DISPATCHER.send_request(PluginRequest::AgentCloseSession {
-                session_id: "session-1".to_string(),
-            });
-            core.input(crate::headless::InputEvent::Key {
-                code: crate::headless::KeyCode::Character('h'),
-                modifiers: Vec::new(),
-            })
-            .await
-            .expect("closing a Codex session should archive its pending proposals");
-            {
-                let workspace = workspace.lock().unwrap();
-                assert_eq!(workspace.review_sessions(""), ["session-1"]);
-                assert_eq!(
-                    workspace.pending_files("session-1"),
-                    [path.clone(), safe_path.clone()]
-                );
-            }
-
-            std::fs::remove_file(&path).unwrap();
-            match source {
-                "symlink" => {
-                    let outside = root.path().join("outside.txt");
-                    std::fs::write(&outside, "outside secret\n").unwrap();
-                    std::os::unix::fs::symlink(outside, &path).unwrap();
-                }
-                "fifo" => mkfifo(&path, UnixMode::S_IRUSR | UnixMode::S_IWUSR).unwrap(),
-                "oversized" => {
-                    std::fs::write(&path, "x".repeat(1024 * 1024)).unwrap();
-                }
-                _ => unreachable!(),
-            }
-
-            for character in ":AgentReview".chars() {
-                core.input(crate::headless::InputEvent::Key {
-                    code: crate::headless::KeyCode::Character(character),
-                    modifiers: Vec::new(),
-                })
-                .await
-                .expect("production command input should keep the detached editor alive");
-            }
-            let reviewed = core
-                .input(crate::headless::InputEvent::Key {
-                    code: crate::headless::KeyCode::Enter,
-                    modifiers: Vec::new(),
-                })
-                .await
-                .expect("unsafe proposal review should not terminate the detached editor");
-            assert!(reviewed
-                .lines
-                .iter()
-                .any(|line| { line.text.contains("Unable to review this agent proposal") }));
-            let proposals = core.editor.agent_proposals_payload("").unwrap();
-            assert!(proposals["files"].as_array().unwrap().iter().any(|file| {
-                file["path"] == safe_path.to_string_lossy().as_ref()
-                    && !file["hunks"].as_array().unwrap().is_empty()
-            }));
-            assert!(!reviewed
-                .lines
-                .iter()
-                .any(|line| line.text.contains("outside secret")));
-            assert!(!core.stopped);
-            core.input(crate::headless::InputEvent::Key {
-                code: crate::headless::KeyCode::Character('q'),
-                modifiers: Vec::new(),
-            })
-            .await
-            .expect("proposal review should remain dismissible");
-
-            for (request, message) in [
-                (
-                    PluginRequest::AgentAcceptProposal {
-                        session_id: "session-1".to_string(),
-                        path: path.clone(),
-                        hunk_id: None,
-                    },
-                    "Unable to accept agent proposal safely",
-                ),
-                (
-                    PluginRequest::AgentRejectProposal {
-                        session_id: "session-1".to_string(),
-                        path: path.clone(),
-                        hunk_id: None,
-                    },
-                    "Unable to reject agent proposal safely",
-                ),
-            ] {
-                ACTION_DISPATCHER.send_request(request);
-                let delta = core
-                    .input(crate::headless::InputEvent::Key {
-                        code: crate::headless::KeyCode::Character('h'),
-                        modifiers: Vec::new(),
-                    })
-                    .await
-                    .expect("unsafe proposal action should not terminate the detached editor");
-                assert!(delta.lines.iter().any(|line| line.text.contains(message)));
-                assert!(!delta
-                    .lines
-                    .iter()
-                    .any(|line| line.text.contains("outside secret")));
-                assert!(!core.stopped);
-            }
-            assert_eq!(
-                workspace.lock().unwrap().pending_files("session-1"),
-                [path, safe_path]
-            );
-            assert_eq!(core.editor.current_buffer().contents(), "scratch");
-        }
-        drain_plugin_requests();
-    }
-
-    #[cfg(unix)]
     #[tokio::test]
     async fn detached_input_processes_only_a_bounded_batch_of_agent_events() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
@@ -27245,120 +26892,6 @@ builtin = "rust"
     }
 
     #[tokio::test]
-    async fn completed_agent_turn_ignores_late_updates_and_preserves_proposal_events() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
-        drain_plugin_requests();
-        let plugin_root = tempfile::tempdir().unwrap();
-        let probe = plugin_root.path().join("proposal-probe.hk");
-        std::fs::write(
-            &probe,
-            r#"
-                pub fn activate() { red::on("agent:proposals_changed", changed); }
-                fn changed(event: Json) { red::execute("Print", "proposal event delivered"); }
-            "#,
-        )
-        .unwrap();
-        let mut config = Config::default();
-        config.plugins.retain(|name, _| name == "agent");
-        config.plugins.insert(
-            "agent".to_string(),
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("plugins/agent.hk")
-                .to_string_lossy()
-                .into_owned(),
-        );
-        config.plugins.insert(
-            "proposal_probe".to_string(),
-            probe.to_string_lossy().into_owned(),
-        );
-        config.lsp.enabled = false;
-        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
-        let mut editor = Editor::with_size(
-            lsp,
-            /*width*/ 100,
-            /*height*/ 24,
-            config,
-            Theme::default(),
-            vec![Buffer::new(None, "scratch".to_string())],
-        )
-        .unwrap();
-        editor.test_disable_terminal_output();
-        editor.test_set_agent_workspace(Arc::new(Mutex::new(
-            ProposalWorkspace::new(plugin_root.path()).unwrap(),
-        )));
-        let mut core = DetachedEditorCore::new(editor).await.unwrap();
-        core.editor
-            .plugin_registry
-            .notify(
-                &mut core.runtime,
-                "agent:session_created",
-                json!({ "session_id": "session-1" }),
-            )
-            .await
-            .unwrap();
-        core.tick().await.unwrap();
-        core.editor.agent_manager.mark_session_active("session-1");
-        let (bridge, mut worker) = CodexBridge::channel(NonZeroUsize::new(8).unwrap());
-        for event in [
-            CodexEvent::Update {
-                session_id: ("session-1").to_string(),
-                text: "live output".to_string(),
-            },
-            CodexEvent::Completed {
-                session_id: ("session-1").to_string(),
-                stop_reason: "end_turn".to_string(),
-            },
-            CodexEvent::Update {
-                session_id: ("session-1").to_string(),
-                text: "stale output must be ignored".to_string(),
-            },
-            CodexEvent::PermissionRequested {
-                request_id: "stale-permission".to_string(),
-                session_id: ("session-1").to_string(),
-                tool_call: json!({ "tool_call_id": "stale-tool" }),
-                options: json!([]),
-            },
-            CodexEvent::ProposalsChanged {
-                session_id: ("session-1").to_string(),
-            },
-        ] {
-            worker.send(event).await.unwrap();
-        }
-        core.editor.agent_manager.set_bridge(bridge);
-
-        core.tick().await.unwrap();
-
-        assert!(!core.editor.agent_manager.is_session_active("session-1"));
-        assert!(matches!(
-            worker.recv().await,
-            Some(CodexCommand::PermissionResponse { request_id, option_id })
-                if request_id == "stale-permission" && option_id.is_none()
-        ));
-        assert!(core.editor.current_dialog.is_none());
-        assert_eq!(
-            core.editor
-                .preferences
-                .plugin_storage("agent", &scoped_plugin_storage_key("agent", "transcript"))
-                .and_then(Value::as_str),
-            Some("Agent: live output\n")
-        );
-        let panel = core
-            .snapshot(None)
-            .lines
-            .into_iter()
-            .map(|line| line.text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(panel.contains("live output"));
-        assert!(!panel.contains("stale output must be ignored"));
-        assert_eq!(
-            core.editor.last_error.as_deref(),
-            Some("proposal event delivered")
-        );
-        drain_plugin_requests();
-    }
-
-    #[tokio::test]
     async fn stale_permission_does_not_block_input_when_the_agent_command_queue_is_full() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_plugin_requests();
@@ -27410,151 +26943,6 @@ builtin = "rust"
         drain_plugin_requests();
     }
 
-    #[tokio::test]
-    async fn concurrent_agent_prompt_preserves_the_active_proposal_turn_until_completion() {
-        let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
-        drain_plugin_requests();
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("proposal.txt");
-        std::fs::write(&path, "disk base\n").unwrap();
-        let mut workspace = ProposalWorkspace::new(root.path()).unwrap();
-        workspace
-            .sync_visible_file(&path, 0, "disk base\n".to_string())
-            .unwrap();
-        let workspace = Arc::new(Mutex::new(workspace));
-        let mut editor = test_editor(/*width*/ 80, /*height*/ 24);
-        editor
-            .agent_manager
-            .set_workspace(Some(Arc::clone(&workspace)));
-        let (bridge, mut worker) = CodexBridge::channel(NonZeroUsize::new(8).unwrap());
-        editor.agent_manager.set_bridge(bridge);
-        let mut buffer =
-            RenderBuffer::new(/*width*/ 80, /*height*/ 24, &Style::default());
-        let mut runtime = Runtime::new();
-
-        ACTION_DISPATCHER.send_request(PluginRequest::AgentPrompt {
-            session_id: "session-1".to_string(),
-            text: "first prompt".to_string(),
-        });
-        editor
-            .service_background(&mut buffer, &mut runtime)
-            .await
-            .unwrap();
-        assert!(matches!(
-            worker.recv().await,
-            Some(CodexCommand::PromptWithContext { text, uri, context, .. })
-                if text == "first prompt"
-                    && uri == "red-buffer://active"
-                    && context.contains("Active file: [No Name]")
-        ));
-        assert!(editor.agent_manager.is_session_active("session-1"));
-        let first_turn = {
-            let mut workspace = workspace.lock().unwrap();
-            workspace
-                .sync_visible_file(&path, 0, "disk base\n".to_string())
-                .unwrap();
-            workspace
-                .write("session-1", &path, "first edit\n".to_string())
-                .unwrap();
-            match workspace
-                .stage_accept_all("session-1", &path, 0, "disk base\n")
-                .unwrap()
-                .disposition()
-            {
-                ProposalDisposition::Applied { turn_id, .. } => turn_id.clone(),
-                other => panic!("expected attributed first edit, got {other:?}"),
-            }
-        };
-
-        ACTION_DISPATCHER.send_request(PluginRequest::AgentCancel {
-            session_id: "session-1".to_string(),
-        });
-        editor
-            .service_background(&mut buffer, &mut runtime)
-            .await
-            .unwrap();
-        assert!(matches!(
-            worker.recv().await,
-            Some(CodexCommand::Cancel { session_id }) if session_id.as_str() == "session-1"
-        ));
-        worker
-            .send(CodexEvent::Cancelled {
-                session_id: ("session-1").to_string(),
-            })
-            .await
-            .unwrap();
-        editor
-            .service_background(&mut buffer, &mut runtime)
-            .await
-            .unwrap();
-        assert!(editor.agent_manager.is_session_active("session-1"));
-
-        let generation = workspace.lock().unwrap().generation();
-        ACTION_DISPATCHER.send_request(PluginRequest::AgentPrompt {
-            session_id: "session-1".to_string(),
-            text: "concurrent prompt".to_string(),
-        });
-        editor
-            .service_background(&mut buffer, &mut runtime)
-            .await
-            .unwrap();
-        assert_eq!(workspace.lock().unwrap().generation(), generation);
-        assert!(editor
-            .last_error
-            .as_deref()
-            .is_some_and(|message| message.contains("already active")));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), worker.recv())
-                .await
-                .is_err()
-        );
-        let attributed_turn = {
-            let mut workspace = workspace.lock().unwrap();
-            workspace
-                .write("session-1", &path, "first turn final edit\n".to_string())
-                .unwrap();
-            match workspace
-                .stage_accept_all("session-1", &path, 0, "disk base\n")
-                .unwrap()
-                .disposition()
-            {
-                ProposalDisposition::Applied { turn_id, .. } => turn_id.clone(),
-                other => panic!("expected attributed final edit, got {other:?}"),
-            }
-        };
-        assert_eq!(attributed_turn, first_turn);
-
-        worker
-            .send(CodexEvent::Completed {
-                session_id: ("session-1").to_string(),
-                stop_reason: "cancelled".to_string(),
-            })
-            .await
-            .unwrap();
-        editor
-            .service_background(&mut buffer, &mut runtime)
-            .await
-            .unwrap();
-        assert!(!editor.agent_manager.is_session_active("session-1"));
-        ACTION_DISPATCHER.send_request(PluginRequest::AgentPrompt {
-            session_id: "session-1".to_string(),
-            text: "next prompt".to_string(),
-        });
-        editor
-            .service_background(&mut buffer, &mut runtime)
-            .await
-            .unwrap();
-        assert!(matches!(
-            worker.recv().await,
-            Some(CodexCommand::PromptWithContext { text, uri, context, .. })
-                if text == "next prompt"
-                    && uri == "red-buffer://active"
-                    && context.contains("Active file: [No Name]")
-        ));
-        drain_plugin_requests();
-    }
-
-    #[cfg(unix)]
     #[tokio::test]
     async fn detached_paste_chunks_render_once_and_form_one_undoable_edit() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
@@ -28306,7 +27694,7 @@ builtin = "rust"
         let dump = rendered_dump(&mut editor, 100, 30);
         assert!(dump.contains("red v"));
         assert!(dump.contains("╭──╮   ╭──╮   ╭──┤"));
-        assert!(dump.contains(":AgentReview<Enter>"));
+        assert!(dump.contains(":AgentHistory<Enter>"));
         assert!(dump.contains("everything your fingers expect"));
     }
 
@@ -28346,7 +27734,7 @@ builtin = "rust"
         let mut editor = splash_test_editor(50, 30, Config::default());
         let dump = rendered_dump(&mut editor, 50, 30);
         assert!(dump.contains("for commands"));
-        assert!(!dump.contains(":AgentReview"));
+        assert!(!dump.contains(":AgentHistory"));
 
         let mut editor = splash_test_editor(24, 6, Config::default());
         assert!(!rendered_dump(&mut editor, 24, 6).contains("red v"));

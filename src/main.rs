@@ -167,7 +167,7 @@ async fn run() -> anyhow::Result<()> {
         println!("{}", report.format());
         anyhow::ensure!(
             !args.strict || report.production_ready,
-            "Codex reviewable-edit readiness check failed"
+            "Codex agent-edit readiness check failed"
         );
         return Ok(());
     }

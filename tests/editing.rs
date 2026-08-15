@@ -9,7 +9,6 @@ use red::{
         EditorActionName, EditorOpenTarget, EditorPosition, EditorSelectionKind, EditorTextEdit,
         EditorToolCall, EditorToolRequest,
     },
-    agent_workspace::ProposalWorkspace,
     buffer::{Buffer, SyntaxSelection},
     clipboard::MemoryClipboardProvider,
     color::Color,
@@ -130,7 +129,7 @@ command = "mock-lsp"
 }
 
 #[tokio::test]
-async fn agent_editor_tools_navigate_select_and_stage_unicode_edits_without_touching_disk() {
+async fn agent_editor_tools_navigate_select_and_apply_saved_unicode_edits() {
     let root = tempfile::tempdir().unwrap();
     let first = root.path().join("first.rs");
     let second = root.path().join("second.rs");
@@ -141,10 +140,7 @@ async fn agent_editor_tools_navigate_select_and_stage_unicode_edits_without_touc
         "unsaved first\n".to_string(),
     );
     let mut harness = EditorHarness::with_buffer(buffer);
-    let workspace = Arc::new(Mutex::new(ProposalWorkspace::new(root.path()).unwrap()));
-    harness
-        .editor
-        .test_set_agent_workspace(Arc::clone(&workspace));
+    harness.editor.test_set_agent_root(root.path());
 
     let opened = harness
         .editor
@@ -188,7 +184,7 @@ async fn agent_editor_tools_navigate_select_and_stage_unicode_edits_without_touc
     assert_eq!(selected["selection"]["end"]["character"], 3);
     let revision = selected["revision"].as_u64().unwrap();
 
-    let staged = harness
+    let applied = harness
         .editor
         .test_run_agent_editor_tool(EditorToolRequest {
             session_id: "session-1".to_string(),
@@ -210,19 +206,46 @@ async fn agent_editor_tools_navigate_select_and_stage_unicode_edits_without_touc
         })
         .await
         .unwrap();
-    assert_eq!(staged["ok"], true);
-    assert!(!staged["hunks"].as_array().unwrap().is_empty());
-    assert_eq!(harness.buffer_contents(), "a😀b\nsecond\n");
-    assert_eq!(fs::read_to_string(&second).unwrap(), "a😀b\nsecond\n");
+    assert_eq!(applied["ok"], true);
+    assert_eq!(applied["applied"], true);
+    assert_eq!(applied["saved"], true);
+    assert_eq!(harness.buffer_contents(), "aλb\nsecond\n");
+    assert_eq!(fs::read_to_string(&second).unwrap(), "aλb\nsecond\n");
+    assert!(matches!(
+        harness.editor.test_last_transaction_origin(),
+        Some(EditOrigin::Agent { session_id, .. }) if session_id == "session-1"
+    ));
+
+    let created = harness
+        .editor
+        .test_run_agent_editor_tool(EditorToolRequest {
+            session_id: "session-1".to_string(),
+            call: EditorToolCall::WriteFile {
+                path: "created.rs".to_string(),
+                expected_revision: 0,
+                content: "fn created() {}\n".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(created["applied"], true);
+    assert_eq!(created["saved"], true);
     assert_eq!(
-        workspace
-            .lock()
-            .unwrap()
-            .read("session-1", &second, None, None)
-            .unwrap(),
-        "aλb\nsecond\n"
+        fs::read_to_string(root.path().join("created.rs")).unwrap(),
+        "fn created() {}\n"
     );
 
+    let moved = harness
+        .editor
+        .test_run_agent_editor_tool(EditorToolRequest {
+            session_id: "session-1".to_string(),
+            call: EditorToolCall::RunEditorAction {
+                action: EditorActionName::PreviousBuffer,
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(moved["file"], "second.rs");
     let moved = harness
         .editor
         .test_run_agent_editor_tool(EditorToolRequest {
@@ -246,9 +269,7 @@ async fn agent_editor_tools_reject_workspace_escape_and_stale_edits() {
         "unsaved\n".to_string(),
     );
     let mut harness = EditorHarness::with_buffer(buffer);
-    harness.editor.test_set_agent_workspace(Arc::new(Mutex::new(
-        ProposalWorkspace::new(root.path()).unwrap(),
-    )));
+    harness.editor.test_set_agent_root(root.path());
 
     let escaped = harness
         .editor
@@ -287,7 +308,7 @@ async fn agent_editor_tools_reject_workspace_escape_and_stale_edits() {
         })
         .await
         .unwrap_err();
-    assert!(stale.to_string().contains("revision is stale"));
+    assert!(stale.to_string().contains("stale editor revision"));
     assert_eq!(harness.buffer_contents(), "unsaved\n");
     assert_eq!(fs::read_to_string(file).unwrap(), "original\n");
 
@@ -321,9 +342,7 @@ async fn agent_editor_navigation_preserves_a_focused_conversation_composer() {
         "first\n".to_string(),
     );
     let mut harness = EditorHarness::with_buffer(buffer);
-    harness.editor.test_set_agent_workspace(Arc::new(Mutex::new(
-        ProposalWorkspace::new(root.path()).unwrap(),
-    )));
+    harness.editor.test_set_agent_root(root.path());
     harness.editor.test_create_text_panel(
         "agent",
         PanelConfig {
@@ -1305,156 +1324,6 @@ async fn substitute_does_not_match_the_carriage_return_in_crlf_buffers() {
 }
 
 #[tokio::test]
-async fn agent_proposal_stays_out_of_buffer_and_disk_until_attributed_acceptance() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("proposal.txt");
-    fs::write(&path, "disk\n").unwrap();
-    let buffer = Buffer::new(
-        Some(path.to_string_lossy().into_owned()),
-        "unsaved\n".to_string(),
-    );
-    let mut harness = EditorHarness::with_config(buffer, default_key_config());
-    let mut workspace = ProposalWorkspace::new(temp.path()).unwrap();
-    workspace
-        .sync_visible_file(&path, /*revision*/ 0, "unsaved\n".to_string())
-        .unwrap();
-    workspace.begin_turn("session-1", "turn-1".to_string());
-    workspace
-        .write("session-1", &path, "agent\n".to_string())
-        .unwrap();
-    harness
-        .editor
-        .test_set_agent_workspace(Arc::new(Mutex::new(workspace)));
-
-    let proposals = harness
-        .editor
-        .test_agent_proposals_payload("session-1")
-        .unwrap();
-    assert!(!proposals["files"][0]["hunks"]
-        .as_array()
-        .unwrap()
-        .is_empty());
-    assert_eq!(harness.editor.test_agent_gutter_sign(/*line*/ 0), Some("A"));
-
-    harness.execute_action(Action::Save).await.unwrap();
-    assert_eq!(fs::read_to_string(&path).unwrap(), "unsaved\n");
-    harness.assert_buffer_contents("unsaved\n");
-
-    harness
-        .editor
-        .test_accept_agent_proposal("session-1", &path, /*hunk_id*/ None)
-        .await
-        .unwrap();
-    harness.assert_buffer_contents("agent\n");
-    assert_eq!(fs::read_to_string(&path).unwrap(), "unsaved\n");
-    assert_eq!(
-        harness.editor.test_last_transaction_origin(),
-        Some(&EditOrigin::Agent {
-            session_id: "session-1".to_string(),
-            turn_id: "turn-1".to_string(),
-        })
-    );
-
-    harness.execute_action(Action::Save).await.unwrap();
-    assert_eq!(fs::read_to_string(path).unwrap(), "agent\n");
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn accepting_an_unopened_existing_file_seeds_the_disk_base_for_undo() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("unopened.txt");
-    fs::write(&path, "disk base\n").unwrap();
-    let mut workspace = ProposalWorkspace::new(temp.path()).unwrap();
-    workspace.begin_turn("session-1", "turn-1".to_string());
-    workspace
-        .write("session-1", &path, "agent replacement\n".to_string())
-        .unwrap();
-    let mut harness = EditorHarness::with_content("scratch");
-    harness
-        .editor
-        .test_set_agent_workspace(Arc::new(Mutex::new(workspace)));
-
-    harness
-        .editor
-        .test_accept_agent_proposal("session-1", &path, /*hunk_id*/ None)
-        .await
-        .unwrap();
-
-    harness.assert_buffer_contents("agent replacement\n");
-    assert_eq!(fs::read_to_string(&path).unwrap(), "disk base\n");
-    harness.execute_action(Action::Undo).await.unwrap();
-    harness.assert_buffer_contents("disk base\n");
-    assert_eq!(fs::read_to_string(path).unwrap(), "disk base\n");
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn accepting_an_unopened_proposal_keeps_it_pending_when_lsp_open_fails() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("unopened.txt");
-    fs::write(&path, "disk base\n").unwrap();
-    let mut workspace = ProposalWorkspace::new(temp.path()).unwrap();
-    workspace.begin_turn("session-1", "turn-1".to_string());
-    workspace
-        .write("session-1", &path, "agent replacement\n".to_string())
-        .unwrap();
-    let workspace = Arc::new(Mutex::new(workspace));
-    let lsp = RecordingLsp::failing_next_did_open();
-    let events = lsp.events();
-    let mut editor = Editor::with_size(
-        Box::new(lsp),
-        /*width*/ 80,
-        /*height*/ 24,
-        Config::default(),
-        Theme::default(),
-        vec![Buffer::new(None, "scratch".to_string())],
-    )
-    .unwrap();
-    editor.test_disable_terminal_output();
-    editor.test_set_agent_workspace(Arc::clone(&workspace));
-    let mut harness = EditorHarness { editor };
-
-    let error = harness
-        .editor
-        .test_accept_agent_proposal("session-1", &path, /*hunk_id*/ None)
-        .await
-        .unwrap_err();
-
-    assert!(error.to_string().contains("injected didOpen failure"));
-    assert_eq!(
-        workspace.lock().unwrap().pending_files("session-1"),
-        std::slice::from_ref(&path)
-    );
-    assert_eq!(fs::read_to_string(&path).unwrap(), "disk base\n");
-    harness.assert_buffer_contents("disk base\n");
-
-    harness
-        .editor
-        .test_accept_agent_proposal("session-1", &path, /*hunk_id*/ None)
-        .await
-        .unwrap();
-
-    assert!(workspace
-        .lock()
-        .unwrap()
-        .pending_files("session-1")
-        .is_empty());
-    harness.assert_buffer_contents("agent replacement\n");
-    assert_eq!(fs::read_to_string(&path).unwrap(), "disk base\n");
-    let opened_path = path.to_string_lossy().into_owned();
-    assert_eq!(
-        events
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|event| matches!(event, LspEvent::DidOpen(file) if file == &opened_path))
-            .count(),
-        2
-    );
-}
-
-#[tokio::test]
 async fn format_on_save_restores_save_as_identity_and_insert_transaction_after_sync_failure() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source.rs");
@@ -1517,257 +1386,6 @@ async fn format_on_save_restores_save_as_identity_and_insert_transaction_after_s
 
 #[cfg(unix)]
 #[tokio::test]
-async fn accepting_an_unopened_proposal_commits_before_a_failed_change_notification() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("unopened.txt");
-    fs::write(&path, "disk base\n").unwrap();
-    let mut workspace = ProposalWorkspace::new(temp.path()).unwrap();
-    workspace.begin_turn("session-1", "turn-1".to_string());
-    workspace
-        .write("session-1", &path, "agent replacement\n".to_string())
-        .unwrap();
-    let workspace = Arc::new(Mutex::new(workspace));
-    let mut editor = Editor::with_size(
-        Box::new(RecordingLsp::failing_next_did_change()),
-        /*width*/ 80,
-        /*height*/ 24,
-        Config::default(),
-        Theme::default(),
-        vec![Buffer::new(None, "scratch".to_string())],
-    )
-    .unwrap();
-    editor.test_disable_terminal_output();
-    editor.test_set_agent_workspace(Arc::clone(&workspace));
-    let mut harness = EditorHarness { editor };
-
-    harness
-        .editor
-        .test_accept_agent_proposal("session-1", &path, /*hunk_id*/ None)
-        .await
-        .unwrap();
-
-    harness.assert_buffer_contents("agent replacement\n");
-    assert!(workspace
-        .lock()
-        .unwrap()
-        .pending_files("session-1")
-        .is_empty());
-    assert!(harness
-        .last_error()
-        .is_some_and(|error| error.contains("change notification failed")));
-    assert_eq!(fs::read_to_string(path).unwrap(), "disk base\n");
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn unopened_proposal_review_accept_and_reject_refuse_unsafe_disk_sources() {
-    use nix::{sys::stat::Mode, unistd::mkfifo};
-
-    for source in ["symlink", "fifo", "oversized"] {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("proposal.txt");
-        fs::write(&path, "disk base\n").unwrap();
-        let mut workspace = ProposalWorkspace::new(temp.path()).unwrap();
-        workspace
-            .write("session-1", &path, "agent replacement\n".to_string())
-            .unwrap();
-        fs::remove_file(&path).unwrap();
-        match source {
-            "symlink" => {
-                let outside = temp.path().join("outside.txt");
-                fs::write(&outside, "outside secret\n").unwrap();
-                std::os::unix::fs::symlink(outside, &path).unwrap();
-            }
-            "fifo" => mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap(),
-            "oversized" => fs::write(&path, "x".repeat(1024 * 1024)).unwrap(),
-            _ => unreachable!(),
-        }
-        let mut harness = EditorHarness::with_content("scratch");
-        harness
-            .editor
-            .test_set_agent_workspace(Arc::new(Mutex::new(workspace)));
-
-        let proposals = harness
-            .editor
-            .test_agent_proposals_payload("session-1")
-            .unwrap();
-        assert_eq!(proposals["files"][0]["conflict"], true);
-        assert!(proposals["files"][0]["message"]
-            .as_str()
-            .unwrap()
-            .contains("Unable to review this agent proposal safely"));
-        assert!(harness
-            .editor
-            .test_accept_agent_proposal("session-1", &path, /*hunk_id*/ None)
-            .await
-            .is_err());
-        assert!(harness
-            .editor
-            .test_reject_agent_proposal("session-1", &path, /*hunk_id*/ None)
-            .is_err());
-        harness.assert_buffer_contents("scratch");
-    }
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn unsafe_open_buffer_does_not_block_an_unrelated_agent_proposal() {
-    let temp = tempfile::tempdir().unwrap();
-    let safe = temp.path().join("safe.txt");
-    let linked = temp.path().join("linked.txt");
-    let outside = tempfile::NamedTempFile::new().unwrap();
-    fs::write(&safe, "safe base\n").unwrap();
-    fs::write(outside.path(), "outside secret\n").unwrap();
-    std::os::unix::fs::symlink(outside.path(), &linked).unwrap();
-    let mut workspace = ProposalWorkspace::new(temp.path()).unwrap();
-    workspace
-        .write("session-1", &safe, "agent replacement\n".to_string())
-        .unwrap();
-    let buffer = Buffer::new(
-        Some(linked.to_string_lossy().into_owned()),
-        "outside secret\n".to_string(),
-    );
-    let mut harness = EditorHarness::with_config(buffer, default_key_config());
-    harness
-        .editor
-        .test_set_agent_workspace(Arc::new(Mutex::new(workspace)));
-
-    let proposals = harness
-        .editor
-        .test_agent_proposals_payload("session-1")
-        .unwrap();
-
-    assert_eq!(proposals["files"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        proposals["files"][0]["path"].as_str(),
-        Some(safe.to_string_lossy().as_ref())
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn replaced_workspace_root_cannot_expose_an_outside_buffer_to_the_agent() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("workspace");
-    let moved = temp.path().join("original-workspace");
-    let outside = temp.path().join("outside");
-    let source = root.join("source.txt");
-    fs::create_dir(&root).unwrap();
-    fs::create_dir(&outside).unwrap();
-    fs::write(&source, "workspace base\n").unwrap();
-    fs::write(outside.join("source.txt"), "outside secret\n").unwrap();
-    let mut workspace = ProposalWorkspace::new(&root).unwrap();
-    workspace
-        .write("session-1", &source, "agent replacement\n".to_string())
-        .unwrap();
-    fs::rename(&root, &moved).unwrap();
-    std::os::unix::fs::symlink(&outside, &root).unwrap();
-    let buffer = Buffer::new(
-        Some(source.to_string_lossy().into_owned()),
-        "outside secret\n".to_string(),
-    );
-    let mut harness = EditorHarness::with_config(buffer, default_key_config());
-    harness
-        .editor
-        .test_set_agent_workspace(Arc::new(Mutex::new(workspace)));
-
-    let error = harness
-        .editor
-        .test_agent_proposals_payload("session-1")
-        .unwrap_err()
-        .to_string();
-
-    assert!(error.contains("workspace root cannot be opened safely"));
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn closing_a_buffer_removes_its_stale_agent_visible_contents() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("source.txt");
-    fs::write(&path, "disk base\n").unwrap();
-    let mut workspace = ProposalWorkspace::new(temp.path()).unwrap();
-    workspace
-        .sync_visible_file(&path, /*revision*/ 7, "stale unsaved\n".to_string())
-        .unwrap();
-    let workspace = Arc::new(Mutex::new(workspace));
-    let mut harness = EditorHarness::with_content("scratch");
-    harness
-        .editor
-        .test_set_agent_workspace(Arc::clone(&workspace));
-
-    harness
-        .editor
-        .test_agent_proposals_payload("session-1")
-        .unwrap();
-    fs::write(&path, "fresh disk\n").unwrap();
-
-    assert_eq!(
-        workspace
-            .lock()
-            .unwrap()
-            .read("session-2", &path, None, None)
-            .unwrap(),
-        "fresh disk\n"
-    );
-}
-
-#[tokio::test]
-async fn crash_session_restores_dirty_undo_and_pending_proposal_without_writing_disk() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("recovery.txt");
-    fs::write(&path, "base\n").unwrap();
-    let buffer = Buffer::new(
-        Some(path.to_string_lossy().into_owned()),
-        "base\n".to_string(),
-    );
-    let mut harness = EditorHarness::with_config(buffer, default_key_config());
-    type_normal_keys(&mut harness, "iuser ").await;
-    command_key(&mut harness, KeyCode::Esc).await;
-
-    let mut workspace = ProposalWorkspace::new(temp.path()).unwrap();
-    workspace
-        .sync_visible_file(&path, /*revision*/ 1, "user base\n".to_string())
-        .unwrap();
-    workspace.begin_turn("session-1", "turn-1".to_string());
-    workspace
-        .write("session-1", &path, "agent base\n".to_string())
-        .unwrap();
-    harness
-        .editor
-        .test_set_agent_workspace(Arc::new(Mutex::new(workspace)));
-    let snapshot = harness.editor.test_session_snapshot();
-
-    fs::write(&path, "external\n").unwrap();
-    let mut restored_buffers = Editor::buffers_from_session_snapshot(&snapshot);
-    let mut restored = EditorHarness::with_config(restored_buffers.remove(0), default_key_config());
-    let divergences = restored.editor.restore_session_snapshot(&snapshot).unwrap();
-
-    restored.assert_buffer_contents("user base\n");
-    assert!(restored.is_dirty());
-    assert_eq!(divergences.len(), 1);
-    assert!(divergences[0].diff.contains("external"));
-    let archived = restored.editor.test_agent_proposals_payload("").unwrap();
-    assert_eq!(archived["files"][0]["session_id"], "session-1");
-    assert!(!archived["files"][0]["hunks"].as_array().unwrap().is_empty());
-    let replacement = restored
-        .editor
-        .test_agent_proposals_payload("replacement-session")
-        .unwrap();
-    assert_eq!(replacement["files"][0]["session_id"], "replacement-session");
-    assert!(!replacement["files"][0]["hunks"]
-        .as_array()
-        .unwrap()
-        .is_empty());
-    assert_eq!(fs::read_to_string(&path).unwrap(), "external\n");
-
-    restored.execute_action(Action::Undo).await.unwrap();
-    restored.assert_buffer_contents("base\n");
-    assert_eq!(fs::read_to_string(path).unwrap(), "external\n");
-}
-
-#[cfg(unix)]
-#[tokio::test]
 async fn crash_recovery_keeps_transcript_in_memory_when_preferences_are_unsafe() {
     let temp = tempfile::tempdir().unwrap();
     let outside = temp.path().join("outside-preferences.json");
@@ -1783,6 +1401,14 @@ async fn crash_recovery_keeps_transcript_in_memory_when_preferences_are_unsafe()
     let mut source = EditorHarness::with_config(buffer, default_key_config());
     let mut snapshot = source.editor.test_session_snapshot();
     snapshot.agent_transcript = Some("You: recover me\nAgent: retained\n".to_string());
+    let mut conversation = red::agent_conversation::AgentConversationSnapshot::new(
+        "thread-recoverable",
+        temp.path().to_string_lossy(),
+    );
+    conversation.append_user("turn-1", "recover me");
+    conversation.append_agent_delta("turn-1", "retained");
+    snapshot.agent_conversation = Some(conversation.clone());
+    snapshot.agent_session_resumable = true;
     let restored_buffers = Editor::buffers_from_session_snapshot(&snapshot);
     let preferences = PreferencesStore::load(&preferences_path);
     let mut editor = Editor::with_size_and_preferences(
@@ -1806,6 +1432,7 @@ async fn crash_recovery_keeps_transcript_in_memory_when_preferences_are_unsafe()
         recovered.agent_transcript.as_deref(),
         Some("You: recover me\nAgent: retained\n")
     );
+    assert_eq!(recovered.agent_conversation, Some(conversation));
     assert_eq!(recovered.buffers[0].contents, "recovered text\n");
     assert_eq!(fs::read_to_string(outside).unwrap(), "outside secret");
     let restored = EditorHarness { editor };
@@ -1904,47 +1531,6 @@ async fn periodic_recovery_snapshot_materializes_shared_buffer_contents() {
     harness.editor.test_finish_session_snapshot();
 
     assert_eq!(store.load().unwrap().buffers[0].contents, expected);
-}
-
-#[tokio::test]
-async fn proposal_only_mutations_trigger_a_periodic_recovery_snapshot() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = red::session::SessionStore::for_owner(directory.path(), "editor-one").unwrap();
-    let path = directory.path().join("proposal.txt");
-    fs::write(&path, "base\n").unwrap();
-    let workspace = Arc::new(Mutex::new(
-        ProposalWorkspace::new(directory.path()).unwrap(),
-    ));
-    let buffer = Buffer::new(None, "base\n".to_string());
-    let mut harness = EditorHarness::with_config(buffer, default_key_config());
-    harness
-        .editor
-        .test_set_agent_workspace(Arc::clone(&workspace));
-    harness.editor.set_session_store(store.clone());
-    harness
-        .editor
-        .test_persist_session_snapshot(/*force*/ true, /*due*/ true);
-    let generation = store.load().unwrap().generation;
-
-    workspace
-        .lock()
-        .unwrap()
-        .sync_visible_file(&path, /*revision*/ 0, "base\n".to_string())
-        .unwrap();
-    workspace
-        .lock()
-        .unwrap()
-        .write("session-1", &path, "proposed\n".to_string())
-        .unwrap();
-    harness
-        .editor
-        .test_persist_session_snapshot(/*force*/ false, /*due*/ true);
-    harness.editor.test_finish_session_snapshot();
-
-    let snapshot = store.load().unwrap();
-    assert_eq!(snapshot.generation, generation + 1);
-    let restored = ProposalWorkspace::from_snapshot(snapshot.agent_workspace.unwrap());
-    assert_eq!(restored.pending_files("session-1"), [path]);
 }
 
 fn tree_rows() -> Vec<PanelRow> {
