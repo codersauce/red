@@ -1155,6 +1155,7 @@ impl TextPanel {
             }
         }
 
+        let _span = crate::editor::perf::PerfSpan::start("panel:text_layout_miss");
         let content_width = TextPanelContentMetrics::new(width).width;
         let mut layout = TextPanelLayout::new(self.build_rendered_lines(content_width));
         if self.status.as_ref().is_some_and(|status| status.stream) {
@@ -3306,6 +3307,8 @@ impl PanelManager {
         use_ascii: bool,
     ) {
         for placement in self.panel_placements(buffer.width, buffer.height) {
+            let _span =
+                crate::editor::perf::PerfSpan::with_detail("panel:paint", placement.id.as_str());
             let Some(config) = self.panel_config(&placement.id) else {
                 continue;
             };

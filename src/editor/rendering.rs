@@ -1090,17 +1090,23 @@ impl Editor {
     /// Renders the entire editor state to the terminal
     /// This is the main entry point for all rendering operations
     pub fn render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
-        if self.relative_line_numbers_enabled() && self.defer_motion_render {
-            self.deferred_motion_needs_full_render = true;
+        if self.defer_motion_render {
+            self.request_motion_render(super::MotionRender::Full);
             return Ok(());
         }
 
         let _span = super::perf::PerfSpan::start("render:full");
+        #[cfg(test)]
+        {
+            self.full_render_count += 1;
+        }
+        let prepare_span = super::perf::PerfSpan::start("render:prepare");
         self.update_gutter_width();
         self.apply_panel_layout();
         self.fix_cursor_pos();
         self.check_bounds();
         self.sync_to_window();
+        drop(prepare_span);
         // Render all windows
         let windows_span = super::perf::PerfSpan::start("render:windows");
         let window_count = self.window_manager.window_count();
@@ -1133,12 +1139,14 @@ impl Editor {
                 }
             }
         }
+        let panels_span = super::perf::PerfSpan::start("render:panels");
         self.panel_manager.render_with_active_dividers(
             buffer,
             &self.theme,
             &active_panel_dividers,
             self.config.window_borders_ascii,
         );
+        drop(panels_span);
 
         // Render global UI elements
         let chrome_span = super::perf::PerfSpan::start("render:chrome");
@@ -1161,11 +1169,13 @@ impl Editor {
         drop(chrome_span);
 
         // Update overlay positions and render them
+        let overlays_span = super::perf::PerfSpan::start("render:overlays+cursor");
         self.update_and_render_overlays(buffer)?;
 
         self.update_terminal_cursor_surface(buffer);
         self.render_cursor_cell(buffer);
         self.last_rendered_cursor_position = self.render_cursor_position();
+        drop(overlays_span);
 
         // Flush changes to terminal
         let diff_span = super::perf::PerfSpan::start("render:diff+flush");
@@ -1173,6 +1183,7 @@ impl Editor {
         self.render_diff(&changes)?;
         self.commit_render_buffer_changes(&changes);
         drop(diff_span);
+        self.last_rendered_window = self.window_manager.active_stable_window_id();
         self.render_generation = self.render_generation.wrapping_add(1);
 
         Ok(())
@@ -1218,12 +1229,62 @@ impl Editor {
     }
 
     pub(crate) fn render_motion_frame(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        if self.defer_motion_render {
+            self.request_motion_render(super::MotionRender::Window);
+            return Ok(());
+        }
+        if !self.can_reuse_editor_surfaces() {
+            return self.render(buffer);
+        }
         let _span = super::perf::PerfSpan::start("render:motion_frame");
+        self.render_editor_frame(buffer, /*all_windows*/ false)
+    }
+
+    /// Repaint editor-owned decorations without rebuilding unchanged docked panes.
+    pub(crate) fn render_editor_windows_frame(
+        &mut self,
+        buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<()> {
+        if self.defer_motion_render {
+            self.request_motion_render(super::MotionRender::EditorWindows);
+            return Ok(());
+        }
+        if !self.can_reuse_editor_surfaces() {
+            return self.render(buffer);
+        }
+        let _span = super::perf::PerfSpan::start("render:editor_windows");
+        self.render_editor_frame(buffer, /*all_windows*/ true)
+    }
+
+    fn can_reuse_editor_surfaces(&self) -> bool {
+        self.previous_render_buffer.is_some()
+            && !self.force_full_redraw
+            && self.last_rendered_window == self.window_manager.active_stable_window_id()
+            && self.current_dialog.is_none()
+            && !self.keymap_hints_visible
+            && !self.panel_manager.has_focused_panel()
+            && !self.workspace_manager.is_active()
+            && !self.overlay_manager.has_visible_content()
+            && self.render_commands.is_empty()
+            && !self.has_term()
+    }
+
+    fn render_editor_frame(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        all_windows: bool,
+    ) -> anyhow::Result<()> {
         self.update_gutter_width();
         self.fix_cursor_pos();
         self.sync_to_window();
-        let active_window_id = self.window_manager.active_window_id();
-        self.render_window(buffer, active_window_id)?;
+        if all_windows {
+            for window_id in 0..self.window_manager.window_count() {
+                self.render_window(buffer, window_id)?;
+            }
+            self.render_all_window_separators(buffer)?;
+        } else {
+            self.render_window(buffer, self.window_manager.active_window_id())?;
+        }
         self.render_ui_chrome(buffer)?;
         self.render_dialog(buffer)?;
         self.update_and_render_overlays(buffer)?;
@@ -1234,6 +1295,7 @@ impl Editor {
         let changes = self.render_buffer_changes(buffer);
         self.render_diff(&changes)?;
         self.commit_render_buffer_changes(&changes);
+        self.last_rendered_window = self.window_manager.active_stable_window_id();
         self.render_generation = self.render_generation.wrapping_add(1);
 
         Ok(())
@@ -1241,6 +1303,7 @@ impl Editor {
 
     pub(crate) fn can_render_cursor_motion_delta(&self) -> bool {
         self.terminal_output_enabled
+            && self.can_reuse_editor_surfaces()
             && !self.relative_line_numbers_enabled()
             && self.uses_synthetic_block_cursor()
             && self.current_dialog.is_none()
