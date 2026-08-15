@@ -26,6 +26,7 @@ pub struct AgentManager {
     active_sessions: HashSet<String>,
     active_turn_ids: HashMap<String, String>,
     turn_started_at: HashMap<String, Instant>,
+    pending_commit_messages: HashSet<i64>,
     conversation: Option<AgentConversationSnapshot>,
     forgotten_conversations: HashSet<String>,
 }
@@ -193,6 +194,18 @@ impl AgentManager {
 
     pub fn clear_turns(&mut self) {
         self.turn_started_at.clear();
+    }
+
+    pub fn mark_commit_message_pending(&mut self, request_id: i64) {
+        self.pending_commit_messages.insert(request_id);
+    }
+
+    pub fn finish_commit_message(&mut self, request_id: i64) {
+        self.pending_commit_messages.remove(&request_id);
+    }
+
+    pub fn take_pending_commit_messages(&mut self) -> Vec<i64> {
+        self.pending_commit_messages.drain().collect()
     }
 
     pub fn begin_conversation(&mut self, thread_id: impl Into<String>, cwd: &Path) {

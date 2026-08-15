@@ -1890,6 +1890,23 @@ impl RedHost {
             }
             "GetEditorInfo" => PluginRequest::EditorInfo(request_id),
             "EditHistory" => PluginRequest::EditHistory { request_id },
+            "GenerateCommitMessage" => {
+                let cwd = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("GenerateCommitMessage requires a cwd"))?;
+                let context = args
+                    .get(1)
+                    .map(value_to_json)
+                    .ok_or_else(|| anyhow::anyhow!("GenerateCommitMessage requires context"))?;
+                PluginRequest::GenerateCommitMessage {
+                    request_id,
+                    cwd: PathBuf::from(cwd),
+                    branch: json_str(&context, "branch").to_string(),
+                    staged_diff: json_str(&context, "staged_diff").to_string(),
+                    recent_commits: json_str(&context, "recent_commits").to_string(),
+                }
+            }
             "GetCursorPosition" => PluginRequest::GetCursorPosition { request_id },
             "GetCursorDisplayColumn" => PluginRequest::GetCursorDisplayColumn { request_id },
             "GetBufferText" => {
@@ -2553,6 +2570,7 @@ impl RedHost {
             "detail_diff_args" => "commands::detail_diff_args",
             "hunk_diff_args" => "commands::hunk_diff_args",
             "commit_args" => "commands::commit_args",
+            "commit_history_args" => "commands::commit_history_args",
             _ => anyhow::bail!("unknown Git core operation `{operation}`"),
         };
 
@@ -11025,13 +11043,46 @@ mod tests {
 
     #[cfg(not(windows))]
     #[tokio::test]
-    async fn git_commit_scratch_includes_status_diff_and_managed_commands() {
+    async fn git_generated_commit_reports_failure_retry_and_success() {
         let _lock = PLUGIN_DISPATCHER_TEST_LOCK.lock().await;
         drain_requests();
         let repository = tempfile::tempdir().unwrap();
         let root = repository.path();
         assert!(Command::new("git")
             .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.join("base.txt"), "base\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "base.txt"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.name=Red Test",
+                "-c",
+                "user.email=red@example.test",
+                "commit",
+                "-qm",
+                "feat(core): establish repository style",
+            ])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["config", "user.name", "Red Test"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["config", "user.email", "red@example.test"])
             .current_dir(root)
             .status()
             .unwrap()
@@ -11072,7 +11123,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let (picker, create) = match ACTION_DISPATCHER.recv_request() {
+        let (picker, generate) = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::OpenCallbackPicker {
                 handle,
                 title,
@@ -11080,59 +11131,303 @@ mod tests {
                 ..
             } => {
                 assert_eq!(title.as_deref(), Some("Commit"));
-                let create = items
+                assert_eq!(items.first().map(|item| item.id.as_str()), Some("generate"));
+                assert_eq!(
+                    items.first().map(|item| item.label.as_str()),
+                    Some("Generate message")
+                );
+                assert!(items.iter().any(|item| item.id == "create"));
+                let generate = items
                     .into_iter()
-                    .find(|item| item.id == "create")
-                    .expect("commit picker should contain Create commit");
-                (handle, create)
+                    .find(|item| item.id == "generate")
+                    .expect("commit picker should contain generated message");
+                (handle, generate)
             }
             _ => panic!("expected the commit picker"),
         };
         runtime
-            .notify_picker(picker, PickerCallback::Selected(create))
+            .notify_picker(picker, PickerCallback::Selected(generate))
             .unwrap();
         let request_id = match ACTION_DISPATCHER.recv_request() {
             PluginRequest::GetEditorState { request_id } => request_id,
             _ => panic!("expected an editor snapshot request"),
         };
+        let editor_snapshot = serde_json::json!({
+            "version": 1,
+            "cwd": root.display().to_string(),
+            "saved_at": 1,
+            "buffers": [{
+                "index": 0,
+                "path": root.join("base.txt").display().to_string(),
+                "dirty": false,
+                "cursor": { "x": 0, "y": 0 },
+                "viewport_top": 0
+            }],
+            "current_buffer_index": 0,
+            "window_layout": {
+                "active_window_id": 0,
+                "root": {
+                    "kind": "window",
+                    "buffer_index": 0,
+                    "vtop": 0,
+                    "vleft": 0,
+                    "cx": 0,
+                    "cy": 0,
+                    "vx": 0
+                }
+            }
+        });
         runtime
-            .resolve_request(request_id, serde_json::json!({ "version": 1 }))
+            .resolve_request(request_id, editor_snapshot.clone())
             .await
             .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
+        let generation_request = loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            let mut generation_request = None;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                if let PluginRequest::GenerateCommitMessage {
+                    request_id,
+                    cwd,
+                    branch,
+                    staged_diff,
+                    recent_commits,
+                } = request
+                {
+                    assert_eq!(cwd.canonicalize().unwrap(), root.canonicalize().unwrap());
+                    assert!(branch == "master" || branch == "main");
+                    assert!(staged_diff.contains("staged.txt"));
+                    assert!(staged_diff.contains("+hello"));
+                    assert!(recent_commits.contains("feat(core): establish repository style"));
+                    generation_request = Some(request_id);
+                }
+            }
+            if let Some(request_id) = generation_request {
+                break request_id;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "commit message generation was not requested"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        runtime
+            .resolve_request(
+                generation_request,
+                serde_json::json!({
+                    "message": "feat(git): describe staged files",
+                    "error": ""
+                }),
+            )
+            .await
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let scratch_request = loop {
             pump_process_events(&mut runtime).await.unwrap();
             let mut scratch = None;
             while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
                 if let PluginRequest::OpenScratchBuffer {
+                    request_id,
                     name,
                     text,
                     submit_command,
                     cancel_command,
-                    ..
                 } = request
                 {
-                    scratch = Some((name, text, submit_command, cancel_command));
+                    scratch = Some((request_id, name, text, submit_command, cancel_command));
                 }
             }
-            if let Some((name, text, submit, cancel)) = scratch {
+            if let Some((request_id, name, text, submit, cancel)) = scratch {
                 assert_eq!(name, "[Git Commit].gitcommit");
                 assert_eq!(submit.as_deref(), Some("GitSubmitMessage"));
                 assert_eq!(cancel.as_deref(), Some("GitCancelMessage"));
+                assert!(text.starts_with("feat(git): describe staged files\n"));
                 assert!(text.contains("# --- Red commit context"));
                 assert!(text.contains("# Changes to be committed:"));
                 assert!(text.contains("staged.txt"));
                 assert!(text.contains("# Staged diff:"));
                 assert!(text.contains("# +hello"));
-                break;
+                break request_id;
             }
             assert!(
                 Instant::now() < deadline,
                 "commit scratch buffer did not open"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        runtime
+            .resolve_request(scratch_request, serde_json::json!({ "buffer_index": 7 }))
+            .await
+            .unwrap();
+
+        let hook = root.join(".git/hooks/pre-commit");
+        fs::write(
+            &hook,
+            "#!/bin/sh\necho blocked by commit feedback test >&2\nexit 1\n",
+        )
+        .unwrap();
+        assert!(Command::new("chmod")
+            .args(["+x", hook.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+
+        runtime.execute_command("GitSubmitMessage").await.unwrap();
+        let buffer_text_request = loop {
+            if let PluginRequest::GetBufferText { request_id, .. } =
+                ACTION_DISPATCHER.recv_request()
+            {
+                break request_id;
+            }
+        };
+        runtime
+            .resolve_request(
+                buffer_text_request,
+                serde_json::json!({ "text": "feat(git): describe staged files\n" }),
+            )
+            .await
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut failure_reported = false;
+        let mut retry_requested = false;
+        loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                match request {
+                    PluginRequest::CloseScratchBuffer { buffer_index } => {
+                        assert_eq!(buffer_index, 7);
+                    }
+                    PluginRequest::RestoreEditorState { request_id, .. } => {
+                        runtime
+                            .resolve_request(
+                                request_id,
+                                serde_json::json!({ "restored": true, "warnings": [] }),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    PluginRequest::Action(Action::Print(message))
+                        if message == "Git commit failed: blocked by commit feedback test" =>
+                    {
+                        failure_reported = true;
+                    }
+                    PluginRequest::GetEditorState { request_id } => {
+                        runtime
+                            .resolve_request(request_id, editor_snapshot.clone())
+                            .await
+                            .unwrap();
+                        retry_requested = true;
+                    }
+                    _ => {}
+                }
+            }
+            if failure_reported && retry_requested {
+                break;
+            }
+            assert!(Instant::now() < deadline, "commit failure was not reported");
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let retry_scratch = loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            let mut scratch = None;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                if let PluginRequest::OpenScratchBuffer {
+                    request_id,
+                    text,
+                    submit_command,
+                    ..
+                } = request
+                {
+                    scratch = Some((request_id, text, submit_command));
+                }
+            }
+            if let Some((request_id, text, submit)) = scratch {
+                assert_eq!(submit.as_deref(), Some("GitSubmitMessage"));
+                assert!(text.starts_with("feat(git): describe staged files\n"));
+                break request_id;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "failed commit message was not reopened for retry"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        runtime
+            .resolve_request(retry_scratch, serde_json::json!({ "buffer_index": 8 }))
+            .await
+            .unwrap();
+        fs::remove_file(hook).unwrap();
+
+        runtime.execute_command("GitSubmitMessage").await.unwrap();
+        let buffer_text_request = loop {
+            if let PluginRequest::GetBufferText { request_id, .. } =
+                ACTION_DISPATCHER.recv_request()
+            {
+                break request_id;
+            }
+        };
+        runtime
+            .resolve_request(
+                buffer_text_request,
+                serde_json::json!({ "text": "feat(git): describe staged files\n" }),
+            )
+            .await
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut restored = false;
+        let success = loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            let mut success = false;
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                match request {
+                    PluginRequest::CloseScratchBuffer { buffer_index } => {
+                        assert_eq!(buffer_index, 8);
+                    }
+                    PluginRequest::RestoreEditorState { request_id, .. } => {
+                        runtime
+                            .resolve_request(
+                                request_id,
+                                serde_json::json!({ "restored": true, "warnings": [] }),
+                            )
+                            .await
+                            .unwrap();
+                        restored = true;
+                    }
+                    PluginRequest::Action(Action::Print(message))
+                        if message == "Commit created successfully" =>
+                    {
+                        success = true;
+                    }
+                    _ => {}
+                }
+            }
+            if success {
+                break true;
+            }
+            assert!(Instant::now() < deadline, "commit success was not reported");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(success);
+        assert!(restored);
+        assert_eq!(
+            String::from_utf8(
+                Command::new("git")
+                    .args(["log", "-1", "--format=%s"])
+                    .current_dir(root)
+                    .output()
+                    .unwrap()
+                    .stdout
+            )
+            .unwrap()
+            .trim(),
+            "feat(git): describe staged files"
+        );
     }
 
     #[cfg(not(windows))]

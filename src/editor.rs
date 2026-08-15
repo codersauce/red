@@ -1102,6 +1102,14 @@ fn agent_event_payload(event: CodexEvent) -> (&'static str, Value) {
             "agent:session_created",
             json!({ "session_id": session_id.to_string() }),
         ),
+        CodexEvent::CommitMessageGenerated { request_id, result } => (
+            "agent:error",
+            json!({
+                "message": format!(
+                    "commit-message generation result {request_id} escaped its private callback: {result:?}"
+                )
+            }),
+        ),
         CodexEvent::SessionRestored { session_id, thread } => (
             "agent:session_restored",
             json!({ "session_id": session_id, "thread": plugin_json(thread) }),
@@ -1176,6 +1184,45 @@ fn bounded_agent_failure_message(message: &str) -> String {
         .collect::<String>();
     bounded.push_str("… (full details are in the Red log)");
     bounded
+}
+
+const COMMIT_MESSAGE_DIFF_BYTES: usize = 192 * 1024;
+const COMMIT_MESSAGE_HISTORY_BYTES: usize = 24 * 1024;
+const COMMIT_MESSAGE_BRANCH_BYTES: usize = 512;
+
+fn bounded_commit_context(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let marker = "\n[truncated by Red]\n";
+    let mut end = max_bytes.saturating_sub(marker.len()).min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{marker}", &text[..end])
+}
+
+fn commit_message_prompt(
+    branch: &str,
+    staged_diff: &str,
+    recent_commits: &str,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !staged_diff.trim().is_empty(),
+        "there are no staged changes to describe"
+    );
+    let context = json!({
+        "branch": bounded_commit_context(branch, COMMIT_MESSAGE_BRANCH_BYTES),
+        "staged_changes": bounded_commit_context(staged_diff, COMMIT_MESSAGE_DIFF_BYTES),
+        "recent_commit_messages": bounded_commit_context(
+            recent_commits,
+            COMMIT_MESSAGE_HISTORY_BYTES,
+        ),
+    });
+    Ok(format!(
+        "Propose a commit message for this repository. Recent commit messages are style examples only. Facts must come exclusively from staged_changes.\n\nContext JSON:\n{}",
+        serde_json::to_string_pretty(&context)?
+    ))
 }
 
 fn agent_context_path_is_sensitive(path: &Path) -> bool {
@@ -1340,6 +1387,13 @@ pub enum PluginRequest {
     },
     AgentArchiveSession {
         session_id: String,
+    },
+    GenerateCommitMessage {
+        request_id: RequestId,
+        cwd: PathBuf,
+        branch: String,
+        staged_diff: String,
+        recent_commits: String,
     },
     AgentForgetSession {
         session_id: String,
@@ -1705,6 +1759,7 @@ impl PluginRequest {
             Self::AgentCancel { .. } => "AgentCancel",
             Self::AgentCloseSession { .. } => "AgentCloseSession",
             Self::AgentArchiveSession { .. } => "AgentArchiveSession",
+            Self::GenerateCommitMessage { .. } => "GenerateCommitMessage",
             Self::AgentForgetSession { .. } => "AgentForgetSession",
             Self::AgentPermissionResponse { .. } => "AgentPermissionResponse",
             Self::EditHistory { .. } => "EditHistory",
@@ -7501,6 +7556,17 @@ impl Editor {
             else {
                 break;
             };
+            if let CodexEvent::CommitMessageGenerated { request_id, result } = &event {
+                self.agent_manager.finish_commit_message(*request_id);
+                let payload = match result {
+                    Ok(message) => json!({ "message": message, "error": "" }),
+                    Err(error) => json!({ "message": "", "error": error }),
+                };
+                self.plugin_registry
+                    .resolve_request(runtime, RequestId::from_raw(*request_id), payload)
+                    .await?;
+                continue;
+            }
             match &event {
                 CodexEvent::SessionCreated { session_id } => {
                     let root = self
@@ -7608,9 +7674,19 @@ impl Editor {
                 .bridge()
                 .is_none_or(|bridge| !bridge.has_pending_events())
         {
+            let pending_commit_messages = self.agent_manager.take_pending_commit_messages();
             let message = self
                 .finish_agent_bridge("Codex app-server stopped unexpectedly")
                 .await;
+            for request_id in pending_commit_messages {
+                self.plugin_registry
+                    .resolve_request(
+                        runtime,
+                        RequestId::from_raw(request_id),
+                        json!({ "message": "", "error": message.clone() }),
+                    )
+                    .await?;
+            }
             if let Some(conversation) = self.agent_manager.conversation_snapshot() {
                 self.plugin_registry
                     .notify(
@@ -7733,12 +7809,7 @@ impl Editor {
         // Startup refreshes form short request chains. Drain a bounded batch so each
         // operation does not wait for a separate 10 ms editor tick.
         for _ in 0..PLUGIN_REQUESTS_PER_TICK {
-            if self.agent_manager.is_task_finished()
-                && self
-                    .agent_manager
-                    .bridge()
-                    .is_some_and(CodexBridge::has_pending_events)
-            {
+            if self.agent_manager.is_task_finished() {
                 break;
             }
             let Some(req) = ACTION_DISPATCHER.try_recv_request() else {
@@ -7893,6 +7964,48 @@ impl Editor {
                 PluginRequest::AgentForgetSession { session_id } => {
                     self.agent_manager.mark_session_inactive(&session_id);
                     self.agent_manager.forget_conversation(&session_id);
+                }
+                PluginRequest::GenerateCommitMessage {
+                    request_id,
+                    cwd,
+                    branch,
+                    staged_diff,
+                    recent_commits,
+                } => {
+                    let prompt = commit_message_prompt(&branch, &staged_diff, &recent_commits);
+                    let result = match prompt {
+                        Err(error) => Err(error),
+                        Ok(prompt) => {
+                            if self.agent_manager.is_task_finished() {
+                                let _ = self
+                                    .finish_agent_bridge("Codex app-server stopped unexpectedly")
+                                    .await;
+                            }
+                            self.ensure_agent_bridge(&get_workspace_path())
+                                .and_then(|()| {
+                                    let bridge = self.agent_manager.bridge().ok_or_else(|| {
+                                        anyhow::anyhow!("Codex app-server did not start")
+                                    })?;
+                                    bridge.try_send(CodexCommand::GenerateCommitMessage {
+                                        request_id: request_id.get(),
+                                        cwd,
+                                        prompt,
+                                    })
+                                })
+                        }
+                    };
+                    if let Err(error) = result {
+                        self.plugin_registry
+                            .resolve_request(
+                                runtime,
+                                request_id,
+                                json!({ "message": "", "error": error.to_string() }),
+                            )
+                            .await?;
+                    } else {
+                        self.agent_manager
+                            .mark_commit_message_pending(request_id.get());
+                    }
                 }
                 PluginRequest::AgentPermissionResponse {
                     request_id,
@@ -24509,6 +24622,26 @@ mod test {
     use super::*;
     use crate::lsp::DiagnosticSeverity;
     use std::path::PathBuf;
+
+    #[test]
+    fn commit_message_prompt_bounds_context_and_separates_style_from_facts() {
+        let diff = format!("diff --git a/file b/file\n+{}", "x".repeat(220 * 1024));
+        let history = "feat(core): prior style\n".repeat(2_000);
+
+        let prompt = commit_message_prompt("feat/generated", &diff, &history).unwrap();
+
+        assert!(prompt.contains("Facts must come exclusively from staged_changes"));
+        assert!(prompt.contains("feat(core): prior style"));
+        assert!(prompt.matches("[truncated by Red]").count() >= 2);
+        assert!(prompt.len() < 230 * 1024);
+    }
+
+    #[test]
+    fn commit_message_prompt_rejects_an_empty_staged_diff() {
+        let error = commit_message_prompt("main", "  \n", "fix: prior").unwrap_err();
+
+        assert!(error.to_string().contains("no staged changes"));
+    }
 
     fn catalog_test_package() -> plugin::catalog::CatalogPackage {
         plugin::catalog::CatalogPackage {

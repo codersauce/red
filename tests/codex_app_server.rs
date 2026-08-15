@@ -133,6 +133,60 @@ for line in sys.stdin:
     path
 }
 
+fn mock_commit_codex(directory: &std::path::Path) -> std::path::PathBuf {
+    let path = directory.join("codex-commit");
+    std::fs::write(
+        &path,
+        r#"#!/usr/bin/env python3
+import json, sys
+
+def send(value):
+    print(json.dumps(value), flush=True)
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    ident = message.get("id")
+    if method == "initialize":
+        send({"id": ident, "result": {"userAgent": "mock"}})
+    elif method == "initialized":
+        pass
+    elif method == "account/read":
+        send({"id": ident, "result": {"account": {"type": "chatgpt"}, "requiresOpenaiAuth": True}})
+    elif method == "config/read":
+        send({"id": ident, "result": {"config": {"mcp_servers": {}}, "origins": {}}})
+    elif method == "configRequirements/read":
+        send({"id": ident, "result": {"requirements": None}})
+    elif method == "thread/start":
+        params = message["params"]
+        assert params["sandbox"] == "read-only"
+        assert params["approvalPolicy"] == "never"
+        assert params["dynamicTools"] == []
+        assert "Draft one Git commit message" in params["baseInstructions"]
+        assert params["config"]["features"]["hooks"] is False
+        send({"id": ident, "result": {"thread": {"id": "thread-commit"}}})
+    elif method == "turn/start":
+        text = message["params"]["input"][0]["text"]
+        assert "staged_changes" in text
+        assert "recent_commit_messages" in text
+        send({"id": ident, "result": {"turn": {"id": "turn-commit"}}})
+        send({"method": "item/agentMessage/delta", "params": {
+            "threadId": "thread-commit", "turnId": "turn-commit",
+            "delta": "```text\nfeat(git): generate commit messages\n```"
+        }})
+        send({"method": "turn/completed", "params": {
+            "threadId": "thread-commit",
+            "turn": {"id": "turn-commit", "status": "completed"}
+        }})
+"#,
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
 #[tokio::test]
 async fn direct_app_server_streams_and_routes_writes_to_the_host() {
     let directory = tempfile::tempdir().unwrap();
@@ -189,6 +243,52 @@ async fn direct_app_server_streams_and_routes_writes_to_the_host() {
         vec![("src/main.rs".to_string(), "updated\n".to_string())]
     );
 
+    drop(bridge);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn direct_app_server_generates_commit_messages_without_tools_or_agent_events() {
+    let directory = tempfile::tempdir().unwrap();
+    let codex = mock_commit_codex(directory.path());
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let host = RecordingHost {
+        writes: Arc::clone(&writes),
+    };
+    let (mut bridge, task) = start_codex(
+        CodexProcessSpec::new(codex, directory.path()),
+        host,
+        NonZeroUsize::new(32).unwrap(),
+    )
+    .unwrap();
+
+    bridge
+        .send(CodexCommand::GenerateCommitMessage {
+            request_id: 42,
+            cwd: directory.path().to_path_buf(),
+            prompt: "staged_changes recent_commit_messages".to_string(),
+        })
+        .await
+        .unwrap();
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(event) = bridge.try_recv() {
+                break event;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        event,
+        CodexEvent::CommitMessageGenerated {
+            request_id: 42,
+            result: Ok(message),
+        } if message == "feat(git): generate commit messages"
+    ));
+    assert!(writes.lock().unwrap().is_empty());
     drop(bridge);
     task.await.unwrap().unwrap();
 }

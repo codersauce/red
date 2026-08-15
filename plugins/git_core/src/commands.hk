@@ -116,6 +116,18 @@ pub fn commit_args(mode: String) -> [String] {
     args
 }
 
+pub fn commit_history_args(count: i32) -> [String] {
+    if count < 0 { count = 0; }
+    if count > 50 { count = 50; }
+    return [
+        "log",
+        "--no-merges",
+        "-n",
+        "" + count,
+        "--format=%H%n%B%x1e",
+    ];
+}
+
 pub fn apply_hunk_args(action: String) -> [String] {
     if action != "stage" && action != "unstage" && action != "reset" {
         return [];
@@ -198,4 +210,6 @@ fn builds_navigation_selection_and_commit_modes_explicitly() {
     assert(commit_args("create").join(" ") == "commit --cleanup=strip -F -");
     assert(commit_args("amend").join(" ") == "commit --amend --cleanup=strip -F -");
     assert(commit_args("--amend").join(" ") == "commit --amend --no-edit");
+    assert(commit_history_args(20).join(" ") == "log --no-merges -n 20 --format=%H%n%B%x1e");
+    assert(commit_history_args(100).join(" ") == "log --no-merges -n 50 --format=%H%n%B%x1e");
 }
