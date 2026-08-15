@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::undo::{TextPosition, TextRange, UndoHistory};
 use crate::unicode_utils::{char_to_column, column_to_char, display_width, trim_line_ending};
-use crate::utils::expand_user_path;
+use crate::utils::{expand_user_path, normalized_file_path};
 
 const FIRST_BUFFER_ID: u64 = 1;
 static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(FIRST_BUFFER_ID);
@@ -121,7 +121,7 @@ impl Buffer {
     pub async fn from_file(file: Option<String>) -> anyhow::Result<Self> {
         match &file {
             Some(file) => {
-                let path = expand_user_path(file)?;
+                let path = normalized_file_path(file)?;
                 if !path.exists() {
                     return Err(anyhow::anyhow!("file {:?} not found", file));
                 }
@@ -154,7 +154,7 @@ impl Buffer {
     pub async fn load_or_create(file: Option<String>) -> anyhow::Result<Self> {
         match &file {
             Some(file) => {
-                let path = expand_user_path(file)?;
+                let path = normalized_file_path(file)?;
                 let resolved_file = path.to_string_lossy().into_owned();
                 if !path.exists() {
                     if std::fs::symlink_metadata(&path).is_ok() {
@@ -407,7 +407,7 @@ impl Buffer {
     /// Saves the buffer contents to its associated file
     pub fn save(&mut self) -> anyhow::Result<String> {
         if let Some(file) = self.file.clone() {
-            let path = expand_user_path(&file)?;
+            let path = normalized_file_path(&file)?;
             let file = path.to_string_lossy().into_owned();
             let contents = self.contents();
             std::fs::write(&path, &contents)?;
@@ -422,7 +422,7 @@ impl Buffer {
 
     /// Saves the buffer contents to a new file path
     pub fn save_as(&mut self, new_file_name: &str) -> anyhow::Result<String> {
-        let path = expand_user_path(new_file_name)?;
+        let path = normalized_file_path(new_file_name)?;
         let file = path.to_string_lossy().into_owned();
         let contents = self.contents();
         std::fs::write(&path, &contents)?;
@@ -1209,6 +1209,24 @@ mod test {
         assert_eq!(buffer.file, Some(file.to_string_lossy().into_owned()));
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_or_create_stores_relative_paths_as_absolute() {
+        let cwd = std::env::current_dir().unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("red-relative-buffer-")
+            .tempdir_in(&cwd)
+            .unwrap();
+        let absolute = directory.path().join("main.c");
+        fs::write(&absolute, "int main(void) { return 0; }\n").unwrap();
+        let relative = absolute.strip_prefix(&cwd).unwrap();
+
+        let buffer = Buffer::load_or_create(Some(relative.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+
+        assert_eq!(buffer.file.as_deref(), absolute.to_str());
     }
 
     #[cfg(unix)]

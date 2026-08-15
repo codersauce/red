@@ -42,7 +42,7 @@ use red::onboarding;
 use red::preferences::PreferencesStore;
 use red::session::SessionStore;
 use red::theme::{parse_vscode_theme, parse_vscode_theme_contents, Theme};
-use red::utils::expand_user_path;
+use red::utils::{expand_user_path, same_file_path};
 use red::{log, run_self_check, LOGGER};
 
 #[cfg(unix)]
@@ -1034,7 +1034,17 @@ fn resolve_log_path(config_dir: &Path, configured_path: &str) -> anyhow::Result<
 async fn load_startup_buffers(files: &[String]) -> anyhow::Result<Vec<Buffer>> {
     let mut buffers = Vec::with_capacity(files.len());
     for file in files {
-        buffers.push(Buffer::load_or_create(Some(file.clone())).await?);
+        let buffer = Buffer::load_or_create(Some(file.clone())).await?;
+        let duplicate = buffer.file.as_deref().is_some_and(|candidate| {
+            buffers.iter().any(|open: &Buffer| {
+                open.file
+                    .as_deref()
+                    .is_some_and(|open| same_file_path(Path::new(open), Path::new(candidate)))
+            })
+        });
+        if !duplicate {
+            buffers.push(buffer);
+        }
     }
     Ok(buffers)
 }
@@ -1117,6 +1127,29 @@ mod tests {
         assert_eq!(buffers[1].file.as_deref(), Some(missing.as_str()));
         assert_eq!(buffers[1].contents(), "\n");
         assert!(!missing_path.exists());
+    }
+
+    #[tokio::test]
+    async fn startup_collapses_relative_and_absolute_aliases() {
+        let cwd = std::env::current_dir().unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("red-startup-alias-")
+            .tempdir_in(&cwd)
+            .unwrap();
+        let absolute = directory.path().join("main.c");
+        fs::write(&absolute, "int main(void) { return 0; }\n").unwrap();
+        let relative = absolute
+            .strip_prefix(&cwd)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let buffers = load_startup_buffers(&[absolute.to_string_lossy().into_owned(), relative])
+            .await
+            .unwrap();
+
+        assert_eq!(buffers.len(), 1);
+        assert_eq!(buffers[0].file.as_deref(), absolute.to_str());
     }
 
     #[tokio::test]

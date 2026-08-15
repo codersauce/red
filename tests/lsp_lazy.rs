@@ -309,10 +309,11 @@ async fn split_with_file_opens_new_active_lsp_buffer() {
         .unwrap();
 
     let events = recorded(&events);
+    let expected = std::env::current_dir().unwrap().join("src/main.rs");
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, LspEvent::DidOpen(file) if file == "src/main.rs")),
+            .any(|event| matches!(event, LspEvent::DidOpen(file) if Path::new(file) == expected)),
         "expected split-created active buffer to open through LSP, got {events:?}"
     );
 }
