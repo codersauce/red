@@ -3430,19 +3430,42 @@ async fn test_change_line() {
 
 #[tokio::test]
 async fn test_replace_char() {
-    let mut harness = EditorHarness::with_content("Hello World");
+    let buffer = Buffer::new(None, "Hello World".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
 
-    // Replace character with 'r' - delete char and insert new one
-    harness
-        .execute_action(Action::DeleteCharAtCursorPos)
-        .await
-        .unwrap();
-    harness
-        .execute_action(Action::InsertCharAtCursorPos('J'))
-        .await
-        .unwrap();
+    type_normal_keys(&mut harness, "rJ").await;
+
     harness.assert_buffer_contents("Jello World");
-    harness.assert_mode(Mode::Normal); // Should stay in normal mode
+    harness.assert_mode(Mode::Normal);
+}
+
+#[tokio::test]
+async fn replace_char_accepts_operator_and_character_motion_prefixes() {
+    for replacement in ['d', 'c', 'y', 'f', 't', 'F', 'T'] {
+        let buffer = Buffer::new(None, "abc".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+        type_normal_keys(&mut harness, &format!("r{replacement}")).await;
+
+        harness.assert_buffer_contents(&format!("{replacement}bc"));
+        harness.assert_mode(Mode::Normal);
+
+        type_normal_keys(&mut harness, "x").await;
+        harness.assert_buffer_contents("bc");
+    }
+}
+
+#[tokio::test]
+async fn visual_replace_accepts_operator_and_character_motion_prefixes() {
+    for replacement in ['d', 'c', 'y', 'f', 't', 'F', 'T'] {
+        let buffer = Buffer::new(None, "abc".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+        type_normal_keys(&mut harness, &format!("vlr{replacement}")).await;
+
+        harness.assert_buffer_contents(&format!("{replacement}{replacement}c"));
+        harness.assert_mode(Mode::Normal);
+    }
 }
 
 #[tokio::test]
