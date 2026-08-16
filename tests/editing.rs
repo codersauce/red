@@ -15,6 +15,7 @@ use red::{
     config::{Config, KeyAction, LanguageConfig, MatchitLanguageConfig},
     editor::{Action, Content, Editor, Mode, SearchDirection},
     lsp::LspClient,
+    notification::{MessageAction, Notice, NotificationSource, Severity},
     plugin::{
         PanelConfig, PanelRow, PanelRowKind, PanelSegment, PanelSide, Runtime, TextPanelBlock,
         TextPanelBlockFormat, TextPanelBlockKind, TextPanelComposerConfig,
@@ -28,7 +29,7 @@ use std::{
     env, fs,
     path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 static COMMAND_COMPLETION_CWD_LOCK: Mutex<()> = Mutex::new(());
@@ -1573,13 +1574,49 @@ async fn unchanged_recovery_snapshots_are_skipped_and_failures_back_off() {
 
     let warning = harness.commandline_row();
     assert!(warning.contains("Crash recovery is not being saved"));
+    let warning_id = harness
+        .editor
+        .notifications()
+        .primary(Instant::now())
+        .unwrap()
+        .id;
 
-    harness.editor.test_set_last_error("a newer LSP error");
+    let error_id = harness
+        .editor
+        .publish_notification(Notice::new(
+            NotificationSource::Editor,
+            Severity::Error,
+            "a newer LSP error",
+        ))
+        .unwrap();
     let status = harness.commandline_row();
     assert!(status.contains("a newer LSP error"));
-    assert!(status.contains("Crash recovery is not being saved"));
+    assert!(status.contains("2 active"));
+    assert!(harness
+        .editor
+        .notifications()
+        .get(warning_id)
+        .unwrap()
+        .is_active(Instant::now()));
     harness.editor.test_set_size(/*width*/ 8, /*height*/ 4);
-    assert_eq!(harness.commandline_row(), "a newer ");
+    assert_eq!(harness.commandline_row(), "× a  [2]");
+    harness.editor.test_set_size(/*width*/ 120, /*height*/ 24);
+
+    harness.execute_action(Action::OpenMessages).await.unwrap();
+    harness
+        .execute_action(Action::MessageHistory(MessageAction::Acknowledge))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::MessageHistory(MessageAction::Close))
+        .await
+        .unwrap();
+    assert!(!harness
+        .editor
+        .notifications()
+        .get(error_id)
+        .unwrap()
+        .is_active(Instant::now()));
 
     harness
         .execute_action(Action::Command("1".to_string()))
@@ -5700,8 +5737,8 @@ async fn focused_agent_panel_keeps_global_leader_until_the_composer_is_focused()
     let Some(KeyAction::Nested(leader)) = action else {
         panic!("expected Space to start the leader sequence from the conversation, got {action:?}");
     };
-    assert_eq!(leader.len(), 6);
-    for global in ["A", "?", "d", "e", "P", "s"] {
+    assert_eq!(leader.len(), 7);
+    for global in ["A", "?", "d", "e", "m", "P", "s"] {
         assert!(
             leader.contains_key(global),
             "global leader branch {global:?} must remain available"
@@ -5713,6 +5750,10 @@ async fn focused_agent_panel_keeps_global_leader_until_the_composer_is_focused()
             "contextual leader branch {contextual:?} must be filtered"
         );
     }
+    assert_eq!(
+        leader.get("m"),
+        Some(&KeyAction::Single(Action::OpenMessages))
+    );
     assert_eq!(
         leader.get("A"),
         Some(&KeyAction::Single(Action::PluginCommand(
