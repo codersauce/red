@@ -76,6 +76,12 @@ pub struct Buffer {
     /// The text content stored as a rope for efficient editing
     content: Rope,
 
+    /// Last loaded or successfully saved text. Unknown recovered baselines stay dirty.
+    saved_content: Option<Rope>,
+
+    /// Content revision for which `dirty` was last computed.
+    dirty_revision: u64,
+
     /// Whether the buffer has unsaved changes
     pub dirty: bool,
 
@@ -104,10 +110,16 @@ impl Buffer {
             contents
         };
 
+        Self::with_content(file, Rope::from_str(&contents))
+    }
+
+    fn with_content(file: Option<String>, content: Rope) -> Self {
         Self {
             id: BufferId::next(),
             file,
-            content: Rope::from_str(&contents),
+            saved_content: Some(content.clone()),
+            content,
+            dirty_revision: 0,
             dirty: false,
             pos: (0, 0),
             vtop: 0,
@@ -221,6 +233,11 @@ impl Buffer {
         self.content.clone()
     }
 
+    /// Returns the last saved text without flattening it on the editor thread.
+    pub(crate) fn saved_contents_snapshot(&self) -> Option<Rope> {
+        self.saved_content.clone()
+    }
+
     /// Gets the exact contents of the half-open line range `[start, end)`.
     ///
     /// Line endings are preserved and no separators are synthesized.
@@ -286,14 +303,19 @@ impl Buffer {
     pub fn from_session_snapshot(
         file: Option<String>,
         contents: String,
+        saved_contents: Option<String>,
         dirty: bool,
         revision: u64,
         undo_history: UndoHistory,
     ) -> Self {
-        let mut buffer = Self::new(file, contents);
-        buffer.dirty = dirty;
+        let mut buffer = Self::with_content(file, Rope::from_str(&contents));
+        buffer.saved_content = saved_contents
+            .map(|contents| Rope::from_str(&contents))
+            .or_else(|| (!dirty).then(|| buffer.content.clone()));
         buffer.revision = revision;
+        buffer.dirty_revision = revision.wrapping_sub(1);
         buffer.undo_history = undo_history;
+        buffer.refresh_dirty();
         buffer
     }
 
@@ -400,8 +422,8 @@ impl Buffer {
     }
 
     fn mark_changed(&mut self) {
-        self.dirty = true;
         self.revision = self.revision.wrapping_add(1);
+        self.refresh_dirty();
     }
 
     /// Saves the buffer contents to its associated file
@@ -589,9 +611,9 @@ impl Buffer {
 
     /// Applies a replacement directly and advances the buffer revision.
     ///
-    /// This method does not record undo history, update marks, refresh dirty state, or
-    /// notify external consumers. Using it from a new action handler would create an
-    /// untracked edit; production changes must go through `Editor::replace_range`.
+    /// This method updates content-based dirty state, but does not record undo history,
+    /// update marks, or notify external consumers. Using it from a new action handler
+    /// would create an untracked edit; production changes must use `Editor::replace_range`.
     pub fn replace_range_raw(&mut self, range: TextRange, text: &str) {
         let start_char = self.position_to_char_idx(range.start);
         let end_char = self.position_to_char_idx(range.end);
@@ -1029,15 +1051,31 @@ impl Buffer {
         self.dirty
     }
 
-    /// Recomputes the public dirty flag from undo history's saved revision.
-    pub fn refresh_dirty_from_history(&mut self) {
-        self.dirty = self.undo_history.is_dirty();
+    /// Refreshes dirty state once per content revision, independently of undo history.
+    ///
+    /// An open transaction can change the text without advancing its history revision.
+    /// Compare exact Rope contents so manually restoring saved text is clean as well.
+    /// Recovery without a trustworthy baseline remains dirty until save or reload.
+    pub fn refresh_dirty(&mut self) {
+        if self.dirty_revision == self.revision {
+            return;
+        }
+        self.dirty = match &self.saved_content {
+            Some(saved) => {
+                !self.content.is_instance(saved)
+                    && (self.content.len_bytes() != saved.len_bytes() || self.content != *saved)
+            }
+            None => true,
+        };
+        self.dirty_revision = self.revision;
     }
 
-    /// Marks the current history revision as saved and clears the public dirty flag.
+    /// Records the current contents and history revision as the saved state.
     pub fn mark_saved(&mut self) {
+        self.saved_content = Some(self.content.clone());
         self.undo_history.mark_saved();
-        self.refresh_dirty_from_history();
+        self.dirty = false;
+        self.dirty_revision = self.revision;
     }
 
     // Helper method to convert (x,y) coordinates to character index in the rope
@@ -1175,6 +1213,147 @@ mod test {
 
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
+
+    fn replace_all(buffer: &mut Buffer, text: &str) {
+        let end = buffer.char_idx_to_position(buffer.content.len_chars());
+        buffer.replace_range_raw(TextRange::new(TextPosition::new(0, 0), end), text);
+    }
+
+    fn commit_text(buffer: &mut Buffer, text: &str) {
+        use crate::undo::CursorSnapshot;
+        buffer
+            .undo_history
+            .begin_transaction("replace text", CursorSnapshot::default());
+        let end = buffer.char_idx_to_position(buffer.content.len_chars());
+        crate::editing::apply_transactional_replacement(
+            buffer,
+            TextRange::new(TextPosition::new(0, 0), end),
+            text,
+        );
+        buffer
+            .undo_history
+            .commit_transaction(CursorSnapshot::default());
+        buffer.refresh_dirty();
+    }
+
+    #[test]
+    fn dirty_tracks_exact_contents_during_an_open_transaction() {
+        let original = "a👋\r\nbeta\n";
+        let mut buffer = Buffer::new(None, original.to_string());
+        buffer
+            .undo_history
+            .begin_transaction("insert session", crate::undo::CursorSnapshot::default());
+        let revision = buffer.revision();
+        for changed in ["a🙂\r\nbeta\n", "a👋\nbeta\n", "a👋\r\nbeta"] {
+            replace_all(&mut buffer, changed);
+            assert!(buffer.is_dirty());
+            assert!(!buffer.undo_history.is_dirty());
+            replace_all(&mut buffer, original);
+            assert!(!buffer.is_dirty());
+        }
+        assert!(buffer.revision() > revision);
+        assert!(buffer.undo_history.is_transaction_active());
+    }
+
+    #[test]
+    fn dirty_clears_on_an_equivalent_undo_branch_and_after_history_pruning() {
+        let mut buffer = Buffer::new(None, "abc".to_string());
+        commit_text(&mut buffer, "saved");
+        buffer.mark_saved();
+        let mut history = std::mem::take(&mut buffer.undo_history);
+        assert!(history.undo(&mut buffer).is_some());
+        buffer.undo_history = history;
+        assert!(buffer.is_dirty());
+
+        commit_text(&mut buffer, "saved");
+        assert!(buffer.undo_history.is_dirty());
+        assert_eq!(buffer.undo_history.node_count(), 2);
+        assert!(!buffer.is_dirty());
+
+        buffer.undo_history.set_max_nodes(1);
+        commit_text(&mut buffer, "other");
+        commit_text(&mut buffer, "saved");
+        assert_eq!(buffer.undo_history.node_count(), 1);
+        assert!(!buffer.is_dirty());
+    }
+
+    #[test]
+    fn dirty_baseline_moves_only_after_a_successful_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.txt");
+        let second = directory.path().join("second.txt");
+        fs::write(&first, "abc").unwrap();
+        let mut buffer = Buffer::new(Some(first.to_string_lossy().into_owned()), "abc".into());
+
+        replace_all(&mut buffer, "def");
+        let invalid = directory.path().join("missing/failed.txt");
+        assert!(buffer.save_as(&invalid.to_string_lossy()).is_err());
+        assert_eq!(buffer.file.as_deref(), first.to_str());
+        assert!(buffer.is_dirty());
+        replace_all(&mut buffer, "abc");
+        assert!(!buffer.is_dirty());
+
+        replace_all(&mut buffer, "def");
+        buffer.save().unwrap();
+        assert!(!buffer.is_dirty());
+        replace_all(&mut buffer, "abc");
+        assert!(buffer.is_dirty());
+        buffer.save_as(&second.to_string_lossy()).unwrap();
+        replace_all(&mut buffer, "def");
+        assert!(buffer.is_dirty());
+        replace_all(&mut buffer, "abc");
+        assert!(!buffer.is_dirty());
+        assert_eq!(fs::read_to_string(first).unwrap(), "def");
+        assert_eq!(fs::read_to_string(second).unwrap(), "abc");
+    }
+
+    #[test]
+    fn dirty_recovery_uses_the_saved_baseline_and_preserves_unknown_state() {
+        let mut restored = Buffer::from_session_snapshot(
+            None,
+            "modified".into(),
+            Some("saved".into()),
+            true,
+            19,
+            UndoHistory::default(),
+        );
+        assert!(restored.is_dirty());
+        replace_all(&mut restored, "saved");
+        assert!(!restored.is_dirty());
+
+        let mut unknown = Buffer::from_session_snapshot(
+            None,
+            "recovered".into(),
+            None,
+            true,
+            0,
+            UndoHistory::default(),
+        );
+        unknown.refresh_dirty();
+        assert!(unknown.is_dirty());
+        replace_all(&mut unknown, "different");
+        replace_all(&mut unknown, "recovered");
+        assert!(unknown.is_dirty());
+        unknown.mark_saved();
+        assert!(!unknown.is_dirty());
+    }
+
+    #[test]
+    fn dirty_recovery_preserves_an_empty_unnamed_buffer() {
+        let mut buffer = Buffer::from_session_snapshot(
+            None,
+            String::new(),
+            None,
+            false,
+            0,
+            UndoHistory::default(),
+        );
+        assert_eq!(buffer.contents(), "");
+        replace_all(&mut buffer, "x");
+        assert!(buffer.is_dirty());
+        replace_all(&mut buffer, "");
+        assert!(!buffer.is_dirty());
+    }
 
     #[test]
     fn syntax_selection_is_buffer_local_and_does_not_change_revision() {

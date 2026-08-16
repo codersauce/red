@@ -336,7 +336,7 @@ impl TextArea {
             return false;
         };
         self.restore_cursor(cursor);
-        self.buffer.refresh_dirty_from_history();
+        self.buffer.refresh_dirty();
         true
     }
 
@@ -350,7 +350,7 @@ impl TextArea {
             return false;
         };
         self.restore_cursor(cursor);
-        self.buffer.refresh_dirty_from_history();
+        self.buffer.refresh_dirty();
         true
     }
 
@@ -1072,7 +1072,7 @@ impl TextArea {
             } else {
                 let after = self.cursor_snapshot();
                 self.buffer.undo_history.commit_transaction(after);
-                self.buffer.refresh_dirty_from_history();
+                self.buffer.refresh_dirty();
                 self.record_change(keys);
                 self.set_mode(Mode::Normal);
             }
@@ -1500,7 +1500,7 @@ impl TextArea {
         if self.buffer.undo_history.is_transaction_active() {
             let after = self.cursor_snapshot();
             self.buffer.undo_history.commit_transaction(after);
-            self.buffer.refresh_dirty_from_history();
+            self.buffer.refresh_dirty();
         }
         if let Some(mut recipe) = self.insert_recipe.take() {
             if recipe.len() > 1 {
@@ -1750,7 +1750,7 @@ impl TextArea {
         if started_transaction {
             let after = self.cursor_snapshot();
             self.buffer.undo_history.commit_transaction(after);
-            self.buffer.refresh_dirty_from_history();
+            self.buffer.refresh_dirty();
         }
         true
     }
@@ -1820,12 +1820,24 @@ fn unnamed_buffer(text: &str) -> Buffer {
         TextRange::new(TextPosition::new(0, 0), TextPosition::new(1, 0)),
         "",
     );
-    buffer.dirty = false;
+    buffer.mark_saved();
     buffer
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn empty_textarea_has_an_exact_clean_baseline() {
+        let mut buffer = super::unnamed_buffer("");
+        assert!(!buffer.is_dirty());
+        buffer.insert_str(0, 0, "x");
+        assert!(buffer.is_dirty());
+        buffer.remove(0, 0);
+        assert_eq!(buffer.contents(), "");
+        assert!(!buffer.is_dirty());
+    }
+
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
     use super::{TextArea, TextAreaOutcome};

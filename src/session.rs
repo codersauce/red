@@ -153,6 +153,10 @@ pub struct SessionBufferSnapshot {
     pub path: Option<String>,
     /// Full in-memory text at capture time.
     pub contents: String,
+    /// Last loaded or successfully saved text, independent of later disk changes.
+    /// Older dirty snapshots may not have a trustworthy saved baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_contents: Option<String>,
     /// Whether the in-memory text differed from its saved state.
     pub dirty: bool,
     /// Buffer revision used to correlate derived state.
@@ -2287,6 +2291,7 @@ mod tests {
                 index: 0,
                 path: None,
                 contents: contents.to_string(),
+                saved_contents: None,
                 dirty: true,
                 revision: 1,
                 cursor_x: 0,
@@ -2348,6 +2353,18 @@ mod tests {
             encoded.get("former_plugin"),
             Some(&serde_json::json!({ "version": 1, "reviews": [1, 2] }))
         );
+    }
+
+    #[test]
+    fn older_session_snapshots_default_missing_saved_contents() {
+        let mut value = serde_json::to_value(snapshot("recovered")).unwrap();
+        value["buffers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("saved_contents");
+        let restored: SessionSnapshot = serde_json::from_value(value).unwrap();
+        assert!(restored.buffers[0].saved_contents.is_none());
+        assert!(crate::editor::Editor::buffers_from_session_snapshot(&restored)[0].is_dirty());
     }
 
     #[test]

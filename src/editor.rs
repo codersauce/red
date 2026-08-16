@@ -23346,7 +23346,7 @@ impl Editor {
             .current_buffer_mut()
             .undo_history
             .commit_transaction(after_cursor);
-        self.current_buffer_mut().refresh_dirty_from_history();
+        self.current_buffer_mut().refresh_dirty();
         committed
     }
 
@@ -23370,7 +23370,7 @@ impl Editor {
         let mut history = std::mem::take(&mut buffer.undo_history);
         let outcome = history.undo(buffer);
         buffer.undo_history = history;
-        buffer.refresh_dirty_from_history();
+        buffer.refresh_dirty();
 
         let Some((cursor, edits)) = outcome else {
             self.set_legacy_message(Some("already at oldest change".to_string()));
@@ -23401,7 +23401,7 @@ impl Editor {
         let mut history = std::mem::take(&mut buffer.undo_history);
         let outcome = history.redo(buffer);
         buffer.undo_history = history;
-        buffer.refresh_dirty_from_history();
+        buffer.refresh_dirty();
 
         let Some((cursor, edits)) = outcome else {
             self.set_legacy_message(Some("already at newest change".to_string()));
@@ -23502,6 +23502,11 @@ impl Editor {
                 let mut buffer = Buffer::from_session_snapshot(
                     path,
                     saved.contents.clone(),
+                    if detached_duplicate {
+                        None
+                    } else {
+                        saved.saved_contents.clone()
+                    },
                     saved.dirty || detached_duplicate,
                     saved.revision,
                     saved.undo_history.clone(),
@@ -23856,6 +23861,13 @@ impl Editor {
                         } else {
                             String::new()
                         },
+                        saved_contents: if include_disk_contents {
+                            buffer
+                                .saved_contents_snapshot()
+                                .map(|contents| contents.to_string())
+                        } else {
+                            None
+                        },
                         dirty: buffer.dirty,
                         revision: buffer.revision(),
                         cursor_x,
@@ -24052,18 +24064,19 @@ impl Editor {
         let content_snapshots = self
             .buffer_manager
             .iter()
-            .map(Buffer::contents_snapshot)
+            .map(|buffer| (buffer.contents_snapshot(), buffer.saved_contents_snapshot()))
             .collect::<Vec<_>>();
         let (mut snapshot, disk_fingerprints) =
             self.durable_session_snapshot(/*include_disk_contents*/ false);
         let writer = std::thread::spawn(move || {
-            for ((buffer, fingerprint), contents) in snapshot
+            for ((buffer, fingerprint), (contents, saved_contents)) in snapshot
                 .buffers
                 .iter_mut()
                 .zip(disk_fingerprints)
                 .zip(content_snapshots)
             {
                 buffer.contents = contents.to_string();
+                buffer.saved_contents = saved_contents.map(|contents| contents.to_string());
                 buffer.disk_contents =
                     buffer
                         .path
