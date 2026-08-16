@@ -188,8 +188,9 @@ impl Editor {
             .count()
             >= MAX_BUFFER_COMMENTS
         {
-            self.last_error =
-                Some("inline comment limit reached; dismiss existing comments first".into());
+            self.set_legacy_message(Some(
+                "inline comment limit reached; dismiss existing comments first".into(),
+            ));
             return;
         }
         let comment =
@@ -391,7 +392,7 @@ impl Editor {
             .collect::<Vec<_>>();
         indices.sort_by_key(|&(index, start)| (start, index));
         if indices.is_empty() {
-            self.last_error = Some("no inline comments in this buffer".into());
+            self.set_legacy_message(Some("no inline comments in this buffer".into()));
             return;
         }
         let current = self.current_inline_comment_index().and_then(|index| {
@@ -416,11 +417,11 @@ impl Editor {
         self.layout_cache.borrow_mut().clear();
         self.move_to_text_position(TextPosition::new(line, 0));
         self.refresh_cursor_goal();
-        self.last_error = Some(format!(
+        self.set_legacy_message(Some(format!(
             "comment {}/{} · Space v view · Space x dismiss",
             position + 1,
             indices.len()
-        ));
+        )));
     }
 
     pub(super) fn dismiss_inline_comment(&mut self) {
@@ -441,13 +442,13 @@ impl Editor {
             self.active_inline_comment = None;
             self.layout_cache.borrow_mut().clear();
         } else {
-            self.last_error = Some("no inline comment at the cursor".into());
+            self.set_legacy_message(Some("no inline comment at the cursor".into()));
         }
     }
 
     pub(super) fn show_inline_comment(&mut self) {
         let Some(index) = self.current_inline_comment_index() else {
-            self.last_error = Some("no inline comment at the cursor".into());
+            self.set_legacy_message(Some("no inline comment at the cursor".into()));
             return;
         };
         let comment = &self.inline_comments[index];

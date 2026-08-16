@@ -22,6 +22,7 @@ mod inline_history;
 mod input_prompt;
 mod keymap_hints;
 mod list;
+mod messages;
 mod picker;
 mod prompt_buffer;
 mod rich_text;
@@ -52,6 +53,7 @@ pub(crate) use inline_history::InlineHistoryPanel;
 pub use input_prompt::InputPrompt;
 pub(crate) use keymap_hints::draw_keymap_hints;
 use list::List;
+pub(crate) use messages::{MessageRow, MessagesPanel, MessagesView};
 pub(crate) use picker::MAX_UNFOCUSED_PREVIEW_BYTES;
 pub use picker::{
     LegacyPickerOptions, Picker, PickerIcon, PickerItem, PickerOptions, PickerPresentation,
@@ -77,6 +79,10 @@ use crate::{
 
 pub trait Component: Send {
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()>;
+
+    fn is_message_history(&self) -> bool {
+        false
+    }
 
     /// Actions for the surface-local F1 menu. The default keeps passive popups unchanged.
     fn surface_actions(&self) -> Vec<UiAction> {

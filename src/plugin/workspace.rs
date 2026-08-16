@@ -218,7 +218,7 @@ impl WorkspaceLayout {
             x: 0,
             y: 2,
             width,
-            height: height.saturating_sub(3),
+            height: height.saturating_sub(4),
         };
         if let Some(focus) = workspace.zoomed {
             return Self {
@@ -1498,7 +1498,7 @@ impl WorkspaceManager {
             return;
         };
         let editor_style = &theme.style;
-        for y in 0..buffer.height {
+        for y in 0..buffer.height.saturating_sub(1) {
             buffer.set_text(0, y, &" ".repeat(buffer.width), editor_style);
         }
         if buffer.width < 4 || buffer.height < 4 {
@@ -1563,7 +1563,7 @@ impl WorkspaceManager {
         if workspace.model.actions.is_empty() {
             render_segments(
                 buffer,
-                (1, buffer.height - 1, buffer.width - 2),
+                (1, buffer.height - 2, buffer.width - 2),
                 &workspace.model.footer,
                 editor_style,
                 theme,
@@ -1588,7 +1588,7 @@ impl WorkspaceManager {
                 .render(
                     buffer,
                     1,
-                    buffer.height - 1,
+                    buffer.height - 2,
                     buffer.width - 2,
                     theme,
                     editor_style,
@@ -2674,7 +2674,7 @@ mod tests {
                 assert!(!event.notify_plugin);
                 let zoomed = WorkspaceLayout::calculate(&workspace, height, width);
                 assert_eq!(zoomed.pane(focus).unwrap().width, width);
-                assert_eq!(zoomed.pane(focus).unwrap().height, height - 3);
+                assert_eq!(zoomed.pane(focus).unwrap().height, height - 4);
                 assert!(zoomed.separator.is_none());
                 assert_eq!(workspace.rows_width, Some(31));
                 workspace.handle_action("toggle_zoom".to_string(), height, width);

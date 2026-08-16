@@ -31,6 +31,7 @@ use crate::{
     config::{CursorShape, FormattingProvider, KeyAction, PickerIconStyle, StatuslineSection},
     editor::RenderCommand,
     lsp::{Diagnostic, DiagnosticSeverity},
+    notification::{NotificationCounts, NotificationState, Severity},
     plugin::DecorationAnchor,
     splash,
     theme::{SelectionForegroundPriority, Style, Theme},
@@ -79,6 +80,37 @@ fn diagnostic_row(diagnostics: &[&Diagnostic], available_width: usize) -> Option
     let mut row = truncate_display_width(&row, available_width - 1);
     row.push('…');
     Some(fit_display_width(&row, available_width))
+}
+
+fn notification_badge(counts: NotificationCounts, width: usize, has_message: bool) -> String {
+    let full = if counts.active > 0 {
+        format!("[{} active · :messages]", counts.active)
+    } else if counts.unread > 0 {
+        format!("[{} unread · :messages]", counts.unread)
+    } else if counts.total > 0 {
+        "[:messages]".to_string()
+    } else {
+        return String::new();
+    };
+    let reserve = if has_message { 16 } else { 0 };
+    if display_width(&full) + reserve <= width {
+        return full;
+    }
+    if counts.active > 1 {
+        let compact = format!("[{}]", counts.active);
+        if display_width(&compact) + usize::from(has_message) < width {
+            return compact;
+        }
+    }
+    String::new()
+}
+
+fn notification_summary(text: &str, width: usize) -> String {
+    if width >= 10 && display_width(text) > width {
+        format!("{}…", truncate_display_width(text, width - 1))
+    } else {
+        truncate_display_width(text, width)
+    }
 }
 
 fn diagnostics_by_visible_line(
@@ -1246,13 +1278,6 @@ impl Editor {
         // and overlays so prompts and transient menus stay interactive.
         self.workspace_manager
             .render(buffer, &self.theme, self.picker_icons());
-        if self.workspace_manager.is_active()
-            && (self.last_error.is_some()
-                || self.session_manager.warning().is_some()
-                || self.config_diagnostics_banner().is_some())
-        {
-            self.draw_commandline(buffer);
-        }
         self.render_dialog(buffer)?;
 
         // Render all plugins
@@ -1262,6 +1287,8 @@ impl Editor {
         // Update overlay positions and render them
         let overlays_span = super::perf::PerfSpan::start("render:overlays+cursor");
         self.update_and_render_overlays(buffer)?;
+        // The final row belongs to the editor, including inside modal workspaces.
+        self.draw_commandline(buffer);
 
         self.update_terminal_cursor_surface(buffer);
         self.render_cursor_cell(buffer);
@@ -3321,22 +3348,74 @@ impl Editor {
             };
             let wc_width = if wc.is_empty() { 0 } else { 10.min(width) };
 
-            let mut messages = Vec::new();
-            if let Some(error) = self.last_error.as_deref() {
-                messages.push(error.to_string());
+            let now = Instant::now();
+            let mut counts = self.notifications.counts(now);
+            let primary = self.notifications.primary(now);
+            let (message, severity) = if let Some(fallback) = &self.notification_fallback {
+                counts.active += 1;
+                (
+                    format!("! {fallback} [not retained]"),
+                    Some(Severity::Error),
+                )
+            } else if let Some(record) = primary {
+                let prefix = if record.is_running() {
+                    format!(
+                        "{} ",
+                        crate::ui::spinner_frame(
+                            self.notification_animation_start.elapsed().as_millis() as u64
+                        )
+                    )
+                } else if record.severity != Severity::Info {
+                    format!("{} ", record.severity.marker())
+                } else {
+                    String::new()
+                };
+                let source = if matches!(
+                    record.source,
+                    crate::notification::NotificationSource::Editor
+                ) {
+                    String::new()
+                } else {
+                    format!("{}: ", record.source.label())
+                };
+                let percentage = match record.state {
+                    NotificationState::Running {
+                        percentage: Some(value),
+                    } => format!(" ({value}%)"),
+                    _ => String::new(),
+                };
+                (
+                    format!("{prefix}{source}{}{percentage}", record.content.summary),
+                    Some(record.severity),
+                )
+            } else {
+                (String::new(), None)
+            };
+            let available = width.saturating_sub(wc_width);
+            let badge = notification_badge(counts, available, !message.is_empty());
+            let badge_width = display_width(&badge);
+            let message_width =
+                available.saturating_sub(badge_width + usize::from(badge_width > 0));
+            let mut message_style = style.clone();
+            let color = match severity {
+                Some(Severity::Error) => Some("notificationsErrorIcon.foreground"),
+                Some(Severity::Warning) => Some("notificationsWarningIcon.foreground"),
+                Some(Severity::Success) => Some("gitDecoration.addedResourceForeground"),
+                _ => None,
+            };
+            if let Some(color) = color.and_then(|key| self.theme.colors.get(key)).copied() {
+                message_style.fg = Some(color);
             }
-            if let Some(warning) = self.session_manager.warning() {
-                messages.push(warning.to_string());
-            }
-            if let Some(warning) = self.config_diagnostics_banner() {
-                messages.push(warning);
-            }
-            let last_error = (!messages.is_empty()).then(|| messages.join(" | "));
-            if let Some(last_error) = last_error {
-                let width = width.saturating_sub(wc_width);
-                let last_error = last_error.replace(['\r', '\n'], " ");
-                let last_error = fit_display_width(&last_error, width);
-                buffer.set_text(0, y, &last_error, style);
+            buffer.set_text(
+                0,
+                y,
+                &notification_summary(&message, message_width),
+                &message_style,
+            );
+            if badge_width > 0 {
+                let mut badge_style = style.clone();
+                badge_style.fg = self.theme.ui_style.muted.fg.or(style.fg);
+                buffer.set_text(available - badge_width, y, &badge, &badge_style);
             }
 
             if wc_width > 0 {
@@ -3359,6 +3438,13 @@ impl Editor {
         };
         let cmdline = format!("{}{}", prefix, text);
         buffer.set_text(0, y, &cmdline, style);
+        let badge = notification_badge(self.notifications.counts(Instant::now()), width, false);
+        let badge_width = display_width(&badge);
+        if badge_width > 0 && display_width(&cmdline).saturating_add(badge_width + 2) <= width {
+            let mut badge_style = style.clone();
+            badge_style.fg = self.theme.ui_style.muted.fg.or(style.fg);
+            buffer.set_text(width - badge_width, y, &badge, &badge_style);
+        }
     }
 
     /// Renders the gutter with line numbers for a specific window
@@ -3685,7 +3771,7 @@ mod tests {
             },
             &editor.theme,
         );
-        editor.last_error = Some("fatal: index.lock already exists".to_string());
+        editor.set_legacy_message(Some("fatal: index.lock already exists".to_string()));
         let mut buffer = RenderBuffer::new(60, 12, &Style::default());
 
         editor.render(&mut buffer).unwrap();
@@ -3700,6 +3786,15 @@ mod tests {
             .collect::<String>();
         assert!(commandline.contains("fatal: index.lock already exists"));
         assert!(!commandline.contains("s stage"));
+        let actionline = buffer
+            .cells
+            .chunks(buffer.width)
+            .nth(buffer.height - 2)
+            .unwrap()
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>();
+        assert!(actionline.contains("s stage"), "{actionline}");
     }
 
     #[test]

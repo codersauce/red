@@ -24,6 +24,7 @@ mod inline_history;
 mod lsp_coordinator;
 #[cfg(test)]
 mod navigation_perf_tests;
+mod notifications;
 pub(crate) mod perf;
 pub mod render_buffer;
 pub mod rendering;
@@ -110,6 +111,10 @@ use crate::{
         WorkspaceEditOperation as LspWorkspaceEditOperation, MAX_WORKSPACE_EDIT_TOTAL_BYTES,
     },
     matchit::{self, MatchDirection, MatchMotion},
+    notification::{
+        MessageAction, Notice, NotificationCenter, NotificationError, NotificationId,
+        NotificationSource, NotificationTime, Severity,
+    },
     plugin::{self, ComposerHandle, PickerHandle, PluginRegistry, RequestId, Runtime},
     preferences::{PanelLayoutPreference, PreferencesStore},
     session::{
@@ -2416,6 +2421,8 @@ pub enum Action {
         failure_reason: Option<String>,
     },
     Print(String),
+    OpenMessages,
+    MessageHistory(MessageAction),
 
     OpenTextPanelTurnActions,
     CopyTextPanelTurn {
@@ -3138,7 +3145,17 @@ pub struct Editor {
     /// Whether persistent hlsearch rendering has been cleared with :noh.
     search_highlights_suppressed: bool,
 
-    /// Most recent error message
+    /// Session-local notification records, independent of the legacy display slot.
+    notifications: NotificationCenter,
+    message_browser: Option<notifications::MessageBrowser>,
+    notification_presentation: notifications::NotificationPresentation,
+    notification_animation_start: Instant,
+    notification_fallback: Option<String>,
+    config_notification: Option<NotificationId>,
+    session_notification: Option<NotificationId>,
+    persistent_notification_messages: [Option<String>; 2],
+
+    /// Compatibility display slot while existing producers are migrated.
     last_error: Option<String>,
 
     /// Active dialog/popup component
@@ -3971,6 +3988,19 @@ impl Content {
 }
 
 impl Editor {
+    /// Session-local messages. Reading history does not acknowledge its entries.
+    pub fn notifications(&self) -> &NotificationCenter {
+        &self.notifications
+    }
+
+    /// Records a typed notice for the bottom line and message history.
+    pub fn publish_notification(
+        &mut self,
+        notice: Notice,
+    ) -> Result<NotificationId, NotificationError> {
+        self.notifications.publish(notice, NotificationTime::now())
+    }
+
     pub fn set_config_diagnostics(
         &mut self,
         diagnostics: Vec<ConfigDiagnostic>,
@@ -3978,6 +4008,7 @@ impl Editor {
     ) {
         self.config_diagnostics = diagnostics;
         self.config_diagnostics_acknowledged = self.config_diagnostics.is_empty();
+        self.sync_persistent_notifications();
         if recovery == ConfigRecovery::WholeFileFallback && !self.config_diagnostics.is_empty() {
             self.open_config_diagnostics();
         }
@@ -4085,6 +4116,7 @@ impl Editor {
         self.config.commenting = loaded.config.commenting;
         self.config_diagnostics = loaded.diagnostics;
         self.config_diagnostics_acknowledged = self.config_diagnostics.is_empty();
+        self.sync_persistent_notifications();
         self.highlighter = highlighter;
         self.syntax_textobjects.reset(Arc::clone(&registry));
         self.indentation = indentation;
@@ -4112,6 +4144,7 @@ impl Editor {
 
     fn open_config_diagnostics(&mut self) {
         self.config_diagnostics_acknowledged = true;
+        self.sync_persistent_notifications();
         let diagnostics = self.config_diagnostics.clone();
         let actions = diagnostics
             .iter()
@@ -4394,6 +4427,14 @@ impl Editor {
             active_search: None,
             search_match_cache: None,
             search_highlights_suppressed: false,
+            notifications: NotificationCenter::default(),
+            message_browser: None,
+            notification_presentation: notifications::NotificationPresentation::default(),
+            notification_animation_start: Instant::now(),
+            notification_fallback: None,
+            config_notification: None,
+            session_notification: None,
+            persistent_notification_messages: [None, None],
             last_error: None,
             current_dialog: None,
             dialog_action_menu: crate::ui::ActionMenu::default(),
@@ -4818,7 +4859,7 @@ impl Editor {
             crate::window::Direction::Left => "no window to the left",
             crate::window::Direction::Right => "no window to the right",
         };
-        self.last_error = Some(message.to_string());
+        self.set_legacy_message(Some(message.to_string()));
         self.draw_commandline(buffer);
         Ok(())
     }
@@ -4985,7 +5026,9 @@ impl Editor {
             Ok(changed) => changed,
             Err(error) => {
                 log!("failed to reset panel layout preferences: {error}");
-                self.last_error = Some(format!("unable to save panel layout reset: {error}"));
+                self.set_legacy_message(Some(format!(
+                    "unable to save panel layout reset: {error}"
+                )));
                 false
             }
         };
@@ -5003,7 +5046,7 @@ impl Editor {
             }
         }
         if let Some(panel_id) = panel_id.filter(|_| !live_found && !preference_changed) {
-            self.last_error = Some(format!("unknown panel {panel_id:?}"));
+            self.set_legacy_message(Some(format!("unknown panel {panel_id:?}")));
         }
         if live_changed {
             self.apply_panel_layout();
@@ -7434,9 +7477,9 @@ impl Editor {
         } else {
             Ok(())
         } {
-            self.last_error = Some(format!(
+            self.set_legacy_message(Some(format!(
                 "inline edit applied, but change notification failed: {error}"
-            ));
+            )));
         }
         let scope = self
             .inline_assist
@@ -7966,7 +8009,9 @@ impl Editor {
             return Ok(false);
         }
         if self.agent_manager.is_session_active(&session_id) {
-            self.last_error = Some("a Codex prompt is already active for this session".to_string());
+            self.set_legacy_message(Some(
+                "a Codex prompt is already active for this session".to_string(),
+            ));
             return Ok(true);
         }
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -8665,7 +8710,9 @@ impl Editor {
                         plugin_json(serde_json::to_value(conversation)?),
                     )
                     .await?;
-                self.last_error = Some(format!("{message}; restoring the persisted agent session"));
+                self.set_legacy_message(Some(format!(
+                    "{message}; restoring the persisted agent session"
+                )));
             } else {
                 self.plugin_registry
                     .notify(runtime, "agent:session_lost", json!({ "message": message }))
@@ -8774,7 +8821,7 @@ impl Editor {
             Ok(None) => {}
             Err(err) => {
                 log!("ERROR: Lsp error: {err}");
-                self.last_error = Some(err.to_string());
+                self.set_legacy_message(Some(err.to_string()));
                 needs_render = true;
             }
         }
@@ -9077,9 +9124,9 @@ impl Editor {
                 } => {
                     if runtime.composer_plugin(handle).as_deref() != Some(owner.as_str()) {
                         runtime.release_composer(handle);
-                        self.last_error = Some(
+                        self.set_legacy_message(Some(
                             "ignored a composer whose callback owner no longer exists".to_string(),
-                        );
+                        ));
                         needs_render = true;
                         continue;
                     }
@@ -9100,9 +9147,9 @@ impl Editor {
                 } => {
                     if runtime.composer_plugin(handle).as_deref() != Some(owner.as_str()) {
                         runtime.release_composer(handle);
-                        self.last_error = Some(
+                        self.set_legacy_message(Some(
                             "ignored an input whose callback owner no longer exists".to_string(),
-                        );
+                        ));
                         needs_render = true;
                         continue;
                     }
@@ -9137,9 +9184,9 @@ impl Editor {
                 } => {
                     if runtime.picker_plugin(handle).as_deref() != Some(owner.as_str()) {
                         runtime.release_picker(handle);
-                        self.last_error = Some(
+                        self.set_legacy_message(Some(
                             "ignored a picker whose callback owner no longer exists".to_string(),
-                        );
+                        ));
                         needs_render = true;
                         continue;
                     }
@@ -9162,10 +9209,10 @@ impl Editor {
                 } => {
                     if runtime.picker_plugin(handle).as_deref() != Some(owner.as_str()) {
                         runtime.release_picker(handle);
-                        self.last_error = Some(
+                        self.set_legacy_message(Some(
                             "ignored a confirmation whose callback owner no longer exists"
                                 .to_string(),
-                        );
+                        ));
                         needs_render = true;
                         continue;
                     }
@@ -10224,6 +10271,8 @@ impl Editor {
                 }
             }
         }
+        self.sync_persistent_notifications();
+        needs_render |= self.notification_presentation_changed();
         let background_render = if needs_render {
             MotionRender::Full
         } else if needs_editor_windows_render {
@@ -11099,7 +11148,7 @@ impl Editor {
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
         let Some(change) = self.last_semantic_change.clone() else {
-            self.last_error = Some("no change to repeat".to_string());
+            self.set_legacy_message(Some("no change to repeat".to_string()));
             return Ok(());
         };
 
@@ -11130,24 +11179,24 @@ impl Editor {
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
         let Some(register) = normalize_macro_register(register) else {
-            self.last_error = Some("macro register must be a letter or digit".to_string());
+            self.set_legacy_message(Some("macro register must be a letter or digit".to_string()));
             return Ok(());
         };
         let depth = self.macro_replay_depth.saturating_add(1);
         if depth > MACRO_MAX_REPLAY_DEPTH {
-            self.last_error = Some(format!(
+            self.set_legacy_message(Some(format!(
                 "macro recursion limit ({MACRO_MAX_REPLAY_DEPTH}) reached"
-            ));
+            )));
             return Ok(());
         }
         let Some(content) = self.registers.get(&register) else {
-            self.last_error = Some(format!("macro register @{register} is empty"));
+            self.set_legacy_message(Some(format!("macro register @{register} is empty")));
             return Ok(());
         };
         let events = match Self::macro_events_from_notation(&content.text) {
             Ok(events) => events,
             Err(error) => {
-                self.last_error = Some(error.to_string());
+                self.set_legacy_message(Some(error.to_string()));
                 return Ok(());
             }
         };
@@ -11170,9 +11219,9 @@ impl Editor {
         let result = async {
             while let Some(replay) = self.macro_replay_queue.pop_front() {
                 if self.macro_instructions_remaining == 0 {
-                    self.last_error = Some(format!(
+                    self.set_legacy_message(Some(format!(
                         "macro instruction limit ({MACRO_MAX_REPLAY_EVENTS}) reached"
-                    ));
+                    )));
                     self.macro_replay_queue.clear();
                     break;
                 }
@@ -11534,7 +11583,7 @@ impl Editor {
             } else {
                 "format response is stale; buffer changed".to_string()
             };
-            self.last_error = Some(warning.clone());
+            self.set_legacy_message(Some(warning.clone()));
             return save.filter(|save| save.save_as.is_some()).map(|save| {
                 Action::RestoreLspFormatSave {
                     buffer_id: pending.buffer_id,
@@ -11561,7 +11610,7 @@ impl Editor {
                 } else {
                     format!("invalid LSP formatting response: {error}")
                 };
-                self.last_error = Some(warning.clone());
+                self.set_legacy_message(Some(warning.clone()));
                 return save.filter(|save| save.save_as.is_some()).map(|save| {
                     Action::RestoreLspFormatSave {
                         buffer_id: pending.buffer_id,
@@ -11591,7 +11640,7 @@ impl Editor {
             crate::lsp::apply_text_edits(&contents, &edits).err()
         }) {
             let warning = format!("invalid LSP formatting edits; Save As cancelled: {error}");
-            self.last_error = Some(warning.clone());
+            self.set_legacy_message(Some(warning.clone()));
             let save = save?;
             return Some(Action::RestoreLspFormatSave {
                 buffer_id: pending.buffer_id,
@@ -11624,14 +11673,16 @@ impl Editor {
         let pending = self.pending_lsp_edit_requests.remove(&response.id)?;
         let revision_snapshot = self.pending_lsp_revision_snapshots.remove(&response.id);
         if !self.pending_lsp_edit_is_current(&pending) {
-            self.last_error = Some("code-action response is stale; buffer changed".to_string());
+            self.set_legacy_message(Some(
+                "code-action response is stale; buffer changed".to_string(),
+            ));
             return None;
         }
         let values = match &response.result {
             Value::Null => return None,
             Value::Array(values) => values,
             _ => {
-                self.last_error = Some("invalid LSP code-action response".to_string());
+                self.set_legacy_message(Some("invalid LSP code-action response".to_string()));
                 return None;
             }
         };
@@ -11649,7 +11700,9 @@ impl Editor {
                 Some(edit) => match workspace_edit_operations(edit) {
                     Ok(operations) => operations,
                     Err(error) => {
-                        self.last_error = Some(format!("invalid LSP code-action edit: {error}"));
+                        self.set_legacy_message(Some(format!(
+                            "invalid LSP code-action edit: {error}"
+                        )));
                         continue;
                     }
                 },
@@ -11664,7 +11717,9 @@ impl Editor {
                 Some(command) => match serde_json::from_value::<LspCommand>(command) {
                     Ok(command) => Some(command),
                     Err(error) => {
-                        self.last_error = Some(format!("invalid LSP code-action command: {error}"));
+                        self.set_legacy_message(Some(format!(
+                            "invalid LSP code-action command: {error}"
+                        )));
                         continue;
                     }
                 },
@@ -11681,12 +11736,12 @@ impl Editor {
             ) {
                 Ok(revisions) => revisions,
                 Err(error) => {
-                    self.last_error = Some(error);
+                    self.set_legacy_message(Some(error));
                     continue;
                 }
             };
             if let Err(error) = self.validate_workspace_edit_origin(&operations, &pending.uri) {
-                self.last_error = Some(error);
+                self.set_legacy_message(Some(error));
                 continue;
             }
 
@@ -11725,7 +11780,7 @@ impl Editor {
 
         if items.is_empty() {
             if self.last_error.is_none() {
-                self.last_error = Some("no applicable LSP code actions".to_string());
+                self.set_legacy_message(Some("no applicable LSP code actions".to_string()));
             }
             return None;
         }
@@ -11950,17 +12005,17 @@ impl Editor {
         let pending = self.pending_lsp_edit_requests.remove(&response.id)?;
         let revision_snapshot = self.pending_lsp_revision_snapshots.remove(&response.id);
         if !self.pending_lsp_edit_is_current(&pending) {
-            self.last_error = Some("rename response is stale; buffer changed".to_string());
+            self.set_legacy_message(Some("rename response is stale; buffer changed".to_string()));
             return None;
         }
         if response.result.is_null() {
-            self.last_error = Some("language server returned no rename edit".to_string());
+            self.set_legacy_message(Some("language server returned no rename edit".to_string()));
             return None;
         }
         let operations = match workspace_edit_operations(&response.result) {
             Ok(operations) => operations,
             Err(error) => {
-                self.last_error = Some(format!("invalid LSP rename response: {error}"));
+                self.set_legacy_message(Some(format!("invalid LSP rename response: {error}")));
                 return None;
             }
         };
@@ -11971,12 +12026,12 @@ impl Editor {
         ) {
             Ok(revisions) => revisions,
             Err(error) => {
-                self.last_error = Some(error);
+                self.set_legacy_message(Some(error));
                 return None;
             }
         };
         if let Err(error) = self.validate_workspace_edit_origin(&operations, &pending.uri) {
-            self.last_error = Some(error);
+            self.set_legacy_message(Some(error));
             return None;
         }
         Some(self.workspace_edit_action(
@@ -12145,16 +12200,16 @@ impl Editor {
                         if msg.request.is_some()
                             && self.completion_filter_for_response(msg).is_none()
                         {
-                            self.last_error = Some(
+                            self.set_legacy_message(Some(
                                 "completion response is stale; cursor moved before the request position"
                                     .to_string(),
-                            );
+                            ));
                             return None;
                         }
                         let Some(snapshot) = self.snapshot_for_completion_response(&pending) else {
-                            self.last_error = Some(
+                            self.set_legacy_message(Some(
                                 "completion response is stale; active buffer changed".to_string(),
-                            );
+                            ));
                             return None;
                         };
                         if msg.result.is_null() {
@@ -12259,7 +12314,7 @@ impl Editor {
                 {
                     return Some(Action::ShowDialog);
                 }
-                self.last_error = Some(error_msg.message.clone());
+                self.set_legacy_message(Some(error_msg.message.clone()));
                 let save_as = save.as_ref().is_some_and(|save| save.save_as.is_some());
                 if (error_msg.code == -32601 || save_as)
                     && method.as_deref() == Some("textDocument/formatting")
@@ -12293,7 +12348,7 @@ impl Editor {
                                 "format response is stale; Save As cancelled: {}",
                                 error_msg.message
                             );
-                            self.last_error = Some(warning.clone());
+                            self.set_legacy_message(Some(warning.clone()));
                             return Some(Action::RestoreLspFormatSave {
                                 buffer_id: pending.buffer_id,
                                 uri: pending.uri,
@@ -12325,7 +12380,7 @@ impl Editor {
                     {
                         return Some(Action::ShowDialog);
                     }
-                    self.last_error = Some(error.to_string());
+                    self.set_legacy_message(Some(error.to_string()));
                     let save_as = save.as_ref().is_some_and(|save| save.save_as.is_some());
                     if (matches!(
                         error,
@@ -12360,7 +12415,7 @@ impl Editor {
                             if save.save_as.is_some() {
                                 let warning =
                                     format!("format response is stale; Save As cancelled: {error}");
-                                self.last_error = Some(warning.clone());
+                                self.set_legacy_message(Some(warning.clone()));
                                 return Some(Action::RestoreLspFormatSave {
                                     buffer_id: pending.buffer_id,
                                     uri: pending.uri,
@@ -12436,6 +12491,18 @@ impl Editor {
 
         if self.substitute_confirmation.is_some() {
             return Ok(self.handle_substitute_confirmation_event(ev));
+        }
+
+        if !self.has_term()
+            && (self.notifications.records().len() > 0 || self.notification_fallback.is_some())
+            && matches!(ev, Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left), row, ..
+            }) if *row == self.size.1.saturating_sub(1))
+        {
+            self.waiting_key_action = None;
+            self.waiting_command = None;
+            self.clear_keymap_hints();
+            return Ok(Some(KeyAction::Single(Action::OpenMessages)));
         }
 
         if matches!(ev, Event::Paste(_)) {
@@ -12806,11 +12873,11 @@ impl Editor {
                         Content::charwise(yank.text)
                     };
                     self.set_default_register(content);
-                    self.last_error = Some(if yank.linewise {
+                    self.set_legacy_message(Some(if yank.linewise {
                         format!("{} lines yanked", lines.max(1))
                     } else {
                         format!("{length} characters yanked")
-                    });
+                    }));
                     KeyAction::Single(Action::Refresh)
                 }
             });
@@ -12824,15 +12891,17 @@ impl Editor {
                         .focused_text_for_copy(copy_all, usize::from(self.size.0))
                     {
                         self.set_default_register(Content::charwise(text));
-                        self.last_error = Some(if copy_all {
+                        self.set_legacy_message(Some(if copy_all {
                             "conversation copied".to_string()
                         } else {
                             "answer copied".to_string()
-                        });
+                        }));
                         return Some(KeyAction::Single(Action::Refresh));
                     }
                     if !self.panel_manager.focused_row_panel() {
-                        self.last_error = Some("selected turn has no answer to copy".to_string());
+                        self.set_legacy_message(Some(
+                            "selected turn has no answer to copy".to_string(),
+                        ));
                         return Some(KeyAction::Single(Action::Refresh));
                     }
                 }
@@ -13062,7 +13131,7 @@ impl Editor {
         match target {
             plugin::TextPanelLinkTarget::File { path, location } => {
                 if let Err(error) = validate_text_panel_file(&path) {
-                    self.last_error = Some(format!("Unable to open link: {error}"));
+                    self.set_legacy_message(Some(format!("Unable to open link: {error}")));
                     return KeyAction::Single(Action::Refresh);
                 }
                 self.panel_manager.focus_editor();
@@ -13199,6 +13268,7 @@ impl Editor {
             | Action::ConfigDiagnostics
             | Action::Suspend
             | Action::ViewLogs
+            | Action::OpenMessages
             | Action::ListPlugins
             | Action::SplitHorizontal
             | Action::SplitVertical
@@ -13453,7 +13523,7 @@ impl Editor {
         self.command = String::new();
         self.waiting_command = None;
         self.repeater = None;
-        self.last_error = None;
+        self.set_legacy_message(None);
 
         if let Some(commands) = self.scratch_buffers.get(&self.current_buffer().id()) {
             let routed = match cmd.trim() {
@@ -13474,7 +13544,7 @@ impl Editor {
             Ok(Some(command)) => return vec![Action::Substitute(command)],
             Ok(None) => {}
             Err(error) => {
-                self.last_error = Some(error.to_string());
+                self.set_legacy_message(Some(error.to_string()));
                 return Vec::new();
             }
         }
@@ -13493,7 +13563,9 @@ impl Editor {
                 } else if let Ok(count) = arguments.trim().parse::<u16>() {
                     count.max(2)
                 } else {
-                    self.last_error = Some("join count must be a positive integer".to_string());
+                    self.set_legacy_message(Some(
+                        "join count must be a positive integer".to_string(),
+                    ));
                     return Vec::new();
                 };
                 return vec![if keep_spaces {
@@ -13503,13 +13575,15 @@ impl Editor {
                 }];
             }
             if !arguments.trim().is_empty() {
-                self.last_error = Some("join count cannot be combined with a range".to_string());
+                self.set_legacy_message(Some(
+                    "join count cannot be combined with a range".to_string(),
+                ));
                 return Vec::new();
             }
             let range = match self.resolve_ex_line_range(range, "join") {
                 Ok(range) => range,
                 Err(error) => {
-                    self.last_error = Some(error.to_string());
+                    self.set_legacy_message(Some(error.to_string()));
                     return Vec::new();
                 }
             };
@@ -13520,11 +13594,11 @@ impl Editor {
             }];
         }
         if !range.is_empty() {
-            self.last_error = Some(if ranged_command.is_empty() {
+            self.set_legacy_message(Some(if ranged_command.is_empty() {
                 "line range requires a command".to_string()
             } else {
                 format!("command {name:?} does not support a line range")
-            });
+            }));
             return Vec::new();
         }
 
@@ -13536,6 +13610,9 @@ impl Editor {
         }
         if cmd == "config-diagnostics" {
             return vec![Action::ConfigDiagnostics];
+        }
+        if cmd == "messages" {
+            return vec![Action::OpenMessages];
         }
         if matches!(cmd, "InlineHistory" | "inline-history") {
             return vec![Action::OpenInlineHistory];
@@ -13583,16 +13660,20 @@ impl Editor {
         }
         if let Some(assignment) = cmd.strip_prefix("register ") {
             let Some((register, keys)) = assignment.split_once(' ') else {
-                self.last_error = Some("usage: register <name> <key-notation>".to_string());
+                self.set_legacy_message(Some("usage: register <name> <key-notation>".to_string()));
                 return Vec::new();
             };
             let mut register_chars = register.chars();
             let Some(register) = register_chars.next() else {
-                self.last_error = Some("macro register must be a letter or digit".to_string());
+                self.set_legacy_message(Some(
+                    "macro register must be a letter or digit".to_string(),
+                ));
                 return Vec::new();
             };
             if register_chars.next().is_some() || normalize_macro_register(register).is_none() {
-                self.last_error = Some("macro register must be a letter or digit".to_string());
+                self.set_legacy_message(Some(
+                    "macro register must be a letter or digit".to_string(),
+                ));
                 return Vec::new();
             }
             return vec![Action::SetMacroRegister {
@@ -13610,7 +13691,7 @@ impl Editor {
                 return vec![Action::OpenSyntaxPicker];
             };
             if arguments.next().is_some() {
-                self.last_error = Some("usage: syntax [language|auto|off]".to_string());
+                self.set_legacy_message(Some("usage: syntax [language|auto|off]".to_string()));
                 return Vec::new();
             }
             return vec![Action::SetSyntax(syntax.to_string())];
@@ -13620,7 +13701,7 @@ impl Editor {
             return if arguments.trim() == "reload" {
                 vec![Action::ReloadLanguages]
             } else {
-                self.last_error = Some("usage: languages reload".to_string());
+                self.set_legacy_message(Some("usage: languages reload".to_string()));
                 Vec::new()
             };
         }
@@ -13629,7 +13710,7 @@ impl Editor {
             return if arguments.trim().is_empty() {
                 vec![Action::ListPlugins]
             } else {
-                self.last_error = Some("usage: plugins".to_string());
+                self.set_legacy_message(Some("usage: plugins".to_string()));
                 Vec::new()
             };
         }
@@ -13637,18 +13718,22 @@ impl Editor {
         if name == "set" {
             let mut options = arguments.split_whitespace();
             let Some(option) = options.next() else {
-                self.last_error = Some("usage: set {relativenumber|norelativenumber}".to_string());
+                self.set_legacy_message(Some(
+                    "usage: set {relativenumber|norelativenumber}".to_string(),
+                ));
                 return Vec::new();
             };
             if options.next().is_some() {
-                self.last_error = Some("usage: set {relativenumber|norelativenumber}".to_string());
+                self.set_legacy_message(Some(
+                    "usage: set {relativenumber|norelativenumber}".to_string(),
+                ));
                 return Vec::new();
             }
             return match option {
                 "relativenumber" | "rnu" => vec![Action::SetRelativeLineNumbers(true)],
                 "norelativenumber" | "nornu" => vec![Action::SetRelativeLineNumbers(false)],
                 _ => {
-                    self.last_error = Some(format!("unknown option {option:?}"));
+                    self.set_legacy_message(Some(format!("unknown option {option:?}")));
                     Vec::new()
                 }
             };
@@ -13660,7 +13745,10 @@ impl Editor {
             if runtime.command_plugin(cmd).is_some() {
                 return vec![Action::PluginCommand(cmd.to_string())];
             }
-            self.last_error = Some(format!("unknown command {cmd:?}"));
+            self.set_notification_message(
+                Severity::Error,
+                Some(format!("unknown command {cmd:?}")),
+            );
             return vec![];
         };
 
@@ -13738,7 +13826,9 @@ impl Editor {
 
             if cmd == "panel-layout-reset" {
                 if parsed.args.len() > 1 {
-                    self.last_error = Some("usage: panel-layout-reset [panel-id]".to_string());
+                    self.set_legacy_message(Some(
+                        "usage: panel-layout-reset [panel-id]".to_string(),
+                    ));
                     return Vec::new();
                 }
                 actions.push(Action::ResetPanelLayout(parsed.args.first().cloned()));
@@ -13827,10 +13917,10 @@ impl Editor {
             .char_idx_to_position(substitution.start_char);
         self.move_to_text_position(position);
         self.refresh_cursor_goal();
-        self.last_error = Some(format!(
+        self.set_legacy_message(Some(format!(
             "replace with {:?}? (y/n/a/q/l)",
             substitution.replacement
-        ));
+        )));
         self.render(buffer)
     }
 
@@ -13841,7 +13931,7 @@ impl Editor {
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
         if substitutions.is_empty() {
-            self.last_error = Some("pattern not found".to_string());
+            self.set_legacy_message(Some("pattern not found".to_string()));
             self.render(buffer)?;
             return Ok(());
         }
@@ -14016,7 +14106,7 @@ impl Editor {
         self.mode = Mode::Search;
         self.waiting_command = None;
         self.repeater = None;
-        self.last_error = None;
+        self.set_legacy_message(None);
     }
 
     fn update_search_preview(&mut self) {
@@ -14040,13 +14130,13 @@ impl Editor {
         ) {
             Ok(preview) => preview,
             Err(err) => {
-                self.last_error = Some(err.to_string());
+                self.set_legacy_message(Some(err.to_string()));
                 None
             }
         };
 
         if let Some(match_) = preview {
-            self.last_error = None;
+            self.set_legacy_message(None);
             self.move_to_search_match(match_);
         } else {
             self.restore_search_origin(&session.origin, session.origin_vtop);
@@ -14062,7 +14152,7 @@ impl Editor {
             self.restore_search_origin(&session.origin, session.origin_vtop);
         }
         self.mode = Mode::Normal;
-        self.last_error = None;
+        self.set_legacy_message(None);
     }
 
     fn finish_search_with_error(&mut self, session: SearchSession, error: String) {
@@ -14072,7 +14162,7 @@ impl Editor {
         self.search_highlights_suppressed = false;
         self.active_search = None;
         self.mode = Mode::Normal;
-        self.last_error = Some(error);
+        self.set_legacy_message(Some(error));
     }
 
     fn pattern_not_found_message(pattern: &str) -> String {
@@ -14110,7 +14200,7 @@ impl Editor {
             .to_string();
         if pattern.is_empty() {
             if self.active_search.is_none() {
-                self.last_error = Some("no previous search".to_string());
+                self.set_legacy_message(Some("no previous search".to_string()));
                 self.draw_commandline(buffer);
             }
             return Ok(false);
@@ -14125,13 +14215,13 @@ impl Editor {
         ) {
             Ok(matched) => matched,
             Err(err) => {
-                self.last_error = Some(err.to_string());
+                self.set_legacy_message(Some(err.to_string()));
                 self.render(buffer)?;
                 return Ok(false);
             }
         };
         if let Some(match_) = matched {
-            self.last_error = None;
+            self.set_legacy_message(None);
             self.search_highlights_suppressed = false;
             self.move_to_search_match(match_);
             if let Some(active_search) = &mut self.active_search {
@@ -14140,7 +14230,7 @@ impl Editor {
             self.render(buffer)?;
             return Ok(true);
         } else {
-            self.last_error = Some(Self::pattern_not_found_message(&pattern));
+            self.set_legacy_message(Some(Self::pattern_not_found_message(&pattern)));
             self.render(buffer)?;
         }
 
@@ -14177,7 +14267,7 @@ impl Editor {
             return;
         }
         session.preview = None;
-        self.last_error = None;
+        self.set_legacy_message(None);
         self.update_search_preview();
     }
 
@@ -14655,7 +14745,7 @@ impl Editor {
             if let Some(kind) = SyntaxObjectKind::for_text_object_key(*c) {
                 let Some(object) = self.syntax_text_object(scope, kind) else {
                     if self.last_error.is_none() {
-                        self.last_error = Some("text object not found".to_string());
+                        self.set_legacy_message(Some("text object not found".to_string()));
                     }
                     return Some(KeyAction::None);
                 };
@@ -14667,26 +14757,26 @@ impl Editor {
                 if selected {
                     return Some(KeyAction::Single(Action::Refresh));
                 }
-                self.last_error = Some("text object not found".to_string());
+                self.set_legacy_message(Some("text object not found".to_string()));
                 return Some(KeyAction::None);
             }
             let Some(kind) = text_object_kind_for_key(*c) else {
                 if *c == '%' {
                     let Some(range) = self.matchit_select_around_range() else {
-                        self.last_error = Some("text object not found".to_string());
+                        self.set_legacy_message(Some("text object not found".to_string()));
                         return Some(KeyAction::None);
                     };
                     if self.select_text_range(range) {
                         return Some(KeyAction::Single(Action::Refresh));
                     }
-                    self.last_error = Some("text object not found".to_string());
+                    self.set_legacy_message(Some("text object not found".to_string()));
                     return Some(KeyAction::None);
                 }
                 return self.pending_visual_text_object_invalid();
             };
 
             let Some(range) = self.text_object_range(scope, kind) else {
-                self.last_error = Some("text object not found".to_string());
+                self.set_legacy_message(Some("text object not found".to_string()));
                 return Some(KeyAction::None);
             };
 
@@ -14696,7 +14786,7 @@ impl Editor {
             if self.select_text_range(range) {
                 return Some(KeyAction::Single(Action::Refresh));
             }
-            self.last_error = Some("text object not found".to_string());
+            self.set_legacy_message(Some("text object not found".to_string()));
             return Some(KeyAction::None);
         }
 
@@ -14718,7 +14808,7 @@ impl Editor {
     fn pending_visual_text_object_invalid(&mut self) -> Option<KeyAction> {
         self.pending_visual_text_object_scope = None;
         self.waiting_command = None;
-        self.last_error = Some("invalid text object".to_string());
+        self.set_legacy_message(Some("invalid text object".to_string()));
         Some(KeyAction::None)
     }
 
@@ -14820,12 +14910,12 @@ impl Editor {
                 return Some(KeyAction::None);
             }
             if !matches!(*modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) {
-                self.last_error = Some("replacement must be a character".to_string());
+                self.set_legacy_message(Some("replacement must be a character".to_string()));
                 self.repeater = None;
                 return Some(KeyAction::None);
             }
             let KeyCode::Char(character) = code else {
-                self.last_error = Some("replacement must be a character".to_string());
+                self.set_legacy_message(Some("replacement must be a character".to_string()));
                 self.repeater = None;
                 return Some(KeyAction::None);
             };
@@ -14912,7 +15002,9 @@ impl Editor {
     fn invalid_mark(&mut self) -> Option<KeyAction> {
         self.pending_mark_action = None;
         self.waiting_command = None;
-        self.last_error = Some("mark must be a letter or a supported special mark".to_string());
+        self.set_legacy_message(Some(
+            "mark must be a letter or a supported special mark".to_string(),
+        ));
         Some(KeyAction::None)
     }
 
@@ -14952,7 +15044,7 @@ impl Editor {
                 PendingMacroAction::Play => {
                     let register = if *register == '@' {
                         let Some(register) = self.last_played_macro else {
-                            self.last_error = Some("no previously played macro".to_string());
+                            self.set_legacy_message(Some("no previously played macro".to_string()));
                             self.repeater = None;
                             return Some(KeyAction::None);
                         };
@@ -15024,7 +15116,7 @@ impl Editor {
         self.pending_macro_action = None;
         self.waiting_command = None;
         self.repeater = None;
-        self.last_error = Some("macro register must be a letter or digit".to_string());
+        self.set_legacy_message(Some("macro register must be a letter or digit".to_string()));
         Some(KeyAction::None)
     }
 
@@ -15100,7 +15192,7 @@ impl Editor {
         self.pending_character_motion = None;
         self.waiting_command = None;
         self.repeater = None;
-        self.last_error = Some("invalid character motion".to_string());
+        self.set_legacy_message(Some("invalid character motion".to_string()));
         Some(KeyAction::None)
     }
 
@@ -15472,7 +15564,7 @@ impl Editor {
         self.pending_operator = None;
         self.waiting_command = None;
         self.repeater = None;
-        self.last_error = Some("invalid operator motion".to_string());
+        self.set_legacy_message(Some("invalid operator motion".to_string()));
         Some(KeyAction::None)
     }
 
@@ -15485,7 +15577,7 @@ impl Editor {
         self.pending_operator = None;
         self.waiting_command = None;
         let Some(range) = range else {
-            self.last_error = Some(error.to_string());
+            self.set_legacy_message(Some(error.to_string()));
             return Some(KeyAction::None);
         };
 
@@ -15520,7 +15612,7 @@ impl Editor {
         self.pending_operator = None;
         self.waiting_command = None;
         let Some(range) = range else {
-            self.last_error = Some(error.to_string());
+            self.set_legacy_message(Some(error.to_string()));
             return Some(KeyAction::None);
         };
 
@@ -15899,7 +15991,7 @@ impl Editor {
         {
             Ok(object) => object,
             Err(error) => {
-                self.last_error = Some(error.to_string());
+                self.set_legacy_message(Some(error.to_string()));
                 None
             }
         }
@@ -15925,7 +16017,7 @@ impl Editor {
         ) {
             Ok(target) => target,
             Err(error) => {
-                self.last_error = Some(error.to_string());
+                self.set_legacy_message(Some(error.to_string()));
                 None
             }
         }
@@ -15976,7 +16068,7 @@ impl Editor {
                 Ok(Some(ranges)) => ranges,
                 Ok(None) => return false,
                 Err(error) => {
-                    self.last_error = Some(error.to_string());
+                    self.set_legacy_message(Some(error.to_string()));
                     return false;
                 }
             };
@@ -16325,7 +16417,7 @@ impl Editor {
         tracking: bool,
     ) -> anyhow::Result<bool> {
         // log!("Action: {action:?}");
-        self.last_error = None;
+        self.set_legacy_message(None);
         let sensitive_action = matches!(action, Action::NotifyPlugin(_, _, _))
             || matches!(action, Action::SubmitInlineAssist(_))
             || matches!(action, Action::NotifyPlugins(method, _) if method.starts_with("composer:"));
@@ -16407,10 +16499,10 @@ impl Editor {
                     if modified_buffers.is_empty() {
                         return Ok(true);
                     }
-                    self.last_error = Some(format!(
+                    self.set_legacy_message(Some(format!(
                         "The following buffers have unwritten changes: {}",
                         modified_buffers.join(", ")
-                    ));
+                    )));
                     return Ok(false);
                 }
             }
@@ -16488,14 +16580,14 @@ impl Editor {
             }
             Action::RepeatCharSearch(count) => {
                 let Some((kind, target)) = self.last_character_motion else {
-                    self.last_error = Some("no previous character search".to_string());
+                    self.set_legacy_message(Some("no previous character search".to_string()));
                     return Ok(false);
                 };
                 self.move_to_forward_character(target, *count, kind, buffer)?;
             }
             Action::RepeatCharSearchOpposite(count) => {
                 let Some((kind, target)) = self.last_character_motion else {
-                    self.last_error = Some("no previous character search".to_string());
+                    self.set_legacy_message(Some("no previous character search".to_string()));
                     return Ok(false);
                 };
                 let kind = match kind {
@@ -16654,7 +16746,7 @@ impl Editor {
                 if self.restore_last_visual_selection() {
                     self.render(buffer)?;
                 } else {
-                    self.last_error = Some("last visual selection is not set".to_string());
+                    self.set_legacy_message(Some("last visual selection is not set".to_string()));
                     self.draw_commandline(buffer);
                 }
             }
@@ -16675,9 +16767,9 @@ impl Editor {
                     } else {
                         format!("lines {}–{}", start_line + 1, end_line + 1)
                     };
-                    self.last_error = Some(format!(
+                    self.set_legacy_message(Some(format!(
                         "sample comment · {scope} · Space C replace · Space X clear"
-                    ));
+                    )));
                     self.render(buffer)?;
                 }
             }
@@ -16706,8 +16798,9 @@ impl Editor {
                 match self.inline_assist_target() {
                     Ok((range, scope)) => {
                         let Some(window_id) = self.window_manager.active_stable_window_id() else {
-                            self.last_error =
-                                Some("inline assist requires an active editor window".to_string());
+                            self.set_legacy_message(Some(
+                                "inline assist requires an active editor window".to_string(),
+                            ));
                             self.draw_commandline(buffer);
                             return Ok(false);
                         };
@@ -16737,7 +16830,7 @@ impl Editor {
                         self.render(buffer)?;
                     }
                     Err(error) => {
-                        self.last_error = Some(error.to_string());
+                        self.set_legacy_message(Some(error.to_string()));
                         self.draw_commandline(buffer);
                     }
                 }
@@ -16753,13 +16846,13 @@ impl Editor {
                         )
                     })
                 else {
-                    self.last_error = Some("inline assist is no longer active".to_string());
+                    self.set_legacy_message(Some("inline assist is no longer active".to_string()));
                     return Ok(false);
                 };
                 let mut context = match self.inline_assist_context(range) {
                     Ok(context) => context,
                     Err(error) => {
-                        self.last_error = Some(error.to_string());
+                        self.set_legacy_message(Some(error.to_string()));
                         return Ok(false);
                     }
                 };
@@ -16771,7 +16864,7 @@ impl Editor {
                 }
                 let request_id = uuid::Uuid::new_v4().to_string();
                 if let Err(error) = self.begin_inline_history_turn(&request_id, prompt, range) {
-                    self.last_error = Some(error.to_string());
+                    self.set_legacy_message(Some(error.to_string()));
                     self.render(buffer)?;
                     return Ok(false);
                 }
@@ -16859,7 +16952,7 @@ impl Editor {
                 add_to_history = false;
                 let result = self.inline_assist_result_state();
                 self.close_inline_assist_session();
-                self.last_error = Some(match result {
+                self.set_legacy_message(Some(match result {
                     InlineAssistPopupState::Applied {
                         edited: true,
                         comments,
@@ -16868,7 +16961,7 @@ impl Editor {
                         "kept {comments} inline comment(s) · Space v view · Space x dismiss"
                     ),
                     _ => "inline assist closed".to_string(),
-                });
+                }));
                 self.render(buffer)?;
             }
             Action::UndoInlineAssist => {
@@ -16920,13 +17013,13 @@ impl Editor {
                 if is_latest {
                     self.undo_transaction(buffer, runtime).await?;
                 } else if transaction_id.is_some() {
-                    self.last_error = Some(
+                    self.set_legacy_message(Some(
                         "inline edit is no longer the latest change; use transaction history to revert it"
                             .to_string(),
-                    );
+                    ));
                     self.render(buffer)?;
                 } else {
-                    self.last_error = Some("dismissed inline comments".to_string());
+                    self.set_legacy_message(Some("dismissed inline comments".to_string()));
                     self.render(buffer)?;
                 }
             }
@@ -17328,7 +17421,7 @@ impl Editor {
                     self.notify_change(runtime).await?;
                     self.finish_cursor_motion(buffer, false)?;
                 } else if self.last_error.is_none() {
-                    self.last_error = Some("adjacent text object not found".to_string());
+                    self.set_legacy_message(Some("adjacent text object not found".to_string()));
                 }
             }
             Action::StartCommentOperator(count)
@@ -17437,7 +17530,7 @@ impl Editor {
                 let available = line_length.saturating_sub(self.cx);
                 let count = usize::from(*count);
                 if count == 0 || count > available {
-                    self.last_error = Some("not enough characters to replace".to_string());
+                    self.set_legacy_message(Some("not enough characters to replace".to_string()));
                 } else {
                     let start = self.grapheme_to_char_on_line(self.cx, line);
                     let end = self.grapheme_to_char_on_line(self.cx + count, line);
@@ -17558,7 +17651,7 @@ impl Editor {
             }
             Action::SelectPreviousUndoBranch => {
                 add_to_history = false;
-                self.last_error = self
+                let message = self
                     .current_buffer_mut()
                     .undo_history
                     .select_previous_branch()
@@ -17566,11 +17659,12 @@ impl Editor {
                         format!("undo branch {selected}/{total} selected; redo to traverse")
                     })
                     .or_else(|| Some("no alternate undo branch".to_string()));
+                self.set_legacy_message(message);
                 self.draw_commandline(buffer);
             }
             Action::SelectNextUndoBranch => {
                 add_to_history = false;
-                self.last_error = self
+                let message = self
                     .current_buffer_mut()
                     .undo_history
                     .select_next_branch()
@@ -17578,6 +17672,7 @@ impl Editor {
                         format!("undo branch {selected}/{total} selected; redo to traverse")
                     })
                     .or_else(|| Some("no alternate undo branch".to_string()));
+                self.set_legacy_message(message);
                 self.draw_commandline(buffer);
             }
             Action::RevertTransaction(transaction_id) => {
@@ -17588,7 +17683,7 @@ impl Editor {
                 {
                     Ok(edits) => edits,
                     Err(error) => {
-                        self.last_error = Some(format!("revert conflict: {error}"));
+                        self.set_legacy_message(Some(format!("revert conflict: {error}")));
                         self.draw_commandline(buffer);
                         return Ok(false);
                     }
@@ -17629,7 +17724,7 @@ impl Editor {
                     if let Some(entry) = self.jump_back_entry() {
                         self.jump_to_entry(&entry, buffer, runtime).await?;
                     } else {
-                        self.last_error = Some("previous jump is not set".to_string());
+                        self.set_legacy_message(Some("previous jump is not set".to_string()));
                     }
                 } else {
                     let current_buffer_id = self.current_buffer().id();
@@ -17644,7 +17739,7 @@ impl Editor {
                         self.special_marks.get(&(current_buffer_id, *mark)).cloned()
                     };
                     let Some(mut anchor) = anchor else {
-                        self.last_error = Some(format!("mark {mark} is not set"));
+                        self.set_legacy_message(Some(format!("mark {mark} is not set")));
                         return Ok(false);
                     };
 
@@ -17661,11 +17756,15 @@ impl Editor {
                             .char_idx_to_position(anchor.char_index);
                     } else if mark.is_ascii_uppercase() {
                         let Some(file) = anchor.file.clone() else {
-                            self.last_error = Some(format!("marked buffer for {mark} disappeared"));
+                            self.set_legacy_message(Some(format!(
+                                "marked buffer for {mark} disappeared"
+                            )));
                             return Ok(false);
                         };
                         if !Path::new(&file).exists() {
-                            self.last_error = Some(format!("marked file for {mark} disappeared"));
+                            self.set_legacy_message(Some(format!(
+                                "marked file for {mark} disappeared"
+                            )));
                             return Ok(false);
                         }
                         self.execute_with_tracking(
@@ -17680,7 +17779,9 @@ impl Editor {
                             self.current_buffer().position_to_char_idx(anchor.fallback);
                         self.global_marks.insert(*mark, anchor.clone());
                     } else {
-                        self.last_error = Some(format!("marked buffer for {mark} disappeared"));
+                        self.set_legacy_message(Some(format!(
+                            "marked buffer for {mark} disappeared"
+                        )));
                         return Ok(false);
                     }
 
@@ -17699,7 +17800,7 @@ impl Editor {
                 let substitutions = match self.plan_substitutions(command) {
                     Ok(substitutions) => substitutions,
                     Err(error) => {
-                        self.last_error = Some(error.to_string());
+                        self.set_legacy_message(Some(error.to_string()));
                         self.render(buffer)?;
                         return Ok(false);
                     }
@@ -17720,7 +17821,9 @@ impl Editor {
             Action::ConfirmSubstitute(decision) => {
                 add_to_history = false;
                 let Some(mut confirmation) = self.substitute_confirmation.take() else {
-                    self.last_error = Some("no substitute confirmation is active".to_string());
+                    self.set_legacy_message(Some(
+                        "no substitute confirmation is active".to_string(),
+                    ));
                     return Ok(false);
                 };
                 match decision {
@@ -17751,7 +17854,7 @@ impl Editor {
                 ) || confirmation.current >= confirmation.substitutions.len();
                 if finished {
                     if confirmation.accepted.is_empty() {
-                        self.last_error = Some("0 substitutions".to_string());
+                        self.set_legacy_message(Some("0 substitutions".to_string()));
                         self.render(buffer)?;
                     } else {
                         self.apply_substitutions(confirmation.accepted, buffer, runtime)
@@ -17765,11 +17868,13 @@ impl Editor {
             Action::SetMacroRegister { register, keys } => {
                 add_to_history = false;
                 let Some(register) = normalize_macro_register(*register) else {
-                    self.last_error = Some("macro register must be a letter or digit".to_string());
+                    self.set_legacy_message(Some(
+                        "macro register must be a letter or digit".to_string(),
+                    ));
                     return Ok(false);
                 };
                 if let Err(error) = Self::macro_events_from_notation(keys) {
-                    self.last_error = Some(error.to_string());
+                    self.set_legacy_message(Some(error.to_string()));
                     return Ok(false);
                 }
                 self.set_register(register, Content::charwise(keys.clone()));
@@ -17783,7 +17888,7 @@ impl Editor {
                     .map(|(register, content)| (*register, content.text.clone()))
                     .collect::<Vec<_>>();
                 registers.sort_by_key(|(register, _)| *register);
-                self.last_error = Some(if registers.is_empty() {
+                self.set_legacy_message(Some(if registers.is_empty() {
                     "no registers".to_string()
                 } else {
                     registers
@@ -17791,7 +17896,7 @@ impl Editor {
                         .map(|(register, text)| format!("{register}: {text}"))
                         .collect::<Vec<_>>()
                         .join("  ")
-                });
+                }));
                 self.draw_commandline(buffer);
             }
             Action::InsertLineAt(y, contents) => {
@@ -18065,7 +18170,10 @@ impl Editor {
                     let path = match normalized_file_path(&log_file) {
                         Ok(path) => path,
                         Err(e) => {
-                            self.last_error = Some(format!("Failed to open log file: {}", e));
+                            self.set_legacy_message(Some(format!(
+                                "Failed to open log file: {}",
+                                e
+                            )));
                             return Ok(false);
                         }
                     };
@@ -18074,16 +18182,19 @@ impl Editor {
                         let (index, _, _) = match self.load_or_reuse_file_buffer(&log_file).await {
                             Ok(opened) => opened,
                             Err(e) => {
-                                self.last_error = Some(format!("Failed to open log file: {}", e));
+                                self.set_legacy_message(Some(format!(
+                                    "Failed to open log file: {}",
+                                    e
+                                )));
                                 return Ok(false);
                             }
                         };
                         self.set_current_buffer(buffer, index).await?;
                     } else {
-                        self.last_error = Some(format!("Log file not found: {}", log_file));
+                        self.set_legacy_message(Some(format!("Log file not found: {}", log_file)));
                     }
                 } else {
-                    self.last_error = Some("No log file configured".to_string());
+                    self.set_legacy_message(Some("No log file configured".to_string()));
                 }
             }
             Action::ListPlugins => {
@@ -18092,7 +18203,7 @@ impl Editor {
                 let installed = match manager.list() {
                     Ok(installed) => installed,
                     Err(error) => {
-                        self.last_error = Some(error.to_string());
+                        self.set_legacy_message(Some(error.to_string()));
                         Vec::new()
                     }
                 };
@@ -18195,7 +18306,9 @@ impl Editor {
             Action::PluginManagerSelect(selection) => {
                 add_to_history = false;
                 if selection == "retry-catalog" {
-                    self.last_error = Some("Retrying official language-pack catalog…".to_string());
+                    self.set_legacy_message(Some(
+                        "Retrying official language-pack catalog…".to_string(),
+                    ));
                     runtime.send_request(PluginRequest::Action(Action::ListPlugins));
                 } else if selection == "custom-source" {
                     self.current_dialog = Some(Box::new(InputPrompt::new(
@@ -18215,7 +18328,7 @@ impl Editor {
                                 "Language pack `{id}` changed availability; select it again to continue."
                             )
                         });
-                    self.last_error = Some(message.clone());
+                    self.set_legacy_message(Some(message.clone()));
                     let manager = plugin::package::PluginPackageManager::new(Config::config_dir());
                     let installed = manager.list().unwrap_or_default();
                     let items = plugin_manager_items(
@@ -18430,7 +18543,7 @@ impl Editor {
                 add_to_history = false;
                 let package = package.clone();
                 let digests = digests.clone();
-                self.last_error = Some("Approving native grammar bytes…".to_string());
+                self.set_legacy_message(Some("Approving native grammar bytes…".to_string()));
                 let runtime = runtime.clone();
                 tokio::spawn(async move {
                     let manager = plugin::package::PluginPackageManager::new(Config::config_dir());
@@ -18477,7 +18590,7 @@ impl Editor {
                 let trust_native_grammars = *trust_native_grammars;
                 let catalog_url = catalog_url.clone();
                 let package = (**package).clone();
-                self.last_error = Some(format!("Installing {}…", package.name));
+                self.set_legacy_message(Some(format!("Installing {}…", package.name)));
                 let runtime = runtime.clone();
                 tokio::spawn(async move {
                     let manager = plugin::package::PluginPackageManager::new(Config::config_dir());
@@ -18513,9 +18626,9 @@ impl Editor {
                 add_to_history = false;
                 let source = source.trim().to_string();
                 if source.is_empty() {
-                    self.last_error = Some("plugin source cannot be empty".to_string());
+                    self.set_legacy_message(Some("plugin source cannot be empty".to_string()));
                 } else {
-                    self.last_error = Some(format!("Installing plugin from {source}…"));
+                    self.set_legacy_message(Some(format!("Installing plugin from {source}…")));
                     let runtime = runtime.clone();
                     tokio::spawn(async move {
                         let manager =
@@ -18558,7 +18671,7 @@ impl Editor {
             Action::PluginManagerAction(operation) => {
                 add_to_history = false;
                 let operation = operation.clone();
-                self.last_error = Some("Updating plugin installation…".to_string());
+                self.set_legacy_message(Some("Updating plugin installation…".to_string()));
                 let runtime = runtime.clone();
                 tokio::spawn(async move {
                     let manager = plugin::package::PluginPackageManager::new(Config::config_dir());
@@ -18596,7 +18709,7 @@ impl Editor {
                 if *restart_plugins {
                     message.push_str(" Restart Red to refresh plugin code.");
                 }
-                self.last_error = Some(message.clone());
+                self.set_legacy_message(Some(message.clone()));
                 let manager = plugin::package::PluginPackageManager::new(Config::config_dir());
                 let installed = manager.list().unwrap_or_default();
                 let items = plugin_manager_items(
@@ -18613,7 +18726,7 @@ impl Editor {
                 self.record_command_history(cmd);
 
                 for action in self.handle_command(cmd, runtime) {
-                    self.last_error = None;
+                    self.set_legacy_message(None);
                     if self.execute(&action, buffer, runtime).await? {
                         return Ok(true);
                     }
@@ -18710,8 +18823,9 @@ impl Editor {
                         self.pending_lsp_revision_snapshots
                             .insert(request_id, revisions);
                     } else {
-                        self.last_error =
-                            Some("no language server is available for this file".to_string());
+                        self.set_legacy_message(Some(
+                            "no language server is available for this file".to_string(),
+                        ));
                     }
                 }
             }
@@ -18758,8 +18872,9 @@ impl Editor {
                         self.pending_lsp_revision_snapshots
                             .insert(request_id, revisions);
                     } else {
-                        self.last_error =
-                            Some("no language server is available for this file".to_string());
+                        self.set_legacy_message(Some(
+                            "no language server is available for this file".to_string(),
+                        ));
                     }
                 }
             }
@@ -18837,7 +18952,7 @@ impl Editor {
             } => {
                 self.restore_lsp_format_save_identity(*buffer_id, uri, previous_file.clone())
                     .await;
-                self.last_error = Some(warning.clone());
+                self.set_legacy_message(Some(warning.clone()));
             }
             Action::RespondLspWorkspaceEdit {
                 request,
@@ -18872,7 +18987,9 @@ impl Editor {
             Action::OpenExternalUrl(url) => {
                 let lowercase = url.to_ascii_lowercase();
                 if !lowercase.starts_with("https://") && !lowercase.starts_with("http://") {
-                    self.last_error = Some("Only HTTP and HTTPS links can be opened".to_string());
+                    self.set_legacy_message(Some(
+                        "Only HTTP and HTTPS links can be opened".to_string(),
+                    ));
                     return Ok(false);
                 }
                 match open_external_url(url) {
@@ -18882,7 +18999,7 @@ impl Editor {
                         });
                     }
                     Err(error) => {
-                        self.last_error = Some(format!("Unable to open link: {error}"));
+                        self.set_legacy_message(Some(format!("Unable to open link: {error}")));
                         return Ok(false);
                     }
                 }
@@ -18892,7 +19009,7 @@ impl Editor {
                     match self.load_or_reuse_file_buffer(&location.path).await {
                         Ok(opened) => opened,
                         Err(error) => {
-                            self.last_error = Some(error.to_string());
+                            self.set_legacy_message(Some(error.to_string()));
                             return Ok(false);
                         }
                     };
@@ -18912,8 +19029,9 @@ impl Editor {
                     if added_buffer {
                         self.buffer_manager.pop_buffer();
                     }
-                    self.last_error =
-                        Some("Unable to open location in requested target".to_string());
+                    self.set_legacy_message(Some(
+                        "Unable to open location in requested target".to_string(),
+                    ));
                     return Ok(false);
                 }
 
@@ -19139,7 +19257,7 @@ impl Editor {
                     self.move_to_text_position(position);
                     self.finish_cursor_motion(buffer, false)?;
                 } else if self.last_error.is_none() {
-                    self.last_error = Some("text object not found".to_string());
+                    self.set_legacy_message(Some("text object not found".to_string()));
                 }
             }
             Action::MoveToFilePercent(percent) => {
@@ -19169,7 +19287,7 @@ impl Editor {
                         self.render(buffer)?;
                     }
                 } else {
-                    self.last_error = Some("text object not found".to_string());
+                    self.set_legacy_message(Some("text object not found".to_string()));
                 }
             }
             Action::MoveLineToViewportBottom => {
@@ -19373,7 +19491,7 @@ impl Editor {
                 let (index, added_buffer, path) = match self.load_or_reuse_file_buffer(path).await {
                     Ok(opened) => opened,
                     Err(e) => {
-                        self.last_error = Some(e.to_string());
+                        self.set_legacy_message(Some(e.to_string()));
                         return Ok(false);
                     }
                 };
@@ -19392,8 +19510,9 @@ impl Editor {
             }
             Action::ReloadFile(force) => {
                 if self.current_buffer().is_dirty() && !force {
-                    self.last_error =
-                        Some("E37: No write since last change (add ! to override)".to_string());
+                    self.set_legacy_message(Some(
+                        "E37: No write since last change (add ! to override)".to_string(),
+                    ));
                     self.render(buffer)?;
                     return Ok(false);
                 }
@@ -19409,15 +19528,15 @@ impl Editor {
                         self.sync_to_window();
                         self.commit_transaction(self.cursor_snapshot());
                         self.current_buffer_mut().mark_saved();
-                        self.last_error = Some(format!(
+                        self.set_legacy_message(Some(format!(
                             "{file:?} {}L, {}B read",
                             self.current_buffer().len(),
                             byte_count
-                        ));
+                        )));
                         self.render(buffer)?;
                     }
                     Err(e) => {
-                        self.last_error = Some(e.to_string());
+                        self.set_legacy_message(Some(e.to_string()));
                         self.render(buffer)?;
                         return Ok(false);
                     }
@@ -19477,8 +19596,9 @@ impl Editor {
                     _ => {
                         let Some(language_id) = self.highlighter.language_id_for_name(syntax)
                         else {
-                            self.last_error =
-                                Some(format!("unknown syntax {syntax:?} (try :syntax)"));
+                            self.set_legacy_message(Some(format!(
+                                "unknown syntax {syntax:?} (try :syntax)"
+                            )));
                             self.render(buffer)?;
                             return Ok(false);
                         };
@@ -19495,7 +19615,7 @@ impl Editor {
                     .invalidate(self.current_buffer().id());
                 self.bracket_match_cache = None;
                 self.force_full_redraw = true;
-                self.last_error = Some(format!("syntax: {label}"));
+                self.set_legacy_message(Some(format!("syntax: {label}")));
                 self.render(buffer)?;
             }
             Action::OpenWhatsNew => {
@@ -19504,7 +19624,9 @@ impl Editor {
                     self.render(buffer)?;
                     self.mark_whats_new_presented();
                 } else {
-                    self.last_error = Some("terminal is too small for release notes".to_string());
+                    self.set_legacy_message(Some(
+                        "terminal is too small for release notes".to_string(),
+                    ));
                     self.render(buffer)?;
                 }
             }
@@ -19535,11 +19657,12 @@ impl Editor {
                     Ok(()) => {
                         self.config.statusline = statusline.clone();
                         self.current_dialog = None;
-                        self.last_error = Some("saved status-line layout".to_string());
+                        self.set_legacy_message(Some("saved status-line layout".to_string()));
                     }
                     Err(error) => {
-                        self.last_error =
-                            Some(format!("could not save status-line layout: {error}"));
+                        self.set_legacy_message(Some(format!(
+                            "could not save status-line layout: {error}"
+                        )));
                     }
                 }
                 self.force_full_redraw = true;
@@ -19549,7 +19672,7 @@ impl Editor {
                 add_to_history = false;
                 self.config.statusline = statusline.clone();
                 self.current_dialog = None;
-                self.last_error = None;
+                self.set_legacy_message(None);
                 self.force_full_redraw = true;
                 self.render(buffer)?;
             }
@@ -19561,13 +19684,13 @@ impl Editor {
             Action::ReloadLanguages => {
                 match self.reload_languages().await {
                     Ok(count) => {
-                        self.last_error = Some(format!(
+                        self.set_legacy_message(Some(format!(
                             "reloaded {count} configured language{}",
                             if count == 1 { "" } else { "s" }
-                        ));
+                        )));
                     }
                     Err(error) => {
-                        self.last_error = Some(format!("language reload failed: {error:#}"));
+                        self.set_legacy_message(Some(format!("language reload failed: {error:#}")));
                     }
                 }
                 self.render(buffer)?;
@@ -19576,6 +19699,20 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::CloseDialog => {
+                if self.message_browser.is_some() {
+                    if self
+                        .current_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.is_message_history())
+                    {
+                        self.close_messages();
+                    } else {
+                        self.release_current_dialog_callbacks(runtime);
+                        self.refresh_message_browser();
+                    }
+                    self.render(buffer)?;
+                    return Ok(false);
+                }
                 if self.inline_history_browser.is_some() {
                     self.handle_inline_history_action(
                         &crate::inline_history::HistoryAction::Close,
@@ -19609,8 +19746,18 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::Print(msg) => {
-                self.last_error = Some(msg.clone());
+                self.set_legacy_message(Some(msg.clone()));
                 self.draw_commandline(buffer);
+            }
+            Action::OpenMessages => {
+                add_to_history = false;
+                self.open_messages();
+                self.render(buffer)?;
+            }
+            Action::MessageHistory(action) => {
+                add_to_history = false;
+                self.handle_message_action(action);
+                self.render(buffer)?;
             }
             Action::OpenTextPanelTurnActions => {
                 add_to_history = false;
@@ -19683,7 +19830,7 @@ impl Editor {
                     self.release_current_dialog_callbacks(runtime);
                     self.current_dialog = Some(Box::new(picker));
                 } else {
-                    self.last_error = Some("no user prompt selected".to_string());
+                    self.set_legacy_message(Some("no user prompt selected".to_string()));
                 }
                 self.render(buffer)?;
             }
@@ -19698,15 +19845,17 @@ impl Editor {
                     .text_turn_for_copy(panel_id, prompt_id, *part)
                 {
                     self.set_default_register(Content::charwise(text));
-                    self.last_error = Some(
+                    self.set_legacy_message(Some(
                         match part {
                             plugin::panel::TextPanelTurnPart::Prompt => "prompt copied",
                             plugin::panel::TextPanelTurnPart::Answer => "answer copied",
                         }
                         .to_string(),
-                    );
+                    ));
                 } else {
-                    self.last_error = Some("selected turn text is no longer available".to_string());
+                    self.set_legacy_message(Some(
+                        "selected turn text is no longer available".to_string(),
+                    ));
                 }
                 self.render(buffer)?;
             }
@@ -19722,8 +19871,9 @@ impl Editor {
                     *expected_draft,
                 ) {
                     Ok(plugin::panel::TextPanelReuseOutcome::Loaded) => {
-                        self.last_error =
-                            Some("prompt loaded for editing; nothing sent".to_string());
+                        self.set_legacy_message(Some(
+                            "prompt loaded for editing; nothing sent".to_string(),
+                        ));
                     }
                     Ok(plugin::panel::TextPanelReuseOutcome::Confirm(revision)) => {
                         self.release_current_dialog_callbacks(runtime);
@@ -19741,7 +19891,7 @@ impl Editor {
                             Action::Print("current draft kept".to_string()),
                         )));
                     }
-                    Err(message) => self.last_error = Some(message.to_string()),
+                    Err(message) => self.set_legacy_message(Some(message.to_string())),
                 }
                 self.render(buffer)?;
             }
@@ -19800,7 +19950,7 @@ impl Editor {
                             )
                             .await?;
                     }
-                    Err(err) => self.last_error = Some(err.to_string()),
+                    Err(err) => self.set_legacy_message(Some(err.to_string())),
                 }
                 self.render(buffer)?;
             }
@@ -19816,7 +19966,7 @@ impl Editor {
                             )
                             .await?;
                     }
-                    Err(err) => self.last_error = Some(err.to_string()),
+                    Err(err) => self.set_legacy_message(Some(err.to_string())),
                 }
                 self.render(buffer)?;
             }
@@ -19975,7 +20125,7 @@ impl Editor {
             Action::ShowProgress(progress) => {
                 add_to_history = false;
                 match progress.token {
-                    ProgressToken::String(ref s) => self.last_error = Some(s.to_string()),
+                    ProgressToken::String(ref s) => self.set_legacy_message(Some(s.to_string())),
                     ProgressToken::Number(_) => {}
                 }
             }
@@ -20033,7 +20183,7 @@ impl Editor {
                     log!("jumping back to {entry:?}");
                     self.jump_to_entry(&entry, buffer, runtime).await?;
                 } else {
-                    self.last_error = Some("at start of jump list".to_string());
+                    self.set_legacy_message(Some("at start of jump list".to_string()));
                     self.draw_commandline(buffer);
                 }
             }
@@ -20043,7 +20193,7 @@ impl Editor {
                     log!("jumping forward to {entry:?}");
                     self.jump_to_entry(&entry, buffer, runtime).await?;
                 } else {
-                    self.last_error = Some("at end of jump list".to_string());
+                    self.set_legacy_message(Some("at end of jump list".to_string()));
                     self.draw_commandline(buffer);
                 }
             }
@@ -20108,7 +20258,7 @@ impl Editor {
                     match self.load_or_reuse_file_buffer(file).await {
                         Ok(opened) => opened,
                         Err(e) => {
-                            self.last_error = Some(format!("Failed to open file: {}", e));
+                            self.set_legacy_message(Some(format!("Failed to open file: {}", e)));
                             return Ok(false);
                         }
                     };
@@ -20129,7 +20279,7 @@ impl Editor {
                     match self.load_or_reuse_file_buffer(file).await {
                         Ok(opened) => opened,
                         Err(e) => {
-                            self.last_error = Some(format!("Failed to open file: {}", e));
+                            self.set_legacy_message(Some(format!("Failed to open file: {}", e)));
                             return Ok(false);
                         }
                     };
@@ -20843,10 +20993,10 @@ impl Editor {
             if count > 2 {
                 if content.kind == ContentKind::Linewise {
                     log!("yanked {} lines", count);
-                    self.last_error = Some(format!("{} lines yanked", count));
+                    self.set_legacy_message(Some(format!("{} lines yanked", count)));
                     needs_update = true;
                 } else if content.kind == ContentKind::Blockwise {
-                    self.last_error = Some(format!("block of {} lines yanked", count));
+                    self.set_legacy_message(Some(format!("block of {} lines yanked", count)));
                     needs_update = true;
                 }
             };
@@ -21438,7 +21588,9 @@ impl Editor {
         force: bool,
     ) -> anyhow::Result<()> {
         if self.current_buffer().is_dirty() && !force {
-            self.last_error = Some("No write since last change (add ! to override)".to_string());
+            self.set_legacy_message(Some(
+                "No write since last change (add ! to override)".to_string(),
+            ));
             self.render(render_buffer)?;
             return Ok(());
         }
@@ -21772,8 +21924,9 @@ impl Editor {
             {
                 self.buffer_manager[index].file = None;
                 identity_changes.push((index, previous_uri));
-                self.last_error =
-                    Some("Removed file kept open as an unsaved scratch buffer".to_string());
+                self.set_legacy_message(Some(
+                    "Removed file kept open as an unsaved scratch buffer".to_string(),
+                ));
             }
         }
 
@@ -22736,7 +22889,9 @@ impl Editor {
 
     fn comment_syntax(&mut self) -> Option<CommentSyntax> {
         let Some(language) = self.current_language_id() else {
-            self.last_error = Some("no comment syntax configured for unnamed buffer".to_string());
+            self.set_legacy_message(Some(
+                "no comment syntax configured for unnamed buffer".to_string(),
+            ));
             return None;
         };
         let extension = self.current_buffer().file_type();
@@ -22756,13 +22911,13 @@ impl Editor {
                 .or_else(|| self.config.commenting.languages.get(&language))
         };
         let Some(template) = template else {
-            self.last_error = Some(format!("no comment syntax configured for {language}"));
+            self.set_legacy_message(Some(format!("no comment syntax configured for {language}")));
             return None;
         };
         let Some(syntax) = CommentSyntax::parse(template) else {
-            self.last_error = Some(format!(
+            self.set_legacy_message(Some(format!(
                 "invalid comment syntax configured for {language}: expected exactly one %s placeholder"
-            ));
+            )));
             return None;
         };
         Some(syntax)
@@ -23088,7 +23243,7 @@ impl Editor {
             self.move_to_text_position(position);
             self.finish_cursor_motion(buffer, false)?;
         } else {
-            self.last_error = Some("character not found".to_string());
+            self.set_legacy_message(Some("character not found".to_string()));
         }
         Ok(())
     }
@@ -23102,7 +23257,7 @@ impl Editor {
             self.move_to_text_position(motion.target);
             self.finish_cursor_motion(buffer, false)?;
         } else {
-            self.last_error = Some("match not found".to_string());
+            self.set_legacy_message(Some("match not found".to_string()));
         }
         Ok(())
     }
@@ -23116,7 +23271,7 @@ impl Editor {
             self.move_to_text_position(motion.target);
             self.finish_cursor_motion(buffer, false)?;
         } else {
-            self.last_error = Some("match not found".to_string());
+            self.set_legacy_message(Some("match not found".to_string()));
         }
         Ok(())
     }
@@ -23218,7 +23373,7 @@ impl Editor {
         buffer.refresh_dirty_from_history();
 
         let Some((cursor, edits)) = outcome else {
-            self.last_error = Some("already at oldest change".to_string());
+            self.set_legacy_message(Some("already at oldest change".to_string()));
             self.draw_commandline(render_buffer);
             return Ok(());
         };
@@ -23249,7 +23404,7 @@ impl Editor {
         buffer.refresh_dirty_from_history();
 
         let Some((cursor, edits)) = outcome else {
-            self.last_error = Some("already at newest change".to_string());
+            self.set_legacy_message(Some("already at newest change".to_string()));
             self.draw_commandline(render_buffer);
             return Ok(());
         };
@@ -23556,18 +23711,18 @@ impl Editor {
                 true
             };
             if snapshot.agent_conversation.is_none() && !snapshot.agent_session_resumable {
-                self.last_error = Some(if transcript_persisted {
+                self.set_legacy_message(Some(if transcript_persisted {
                     "Recovered agent transcript as archived context; start a new session to continue"
                         .to_string()
                 } else {
                     "Recovered agent transcript as archived context, but it could not be persisted; start a new session to continue"
                         .to_string()
-                });
+                }));
             } else if !transcript_persisted {
-                self.last_error = Some(
+                self.set_legacy_message(Some(
                     "Recovered buffers and agent transcript; transcript could not be persisted"
                         .to_string(),
-                );
+                ));
             }
         }
         if !divergences.is_empty() {
@@ -23582,16 +23737,17 @@ impl Editor {
             {
                 warning.push_str("; agent transcript could not be persisted");
             }
-            self.last_error = Some(warning);
+            self.set_legacy_message(Some(warning));
         }
         if duplicate_file_count > 0 {
             let warning = format!(
                 "Recovered {duplicate_file_count} duplicate file buffer(s) as unnamed buffers to preserve their contents"
             );
-            self.last_error = Some(match self.last_error.take() {
+            let message = match self.last_error.take() {
                 Some(existing) => format!("{existing}; {warning}"),
                 None => warning,
-            });
+            };
+            self.set_legacy_message(Some(message));
         }
         self.recompute_window_cursor_goals();
         self.sync_with_window();
@@ -23964,7 +24120,11 @@ impl Editor {
                 );
             }
         }
-        previous_warning != self.session_manager.warning()
+        let changed = previous_warning != self.session_manager.warning();
+        if changed {
+            self.sync_persistent_notifications();
+        }
+        changed
     }
 
     fn editor_state_snapshot(&mut self) -> EditorStateSnapshot {
@@ -24737,13 +24897,17 @@ impl Editor {
         let uri = match self.current_buffer().uri() {
             Ok(uri) => uri,
             Err(error) => {
-                self.last_error = Some(format!("could not resolve completion document: {error}"));
+                self.set_legacy_message(Some(format!(
+                    "could not resolve completion document: {error}"
+                )));
                 return Ok(displayed_immediately);
             }
         };
         if let Some(uri) = uri {
             if let Err(error) = self.ensure_current_buffer_lsp_opened().await {
-                self.last_error = Some(format!("could not open LSP completion document: {error}"));
+                self.set_legacy_message(Some(format!(
+                    "could not open LSP completion document: {error}"
+                )));
                 return Ok(displayed_immediately);
             }
             let position = self.cursor_lsp_position();
@@ -24759,7 +24923,9 @@ impl Editor {
             {
                 Ok(request_id) => request_id,
                 Err(error) => {
-                    self.last_error = Some(format!("LSP completion request failed: {error}"));
+                    self.set_legacy_message(Some(format!(
+                        "LSP completion request failed: {error}"
+                    )));
                     return Ok(displayed_immediately);
                 }
             };
@@ -24791,7 +24957,7 @@ impl Editor {
             .as_ref()
             .is_some_and(|snapshot| !self.completion_snapshot_is_current(snapshot))
         {
-            self.last_error = Some("completion item is stale; buffer changed".to_string());
+            self.set_legacy_message(Some("completion item is stale; buffer changed".to_string()));
             return Ok(());
         }
 
@@ -24819,8 +24985,9 @@ impl Editor {
             Some(edit) => match rebase_edit(edit, true) {
                 Some(edit) => Some(edit),
                 None => {
-                    self.last_error =
-                        Some("completion edit could not be rebased after typing".to_string());
+                    self.set_legacy_message(Some(
+                        "completion edit could not be rebased after typing".to_string(),
+                    ));
                     return Ok(());
                 }
             },
@@ -24829,9 +24996,9 @@ impl Editor {
         let mut additional_text_edits = Vec::new();
         for edit in item.additional_text_edits.iter().flatten() {
             let Some(edit) = rebase_edit(edit, false) else {
-                self.last_error = Some(
+                self.set_legacy_message(Some(
                     "additional completion edit could not be rebased after typing".to_string(),
-                );
+                ));
                 return Ok(());
             };
             additional_text_edits.push(edit);
@@ -24842,7 +25009,7 @@ impl Editor {
             .cloned()
             .collect::<Vec<_>>();
         if let Err(error) = crate::lsp::apply_text_edits(&contents, &validation_edits) {
-            self.last_error = Some(format!("invalid LSP completion edit: {error}"));
+            self.set_legacy_message(Some(format!("invalid LSP completion edit: {error}")));
             return Ok(());
         }
         let resume_insert_transaction = self.transaction_active();
@@ -25002,7 +25169,7 @@ impl Editor {
             let reason = format!(
                 "LSP workspace edit exceeds {MAX_WORKSPACE_EDIT_TOTAL_BYTES} bytes of open-buffer content"
             );
-            self.last_error = Some(reason.clone());
+            self.set_legacy_message(Some(reason.clone()));
             if let Some(response) = response {
                 self.lsp
                     .respond_workspace_edit(response, false, Some(&reason))
@@ -25068,7 +25235,7 @@ impl Editor {
             let reason =
                 "LSP workspace edit cannot be applied because its originating server is unavailable"
                     .to_string();
-            self.last_error = Some(reason.clone());
+            self.set_legacy_message(Some(reason.clone()));
             if let Some(response) = response {
                 self.lsp
                     .respond_workspace_edit(response, false, Some(&reason))
@@ -25085,7 +25252,7 @@ impl Editor {
             Ok(prepared) => prepared,
             Err(error) => {
                 let reason = format!("invalid LSP workspace edit: {error}");
-                self.last_error = Some(reason.clone());
+                self.set_legacy_message(Some(reason.clone()));
                 if let Some(response) = response {
                     self.lsp
                         .respond_workspace_edit(response, false, Some(&reason))
@@ -25110,7 +25277,7 @@ impl Editor {
             .collect::<Result<Vec<_>, _>>()?;
         if let Err(error) = apply_workspace_resource_operations(&prepared) {
             let reason = format!("LSP resource operation failed: {error}");
-            self.last_error = Some(reason.clone());
+            self.set_legacy_message(Some(reason.clone()));
             if let Some(response) = response {
                 self.lsp
                     .respond_workspace_edit(response, false, Some(&reason))
@@ -25173,8 +25340,9 @@ impl Editor {
         for (uri, file, index) in &renamed {
             if let Ok(file) = lsp_file_path(uri) {
                 if let Err(error) = self.lsp.did_close(&file).await {
-                    self.last_error =
-                        Some(format!("failed to close renamed LSP document: {error}"));
+                    self.set_legacy_message(Some(format!(
+                        "failed to close renamed LSP document: {error}"
+                    )));
                 }
             }
             self.lsp_coordinator.mark_document_closed(uri);
@@ -25189,7 +25357,9 @@ impl Editor {
                 .did_open(file, &self.buffer_manager[*index].contents())
                 .await
             {
-                self.last_error = Some(format!("failed to open renamed LSP document: {error}"));
+                self.set_legacy_message(Some(format!(
+                    "failed to open renamed LSP document: {error}"
+                )));
             } else if let Some(new_uri) = new_uri {
                 self.lsp_coordinator.mark_document_opened(new_uri);
             }
@@ -25198,8 +25368,9 @@ impl Editor {
         for index in changed {
             self.select_buffer_for_lsp_edit(index);
             if let Err(error) = self.notify_change(runtime).await {
-                self.last_error =
-                    Some(format!("LSP edit applied but notification failed: {error}"));
+                self.set_legacy_message(Some(format!(
+                    "LSP edit applied but notification failed: {error}"
+                )));
             }
         }
         self.select_buffer_for_lsp_edit(original_index);
@@ -25213,7 +25384,9 @@ impl Editor {
                 )
                 .await
             {
-                self.last_error = Some(format!("LSP edit applied but command failed: {error}"));
+                self.set_legacy_message(Some(format!(
+                    "LSP edit applied but command failed: {error}"
+                )));
             }
         }
         if let Some(response) = response {
@@ -25235,14 +25408,15 @@ impl Editor {
                 )
                 .await?;
             } else {
-                self.last_error =
-                    Some("formatted buffer is no longer open; save cancelled".to_string());
+                self.set_legacy_message(Some(
+                    "formatted buffer is no longer open; save cancelled".to_string(),
+                ));
             }
         } else if newly_opened > 0 && self.last_error.is_none() {
-            self.last_error = Some(format!(
+            self.set_legacy_message(Some(format!(
                 "LSP edit opened {newly_opened} unsaved buffer{}",
                 if newly_opened == 1 { "" } else { "s" }
-            ));
+            )));
         }
         self.render(render_buffer)?;
         Ok(())
@@ -25277,8 +25451,9 @@ impl Editor {
                     .as_deref()
                     .is_some_and(|candidate| candidate == uri)
         }) else {
-            self.last_error =
-                Some("formatted buffer is no longer open; save cancelled".to_string());
+            self.set_legacy_message(Some(
+                "formatted buffer is no longer open; save cancelled".to_string(),
+            ));
             return Ok(());
         };
         let original = self.buffer_manager.active_index();
@@ -25292,7 +25467,7 @@ impl Editor {
         };
         match result {
             Ok(message) => {
-                self.last_error = Some(warning.unwrap_or(&message).to_string());
+                self.set_legacy_message(Some(warning.unwrap_or(&message).to_string()));
                 self.sync_lsp_document_identity(previous_uri.as_deref(), index)
                     .await?;
                 let file = self.current_buffer().file.clone();
@@ -25309,7 +25484,7 @@ impl Editor {
                     self.restore_lsp_format_save_identity(buffer_id, uri, previous_file)
                         .await;
                 }
-                self.last_error = Some(error.to_string());
+                self.set_legacy_message(Some(error.to_string()));
             }
         }
         self.select_buffer_for_lsp_edit(original);
@@ -25450,8 +25625,12 @@ impl Editor {
 
         match save_result {
             Ok(msg) => {
-                // TODO: use last_message instead of last_error
-                self.last_error = Some(format_warning.unwrap_or(msg));
+                let severity = if format_warning.is_some() {
+                    Severity::Warning
+                } else {
+                    Severity::Success
+                };
+                self.set_notification_message(severity, Some(format_warning.unwrap_or(msg)));
 
                 // Notify plugins about file save
                 if let Some(file) = &self.current_buffer().file {
@@ -25465,7 +25644,7 @@ impl Editor {
                 }
             }
             Err(e) => {
-                self.last_error = Some(e.to_string());
+                self.set_notification_message(Severity::Error, Some(e.to_string()));
             }
         }
         Ok(true)
@@ -25491,8 +25670,9 @@ impl Editor {
             .scratch_buffers
             .contains_key(&self.current_buffer().id())
         {
-            self.last_error =
-                Some("Scratch buffers cannot be written to disk; use :w to submit".to_string());
+            self.set_legacy_message(Some(
+                "Scratch buffers cannot be written to disk; use :w to submit".to_string(),
+            ));
             return Ok(false);
         }
         let target_path = normalized_file_path(new_file_name)?;
@@ -25509,9 +25689,9 @@ impl Editor {
                 same_file_path(Path::new(open_path), &target_path).then_some(open_path)
             })
         {
-            self.last_error = Some(format!(
+            self.set_legacy_message(Some(format!(
                 "Save As cancelled; destination is already open in another buffer: {open_path}"
-            ));
+            )));
             return Ok(false);
         }
         let previous_uri = self.current_buffer().uri()?;
@@ -25560,8 +25740,12 @@ impl Editor {
 
         match save_result {
             Ok(msg) => {
-                // TODO: use last_message instead of last_error
-                self.last_error = Some(format_warning.unwrap_or(msg));
+                let severity = if format_warning.is_some() {
+                    Severity::Warning
+                } else {
+                    Severity::Success
+                };
+                self.set_notification_message(severity, Some(format_warning.unwrap_or(msg)));
                 if let Err(error) = self
                     .sync_lsp_document_identity(
                         previous_uri.as_deref(),
@@ -25591,9 +25775,9 @@ impl Editor {
                             "error": error.to_string(),
                         })
                     );
-                    self.last_error = Some(format!(
+                    self.set_legacy_message(Some(format!(
                         "format-on-save unavailable; saved unformatted: {error}"
-                    ));
+                    )));
                 }
                 let saved_file = self
                     .current_buffer()
@@ -25621,7 +25805,7 @@ impl Editor {
                         .await;
                     }
                 }
-                self.last_error = Some(e.to_string());
+                self.set_notification_message(Severity::Error, Some(e.to_string()));
             }
         }
         Ok(true)
@@ -25651,31 +25835,32 @@ impl Editor {
                 .await
             {
                 Ok(ExternalFormatOutcome::Applied { name }) => {
-                    self.last_error = Some(format!("formatted with {name}"));
+                    self.set_legacy_message(Some(format!("formatted with {name}")));
                     self.render(buffer)?;
                     return Ok(());
                 }
                 Ok(ExternalFormatOutcome::Unchanged { name }) => {
-                    self.last_error = Some(format!("already formatted with {name}"));
+                    self.set_legacy_message(Some(format!("already formatted with {name}")));
                     return Ok(());
                 }
                 Ok(ExternalFormatOutcome::Unavailable { name })
                     if provider == FormattingProvider::External =>
                 {
-                    self.last_error = Some(format!(
+                    self.set_legacy_message(Some(format!(
                         "formatter {name} is not installed or not executable"
-                    ));
+                    )));
                     return Ok(());
                 }
                 Ok(ExternalFormatOutcome::NotConfigured)
                     if provider == FormattingProvider::External =>
                 {
-                    self.last_error =
-                        Some("no external formatter is configured for this language".to_string());
+                    self.set_legacy_message(Some(
+                        "no external formatter is configured for this language".to_string(),
+                    ));
                     return Ok(());
                 }
                 Err(error) => {
-                    self.last_error = Some(error.to_string());
+                    self.set_legacy_message(Some(error.to_string()));
                     return Ok(());
                 }
                 Ok(
@@ -25701,7 +25886,9 @@ impl Editor {
         if request_id > 0 {
             self.pending_lsp_edit_requests.insert(request_id, pending);
         } else {
-            self.last_error = Some("no language server is available for this file".to_string());
+            self.set_legacy_message(Some(
+                "no language server is available for this file".to_string(),
+            ));
         }
         Ok(())
     }
@@ -25852,7 +26039,9 @@ impl Editor {
                 .get(request_id)
                 .is_some_and(|pending| pending.buffer_id == buffer_id)
         }) {
-            self.last_error = Some("format-on-save is already pending for this buffer".to_string());
+            self.set_legacy_message(Some(
+                "format-on-save is already pending for this buffer".to_string(),
+            ));
             return Ok(FormatOnSaveRequest::Pending);
         }
         let previous_uri = self.current_buffer().uri()?;
@@ -25874,10 +26063,10 @@ impl Editor {
                             })
                     });
                 if already_open {
-                    self.last_error = Some(format!(
+                    self.set_legacy_message(Some(format!(
                         "Save As cancelled; destination is already open in another buffer: {}",
                         target.display()
-                    ));
+                    )));
                     return Ok(FormatOnSaveRequest::Cancelled);
                 }
                 self.current_buffer_mut().file = Some(file.clone());
@@ -27286,7 +27475,7 @@ impl Editor {
 
     #[doc(hidden)]
     pub fn test_set_last_error(&mut self, message: &str) {
-        self.last_error = Some(message.to_string());
+        self.set_legacy_message(Some(message.to_string()));
     }
 
     #[doc(hidden)]
@@ -30822,6 +31011,65 @@ builtin = "rust"
             .last()
             .unwrap()
             .contains("fatal: index.lock already exists"));
+        let retained = editor.notifications().records().next().unwrap();
+        assert_eq!(retained.content.summary, "fatal: index.lock already exists");
+        assert_eq!(retained.severity, Severity::Info);
+    }
+
+    #[tokio::test]
+    async fn notification_history_survives_legacy_action_resets() {
+        let mut editor = test_editor(60, 8);
+        let mut buffer = RenderBuffer::new(60, 8, &Style::default());
+        let mut runtime = Runtime::new();
+
+        for message in ["first\nfull details", "second"] {
+            editor
+                .execute(
+                    &Action::Print(message.to_string()),
+                    &mut buffer,
+                    &mut runtime,
+                )
+                .await
+                .unwrap();
+        }
+        editor
+            .execute(&Action::Refresh, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert!(editor.last_error.is_none());
+        let retained = editor.notifications().records().collect::<Vec<_>>();
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0].content.summary, "first full details");
+        assert_eq!(
+            retained[0].content.details.as_deref(),
+            Some("first\nfull details")
+        );
+        assert_eq!(retained[1].content.summary, "second");
+    }
+
+    #[tokio::test]
+    async fn notification_overflow_preserves_legacy_print_feedback() {
+        let mut editor = test_editor(60, 8);
+        editor.notifications = NotificationCenter::with_capacity(0);
+        let mut buffer = RenderBuffer::new(60, 8, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .execute(
+                &Action::Print("still visible".to_string()),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.last_error.as_deref(), Some("still visible"));
+        assert!(render_text_rows(&buffer)
+            .last()
+            .unwrap()
+            .contains("still visible"));
+        assert_eq!(editor.notifications().records().len(), 0);
     }
 
     #[test]
@@ -34765,7 +35013,7 @@ builtin = "rust"
             .as_deref()
             .is_some_and(|error| error.contains("UTF-16")));
 
-        editor.last_error = None;
+        editor.set_legacy_message(None);
         editor
             .test_execute_production_action(Action::ApplyLspWorkspaceEdit {
                 documents: vec![
@@ -34797,7 +35045,7 @@ builtin = "rust"
             .as_deref()
             .is_some_and(|error| error.contains("overlap")));
 
-        editor.last_error = None;
+        editor.set_legacy_message(None);
         editor.buffer_manager[1]
             .replace_range_raw(TextRange::insertion(TextPosition::new(0, 0)), "dirty ");
         editor
@@ -35298,7 +35546,7 @@ builtin = "rust"
             .as_deref()
             .is_some_and(|error| error.contains("no-follow filesystem support")));
 
-        editor.last_error = None;
+        editor.set_legacy_message(None);
         let operations = workspace_edit_operations(&serde_json::json!({
             "documentChanges": [{
                 "kind": "rename",
@@ -36952,14 +37200,15 @@ while True:
 
     #[tokio::test]
     async fn command_feedback_renders_after_prompt_closes() {
-        for (command, dirty, expected) in [
+        for (command, dirty, expected, marker) in [
             (
                 "q",
                 true,
                 "The following buffers have unwritten changes: [No Name]",
+                "",
             ),
-            ("w", true, "No file name"),
-            ("xyz", false, "unknown command \"xyz\""),
+            ("w", true, "No file name", "× "),
+            ("xyz", false, "unknown command \"xyz\"", "× "),
         ] {
             let mut editor = test_editor(80, 5);
             editor.current_buffer_mut().dirty = dirty;
@@ -36980,7 +37229,12 @@ while True:
 
             assert!(!processed.quit, "command {command:?} unexpectedly quit");
             assert_eq!(editor.last_error.as_deref(), Some(expected));
-            assert_eq!(render_row(&render_buffer, 4).trim_end(), expected);
+            let row = render_row(&render_buffer, 4);
+            let message = row
+                .trim_end()
+                .strip_suffix("[1 active · :messages]")
+                .expect("command feedback should include the active-message badge");
+            assert_eq!(message.trim_end(), format!("{marker}{expected}"));
         }
     }
 

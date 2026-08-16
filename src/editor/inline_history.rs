@@ -351,10 +351,11 @@ impl Editor {
                 .open(path)
                 .and_then(|mut file| file.write_all(&contents))
             {
-                Ok(()) => self.last_error = Some(format!("exported inline history to {path}")),
-                Err(error) => {
-                    self.last_error = Some(format!("could not export inline history: {error}"))
+                Ok(()) => {
+                    self.set_legacy_message(Some(format!("exported inline history to {path}")))
                 }
+                Err(error) => self
+                    .set_legacy_message(Some(format!("could not export inline history: {error}"))),
             }
             return self.render(buffer);
         }
@@ -426,10 +427,10 @@ impl Editor {
                     }
                 }
             }
-            self.last_error = Some(
+            self.set_legacy_message(Some(
                 "source is detached; select the intended code and start a new inline request"
                     .into(),
-            );
+            ));
             return self.render(buffer);
         }
         let Some(browser) = &mut self.inline_history_browser else {

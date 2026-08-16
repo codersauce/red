@@ -9,7 +9,7 @@ use crate::{
     editor::{Action, Editor, RenderBuffer},
     inline_history::HistoryAction,
     theme::Theme,
-    unicode_utils::truncate_display_width,
+    unicode_utils::{fit_display_width, truncate_display_width},
 };
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 
@@ -129,7 +129,7 @@ impl Component for InlineHistoryPanel {
             let marker = if offset == self.selected { "> " } else { "  " };
             let row_y = y + 1 + (offset - first) * 2;
             let mut lines = row.lines();
-            let text = truncate_display_width(
+            let text = fit_display_width(
                 &format!("{marker}{}", lines.next().unwrap_or_default()),
                 list_width,
             );
@@ -140,7 +140,7 @@ impl Component for InlineHistoryPanel {
                 buffer.set_text(
                     1,
                     row_y + 1,
-                    &truncate_display_width(
+                    &fit_display_width(
                         &format!("  {}", lines.next().unwrap_or_default()),
                         list_width,
                     ),
@@ -263,5 +263,66 @@ impl Component for InlineHistoryPanel {
             KeyCode::Char('D') => HistoryAction::Forget,
             _ => return None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::color::Color;
+
+    #[test]
+    fn selection_fills_both_lines_without_crossing_pane_boundary() {
+        let mut theme = Theme::default();
+        theme.ui_style.picker_selected_item.bg = Some(Color::Rgb {
+            r: 91,
+            g: 42,
+            b: 73,
+        });
+        let height = 30;
+
+        for (viewport_width, list_width) in [(120, 47), (64, 62)] {
+            let mut panel = InlineHistoryPanel {
+                rows: vec![
+                    "short\ndetails".into(),
+                    format!("{}\n{}", "界".repeat(80), "👋".repeat(80)),
+                ],
+                selected: 0,
+                detail: "preview".into(),
+                scroll: 0,
+                searching: false,
+                query: String::new(),
+                confirm_forget: false,
+                title: "History".into(),
+                width: viewport_width,
+                height,
+                theme: theme.clone(),
+            };
+            let mut buffer = RenderBuffer::new(viewport_width, height, &theme.style);
+
+            for selected in 0..2 {
+                panel.selected = selected;
+                panel.draw(&mut buffer).unwrap();
+
+                let row_y = 14
+                    + if viewport_width >= 72 {
+                        selected * 2
+                    } else {
+                        0
+                    };
+                for row_y in row_y..row_y + 2 {
+                    for column in 1..=list_width {
+                        assert_eq!(
+                            buffer.cells[row_y * viewport_width + column].style,
+                            theme.ui_style.picker_selected_item,
+                            "viewport={viewport_width}, selected={selected}, cell=({column},{row_y})"
+                        );
+                    }
+                    let boundary = &buffer.cells[row_y * viewport_width + list_width + 1];
+                    assert_eq!(boundary.c, '│');
+                    assert_ne!(boundary.style.bg, theme.ui_style.picker_selected_item.bg);
+                }
+            }
+        }
     }
 }
