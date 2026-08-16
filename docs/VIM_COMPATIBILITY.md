@@ -57,7 +57,7 @@ the corresponding integration tests.
 
 | Area | Status | Red behavior |
 |---|---|---|
-| Search | **supported** | `/`, `?`, incremental preview, `n`, `N`, `*`, wrapscan, smartcase/ignorecase, cancellation, and highlight clearing. |
+| Search | **supported** | `/`, `?`, persistent shared search history with prefix-filtered Up/Down and Ctrl-p/Ctrl-n recall, incremental preview, `n`, `N`, `*`, wrapscan, smartcase/ignorecase, cancellation, and highlight clearing. |
 | Search syntax | **intentional difference** | Patterns use Rust `regex` syntax rather than Vim's regex dialect. |
 | Substitute ranges | **supported** | Current line, `%`, one-based numeric line/range, and `'<,'>` last-Visual range. Visual `:` prefills that range, so substitution applies to every line touched by character, line, or block selections. |
 | Substitute flags | **supported** | `g`, `i`, and explicit `c` confirmation with `y/n/a/q/l`. All accepted replacements from one command form one transaction. |

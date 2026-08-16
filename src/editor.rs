@@ -3118,7 +3118,7 @@ pub struct Editor {
     whats_new_needs_persistence: bool,
 
     /// Active command-history navigation state.
-    command_history_navigation: Option<CommandHistoryNavigation>,
+    command_history_navigation: Option<PromptHistoryNavigation>,
 
     /// Active command-line completion state.
     command_completion: Option<CommandCompletionState>,
@@ -3565,16 +3565,57 @@ struct HistoryEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CommandHistoryDirection {
+enum PromptHistoryDirection {
     Previous,
     Next,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CommandHistoryNavigation {
+struct PromptHistoryNavigation {
     prefix: String,
     original: String,
     position: usize,
+}
+
+impl PromptHistoryNavigation {
+    fn navigate(
+        history: &[String],
+        navigation: &mut Option<Self>,
+        text: &mut String,
+        direction: PromptHistoryDirection,
+    ) -> bool {
+        let mut state = navigation.take().unwrap_or_else(|| Self {
+            prefix: text.clone(),
+            original: text.clone(),
+            position: history.len(),
+        });
+        let matches: Vec<_> = history
+            .iter()
+            .filter(|entry| entry.starts_with(&state.prefix))
+            .collect();
+        if matches.is_empty() {
+            return false;
+        }
+        state.position = state.position.min(matches.len());
+
+        let recalled = match direction {
+            PromptHistoryDirection::Previous => {
+                state.position = state.position.saturating_sub(1);
+                matches[state.position]
+            }
+            PromptHistoryDirection::Next => {
+                state.position = (state.position + 1).min(matches.len());
+                matches
+                    .get(state.position)
+                    .copied()
+                    .unwrap_or(&state.original)
+            }
+        };
+        let changed = text.as_str() != recalled.as_str();
+        text.clone_from(recalled);
+        *navigation = Some(state);
+        changed
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3613,6 +3654,7 @@ struct SearchSession {
     origin_vtop: usize,
     direction: SearchDirection,
     draft: String,
+    history_navigation: Option<PromptHistoryNavigation>,
     preview: Option<SearchMatch>,
 }
 
@@ -13968,6 +14010,7 @@ impl Editor {
             origin_vtop: self.vtop,
             direction,
             draft: String::new(),
+            history_navigation: None,
             preview: None,
         });
         self.mode = Mode::Search;
@@ -14112,51 +14155,30 @@ impl Editor {
         self.command_completion = None;
     }
 
-    fn command_history_matches(&self, prefix: &str) -> Vec<usize> {
-        self.preferences
-            .command_history()
-            .iter()
-            .enumerate()
-            .filter_map(|(index, command)| command.starts_with(prefix).then_some(index))
-            .collect()
+    fn navigate_command_history(&mut self, direction: PromptHistoryDirection) {
+        PromptHistoryNavigation::navigate(
+            self.preferences.command_history(),
+            &mut self.command_history_navigation,
+            &mut self.command,
+            direction,
+        );
     }
 
-    fn navigate_command_history(&mut self, direction: CommandHistoryDirection) {
-        let mut navigation = self.command_history_navigation.take().unwrap_or_else(|| {
-            let prefix = self.command.clone();
-            let position = self.command_history_matches(&prefix).len();
-            CommandHistoryNavigation {
-                prefix,
-                original: self.command.clone(),
-                position,
-            }
-        });
-
-        let matches = self.command_history_matches(&navigation.prefix);
-        if matches.is_empty() {
-            self.command_history_navigation = None;
+    fn navigate_search_history(&mut self, direction: PromptHistoryDirection) {
+        let Some(session) = &mut self.active_search else {
+            return;
+        };
+        if !PromptHistoryNavigation::navigate(
+            self.preferences.search_history(),
+            &mut session.history_navigation,
+            &mut session.draft,
+            direction,
+        ) {
             return;
         }
-
-        match direction {
-            CommandHistoryDirection::Previous => {
-                navigation.position = navigation.position.saturating_sub(1);
-                self.command =
-                    self.preferences.command_history()[matches[navigation.position]].clone();
-            }
-            CommandHistoryDirection::Next => {
-                if navigation.position + 1 < matches.len() {
-                    navigation.position += 1;
-                    self.command =
-                        self.preferences.command_history()[matches[navigation.position]].clone();
-                } else {
-                    navigation.position = matches.len();
-                    self.command = navigation.original.clone();
-                }
-            }
-        }
-
-        self.command_history_navigation = Some(navigation);
+        session.preview = None;
+        self.last_error = None;
+        self.update_search_preview();
     }
 
     fn command_accepts_file_completion(command: &str) -> bool {
@@ -14405,6 +14427,12 @@ impl Editor {
         }
     }
 
+    fn record_search_history(&mut self, pattern: &str) {
+        if let Err(error) = self.preferences.record_search(pattern) {
+            log!("failed to save search history: {error}");
+        }
+    }
+
     pub(crate) fn picker_history(&self, key: &str) -> &[String] {
         self.preferences.picker_history(key)
     }
@@ -14477,11 +14505,11 @@ impl Editor {
                 }
                 KeyCode::Up => {
                     self.reset_command_completion();
-                    self.navigate_command_history(CommandHistoryDirection::Previous);
+                    self.navigate_command_history(PromptHistoryDirection::Previous);
                 }
                 KeyCode::Down => {
                     self.reset_command_completion();
-                    self.navigate_command_history(CommandHistoryDirection::Next);
+                    self.navigate_command_history(PromptHistoryDirection::Next);
                 }
                 KeyCode::Tab => {
                     self.reset_command_history_navigation();
@@ -14526,6 +14554,7 @@ impl Editor {
             Event::Paste(text) => {
                 if let Some(active_search) = &mut self.active_search {
                     active_search.draft.push_str(&pasted_input_line(text));
+                    active_search.history_navigation = None;
                     active_search.preview = None;
                 }
                 self.update_search_preview();
@@ -14541,12 +14570,19 @@ impl Editor {
                     (KeyCode::Backspace, _) => {
                         if let Some(active_search) = &mut self.active_search {
                             Self::delete_last_char(&mut active_search.draft);
+                            active_search.history_navigation = None;
                             active_search.preview = None;
                         }
                         self.update_search_preview();
                     }
                     (KeyCode::Enter, _) => {
                         return Some(KeyAction::Single(Action::CommitSearch));
+                    }
+                    (KeyCode::Up, _) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                        self.navigate_search_history(PromptHistoryDirection::Previous);
+                    }
+                    (KeyCode::Down, _) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                        self.navigate_search_history(PromptHistoryDirection::Next);
                     }
                     (KeyCode::Char('g'), KeyModifiers::CONTROL) => {
                         return Some(KeyAction::Single(Action::FindNext));
@@ -14557,6 +14593,7 @@ impl Editor {
                     (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                         if let Some(active_search) = &mut self.active_search {
                             active_search.draft.push(c);
+                            active_search.history_navigation = None;
                         }
                         self.update_search_preview();
                     }
@@ -19207,6 +19244,7 @@ impl Editor {
                     self.mode = Mode::Normal;
                     self.render(buffer)?;
                 } else {
+                    self.record_search_history(&session.draft);
                     let matches = match self.search_matches(&session.draft) {
                         Ok(matches) => matches,
                         Err(err) => {
