@@ -3148,7 +3148,7 @@ pub struct Editor {
     /// Session-local notification records, independent of the legacy display slot.
     notifications: NotificationCenter,
     message_browser: Option<notifications::MessageBrowser>,
-    notification_presentation: Option<notifications::NotificationPresentation>,
+    notification_presentation: notifications::NotificationPresentation,
     notification_animation_start: Instant,
     notification_fallback: Option<String>,
     config_notification: Option<NotificationId>,
@@ -4429,7 +4429,7 @@ impl Editor {
             search_highlights_suppressed: false,
             notifications: NotificationCenter::default(),
             message_browser: None,
-            notification_presentation: None,
+            notification_presentation: notifications::NotificationPresentation::default(),
             notification_animation_start: Instant::now(),
             notification_fallback: None,
             config_notification: None,
@@ -37200,14 +37200,15 @@ while True:
 
     #[tokio::test]
     async fn command_feedback_renders_after_prompt_closes() {
-        for (command, dirty, expected) in [
+        for (command, dirty, expected, marker) in [
             (
                 "q",
                 true,
                 "The following buffers have unwritten changes: [No Name]",
+                "",
             ),
-            ("w", true, "No file name"),
-            ("xyz", false, "unknown command \"xyz\""),
+            ("w", true, "No file name", "× "),
+            ("xyz", false, "unknown command \"xyz\"", "× "),
         ] {
             let mut editor = test_editor(80, 5);
             editor.current_buffer_mut().dirty = dirty;
@@ -37228,7 +37229,12 @@ while True:
 
             assert!(!processed.quit, "command {command:?} unexpectedly quit");
             assert_eq!(editor.last_error.as_deref(), Some(expected));
-            assert_eq!(render_row(&render_buffer, 4).trim_end(), expected);
+            let row = render_row(&render_buffer, 4);
+            let message = row
+                .trim_end()
+                .strip_suffix("[1 active · :messages]")
+                .expect("command feedback should include the active-message badge");
+            assert_eq!(message.trim_end(), format!("{marker}{expected}"));
         }
     }
 

@@ -48,7 +48,9 @@ pub(super) struct MessageBrowser {
     feedback: Option<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Last observed notification state. The default matches a new, empty center so
+/// its first background poll does not invalidate otherwise reusable surfaces.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct NotificationPresentation {
     revision: u64,
     counts: NotificationCounts,
@@ -114,7 +116,10 @@ impl Editor {
     }
 
     pub(super) fn notification_presentation_changed(&mut self) -> bool {
-        let now = Instant::now();
+        self.notification_presentation_changed_at(Instant::now())
+    }
+
+    fn notification_presentation_changed_at(&mut self, now: Instant) -> bool {
         let mut counts = self.notifications.counts(now);
         counts.active += usize::from(self.notification_fallback.is_some());
         let frame = if !self.has_term()
@@ -123,7 +128,8 @@ impl Editor {
                 .primary(now)
                 .is_some_and(Notification::is_running)
         {
-            self.notification_animation_start.elapsed().as_millis() as u64
+            now.saturating_duration_since(self.notification_animation_start)
+                .as_millis() as u64
                 / crate::ui::SPINNER_FRAME_INTERVAL_MS
         } else {
             0
@@ -133,10 +139,10 @@ impl Editor {
             counts,
             frame,
         };
-        if self.notification_presentation == Some(presentation) {
+        if self.notification_presentation == presentation {
             return false;
         }
-        self.notification_presentation = Some(presentation);
+        self.notification_presentation = presentation;
         if self
             .current_dialog
             .as_ref()
@@ -416,6 +422,39 @@ mod tests {
         .unwrap();
         editor.test_disable_terminal_output();
         editor
+    }
+
+    #[test]
+    fn presentation_ignores_an_empty_center_but_detects_arrivals_and_expiry() {
+        let mut editor = editor(90, 12);
+        assert!(!editor.notification_presentation_changed());
+        assert!(!editor.notification_presentation_changed());
+
+        let id = editor
+            .publish_notification(Notice::new(
+                NotificationSource::Editor,
+                Severity::Error,
+                "save failed",
+            ))
+            .unwrap();
+        assert!(editor.notification_presentation_changed());
+        assert!(!editor.notification_presentation_changed());
+        editor.notifications.acknowledge(id).unwrap();
+        assert!(editor.notification_presentation_changed());
+        assert!(!editor.notification_presentation_changed());
+
+        let now = NotificationTime::now();
+        editor
+            .notifications
+            .publish(
+                Notice::new(NotificationSource::Editor, Severity::Info, "saved"),
+                now,
+            )
+            .unwrap();
+        assert!(editor.notification_presentation_changed_at(now.monotonic));
+        let after_expiry = now.monotonic + Duration::from_secs(4);
+        assert!(editor.notification_presentation_changed_at(after_expiry));
+        assert!(!editor.notification_presentation_changed_at(after_expiry));
     }
 
     #[tokio::test]
