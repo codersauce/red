@@ -107,10 +107,25 @@ impl Default for CopilotConfig {
 
 impl CopilotConfig {
     pub(crate) fn allows(&self, root: &Path, path: &Path, bytes: usize) -> bool {
-        if bytes > self.max_file_bytes || !path.starts_with(root) {
+        if bytes > self.max_file_bytes {
             return false;
         }
-        let mut builder = GitignoreBuilder::new(root);
+        let Ok(canonical_root) = root.canonicalize() else {
+            return false;
+        };
+        // Windows canonical paths have a verbatim prefix, while document URIs
+        // round-trip to ordinary drive paths. Compare both lexical names in the
+        // same document-path form, without resolving away excluded aliases.
+        let Some(lexical_root) = normalized_document_path(root) else {
+            return false;
+        };
+        let Some(lexical_path) = normalized_document_path(path) else {
+            return false;
+        };
+        let Ok(relative_path) = lexical_path.strip_prefix(&lexical_root) else {
+            return false;
+        };
+        let mut builder = GitignoreBuilder::new(&canonical_root);
         builder.allow_unclosed_class(false);
         for pattern in &self.excluded_patterns {
             if builder.add_line(None, pattern).is_err() {
@@ -120,7 +135,10 @@ impl CopilotConfig {
         let Ok(ignore) = builder.build() else {
             return false;
         };
-        if ignore.matched_path_or_any_parents(path, false).is_ignore() {
+        if ignore
+            .matched_path_or_any_parents(relative_path, false)
+            .is_ignore()
+        {
             return false;
         }
         // A harmless-looking symlink must not bypass either workspace confinement
@@ -134,15 +152,24 @@ impl CopilotConfig {
                 .join(path.file_name().unwrap_or_default()))
         });
         match resolved {
-            Ok(resolved) => {
-                resolved.starts_with(root)
-                    && !ignore
-                        .matched_path_or_any_parents(&resolved, false)
+            Ok(resolved) => resolved
+                .strip_prefix(&canonical_root)
+                .is_ok_and(|relative| {
+                    !ignore
+                        .matched_path_or_any_parents(relative, false)
                         .is_ignore()
-            }
+                }),
             Err(_) => false,
         }
     }
+}
+
+/// Uses the same lexical path representation as buffer document URIs.
+fn normalized_document_path(path: &Path) -> Option<PathBuf> {
+    let uri = file_uri(path).ok()?;
+    crate::lsp::normalized_file_path(&uri)
+        .ok()
+        .map(PathBuf::from)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -696,6 +723,55 @@ mod tests {
         config.excluded_patterns.push("[".into());
         assert!(!config.allows(root, &root.join("main.rs"), 100));
     }
+    #[test]
+    fn document_uri_paths_preserve_workspace_privacy() {
+        let config = CopilotConfig::default();
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(root.join(".env.local"), "secret").unwrap();
+        let document_path = |path: &Path| {
+            PathBuf::from(crate::lsp::normalized_file_path(&file_uri(path).unwrap()).unwrap())
+        };
+        let uri_root = document_path(&root);
+        let existing = document_path(&root.join("src/main.rs"));
+        let unsaved = document_path(&root.join("src/new.rs"));
+        let excluded = document_path(&root.join(".env.local"));
+        let outside_file = document_path(&outside.path().join("main.rs"));
+        for workspace in [&root, &uri_root] {
+            assert!(
+                config.allows(workspace, &existing, 100),
+                "{workspace:?}: {existing:?}"
+            );
+            assert!(config.allows(workspace, &unsaved, 100));
+            assert!(!config.allows(workspace, &excluded, 100));
+            assert!(!config.allows(workspace, &outside_file, 100));
+            assert!(!config.allows(workspace, &existing, config.max_file_bytes + 1));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_aliases_keep_lexical_and_resolved_exclusions() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("workspace");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("main.rs"), "source").unwrap();
+        std::fs::write(root.join(".env.local"), "secret").unwrap();
+        symlink(&root, &alias).unwrap();
+        symlink(root.join("main.rs"), root.join(".env")).unwrap();
+        symlink(root.join(".env.local"), root.join("looks-safe.rs")).unwrap();
+        let config = CopilotConfig::default();
+        assert!(config.allows(&alias, &alias.join("main.rs"), 6));
+        assert!(config.allows(&alias, &alias.join("new.rs"), 6));
+        assert!(!config.allows(&alias, &alias.join(".env"), 6));
+        assert!(!config.allows(&alias, &alias.join("looks-safe.rs"), 6));
+    }
+
     #[test]
     fn document_end_uses_utf16() {
         assert_eq!(
