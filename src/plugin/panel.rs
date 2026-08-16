@@ -21,6 +21,7 @@ use super::markdown::{
 };
 use super::text_link::{TextPanelLink, TextPanelLinkTarget};
 use crate::{
+    buffer::BufferId,
     color::{blend_color, ensure_minimum_contrast, Color},
     editor::{render_buffer::RenderBuffer, Point},
     text_layout::{LayoutOptions, TextLayout},
@@ -755,6 +756,36 @@ pub(crate) struct TextPanelYank {
 pub(crate) enum TextPanelScrollbackInput {
     Handled,
     Yank(TextPanelYank),
+    OpenTurnActions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+/// The source text to copy from a conversation turn.
+pub enum TextPanelTurnPart {
+    Prompt,
+    Answer,
+}
+
+/// Identifies the exact unsent draft a replacement confirmation approved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextPanelDraftRevision {
+    buffer_id: BufferId,
+    revision: u64,
+}
+
+pub(crate) struct TextPanelTurnTarget {
+    pub panel_id: String,
+    pub prompt_id: String,
+    pub number: usize,
+    pub preview: String,
+    pub has_answer: bool,
+    pub can_reuse: bool,
+}
+
+pub(crate) enum TextPanelReuseOutcome {
+    Loaded,
+    Confirm(TextPanelDraftRevision),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1027,6 +1058,24 @@ impl TextPanel {
             .rev()
             .find(|block| block.kind == TextPanelBlockKind::Agent && !block.text.is_empty())
             .map(|block| block.text.clone())
+    }
+
+    fn turn_text(&self, prompt_id: &str, part: TextPanelTurnPart) -> Option<String> {
+        let start = self
+            .blocks
+            .iter()
+            .position(|block| block.id == prompt_id && block.kind == TextPanelBlockKind::User)?;
+        if part == TextPanelTurnPart::Prompt {
+            return Some(self.blocks[start].text.clone());
+        }
+        let answer = self.blocks[start + 1..]
+            .iter()
+            .take_while(|block| block.kind != TextPanelBlockKind::User)
+            .filter(|block| block.kind == TextPanelBlockKind::Agent && !block.text.is_empty())
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        (!answer.is_empty()).then_some(answer)
     }
 
     fn links(&self, width: usize) -> Vec<(TextPanelLink, usize)> {
@@ -3215,6 +3264,9 @@ impl PanelManager {
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
         {
             match key.code {
+                KeyCode::Char('m') if panel.scrollback.mode == TextPanelScrollbackMode::Normal => {
+                    return Some(TextPanelScrollbackInput::OpenTurnActions);
+                }
                 KeyCode::Char('/' | '?')
                     if panel.scrollback.mode == TextPanelScrollbackMode::Normal
                         && (panel.composer.is_some()
@@ -3498,13 +3550,98 @@ impl PanelManager {
         None
     }
 
-    pub fn focused_text_for_copy(&self, all: bool) -> Option<String> {
+    pub fn focused_text_for_copy(&self, all: bool, terminal_width: usize) -> Option<String> {
         let panel = self.text_panels.get(self.focused.as_deref()?)?;
         if all {
             Some(panel.copy_all())
         } else {
-            panel.copy_last_agent()
+            let width = effective_panel_width(&panel.config, terminal_width);
+            match panel.selected_prompt(&panel.layout(width)) {
+                Some(index) => panel.turn_text(&panel.blocks[index].id, TextPanelTurnPart::Answer),
+                None => panel.copy_last_agent(),
+            }
         }
+    }
+
+    pub(crate) fn selected_text_turn(&self, terminal_width: usize) -> Option<TextPanelTurnTarget> {
+        let panel = self.text_panels.get(self.focused.as_deref()?)?;
+        let width = effective_panel_width(&panel.config, terminal_width);
+        let index = panel.selected_prompt(&panel.layout(width))?;
+        let prompt = &panel.blocks[index];
+        Some(TextPanelTurnTarget {
+            panel_id: panel.id.clone(),
+            prompt_id: prompt.id.clone(),
+            number: panel.blocks[..=index]
+                .iter()
+                .filter(|block| block.kind == TextPanelBlockKind::User)
+                .count(),
+            preview: truncate_display_width(&first_prompt_line(&prompt.text), 52),
+            has_answer: panel
+                .turn_text(&prompt.id, TextPanelTurnPart::Answer)
+                .is_some(),
+            can_reuse: panel
+                .composer
+                .as_ref()
+                .is_some_and(|composer| composer.enabled),
+        })
+    }
+
+    pub(crate) fn text_turn_for_copy(
+        &self,
+        panel_id: &str,
+        prompt_id: &str,
+        part: TextPanelTurnPart,
+    ) -> Option<String> {
+        self.text_panels.get(panel_id)?.turn_text(prompt_id, part)
+    }
+
+    pub(crate) fn reuse_text_panel_prompt(
+        &mut self,
+        panel_id: &str,
+        prompt_id: &str,
+        expected_draft: Option<TextPanelDraftRevision>,
+    ) -> Result<TextPanelReuseOutcome, &'static str> {
+        if !self.z_order.iter().any(|id| id == panel_id) {
+            return Err("conversation pane is no longer visible");
+        }
+        let panel = self
+            .text_panels
+            .get_mut(panel_id)
+            .ok_or("conversation is no longer available")?;
+        let text = normalize_prompt_newlines(
+            &panel
+                .turn_text(prompt_id, TextPanelTurnPart::Prompt)
+                .ok_or("selected prompt is no longer available")?,
+        );
+        if text.len() > MAX_COMPOSER_BYTES {
+            return Err("selected prompt exceeds 128 KiB");
+        }
+        let composer = panel
+            .composer
+            .as_mut()
+            .filter(|composer| composer.enabled)
+            .ok_or("conversation composer is unavailable")?;
+        let revision = TextPanelDraftRevision {
+            buffer_id: composer.prompt.buffer().id(),
+            revision: composer.prompt.buffer().revision(),
+        };
+        if expected_draft.is_some_and(|expected| expected != revision) {
+            return Err("composer draft changed; choose reuse again");
+        }
+        let current = composer.prompt.text();
+        if current != text && !current.is_empty() && expected_draft.is_none() {
+            return Ok(TextPanelReuseOutcome::Confirm(revision));
+        }
+        if current != text && !composer.prompt.replace_draft(&text) {
+            return Err("could not load the selected prompt");
+        }
+        composer.prompt.set_mode(crate::editor::Mode::Insert);
+        composer.validation = None;
+        composer.focused = true;
+        panel.blur_scrollback();
+        panel.last_focused_region = TextPanelFocusRegion::Composer;
+        self.focused = Some(panel_id.to_string());
+        Ok(TextPanelReuseOutcome::Loaded)
     }
 
     pub fn focus_text_panel_composer(&mut self, id: &str) -> bool {
@@ -4591,6 +4728,10 @@ struct TextPanelShortcutHint {
 }
 
 const SCROLLBACK_NORMAL_HINTS: &[TextPanelShortcutHint] = &[
+    TextPanelShortcutHint {
+        keys: "m",
+        action: "actions",
+    },
     TextPanelShortcutHint {
         keys: "/?",
         action: "search",

@@ -125,6 +125,21 @@ impl PromptBuffer {
         self.area.set_text(text)
     }
 
+    /// Loads a different draft as its own undoable edit, leaving prompt-history
+    /// browsing and any previous insert session before editing the replacement.
+    pub(crate) fn replace_draft(&mut self, text: &str) -> bool {
+        let text = normalize_prompt_newlines(text);
+        if text.len() > PROMPT_MAX_BYTES {
+            return false;
+        }
+        self.area.set_mode(Mode::Normal);
+        let changed = self.area.set_text(&text);
+        self.history_position = None;
+        self.history_draft = None;
+        self.area.set_mode(Mode::Insert);
+        changed
+    }
+
     /// Inserts normalized text as one undoable prompt transaction.
     pub(crate) fn insert(&mut self, text: &str) -> bool {
         let changed = self.area.insert(text);

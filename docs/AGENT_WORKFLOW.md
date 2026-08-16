@@ -133,6 +133,13 @@ direction and `N` reverses it, wrapping at the ends. After a completed search,
 Escape hides its highlights; `n` or `N` brings them back. Transcript search is
 independent of the composer's draft and prompt-local search.
 
+Press `m` in transcript Normal mode for the selected turn's actions: copy its
+prompt, copy its answer, or reuse the prompt in the composer. Reuse only loads
+text for editing; it never submits. If an unsent draft would be replaced, Red
+asks first and defaults to keeping it. An approved replacement is one undoable
+composer edit, so Escape followed by `u` restores the previous draft. `y` copies
+the selected turn's answer; `Y` still copies the whole conversation.
+
 If Codex cannot start, Red preserves the prompt and offers a retry action.
 Install or update Codex, run `codex login`, then retry without retyping.
 
