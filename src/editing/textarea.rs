@@ -12,15 +12,13 @@ use super::{
 use crate::{
     buffer::Buffer,
     editor::Mode,
+    text_layout::{LayoutOptions, TextLayout},
     undo::{CursorSnapshot, TextPosition, TextRange},
-    unicode_utils::{
-        char_to_grapheme, display_width, grapheme_len, grapheme_to_byte, trim_line_ending,
-    },
+    unicode_utils::{char_to_grapheme, grapheme_len, grapheme_to_byte, trim_line_ending},
 };
 
 const DEFAULT_MAX_BYTES: usize = 128 * 1024;
 const MAX_MACRO_EVENTS: usize = 1_000;
-const TAB_WIDTH: usize = 4;
 
 /// Result of handling one input event in a host-owned editing surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,6 +367,16 @@ impl TextArea {
 
     /// Applies one editing event, leaving submission and focus decisions to the host.
     pub fn handle_event(&mut self, event: &Event, wrap_width: usize) -> TextAreaOutcome {
+        self.handle_event_with_layout_options(event, LayoutOptions::grapheme(wrap_width.max(1)))
+    }
+
+    /// Applies an event using the host's display policy for visual-row motions.
+    /// Logical-line operators and the document itself are independent of this policy.
+    pub fn handle_event_with_layout_options(
+        &mut self,
+        event: &Event,
+        layout: LayoutOptions,
+    ) -> TextAreaOutcome {
         match event {
             Event::Paste(text) => {
                 self.state.pending = None;
@@ -379,12 +387,12 @@ impl TextArea {
                     TextAreaOutcome::Unhandled
                 }
             }
-            Event::Key(key) => self.handle_key(*key, wrap_width),
+            Event::Key(key) => self.handle_key(*key, layout),
             _ => TextAreaOutcome::Unhandled,
         }
     }
 
-    fn handle_key(&mut self, key: KeyEvent, wrap_width: usize) -> TextAreaOutcome {
+    fn handle_key(&mut self, key: KeyEvent, layout: LayoutOptions) -> TextAreaOutcome {
         if self.state.mode == Mode::Search {
             return self.handle_search_key(key);
         }
@@ -434,11 +442,11 @@ impl TextArea {
                 return TextAreaOutcome::Changed;
             }
             KeyCode::Up => {
-                self.move_vertical(-1, wrap_width);
+                self.move_vertical(-1, layout);
                 return TextAreaOutcome::Changed;
             }
             KeyCode::Down => {
-                self.move_vertical(1, wrap_width);
+                self.move_vertical(1, layout);
                 return TextAreaOutcome::Changed;
             }
             KeyCode::Home => {
@@ -478,7 +486,7 @@ impl TextArea {
                         TextAreaOutcome::Unhandled
                     };
                 }
-                return self.handle_normal_character(character, wrap_width);
+                return self.handle_normal_character(character, layout);
             }
             _ => {}
         }
@@ -486,7 +494,11 @@ impl TextArea {
         TextAreaOutcome::Unhandled
     }
 
-    fn handle_normal_character(&mut self, character: char, wrap_width: usize) -> TextAreaOutcome {
+    fn handle_normal_character(
+        &mut self,
+        character: char,
+        layout: LayoutOptions,
+    ) -> TextAreaOutcome {
         if let Some((_, recorded)) = self.state.recording.as_mut() {
             if character != 'q' {
                 recorded.push(character);
@@ -494,7 +506,7 @@ impl TextArea {
         }
 
         if let Some(pending) = self.state.pending.take() {
-            return self.handle_pending(pending, character, wrap_width);
+            return self.handle_pending(pending, character, layout);
         }
 
         if character.is_ascii_digit() && (character != '0' || self.state.count.is_some()) {
@@ -546,8 +558,8 @@ impl TextArea {
             'o' | 'O' => self.open_line(character == 'o', character),
             'h' => self.repeat_motion(count, |area| area.move_horizontal(-1)),
             'l' => self.repeat_motion(count, |area| area.move_horizontal(1)),
-            'j' => self.repeat_motion(count, |area| area.move_vertical(1, wrap_width)),
-            'k' => self.repeat_motion(count, |area| area.move_vertical(-1, wrap_width)),
+            'j' => self.repeat_motion(count, |area| area.move_vertical(1, layout)),
+            'k' => self.repeat_motion(count, |area| area.move_vertical(-1, layout)),
             '0' => self.set_cursor(self.current_line_start()),
             '^' => self.move_to_first_non_blank(),
             '$' => self.move_to_line_end(count),
@@ -633,7 +645,7 @@ impl TextArea {
             }
             '~' => self.toggle_case(count, vec!['~']),
             'J' => self.join_lines(count.max(2), false, vec!['J']),
-            '.' => self.repeat_last_change(count, wrap_width),
+            '.' => self.repeat_last_change(count, layout),
             '/' | '?' => {
                 self.state.search = Some(SearchState {
                     pattern: String::new(),
@@ -663,7 +675,7 @@ impl TextArea {
         &mut self,
         pending: PendingInput,
         character: char,
-        wrap_width: usize,
+        layout: LayoutOptions,
     ) -> TextAreaOutcome {
         match pending {
             PendingInput::Operator {
@@ -797,10 +809,10 @@ impl TextArea {
                     }
                     'J' if operator.is_none() => self.join_lines(count.max(2), true, keys),
                     'j' if operator.is_none() => {
-                        self.repeat_motion(count, |area| area.move_vertical(1, wrap_width));
+                        self.repeat_motion(count, |area| area.move_vertical(1, layout));
                     }
                     'k' if operator.is_none() => {
-                        self.repeat_motion(count, |area| area.move_vertical(-1, wrap_width));
+                        self.repeat_motion(count, |area| area.move_vertical(-1, layout));
                     }
                     '0' if operator.is_none() => self.set_cursor(self.current_line_start()),
                     '$' if operator.is_none() => self.set_cursor(self.current_line_last_grapheme()),
@@ -830,7 +842,7 @@ impl TextArea {
                 };
                 if let Some(register) = register {
                     self.state.last_macro = Some(register);
-                    self.play_macro(register, count, wrap_width);
+                    self.play_macro(register, count, layout);
                 }
             }
         }
@@ -1504,39 +1516,39 @@ impl TextArea {
         }
     }
 
-    fn repeat_last_change(&mut self, count: u16, width: usize) {
+    fn repeat_last_change(&mut self, count: u16, layout: LayoutOptions) {
         let Some(recipe) = self.state.last_change.clone() else {
             return;
         };
         let previous_replaying = self.replaying;
         self.replaying = true;
         for _ in 0..count {
-            self.replay_keys(&recipe, width);
+            self.replay_keys(&recipe, layout);
         }
         self.replaying = previous_replaying;
         self.state.last_change = Some(recipe);
     }
 
-    fn play_macro(&mut self, register: char, count: u16, width: usize) {
+    fn play_macro(&mut self, register: char, count: u16, layout: LayoutOptions) {
         let Some(recipe) = self.macro_registers.get(&register).cloned() else {
             return;
         };
         let previous_replaying = self.replaying;
         self.replaying = true;
         for _ in 0..count {
-            self.replay_keys(&recipe, width);
+            self.replay_keys(&recipe, layout);
         }
         self.replaying = previous_replaying;
     }
 
-    fn replay_keys(&mut self, recipe: &[char], width: usize) {
+    fn replay_keys(&mut self, recipe: &[char], layout: LayoutOptions) {
         for character in recipe.iter().take(MAX_MACRO_EVENTS) {
             let code = if *character == '\u{1b}' {
                 KeyCode::Esc
             } else {
                 KeyCode::Char(*character)
             };
-            self.handle_key(KeyEvent::new(code, KeyModifiers::NONE), width);
+            self.handle_key(KeyEvent::new(code, KeyModifiers::NONE), layout);
         }
     }
 
@@ -1556,22 +1568,19 @@ impl TextArea {
         self.set_cursor(cursor);
     }
 
-    fn move_vertical(&mut self, direction: isize, width: usize) {
-        let positions = wrapped_positions(&self.text(), width.max(1));
-        let Some(&(row, column)) = positions.get(self.state.cursor) else {
+    fn move_vertical(&mut self, direction: isize, options: LayoutOptions) {
+        let layout = TextLayout::new(&self.text(), options);
+        let Some(position) = layout.position(self.state.cursor) else {
             return;
         };
+        let row = position.row;
+        let column = position.column;
         let target = row.saturating_add_signed(direction);
         if target == row {
             return;
         }
         let preferred = *self.state.preferred_column.get_or_insert(column);
-        if let Some((index, _)) = positions
-            .iter()
-            .enumerate()
-            .filter(|(_, position)| position.0 == target)
-            .min_by_key(|(_, position)| position.1.abs_diff(preferred))
-        {
+        if let Some(index) = layout.nearest_offset_on_row(target, preferred) {
             self.state.cursor = index;
             if self.state.mode != Mode::Insert {
                 self.clamp_normal_cursor();
@@ -1796,52 +1805,6 @@ fn operator_for_character(character: char) -> Operator {
         'y' => Operator::Yank,
         _ => unreachable!("operator is validated by the input parser"),
     }
-}
-
-fn wrapped_positions(text: &str, width: usize) -> Vec<(usize, usize)> {
-    let width = width.max(1);
-    let mut positions = Vec::with_capacity(grapheme_len(text) + 1);
-    let mut row = 0;
-    let mut column = 0;
-    positions.push((row, column));
-
-    for grapheme in text.graphemes(true) {
-        if grapheme == "\n" {
-            row += 1;
-            column = 0;
-            positions.push((row, column));
-            continue;
-        }
-        if column == width {
-            row += 1;
-            column = 0;
-        }
-        let mut grapheme_width = if grapheme == "\t" {
-            TAB_WIDTH - (column % TAB_WIDTH)
-        } else {
-            display_width(grapheme)
-        };
-        if grapheme_width > width.saturating_sub(column) && column > 0 {
-            row += 1;
-            column = 0;
-            grapheme_width = if grapheme == "\t" {
-                TAB_WIDTH
-            } else {
-                display_width(grapheme)
-            };
-        }
-        column += if grapheme_width > width {
-            1
-        } else {
-            grapheme_width
-        };
-        if column == width {
-            positions.push((row + 1, 0));
-        } else {
-            positions.push((row, column));
-        }
-    }
-    positions
 }
 
 fn normalize_newlines(text: &str) -> String {

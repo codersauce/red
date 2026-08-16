@@ -10,6 +10,7 @@ use crate::{
     buffer::Buffer,
     editing::{TextArea, TextAreaOutcome},
     editor::Mode,
+    text_layout::{LayoutOptions, TextLayout},
     unicode_utils::grapheme_len,
 };
 
@@ -84,6 +85,11 @@ impl PromptBuffer {
     #[must_use]
     pub(crate) fn text(&self) -> String {
         self.area.text()
+    }
+
+    /// Projects the current draft without modifying its logical representation.
+    pub(crate) fn layout(&self, options: LayoutOptions) -> TextLayout {
+        TextLayout::new(&self.text(), options)
     }
 
     /// Returns the cursor as an absolute extended-grapheme index.
@@ -210,16 +216,26 @@ impl PromptBuffer {
         Some(text)
     }
 
-    /// Applies local prompt policy before delegating modal editing to the shared engine.
+    /// Exercises the legacy grapheme-wrap policy in prompt compatibility tests.
+    #[cfg(test)]
     pub(crate) fn handle_event(&mut self, event: &Event, wrap_width: usize) -> PromptInput {
+        self.handle_event_with_layout_options(event, LayoutOptions::grapheme(wrap_width.max(1)))
+    }
+
+    /// Applies local prompt policy before delegating modal editing to the shared engine.
+    pub(crate) fn handle_event_with_layout_options(
+        &mut self,
+        event: &Event,
+        layout: LayoutOptions,
+    ) -> PromptInput {
         let Event::Key(key) = event else {
-            return self.apply_area_event(event, wrap_width);
+            return self.apply_area_event(event, layout);
         };
         if key.kind == KeyEventKind::Release {
             return PromptInput::Changed;
         }
         if self.key_policy == PromptKeyPolicy::EnterSends {
-            if let Some(outcome) = self.handle_composer_key(*key, wrap_width) {
+            if let Some(outcome) = self.handle_composer_key(*key, layout) {
                 return outcome;
             }
         }
@@ -271,11 +287,11 @@ impl PromptBuffer {
                 self.set_cursor(grapheme_len(&self.text()));
                 PromptInput::Changed
             }
-            _ => self.apply_area_event(event, wrap_width),
+            _ => self.apply_area_event(event, layout),
         }
     }
 
-    fn handle_composer_key(&mut self, key: KeyEvent, wrap_width: usize) -> Option<PromptInput> {
+    fn handle_composer_key(&mut self, key: KeyEvent, layout: LayoutOptions) -> Option<PromptInput> {
         let enter = matches!(key.code, KeyCode::Enter | KeyCode::Char('\r'));
         let newline = matches!(key.code, KeyCode::Char('\n'))
             || (matches!(key.code, KeyCode::Char('j' | 'J'))
@@ -297,7 +313,7 @@ impl PromptBuffer {
 
         // A search owns Enter, and unfinished Vim commands must not send a draft.
         if self.mode() == Mode::Search || self.area.state().has_pending_input() {
-            let outcome = self.apply_area_event(&Event::Key(key), wrap_width);
+            let outcome = self.apply_area_event(&Event::Key(key), layout);
             return Some(match outcome {
                 PromptInput::Unhandled => PromptInput::Changed,
                 outcome => outcome,
@@ -308,7 +324,7 @@ impl PromptBuffer {
                 // Preserve insert-session undo grouping and dot-repeat recording.
                 self.apply_area_event(
                     &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-                    wrap_width,
+                    layout,
                 );
             } else {
                 self.insert("\n");
@@ -325,9 +341,9 @@ impl PromptBuffer {
         })
     }
 
-    fn apply_area_event(&mut self, event: &Event, wrap_width: usize) -> PromptInput {
+    fn apply_area_event(&mut self, event: &Event, layout: LayoutOptions) -> PromptInput {
         let previous_revision = self.buffer().revision();
-        let result = self.area.handle_event(event, wrap_width);
+        let result = self.area.handle_event_with_layout_options(event, layout);
         self.detach_history_after_edit(self.buffer().revision() != previous_revision);
         match result {
             TextAreaOutcome::Changed => PromptInput::Changed,
@@ -367,6 +383,7 @@ mod tests {
         first_prompt_line, normalize_prompt_newlines, Mode, PromptBuffer, PromptInput,
         PromptKeyPolicy, PROMPT_MAX_BYTES,
     };
+    use crate::text_layout::LayoutOptions;
 
     #[test]
     fn single_line_paste_shares_crlf_normalization_without_accepting_a_newline() {
@@ -447,6 +464,36 @@ mod tests {
             PromptInput::Changed
         );
         assert_eq!(ordinary.text(), "hello\n");
+    }
+
+    #[test]
+    fn word_wrapped_composer_keeps_enter_and_newline_at_the_visual_cursor() {
+        let layout = LayoutOptions::word(7);
+        let mut prompt = composer("one two three");
+        prompt.set_cursor(0);
+        assert_eq!(
+            prompt
+                .handle_event_with_layout_options(&key(KeyCode::Down, KeyModifiers::NONE), layout),
+            PromptInput::Changed
+        );
+        assert_eq!(prompt.cursor(), 8);
+        assert_eq!(
+            prompt.handle_event_with_layout_options(
+                &key(KeyCode::Enter, KeyModifiers::SHIFT),
+                layout
+            ),
+            PromptInput::Changed
+        );
+        assert_eq!(prompt.text(), "one two \nthree");
+        assert!(prompt.undo());
+        assert_eq!(prompt.text(), "one two three");
+        assert!(prompt.redo());
+        assert_eq!(
+            prompt
+                .handle_event_with_layout_options(&key(KeyCode::Enter, KeyModifiers::NONE), layout),
+            PromptInput::Submit
+        );
+        assert_eq!(prompt.text(), "one two \nthree");
     }
 
     #[test]

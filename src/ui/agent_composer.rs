@@ -2,14 +2,14 @@
 
 use crossterm::event::Event;
 use serde_json::json;
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     config::KeyAction,
     editor::{Action, ComposerCallback, Editor, Mode, RenderBuffer},
     plugin::ComposerHandle,
+    text_layout::{LayoutOptions, TextLayout},
     theme::{Style, Theme},
-    unicode_utils::{display_width, grapheme_len, truncate_display_width},
+    unicode_utils::truncate_display_width,
 };
 
 use super::{
@@ -18,7 +18,6 @@ use super::{
     PromptInput, PromptKeyPolicy, UiAction, PROMPT_MAX_BYTES,
 };
 
-const TAB_WIDTH: usize = 4;
 const MAX_PROMPT_BYTES: usize = PROMPT_MAX_BYTES;
 const EMPTY_STATUS: &str = "Prompt is empty";
 const OVERSIZED_STATUS: &str = "Prompt exceeds 128 KiB";
@@ -196,8 +195,8 @@ impl AgentComposer {
         }
     }
 
-    fn wrapped_text(&self) -> WrappedText {
-        wrap_text(&self.prompt.buffer().contents(), self.dialog.width)
+    fn wrapped_text(&self) -> TextLayout {
+        self.prompt.layout(LayoutOptions::word(self.dialog.width))
     }
 
     fn redraw() -> Option<KeyAction> {
@@ -229,18 +228,17 @@ impl Component for AgentComposer {
         } else {
             let wrapped = self.wrapped_text();
             let cursor_row = wrapped
-                .positions
-                .get(self.prompt.cursor())
-                .map_or(0, |position| position.0);
+                .position(self.prompt.cursor())
+                .map_or(0, |position| position.row);
             let scroll = cursor_row.saturating_sub(body_height - 1);
             for (offset, row) in wrapped
-                .rows
+                .rows()
                 .iter()
                 .skip(scroll)
                 .take(body_height)
                 .enumerate()
             {
-                buffer.set_text(content_x, content_y + offset, row, &self.style);
+                buffer.set_text(content_x, content_y + offset, &row.text, &self.style);
             }
         }
 
@@ -306,7 +304,10 @@ impl Component for AgentComposer {
             _ => 0,
         };
 
-        match self.prompt.handle_event(event, self.dialog.width) {
+        match self
+            .prompt
+            .handle_event_with_layout_options(event, LayoutOptions::word(self.dialog.width))
+        {
             PromptInput::Changed => {
                 self.validation_status = None;
                 Self::redraw()
@@ -356,11 +357,9 @@ impl Component for AgentComposer {
 
     fn cursor_position(&self) -> Option<(usize, usize)> {
         let wrapped = self.wrapped_text();
-        let (row, column) = wrapped
-            .positions
-            .get(self.prompt.cursor())
-            .copied()
-            .unwrap_or_default();
+        let position = wrapped.position(self.prompt.cursor()).unwrap_or_default();
+        let row = position.row;
+        let column = position.column;
         let body_height = self.body_height();
         let scroll = row.saturating_sub(body_height.saturating_sub(1));
         let x = self
@@ -384,81 +383,14 @@ impl Component for AgentComposer {
 }
 
 pub(crate) fn wrap_text(text: &str, width: usize) -> WrappedText {
-    let grapheme_count = grapheme_len(text);
-    if width == 0 {
-        return WrappedText {
-            rows: Vec::new(),
-            positions: vec![(0, 0); grapheme_count + 1],
-        };
+    let (rows, positions) = TextLayout::new(text, LayoutOptions::grapheme(width)).into_parts();
+    WrappedText {
+        rows: rows.into_iter().map(|row| row.text).collect(),
+        positions: positions
+            .into_iter()
+            .map(|position| (position.row, position.column))
+            .collect(),
     }
-
-    let mut rows = vec![String::new()];
-    let mut positions = Vec::with_capacity(grapheme_count + 1);
-    let mut row = 0;
-    let mut column = 0;
-    positions.push((row, column));
-
-    for grapheme in text.graphemes(true) {
-        if grapheme == "\n" {
-            row += 1;
-            column = 0;
-            if rows.len() <= row {
-                rows.push(String::new());
-            }
-            positions.push((row, column));
-            continue;
-        }
-
-        if column == width {
-            row += 1;
-            column = 0;
-            if rows.len() <= row {
-                rows.push(String::new());
-            }
-        }
-
-        let mut grapheme_width = if grapheme == "\t" {
-            TAB_WIDTH - (column % TAB_WIDTH)
-        } else {
-            display_width(grapheme)
-        };
-        if grapheme_width > width.saturating_sub(column) && column > 0 {
-            row += 1;
-            column = 0;
-            rows.push(String::new());
-            grapheme_width = if grapheme == "\t" {
-                TAB_WIDTH
-            } else {
-                display_width(grapheme)
-            };
-        }
-
-        if grapheme_width > width {
-            rows[row].push('?');
-            column += 1;
-        } else if grapheme == "\t" {
-            rows[row].push_str(&" ".repeat(grapheme_width));
-            column += grapheme_width;
-        } else {
-            rows[row].push_str(grapheme);
-            column += grapheme_width;
-        }
-
-        if column == width {
-            positions.push((row + 1, 0));
-        } else {
-            positions.push((row, column));
-        }
-    }
-
-    if positions
-        .last()
-        .is_some_and(|position| position.0 >= rows.len())
-    {
-        rows.push(String::new());
-    }
-
-    WrappedText { rows, positions }
 }
 
 #[cfg(test)]
@@ -534,6 +466,45 @@ mod tests {
     }
 
     #[test]
+    fn word_wrapping_moves_and_renders_the_cursor_without_rewriting_the_draft() {
+        let editor = editor(40, 18);
+        let original = "one two three";
+        let mut composer = new_composer(&editor, None, 17, original.to_string(), vec![]);
+        composer.dialog.width = 7;
+        composer.prompt.set_cursor(0);
+        let revision = composer.prompt.buffer().revision();
+        let mut buffer = RenderBuffer::new(40, editor.vheight(), &Style::default());
+        composer.draw(&mut buffer).unwrap();
+        assert!(rendered_row(&buffer, composer.dialog.y + 1).contains("one two"));
+        assert!(rendered_row(&buffer, composer.dialog.y + 2).contains("three"));
+
+        composer.handle_event(&key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(composer.prompt.cursor(), 8);
+        assert_eq!(
+            composer.cursor_position(),
+            Some((composer.dialog.x + 1, composer.dialog.y + 2))
+        );
+        composer.resize(30, 12);
+        assert_eq!(composer.prompt.cursor(), 8);
+        assert_eq!(composer.prompt.text(), original);
+        assert_eq!(composer.prompt.buffer().revision(), revision);
+        assert_eq!(
+            submit(&mut composer),
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::NotifyPlugin(
+                    "agent".to_string(),
+                    "composer:submitted:17".to_string(),
+                    json!(original)
+                ),
+            ]))
+        );
+
+        // Confirmations and inline assist still use the legacy projection.
+        assert_eq!(wrap_text(original, 7).rows, ["one two", " three"]);
+    }
+
+    #[test]
     fn paste_preserves_all_lines_normalizes_crlf_and_renders_tabs_as_spaces() {
         let editor = editor(60, 18);
         let mut composer = new_composer(
@@ -549,9 +520,9 @@ mod tests {
 
         assert_eq!(composer.prompt.text(), "first\tline\n  second\nthird\n");
         let wrapped = composer.wrapped_text();
-        assert_eq!(wrapped.rows[0], "first   line");
-        assert_eq!(wrapped.rows[1], "  second");
-        assert_eq!(wrapped.rows[2], "third");
+        assert_eq!(wrapped.rows()[0].text, "first   line");
+        assert_eq!(wrapped.rows()[1].text, "  second");
+        assert_eq!(wrapped.rows()[2].text, "third");
         assert_eq!(
             submit(&mut composer),
             Some(KeyAction::Multiple(vec![
@@ -1084,7 +1055,8 @@ mod tests {
         assert_eq!(composer.prompt.history(), ["safe history".to_string()]);
         assert_eq!(composer.validation_status, Some(OVERSIZED_STATUS));
         let wrapped = composer.wrapped_text();
-        assert_eq!(wrapped.rows, vec![String::new()]);
+        assert_eq!(wrapped.rows().len(), 1);
+        assert!(wrapped.rows()[0].text.is_empty());
         composer.handle_event(&key(KeyCode::Char('p'), KeyModifiers::CONTROL));
         assert_eq!(composer.prompt.text(), "safe history");
         assert_eq!(composer.validation_status, None);

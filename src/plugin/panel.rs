@@ -23,13 +23,14 @@ use super::text_link::{TextPanelLink, TextPanelLinkTarget};
 use crate::{
     color::{blend_color, ensure_minimum_contrast, Color},
     editor::{render_buffer::RenderBuffer, Point},
+    text_layout::{LayoutOptions, TextLayout},
     theme::{
         SelectionForegroundPriority, Style, Theme, ThemeStyleSpec,
         MINIMUM_SELECTION_STATE_CONTRAST, MINIMUM_SELECTION_TEXT_CONTRAST,
     },
     ui::{
-        normalize_prompt_newlines, wrap_text, FollowTailViewport, PromptBuffer, PromptInput,
-        PromptKeyPolicy, PROMPT_MAX_BYTES,
+        normalize_prompt_newlines, FollowTailViewport, PromptBuffer, PromptInput, PromptKeyPolicy,
+        PROMPT_MAX_BYTES,
     },
     unicode_utils::{display_width, fit_display_width, truncate_display_width},
 };
@@ -568,6 +569,20 @@ struct TextPanelComposer {
 }
 
 impl TextPanelComposer {
+    /// `content_width` excludes the panel inset, but includes the prompt marker.
+    fn layout_options(content_width: usize) -> LayoutOptions {
+        LayoutOptions::word(content_width.saturating_sub(2).max(1))
+    }
+
+    fn layout(&self, content_width: usize) -> TextLayout {
+        self.prompt.layout(Self::layout_options(content_width))
+    }
+
+    fn handle_event(&mut self, event: &Event, content_width: usize) -> PromptInput {
+        self.prompt
+            .handle_event_with_layout_options(event, Self::layout_options(content_width))
+    }
+
     fn new(config: TextPanelComposerConfig) -> Self {
         Self {
             config,
@@ -2456,9 +2471,7 @@ impl PanelManager {
                 if let Some(composer) = panel.composer.as_mut() {
                     composer.focused = true;
                     composer.prompt.set_mode(crate::editor::Mode::Normal);
-                    let _ = composer
-                        .prompt
-                        .handle_event(event, width.saturating_sub(2).max(1));
+                    let _ = composer.handle_event(event, TextPanelContentMetrics::new(width).width);
                 }
                 return Some(TextPanelScrollbackInput::Handled);
             }
@@ -2852,38 +2865,36 @@ impl PanelManager {
             },
             _ => 0,
         };
-        let (action, text) = match composer
-            .prompt
-            .handle_event(event, panel_width.saturating_sub(2).max(1))
-        {
-            PromptInput::Changed => {
-                composer.validation = None;
-                ("composer_input", None)
-            }
-            PromptInput::Submit => match composer.take_submission() {
-                Some(text) => {
-                    panel.resume_tail_following();
-                    ("submit", Some(text))
+        let (action, text) =
+            match composer.handle_event(event, TextPanelContentMetrics::new(panel_width).width) {
+                PromptInput::Changed => {
+                    composer.validation = None;
+                    ("composer_input", None)
                 }
-                None => ("composer_input", None),
-            },
-            PromptInput::Cancel => {
-                composer.focused = false;
-                panel.scrollback.focused = true;
-                panel.scrollback.mode = TextPanelScrollbackMode::Normal;
-                panel.scrollback.selection_anchor = None;
-                let layout = panel.layout(panel_width);
-                panel.scrollback.cursor = layout.clamp(panel.scrollback.cursor);
-                ("composer_blur", None)
-            }
-            PromptInput::Unhandled
-                if inserted_bytes > MAX_COMPOSER_BYTES.saturating_sub(previous_bytes) =>
-            {
-                composer.validation = Some("Prompt exceeds 128 KiB");
-                ("composer_input", None)
-            }
-            PromptInput::Unhandled => return None,
-        };
+                PromptInput::Submit => match composer.take_submission() {
+                    Some(text) => {
+                        panel.resume_tail_following();
+                        ("submit", Some(text))
+                    }
+                    None => ("composer_input", None),
+                },
+                PromptInput::Cancel => {
+                    composer.focused = false;
+                    panel.scrollback.focused = true;
+                    panel.scrollback.mode = TextPanelScrollbackMode::Normal;
+                    panel.scrollback.selection_anchor = None;
+                    let layout = panel.layout(panel_width);
+                    panel.scrollback.cursor = layout.clamp(panel.scrollback.cursor);
+                    ("composer_blur", None)
+                }
+                PromptInput::Unhandled
+                    if inserted_bytes > MAX_COMPOSER_BYTES.saturating_sub(previous_bytes) =>
+                {
+                    composer.validation = Some("Prompt exceeds 128 KiB");
+                    ("composer_input", None)
+                }
+                PromptInput::Unhandled => return None,
+            };
 
         Some(PanelEvent {
             panel_id: panel.id.clone(),
@@ -2945,13 +2956,12 @@ impl PanelManager {
             return None;
         }
         let metrics = TextPanelContentMetrics::new(placement.width);
-        let content_width = metrics.width.saturating_sub(2).max(1);
-        let wrapped = wrap_text(&composer.prompt.text(), content_width);
-        let (row, column) = wrapped
-            .positions
-            .get(composer.prompt.cursor())
-            .copied()
+        let wrapped = composer.layout(metrics.width);
+        let position = wrapped
+            .position(composer.prompt.cursor())
             .unwrap_or_default();
+        let row = position.row;
+        let column = position.column;
         let rows = composer.config.rows.max(1);
         let first = row.saturating_sub(rows.saturating_sub(1));
         let top = placement.height.saturating_sub(panel.composer_height());
@@ -3006,23 +3016,15 @@ impl PanelManager {
             {
                 if let Some(composer) = panel.composer.as_mut() {
                     composer.focused = true;
-                    let content_width = metrics.width.saturating_sub(2).max(1);
-                    let wrapped = wrap_text(&composer.prompt.text(), content_width);
+                    let wrapped = composer.layout(metrics.width);
                     let cursor_row = wrapped
-                        .positions
-                        .get(composer.prompt.cursor())
-                        .map_or(0, |position| position.0);
+                        .position(composer.prompt.cursor())
+                        .map_or(0, |position| position.row);
                     let rows = composer.config.rows.max(1);
                     let first = cursor_row.saturating_sub(rows.saturating_sub(1));
                     let row = first.saturating_add(y.saturating_sub(composer_top + 1));
                     let column = x.saturating_sub(metrics.x(placement.x).saturating_add(2));
-                    if let Some((index, _)) = wrapped
-                        .positions
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, position)| position.0 == row)
-                        .min_by_key(|(_, position)| position.1.abs_diff(column))
-                    {
+                    if let Some(index) = wrapped.nearest_offset_on_row(row, column) {
                         composer.prompt.set_cursor(index);
                     }
                 }
@@ -3949,17 +3951,16 @@ fn render_text_panel_composer(
     let top = position.y.saturating_add(top);
 
     let rows = composer.config.rows.max(1);
-    let content_width = width.saturating_sub(2).max(1);
-    let wrapped = wrap_text(&composer.prompt.text(), content_width);
+    let content_width = TextPanelComposer::layout_options(width).width;
+    let wrapped = composer.layout(width);
     let cursor_row = wrapped
-        .positions
-        .get(composer.prompt.cursor())
-        .map_or(0, |position| position.0);
+        .position(composer.prompt.cursor())
+        .map_or(0, |position| position.row);
     let first = cursor_row.saturating_sub(rows.saturating_sub(1));
     let active_row = cursor_row.saturating_sub(first).min(rows.saturating_sub(1));
     for row in 0..rows {
         let y = top + 1 + row;
-        let line = wrapped.rows.get(first + row).map(String::as_str);
+        let line = wrapped.rows().get(first + row).map(|row| row.text.as_str());
         let placeholder =
             line.is_some_and(str::is_empty) && composer.prompt.text().is_empty() && row == 0;
         let text = if placeholder {
@@ -5996,6 +5997,90 @@ mod tests {
 
         let composer = manager.text_panels["agent"].composer.as_ref().unwrap();
         assert_eq!(composer.prompt.text(), "first line\nsecXond line");
+    }
+
+    #[test]
+    fn word_wrapped_composer_render_navigation_and_click_use_the_same_width() {
+        use crossterm::event::KeyEvent;
+
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".to_string(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 11,
+                title: None,
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".to_string(),
+                    rows: 3,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        assert!(manager.focus_text_panel_composer("agent"));
+        manager.handle_focused_text_input(&Event::Paste("one two three".to_string()), 40);
+        manager
+            .text_panels
+            .get_mut("agent")
+            .unwrap()
+            .composer
+            .as_mut()
+            .unwrap()
+            .prompt
+            .set_cursor(0);
+
+        let placement = manager
+            .panel_placements(40, 20)
+            .into_iter()
+            .find(|placement| placement.id == "agent")
+            .unwrap();
+        let x = TextPanelContentMetrics::new(placement.width).x(placement.x) + 2;
+        let y = placement.y + placement.height - manager.text_panels["agent"].composer_height() + 1;
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(40, 20, &theme.style);
+        manager.render(&mut buffer, &theme);
+        assert_eq!(text_position(&buffer, "one two"), Some(Point::new(x, y)));
+        assert_eq!(text_position(&buffer, "three"), Some(Point::new(x, y + 1)));
+
+        let down = Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        manager.handle_focused_text_input(&down, 40);
+        assert_eq!(
+            manager.text_panels["agent"]
+                .composer
+                .as_ref()
+                .unwrap()
+                .prompt
+                .cursor(),
+            8
+        );
+        assert_eq!(
+            manager.focused_text_panel_cursor_position(40, 20),
+            Some((x, y + 1))
+        );
+        manager
+            .focus_panel_at_position(x + 2, y + 1, 40, 20)
+            .unwrap();
+        manager.handle_focused_text_input(&Event::Paste("X".to_string()), 40);
+        assert_eq!(
+            manager.text_panels["agent"]
+                .composer
+                .as_ref()
+                .unwrap()
+                .prompt
+                .text(),
+            "one two thXree"
+        );
+
+        let (cursor_x, cursor_y) = manager.focused_text_panel_cursor_position(18, 20).unwrap();
+        assert!(cursor_x < 18 && cursor_y < 20);
+        let submitted = manager
+            .handle_focused_text_input(
+                &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+                40,
+            )
+            .unwrap();
+        assert_eq!(submitted.action, "submit");
+        assert_eq!(submitted.text.as_deref(), Some("one two thXree"));
     }
 
     #[test]
