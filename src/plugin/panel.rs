@@ -9,7 +9,7 @@
 //! manager-owned UI state. A plugin may replace content but must use the same panel ID to
 //! preserve that lifecycle intentionally.
 
-use std::{cell::RefCell, collections::HashMap, sync::Arc, time::Instant};
+use std::{cell::RefCell, collections::HashMap, ops::Range, sync::Arc, time::Instant};
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use serde::{Deserialize, Serialize};
@@ -21,14 +21,22 @@ use super::markdown::{
 };
 use super::text_link::{TextPanelLink, TextPanelLinkTarget};
 use crate::{
+    buffer::BufferId,
+    color::{blend_color, ensure_minimum_contrast, Color},
     editor::{render_buffer::RenderBuffer, Point},
     text_layout::{LayoutOptions, TextLayout},
-    theme::{SelectionForegroundPriority, Style, SurfacePalette, Theme, ThemeStyleSpec},
-    ui::{
-        normalize_prompt_newlines, ActionBar, ActionPriority, FollowTailViewport, PromptBuffer,
-        PromptInput, PromptKeyPolicy, UiAction, PROMPT_MAX_BYTES,
+    theme::{
+        SelectionForegroundPriority, Style, SurfacePalette, Theme, ThemeStyleSpec,
+        MINIMUM_SELECTION_TEXT_CONTRAST,
     },
-    unicode_utils::{display_width, fit_display_width, truncate_display_width},
+    ui::{
+        first_prompt_line, normalize_prompt_newlines, ActionBar, ActionPriority,
+        FollowTailViewport, PromptBuffer, PromptInput, PromptKeyPolicy, UiAction, PROMPT_MAX_BYTES,
+    },
+    unicode_utils::{
+        display_width, fit_display_width, grapheme_to_byte, truncate_display_width,
+        truncate_display_width_from_end,
+    },
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -290,6 +298,87 @@ fn text_panel_palette(theme: &Theme, config: &PanelConfig) -> TextPanelPalette {
     SurfacePalette::new(theme, &panel_style(theme, config.surface.as_ref()))
 }
 
+/// Prompt surfaces remain theme-derived, while the half-block caps blend back into
+/// the surrounding pane. The explicit color keys make this exploration tunable.
+struct TextPanelPromptPalette {
+    content: TextPanelPalette,
+    edge: Style,
+    cap: Style,
+}
+
+impl TextPanelPromptPalette {
+    fn new(theme: &Theme, panel: &TextPanelPalette, selected: bool) -> Self {
+        let surface = blend_color(
+            panel.surface.bg.unwrap_or_default(),
+            Color::Rgb { r: 0, g: 0, b: 0 },
+        );
+        let light = surface.is_light();
+        let neutral = if light {
+            Color::Rgb { r: 0, g: 0, b: 0 }
+        } else {
+            Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            }
+        };
+        let background = theme_color(theme, &["red.agentPromptBackground"])
+            .map(|color| blend_color(color, surface))
+            .unwrap_or_else(|| tint_color(neutral, surface, if light { 12 } else { 17 }));
+        let accent = panel.accent.fg.unwrap_or(neutral);
+        let background = if selected {
+            theme_color(theme, &["red.agentPromptSelectedBackground"])
+                .map(|color| blend_color(color, surface))
+                .unwrap_or_else(|| tint_color(accent, background, if light { 22 } else { 32 }))
+        } else {
+            background
+        };
+        let edge_color = if selected {
+            theme_color(theme, &["red.agentPromptSelectedBorder"]).unwrap_or(accent)
+        } else {
+            theme_color(theme, &["red.agentPromptBorder"])
+                .or(panel.muted.fg)
+                .unwrap_or(accent)
+        };
+        let edge = Style {
+            fg: Some(ensure_minimum_contrast(
+                edge_color,
+                background,
+                MINIMUM_SELECTION_TEXT_CONTRAST,
+            )),
+            bg: Some(background),
+            bold: selected,
+            ..Style::default()
+        };
+        let mut content = panel.on_background(background);
+        content.accent = edge.clone();
+        Self {
+            content,
+            edge: Style {
+                bg: panel.surface.bg,
+                bold: false,
+                ..edge
+            },
+            cap: Style {
+                fg: Some(background),
+                bg: panel.surface.bg,
+                ..Style::default()
+            },
+        }
+    }
+}
+
+fn tint_color(color: Color, background: Color, alpha: u8) -> Color {
+    let (Color::Rgb { r, g, b } | Color::Rgba { r, g, b, .. }) = color;
+    blend_color(Color::Rgba { r, g, b, a: alpha }, background)
+}
+
+fn theme_color(theme: &Theme, candidates: &[&str]) -> Option<Color> {
+    candidates
+        .iter()
+        .find_map(|candidate| theme.colors.get(*candidate).copied())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TextPanelContentMetrics {
     inset: usize,
@@ -339,8 +428,10 @@ pub struct TextPanel {
     busy_since: Option<Instant>,
     selected_link: Option<u64>,
     scrollback: TextPanelScrollback,
+    search: TextPanelSearch,
     last_focused_region: TextPanelFocusRegion,
     layout_cache: RefCell<Option<(usize, Arc<TextPanelLayout>)>>,
+    search_cache: RefCell<Option<TextPanelSearchCache>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -370,6 +461,109 @@ struct TextPanelScrollback {
     mouse_dragging: bool,
     pending_find: Option<PendingScrollbackFind>,
     last_find: Option<ScrollbackFind>,
+    pending_jump: Option<PendingScrollbackJump>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingScrollbackJump {
+    direction: ScrollbackJumpDirection,
+    count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ScrollbackJumpDirection {
+    Previous,
+    Next,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TextPanelSearchDirection {
+    Forward,
+    Backward,
+}
+
+impl TextPanelSearchDirection {
+    fn reversed(self) -> Self {
+        match self {
+            Self::Forward => Self::Backward,
+            Self::Backward => Self::Forward,
+        }
+    }
+
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Forward => "/",
+            Self::Backward => "?",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TextPanelSearchQuery {
+    text: String,
+    direction: TextPanelSearchDirection,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TextPanelSearchOrigin {
+    cursor: usize,
+    initialized: bool,
+    preferred_column: Option<usize>,
+    scroll: usize,
+    follow_tail: bool,
+    selected_link: Option<u64>,
+}
+
+#[derive(Debug)]
+struct TextPanelSearchSession {
+    input: PromptBuffer,
+    query: TextPanelSearchQuery,
+    origin: TextPanelSearchOrigin,
+}
+
+#[derive(Debug, Default)]
+struct TextPanelSearch {
+    active: Option<TextPanelSearchSession>,
+    last: Option<TextPanelSearchQuery>,
+    visible: bool,
+}
+
+impl TextPanelSearch {
+    fn query(&self) -> Option<&TextPanelSearchQuery> {
+        self.active
+            .as_ref()
+            .map(|session| &session.query)
+            .or_else(|| self.visible.then_some(self.last.as_ref()).flatten())
+    }
+}
+
+fn text_panel_search_match(
+    matches: &[Range<usize>],
+    cursor: usize,
+    direction: TextPanelSearchDirection,
+    count: usize,
+) -> Option<usize> {
+    let length = matches.len();
+    if length == 0 {
+        return None;
+    }
+    let step = count.max(1).saturating_sub(1) % length;
+    Some(match direction {
+        TextPanelSearchDirection::Forward => {
+            (matches.partition_point(|found| found.start <= cursor) + step) % length
+        }
+        TextPanelSearchDirection::Backward => {
+            (matches.partition_point(|found| found.start < cursor) + length - 1 - step) % length
+        }
+    })
+}
+
+fn current_text_panel_search_match(matches: &[Range<usize>], cursor: usize) -> Option<usize> {
+    let index = matches.partition_point(|found| found.end <= cursor);
+    matches
+        .get(index)
+        .is_some_and(|found| found.contains(&cursor))
+        .then_some(index)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -415,7 +609,141 @@ struct TextPanelLayoutLine {
 struct TextPanelLayout {
     rendered: Vec<RenderedTextLine>,
     lines: Vec<TextPanelLayoutLine>,
+    prompt_cards: Vec<TextPanelPromptCard>,
+    searchable_rows: Vec<Range<usize>>,
     len: usize,
+}
+
+#[derive(Debug, Clone)]
+struct TextPanelSearchCache {
+    layout: Arc<TextPanelLayout>,
+    query: String,
+    matches: Arc<[Range<usize>]>,
+}
+
+struct TextPanelSearchCell {
+    bytes: Range<usize>,
+    offset: usize,
+}
+
+struct TextPanelSearchHighlights {
+    matches: Arc<[Range<usize>]>,
+    current: Option<usize>,
+    normal_style: Style,
+    current_style: Style,
+}
+
+impl TextPanelSearchHighlights {
+    fn new(
+        matches: Arc<[Range<usize>]>,
+        cursor: usize,
+        theme: &Theme,
+        palette: &TextPanelPalette,
+    ) -> Self {
+        let fallback = Style {
+            bg: Some(tint_color(
+                palette.accent.fg.unwrap_or_default(),
+                palette.surface.bg.unwrap_or_default(),
+                90,
+            )),
+            ..Style::default()
+        };
+        Self {
+            current: current_text_panel_search_match(&matches, cursor),
+            matches,
+            normal_style: theme
+                .find_match_highlight_style
+                .clone()
+                .or_else(|| theme.find_match_style.clone())
+                .unwrap_or(fallback),
+            current_style: theme
+                .find_match_style
+                .clone()
+                .unwrap_or_else(|| theme.list_selection_style()),
+        }
+    }
+
+    fn style_at(&self, offset: usize) -> Option<&Style> {
+        let index = self.matches.partition_point(|found| found.end <= offset);
+        self.matches
+            .get(index)
+            .is_some_and(|found| found.contains(&offset))
+            .then(|| {
+                if self.current == Some(index) {
+                    &self.current_style
+                } else {
+                    &self.normal_style
+                }
+            })
+    }
+}
+
+/// The query and counter share one existing chrome row; long queries scroll to
+/// keep their input cursor visible without changing transcript geometry.
+struct TextPanelSearchBar {
+    prefix: &'static str,
+    text: String,
+    suffix: String,
+    suffix_column: usize,
+    cursor_column: Option<usize>,
+}
+
+impl TextPanelSearchBar {
+    fn new(
+        search: &TextPanelSearch,
+        matches: &[Range<usize>],
+        cursor: usize,
+        width: usize,
+    ) -> Option<Self> {
+        let query = search.query()?;
+        let current = current_text_panel_search_match(matches, cursor).map_or(0, |index| index + 1);
+        let suffix = if search.active.is_some() {
+            format!("{current}/{}", matches.len())
+        } else {
+            format!("n/N · {current}/{}", matches.len())
+        };
+        let suffix_width = display_width(&suffix);
+        let show_suffix = width >= suffix_width.saturating_add(5);
+        let suffix_column = if show_suffix {
+            width - suffix_width
+        } else {
+            width
+        };
+        let query_width = suffix_column.saturating_sub(if show_suffix { 2 } else { 1 });
+        let (start, cursor_column) = if let Some(session) = &search.active {
+            let cursor_byte = grapheme_to_byte(&query.text, session.input.cursor());
+            let before = truncate_display_width_from_end(
+                &query.text[..cursor_byte],
+                query_width.saturating_sub(1),
+            );
+            (
+                cursor_byte - before.len(),
+                Some((1 + display_width(&before)).min(width.saturating_sub(1))),
+            )
+        } else {
+            (0, None)
+        };
+        Some(Self {
+            prefix: query.direction.prefix(),
+            text: truncate_display_width(&query.text[start..], query_width),
+            suffix: if show_suffix { suffix } else { String::new() },
+            suffix_column,
+            cursor_column,
+        })
+    }
+}
+
+struct TextPanelRendered {
+    lines: Vec<RenderedTextLine>,
+    prompt_cards: Vec<TextPanelPromptCard>,
+    searchable_rows: Vec<Range<usize>>,
+}
+
+/// Rendered rows belonging to one source-backed user prompt, including its chrome.
+#[derive(Debug, Clone)]
+struct TextPanelPromptCard {
+    block_index: usize,
+    rows: Range<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -428,6 +756,36 @@ pub(crate) struct TextPanelYank {
 pub(crate) enum TextPanelScrollbackInput {
     Handled,
     Yank(TextPanelYank),
+    OpenTurnActions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+/// The source text to copy from a conversation turn.
+pub enum TextPanelTurnPart {
+    Prompt,
+    Answer,
+}
+
+/// Identifies the exact unsent draft a replacement confirmation approved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextPanelDraftRevision {
+    buffer_id: BufferId,
+    revision: u64,
+}
+
+pub(crate) struct TextPanelTurnTarget {
+    pub panel_id: String,
+    pub prompt_id: String,
+    pub number: usize,
+    pub preview: String,
+    pub has_answer: bool,
+    pub can_reuse: bool,
+}
+
+pub(crate) enum TextPanelReuseOutcome {
+    Loaded,
+    Confirm(TextPanelDraftRevision),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -533,8 +891,10 @@ impl TextPanel {
             busy_since: None,
             selected_link: None,
             scrollback: TextPanelScrollback::default(),
+            search: TextPanelSearch::default(),
             last_focused_region: TextPanelFocusRegion::default(),
             layout_cache: RefCell::new(None),
+            search_cache: RefCell::new(None),
         }
     }
 
@@ -560,6 +920,14 @@ impl TextPanel {
 
     fn status_height(&self) -> usize {
         usize::from(self.status.is_some())
+    }
+
+    fn search_bar_row(&self, height: usize) -> Option<usize> {
+        if self.composer.is_some() {
+            height.checked_sub(1)
+        } else {
+            (text_panel_header_rows(&self.config) > 0).then_some(0)
+        }
     }
 
     fn update_blocks(
@@ -692,55 +1060,80 @@ impl TextPanel {
             .map(|block| block.text.clone())
     }
 
-    fn links(&self, width: usize) -> Vec<(TextPanelLink, usize)> {
-        let mut links = Vec::new();
+    fn turn_text(&self, prompt_id: &str, part: TextPanelTurnPart) -> Option<String> {
+        let start = self
+            .blocks
+            .iter()
+            .position(|block| block.id == prompt_id && block.kind == TextPanelBlockKind::User)?;
+        if part == TextPanelTurnPart::Prompt {
+            return Some(self.blocks[start].text.clone());
+        }
+        let answer = self.blocks[start + 1..]
+            .iter()
+            .take_while(|block| block.kind != TextPanelBlockKind::User)
+            .filter(|block| block.kind == TextPanelBlockKind::Agent && !block.text.is_empty())
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        (!answer.is_empty()).then_some(answer)
+    }
+
+    fn links(&self, width: usize) -> Vec<(TextPanelLink, Range<usize>)> {
+        let mut links: Vec<(TextPanelLink, Range<usize>)> = Vec::new();
         let layout = self.layout(width);
-        for (line_index, line) in layout.rendered.iter().enumerate() {
-            for span in &line.spans {
-                let Some(link) = span.link.clone() else {
+        for line in &layout.lines {
+            for (index, cell) in line.cells.iter().enumerate() {
+                let Some(link) = cell.link.as_ref() else {
                     continue;
                 };
-                if links
-                    .last()
-                    .is_none_or(|(previous, _): &(TextPanelLink, usize)| previous.id != link.id)
-                {
-                    links.push((link, line_index));
+                let offset = line.first + index;
+                if let Some((previous, range)) = links.last_mut() {
+                    if previous.id == link.id {
+                        range.end = offset + 1;
+                        continue;
+                    }
                 }
+                links.push((link.clone(), offset..offset + 1));
             }
         }
         links
     }
 
-    fn select_link(&mut self, forward: bool, panel_height: usize, width: usize) -> bool {
+    fn jump_to_link(
+        &mut self,
+        direction: ScrollbackJumpDirection,
+        count: usize,
+        panel_height: usize,
+        width: usize,
+    ) {
         let links = self.links(width);
         if links.is_empty() {
             self.selected_link = None;
-            return false;
+            return;
         }
-        let current = self
-            .selected_link
-            .and_then(|selected| links.iter().position(|(link, _)| link.id == selected));
-        let index = match (current, forward) {
-            (Some(index), true) => (index + 1) % links.len(),
-            (Some(0), false) => links.len() - 1,
-            (Some(index), false) => index - 1,
-            (None, true) => 0,
-            (None, false) => links.len() - 1,
+        let layout = self.layout(width);
+        let cursor = layout.clamp(self.scrollback.cursor);
+        let step = count.saturating_sub(1) % links.len();
+        // Treat a soft-wrapped link as one destination, skipping it when the
+        // cursor is anywhere inside its label.
+        let index = match direction {
+            ScrollbackJumpDirection::Next => {
+                (links.partition_point(|(_, range)| range.start <= cursor) + step) % links.len()
+            }
+            ScrollbackJumpDirection::Previous => {
+                (links.partition_point(|(_, range)| range.end <= cursor) + links.len() - 1 - step)
+                    % links.len()
+            }
         };
-        let (link, line) = &links[index];
+        let (link, range) = &links[index];
         self.selected_link = Some(link.id);
-        self.scrollback.focused = true;
+        self.scrollback.cursor = range.start;
+        self.scrollback.initialized = true;
+        self.scrollback.preferred_column = None;
         self.scrollback.mode = TextPanelScrollbackMode::Normal;
         self.scrollback.selection_anchor = None;
-        let layout = self.layout(width);
-        if let Some(offset) = layout.link_offset(link.id) {
-            self.scrollback.cursor = offset;
-        }
-        self.viewport.restore(self.scroll, self.follow_tail);
-        self.viewport.reveal(*line, self.visible_rows(panel_height));
-        self.scroll = self.viewport.offset();
-        self.follow_tail = self.viewport.is_following();
-        true
+        self.follow_tail = false;
+        self.reveal_scrollback_cursor(&layout, panel_height);
     }
 
     fn selected_link_target(&self, width: usize) -> Option<TextPanelLinkTarget> {
@@ -751,25 +1144,24 @@ impl TextPanel {
             .map(|(link, _)| link.target)
     }
 
-    fn build_rendered_lines(&self, width: usize) -> Vec<RenderedTextLine> {
+    fn build_rendered_lines(&self, width: usize) -> TextPanelRendered {
         let mut lines: Vec<RenderedTextLine> = Vec::new();
+        let mut prompt_cards = Vec::new();
+        let mut searchable_rows = Vec::new();
         for (block_index, block) in self.blocks.iter().enumerate() {
+            let block_start = lines.len();
             if block.kind == TextPanelBlockKind::User {
-                // A new user message starts a turn: separate it with a light
-                // rule and mark its lines with an accent bar instead of a
-                // one-line label.
-                if let Some(last) = lines.last_mut() {
-                    if last.is_empty() {
-                        *last = turn_separator(width);
-                    } else {
-                        lines.push(turn_separator(width));
-                    }
-                }
+                let start = lines.len();
+                let framed = width >= 7;
                 lines.push(RenderedTextLine::chrome(
-                    "▎ You".to_string(),
+                    "▄".repeat(width),
                     TextPanelSpanStyle::User,
                 ));
-                let content_width = width.saturating_sub(2).max(1);
+                lines.push(RenderedTextLine::chrome(
+                    if framed { "  You" } else { "You" }.to_string(),
+                    TextPanelSpanStyle::User,
+                ));
+                let content_width = width.saturating_sub(if framed { 4 } else { 0 }).max(1);
                 let mut block_lines = match block.format {
                     TextPanelBlockFormat::Plain => {
                         wrap_plain_text(&block.text, content_width, TextPanelSpanStyle::Text)
@@ -785,7 +1177,21 @@ impl TextPanel {
                     ));
                 }
                 namespace_block_links(&mut block_lines, block_index);
-                lines.extend(block_lines.into_iter().map(user_accented));
+                lines.extend(block_lines.into_iter().map(|line| {
+                    if framed {
+                        user_padded(line)
+                    } else {
+                        line
+                    }
+                }));
+                lines.push(RenderedTextLine::chrome(
+                    "▀".repeat(width),
+                    TextPanelSpanStyle::User,
+                ));
+                prompt_cards.push(TextPanelPromptCard {
+                    block_index,
+                    rows: start..lines.len(),
+                });
             } else {
                 if let Some((label, style)) = block_label(&block.kind) {
                     lines.push(RenderedTextLine::chrome(label.to_string(), style));
@@ -801,6 +1207,12 @@ impl TextPanel {
                 }
                 namespace_block_links(&mut block_lines, block_index);
                 lines.extend(block_lines);
+            }
+            if matches!(
+                block.kind,
+                TextPanelBlockKind::User | TextPanelBlockKind::Agent
+            ) {
+                searchable_rows.push(block_start..lines.len());
             }
             lines.push(RenderedTextLine::plain(
                 String::new(),
@@ -828,7 +1240,11 @@ impl TextPanel {
                 });
             }
         }
-        lines
+        TextPanelRendered {
+            lines,
+            prompt_cards,
+            searchable_rows,
+        }
     }
 }
 
@@ -893,12 +1309,57 @@ impl TextPanelLayout {
         Self {
             rendered,
             lines,
+            prompt_cards: Vec::new(),
+            searchable_rows: Vec::new(),
             len: next,
         }
     }
 
     fn clamp(&self, offset: usize) -> usize {
         offset.min(self.len.saturating_sub(1))
+    }
+
+    /// Matches literal visible text, retaining grapheme offsets for cursor movement
+    /// and highlighting. Soft-wrapped rows join without introducing fake newlines.
+    fn find_search_matches(&self, query: &str) -> Arc<[Range<usize>]> {
+        let mut matches = Vec::new();
+        if !query.is_empty() {
+            for rows in &self.searchable_rows {
+                let mut text = String::new();
+                let mut cells = Vec::new();
+                let mut previous_break = None;
+                for row in rows.clone() {
+                    let Some(line) = self.lines.get(row) else {
+                        continue;
+                    };
+                    if line.chrome_only {
+                        continue;
+                    }
+                    if previous_break == Some(RenderedTextLineBreak::Hard) {
+                        text.push('\n');
+                    }
+                    for (index, cell) in line.cells.iter().enumerate() {
+                        text.push_str(&cell.copy_prefix);
+                        let start = text.len();
+                        text.push_str(&cell.text);
+                        cells.push(TextPanelSearchCell {
+                            bytes: start..text.len(),
+                            offset: line.first + index,
+                        });
+                    }
+                    previous_break = Some(line.break_after);
+                }
+                for (start, found) in text.match_indices(query) {
+                    let end = start + found.len();
+                    let first = cells.partition_point(|cell| cell.bytes.end <= start);
+                    let after = cells.partition_point(|cell| cell.bytes.start < end);
+                    if first < after {
+                        matches.push(cells[first].offset..cells[after - 1].offset + 1);
+                    }
+                }
+            }
+        }
+        matches.into()
     }
 
     fn position(&self, offset: usize) -> Option<(usize, usize, usize)> {
@@ -1003,15 +1464,6 @@ impl TextPanelLayout {
             .map(|link| link.target.clone())
     }
 
-    fn link_offset(&self, id: u64) -> Option<usize> {
-        self.lines.iter().find_map(|line| {
-            line.cells
-                .iter()
-                .position(|cell| cell.link.as_ref().is_some_and(|link| link.id == id))
-                .map(|index| line.first.saturating_add(index))
-        })
-    }
-
     fn selected_text(&self, start: usize, end: usize, linewise: bool) -> String {
         if self.len == 0 {
             return String::new();
@@ -1074,6 +1526,22 @@ impl TextPanelLayout {
 impl TextPanel {
     fn invalidate_layout(&self) {
         self.layout_cache.borrow_mut().take();
+        self.search_cache.borrow_mut().take();
+    }
+
+    fn search_matches(&self, layout: &Arc<TextPanelLayout>, query: &str) -> Arc<[Range<usize>]> {
+        if let Some(cache) = self.search_cache.borrow().as_ref() {
+            if Arc::ptr_eq(&cache.layout, layout) && cache.query == query {
+                return Arc::clone(&cache.matches);
+            }
+        }
+        let matches = layout.find_search_matches(query);
+        *self.search_cache.borrow_mut() = Some(TextPanelSearchCache {
+            layout: Arc::clone(layout),
+            query: query.to_string(),
+            matches: Arc::clone(&matches),
+        });
+        matches
     }
 
     fn layout(&self, width: usize) -> Arc<TextPanelLayout> {
@@ -1086,7 +1554,10 @@ impl TextPanel {
 
         let _span = crate::editor::perf::PerfSpan::start("panel:text_layout_miss");
         let content_width = TextPanelContentMetrics::new(width).width;
-        let mut layout = TextPanelLayout::new(self.build_rendered_lines(content_width));
+        let rendered = self.build_rendered_lines(content_width);
+        let mut layout = TextPanelLayout::new(rendered.lines);
+        layout.prompt_cards = rendered.prompt_cards;
+        layout.searchable_rows = rendered.searchable_rows;
         if self.status.as_ref().is_some_and(|status| status.stream) {
             if let Some(line) = layout.lines.last_mut() {
                 if line.cells.last().is_some_and(|cell| cell.text == "▌") {
@@ -1100,13 +1571,263 @@ impl TextPanel {
         layout
     }
 
+    /// The transcript cursor selects its enclosing turn. While composing, the newest
+    /// prompt stays accented without adding a second, independent selection model.
+    fn selected_prompt(&self, layout: &TextPanelLayout) -> Option<usize> {
+        if self.scrollback.focused && self.scrollback.initialized {
+            if let Some((row, _, _)) = layout.position(self.scrollback.cursor) {
+                return layout
+                    .prompt_cards
+                    .iter()
+                    .rev()
+                    .find(|card| card.rows.start <= row)
+                    .map(|card| card.block_index);
+            }
+        }
+        layout.prompt_cards.last().map(|card| card.block_index)
+    }
+
+    fn jump_to_prompt(
+        &mut self,
+        direction: ScrollbackJumpDirection,
+        count: usize,
+        panel_height: usize,
+        width: usize,
+    ) {
+        let layout = self.layout(width);
+        let cursor = if self.follow_tail {
+            // Following output starts the backward search after the entire transcript.
+            layout.len
+        } else if self.scrollback.initialized {
+            layout.clamp(self.scrollback.cursor)
+        } else {
+            layout.offset_at_or_after(self.scroll, 0).unwrap_or(0)
+        };
+        let anchors = layout.prompt_cards.iter().filter_map(|card| {
+            card.rows.clone().find_map(|row| {
+                layout
+                    .offset_at(row, 0)
+                    .map(|offset| (card.rows.start, row, offset))
+            })
+        });
+        let count = count.max(1);
+        let target = match direction {
+            ScrollbackJumpDirection::Previous => anchors
+                .rev()
+                .filter(|(_, _, offset)| *offset < cursor)
+                .take(count)
+                .last(),
+            ScrollbackJumpDirection::Next => anchors
+                .filter(|(_, _, offset)| *offset > cursor)
+                .take(count)
+                .last(),
+        };
+        let Some((card_start, row, offset)) = target else {
+            return;
+        };
+
+        self.scrollback.cursor = offset;
+        self.scrollback.initialized = true;
+        self.scrollback.preferred_column = None;
+        self.scrollback.selection_anchor = None;
+        self.selected_link = None;
+
+        // Include the card's heading and cap whenever the pane is tall enough.
+        let visible_rows = self.visible_rows(panel_height);
+        let max_scroll = layout.lines.len().saturating_sub(visible_rows);
+        self.viewport.restore(card_start.min(max_scroll), false);
+        self.viewport.reveal(row, visible_rows);
+        self.scroll = self.viewport.offset();
+        self.follow_tail = self.viewport.is_following();
+    }
+
+    fn begin_transcript_search(
+        &mut self,
+        direction: TextPanelSearchDirection,
+        panel_height: usize,
+        width: usize,
+    ) {
+        let scroll = self
+            .viewport
+            .visible_offset(self.max_scroll(panel_height, width));
+        self.search.active = Some(TextPanelSearchSession {
+            input: PromptBuffer::new(""),
+            query: TextPanelSearchQuery {
+                text: String::new(),
+                direction,
+            },
+            origin: TextPanelSearchOrigin {
+                cursor: self.scrollback.cursor,
+                initialized: self.scrollback.initialized,
+                preferred_column: self.scrollback.preferred_column,
+                scroll,
+                follow_tail: self.follow_tail,
+                selected_link: self.selected_link,
+            },
+        });
+        self.scrollback.pending_find = None;
+        self.scrollback.pending_jump = None;
+        self.viewport.restore(scroll, false);
+        self.scroll = scroll;
+        self.follow_tail = false;
+    }
+
+    fn restore_search_origin(&mut self, origin: TextPanelSearchOrigin, following: bool) {
+        self.scrollback.cursor = origin.cursor;
+        self.scrollback.initialized = origin.initialized;
+        self.scrollback.preferred_column = origin.preferred_column;
+        self.selected_link = origin.selected_link;
+        self.viewport.restore(origin.scroll, following);
+        self.scroll = origin.scroll;
+        self.follow_tail = following;
+    }
+
+    fn cancel_transcript_search(&mut self) {
+        if let Some(session) = self.search.active.take() {
+            self.restore_search_origin(session.origin, session.origin.follow_tail);
+        }
+    }
+
+    fn move_to_transcript_match(
+        &mut self,
+        layout: &TextPanelLayout,
+        found: &Range<usize>,
+        panel_height: usize,
+    ) {
+        self.scrollback.cursor = layout.clamp(found.start);
+        self.scrollback.initialized = true;
+        self.scrollback.preferred_column = None;
+        self.selected_link = None;
+        self.follow_tail = false;
+        self.reveal_scrollback_cursor(layout, panel_height);
+    }
+
+    fn preview_transcript_search(&mut self, panel_height: usize, width: usize) {
+        let Some(session) = self.search.active.as_ref() else {
+            return;
+        };
+        let origin = session.origin;
+        let direction = session.query.direction;
+        let layout = self.layout(width);
+        let matches = self.search_matches(&layout, &session.query.text);
+        let cursor = if origin.follow_tail {
+            layout.len
+        } else if origin.initialized {
+            layout.clamp(origin.cursor)
+        } else {
+            layout.offset_at_or_after(origin.scroll, 0).unwrap_or(0)
+        };
+        self.restore_search_origin(origin, false);
+        if let Some(index) = text_panel_search_match(&matches, cursor, direction, 1) {
+            self.move_to_transcript_match(&layout, &matches[index], panel_height);
+        }
+    }
+
+    fn finish_transcript_search(&mut self, panel_height: usize, width: usize) {
+        if let Some(session) = self.search.active.as_mut() {
+            if session.query.text.is_empty() {
+                if let Some(last) = self.search.last.as_ref() {
+                    session.query.text.clone_from(&last.text);
+                }
+            }
+        }
+        self.preview_transcript_search(panel_height, width);
+        let Some(session) = self.search.active.take() else {
+            return;
+        };
+        if session.query.text.is_empty() {
+            self.restore_search_origin(session.origin, session.origin.follow_tail);
+        } else {
+            self.search.last = Some(session.query);
+            self.search.visible = true;
+        }
+    }
+
+    fn repeat_transcript_search(
+        &mut self,
+        reverse: bool,
+        count: usize,
+        panel_height: usize,
+        width: usize,
+    ) {
+        let Some(query) = self.search.last.as_ref() else {
+            return;
+        };
+        let direction = if reverse {
+            query.direction.reversed()
+        } else {
+            query.direction
+        };
+        let layout = self.layout(width);
+        let matches = self.search_matches(&layout, &query.text);
+        let cursor = if self.follow_tail {
+            layout.len
+        } else {
+            layout.clamp(self.scrollback.cursor)
+        };
+        self.search.visible = true;
+        if let Some(index) = text_panel_search_match(&matches, cursor, direction, count) {
+            self.move_to_transcript_match(&layout, &matches[index], panel_height);
+        }
+    }
+
+    fn handle_transcript_search_input(
+        &mut self,
+        event: &Event,
+        panel_height: usize,
+        width: usize,
+    ) -> bool {
+        if self.search.active.is_none() {
+            return false;
+        }
+        if let Event::Key(key) = event {
+            if key.code == KeyCode::Esc
+                || (matches!(key.code, KeyCode::Char('c' | 'g'))
+                    && key.modifiers.contains(KeyModifiers::CONTROL))
+            {
+                self.cancel_transcript_search();
+                return true;
+            }
+            if matches!(key.code, KeyCode::Enter | KeyCode::Char('\n'))
+                || (key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL))
+            {
+                self.finish_transcript_search(panel_height, width);
+                return true;
+            }
+        }
+        let Some(session) = self.search.active.as_mut() else {
+            return false;
+        };
+        match event {
+            Event::Paste(text) => {
+                session.input.insert(&first_prompt_line(text));
+            }
+            Event::Key(_) => {
+                session
+                    .input
+                    .handle_event_with_layout_options(event, LayoutOptions::grapheme(width.max(1)));
+                session.input.set_mode(crate::editor::Mode::Insert);
+            }
+            _ => return false,
+        }
+        let text = session.input.text();
+        if text != session.query.text {
+            session.query.text = text;
+            self.preview_transcript_search(panel_height, width);
+        }
+        true
+    }
+
     fn focus_scrollback(&mut self, width: usize) {
+        self.cancel_transcript_search();
         if let Some(composer) = self.composer.as_mut() {
             composer.focused = false;
         }
         self.scrollback.focused = true;
         self.scrollback.mode = TextPanelScrollbackMode::Normal;
         self.scrollback.selection_anchor = None;
+        self.scrollback.pending_find = None;
+        self.scrollback.pending_jump = None;
         let layout = self.layout(width);
         if !self.scrollback.initialized {
             self.scrollback.cursor = (self.scroll..layout.lines.len())
@@ -1119,11 +1840,14 @@ impl TextPanel {
     }
 
     fn blur_scrollback(&mut self) {
+        self.cancel_transcript_search();
         self.scrollback.focused = false;
         self.scrollback.mode = TextPanelScrollbackMode::Normal;
         self.scrollback.selection_anchor = None;
         self.scrollback.mouse_anchor = None;
         self.scrollback.mouse_dragging = false;
+        self.scrollback.pending_find = None;
+        self.scrollback.pending_jump = None;
     }
 
     fn remember_focused_region(&mut self) {
@@ -2456,15 +3180,36 @@ impl PanelManager {
         if !panel.scrollback.focused {
             return None;
         }
-        let Event::Key(key) = event else {
-            return None;
-        };
         let width = self
             .presentation
             .width(&panel.id, &panel.config, terminal_width);
         let panel_height = self
             .presentation
             .height(&panel.id, &panel.config, panel_height);
+        if panel.handle_transcript_search_input(event, panel_height, width) {
+            return Some(TextPanelScrollbackInput::Handled);
+        }
+        let Event::Key(key) = event else {
+            return None;
+        };
+
+        if let Some(pending) = panel.scrollback.pending_jump.take() {
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+            {
+                match key.code {
+                    KeyCode::Char('p') => {
+                        panel.jump_to_prompt(pending.direction, pending.count, panel_height, width);
+                    }
+                    KeyCode::Char('l') => {
+                        panel.jump_to_link(pending.direction, pending.count, panel_height, width);
+                    }
+                    _ => {}
+                }
+            }
+            return Some(TextPanelScrollbackInput::Handled);
+        }
 
         if let Some(pending) = panel.scrollback.pending_find.take() {
             if key.code == KeyCode::Esc {
@@ -2489,6 +3234,10 @@ impl PanelManager {
             return Some(TextPanelScrollbackInput::Handled);
         }
         if key.code == KeyCode::Esc {
+            if panel.search.visible {
+                panel.search.visible = false;
+                return Some(TextPanelScrollbackInput::Handled);
+            }
             let composer_enabled = panel
                 .composer
                 .as_ref()
@@ -2522,6 +3271,46 @@ impl PanelManager {
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
         {
             match key.code {
+                KeyCode::Char('m') if panel.scrollback.mode == TextPanelScrollbackMode::Normal => {
+                    return Some(TextPanelScrollbackInput::OpenTurnActions);
+                }
+                KeyCode::Char('/' | '?')
+                    if panel.scrollback.mode == TextPanelScrollbackMode::Normal
+                        && (panel.composer.is_some()
+                            || text_panel_header_rows(&panel.config) > 0) =>
+                {
+                    let direction = if key.code == KeyCode::Char('?') {
+                        TextPanelSearchDirection::Backward
+                    } else {
+                        TextPanelSearchDirection::Forward
+                    };
+                    panel.begin_transcript_search(direction, panel_height, width);
+                    return Some(TextPanelScrollbackInput::Handled);
+                }
+                KeyCode::Char('n' | 'N')
+                    if panel.scrollback.mode == TextPanelScrollbackMode::Normal =>
+                {
+                    panel.repeat_transcript_search(
+                        key.code == KeyCode::Char('N'),
+                        count,
+                        panel_height,
+                        width,
+                    );
+                    return Some(TextPanelScrollbackInput::Handled);
+                }
+                KeyCode::Char('[' | ']')
+                    if panel.scrollback.mode == TextPanelScrollbackMode::Normal =>
+                {
+                    panel.scrollback.pending_jump = Some(PendingScrollbackJump {
+                        direction: if key.code == KeyCode::Char('[') {
+                            ScrollbackJumpDirection::Previous
+                        } else {
+                            ScrollbackJumpDirection::Next
+                        },
+                        count,
+                    });
+                    return Some(TextPanelScrollbackInput::Handled);
+                }
                 KeyCode::Char('v') => {
                     panel.scrollback.mode =
                         if panel.scrollback.mode == TextPanelScrollbackMode::Visual {
@@ -2664,28 +3453,22 @@ impl PanelManager {
         })
     }
 
-    pub(crate) fn select_focused_text_link(
-        &mut self,
-        forward: bool,
-        panel_height: usize,
-        terminal_width: usize,
-    ) -> bool {
+    pub(crate) fn toggle_focused_text_region(&mut self, terminal_width: usize) -> bool {
         let Some(focused) = self.focused.clone() else {
             return false;
         };
-        let Some(panel) = self.text_panels.get_mut(&focused) else {
+        let Some(panel) = self.text_panels.get(&focused) else {
             return false;
         };
-        let width = self
-            .presentation
-            .width(&panel.id, &panel.config, terminal_width);
-        let panel_height = self
-            .presentation
-            .height(&panel.id, &panel.config, panel_height);
-        if let Some(composer) = panel.composer.as_mut() {
-            composer.focused = false;
+        if panel
+            .composer
+            .as_ref()
+            .is_some_and(|composer| composer.enabled && !composer.focused)
+        {
+            self.focus_text_panel_composer(&focused)
+        } else {
+            self.focus_focused_text_scrollback(terminal_width)
         }
-        panel.select_link(forward, panel_height, width)
     }
 
     pub(crate) fn focus_focused_text_scrollback(&mut self, terminal_width: usize) -> bool {
@@ -2768,13 +3551,102 @@ impl PanelManager {
         None
     }
 
-    pub fn focused_text_for_copy(&self, all: bool) -> Option<String> {
+    pub fn focused_text_for_copy(&self, all: bool, terminal_width: usize) -> Option<String> {
         let panel = self.text_panels.get(self.focused.as_deref()?)?;
         if all {
             Some(panel.copy_all())
         } else {
-            panel.copy_last_agent()
+            let width = self
+                .presentation
+                .width(&panel.id, &panel.config, terminal_width);
+            match panel.selected_prompt(&panel.layout(width)) {
+                Some(index) => panel.turn_text(&panel.blocks[index].id, TextPanelTurnPart::Answer),
+                None => panel.copy_last_agent(),
+            }
         }
+    }
+
+    pub(crate) fn selected_text_turn(&self, terminal_width: usize) -> Option<TextPanelTurnTarget> {
+        let panel = self.text_panels.get(self.focused.as_deref()?)?;
+        let width = self
+            .presentation
+            .width(&panel.id, &panel.config, terminal_width);
+        let index = panel.selected_prompt(&panel.layout(width))?;
+        let prompt = &panel.blocks[index];
+        Some(TextPanelTurnTarget {
+            panel_id: panel.id.clone(),
+            prompt_id: prompt.id.clone(),
+            number: panel.blocks[..=index]
+                .iter()
+                .filter(|block| block.kind == TextPanelBlockKind::User)
+                .count(),
+            preview: truncate_display_width(&first_prompt_line(&prompt.text), 52),
+            has_answer: panel
+                .turn_text(&prompt.id, TextPanelTurnPart::Answer)
+                .is_some(),
+            can_reuse: panel
+                .composer
+                .as_ref()
+                .is_some_and(|composer| composer.enabled),
+        })
+    }
+
+    pub(crate) fn text_turn_for_copy(
+        &self,
+        panel_id: &str,
+        prompt_id: &str,
+        part: TextPanelTurnPart,
+    ) -> Option<String> {
+        self.text_panels.get(panel_id)?.turn_text(prompt_id, part)
+    }
+
+    pub(crate) fn reuse_text_panel_prompt(
+        &mut self,
+        panel_id: &str,
+        prompt_id: &str,
+        expected_draft: Option<TextPanelDraftRevision>,
+    ) -> Result<TextPanelReuseOutcome, &'static str> {
+        if !self.z_order.iter().any(|id| id == panel_id) {
+            return Err("conversation pane is no longer visible");
+        }
+        let panel = self
+            .text_panels
+            .get_mut(panel_id)
+            .ok_or("conversation is no longer available")?;
+        let text = normalize_prompt_newlines(
+            &panel
+                .turn_text(prompt_id, TextPanelTurnPart::Prompt)
+                .ok_or("selected prompt is no longer available")?,
+        );
+        if text.len() > MAX_COMPOSER_BYTES {
+            return Err("selected prompt exceeds 128 KiB");
+        }
+        let composer = panel
+            .composer
+            .as_mut()
+            .filter(|composer| composer.enabled)
+            .ok_or("conversation composer is unavailable")?;
+        let revision = TextPanelDraftRevision {
+            buffer_id: composer.prompt.buffer().id(),
+            revision: composer.prompt.buffer().revision(),
+        };
+        if expected_draft.is_some_and(|expected| expected != revision) {
+            return Err("composer draft changed; choose reuse again");
+        }
+        let current = composer.prompt.text();
+        if current != text && !current.is_empty() && expected_draft.is_none() {
+            return Ok(TextPanelReuseOutcome::Confirm(revision));
+        }
+        if current != text && !composer.prompt.replace_draft(&text) {
+            return Err("could not load the selected prompt");
+        }
+        composer.prompt.set_mode(crate::editor::Mode::Insert);
+        composer.validation = None;
+        composer.focused = true;
+        panel.blur_scrollback();
+        panel.last_focused_region = TextPanelFocusRegion::Composer;
+        self.focused = Some(panel_id.to_string());
+        Ok(TextPanelReuseOutcome::Loaded)
     }
 
     pub fn focus_text_panel_composer(&mut self, id: &str) -> bool {
@@ -2964,6 +3836,9 @@ impl PanelManager {
     pub(crate) fn focused_text_panel_cursor_mode(&self) -> Option<crate::editor::Mode> {
         let panel = self.text_panels.get(self.focused.as_deref()?)?;
         if panel.scrollback.focused {
+            if panel.search.active.is_some() {
+                return Some(crate::editor::Mode::Search);
+            }
             return Some(match panel.scrollback.mode {
                 TextPanelScrollbackMode::Normal => crate::editor::Mode::Normal,
                 TextPanelScrollbackMode::Visual => crate::editor::Mode::Visual,
@@ -2990,6 +3865,20 @@ impl PanelManager {
             let metrics = TextPanelContentMetrics::new(placement.width);
             let visible_rows = panel.visible_rows(placement.height);
             let layout = panel.layout(placement.width);
+            if panel.search.active.is_some() {
+                let query = panel.search.query()?;
+                let matches = panel.search_matches(&layout, &query.text);
+                let bar = TextPanelSearchBar::new(
+                    &panel.search,
+                    &matches,
+                    panel.scrollback.cursor,
+                    metrics.width,
+                )?;
+                return Some((
+                    metrics.x(placement.x) + bar.cursor_column?,
+                    placement.y + panel.search_bar_row(placement.height)?,
+                ));
+            }
             let max_scroll = layout.lines.len().saturating_sub(visible_rows);
             let scroll = panel.viewport.visible_offset(max_scroll);
             let (row, _, column) = layout
@@ -3642,6 +4531,23 @@ fn render_text_panel(
     let max_scroll = layout.lines.len().saturating_sub(visible_rows);
     let scroll = panel.viewport.visible_offset(max_scroll);
     let selection = panel.selection_bounds(&layout);
+    let search_matches = panel
+        .scrollback
+        .focused
+        .then(|| panel.search.query())
+        .flatten()
+        .map(|query| panel.search_matches(&layout, &query.text));
+    let search_highlights = search_matches.as_ref().map(|matches| {
+        TextPanelSearchHighlights::new(
+            Arc::clone(matches),
+            panel.scrollback.cursor,
+            theme,
+            &palette,
+        )
+    });
+    let selected_prompt = panel.selected_prompt(&layout);
+    let normal_prompt = TextPanelPromptPalette::new(theme, &palette, false);
+    let active_prompt = TextPanelPromptPalette::new(theme, &palette, true);
     for (offset, line) in layout
         .rendered
         .iter()
@@ -3650,11 +4556,58 @@ fn render_text_panel(
         .enumerate()
     {
         let line_index = scroll.saturating_add(offset);
+        let y = position.y.saturating_add(title_rows + offset);
+        let prompt_card = layout
+            .prompt_cards
+            .iter()
+            .find(|card| card.rows.contains(&line_index));
+        let prompt_palette = prompt_card.map(|card| {
+            if selected_prompt == Some(card.block_index) {
+                &active_prompt
+            } else {
+                &normal_prompt
+            }
+        });
+        let framed_prompt = prompt_palette.is_some() && metrics.width >= 7;
+        let edge_inset = usize::from(framed_prompt);
+        if let (Some(card), Some(prompt)) = (prompt_card, prompt_palette) {
+            let cap = if line_index == card.rows.start {
+                Some(("▄", "╷"))
+            } else if line_index + 1 == card.rows.end {
+                Some(("▀", "╵"))
+            } else {
+                None
+            };
+            if let Some((cap, rail)) = cap {
+                buffer.set_text(
+                    content_position.x + edge_inset,
+                    y,
+                    &cap.repeat(metrics.width.saturating_sub(edge_inset * 2)),
+                    &prompt.cap,
+                );
+                if framed_prompt {
+                    render_prompt_rails(
+                        buffer,
+                        Point::new(content_position.x, y),
+                        metrics.width,
+                        rail,
+                        &prompt.edge,
+                    );
+                }
+                continue;
+            }
+            buffer.set_text(
+                content_position.x + edge_inset,
+                y,
+                &" ".repeat(metrics.width.saturating_sub(edge_inset * 2)),
+                &prompt.content.surface,
+            );
+        }
         render_text_spans(
             buffer,
             content_position.x,
-            position.y.saturating_add(title_rows + offset),
-            metrics.width,
+            y,
+            metrics.width.saturating_sub(usize::from(framed_prompt)),
             line,
             layout.lines.get(line_index).map_or(0, |line| line.first),
             layout
@@ -3664,9 +4617,21 @@ fn render_text_panel(
                 .then_some(selection)
                 .flatten(),
             panel.selected_link,
+            search_highlights.as_ref(),
             theme,
-            &palette,
+            prompt_palette.map_or(&palette, |prompt| &prompt.content),
         );
+        if framed_prompt {
+            if let Some(prompt) = prompt_palette {
+                render_prompt_rails(
+                    buffer,
+                    Point::new(content_position.x, y),
+                    metrics.width,
+                    "│",
+                    &prompt.edge,
+                );
+            }
+        }
     }
 
     if let Some(status) = &panel.status {
@@ -3714,6 +4679,43 @@ fn render_text_panel(
             theme,
         );
     }
+    if let (Some(matches), Some(row)) = (search_matches, panel.search_bar_row(height)) {
+        if let Some(bar) = TextPanelSearchBar::new(
+            &panel.search,
+            &matches,
+            panel.scrollback.cursor,
+            metrics.width,
+        ) {
+            render_text_panel_search_bar(
+                buffer,
+                Point::new(content_position.x, position.y + row),
+                metrics.width,
+                &bar,
+                &palette,
+            );
+        }
+    }
+}
+
+fn render_text_panel_search_bar(
+    buffer: &mut RenderBuffer,
+    position: Point,
+    width: usize,
+    bar: &TextPanelSearchBar,
+    palette: &TextPanelPalette,
+) {
+    buffer.set_text(position.x, position.y, &" ".repeat(width), &palette.surface);
+    if width == 0 {
+        return;
+    }
+    buffer.set_text(position.x, position.y, bar.prefix, &palette.accent);
+    buffer.set_text(position.x + 1, position.y, &bar.text, &palette.primary);
+    buffer.set_text(
+        position.x + bar.suffix_column,
+        position.y,
+        &bar.suffix,
+        &palette.secondary,
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -3732,12 +4734,32 @@ struct TextPanelShortcutHint {
 
 const SCROLLBACK_NORMAL_HINTS: &[TextPanelShortcutHint] = &[
     TextPanelShortcutHint {
-        keys: "hjkl/arrows",
-        action: "move",
+        keys: "Tab",
+        action: "edit",
     },
     TextPanelShortcutHint {
-        keys: "a",
-        action: "edit",
+        keys: "m",
+        action: "actions",
+    },
+    TextPanelShortcutHint {
+        keys: "/?",
+        action: "search",
+    },
+    TextPanelShortcutHint {
+        keys: "[p/]p",
+        action: "prompt",
+    },
+    TextPanelShortcutHint {
+        keys: "[l/]l",
+        action: "link",
+    },
+    TextPanelShortcutHint {
+        keys: "G",
+        action: "latest",
+    },
+    TextPanelShortcutHint {
+        keys: "hjkl/arrows",
+        action: "move",
     },
     TextPanelShortcutHint {
         keys: "y",
@@ -3772,8 +4794,8 @@ const COMPOSER_NORMAL_HINTS: &[TextPanelShortcutHint] = &[
         action: "edit",
     },
     TextPanelShortcutHint {
-        keys: "Esc",
-        action: "nav",
+        keys: "Tab",
+        action: "transcript",
     },
     TextPanelShortcutHint {
         keys: "j/k ↑/↓",
@@ -3820,6 +4842,10 @@ const COMPOSER_INSERT_HINTS: &[TextPanelShortcutHint] = &[
     TextPanelShortcutHint {
         keys: "^J",
         action: "newline",
+    },
+    TextPanelShortcutHint {
+        keys: "Tab",
+        action: "transcript",
     },
     TextPanelShortcutHint {
         keys: "Esc",
@@ -4169,6 +5195,7 @@ fn render_text_spans(
     line_first: usize,
     selection: Option<(usize, usize)>,
     selected_link: Option<u64>,
+    search: Option<&TextPanelSearchHighlights>,
     theme: &Theme,
     palette: &TextPanelPalette,
 ) {
@@ -4201,6 +5228,15 @@ fn render_text_spans(
             }
             let mut grapheme_style = style.clone();
             let selectable = matches!(span.selection, TextPanelSpanSelection::Content);
+            if selectable {
+                if let Some(search_style) = search.and_then(|search| search.style_at(offset)) {
+                    grapheme_style = theme.selected_style(
+                        &grapheme_style,
+                        search_style,
+                        SelectionForegroundPriority::Content,
+                    );
+                }
+            }
             if selectable && selection.is_some_and(|(start, end)| offset >= start && offset <= end)
             {
                 let selected = theme.list_selection_style();
@@ -4307,7 +5343,7 @@ fn render_panel_separator(
 
 fn block_label(kind: &TextPanelBlockKind) -> Option<(&'static str, TextPanelSpanStyle)> {
     match kind {
-        // User blocks render a rule + accent bar instead of a label.
+        // User blocks render their own prompt card and label.
         TextPanelBlockKind::User => None,
         TextPanelBlockKind::Agent => Some(("◆ Agent", TextPanelSpanStyle::Agent)),
         TextPanelBlockKind::Error => Some(("⚠ Error", TextPanelSpanStyle::Error)),
@@ -4325,15 +5361,27 @@ fn block_style(kind: &TextPanelBlockKind) -> TextPanelSpanStyle {
     }
 }
 
-fn turn_separator(width: usize) -> RenderedTextLine {
-    RenderedTextLine::chrome("─".repeat(width.max(1)), TextPanelSpanStyle::Muted)
+fn render_prompt_rails(
+    buffer: &mut RenderBuffer,
+    position: Point,
+    width: usize,
+    glyph: &str,
+    style: &Style,
+) {
+    buffer.set_text(position.x, position.y, glyph, style);
+    buffer.set_text(
+        position.x + width.saturating_sub(1),
+        position.y,
+        glyph,
+        style,
+    );
 }
 
-fn user_accented(line: RenderedTextLine) -> RenderedTextLine {
+fn user_padded(line: RenderedTextLine) -> RenderedTextLine {
     let break_after = line.break_after;
     let selection = line.selection;
     let mut spans = vec![RenderedTextSpan {
-        text: "▎ ".to_string(),
+        text: "  ".to_string(),
         style: TextPanelSpanStyle::User,
         syntax_style: None,
         link: None,
@@ -5419,7 +6467,19 @@ mod tests {
         let mut buffer = RenderBuffer::new(2, 1, &theme.style);
         let palette = text_panel_palette(&theme, &PanelConfig::default());
 
-        render_text_spans(&mut buffer, 0, 0, 2, &line, 0, None, None, &theme, &palette);
+        render_text_spans(
+            &mut buffer,
+            0,
+            0,
+            2,
+            &line,
+            0,
+            None,
+            None,
+            None,
+            &theme,
+            &palette,
+        );
 
         assert_eq!(
             buffer.cells[0].style,
@@ -5468,7 +6528,19 @@ mod tests {
         let mut selected = RenderBuffer::new(3, 1, &theme.style);
         let palette = text_panel_palette(&theme, &PanelConfig::default());
 
-        render_text_spans(&mut normal, 0, 0, 3, &line, 0, None, None, &theme, &palette);
+        render_text_spans(
+            &mut normal,
+            0,
+            0,
+            3,
+            &line,
+            0,
+            None,
+            None,
+            None,
+            &theme,
+            &palette,
+        );
         render_text_spans(
             &mut selected,
             0,
@@ -5477,6 +6549,7 @@ mod tests {
             &line,
             0,
             Some((0, 0)),
+            None,
             None,
             &theme,
             &palette,
@@ -6049,6 +7122,8 @@ mod tests {
 
     #[test]
     fn text_panel_links_support_keyboard_navigation_and_clicks() {
+        use crossterm::event::KeyEvent;
+
         let mut manager = PanelManager::default();
         manager.create_text_panel(
             "agent".to_string(),
@@ -6075,14 +7150,28 @@ mod tests {
         );
         assert!(manager.focus_panel("agent"));
 
-        assert!(manager.select_focused_text_link(true, 18, 80));
+        let press = |manager: &mut PanelManager, character| {
+            assert!(matches!(
+                manager.handle_focused_scrollback_input(
+                    &Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+                    18,
+                    80,
+                    1,
+                ),
+                Some(TextPanelScrollbackInput::Handled)
+            ));
+        };
+        press(&mut manager, 'G');
+        press(&mut manager, ']');
+        press(&mut manager, 'l');
         assert_eq!(
             manager.focused_text_link_target(80),
             Some(TextPanelLinkTarget::ExternalUrl(
                 "https://example.com".to_string()
             ))
         );
-        assert!(manager.select_focused_text_link(true, 18, 80));
+        press(&mut manager, ']');
+        press(&mut manager, 'l');
         assert_eq!(
             manager.focused_text_link_target(80),
             Some(TextPanelLinkTarget::File {
@@ -6090,7 +7179,8 @@ mod tests {
                 location: None,
             })
         );
-        assert!(manager.select_focused_text_link(false, 18, 80));
+        press(&mut manager, '[');
+        press(&mut manager, 'l');
         assert_eq!(
             manager.focused_text_link_target(80),
             Some(TextPanelLinkTarget::ExternalUrl(
@@ -6457,7 +7547,11 @@ mod tests {
         let status_y = text_position(&buffer, "Waiting for agent…").unwrap().y;
         assert_eq!(status_y, 7);
         assert!(row_text(&buffer, status_y - 1).trim().is_empty());
-        assert!(row_text(&buffer, status_y - 2).contains("follow up"));
+        assert_eq!(
+            row_text(&buffer, status_y - 2).trim(),
+            format!("╵{}╵", "▀".repeat(36))
+        );
+        assert!(row_text(&buffer, status_y - 3).contains("│ follow up"));
 
         panel.set_status(Some(TextPanelStatus {
             busy: false,
@@ -6472,7 +7566,7 @@ mod tests {
     }
 
     #[test]
-    fn text_panel_states_share_one_surface_and_use_foreground_hierarchy() {
+    fn text_panel_states_preserve_prompt_surfaces_and_foreground_hierarchy() {
         let surface_foreground = Color::Rgb {
             r: 225,
             g: 230,
@@ -6546,6 +7640,36 @@ mod tests {
             border: None,
         };
         let palette = text_panel_palette(&theme, &config);
+        let prompt_palette = TextPanelPromptPalette::new(&theme, &palette, true);
+        let assert_surfaces = |buffer: &RenderBuffer| {
+            let label_y = text_position(buffer, "You").unwrap().y;
+            let body_y = text_position(buffer, "question").unwrap().y;
+            assert_eq!(body_y, label_y + 1);
+            assert_ne!(prompt_palette.content.surface.bg, Some(surface_background));
+            for y in 0..buffer.height {
+                for x in 0..buffer.width {
+                    let expected =
+                        if (label_y..=body_y).contains(&y) && (2..buffer.width - 2).contains(&x) {
+                            prompt_palette.content.surface.bg
+                        } else {
+                            Some(surface_background)
+                        };
+                    assert_eq!(
+                        buffer.cells[y * buffer.width + x].style.bg,
+                        expected,
+                        "unexpected background at ({x}, {y})"
+                    );
+                }
+            }
+            assert_eq!(text_style(buffer, "▄▄").fg, prompt_palette.cap.fg);
+            assert_eq!(text_style(buffer, "▀▀").fg, prompt_palette.cap.fg);
+            assert_eq!(text_style(buffer, "╷").fg, prompt_palette.edge.fg);
+            assert_eq!(text_style(buffer, "╵").fg, prompt_palette.edge.fg);
+            assert_eq!(
+                text_style(buffer, "You").fg,
+                prompt_palette.content.accent.fg
+            );
+        };
         let mut panel = TextPanel::new("agent".to_string(), config);
         panel.blocks = vec![
             TextPanelBlock {
@@ -6585,10 +7709,7 @@ mod tests {
 
         render_text_panel(&mut streaming, &panel, Point::new(0, 0), 72, 22, &theme);
 
-        assert!(streaming
-            .cells
-            .iter()
-            .all(|cell| cell.style.bg == Some(surface_background)));
+        assert_surfaces(&streaming);
         assert_eq!(
             text_style(&streaming, "Worked for 13s").fg,
             palette.muted.fg
@@ -6628,19 +7749,13 @@ mod tests {
         let mut scrollback = RenderBuffer::new(72, 22, &theme.style);
         render_text_panel(&mut scrollback, &panel, Point::new(0, 0), 72, 22, &theme);
 
-        assert!(scrollback
-            .cells
-            .iter()
-            .all(|cell| cell.style.bg == Some(surface_background)));
+        assert_surfaces(&scrollback);
         assert_eq!(
             text_style(&scrollback, "SCROLLBACK NORMAL").fg,
             palette.accent.fg
         );
-        assert_eq!(
-            text_style(&scrollback, "hjkl/arrows").fg,
-            palette.secondary.fg
-        );
-        assert_eq!(text_style(&scrollback, "move").fg, palette.muted.fg);
+        assert_eq!(text_style(&scrollback, "Tab").fg, palette.secondary.fg);
+        assert_eq!(text_style(&scrollback, "edit").fg, palette.muted.fg);
     }
 
     #[test]
@@ -6807,11 +7922,20 @@ mod tests {
             .map(|row| row_text(&buffer, row))
             .collect::<Vec<_>>();
         let joined = rendered.join("\n");
-        assert!(joined.contains("▎ You"));
+        assert_eq!(joined.matches("│ You").count(), 2);
+        assert_eq!(joined.matches("╷▄▄").count(), 2);
+        assert_eq!(joined.matches("╵▀▀").count(), 2);
         assert!(joined.contains("✓ Read demo.txt"));
+        let palette = text_panel_palette(&theme, &manager.text_panels["agent"].config);
+        assert_eq!(text_style(&buffer, "✓ Read demo.txt").fg, palette.muted.fg);
+        let first_y = text_position(&buffer, "first").unwrap().y;
+        let activity_y = text_position(&buffer, "✓ Read demo.txt").unwrap().y;
+        let second_y = text_position(&buffer, "second").unwrap().y;
+        assert!(first_y < activity_y && activity_y < second_y);
+        assert!(!joined.contains("▎ You"));
         assert!(!joined.contains("❯ You"));
         let separator_rows = rendered.iter().filter(|row| row.contains("────")).count();
-        assert_eq!(separator_rows, 1);
+        assert_eq!(separator_rows, 0);
     }
 
     #[test]
@@ -6942,7 +8066,7 @@ mod tests {
             .map(|row| row_text(&buffer, row))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(top.contains("SCROLLBACK NORMAL · hjkl/arrows move"));
+        assert!(top.contains("SCROLLBACK NORMAL · Tab edit"));
 
         manager.handle_focused_key("bottom", 15, 80, 0).unwrap();
         let mut buffer = RenderBuffer::new(80, 15, &theme.style);
@@ -6951,7 +8075,7 @@ mod tests {
             .map(|row| row_text(&buffer, row))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(bottom.contains("SCROLLBACK NORMAL · hjkl/arrows move"));
+        assert!(bottom.contains("SCROLLBACK NORMAL · Tab edit"));
     }
 
     #[test]
@@ -7020,9 +8144,10 @@ mod tests {
 
         manager.render(&mut buffer, &theme);
 
-        assert!(row_text(&buffer, 0).contains("│ ▎ You"));
-        assert!(row_text(&buffer, 1).contains("│ ▎ hell"));
-        assert!(row_text(&buffer, 2).contains("│ ▎ o"));
+        assert!(row_text(&buffer, 0).contains("│ ▄▄▄▄▄▄"));
+        assert!(row_text(&buffer, 1).contains("│ You"));
+        assert!(row_text(&buffer, 2).contains("│ hello"));
+        assert!(row_text(&buffer, 3).contains("│ ▀▀▀▀▀▀"));
         assert!(manager.panel_at_position(7, 0, 16, 7).is_none());
         assert!(manager.panel_at_position(8, 0, 16, 7).is_some());
     }

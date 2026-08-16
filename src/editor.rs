@@ -2417,6 +2417,17 @@ pub enum Action {
     },
     Print(String),
 
+    OpenTextPanelTurnActions,
+    CopyTextPanelTurn {
+        panel_id: String,
+        prompt_id: String,
+        part: plugin::panel::TextPanelTurnPart,
+    },
+    ReuseTextPanelPrompt {
+        panel_id: String,
+        prompt_id: String,
+        expected_draft: Option<plugin::panel::TextPanelDraftRevision>,
+    },
     OpenPicker(Option<String>, Vec<String>, Option<i32>),
     OpenLivePicker(
         Option<String>,
@@ -6615,6 +6626,9 @@ impl Editor {
                 | Action::StartRename
                 | Action::RenameSymbol(_)
                 | Action::Print(_)
+                | Action::OpenTextPanelTurnActions
+                | Action::CopyTextPanelTurn { .. }
+                | Action::ReuseTextPanelPrompt { .. }
                 | Action::ShowProgress(_)
                 | Action::NotifyPlugins(_, _)
                 | Action::NotifyPlugin(_, _, _)
@@ -12712,6 +12726,14 @@ impl Editor {
         ev: &event::Event,
         runtime: Option<&Runtime>,
     ) -> Option<KeyAction> {
+        if matches!(ev, Event::Key(key) if matches!(key.code, KeyCode::Tab | KeyCode::BackTab))
+            && self
+                .panel_manager
+                .toggle_focused_text_region(usize::from(self.size.0))
+        {
+            self.repeater = None;
+            return Some(KeyAction::Single(Action::Refresh));
+        }
         if let Some(event) = self
             .panel_manager
             .handle_focused_text_input(ev, usize::from(self.size.0))
@@ -12729,6 +12751,9 @@ impl Editor {
             return Some(match input {
                 plugin::panel::TextPanelScrollbackInput::Handled => {
                     KeyAction::Single(Action::Refresh)
+                }
+                plugin::panel::TextPanelScrollbackInput::OpenTurnActions => {
+                    KeyAction::Single(Action::OpenTextPanelTurnActions)
                 }
                 plugin::panel::TextPanelScrollbackInput::Yank(yank) => {
                     let length = yank.text.graphemes(true).count();
@@ -12752,7 +12777,10 @@ impl Editor {
             Event::Key(event) => {
                 if matches!(event.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
                     let copy_all = event.code == KeyCode::Char('Y');
-                    if let Some(text) = self.panel_manager.focused_text_for_copy(copy_all) {
+                    if let Some(text) = self
+                        .panel_manager
+                        .focused_text_for_copy(copy_all, usize::from(self.size.0))
+                    {
                         self.set_default_register(Content::charwise(text));
                         self.last_error = Some(if copy_all {
                             "conversation copied".to_string()
@@ -12761,23 +12789,8 @@ impl Editor {
                         });
                         return Some(KeyAction::Single(Action::Refresh));
                     }
-                }
-                if matches!(event.code, KeyCode::Tab | KeyCode::BackTab) {
-                    if self.panel_manager.focused_text_input_active()
-                        && self
-                            .panel_manager
-                            .focus_focused_text_scrollback(usize::from(self.size.0))
-                    {
-                        return Some(KeyAction::Single(Action::Refresh));
-                    }
-                    let panel_height = usize::from(self.size.1.saturating_sub(2));
-                    let forward = event.code == KeyCode::Tab;
-                    let selected = self.panel_manager.select_focused_text_link(
-                        forward,
-                        panel_height,
-                        usize::from(self.size.0),
-                    );
-                    if selected || !self.panel_manager.focused_row_panel() {
+                    if !self.panel_manager.focused_row_panel() {
+                        self.last_error = Some("selected turn has no answer to copy".to_string());
                         return Some(KeyAction::Single(Action::Refresh));
                     }
                 }
@@ -19560,6 +19573,139 @@ impl Editor {
             Action::Print(msg) => {
                 self.last_error = Some(msg.clone());
                 self.draw_commandline(buffer);
+            }
+            Action::OpenTextPanelTurnActions => {
+                add_to_history = false;
+                if let Some(target) = self
+                    .panel_manager
+                    .selected_text_turn(usize::from(self.size.0))
+                {
+                    let mut choices = vec![(
+                        "copy-prompt",
+                        "Copy prompt",
+                        Action::CopyTextPanelTurn {
+                            panel_id: target.panel_id.clone(),
+                            prompt_id: target.prompt_id.clone(),
+                            part: plugin::panel::TextPanelTurnPart::Prompt,
+                        },
+                    )];
+                    if target.has_answer {
+                        choices.push((
+                            "copy-answer",
+                            "Copy answer",
+                            Action::CopyTextPanelTurn {
+                                panel_id: target.panel_id.clone(),
+                                prompt_id: target.prompt_id.clone(),
+                                part: plugin::panel::TextPanelTurnPart::Answer,
+                            },
+                        ));
+                    }
+                    if target.can_reuse {
+                        choices.push((
+                            "reuse-prompt",
+                            "Reuse prompt in composer",
+                            Action::ReuseTextPanelPrompt {
+                                panel_id: target.panel_id.clone(),
+                                prompt_id: target.prompt_id.clone(),
+                                expected_draft: None,
+                            },
+                        ));
+                    }
+                    let actions = choices
+                        .iter()
+                        .map(|(id, _, action)| ((*id).to_string(), action.clone()))
+                        .collect::<HashMap<_, _>>();
+                    let items = choices
+                        .into_iter()
+                        .map(|(id, label, _)| PickerItem {
+                            id: id.to_string(),
+                            icon: None,
+                            label: label.to_string(),
+                            kind: None,
+                            annotation: None,
+                            detail: None,
+                            data: Value::Null,
+                            matches: Vec::new(),
+                            detail_matches: Vec::new(),
+                            preview: None,
+                        })
+                        .collect();
+                    let picker = Picker::builder()
+                        .title("Turn actions")
+                        .structured_items(items)
+                        .placeholder("Choose an action")
+                        .status(format!("Turn {} · {}", target.number, target.preview))
+                        .content_sized(72, 3)
+                        .select_action(move |id| {
+                            actions.get(&id).cloned().unwrap_or_else(|| {
+                                Action::Print("turn action is no longer available".to_string())
+                            })
+                        })
+                        .build(self);
+                    self.release_current_dialog_callbacks(runtime);
+                    self.current_dialog = Some(Box::new(picker));
+                } else {
+                    self.last_error = Some("no user prompt selected".to_string());
+                }
+                self.render(buffer)?;
+            }
+            Action::CopyTextPanelTurn {
+                panel_id,
+                prompt_id,
+                part,
+            } => {
+                add_to_history = false;
+                if let Some(text) = self
+                    .panel_manager
+                    .text_turn_for_copy(panel_id, prompt_id, *part)
+                {
+                    self.set_default_register(Content::charwise(text));
+                    self.last_error = Some(
+                        match part {
+                            plugin::panel::TextPanelTurnPart::Prompt => "prompt copied",
+                            plugin::panel::TextPanelTurnPart::Answer => "answer copied",
+                        }
+                        .to_string(),
+                    );
+                } else {
+                    self.last_error = Some("selected turn text is no longer available".to_string());
+                }
+                self.render(buffer)?;
+            }
+            Action::ReuseTextPanelPrompt {
+                panel_id,
+                prompt_id,
+                expected_draft,
+            } => {
+                add_to_history = false;
+                match self.panel_manager.reuse_text_panel_prompt(
+                    panel_id,
+                    prompt_id,
+                    *expected_draft,
+                ) {
+                    Ok(plugin::panel::TextPanelReuseOutcome::Loaded) => {
+                        self.last_error =
+                            Some("prompt loaded for editing; nothing sent".to_string());
+                    }
+                    Ok(plugin::panel::TextPanelReuseOutcome::Confirm(revision)) => {
+                        self.release_current_dialog_callbacks(runtime);
+                        self.current_dialog = Some(Box::new(Confirmation::new_actions(
+                            self,
+                            "Replace unsent draft?",
+                            "The composer already contains an unsent draft. Replacing it is one undoable edit; nothing will be sent.",
+                            "Replace draft",
+                            "Keep draft",
+                            Action::ReuseTextPanelPrompt {
+                                panel_id: panel_id.clone(),
+                                prompt_id: prompt_id.clone(),
+                                expected_draft: Some(revision),
+                            },
+                            Action::Print("current draft kept".to_string()),
+                        )));
+                    }
+                    Err(message) => self.last_error = Some(message.to_string()),
+                }
+                self.render(buffer)?;
             }
             Action::OpenPicker(title, items, id) => {
                 let history_key = Self::picker_history_key(title, *id);
