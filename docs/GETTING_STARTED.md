@@ -178,7 +178,8 @@ The command palette includes descriptions, effective keymaps, and accepted
 
 ## Windows and buffers
 
-- `Ctrl-w s` and `Ctrl-w v` split horizontally and vertically.
+- `Ctrl-w s` splits horizontally (top/bottom); `Ctrl-w v` or `Ctrl-w d` splits
+  vertically (side by side).
 - `Ctrl-w h/j/k/l` move focus between editor windows and docked panes.
 - `Ctrl-w H/J/K/L` move the focused editor window or pane to the left, bottom,
   top, or right outer edge.

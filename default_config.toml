@@ -365,6 +365,7 @@ Esc = { EnterMode = "Normal" }
 "p" = "PreviousWindow"
 "s" = "SplitHorizontal"
 "v" = "SplitVertical"
+"d" = "SplitVertical"
 "|" = "SplitVertical"
 "c" = "CloseWindow"
 "q" = "CloseWindow"
