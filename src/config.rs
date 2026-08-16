@@ -255,6 +255,9 @@ pub struct Config {
     /// Insert-mode completion sources and automatic triggering.
     #[serde(default)]
     pub completion: CompletionConfig,
+    /// Opt-in AI inline completion, independent of ordinary language servers.
+    #[serde(default)]
+    pub copilot: crate::copilot::CopilotConfig,
     /// Picker layout behavior.
     #[serde(default)]
     pub picker: PickerConfig,
@@ -1826,6 +1829,7 @@ fn known_top_level_field(field: &str) -> bool {
             | "persist_inline_history"
             | "search"
             | "completion"
+            | "copilot"
             | "picker"
             | "statusline"
             | "key_hints"
@@ -1985,6 +1989,10 @@ fn known_schema_path(path: &[String]) -> bool {
                 | "debounce_ms"
                 | "buffer_words"
                 | "max_buffer_words"
+        ),
+        ["copilot", field] => matches!(
+            *field,
+            "enabled" | "command" | "args" | "debounce_ms" | "max_file_bytes" | "excluded_patterns"
         ),
         ["picker", "input_position"] => true,
         ["picker", "icons", field] => matches!(*field, "style" | "color"),
@@ -3967,6 +3975,21 @@ max_buffer_words = 20
         assert_eq!(config.completion.debounce_ms, 250);
         assert!(!config.completion.buffer_words);
         assert_eq!(config.completion.max_buffer_words, 20);
+    }
+
+    #[test]
+    fn copilot_configuration_is_opt_in_and_accepts_overrides() {
+        let defaults = Config::from_user_toml_with_overrides("", &[]).unwrap();
+        assert!(!defaults.copilot.enabled);
+        let config = Config::from_user_toml_with_overrides(
+            "[copilot]\nenabled = true\ncommand = 'custom-copilot'\ndebounce_ms = 250\n",
+            &[],
+        )
+        .unwrap();
+        assert!(config.copilot.enabled);
+        assert_eq!(config.copilot.command, "custom-copilot");
+        assert_eq!(config.copilot.debounce_ms, 250);
+        assert!(known_top_level_field("copilot"));
     }
 
     #[test]

@@ -71,6 +71,8 @@ pub(crate) enum RedFunctionAnnotation {
         aliases: Vec<String>,
         visible: bool,
         scope: CommandScope,
+        arguments: bool,
+        completions: Vec<Vec<String>>,
     },
     Event {
         name: String,
@@ -122,12 +124,6 @@ pub(crate) fn red_function_annotations(
             continue;
         }
         if attribute.matches_path(&["red", "command"]) {
-            if parameter_count != 0 {
-                return Err(annotation_error(
-                    attribute,
-                    "`#[red::command]` requires a function without parameters",
-                ));
-            }
             let Some(arguments) = attribute.arguments.as_ref() else {
                 return Err(annotation_error(
                     attribute,
@@ -149,6 +145,8 @@ pub(crate) fn red_function_annotations(
             let mut aliases = Vec::new();
             let mut visible = true;
             let mut scope = CommandScope::Editor;
+            let mut accepts_arguments = false;
+            let mut completions = Vec::new();
             for argument in arguments {
                 let AttributeArgumentKind::Named { name: key, value } = &argument.kind else {
                     return Err(annotation_value_error(
@@ -208,6 +206,42 @@ pub(crate) fn red_function_annotations(
                             aliases.push(text.to_string());
                         }
                     }
+                    "arguments" => {
+                        let AttributeValueKind::Bool(enabled) = &value.kind else {
+                            return Err(annotation_value_error(
+                                &value.span,
+                                "command metadata `arguments` must be a boolean",
+                            ));
+                        };
+                        accepts_arguments = *enabled;
+                    }
+                    "completions" => {
+                        let AttributeValueKind::Array(positions) = &value.kind else {
+                            return Err(annotation_value_error(
+                                &value.span,
+                                "command metadata `completions` must be an array of string arrays",
+                            ));
+                        };
+                        for position in positions {
+                            let AttributeValueKind::Array(values) = &position.kind else {
+                                return Err(annotation_value_error(
+                                    &position.span,
+                                    "command completions must be an array of string arrays",
+                                ));
+                            };
+                            let mut choices = Vec::new();
+                            for choice in values {
+                                let Some(text) = choice.as_str() else {
+                                    return Err(annotation_value_error(
+                                        &choice.span,
+                                        "command completion choices must be strings",
+                                    ));
+                                };
+                                choices.push(text.to_string());
+                            }
+                            completions.push(choices);
+                        }
+                    }
                     "visible" => {
                         let AttributeValueKind::Bool(visible_value) = &value.kind else {
                             return Err(annotation_value_error(
@@ -243,6 +277,18 @@ pub(crate) fn red_function_annotations(
                     }
                 }
             }
+            if parameter_count != usize::from(accepts_arguments) {
+                return Err(annotation_error(
+                    attribute,
+                    if accepts_arguments {
+                        "`#[red::command(arguments = true)]` requires one CommandInvocation parameter"
+                    } else {
+                        "`#[red::command]` requires a function without parameters"
+                    },
+                ));
+            }
+            super::runtime::validate_command_arguments(accepts_arguments, &completions)
+                .map_err(|error| annotation_error(attribute, error.to_string()))?;
             let Some(name) = name else {
                 return Err(annotation_error(
                     attribute,
@@ -257,6 +303,8 @@ pub(crate) fn red_function_annotations(
                 aliases,
                 visible,
                 scope,
+                arguments: accepts_arguments,
+                completions,
             });
         } else if attribute.matches_path(&["red", "on"]) {
             if parameter_count != 1 {
@@ -448,13 +496,16 @@ struct HostCallSite<'a> {
 struct RedSourceSites<'a> {
     host_calls: Vec<HostCallSite<'a>>,
     uses_command_scope: bool,
+    uses_command_arguments: bool,
 }
 
 #[derive(Default)]
 struct RedSourceVisitor<'a> {
     host_calls: Vec<HostCallSite<'a>>,
     uses_command_scope: bool,
+    uses_command_arguments: bool,
     command_metadata_bindings: HashMap<String, bool>,
+    command_argument_metadata_bindings: HashMap<String, bool>,
 }
 
 fn red_source_sites(file: &File) -> RedSourceSites<'_> {
@@ -463,6 +514,8 @@ fn red_source_sites(file: &File) -> RedSourceSites<'_> {
         match &item.kind {
             ItemKind::Fn { body, .. } => {
                 visitor.uses_command_scope |= command_attribute_uses_scope(&item.attributes);
+                visitor.uses_command_arguments |=
+                    command_attribute_uses_arguments(&item.attributes);
                 visitor.visit_body(body);
             }
             ItemKind::Trait(definition) => {
@@ -491,6 +544,7 @@ fn red_source_sites(file: &File) -> RedSourceSites<'_> {
     RedSourceSites {
         host_calls: visitor.host_calls,
         uses_command_scope: visitor.uses_command_scope,
+        uses_command_arguments: visitor.uses_command_arguments,
     }
 }
 
@@ -508,6 +562,23 @@ fn command_attribute_uses_scope(attributes: &[Attribute]) -> bool {
     })
 }
 
+fn command_attribute_uses_arguments(attributes: &[Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        attribute.matches_path(&["red", "command"])
+            && attribute.arguments.as_ref().is_some_and(|arguments| {
+                arguments.iter().any(|argument| {
+                    matches!(&argument.kind,
+                    AttributeArgumentKind::Named { name, .. }
+                        if matches!(name.name.as_str(), "arguments" | "completions"))
+                })
+            })
+    })
+}
+
+pub(crate) fn source_uses_command_arguments(file: &File) -> bool {
+    red_source_sites(file).uses_command_arguments
+}
+
 pub(crate) fn source_uses_command_scope(file: &File) -> bool {
     red_source_sites(file).uses_command_scope
 }
@@ -519,6 +590,7 @@ fn host_call_sites(file: &File) -> Vec<HostCallSite<'_>> {
 impl<'a> RedSourceVisitor<'a> {
     fn visit_body(&mut self, statements: &'a [Stmt]) {
         self.command_metadata_bindings.clear();
+        self.command_argument_metadata_bindings.clear();
         self.visit_statements(statements);
     }
 
@@ -541,6 +613,10 @@ impl<'a> RedSourceVisitor<'a> {
                         self.command_metadata_bindings.insert(
                             binding.name.clone(),
                             self.command_metadata_expression_uses_scope(value),
+                        );
+                        self.command_argument_metadata_bindings.insert(
+                            binding.name.clone(),
+                            self.command_metadata_expression_uses_arguments(value),
                         );
                     }
                     self.visit_expression(value);
@@ -610,6 +686,13 @@ impl<'a> RedSourceVisitor<'a> {
                         })
                     {
                         self.uses_command_scope = true;
+                    }
+                    if matches!(segments.as_slice(), [module, method] if module.name == "red" && method.name == "add_command")
+                        && args.get(2).is_some_and(|metadata| {
+                            self.command_metadata_expression_uses_arguments(metadata)
+                        })
+                    {
+                        self.uses_command_arguments = true;
                     }
                     let kind = match segments.as_slice() {
                         [module, method] if module.name == "red" && method.name == "execute" => {
@@ -715,6 +798,24 @@ impl<'a> RedSourceVisitor<'a> {
                 binding.name.clone(),
                 self.command_metadata_expression_uses_scope(value),
             );
+            self.command_argument_metadata_bindings.insert(
+                binding.name.clone(),
+                self.command_metadata_expression_uses_arguments(value),
+            );
+        }
+    }
+
+    fn command_metadata_expression_uses_arguments(&self, expression: &Expr) -> bool {
+        match &expression.kind {
+            ExprKind::Struct { fields, .. } => fields
+                .iter()
+                .any(|field| matches!(field.name.name.as_str(), "arguments" | "completions")),
+            ExprKind::Ident(binding) => self
+                .command_argument_metadata_bindings
+                .get(&binding.name)
+                .copied()
+                .unwrap_or(false),
+            _ => false,
         }
     }
 
@@ -1121,6 +1222,8 @@ mod tests {
                 aliases: vec!["outline".to_string(), "symbols".to_string()],
                 visible: true,
                 scope: CommandScope::Global,
+                arguments: false,
+                completions: Vec::new(),
             }]
         );
         assert_eq!(
@@ -1195,6 +1298,8 @@ mod tests {
                 aliases: Vec::new(),
                 visible: false,
                 scope: CommandScope::Editor,
+                arguments: false,
+                completions: Vec::new(),
             }]
         );
         validate_source("valid", "plugins/valid.hk", source).unwrap();

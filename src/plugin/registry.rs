@@ -33,13 +33,14 @@ pub struct PluginRegistry {
 }
 
 /// Host API version used for plugin compatibility checks.
-pub const RED_HOST_API_VERSION: &str = "0.10.0";
+pub const RED_HOST_API_VERSION: &str = "0.11.0";
 pub(crate) const SUPPORTED_HOST_API_VERSIONS: &[&str] = &[
     "0.4.0",
     "0.6.0",
     "0.7.0",
     "0.8.0",
     "0.9.0",
+    "0.10.0",
     RED_HOST_API_VERSION,
 ];
 
@@ -319,13 +320,19 @@ impl PluginRegistry {
         if runtime.command_plugin(command).is_some() {
             return;
         }
-        if let Some((name, path)) = self.pending_command_plugin(command) {
+        if let Some((name, path)) = self
+            .pending_command_plugin(command)
+            .or_else(|| self.pending_command_plugin(crate::command::split_invocation(command).0))
+        {
             self.activate_one(runtime, &name, &path).await;
         }
     }
 
     pub(crate) fn has_pending_command(&self, command: &str) -> bool {
         self.pending_command_plugin(command).is_some()
+            || self
+                .pending_command_plugin(crate::command::split_invocation(command).0)
+                .is_some()
     }
 
     fn pending_command_plugin(&self, command: &str) -> Option<(String, String)> {

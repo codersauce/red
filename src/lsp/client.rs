@@ -378,7 +378,7 @@ impl RealLspClient {
     }
 }
 
-async fn read_lsp_frame(
+pub(crate) async fn read_lsp_frame(
     reader: &mut (impl AsyncBufRead + Unpin),
 ) -> Result<Option<Vec<u8>>, LspError> {
     let mut header_bytes = 0usize;

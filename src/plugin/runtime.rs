@@ -72,6 +72,10 @@ pub struct CommandMetadata {
     pub aliases: Vec<String>,
     pub visible: bool,
     pub scope: CommandScope,
+    /// Opt in to receiving one `CommandInvocation` callback argument.
+    pub arguments: bool,
+    /// Optional literal completion choices, indexed by argument position.
+    pub completions: Vec<Vec<String>>,
 }
 
 impl Default for CommandMetadata {
@@ -83,8 +87,28 @@ impl Default for CommandMetadata {
             aliases: Vec::new(),
             visible: true,
             scope: CommandScope::Editor,
+            arguments: false,
+            completions: Vec::new(),
         }
     }
+}
+
+pub(crate) fn validate_command_arguments(
+    arguments: bool,
+    completions: &[Vec<String>],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        arguments || completions.is_empty(),
+        "command completions require arguments = true"
+    );
+    anyhow::ensure!(
+        completions
+            .iter()
+            .flatten()
+            .all(|value| !value.is_empty() && !value.chars().any(char::is_whitespace)),
+        "command completion choices must be nonempty single arguments"
+    );
+    Ok(())
 }
 
 /// Surfaces from which a registered plugin command may be invoked by keymap.
@@ -156,6 +180,13 @@ struct CommandMetadata {
     aliases: [String],
     visible: bool,
     scope: String,
+    arguments: bool,
+    completions: [[String]],
+}
+struct CommandInvocation {
+    name: String,
+    args: [String],
+    raw_args: String,
 }
 struct Position {
     line: i32,
@@ -2187,6 +2218,7 @@ impl RedHost {
                         anyhow::anyhow!("invalid metadata for command `{command}`: {error}")
                     })?
                     .unwrap_or_default();
+                validate_command_registration(self, &callback, &metadata)?;
                 if let Some(existing) = self.policy().commands.get(command) {
                     if existing.callback.plugin() != plugin {
                         anyhow::bail!(
@@ -2924,6 +2956,8 @@ impl Host for RedHost {
                     aliases,
                     visible,
                     scope,
+                    arguments,
+                    completions,
                 } => {
                     if let Some(existing) = self.policy().commands.get(&name) {
                         if existing.callback.plugin() == plugin {
@@ -2934,18 +2968,22 @@ impl Host for RedHost {
                             existing.callback.plugin()
                         );
                     }
+                    let metadata = CommandMetadata {
+                        title,
+                        category,
+                        description,
+                        aliases,
+                        visible,
+                        scope,
+                        arguments,
+                        completions,
+                    };
+                    validate_command_registration(self, function.callback(), &metadata)?;
                     self.policy_mut().commands.insert(
                         name,
                         RedCommand {
                             callback: function.callback().clone(),
-                            metadata: CommandMetadata {
-                                title,
-                                category,
-                                description,
-                                aliases,
-                                visible,
-                                scope,
-                            },
+                            metadata,
                         },
                     );
                 }
@@ -3677,27 +3715,17 @@ impl Runtime {
 
     #[must_use]
     pub fn command_plugin(&self, command: &str) -> Option<String> {
-        self.inner
-            .lock()
-            .unwrap()
-            .host
-            .policy()
-            .commands
-            .get(command)
-            .map(|command| command.callback.plugin().to_string())
+        let inner = self.inner.lock().unwrap();
+        resolve_command(&inner.host.policy().commands, command)
+            .map(|(_, command, _)| command.callback.plugin().to_string())
     }
 
     /// Returns the key-dispatch scope declared by an active plugin command.
     #[must_use]
     pub fn command_scope(&self, command: &str) -> Option<CommandScope> {
-        self.inner
-            .lock()
-            .unwrap()
-            .host
-            .policy()
-            .commands
-            .get(command)
-            .map(|command| command.metadata.scope)
+        let inner = self.inner.lock().unwrap();
+        resolve_command(&inner.host.policy().commands, command)
+            .map(|(_, command, _)| command.metadata.scope)
     }
 
     /// Returns the active plugin commands in a stable order for discovery UI.
@@ -3736,13 +3764,16 @@ impl Runtime {
         let _span = crate::editor::perf::PerfSpan::with_detail("husk:command", command);
         let mut inner = self.inner.lock().unwrap();
         let RuntimeInner { plugins, host, .. } = &mut *inner;
-        let callback = host
-            .policy()
-            .commands
-            .get(command)
-            .map(|command| command.callback.clone())
+        let (name, registered, raw_args) = resolve_command(&host.policy().commands, command)
             .ok_or_else(|| anyhow::anyhow!("unknown Husk plugin command `{command}`"))?;
-        call_plugin_callback(plugins, host, &callback, Vec::new()).map(drop)
+        let callback = registered.callback.clone();
+        let args = if registered.metadata.arguments {
+            let payload = command_invocation_payload(name, raw_args);
+            vec![decoded_callback_payload(host, &callback, 0, &payload)?]
+        } else {
+            Vec::new()
+        };
+        call_plugin_callback(plugins, host, &callback, args).map(drop)
     }
 
     pub async fn notify(&mut self, event: &str, args: serde_json::Value) -> anyhow::Result<()> {
@@ -4024,6 +4055,54 @@ fn call_plugin_callback(
         )
     })?;
     vm.call_callback(callback, args, host)
+}
+
+/// Exact legacy command names win over argument-aware prefix resolution.
+fn resolve_command<'a>(
+    commands: &'a HashMap<String, RedCommand>,
+    input: &'a str,
+) -> Option<(&'a str, &'a RedCommand, &'a str)> {
+    if let Some((name, command)) = commands.get_key_value(input) {
+        return Some((name, command, ""));
+    }
+    let (name, raw_args) = crate::command::split_invocation(input);
+    let (name, command) = commands.get_key_value(name)?;
+    command
+        .metadata
+        .arguments
+        .then_some((name, command, raw_args))
+}
+
+fn command_invocation_payload(name: &str, raw_args: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "args": raw_args.split_whitespace().collect::<Vec<_>>(),
+        "raw_args": raw_args,
+    })
+}
+
+fn validate_command_registration(
+    host: &RedHost,
+    callback: &Callback,
+    metadata: &CommandMetadata,
+) -> anyhow::Result<()> {
+    validate_command_arguments(metadata.arguments, &metadata.completions)?;
+    if metadata.arguments {
+        if let Some(parameters) = host
+            .policy()
+            .payload_schemas
+            .get(callback.plugin())
+            .and_then(|schema| schema.callback_parameters.get(callback.function()))
+        {
+            anyhow::ensure!(
+                matches!(parameters.as_slice(), [TypeExpr { kind: TypeExprKind::Named(name), .. }]
+                    if matches!(name.name.as_str(), "CommandInvocation" | "Json" | "JsValue")),
+                "argument-aware command callback must take one CommandInvocation or Json parameter"
+            );
+        }
+        decoded_callback_payload(host, callback, 0, &command_invocation_payload("", ""))?;
+    }
+    Ok(())
 }
 
 fn decoded_callback_payload(
@@ -5067,6 +5146,85 @@ mod tests {
             runtime.command_scope("ProjectSearch"),
             Some(CommandScope::Global)
         );
+    }
+
+    #[tokio::test]
+    async fn command_arguments_dispatch_typed_payloads_and_keep_legacy_commands() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime.load_plugin("command_arguments", r#"
+            #[red::command(name = "Service", arguments = true,
+                completions = [["enable", "disable"], ["local", "workspace"]], scope = "global")]
+            fn service(command: CommandInvocation) {
+                red::execute("Print", format("{}|{}|{}", command.name, command.args.len(), command.raw_args));
+            }
+            fn imperative(command: CommandInvocation) {
+                red::execute("Print", command.args[0]);
+            }
+            fn legacy() { red::execute("Print", "legacy"); }
+            pub fn activate() {
+                red::add_command("Imperative", imperative,
+                    Json { arguments: true, completions: [["status"]] });
+                red::add_command("Legacy", legacy);
+                red::add_command("Service exact", legacy);
+            }
+        "#).await.unwrap();
+        let commands = runtime.registered_commands();
+        let service = commands
+            .iter()
+            .find(|command| command.name == "Service")
+            .unwrap();
+        assert!(service.metadata.arguments);
+        assert_eq!(
+            service.metadata.completions,
+            [vec!["enable", "disable"], vec!["local", "workspace"]]
+        );
+        assert_eq!(
+            runtime.command_scope("Service enable"),
+            Some(CommandScope::Global)
+        );
+        for (input, expected) in [
+            ("Service", "Service|0|"),
+            (
+                "Service  enable   workspace",
+                "Service|2|enable   workspace",
+            ),
+            ("Imperative status", "status"),
+            ("Legacy", "legacy"),
+            ("Service exact", "legacy"),
+        ] {
+            runtime.execute_command(input).await.unwrap();
+            assert!(
+                matches!(ACTION_DISPATCHER.recv_request(),
+                PluginRequest::Action(Action::Print(message)) if message == expected),
+                "{input}"
+            );
+        }
+        assert!(runtime.execute_command("Legacy extra").await.is_err());
+        assert!(runtime.command_plugin("Legacy extra").is_none());
+        assert!(runtime.command_plugin("Legacy").is_some());
+    }
+
+    #[tokio::test]
+    async fn command_arguments_reject_invalid_metadata_before_activation() {
+        for source in [
+            r#"#[red::command(name = "Bad", arguments = true)] fn bad() {}"#,
+            r#"#[red::command(name = "Bad", completions = [["one"]])] fn bad() {}"#,
+            r#"#[red::command(name = "Bad", arguments = true, completions = [["two words"]])] fn bad(command: CommandInvocation) {}"#,
+            r#"pub fn activate() { red::add_command("Bad", bad, Json { arguments: true }); } fn bad() {}"#,
+            r#"pub fn activate() { red::add_command("Bad", bad, Json { arguments: true, completions: [[""]] }); } fn bad(command: CommandInvocation) {}"#,
+            r#"#[red::command(name = "Bad", arguments = true)] fn bad(value: i32) {}"#,
+        ] {
+            let mut runtime = Runtime::new();
+            assert!(
+                runtime
+                    .load_plugin("invalid_command_arguments", source)
+                    .await
+                    .is_err(),
+                "{source}"
+            );
+            assert!(runtime.command_plugin("Bad").is_none());
+        }
     }
 
     #[tokio::test]

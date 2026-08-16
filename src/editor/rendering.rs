@@ -1427,6 +1427,7 @@ impl Editor {
 
     pub(crate) fn can_render_cursor_motion_delta(&self) -> bool {
         self.terminal_output_enabled
+            && self.visible_inline_suggestion().is_none()
             && self.can_reuse_editor_surfaces()
             && self.last_rendered_viewport.is_some()
             && self.last_rendered_viewport == self.rendered_viewport()
@@ -1939,8 +1940,80 @@ impl Editor {
 
             // Render overlays within window bounds
             self.render_overlays_in_window(buffer, &window)?;
+            self.render_inline_prediction_in_window(buffer, &window)?;
         }
 
+        Ok(())
+    }
+
+    fn render_inline_prediction_in_window(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        window: &crate::window::Window,
+    ) -> anyhow::Result<()> {
+        let layout = self.layout_for_window(window);
+        if layout.inline_prediction.is_empty() {
+            return Ok(());
+        }
+        let spans = self.viewport_highlight_spans(
+            window.buffer_index,
+            window.vtop,
+            self.window_content_height(window),
+        )?;
+        let mut styles = StyleCursor::new(&spans);
+        let normal = self.theme.style.clone();
+        let ghost = Style {
+            fg: self
+                .theme
+                .colors
+                .get("editorGhostText.foreground")
+                .copied()
+                .or_else(|| self.theme.get_style("comment").and_then(|style| style.fg))
+                .or(self.theme.ui_style.muted.fg)
+                .or(normal.fg),
+            bg: normal.bg,
+            italic: true,
+            ..Style::default()
+        };
+        let width = self.window_content_width(window);
+        let start_x = self.window_to_terminal_x(window, self.gutter_width_for_window(window) + 1);
+        let tab_width = self.tab_width_for_buffer_index(window.buffer_index).max(1);
+        for row in &layout.inline_prediction {
+            let y = self.window_to_terminal_y(window, row.row);
+            self.fill_line_in_window(buffer, start_x, y, width, &normal);
+            let mut x = row.visual_offset;
+            let mut col = row.display_col;
+            for (offset, grapheme) in row.text.grapheme_indices(true) {
+                let projected = row.projected_start + offset;
+                let style = if row.insertion.contains(&projected) {
+                    &ghost
+                } else {
+                    let source = if projected >= row.insertion.end {
+                        projected - row.insertion.len()
+                    } else {
+                        projected
+                    };
+                    styles
+                        .style_at(row.source_offset + source)
+                        .unwrap_or(&normal)
+                };
+                let cells = if grapheme == "\t" {
+                    tab_width - col % tab_width
+                } else {
+                    display_width(grapheme)
+                };
+                if x.saturating_add(cells) > width {
+                    break;
+                }
+                if grapheme == "\t" {
+                    buffer.set_text(start_x + x, y, &" ".repeat(cells), style);
+                } else {
+                    buffer.set_text(start_x + x, y, grapheme, style);
+                }
+                x += cells;
+                col += cells;
+            }
+        }
         Ok(())
     }
 

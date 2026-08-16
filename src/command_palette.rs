@@ -48,6 +48,7 @@ pub(crate) const BUILTIN_COLON_COMMANDS: &[&str] = &[
 ];
 
 const SPECIAL_BUILTIN_COLON_COMMANDS: &[&str] = &[
+    "Copilot",
     "InlineHistory",
     "inline-history",
     "InlineHistoryExport",
@@ -391,6 +392,33 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Some(":messages"),
             &["notifications", "message history", "errors"],
             Action::OpenMessages,
+        ),
+        builtin(
+            "ai.copilot",
+            "Copilot status",
+            "AI",
+            "Manage inline AI completions",
+            Some(":Copilot status"),
+            &["autocomplete", "ghost text"],
+            Action::Copilot("status".into()),
+        ),
+        builtin(
+            "ai.copilot_signin",
+            "Sign in to Copilot",
+            "AI",
+            "Authenticate the official GitHub Copilot language server",
+            Some(":Copilot signin"),
+            &[],
+            Action::Copilot("signin".into()),
+        ),
+        builtin(
+            "ai.inline_completion",
+            "Request inline completion",
+            "AI",
+            "Request an AI suggestion at the cursor",
+            Some(":Copilot complete"),
+            &[],
+            Action::Command("Copilot complete".into()),
         ),
         builtin(
             "editor.inline_history",
@@ -1316,23 +1344,9 @@ fn display_key(key: &str) -> &str {
     }
 }
 
-fn colon_name_is_builtin(name: &str) -> bool {
-    matches!(
-        name,
-        "commands"
-            | "command-palette"
-            | "whats-new"
-            | "changelog"
-            | "db"
-            | "dh"
-            | "di"
-            | "dc"
-            | "dt"
-            | "registers"
-            | "undotree"
-            | "j"
-            | "join"
-    ) || command::parse(BUILTIN_COLON_COMMANDS, name).is_some()
+pub(crate) fn colon_name_is_builtin(name: &str) -> bool {
+    SPECIAL_BUILTIN_COLON_COMMANDS.contains(&name)
+        || command::parse(BUILTIN_COLON_COMMANDS, name).is_some()
 }
 
 fn humanize_identifier(identifier: &str) -> String {

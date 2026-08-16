@@ -20,6 +20,7 @@ mod buffer_manager;
 mod diagnostics_picker;
 mod display_layout;
 mod inline_comments;
+mod inline_completion;
 mod inline_history;
 mod lsp_coordinator;
 #[cfg(test)]
@@ -84,7 +85,9 @@ use crate::{
     clipboard::{ClipboardProvider, DisabledClipboardProvider, NativeClipboardProvider},
     codex::{start_codex, CodexBridge, CodexCommand, CodexEvent, CodexProcessSpec},
     color::Color,
-    command, command_palette,
+    command,
+    command_completion::{self, CommandCompletionState, CompletionDirection},
+    command_palette,
     comment::CommentSyntax,
     config::{
         Config, ConfigDiagnostic, ConfigDiagnosticSource, ConfigRecovery, FormattingProvider,
@@ -2470,6 +2473,15 @@ pub enum Action {
     BufferText(Value),
 
     RequestCompletion,
+    Copilot(String),
+    RequestInlineCompletion,
+    AcceptInlineCompletion,
+    DismissInlineCompletion,
+    CopilotFinishSignIn(Value),
+    CopilotRespond {
+        id: Value,
+        result: Value,
+    },
     RequestCompletionWithTrigger(char),
     ApplyCompletion {
         item: Box<CompletionResponseItem>,
@@ -2657,6 +2669,7 @@ struct LayoutCacheKey {
     content_height: usize,
     line_count_override: Option<usize>,
     break_indent: BreakIndentOptions,
+    inline_prediction: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -3216,6 +3229,7 @@ pub struct Editor {
     pending_lsp_revision_snapshots: HashMap<i64, Vec<(String, u64)>>,
     pending_completions: HashMap<i64, PendingCompletion>,
     scheduled_completion: Option<ScheduledCompletion>,
+    inline_completion: inline_completion::InlineCompletionState,
     completion_snapshot: Option<CompletionSnapshot>,
 }
 
@@ -3645,35 +3659,6 @@ impl PromptHistoryNavigation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CommandCompletionState {
-    replacement_start: usize,
-    replacement_end: usize,
-    candidates: Vec<String>,
-    selected: usize,
-    needs_leading_space: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CommandCompletionContext {
-    replacement_start: usize,
-    replacement_end: usize,
-    fragment: String,
-    needs_leading_space: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CompletionDirection {
-    Next,
-    Previous,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PathCompletionCandidate {
-    replacement: String,
-    is_dir: bool,
-}
-
 #[derive(Debug, Clone)]
 struct SearchSession {
     origin: HistoryEntry,
@@ -3747,6 +3732,7 @@ struct PendingCompletion {
     buffer_items: Vec<CompletionResponseItem>,
     snapshot: CompletionSnapshot,
     displayed_immediately: bool,
+    superseded: bool,
 }
 
 impl From<PendingLspEdit> for CompletionSnapshot {
@@ -4473,6 +4459,7 @@ impl Editor {
             pending_lsp_revision_snapshots: HashMap::new(),
             pending_completions: HashMap::new(),
             scheduled_completion: None,
+            inline_completion: inline_completion::InlineCompletionState::default(),
             completion_snapshot: None,
         })
     }
@@ -5637,6 +5624,9 @@ impl Editor {
         }
 
         let break_indent = self.break_indent_options_for_buffer_index(window.buffer_index);
+        let prediction = self
+            .visible_inline_suggestion()
+            .filter(|suggestion| window.active && suggestion.snapshot.buffer_id == buffer.id());
         let key = LayoutCacheKey {
             buffer_index: window.buffer_index,
             buffer_id: buffer.id(),
@@ -5650,6 +5640,7 @@ impl Editor {
             content_height: self.window_content_height(window),
             line_count_override,
             break_indent,
+            inline_prediction: prediction.map(|suggestion| suggestion.snapshot.generation),
         };
         if let Some(layout) = self.layout_cache.borrow().get(&key) {
             return layout.clone();
@@ -5669,26 +5660,37 @@ impl Editor {
             .iter()
             .map(|(line, message)| (*line, message.as_str()))
             .collect::<Vec<_>>();
-        let layout = std::sync::Arc::new(
-            layout_lines(
-                &lines,
-                line_count,
-                LayoutConfig {
-                    content_width: self.window_content_width(window),
-                    height: self.window_content_height(window),
-                    wrap: window.wrap,
-                    vtop: window.vtop,
-                    vleft: window.vleft,
-                    skipcol: window.skipcol,
-                    break_indent,
-                },
-            )
-            .with_inline_comments(
-                &comments,
-                self.window_content_width(window),
-                self.window_content_height(window),
-            ),
+        let layout_config = LayoutConfig {
+            content_width: self.window_content_width(window),
+            height: self.window_content_height(window),
+            wrap: window.wrap,
+            vtop: window.vtop,
+            vleft: window.vleft,
+            skipcol: window.skipcol,
+            break_indent,
+        };
+        let mut layout = layout_lines(&lines, line_count, layout_config).with_inline_comments(
+            &comments,
+            self.window_content_width(window),
+            self.window_content_height(window),
         );
+        if let Some(suggestion) = prediction {
+            if let Some(line) = buffer.get(suggestion.snapshot.cursor.line) {
+                let line = trim_line_ending(&line);
+                let cursor_byte = line
+                    .char_indices()
+                    .nth(suggestion.snapshot.cursor.character)
+                    .map_or(line.len(), |(byte, _)| byte);
+                layout = layout.with_inline_prediction(
+                    suggestion.snapshot.cursor.line,
+                    line,
+                    cursor_byte,
+                    &suggestion.insertion,
+                    layout_config,
+                );
+            }
+        }
+        let layout = std::sync::Arc::new(layout);
 
         let mut cache = self.layout_cache.borrow_mut();
         if cache.len() >= 32 {
@@ -8750,6 +8752,7 @@ impl Editor {
             }
         }
 
+        let inline_completion_changed = self.service_inline_completion();
         let completion_changed = if self
             .scheduled_completion
             .is_some_and(|scheduled| Instant::now() >= scheduled.deadline)
@@ -8794,7 +8797,8 @@ impl Editor {
         }
         let panel_animation_changed = self.panel_manager.poll_animation();
         let overlay_animation_changed = self.overlay_manager.poll_animation();
-        if completion_changed
+        if inline_completion_changed
+            || completion_changed
             || startup_release_changed
             || dialog_changed
             || keymap_hints_changed
@@ -11576,6 +11580,9 @@ impl Editor {
         &self,
         pending: &PendingCompletion,
     ) -> Option<CompletionSnapshot> {
+        if pending.superseded {
+            return None;
+        }
         if pending.displayed_immediately {
             let active = self.completion_snapshot.as_ref()?;
             let same_session = active.buffer_id == pending.snapshot.buffer_id
@@ -12217,8 +12224,12 @@ impl Editor {
                                         .map(CompletionSnapshot::from)
                                         .unwrap_or_else(|| self.completion_snapshot()),
                                     displayed_immediately: false,
+                                    superseded: false,
                                 }
                             });
+                        if pending.superseded {
+                            return None;
+                        }
                         if pending.displayed_immediately && self.completion_snapshot.is_none() {
                             return None;
                         }
@@ -12333,6 +12344,12 @@ impl Editor {
                 let pending_completion = self.pending_completions.remove(&id);
                 let save = self.pending_lsp_format_saves.remove(&id);
                 self.pending_lsp_revision_snapshots.remove(&id);
+                if pending_completion
+                    .as_ref()
+                    .is_some_and(|pending| pending.superseded)
+                {
+                    return None;
+                }
                 if method.as_deref() == Some("textDocument/completion")
                     && pending_completion
                         .is_some_and(|pending| self.show_completion_fallback(pending))
@@ -12399,6 +12416,12 @@ impl Editor {
                     let pending_completion = self.pending_completions.remove(id);
                     let save = self.pending_lsp_format_saves.remove(id);
                     self.pending_lsp_revision_snapshots.remove(id);
+                    if pending_completion
+                        .as_ref()
+                        .is_some_and(|pending| pending.superseded)
+                    {
+                        return None;
+                    }
                     if method.as_deref() == Some("textDocument/completion")
                         && pending_completion
                             .is_some_and(|pending| self.show_completion_fallback(pending))
@@ -12480,6 +12503,9 @@ impl Editor {
         ev: &event::Event,
         runtime: Option<&Runtime>,
     ) -> anyhow::Result<Option<KeyAction>> {
+        if let Some(action) = self.handle_inline_completion_event(ev) {
+            return Ok(Some(action));
+        }
         // Pointer motion has no editor/pane action. Let dialogs opt into hover
         // handling without clearing an in-progress key sequence or its hints.
         if matches!(
@@ -13550,6 +13576,20 @@ impl Editor {
         self.repeater = None;
         self.set_legacy_message(None);
 
+        if cmd == "Copilot" || cmd.starts_with("Copilot ") {
+            let command = cmd.strip_prefix("Copilot").unwrap_or_default().trim();
+            return if crate::copilot::CopilotCommand::parse(command)
+                == Some(crate::copilot::CopilotCommand::Complete)
+            {
+                vec![
+                    Action::EnterMode(Mode::Insert),
+                    Action::RequestInlineCompletion,
+                ]
+            } else {
+                vec![Action::Copilot(command.to_string())]
+            };
+        }
+
         if let Some(commands) = self.scratch_buffers.get(&self.current_buffer().id()) {
             let routed = match cmd.trim() {
                 "w" | "w!" | "write" | "write!" | "wq" | "wq!" => commands.submit.as_ref(),
@@ -13788,8 +13828,8 @@ impl Editor {
             }
 
             if cmd == "write" {
-                if let Some(file) = parsed.args.first() {
-                    actions.push(Action::SaveAs(file.clone()));
+                if let Some(file) = parsed.file_argument() {
+                    actions.push(Action::SaveAs(file));
                 } else {
                     actions.push(Action::Save);
                 }
@@ -13808,8 +13848,8 @@ impl Editor {
             }
 
             if cmd == "edit" {
-                if let Some(file) = parsed.args.first() {
-                    actions.push(Action::OpenFile(file.clone()));
+                if let Some(file) = parsed.file_argument() {
+                    actions.push(Action::OpenFile(file));
                 } else {
                     actions.push(Action::ReloadFile(parsed.is_forced()));
                 }
@@ -13821,8 +13861,8 @@ impl Editor {
                     cmd,
                     parsed.args
                 );
-                if let Some(file) = parsed.args.first() {
-                    actions.push(Action::SplitHorizontalWithFile(file.clone()));
+                if let Some(file) = parsed.file_argument() {
+                    actions.push(Action::SplitHorizontalWithFile(file));
                 } else {
                     actions.push(Action::SplitHorizontal);
                 }
@@ -13834,8 +13874,8 @@ impl Editor {
                     cmd,
                     parsed.args
                 );
-                if let Some(file) = parsed.args.first() {
-                    actions.push(Action::SplitVerticalWithFile(file.clone()));
+                if let Some(file) = parsed.file_argument() {
+                    actions.push(Action::SplitVerticalWithFile(file));
                 } else {
                     actions.push(Action::SplitVertical);
                 }
@@ -14296,244 +14336,24 @@ impl Editor {
         self.update_search_preview();
     }
 
-    fn command_accepts_file_completion(command: &str) -> bool {
-        matches!(
-            command.trim_end_matches('!'),
-            "e" | "edit" | "w" | "write" | "sp" | "split" | "vs" | "vsplit"
-        )
-    }
-
-    fn command_accepts_syntax_completion(command: &str) -> bool {
-        matches!(command.trim_end_matches('!'), "syntax" | "syn" | "ft")
-    }
-
-    fn command_completion_context(
-        command: &str,
-        accepts_completion: fn(&str) -> bool,
-    ) -> Option<CommandCompletionContext> {
-        let command_start = command
-            .char_indices()
-            .find_map(|(index, ch)| (!ch.is_whitespace()).then_some(index))?;
-        let after_leading = &command[command_start..];
-        let command_end = after_leading
-            .char_indices()
-            .find_map(|(index, ch)| ch.is_whitespace().then_some(command_start + index))
-            .unwrap_or(command.len());
-        let command_name = &command[command_start..command_end];
-        if !accepts_completion(command_name) {
-            return None;
-        }
-
-        let args_start = command[command_end..]
-            .char_indices()
-            .find_map(|(index, ch)| (!ch.is_whitespace()).then_some(command_end + index));
-
-        if let Some(replacement_start) = args_start {
-            Some(CommandCompletionContext {
-                replacement_start,
-                replacement_end: command.len(),
-                fragment: command[replacement_start..].to_string(),
-                needs_leading_space: false,
-            })
-        } else {
-            Some(CommandCompletionContext {
-                replacement_start: command_end,
-                replacement_end: command.len(),
-                fragment: String::new(),
-                needs_leading_space: true,
-            })
-        }
-    }
-
-    fn dot_directory_candidate(fragment: &str) -> Option<PathCompletionCandidate> {
-        match fragment {
-            "." => Some(PathCompletionCandidate {
-                replacement: "./".to_string(),
-                is_dir: true,
-            }),
-            ".." => Some(PathCompletionCandidate {
-                replacement: "../".to_string(),
-                is_dir: true,
-            }),
-            "~" if expand_user_path("~").is_ok() => Some(PathCompletionCandidate {
-                replacement: "~/".to_string(),
-                is_dir: true,
-            }),
-            _ => None,
-        }
-    }
-
-    fn path_completion_candidates(fragment: &str) -> Vec<PathCompletionCandidate> {
-        if let Some(candidate) = Self::dot_directory_candidate(fragment) {
-            return vec![candidate];
-        }
-
-        let (directory_fragment, file_prefix) = fragment
-            .rfind('/')
-            .map(|index| (&fragment[..=index], &fragment[index + 1..]))
-            .unwrap_or(("", fragment));
-        let directory_path = if directory_fragment.is_empty() {
-            PathBuf::from(".")
-        } else {
-            expand_user_path(directory_fragment)
-                .unwrap_or_else(|_| PathBuf::from(directory_fragment))
-        };
-
-        let Ok(read_dir) = fs::read_dir(directory_path) else {
-            return Vec::new();
-        };
-
-        let mut candidates = read_dir
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if !name.starts_with(file_prefix) {
-                    return None;
-                }
-
-                let is_dir = entry
-                    .file_type()
-                    .map(|file_type| file_type.is_dir())
-                    .unwrap_or(false);
-                let suffix = if is_dir { "/" } else { "" };
-                Some(PathCompletionCandidate {
-                    replacement: format!("{directory_fragment}{name}{suffix}"),
-                    is_dir,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        candidates.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-            (true, false) => Ordering::Less,
-            (false, true) => Ordering::Greater,
-            _ => a.replacement.cmp(&b.replacement),
-        });
-        candidates
-    }
-
-    fn apply_command_completion_candidate(&mut self, candidate: &str) {
-        let Some(completion) = self.command_completion.as_mut() else {
-            return;
-        };
-        let replacement = if completion.needs_leading_space {
-            format!(" {candidate}")
-        } else {
-            candidate.to_string()
-        };
-        self.command.replace_range(
-            completion.replacement_start..completion.replacement_end,
-            &replacement,
-        );
-        completion.replacement_end = completion.replacement_start + replacement.len();
-    }
-
     fn complete_command_line(
         &mut self,
         direction: CompletionDirection,
         plugin_commands: &[plugin::RegisteredPluginCommand],
     ) {
-        if let Some(mut completion) = self.command_completion.take() {
-            if completion.candidates.len() > 1 {
-                completion.selected = match direction {
-                    CompletionDirection::Next => {
-                        (completion.selected + 1) % completion.candidates.len()
-                    }
-                    CompletionDirection::Previous => completion
-                        .selected
-                        .checked_sub(1)
-                        .unwrap_or_else(|| completion.candidates.len() - 1),
-                };
-                self.command_completion = Some(completion);
-                let candidate = self
-                    .command_completion
-                    .as_ref()
-                    .and_then(|state| state.candidates.get(state.selected).cloned());
-                if let Some(candidate) = candidate {
-                    self.apply_command_completion_candidate(&candidate);
-                }
-                return;
-            }
-        }
-
-        let (context, candidates) = if let Some(context) =
-            Self::command_completion_context(&self.command, Self::command_accepts_file_completion)
-        {
-            let candidates = Self::path_completion_candidates(&context.fragment)
-                .into_iter()
-                .map(|candidate| candidate.replacement)
-                .collect::<Vec<_>>();
-            (context, candidates)
-        } else if let Some(context) =
-            Self::command_completion_context(&self.command, Self::command_accepts_syntax_completion)
-        {
-            let fragment = context.fragment.to_ascii_lowercase();
-            let mut candidates = if fragment.chars().any(char::is_whitespace) {
-                Vec::new()
-            } else {
-                ["auto", "off"]
+        command_completion::complete(
+            &mut self.command_completion,
+            &mut self.command,
+            direction,
+            plugin_commands,
+            |fragment| {
+                self.highlighter
+                    .matching_language_ids(fragment)
                     .into_iter()
-                    .filter(|language| language.starts_with(&fragment))
                     .map(str::to_string)
-                    .chain(
-                        self.highlighter
-                            .matching_language_ids(&fragment)
-                            .into_iter()
-                            .map(str::to_string),
-                    )
-                    .collect::<Vec<_>>()
-            };
-            candidates.sort_unstable();
-            candidates.dedup();
-            (context, candidates)
-        } else {
-            let command_start = self
-                .command
-                .char_indices()
-                .find_map(|(index, ch)| (!ch.is_whitespace()).then_some(index))
-                .unwrap_or(self.command.len());
-            let fragment = &self.command[command_start..];
-            if fragment.is_empty() || fragment.chars().any(char::is_whitespace) {
-                self.command_completion = None;
-                return;
-            }
-            let candidates = command_palette::colon_completion_names(plugin_commands)
-                .into_iter()
-                .filter(|command| command.starts_with(fragment))
-                .collect::<Vec<_>>();
-            (
-                CommandCompletionContext {
-                    replacement_start: command_start,
-                    replacement_end: self.command.len(),
-                    fragment: fragment.to_string(),
-                    needs_leading_space: false,
-                },
-                candidates,
-            )
-        };
-        if candidates.is_empty() {
-            self.command_completion = None;
-            return;
-        }
-
-        let selected = match direction {
-            CompletionDirection::Next => 0,
-            CompletionDirection::Previous => candidates.len() - 1,
-        };
-
-        self.command_completion = Some(CommandCompletionState {
-            replacement_start: context.replacement_start,
-            replacement_end: context.replacement_end,
-            candidates,
-            selected,
-            needs_leading_space: context.needs_leading_space,
-        });
-        let candidate = self
-            .command_completion
-            .as_ref()
-            .and_then(|state| state.candidates.get(state.selected).cloned());
-        if let Some(candidate) = candidate {
-            self.apply_command_completion_candidate(&candidate);
-        }
+                    .collect()
+            },
+        );
     }
 
     fn record_command_history(&mut self, command: &str) {
@@ -16446,6 +16266,10 @@ impl Editor {
         // log!("Action: {action:?}");
         self.set_legacy_message(None);
         let sensitive_action = matches!(action, Action::NotifyPlugin(_, _, _))
+            || matches!(
+                action,
+                Action::CopilotFinishSignIn(_) | Action::CopilotRespond { .. }
+            )
             || matches!(action, Action::SubmitInlineAssist(_))
             || matches!(action, Action::NotifyPlugins(method, _) if method.starts_with("composer:"));
         if !sensitive_action {
@@ -20136,6 +19960,38 @@ impl Editor {
                     self.render(buffer)?;
                 }
             }
+            Action::Copilot(command) => {
+                add_to_history = false;
+                self.handle_copilot_command(command);
+                self.render(buffer)?;
+            }
+            Action::RequestInlineCompletion => {
+                add_to_history = false;
+                self.request_inline_completion(false);
+                self.render(buffer)?;
+            }
+            Action::AcceptInlineCompletion => {
+                self.accept_inline_completion(runtime).await?;
+                self.render(buffer)?;
+            }
+            Action::DismissInlineCompletion => {
+                add_to_history = false;
+                self.dismiss_inline_completion();
+                self.render(buffer)?;
+            }
+            Action::CopilotFinishSignIn(command) => {
+                add_to_history = false;
+                self.copilot_control(crate::copilot::Control::FinishSignIn(command.clone()));
+                self.render(buffer)?;
+            }
+            Action::CopilotRespond { id, result } => {
+                add_to_history = false;
+                self.copilot_control(crate::copilot::Control::Respond {
+                    id: id.clone(),
+                    result: result.clone(),
+                });
+                self.render(buffer)?;
+            }
             Action::RequestCompletionWithTrigger(trigger_character) => {
                 if self.request_completion(Some(*trigger_character)).await? {
                     self.render(buffer)?;
@@ -21526,6 +21382,7 @@ impl Editor {
             return Ok(());
         }
 
+        self.schedule_inline_completion();
         let file = self.current_buffer().file.clone();
 
         // Notify LSP if enabled and the buffer has a file.
@@ -24614,7 +24471,8 @@ impl Editor {
             self.scheduled_completion = None;
             return;
         };
-        if !self.config.completion.auto_trigger
+        if self.prefers_inline_completion()
+            || !self.config.completion.auto_trigger
             || prefix.chars().count() < self.config.completion.min_prefix_length
         {
             self.scheduled_completion = None;
@@ -24924,6 +24782,7 @@ impl Editor {
             return Ok(false);
         }
 
+        self.dismiss_inline_completion();
         self.scheduled_completion = None;
         let buffer_items = self.buffer_completion_items();
         let snapshot = self.completion_snapshot();
@@ -24977,6 +24836,7 @@ impl Editor {
                         buffer_items,
                         snapshot: pending_snapshot,
                         displayed_immediately,
+                        superseded: false,
                     },
                 );
                 return Ok(displayed_immediately);
@@ -28565,6 +28425,56 @@ builtin = "rust"
             editor.last_error.as_deref(),
             Some("reloaded 1 configured language")
         );
+    }
+
+    #[tokio::test]
+    async fn command_argument_completion_runs_plugin_only_after_enter() {
+        drain_plugin_requests();
+        let mut editor = test_editor(80, 12);
+        let mut buffer = RenderBuffer::new(80, 12, &Style::default());
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "argument_completion",
+                r#"
+            #[red::command(name = "Service", arguments = true,
+                completions = [["enable", "disable"], ["local", "workspace"]])]
+            fn service(command: CommandInvocation) {
+                red::execute("Print", format("received: {}", command.raw_args));
+            }
+        "#,
+            )
+            .await
+            .unwrap();
+        editor.test_set_commandline(Mode::Command, "Service en");
+        for key in [
+            KeyCode::Tab,
+            KeyCode::Char(' '),
+            KeyCode::Char('l'),
+            KeyCode::Tab,
+        ] {
+            editor
+                .process_editor_event(
+                    Event::Key(KeyEvent::new(key, KeyModifiers::NONE)),
+                    &mut buffer,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(editor.command, "Service enable local");
+        assert!(collect_print_requests().is_empty());
+        assert_eq!(editor.last_error, None);
+
+        enter_colon_command(
+            &mut editor,
+            &mut buffer,
+            &mut runtime,
+            "Service enable local",
+        )
+        .await;
+        assert_eq!(editor.last_error.as_deref(), Some("received: enable local"));
     }
 
     #[tokio::test]
@@ -33065,6 +32975,7 @@ builtin = "rust"
                 buffer_items,
                 snapshot: pending_snapshot,
                 displayed_immediately: true,
+                superseded: false,
             },
         );
         let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
@@ -33114,6 +33025,7 @@ builtin = "rust"
                 buffer_items,
                 snapshot: pending_snapshot,
                 displayed_immediately: true,
+                superseded: false,
             },
         );
         let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
