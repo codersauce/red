@@ -25,6 +25,7 @@ pub(super) struct InlineCompletionState {
     failed: bool,
     prompts: VecDeque<CopilotEvent>,
     pub(super) sign_in: Option<Arc<Mutex<CopilotSignInModel>>>,
+    setup_hint_checked: bool,
 }
 
 pub(super) struct Suggestion {
@@ -215,13 +216,13 @@ impl Editor {
 
     fn ensure_copilot(&mut self) -> bool {
         if self.config.disable_ai {
-            self.last_error = Some("Copilot is disabled by disable_ai = true".into());
+            self.set_legacy_message(Some("Copilot is disabled by disable_ai = true".into()));
             return false;
         }
         if !self.copilot_enabled() {
-            self.last_error = Some(
+            self.set_legacy_message(Some(
                 "Copilot is disabled; use :Copilot enable to allow source-code transmission".into(),
-            );
+            ));
             return false;
         }
         if self.inline_completion.failed {
@@ -237,6 +238,50 @@ impl Editor {
         true
     }
 
+    fn copilot_executable_available(&self) -> bool {
+        crate::codex::find_executable(&self.config.copilot.command).is_some()
+    }
+
+    fn mark_copilot_setup_hint_seen(&mut self) {
+        self.inline_completion.setup_hint_checked = true;
+        if let Err(error) = self.preferences.mark_copilot_setup_hint_seen() {
+            log!("failed to persist Copilot setup hint: {error}");
+        }
+    }
+
+    fn confirm_copilot_sign_in(&mut self) {
+        if self.config.disable_ai {
+            self.set_legacy_message(Some("Copilot is disabled by disable_ai = true".into()));
+            return;
+        }
+        if !self.copilot_executable_available() {
+            self.set_legacy_message(Some(format!(
+                "Copilot language server not found: {}",
+                self.config.copilot.command
+            )));
+            return;
+        }
+        self.mark_copilot_setup_hint_seen();
+        self.current_dialog = Some(Box::new(Confirmation::new_actions(
+            self,
+            "Enable GitHub Copilot?",
+            "Eligible source files may be sent to GitHub for inline suggestions. Copilot will be enabled for this session.",
+            "Enable and sign in",
+            "Cancel",
+            Action::CopilotEnableAndSignIn,
+            Action::CloseDialog,
+        )));
+    }
+
+    pub(super) fn enable_and_sign_in_copilot(&mut self) {
+        self.inline_completion.enabled_override = Some(true);
+        self.inline_completion.failed = false;
+        if self.ensure_copilot() {
+            self.set_legacy_message(Some("Contacting GitHub Copilot...".into()));
+            self.copilot_control(Control::SignIn);
+        }
+    }
+
     pub(super) fn copilot_control(&mut self, control: Control) {
         if !self.ensure_copilot() {
             return;
@@ -247,7 +292,7 @@ impl Editor {
             .as_ref()
             .map(|bridge| bridge.control(control))
         {
-            self.last_error = Some(error.to_string());
+            self.set_legacy_message(Some(error.to_string()));
         }
     }
 
@@ -256,18 +301,22 @@ impl Editor {
         match CopilotCommand::parse(command) {
             Some(CopilotCommand::Enable) => {
                 if self.config.disable_ai {
-                    self.last_error = Some("Copilot is disabled by disable_ai = true".into());
+                    self.set_legacy_message(Some(
+                        "Copilot is disabled by disable_ai = true".into(),
+                    ));
                     return;
                 }
+                self.mark_copilot_setup_hint_seen();
                 self.inline_completion.enabled_override = Some(true);
                 self.inline_completion.failed = false;
                 self.ensure_copilot();
-                self.last_error = Some(
+                self.set_legacy_message(Some(
                     "Copilot enabled for this session; eligible source files may be sent to GitHub"
                         .into(),
-                );
+                ));
             }
             Some(CopilotCommand::Disable) => {
+                self.mark_copilot_setup_hint_seen();
                 self.dismiss_inline_completion();
                 if self.inline_completion.sign_in.take().is_some() {
                     self.current_dialog = None;
@@ -276,16 +325,22 @@ impl Editor {
                 self.inline_completion.bridge = None;
                 self.inline_completion.prompts.clear();
                 self.inline_completion.status = "Disabled".into();
-                self.last_error = Some("Copilot disabled".into());
+                self.set_legacy_message(Some("Copilot disabled".into()));
             }
-            Some(CopilotCommand::SignIn | CopilotCommand::Restart) => {
+            Some(CopilotCommand::SignIn) => {
                 self.inline_completion.failed = false;
-                if command == "restart" {
-                    self.inline_completion.bridge = None;
+                if self.copilot_enabled() {
+                    if self.ensure_copilot() {
+                        self.copilot_control(Control::SignIn);
+                    }
+                } else {
+                    self.confirm_copilot_sign_in();
                 }
-                if self.ensure_copilot() && command == "signin" {
-                    self.copilot_control(Control::SignIn);
-                }
+            }
+            Some(CopilotCommand::Restart) => {
+                self.inline_completion.failed = false;
+                self.inline_completion.bridge = None;
+                self.ensure_copilot();
             }
             Some(CopilotCommand::SignOut) => {
                 self.dismiss_inline_completion();
@@ -294,19 +349,17 @@ impl Editor {
                 }
                 self.copilot_control(Control::SignOut);
             }
-            Some(CopilotCommand::Status) => {
-                self.last_error = Some(format!(
-                    "Copilot: {}",
-                    if !self.copilot_enabled() {
-                        "Disabled"
-                    } else if self.inline_completion.status.is_empty() {
-                        "Not started"
-                    } else {
-                        &self.inline_completion.status
-                    }
-                ))
-            }
-            _ => self.last_error = Some(CopilotCommand::usage()),
+            Some(CopilotCommand::Status) => self.set_legacy_message(Some(format!(
+                "Copilot: {}",
+                if !self.copilot_enabled() {
+                    "Disabled"
+                } else if self.inline_completion.status.is_empty() {
+                    "Not started"
+                } else {
+                    &self.inline_completion.status
+                }
+            ))),
+            _ => self.set_legacy_message(Some(CopilotCommand::usage())),
         }
     }
 
@@ -357,11 +410,11 @@ impl Editor {
                 }
             }
         }
-        self.last_error = Some(if copied {
+        self.set_legacy_message(Some(if copied {
             "Copilot device code copied to clipboard".into()
         } else {
             "Unable to copy Copilot device code; it remains visible in the dialog".into()
-        });
+        }));
     }
 
     pub(super) fn retry_copilot_sign_in(&mut self) {
@@ -405,8 +458,9 @@ impl Editor {
         };
         if !self.copilot_file_allowed() {
             if !automatic {
-                self.last_error =
-                    Some("Copilot: file excluded, outside workspace, or too large".into());
+                self.set_legacy_message(Some(
+                    "Copilot: file excluded, outside workspace, or too large".into(),
+                ));
             }
             return;
         }
@@ -434,6 +488,23 @@ impl Editor {
 
     pub(super) fn service_inline_completion(&mut self) -> bool {
         let mut changed = false;
+        if !self.inline_completion.setup_hint_checked
+            && !self.config.disable_ai
+            && !self.config.copilot.enabled
+            && self.preferences.is_persistent()
+            && !self.preferences.copilot_setup_hint_seen()
+            && self.current_dialog.is_none()
+            && self.last_error.is_none()
+            && self.copilot_file_allowed()
+            && self.copilot_executable_available()
+        {
+            self.mark_copilot_setup_hint_seen();
+            self.set_legacy_message(Some(
+                "GitHub Copilot is available. Run :Copilot signin to enable inline suggestions."
+                    .into(),
+            ));
+            changed = true;
+        }
         if !self.copilot_enabled() && self.inline_completion.bridge.is_some() {
             self.dismiss_inline_completion();
             self.inline_completion.bridge = None;
@@ -481,13 +552,13 @@ impl Editor {
                             }
                         }
                         self.inline_completion.status = format!("Sign-in failed: {error}");
-                        self.last_error = Some(format!("Copilot sign-in failed: {error}"));
+                        self.set_legacy_message(Some(format!("Copilot sign-in failed: {error}")));
                     } else {
                         self.inline_completion.status = "Signed in".into();
                         if self.inline_completion.sign_in.take().is_some() {
                             self.current_dialog = None;
                         }
-                        self.last_error = Some("Copilot signed in".into());
+                        self.set_legacy_message(Some("Copilot signed in".into()));
                     }
                     changed = true;
                 }
@@ -501,7 +572,7 @@ impl Editor {
                             model.phase = CopilotSignInPhase::Failed(status.clone());
                         }
                     }
-                    self.last_error = Some(status);
+                    self.set_legacy_message(Some(status));
                     changed = true;
                     break;
                 }
@@ -809,6 +880,116 @@ mod tests {
         );
     }
 
+    #[test]
+    fn available_copilot_is_suggested_once_without_starting_it() {
+        let mut editor = editor("foo");
+        let preferences_dir =
+            std::env::temp_dir().join(format!("red-copilot-hint-editor-{}", uuid::Uuid::new_v4()));
+        editor.preferences = PreferencesStore::load(preferences_dir.join("preferences.json"));
+        editor.config.copilot.enabled = false;
+        editor.config.copilot.command = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        editor.inline_completion.bridge = None;
+
+        assert!(editor.service_inline_completion());
+
+        assert_eq!(
+            editor.last_error.as_deref(),
+            Some("GitHub Copilot is available. Run :Copilot signin to enable inline suggestions.")
+        );
+        assert!(editor.preferences.copilot_setup_hint_seen());
+        assert!(editor.inline_completion.bridge.is_none());
+
+        editor.set_legacy_message(None);
+        assert!(!editor.service_inline_completion());
+        assert!(editor.last_error.is_none());
+        std::fs::remove_dir_all(preferences_dir).ok();
+    }
+
+    #[test]
+    fn copilot_hint_respects_global_ai_disable() {
+        let mut editor = editor("foo");
+        editor.config.copilot.enabled = false;
+        editor.config.disable_ai = true;
+        editor.config.copilot.command = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        editor.inline_completion.bridge = None;
+
+        assert!(!editor.service_inline_completion());
+        assert!(!editor.preferences.copilot_setup_hint_seen());
+        assert!(editor.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn signin_confirms_consent_then_enables_and_starts_authentication() {
+        let mut editor = editor("foo");
+        editor.config.copilot.enabled = false;
+        editor.config.copilot.command = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        editor.inline_completion.bridge = None;
+
+        editor.handle_copilot_command("signin");
+
+        assert!(!editor.copilot_enabled());
+        assert!(editor.inline_completion.bridge.is_none());
+        assert!(editor.preferences.copilot_setup_hint_seen());
+        let dialog = editor.current_dialog.as_mut().unwrap();
+        dialog.handle_event(&Event::Key(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            dialog.handle_event(&Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::CopilotEnableAndSignIn,
+            ]))
+        );
+
+        let (bridge, _requests, mut controls, _events) = Bridge::test_channels();
+        editor.inline_completion.bridge = Some(bridge);
+        editor
+            .test_execute_action(Action::CopilotEnableAndSignIn)
+            .await
+            .unwrap();
+
+        assert!(editor.copilot_enabled());
+        assert_eq!(
+            editor.last_error.as_deref(),
+            Some("Contacting GitHub Copilot...")
+        );
+        assert!(matches!(controls.recv().await, Some(Control::SignIn)));
+    }
+
+    #[test]
+    fn signin_reports_a_missing_language_server_without_enabling() {
+        let mut editor = editor("foo");
+        editor.config.copilot.enabled = false;
+        editor.config.copilot.command = format!(
+            "red-missing-copilot-language-server-{}",
+            uuid::Uuid::new_v4()
+        );
+        editor.inline_completion.bridge = None;
+
+        editor.handle_copilot_command("signin");
+
+        assert!(!editor.copilot_enabled());
+        assert!(editor.current_dialog.is_none());
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.starts_with("Copilot language server not found:")));
+    }
+
     #[tokio::test]
     async fn sign_in_copies_the_code_stays_open_and_tracks_the_result() {
         let mut editor = editor("foo");
@@ -884,6 +1065,23 @@ mod tests {
         assert!(editor.current_dialog.is_none());
         assert!(editor.inline_completion.sign_in.is_none());
         assert_eq!(editor.last_error.as_deref(), Some("Copilot signed in"));
+        assert!(editor
+            .notifications()
+            .records()
+            .any(|notice| notice.content.summary == "Copilot signed in"));
+    }
+
+    #[test]
+    fn copilot_status_is_published_as_a_visible_notification() {
+        let mut editor = editor("foo");
+        editor.inline_completion.status = "Signed in".into();
+
+        editor.handle_copilot_command("status");
+
+        assert!(editor
+            .notifications()
+            .records()
+            .any(|notice| notice.content.summary == "Copilot: Signed in"));
     }
 
     #[tokio::test]

@@ -2475,6 +2475,7 @@ pub enum Action {
 
     RequestCompletion,
     Copilot(String),
+    CopilotEnableAndSignIn,
     RequestInlineCompletion,
     AcceptInlineCompletion,
     DismissInlineCompletion,
@@ -16273,6 +16274,7 @@ impl Editor {
             || matches!(
                 action,
                 Action::CopilotFinishSignIn(_)
+                    | Action::CopilotEnableAndSignIn
                     | Action::CopilotCopySignInCode(_)
                     | Action::CopilotRetrySignIn
                     | Action::CopilotDismissSignIn
@@ -19971,6 +19973,11 @@ impl Editor {
             Action::Copilot(command) => {
                 add_to_history = false;
                 self.handle_copilot_command(command);
+                self.render(buffer)?;
+            }
+            Action::CopilotEnableAndSignIn => {
+                add_to_history = false;
+                self.enable_and_sign_in_copilot();
                 self.render(buffer)?;
             }
             Action::RequestInlineCompletion => {
