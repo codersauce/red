@@ -145,6 +145,10 @@ impl Dialog {
         self
     }
 
+    pub(crate) fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
     pub fn set_title(&mut self, title: Option<String>) {
         self.title = title;
     }

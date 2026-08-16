@@ -24,6 +24,8 @@ pub enum ActionPriority {
     Primary,
     /// Discoverable conveniences that may move into the overflow list.
     Secondary,
+    /// Available in keyboard help but never promoted into the compact strip.
+    Reference,
 }
 
 /// The interaction mode for which a surface action is currently meaningful.
@@ -77,6 +79,12 @@ pub struct UiAction {
     pub key: String,
     /// Full user-facing action label.
     pub label: String,
+    /// Optional heading in the complete shortcut reference.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
+    /// Additional searchable explanation, omitted from the compact strip.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
     /// Optional shorter label that never changes the action's meaning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_label: Option<String>,
@@ -105,6 +113,8 @@ impl UiAction {
             id: id.into(),
             key: key.into(),
             label: label.into(),
+            group: String::new(),
+            description: String::new(),
             compact_label: None,
             compact_key: None,
             trigger: None,
@@ -112,6 +122,20 @@ impl UiAction {
             modes: Vec::new(),
             enabled: true,
         }
+    }
+
+    /// Groups this action in keyboard help.
+    #[must_use]
+    pub fn with_group(mut self, group: impl Into<String>) -> Self {
+        self.group = group.into();
+        self
+    }
+
+    /// Sets a searchable, full-length explanation.
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
     }
 
     /// Sets the responsive importance of this action.
@@ -279,6 +303,7 @@ pub struct ActionBar<'a> {
     mode: Option<ActionMode>,
     status: Option<&'a str>,
     context: Option<&'a str>,
+    shortcut_help: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,6 +321,7 @@ impl<'a> ActionBar<'a> {
             mode: None,
             status: None,
             context: None,
+            shortcut_help: true,
         }
     }
 
@@ -320,11 +346,99 @@ impl<'a> ActionBar<'a> {
         self
     }
 
+    /// Suppresses help on the help menu's own navigation strip.
+    #[must_use]
+    pub const fn without_shortcut_help(mut self) -> Self {
+        self.shortcut_help = false;
+        self
+    }
+
     /// Calculates complete action fragments for the supplied display-cell width.
     #[must_use]
     pub fn layout(&self, width: usize) -> ActionBarLayout {
+        let available = self
+            .actions
+            .iter()
+            .enumerate()
+            .filter(|(_, action)| action.is_available(self.mode))
+            .collect::<Vec<_>>();
+        if !self.shortcut_help || available.is_empty() || width < 2 {
+            return self.layout_contents(width);
+        }
+        let minimum = minimum_essential_width(&available);
+        let status_width = self
+            .status
+            .filter(|status| !status.is_empty())
+            .map_or(0, display_width);
+        // A complete validation error and the essential escape route take
+        // precedence when even the two-cell help key cannot fit beside them.
+        if status_width > 0 && minimum.saturating_add(status_width).saturating_add(4) > width {
+            return self.layout_contents(width);
+        }
+        let primary = available
+            .iter()
+            .filter(|(_, action)| action.priority <= ActionPriority::Primary)
+            .collect::<Vec<_>>();
+        let primary_width = primary
+            .iter()
+            .map(|(_, action)| action_width(action, true))
+            .sum::<usize>()
+            .saturating_add(primary.len().saturating_sub(1) * 3);
+        let preferred_minimum =
+            if primary_width.saturating_add(status_width).saturating_add(4) <= width {
+                primary_width
+            } else {
+                minimum
+            };
+        let preserve_status = if minimum.saturating_add(status_width).saturating_add(4) <= width {
+            status_width.saturating_add(usize::from(status_width > 0))
+        } else {
+            0
+        };
+        let help_width = width
+            .saturating_sub(
+                preferred_minimum
+                    .saturating_add(usize::from(preferred_minimum > 0))
+                    .saturating_add(preserve_status),
+            )
+            .max(2)
+            .min(width);
+        let mut marker = overflow_marker(0, help_width);
+        let mut contents = self.layout_contents(width.saturating_sub(display_width(&marker) + 1));
+        for _ in 0..4 {
+            let next = overflow_marker(contents.hidden_count(), help_width);
+            if next == marker {
+                break;
+            }
+            marker = next;
+            contents = self.layout_contents(width.saturating_sub(display_width(&marker) + 1));
+        }
+        let used = display_width(&contents.text());
+        let padding = width.saturating_sub(used + display_width(&marker));
+        if padding > 0 {
+            contents.spans.push(ActionBarSpan {
+                text: " ".repeat(padding),
+                role: ActionBarRole::Separator,
+            });
+        }
+        contents.spans.push(ActionBarSpan {
+            text: marker,
+            role: ActionBarRole::Overflow,
+        });
+        contents
+    }
+
+    fn layout_contents(&self, width: usize) -> ActionBarLayout {
         if width == 0 {
-            return ActionBarLayout::default();
+            return ActionBarLayout {
+                spans: Vec::new(),
+                hidden_actions: self
+                    .actions
+                    .iter()
+                    .filter(|action| action.is_available(self.mode))
+                    .cloned()
+                    .collect(),
+            };
         }
 
         let mut available = self
@@ -357,24 +471,7 @@ impl<'a> ActionBar<'a> {
                     .min(width.saturating_sub(essential_width))
             })
             .unwrap_or_default();
-        let mut reserved = status_reserved;
-        let mut packed = self.pack(width, reserved, &available);
-        for _ in 0..3 {
-            let hidden = available.len().saturating_sub(packed.visible.len());
-            if hidden == 0 {
-                break;
-            }
-            let marker = overflow_marker(hidden, width);
-            let next_reserved = status_reserved
-                .saturating_add(display_width(&marker))
-                .saturating_add(usize::from(packed.used > 0))
-                .min(width.saturating_sub(essential_width));
-            if next_reserved == reserved {
-                break;
-            }
-            reserved = next_reserved;
-            packed = self.pack(width, reserved, &available);
-        }
+        let packed = self.pack(width, status_reserved, &available);
 
         let mut spans = Vec::new();
         let mut used = 0;
@@ -418,23 +515,6 @@ impl<'a> ActionBar<'a> {
             })
             .map(|(_, action)| (*action).clone())
             .collect::<Vec<_>>();
-
-        if !hidden_actions.is_empty() {
-            let separator_width = usize::from(used > 0);
-            let marker = overflow_marker(
-                hidden_actions.len(),
-                width
-                    .saturating_sub(used)
-                    .saturating_sub(separator_width)
-                    .saturating_sub(status_reserved),
-            );
-            if !marker.is_empty() {
-                if used > 0 {
-                    push_span(&mut spans, &mut used, " ", ActionBarRole::Separator);
-                }
-                push_span(&mut spans, &mut used, &marker, ActionBarRole::Overflow);
-            }
-        }
 
         if let Some(status) = self.status.filter(|status| !status.is_empty()) {
             let separator = if used == 0 {
@@ -536,6 +616,29 @@ impl<'a> ActionBar<'a> {
             }
         };
         for span in &layout.spans {
+            if span.role == ActionBarRole::Overflow && !span.text.is_empty() {
+                buffer
+                    .shortcut_help_regions
+                    .push(super::ShortcutHelpRegion {
+                        rect: super::ScreenRect {
+                            x: column,
+                            y,
+                            width: display_width(&span.text),
+                            height: 1,
+                        },
+                        context: self
+                            .context
+                            .or(self.mode.map(ActionMode::label))
+                            .unwrap_or("Actions")
+                            .to_owned(),
+                        actions: self
+                            .actions
+                            .iter()
+                            .filter(|action| action.is_available(self.mode))
+                            .cloned()
+                            .collect(),
+                    });
+            }
             let style = match span.role {
                 ActionBarRole::Mode => palette.accent.clone(),
                 ActionBarRole::Key | ActionBarRole::Overflow => Style {
@@ -617,6 +720,9 @@ impl<'a> ActionBar<'a> {
         let mut missing_essential = false;
 
         for (position, (index, action)) in actions.iter().enumerate() {
+            if action.priority == ActionPriority::Reference {
+                continue;
+            }
             if missing_essential && action.priority != ActionPriority::Essential {
                 continue;
             }
@@ -651,18 +757,13 @@ impl<'a> ActionBar<'a> {
         }
 
         visible.sort_by_key(|(index, _, _)| *index);
-        PackedActions {
-            mode,
-            visible,
-            used,
-        }
+        PackedActions { mode, visible }
     }
 }
 
 struct PackedActions<'a> {
     mode: Option<&'a str>,
     visible: Vec<(usize, &'a UiAction, bool)>,
-    used: usize,
 }
 
 fn minimum_essential_width(actions: &[(usize, &UiAction)]) -> usize {
@@ -702,17 +803,20 @@ fn action_width(action: &UiAction, compact: bool) -> usize {
 }
 
 fn overflow_marker(hidden: usize, width: usize) -> String {
-    if hidden == 0 || width == 0 {
-        return String::new();
-    }
-    let marker = format!("… F1 +{hidden}");
-    if display_width(&marker) <= width {
-        marker
-    } else if display_width("…") <= width {
-        "…".to_string()
+    let full = if hidden == 0 {
+        "F1 shortcuts".to_owned()
     } else {
-        String::new()
-    }
+        format!("F1 shortcuts +{hidden}")
+    };
+    let compact = if hidden == 0 {
+        "F1".to_owned()
+    } else {
+        format!("F1 +{hidden}")
+    };
+    [full, compact, "F1".to_owned()]
+        .into_iter()
+        .find(|marker| display_width(marker) <= width)
+        .unwrap_or_default()
 }
 
 fn push_span(spans: &mut Vec<ActionBarSpan>, used: &mut usize, text: &str, role: ActionBarRole) {
@@ -740,24 +844,6 @@ impl ActionMenu {
 
     pub fn open(&mut self) {
         self.selected = Some(0);
-    }
-
-    pub fn close(&mut self) {
-        self.selected = None;
-    }
-
-    pub fn handle_event(&mut self, event: &Event, actions: &[UiAction]) -> Option<String> {
-        let Event::Key(key) = event else {
-            return None;
-        };
-        let action = match key.code {
-            KeyCode::Up | KeyCode::Char('k') => "up",
-            KeyCode::Down | KeyCode::Char('j') => "down",
-            KeyCode::Enter => "activate",
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(1) => "escape",
-            _ => "noop",
-        };
-        self.handle(action, actions)
     }
 
     /// Returns the selected action ID. Navigation and cancellation are consumed.
@@ -883,7 +969,7 @@ impl ActionMenu {
                 .with_priority(ActionPriority::Essential),
             UiAction::new("return", "Esc", "back").with_priority(ActionPriority::Essential),
         ];
-        ActionBar::new(&navigation).render(
+        ActionBar::new(&navigation).without_shortcut_help().render(
             buffer,
             x + 1,
             y + height - 2,
@@ -988,7 +1074,7 @@ mod tests {
         assert!(display_width(&layout.text()) <= 34);
         assert!(layout.text().contains("Enter Send"));
         assert!(layout.text().contains("Esc Close"));
-        assert!(layout.text().contains('…'));
+        assert!(layout.text().contains("F1"));
         assert!(layout.hidden_count() >= 1);
     }
 
@@ -999,10 +1085,10 @@ mod tests {
             .with_priority(ActionPriority::Essential)];
         let layout = ActionBar::new(&actions)
             .with_mode(ActionMode::Insert)
-            .layout(14);
+            .layout(16);
 
         assert!(layout.text().contains("C-Enter Send"));
-        assert!(display_width(&layout.text()) <= 14);
+        assert!(display_width(&layout.text()) <= 16);
     }
 
     #[test]
@@ -1130,7 +1216,7 @@ mod tests {
             .map(|cell| cell.c)
             .collect::<String>();
         assert!(row.ends_with(&layout.text()), "{row:?}");
-        assert!(row.starts_with(' '), "{row:?}");
+        assert!(row.ends_with("F1"), "{row:?}");
         assert!(buffer.cells[42..76]
             .iter()
             .all(|cell| cell.style.bg == theme.style.bg));
@@ -1159,5 +1245,45 @@ mod tests {
             assert_eq!(buffer.cells[26].c, ' ', "width {width}");
             assert_eq!(buffer.cells[27 + width].c, ' ', "width {width}");
         }
+    }
+}
+
+#[cfg(test)]
+mod shortcut_discovery_tests {
+    use super::*;
+    #[test]
+    fn shortcut_help_is_persistent_counted_and_hit_testable() {
+        let actions = vec![
+            UiAction::new("send", "Enter", "send"),
+            UiAction::new("extra", "Ctrl+x", "Extra action")
+                .with_priority(ActionPriority::Reference),
+        ];
+        let theme = Theme::default();
+        for width in 2..100 {
+            let mut buffer = RenderBuffer::new(width, 1, &theme.style);
+            let layout = ActionBar::new(&actions).with_context("Composer").render(
+                &mut buffer,
+                0,
+                0,
+                width,
+                &theme,
+                &theme.style,
+            );
+            assert!(display_width(&layout.text()) <= width);
+            assert!(layout.text().contains("F1"));
+            assert!(layout
+                .hidden_actions
+                .iter()
+                .any(|action| action.id == "extra"));
+            let help = buffer.shortcut_help_regions.last().unwrap();
+            assert_eq!(help.context, "Composer");
+            assert_eq!(help.actions.len(), 2);
+            assert_eq!(help.rect.x + help.rect.width, width);
+        }
+        let plain = [UiAction::new("send", "Enter", "send")];
+        assert!(ActionBar::new(&plain)
+            .layout(80)
+            .text()
+            .ends_with("F1 shortcuts"));
     }
 }

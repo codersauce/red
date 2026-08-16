@@ -164,13 +164,16 @@ root_markers = ["go.mod", ".git"]
 
 | Key | Action |
 | --- | --- |
-| `Space ?`, `F1`, `Alt-x`, `Ctrl-Shift-p` | Command palette |
+| `F1`, `:keys` | Contextual keyboard-shortcut explorer |
+| `Space ?`, `Alt-x`, `Ctrl-Shift-p` | Command palette |
 | `Ctrl-p` | File picker |
 | `Ctrl-p`, then `>` | Switch from files to commands |
 | `Ctrl-e` | Toggle hidden files in the picker; open the tree otherwise |
 | `Ctrl-j` or `Space b` | Buffer picker |
 | `Space g` | Project search using `rg` |
 | `Space t` | Theme browser |
+
+Press `F1` or click **F1 shortcuts** in an action strip to open keyboard help without closing the current pane or dialog. `Tab` switches between the current context and all Red keys; `/` searches by action or binding. `Esc` returns to exactly where you were. The **Keyboard shortcuts** command and `:keys` open the same explorer. User keymap overrides are reflected in the list.
 
 The command palette includes descriptions, effective keymaps, and accepted
 `:Command` invocations. Pause after a configured prefix such as `Space`,

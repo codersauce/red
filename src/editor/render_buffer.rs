@@ -68,6 +68,7 @@ impl Cell {
 #[derive(Debug, Clone)]
 pub struct RenderBuffer {
     pub cells: Vec<Cell>,
+    pub(crate) shortcut_help_regions: Vec<crate::ui::ShortcutHelpRegion>,
     pub width: usize,
     #[allow(unused)]
     pub height: usize,
@@ -78,6 +79,7 @@ impl RenderBuffer {
         let cells = vec![Cell::new(' ', default_style.clone()); width * height];
 
         RenderBuffer {
+            shortcut_help_regions: Vec::new(),
             cells,
             width,
             height,
@@ -109,6 +111,7 @@ impl RenderBuffer {
         }
 
         RenderBuffer {
+            shortcut_help_regions: Vec::new(),
             cells,
             width,
             height,
@@ -122,6 +125,7 @@ impl RenderBuffer {
 
     /// Resizes and clears the grid while retaining reusable cell allocations.
     pub(crate) fn reset(&mut self, width: usize, height: usize, style: &Style) {
+        self.shortcut_help_regions.clear();
         self.cells
             .resize_with(width * height, || Cell::new(' ', style.clone()));
         self.width = width;

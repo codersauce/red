@@ -173,6 +173,18 @@ impl FilePicker {
 }
 
 impl Component for FilePicker {
+    fn shortcut_context(&self) -> &str {
+        "Files"
+    }
+    fn surface_actions(&self) -> Vec<super::UiAction> {
+        let mut actions = self.picker.surface_actions();
+        actions.extend(super::reference_actions(&[
+            ("Files", "Ctrl+e", "Toggle hidden files"),
+            ("Files", ">", "Open commands when the query is empty"),
+        ]));
+        actions
+    }
+
     fn tick(&mut self) -> anyhow::Result<bool> {
         let mut changed = false;
         loop {

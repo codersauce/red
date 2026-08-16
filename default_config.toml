@@ -325,7 +325,7 @@ Esc = { EnterMode = "Normal" }
 "Ctrl-Shift-p" = "CommandPalette"
 "Alt-a" = { PluginCommand = "AgentToggle" }
 "Alt-x" = "CommandPalette"
-"F1" = "CommandPalette"
+"F1" = "KeyboardShortcuts"
 "Ctrl-j" = { PluginCommand = "BufferPicker" }
 "Ctrl-z" = "Suspend"
 "Ctrl-e" = { PluginCommand = "NeoTree" }

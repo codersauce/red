@@ -22,6 +22,7 @@ mod display_layout;
 mod inline_comments;
 mod inline_completion;
 mod inline_history;
+mod keyboard_shortcuts;
 mod lsp_coordinator;
 #[cfg(test)]
 mod navigation_perf_tests;
@@ -2364,6 +2365,8 @@ pub enum Action {
     DeleteBuffer(bool),
     FilePicker,
     CommandPalette,
+    /// Opens contextual, searchable keyboard help without replacing the active surface.
+    KeyboardShortcuts,
     OpenSyntaxPicker,
     SetSyntax(String),
     OpenWhatsNew,
@@ -3183,7 +3186,8 @@ pub struct Editor {
 
     /// Active dialog/popup component
     current_dialog: Option<Box<dyn Component>>,
-    dialog_action_menu: crate::ui::ActionMenu,
+    keyboard_shortcuts: Option<crate::ui::KeyboardShortcuts>,
+    shortcut_help_regions: Vec<crate::ui::ShortcutHelpRegion>,
 
     /// Number prefix for repeating commands
     repeater: Option<u16>,
@@ -4460,7 +4464,8 @@ impl Editor {
             persistent_notification_messages: [None, None],
             last_error: None,
             current_dialog: None,
-            dialog_action_menu: crate::ui::ActionMenu::default(),
+            keyboard_shortcuts: None,
+            shortcut_help_regions: Vec::new(),
             repeater: None,
             selection_start: None,
             selection: None,
@@ -12530,6 +12535,9 @@ impl Editor {
         ev: &event::Event,
         runtime: Option<&Runtime>,
     ) -> anyhow::Result<Option<KeyAction>> {
+        if let Some(action) = self.handle_keyboard_shortcuts_event(ev, runtime) {
+            return Ok(Some(action));
+        }
         if let Some(action) = self.handle_inline_completion_event(ev) {
             return Ok(Some(action));
         }
@@ -12615,24 +12623,6 @@ impl Editor {
         }
 
         if let Some(current_dialog) = &mut self.current_dialog {
-            let surface_actions = current_dialog.surface_actions();
-            if self.dialog_action_menu.is_open() {
-                let selected = self.dialog_action_menu.handle_event(ev, &surface_actions);
-                return Ok(selected
-                    .and_then(|id| current_dialog.activate_surface_action(&id))
-                    .or(Some(KeyAction::Single(Action::Refresh))));
-            }
-            if matches!(
-                ev,
-                Event::Key(KeyEvent {
-                    code: KeyCode::F(1),
-                    ..
-                })
-            ) && !surface_actions.is_empty()
-            {
-                self.dialog_action_menu.open();
-                return Ok(Some(KeyAction::Single(Action::Refresh)));
-            }
             let action = current_dialog.handle_event(ev);
             let allows_passthrough = current_dialog.allows_event_passthrough();
             if action.is_some() || !allows_passthrough {
@@ -12650,10 +12640,6 @@ impl Editor {
                 };
                 return Ok(action);
             }
-        }
-
-        if !self.panel_manager.has_focused_panel() {
-            self.dialog_action_menu.close();
         }
 
         if self.workspace_manager.is_active() {
@@ -12675,30 +12661,6 @@ impl Editor {
         }
 
         if self.panel_manager.focused_panel_id().is_some() {
-            let surface_actions = self.panel_manager.surface_actions();
-            if self.dialog_action_menu.is_open() {
-                let selected = self.dialog_action_menu.handle_event(ev, &surface_actions);
-                let event = selected.and_then(|id| {
-                    surface_actions
-                        .iter()
-                        .find(|action| action.id == id)
-                        .and_then(crate::ui::UiAction::event)
-                });
-                return Ok(event
-                    .and_then(|event| self.handle_panel_event(&event, runtime))
-                    .or(Some(KeyAction::Single(Action::Refresh))));
-            }
-            if matches!(
-                ev,
-                Event::Key(KeyEvent {
-                    code: KeyCode::F(1),
-                    ..
-                })
-            ) && !surface_actions.is_empty()
-            {
-                self.dialog_action_menu.open();
-                return Ok(Some(KeyAction::Single(Action::Refresh)));
-            }
             if !self.panel_manager.focused_text_input_active() && self.handle_repeater(ev) {
                 return Ok(None);
             }
@@ -13340,6 +13302,7 @@ impl Editor {
             Action::EnterMode(Mode::Command | Mode::Search)
             | Action::FilePicker
             | Action::CommandPalette
+            | Action::KeyboardShortcuts
             | Action::OpenStatuslineManager
             | Action::OpenDiagnosticsPicker
             | Action::OpenErrorDiagnosticsPicker
@@ -13694,6 +13657,9 @@ impl Editor {
             return Vec::new();
         }
 
+        if matches!(cmd, "keys" | "keyboard-shortcuts") {
+            return vec![Action::KeyboardShortcuts];
+        }
         if matches!(cmd, "commands" | "command-palette") {
             return vec![Action::CommandPalette];
         }
@@ -19430,6 +19396,10 @@ impl Editor {
                 self.release_current_dialog_callbacks(runtime);
                 self.current_dialog =
                     Some(Box::new(FilePicker::new(self, std::env::current_dir()?)?));
+            }
+            Action::KeyboardShortcuts => {
+                self.open_keyboard_shortcuts(Some(runtime), None);
+                self.render(buffer)?;
             }
             Action::CommandPalette => {
                 let entries =
@@ -29069,7 +29039,7 @@ builtin = "rust"
 
         editor
             .process_editor_event(
-                Event::Key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT)),
                 &mut buffer,
                 &mut runtime,
                 EventRenderMode::Immediate,

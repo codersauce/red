@@ -112,6 +112,26 @@ impl InputPrompt {
 }
 
 impl Component for InputPrompt {
+    fn shortcut_context(&self) -> &str {
+        self.dialog.title().unwrap_or("Input")
+    }
+    fn surface_actions(&self) -> Vec<super::UiAction> {
+        let mut actions = vec![
+            super::UiAction::new("submit", "Enter", "Submit"),
+            super::UiAction::new("cancel", "Esc", "Cancel"),
+        ];
+        actions.extend(super::reference_actions(&[
+            ("Editing", "← / → / Home / End", "Move the text cursor"),
+            (
+                "Editing",
+                "Backspace / Delete",
+                "Delete previous / next character",
+            ),
+            ("Editing", "Ctrl+w / Alt+Backspace", "Delete previous word"),
+        ]));
+        actions
+    }
+
     fn composer_handle(&self) -> Option<ComposerHandle> {
         self.callback_handle
     }

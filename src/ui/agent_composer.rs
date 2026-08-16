@@ -205,6 +205,9 @@ impl AgentComposer {
 }
 
 impl Component for AgentComposer {
+    fn shortcut_context(&self) -> &str {
+        self.dialog.title().unwrap_or("Agent composer")
+    }
     fn surface_actions(&self) -> Vec<UiAction> {
         let normal = self.prompt.mode() == Mode::Normal;
         let mut actions = vec![
@@ -228,6 +231,7 @@ impl Component for AgentComposer {
                     .with_priority(ActionPriority::Secondary),
             );
         }
+        actions.extend(super::prompt_reference_actions(self.prompt.mode()));
         actions
     }
 
@@ -1041,7 +1045,11 @@ mod tests {
         let mut buffer = RenderBuffer::new(60, editor.vheight(), &Style::default());
         composer.draw(&mut buffer).unwrap();
         let status_y = composer.dialog.y + 1 + composer.body_height();
-        assert!(rendered_row(&buffer, status_y).contains(OVERSIZED_STATUS));
+        assert!(
+            rendered_row(&buffer, status_y).contains(OVERSIZED_STATUS),
+            "{}",
+            rendered_row(&buffer, status_y)
+        );
 
         assert!(composer.prompt.set_text(&"x".repeat(MAX_PROMPT_BYTES)));
         composer.handle_event(&key(KeyCode::Char('!'), KeyModifiers::NONE));
