@@ -1,7 +1,7 @@
 # Inline comments
 
 Inline assist can now leave real annotations or combine annotations with a
-bounded code edit. Select a range (or leave the cursor on one line), press
+bounded code edit. Select a range (or leave the cursor inside a function), press
 `Space i`, and ask for a review or explanation without changing the code.
 See [the inline-assist contract](AGENT_WORKFLOW.md#inline-assist).
 
@@ -9,8 +9,14 @@ Run `cargo run --bin red -- path/to/file` in this worktree.
 
 | Key | Action |
 | --- | --- |
-| `Space i` | Ask inline assist to edit, explain, or review the current target. |
-| `Space H` | Browse retained inline conversations and preview their comments. |
+| `Space i` | Ask inline assist to edit, explain, or review the enclosing function or exact selection. |
+| Result-popup `v` / `A` | Read the full answer / prepare a contextualized Agent draft. |
+| `Space H` / `:InlineHistory` | Open unified history with running jobs, ready results, completed discussions, and saved drafts. |
+| Working-popup `Esc` / `Ctrl-c` | Hide without cancelling / explicitly cancel the request. |
+| Activity marker click / `Space v` | Reopen the selected inline job at its source. |
+| Ready-popup `v` / Enter | Inspect an off-screen code edit / apply it if source is unchanged. Explanations appear automatically. |
+| History Enter / `g` / `s` | Reopen the item / jump to source / restore the selected turn's annotations. |
+| Result-popup `s` | Restore retained annotations without reapplying a code edit. |
 | `Space ] c` / `Space [ c` | Select the next/previous annotation, including overlapping comments. |
 | `Space v` | Read the full comment in a scrollable plain-text popup. |
 | `Space x` | Dismiss the selected comment. |
@@ -34,14 +40,15 @@ foreground, adjusted for readability). Long comments wrap at word boundaries,
 with a four-text-row preview limit. Tiny splits reduce padding to keep the source
 line visible. Source line numbers, Vim motions, selections, file contents, and
 dirty state stay unchanged.
-Clicking a comment moves to its source line. Splits show the same buffer's
+Clicking an activity marker reopens its job; clicking an ordinary comment moves
+to its source line. Splits show the same buffer's
 comments at their own widths.
 
 Questions, answers, and comments are retained in editor-session history. Edits above them move both range anchors;
 changes to their source mark them outdated. Overlapping comments remain stored
 and collapse to one numbered box; navigation selects the visible annotation.
 Refinement replaces only comments from the same inline-assist invocation.
-The sample keys remain available for UI development. `Space H` provides earlier
+The sample keys remain available for UI development. `:InlineHistory` provides earlier
 turns, reviewed-source snapshots, continuation, and rechecking. Normal editor
 recovery restores retained conversations; `persist_inline_history = false`
 disables disk retention. Regular-assistant annotation tools are not exposed yet.

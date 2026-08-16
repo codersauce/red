@@ -394,6 +394,7 @@ Esc = { EnterMode = "Normal" }
 [keys.normal." "]
 "m" = "OpenMessages"
 "H" = "OpenInlineHistory"
+"N" = "OpenLatestInlineCompletion"
 "C" = "AddSampleInlineComment"
 "X" = "ClearInlineComments"
 "v" = "ShowInlineComment"

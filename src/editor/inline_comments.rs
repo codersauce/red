@@ -1,6 +1,7 @@
 //! Session-local annotations, provenance, overlap projection, and source anchors.
 
 use sha2::{Digest as _, Sha256};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 use super::{display_layout::LineSegment, AnchorAffinity, EditAnchor, Editor, Mode};
@@ -18,6 +19,9 @@ const MAX_FINGERPRINT_BYTES: usize = 256 * 1024;
 #[derive(Debug, Clone)]
 pub(super) enum InlineCommentOrigin {
     Sample,
+    Activity {
+        group_id: String,
+    },
     HistoryPreview {
         request_id: String,
         comment_index: usize,
@@ -61,6 +65,9 @@ impl InlineComment {
     }
 
     pub(super) fn refresh_staleness(&mut self, buffer: &Buffer) {
+        if matches!(self.origin, InlineCommentOrigin::Activity { .. }) {
+            return;
+        }
         let (start, end) = self.lines(buffer);
         self.stale = self.expected_fingerprint.is_none()
             || fingerprint(buffer, start, end) != self.expected_fingerprint;
@@ -207,20 +214,33 @@ impl Editor {
         message: String,
         origin: InlineCommentOrigin,
     ) -> InlineComment {
-        let buffer = self.current_buffer();
+        Self::make_inline_comment_in_buffer(self.current_buffer(), start, end, message, origin)
+    }
+
+    pub(super) fn make_inline_comment_in_buffer(
+        buffer: &Buffer,
+        start: usize,
+        end: usize,
+        message: String,
+        origin: InlineCommentOrigin,
+    ) -> InlineComment {
         let last = buffer.navigable_line_count().saturating_sub(1);
         let start = start.min(last);
         let end = end.max(start).min(last);
+        let anchor = |line| {
+            let position = TextPosition::new(line, 0);
+            EditAnchor {
+                buffer_id: buffer.id(),
+                file: buffer.file.clone(),
+                char_index: buffer.position_to_char_idx(position),
+                fallback: position,
+                affinity: AnchorAffinity::Right,
+            }
+        };
         InlineComment {
             id: Uuid::new_v4(),
-            anchor: self.anchor_at_char(
-                buffer.position_to_char_idx(TextPosition::new(start, 0)),
-                AnchorAffinity::Right,
-            ),
-            end_anchor: self.anchor_at_char(
-                buffer.position_to_char_idx(TextPosition::new(end, 0)),
-                AnchorAffinity::Right,
-            ),
+            anchor: anchor(start),
+            end_anchor: anchor(end),
             message,
             origin,
             stale: false,
@@ -234,12 +254,26 @@ impl Editor {
         group_id: &str,
         count: usize,
     ) -> anyhow::Result<()> {
-        let buffer_id = self.current_buffer().id();
+        self.check_inline_comment_capacity_for_buffer(self.current_buffer().id(), group_id, count)
+    }
+
+    pub(super) fn check_inline_comment_capacity_for_buffer(
+        &self,
+        buffer_id: BufferId,
+        group_id: &str,
+        count: usize,
+    ) -> anyhow::Result<()> {
         let retained = self
             .inline_comments
             .iter()
             .filter(|comment| {
-                comment.anchor.buffer_id == buffer_id && !comment.belongs_to(group_id)
+                comment.anchor.buffer_id == buffer_id
+                    && !comment.belongs_to(group_id)
+                    && !matches!(
+                        comment.origin,
+                        InlineCommentOrigin::Activity { .. }
+                            | InlineCommentOrigin::HistoryPreview { .. }
+                    )
             })
             .count();
         anyhow::ensure!(
@@ -257,11 +291,35 @@ impl Editor {
         start_line: usize,
         comments: &[InlineCommentInput],
     ) {
+        if let Some(id) = self.replace_inline_comment_group_in_buffer(
+            self.buffer_manager.active_index(),
+            group_id,
+            session_id,
+            request_id,
+            start_line,
+            comments,
+        ) {
+            self.active_inline_comment = Some(id);
+        }
+    }
+
+    /// Publish annotations without changing the active buffer or current item.
+    pub(super) fn replace_inline_comment_group_in_buffer(
+        &mut self,
+        buffer_index: usize,
+        group_id: &str,
+        session_id: &str,
+        request_id: &str,
+        start_line: usize,
+        comments: &[InlineCommentInput],
+    ) -> Option<Uuid> {
+        let buffer = &self.buffer_manager[buffer_index];
         let added = comments
             .iter()
             .enumerate()
             .map(|(comment_index, comment)| {
-                self.make_inline_comment(
+                Self::make_inline_comment_in_buffer(
+                    buffer,
                     start_line + comment.start_line - 1,
                     start_line + comment.last_line() - 1,
                     comment.message.clone(),
@@ -275,11 +333,10 @@ impl Editor {
             })
             .collect::<Vec<_>>();
         self.remove_inline_comment_group(group_id);
-        if let Some(comment) = added.first() {
-            self.active_inline_comment = Some(comment.id);
-        }
+        let first = added.first().map(|comment| comment.id);
         self.inline_comments.extend(added);
         self.layout_cache.borrow_mut().clear();
+        first
     }
 
     pub(super) fn inline_comment_group_count(&self, group_id: &str) -> usize {
@@ -293,6 +350,27 @@ impl Editor {
         self.inline_comments
             .retain(|comment| !comment.belongs_to(group_id));
         self.layout_cache.borrow_mut().clear();
+    }
+
+    pub(super) fn dismiss_inline_comment_group(&mut self, group_id: &str) {
+        for comment in &self.inline_comments {
+            if let InlineCommentOrigin::Assist {
+                group_id: owner,
+                request_id,
+                comment_index,
+                ..
+            } = &comment.origin
+            {
+                if owner == group_id {
+                    if let Some(turn) = self.inline_history.turn_mut(request_id) {
+                        if !turn.hidden_comments.contains(comment_index) {
+                            turn.hidden_comments.push(*comment_index);
+                        }
+                    }
+                }
+            }
+        }
+        self.remove_inline_comment_group(group_id);
     }
 
     // Collapse connected overlap groups, retaining every annotation in storage.
@@ -356,6 +434,38 @@ impl Editor {
                 (comment.lines(buffer).0, message)
             })
             .collect()
+    }
+
+    pub(super) fn inline_activity_visible_in_window(
+        &self,
+        window: &crate::window::Window,
+        changed: &HashSet<Uuid>,
+    ) -> bool {
+        let Some(buffer) = self.buffer_manager.get(window.buffer_index) else {
+            return false;
+        };
+        let lines = self
+            .comment_projections(buffer)
+            .into_iter()
+            .filter_map(|view| {
+                let comment = &self.inline_comments[view.index];
+                changed
+                    .contains(&comment.id)
+                    .then(|| comment.lines(buffer).0)
+            })
+            .collect::<HashSet<_>>();
+        !lines.is_empty()
+            && self
+                .layout_for_window(window)
+                .inline_comments
+                .iter()
+                .any(|row| {
+                    lines.contains(&row.line)
+                        && matches!(
+                            row.content,
+                            super::display_layout::InlineCommentContent::Text(_)
+                        )
+                })
     }
 
     fn current_inline_comment_index(&self) -> Option<usize> {
@@ -426,6 +536,14 @@ impl Editor {
 
     pub(super) fn dismiss_inline_comment(&mut self) {
         if let Some(index) = self.current_inline_comment_index() {
+            if matches!(
+                self.inline_comments[index].origin,
+                InlineCommentOrigin::Activity { .. }
+            ) {
+                self.last_error =
+                    Some("inline request retained · Space v to open · Ctrl-c to cancel".into());
+                return;
+            }
             if let InlineCommentOrigin::Assist {
                 request_id,
                 comment_index,
@@ -455,6 +573,7 @@ impl Editor {
         let (start, end) = comment.lines(self.current_buffer());
         let provenance = match &comment.origin {
             InlineCommentOrigin::Sample => "sample".to_string(),
+            InlineCommentOrigin::Activity { .. } => "inline activity".to_string(),
             InlineCommentOrigin::HistoryPreview { .. } => "history preview".to_string(),
             InlineCommentOrigin::Assist {
                 session_id,
@@ -494,8 +613,10 @@ impl Editor {
                 }
             }
         }
-        self.inline_comments
-            .retain(|comment| comment.anchor.buffer_id != buffer_id);
+        self.inline_comments.retain(|comment| {
+            comment.anchor.buffer_id != buffer_id
+                || matches!(comment.origin, InlineCommentOrigin::Activity { .. })
+        });
         self.active_inline_comment = None;
         self.layout_cache.borrow_mut().clear();
     }
@@ -510,6 +631,22 @@ impl Editor {
         !comment.detached
             && matches!(comment.origin, InlineCommentOrigin::HistoryPreview { .. })
                 == self.inline_history_browser.is_some()
+    }
+
+    pub(super) fn inline_job_on_comment_line(&self, line: usize) -> Option<String> {
+        self.comment_projections(self.current_buffer())
+            .into_iter()
+            .find_map(|view| {
+                let comment = &self.inline_comments[view.index];
+                match &comment.origin {
+                    InlineCommentOrigin::Activity { group_id }
+                        if comment.lines(self.current_buffer()).0 == line =>
+                    {
+                        Some(group_id.clone())
+                    }
+                    _ => None,
+                }
+            })
     }
 
     /// Reserves a connector and a trailing space without consuming source cells.

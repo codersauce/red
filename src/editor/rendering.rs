@@ -3446,7 +3446,8 @@ impl Editor {
 
     pub fn draw_commandline(&mut self, buffer: &mut RenderBuffer) {
         self.notification_frame_candidate = None;
-        let style = &self.theme.style;
+        self.inline_completion.clear_hit();
+        let style = self.theme.style.clone();
         let width = self.size.0 as usize;
         if width == 0 || self.size.1 == 0 {
             return;
@@ -3454,7 +3455,7 @@ impl Editor {
 
         let y = self.size.1 as usize - 1;
         let clear_line = " ".repeat(width);
-        buffer.set_text(0, y, &clear_line, style);
+        buffer.set_text(0, y, &clear_line, &style);
 
         if !self.has_term() {
             let wc = if let Some(ref waiting_command) = self.waiting_command {
@@ -3552,12 +3553,16 @@ impl Editor {
             if let Some(color) = color.and_then(|key| self.theme.colors.get(key)).copied() {
                 message_style.fg = Some(color);
             }
-            buffer.set_text(
-                0,
-                y,
-                &notification_summary(&message, message_width),
-                &message_style,
-            );
+            if message.is_empty() {
+                self.draw_inline_completion_notice(buffer, message_width, y);
+            } else {
+                buffer.set_text(
+                    0,
+                    y,
+                    &notification_summary(&message, message_width),
+                    &message_style,
+                );
+            }
             if badge_width > 0 {
                 let mut badge_style = style.clone();
                 badge_style.fg = self.theme.ui_style.muted.fg.or(style.fg);
@@ -3566,7 +3571,7 @@ impl Editor {
 
             if wc_width > 0 {
                 let wc = fit_display_width(&wc, wc_width);
-                buffer.set_text(width.saturating_sub(wc_width), y, &wc, style);
+                buffer.set_text(width.saturating_sub(wc_width), y, &wc, &style);
             }
 
             return;
@@ -3583,7 +3588,7 @@ impl Editor {
             self.search_commandline_prefix()
         };
         let cmdline = format!("{}{}", prefix, text);
-        buffer.set_text(0, y, &cmdline, style);
+        buffer.set_text(0, y, &cmdline, &style);
         let badge = notification_badge(self.notifications.counts(Instant::now()), width, false);
         let badge_width = display_width(&badge);
         if badge_width > 0 && display_width(&cmdline).saturating_add(badge_width + 2) <= width {

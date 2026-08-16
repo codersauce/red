@@ -1,5 +1,7 @@
 //! History ownership, conservative source resolution, and browser coordination.
 
+use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
+
 use super::inline_comments::InlineCommentOrigin;
 use super::*;
 use crate::inline_history::{
@@ -8,6 +10,29 @@ use crate::inline_history::{
 
 #[cfg(test)]
 mod tests;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum HistoryKey {
+    Turn(String),
+    Draft(String),
+}
+
+impl HistoryKey {
+    fn request(&self) -> Option<&str> {
+        match self {
+            Self::Turn(request) => Some(request),
+            Self::Draft(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct HistoryRow {
+    pub(super) group: String,
+    pub(super) key: HistoryKey,
+    pub(super) label: String,
+    pub(super) running: bool,
+}
 
 #[derive(Debug)]
 pub(super) struct HistoryBrowser {
@@ -18,77 +43,225 @@ pub(super) struct HistoryBrowser {
     workspace: bool,
     query: String,
     searching: bool,
-    selected: Option<String>,
+    selected: Option<HistoryKey>,
     expanded: HashSet<String>,
     view: usize,
     scroll: usize,
     confirm_forget: bool,
+    dirty: bool,
+    refreshed_at: Instant,
+    animation_started: Instant,
+}
+
+fn history_location_label(location: &InlineLocation) -> String {
+    format!(
+        "{}:{}–{}",
+        location.file,
+        location.range.start.line + 1,
+        location.range.end.line + usize::from(location.range.end.character > 0)
+    )
+}
+
+fn history_match(matcher: &SkimMatcherV2, query: &str, text: &str) -> Option<i64> {
+    if query.is_empty() {
+        Some(0)
+    } else {
+        matcher.fuzzy_match(text, query)
+    }
 }
 
 impl Editor {
-    fn history_rows(&self) -> Vec<(String, String, String)> {
+    /// Recall submitted prompts from this workspace, newest first, without
+    /// maintaining a second copy outside recoverable inline conversations.
+    pub(crate) fn inline_prompt_history(&self) -> Vec<String> {
+        let cwd = get_workspace_path();
+        let mut turns = self
+            .inline_history
+            .conversations
+            .iter()
+            .rev()
+            .filter(|conversation| Path::new(&conversation.cwd) == cwd)
+            .flat_map(|conversation| conversation.turns.iter().rev())
+            .collect::<Vec<_>>();
+        turns.sort_by_key(|turn| std::cmp::Reverse(turn.created_at_ms));
+        let mut seen = HashSet::new();
+        turns
+            .into_iter()
+            .map(|turn| turn.prompt.as_str())
+            .filter(|prompt| !prompt.trim().is_empty() && seen.insert(*prompt))
+            .take(50)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn history_draft_row(&self, group: &str, matcher: &SkimMatcherV2) -> Option<(HistoryRow, i64)> {
+        let browser = self.inline_history_browser.as_ref()?;
+        let job = self.inline_jobs.get(group)?;
+        let InlineAssistPopupState::Prompt { initial, .. } = &job.state else {
+            return None;
+        };
+        if !browser.workspace && browser.file.as_deref() != Some(job.location.file.as_str()) {
+            return None;
+        }
+        let location = history_location_label(&job.location);
+        let snippet = crate::ui::first_prompt_line(&job.session.expected_text);
+        let score = history_match(
+            matcher,
+            &browser.query,
+            &format!("{location} {initial} {snippet}"),
+        )?;
+        let prompt = if initial.is_empty() {
+            "Untitled inline draft".into()
+        } else {
+            crate::ui::first_prompt_line(initial)
+        };
+        Some((
+            HistoryRow {
+                group: group.into(),
+                key: HistoryKey::Draft(group.into()),
+                label: format!("[draft] {prompt}\n{location} · {snippet}"),
+                running: false,
+            },
+            score,
+        ))
+    }
+
+    pub(super) fn history_rows(&self) -> Vec<HistoryRow> {
         let Some(browser) = &self.inline_history_browser else {
             return Vec::new();
         };
-        let query = browser.query.to_lowercase();
-        let mut rows = Vec::new();
+        let matcher = SkimMatcherV2::default();
+        let mut groups = Vec::new();
         for conversation in self.inline_history.conversations.iter().rev() {
-            if !browser.workspace && browser.file.as_deref() != Some(conversation.file.as_str()) {
+            let Some(latest) = conversation.turns.last() else {
                 continue;
+            };
+            let mut rows = Vec::new();
+            let mut score = i64::MIN;
+            if let Some((row, draft_score)) = self.history_draft_row(&conversation.id, &matcher) {
+                score = draft_score;
+                rows.push(row);
             }
-            let expanded = browser.expanded.contains(&conversation.id) || !query.is_empty();
+            let expanded = browser.expanded.contains(&conversation.id) || !browser.query.is_empty();
             for (index, turn) in conversation.turns.iter().enumerate().rev() {
-                if !expanded && index + 1 != conversation.turns.len() {
-                    continue;
-                }
-                if !query.is_empty()
-                    && !format!(
-                        "{} {} {}",
-                        conversation.file,
-                        turn.prompt,
-                        turn.answer_text()
-                    )
-                    .to_lowercase()
-                    .contains(&query)
+                if (!browser.workspace
+                    && browser.file.as_deref() != Some(turn.location.file.as_str()))
+                    || (!expanded && index + 1 != conversation.turns.len())
                 {
                     continue;
                 }
-                let marker = if index + 1 == conversation.turns.len() {
-                    if conversation.turns.len() > 1 {
-                        "▸ "
-                    } else {
-                        ""
-                    }
-                } else {
+                let location = history_location_label(&turn.location);
+                let snippet = crate::ui::first_prompt_line(&turn.before);
+                let Some(turn_score) = history_match(
+                    &matcher,
+                    &browser.query,
+                    &format!(
+                        "{location} {} {} {snippet}",
+                        turn.prompt,
+                        turn.answer_text()
+                    ),
+                ) else {
+                    continue;
+                };
+                score = score.max(turn_score);
+                let marker = if index + 1 < conversation.turns.len() {
                     "  ↳ "
+                } else if conversation.turns.len() > 1 {
+                    "▸ "
+                } else {
+                    ""
                 };
                 let resolved = if conversation.resolved {
                     "[resolved] "
                 } else {
                     ""
                 };
-                let (source_line, source_state) = self.resolve_history_turn(turn).map_or(
-                    (turn.location.range.start.line, InlineSourceState::Detached),
-                    |(_, range, state)| (range.start.line, state),
-                );
+                let source_state = self
+                    .resolve_history_turn(turn)
+                    .map_or(InlineSourceState::Detached, |(_, _, state)| state);
+                let status = if turn.state == InlineTurnState::Pending {
+                    "running"
+                } else {
+                    turn.status()
+                };
                 let name = Path::new(&turn.location.file)
                     .file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or(&turn.location.file);
-                rows.push((
-                    conversation.id.clone(),
-                    turn.request_id.clone(),
-                    format!(
-                        "{marker}{resolved}{}\n{name}:{} · {} · {}",
-                        turn.prompt.lines().next().unwrap_or("Inline question"),
-                        source_line + 1,
-                        source_state.label(),
-                        turn.status()
+                rows.push(HistoryRow {
+                    group: conversation.id.clone(),
+                    key: HistoryKey::Turn(turn.request_id.clone()),
+                    label: format!(
+                        "{marker}{resolved}{}\n{name}:{}–{} · {status} · {} · {snippet}",
+                        crate::ui::first_prompt_line(&turn.prompt),
+                        turn.location.range.start.line + 1,
+                        turn.location.range.end.line
+                            + usize::from(turn.location.range.end.character > 0),
+                        source_state.label()
                     ),
-                ));
+                    running: turn.state == InlineTurnState::Pending,
+                });
+            }
+            if rows.is_empty() {
+                continue;
+            }
+            let rank = match latest.state {
+                InlineTurnState::Pending => 0,
+                InlineTurnState::Ready => 1,
+                _ if self.has_parked_inline_draft(&conversation.id) => 2,
+                _ => 3,
+            };
+            groups.push((
+                rank,
+                std::cmp::Reverse(score),
+                std::cmp::Reverse(latest.created_at_ms),
+                rows,
+            ));
+        }
+        for group in self.inline_jobs.keys() {
+            if self
+                .inline_history
+                .conversations
+                .iter()
+                .any(|conversation| &conversation.id == group)
+            {
+                continue;
+            }
+            if let Some((row, score)) = self.history_draft_row(group, &matcher) {
+                groups.push((2, std::cmp::Reverse(score), std::cmp::Reverse(0), vec![row]));
             }
         }
-        rows
+        groups.sort_by_key(|(rank, score, time, _)| (*rank, *score, *time));
+        groups
+            .into_iter()
+            .flat_map(|(_, _, _, rows)| rows)
+            .collect()
+    }
+
+    pub(super) fn mark_inline_history_dirty(&mut self) {
+        if let Some(browser) = &mut self.inline_history_browser {
+            browser.dirty = true;
+        }
+    }
+
+    pub(super) async fn refresh_live_inline_history(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let should_refresh = self.inline_history_browser.as_ref().is_some_and(|browser| {
+            browser.dirty
+                && browser.refreshed_at.elapsed()
+                    >= Duration::from_millis(crate::ui::SPINNER_FRAME_INTERVAL_MS)
+        }) && self
+            .current_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.is_inline_history());
+        if should_refresh {
+            self.refresh_inline_history_browser(buffer, runtime, false)
+                .await?;
+        }
+        Ok(())
     }
 
     pub(super) async fn open_inline_history(
@@ -96,15 +269,18 @@ impl Editor {
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        self.park_inline_assist();
         self.refresh_inline_history_paths();
+        self.complete_ready_inline_answers();
+        self.sync_inline_activity();
         if self.inline_history_browser.is_none() {
-            self.close_inline_assist_session();
+            let now = Instant::now();
             self.inline_history_browser = Some(HistoryBrowser {
                 origin: self.current_jump_entry(),
                 viewport: (self.vtop, self.vleft, self.skipcol),
                 active_comment: self.active_inline_comment,
                 file: self.current_buffer().file.clone(),
-                workspace: false,
+                workspace: true,
                 query: String::new(),
                 searching: false,
                 selected: None,
@@ -112,45 +288,100 @@ impl Editor {
                 view: 0,
                 scroll: 0,
                 confirm_forget: false,
+                dirty: false,
+                refreshed_at: now,
+                animation_started: now,
             });
         }
-        self.refresh_inline_history_browser(buffer, runtime).await
+        self.refresh_inline_history_browser(buffer, runtime, true)
+            .await
+    }
+
+    pub(super) async fn open_inline_history_request(
+        &mut self,
+        group: &str,
+        request: &str,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        self.open_inline_history(buffer, runtime).await?;
+        if let Some(browser) = &mut self.inline_history_browser {
+            browser.workspace = true;
+            browser.query.clear();
+            browser.searching = false;
+            browser.expanded.insert(group.to_owned());
+            browser.selected = Some(HistoryKey::Turn(request.to_owned()));
+            browser.scroll = 0;
+        }
+        self.refresh_inline_history_browser(buffer, runtime, true)
+            .await
     }
 
     async fn refresh_inline_history_browser(
         &mut self,
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
+        preview_source: bool,
     ) -> anyhow::Result<()> {
         self.clear_history_preview();
         let rows = self.history_rows();
         let selected = self
             .inline_history_browser
             .as_ref()
-            .and_then(|browser| browser.selected.as_deref())
-            .and_then(|request| rows.iter().position(|(_, id, _)| id == request))
+            .and_then(|browser| browser.selected.as_ref())
+            .and_then(|key| rows.iter().position(|row| &row.key == key))
             .unwrap_or(0);
-        let selected_id = rows.get(selected).map(|(_, request, _)| request.clone());
+        let selected_key = rows.get(selected).map(|row| row.key.clone());
         if let Some(browser) = &mut self.inline_history_browser {
-            browser.selected = selected_id.clone();
+            browser.selected = selected_key.clone();
         }
-        let turn = selected_id
-            .as_deref()
+        let turn = selected_key
+            .as_ref()
+            .and_then(HistoryKey::request)
             .and_then(|request| self.inline_history.turn(request))
             .cloned();
-        let mut detail = "No inline conversations here yet. Use Space i to ask a question; w shows the whole workspace.".to_string();
-        if let Some(turn) = turn {
-            if self.resolve_history_turn(&turn).is_none()
-                && Path::new(&turn.location.file).is_file()
-            {
-                self.execute_with_tracking(
-                    &Action::OpenFile(turn.location.file.clone()),
-                    buffer,
-                    runtime,
-                    false,
-                )
-                .await?;
+        let draft = selected_key.as_ref().and_then(|key| match key {
+            HistoryKey::Draft(group) => self.inline_jobs.get(group).and_then(|job| {
+                let InlineAssistPopupState::Prompt { initial, .. } = &job.state else {
+                    return None;
+                };
+                Some((
+                    job.location.clone(),
+                    job.session.expected_text.clone(),
+                    initial.clone(),
+                ))
+            }),
+            HistoryKey::Turn(_) => None,
+        });
+        let file = turn
+            .as_ref()
+            .map(|turn| turn.location.file.as_str())
+            .or_else(|| {
+                draft
+                    .as_ref()
+                    .map(|(location, _, _)| location.file.as_str())
+            });
+        if preview_source {
+            if let Some(file) = file.filter(|file| !file.is_empty() && Path::new(file).is_file()) {
+                if !self
+                    .buffer_manager
+                    .iter()
+                    .any(|buffer| buffer.file.as_deref() == Some(file))
+                {
+                    self.execute_with_tracking(
+                        &Action::OpenFile(file.into()),
+                        buffer,
+                        runtime,
+                        false,
+                    )
+                    .await?;
+                }
             }
+        }
+        let mut detail =
+            "No inline conversations here yet. Use Space i to ask a question.".to_string();
+        let mut can_restore = false;
+        if let Some(turn) = turn {
             let resolved = self.resolve_history_turn(&turn);
             let state = resolved
                 .as_ref()
@@ -164,56 +395,59 @@ impl Editor {
                     })
                 });
             if let Some((index, range, _)) = preview_location {
-                if self.buffer_manager.active_index() != index {
-                    self.set_current_buffer(buffer, index).await?;
+                if preview_source {
+                    self.preview_inline_history_location(index, range, buffer)
+                        .await?;
                 }
-                self.move_to_text_position(range.start);
-                self.vtop = range.start.line.saturating_sub(1);
-                self.cy = range.start.line.saturating_sub(self.vtop);
-                self.skipcol = 0;
-                if let Some(result) = &turn.result {
-                    let comments = result
-                        .comments
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(comment_index, comment)| {
-                            let (comment_buffer, range, state) =
-                                self.resolve_history_comment(&turn, comment_index)?;
-                            if comment_buffer != index || state == InlineSourceState::Detached {
-                                return None;
-                            }
-                            let last = range.end.line.saturating_sub(usize::from(
-                                range.end.character == 0 && range.end.line > range.start.line,
-                            ));
-                            let mut value = self.make_inline_comment(
-                                range.start.line,
-                                last,
-                                comment.message.clone(),
-                                InlineCommentOrigin::HistoryPreview {
-                                    request_id: turn.request_id.clone(),
-                                    comment_index,
-                                },
-                            );
-                            value.stale = state == InlineSourceState::Changed;
-                            Some(value)
-                        })
-                        .collect::<Vec<_>>();
-                    self.active_inline_comment = comments.first().map(|comment| comment.id);
-                    self.inline_comments.extend(comments);
+                if index == self.buffer_manager.active_index() {
+                    if let Some(result) = &turn.result {
+                        let comments = result
+                            .comments
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(comment_index, comment)| {
+                                let (comment_buffer, range, state) =
+                                    self.resolve_history_comment(&turn, comment_index)?;
+                                if comment_buffer != index || state == InlineSourceState::Detached {
+                                    return None;
+                                }
+                                let last = range.end.line.saturating_sub(usize::from(
+                                    range.end.character == 0 && range.end.line > range.start.line,
+                                ));
+                                let mut value = Self::make_inline_comment_in_buffer(
+                                    &self.buffer_manager[index],
+                                    range.start.line,
+                                    last,
+                                    comment.message.clone(),
+                                    InlineCommentOrigin::HistoryPreview {
+                                        request_id: turn.request_id.clone(),
+                                        comment_index,
+                                    },
+                                );
+                                value.stale = state == InlineSourceState::Changed;
+                                Some(value)
+                            })
+                            .collect::<Vec<_>>();
+                        self.active_inline_comment = comments.first().map(|comment| comment.id);
+                        self.inline_comments.extend(comments);
+                    }
                 }
-                self.sync_to_window();
             }
+            can_restore = turn.state == InlineTurnState::Completed
+                && turn
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| !result.comments.is_empty());
             let view = self
                 .inline_history_browser
                 .as_ref()
                 .map_or(0, |browser| browser.view);
             let header = format!(
-                "{} · {}\n{}:{}–{}",
+                "{} · {}\n{}\nSource: {}",
                 state.label(),
                 turn.status(),
-                turn.location.file,
-                turn.original_range.start.line + 1,
-                turn.original_range.end.line + usize::from(turn.original_range.end.character > 0)
+                history_location_label(&turn.location),
+                crate::ui::first_prompt_line(&turn.before)
             );
             detail = match view {
                 1 => format!(
@@ -241,10 +475,30 @@ impl Editor {
                         .unwrap_or_default()
                 ),
             };
+        } else if let Some((location, source, prompt)) = draft {
+            let resolved = self.resolve_history_source(&location, &source, true);
+            let state = resolved
+                .as_ref()
+                .map_or(InlineSourceState::Detached, |(_, _, state)| *state);
+            if preview_source {
+                if let Some((index, range, _)) =
+                    resolved.filter(|(_, _, state)| *state != InlineSourceState::Detached)
+                {
+                    self.preview_inline_history_location(index, range, buffer)
+                        .await?;
+                }
+            }
+            detail = format!(
+                "draft · {}\n{}\n\nUnsent prompt:\n{prompt}\n\nTARGET · read-only\n{source}",
+                state.label(),
+                history_location_label(&location)
+            );
         }
-        let Some(browser) = &self.inline_history_browser else {
+        let Some(browser) = &mut self.inline_history_browser else {
             return Ok(());
         };
+        browser.dirty = false;
+        browser.refreshed_at = Instant::now();
         let title = format!(
             "Inline history · {} · {}",
             if browser.workspace {
@@ -254,22 +508,54 @@ impl Editor {
             },
             ["conversation", "reviewed code", "before edit", "compare"][browser.view]
         );
-        self.current_dialog = Some(Box::new(crate::ui::InlineHistoryPanel::new(
-            self,
-            rows.into_iter().map(|(_, _, label)| label).collect(),
-            selected,
-            detail,
+        let (scroll, searching, query, confirm_forget, animation_started) = (
             browser.scroll,
             browser.searching,
             browser.query.clone(),
             browser.confirm_forget,
+            browser.animation_started,
+        );
+        let panel = crate::ui::InlineHistoryPanel::new(
+            self,
+            rows.into_iter()
+                .map(|row| crate::ui::InlineHistoryRow {
+                    text: row.label,
+                    running: row.running,
+                })
+                .collect(),
+            selected,
+            detail,
+            scroll,
+            searching,
+            query,
+            confirm_forget,
             title,
-        )));
+            can_restore,
+            animation_started,
+        );
+        self.current_dialog = Some(Box::new(panel));
         self.layout_cache.borrow_mut().clear();
         self.render(buffer)
     }
 
-    async fn close_inline_history(
+    async fn preview_inline_history_location(
+        &mut self,
+        index: usize,
+        range: TextRange,
+        buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<()> {
+        if self.buffer_manager.active_index() != index {
+            self.set_current_buffer(buffer, index).await?;
+        }
+        self.move_to_text_position(range.start);
+        self.vtop = range.start.line.saturating_sub(1);
+        self.cy = range.start.line.saturating_sub(self.vtop);
+        self.skipcol = 0;
+        self.sync_to_window();
+        Ok(())
+    }
+
+    pub(super) async fn close_inline_history(
         &mut self,
         jump: bool,
         buffer: &mut RenderBuffer,
@@ -332,6 +618,24 @@ impl Editor {
         }
     }
 
+    pub(super) fn inline_handoff_prompt(&self, group: &str) -> Option<String> {
+        let conversation = self
+            .inline_history
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == group)?;
+        let latest = conversation.turns.last()?;
+        let range = latest.location.range;
+        Some(format!(
+            "Continue this inline-assist discussion in the project. Carry out the latest user request below, using the earlier answers as context. Read current files through Red before editing; the discussion may describe older source.\n\nLocation: {}:{}–{}\n\nLatest user request:\n{}\n{}",
+            latest.location.file,
+            range.start.line + 1,
+            range.end.line + usize::from(range.end.character > 0),
+            latest.prompt,
+            self.recovered_inline_context(group),
+        ))
+    }
+
     pub(super) async fn handle_inline_history_action(
         &mut self,
         action: &HistoryAction,
@@ -365,22 +669,67 @@ impl Editor {
         };
         let selected = browser
             .selected
-            .as_deref()
-            .and_then(|request| rows.iter().position(|(_, id, _)| id == request))
+            .as_ref()
+            .and_then(|key| rows.iter().position(|row| &row.key == key))
             .unwrap_or(0);
         let selected_row = rows.get(selected).cloned();
+        if matches!(action, HistoryAction::Open) {
+            if let Some(row) = selected_row {
+                return self.open_inline_job(&row.group, buffer, runtime).await;
+            }
+            return Ok(());
+        }
+        if matches!(action, HistoryAction::ShowAnnotations) {
+            if let Some(request) = selected_row
+                .as_ref()
+                .and_then(|row| row.key.request())
+                .map(str::to_string)
+            {
+                if self
+                    .show_inline_history_annotations(&request, buffer, runtime)
+                    .await?
+                {
+                    return self.close_inline_history(true, buffer, runtime).await;
+                }
+            } else {
+                self.last_error = Some("this item has no completed annotations".into());
+            }
+            return self
+                .refresh_inline_history_browser(buffer, runtime, false)
+                .await;
+        }
         if matches!(action, HistoryAction::Close | HistoryAction::Jump) {
             return self
                 .close_inline_history(matches!(action, HistoryAction::Jump), buffer, runtime)
                 .await;
         }
         if matches!(action, HistoryAction::Continue | HistoryAction::Recheck) {
-            if let Some((group, request, _)) = selected_row {
-                let turn = self.inline_history.turn(&request).cloned();
+            if let Some(row) = selected_row {
+                let group = row.group;
+                let Some(request) = row.key.request() else {
+                    return self.open_inline_job(&group, buffer, runtime).await;
+                };
+                let latest_is_unfinished = self
+                    .inline_history
+                    .conversations
+                    .iter()
+                    .find(|conversation| conversation.id == group)
+                    .and_then(|conversation| conversation.turns.last())
+                    .is_some_and(|turn| {
+                        matches!(
+                            turn.state,
+                            InlineTurnState::Pending | InlineTurnState::Ready
+                        )
+                    });
+                if self.has_parked_inline_draft(&group) || latest_is_unfinished {
+                    return self.open_inline_job(&group, buffer, runtime).await;
+                }
+                let turn = self.inline_history.turn(request).cloned();
                 if let Some(turn) = turn {
                     if let Some((index, range, state)) = self.resolve_history_turn(&turn) {
                         if state != InlineSourceState::Detached {
                             self.close_inline_history(true, buffer, runtime).await?;
+                            self.release_parked_inline_job(&group);
                             if self.buffer_manager.active_index() != index {
                                 self.set_current_buffer(buffer, index).await?;
                             }
@@ -443,11 +792,18 @@ impl Editor {
                 } else {
                     (selected + rows.len() - 1) % rows.len()
                 };
-                browser.selected = Some(rows[next].1.clone());
+                browser.selected = Some(rows[next].key.clone());
                 browser.scroll = 0;
             }
+            HistoryAction::Select(index) => {
+                if let Some(row) = rows.get(*index) {
+                    browser.selected = Some(row.key.clone());
+                    browser.scroll = 0;
+                }
+            }
             HistoryAction::Expand | HistoryAction::Collapse => {
-                if let Some((group, _, _)) = &selected_row {
+                if let Some(row) = &selected_row {
+                    let group = &row.group;
                     if matches!(action, HistoryAction::Expand) {
                         browser.expanded.insert(group.clone());
                     } else {
@@ -491,16 +847,19 @@ impl Editor {
             HistoryAction::Forget => browser.confirm_forget = !browser.confirm_forget,
             HistoryAction::ConfirmForget => {
                 browser.confirm_forget = false;
-                if let Some((group, _, _)) = &selected_row {
+                if let Some(row) = &selected_row {
+                    let group = &row.group;
                     self.inline_history
                         .conversations
                         .retain(|conversation| conversation.id != *group);
                     self.inline_history.remove_unused_sources();
                     self.remove_inline_comment_group(group);
+                    self.release_parked_inline_job(group);
                 }
             }
             HistoryAction::Resolve => {
-                if let Some((group, _, _)) = &selected_row {
+                if let Some(row) = &selected_row {
+                    let group = &row.group;
                     if let Some(conversation) = self
                         .inline_history
                         .conversations
@@ -511,15 +870,186 @@ impl Editor {
                     }
                     self.remove_inline_comment_group(group);
                     self.restore_inline_history_comments();
+                    self.sync_inline_activity();
                 }
             }
             _ => {}
         }
-        self.refresh_inline_history_browser(buffer, runtime).await
+        let preview_source = matches!(
+            action,
+            HistoryAction::Next
+                | HistoryAction::Previous
+                | HistoryAction::Select(_)
+                | HistoryAction::ToggleWorkspace
+                | HistoryAction::Query(_)
+                | HistoryAction::Backspace
+                | HistoryAction::ClearSearch
+                | HistoryAction::Expand
+                | HistoryAction::Collapse
+        );
+        self.refresh_inline_history_browser(buffer, runtime, preview_source)
+            .await
     }
 
-    fn history_location(&self, range: TextRange) -> InlineLocation {
-        let buffer = self.current_buffer();
+    pub(super) fn inline_annotations_request(
+        &self,
+        group: &str,
+        preferred: Option<&str>,
+    ) -> Option<String> {
+        let conversation = self
+            .inline_history
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == group)?;
+        let has_annotations = |turn: &&InlineHistoryTurn| {
+            turn.state == InlineTurnState::Completed
+                && turn
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| !result.comments.is_empty())
+        };
+        preferred
+            .or(conversation.visible_request.as_deref())
+            .and_then(|request| {
+                conversation
+                    .turns
+                    .iter()
+                    .find(|turn| turn.request_id == request)
+                    .filter(has_annotations)
+            })
+            .or_else(|| conversation.turns.iter().rev().find(has_annotations))
+            .map(|turn| turn.request_id.clone())
+    }
+
+    /// Make a retained turn visible without replaying its source edit or changing
+    /// its historical outcome. Detached comments remain available in history.
+    pub(super) async fn show_inline_history_annotations(
+        &mut self,
+        request: &str,
+        frame: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<bool> {
+        let Some((group, turn)) =
+            self.inline_history
+                .conversations
+                .iter()
+                .find_map(|conversation| {
+                    conversation
+                        .turns
+                        .iter()
+                        .find(|turn| {
+                            turn.request_id == request && turn.state == InlineTurnState::Completed
+                        })
+                        .map(|turn| (conversation.id.clone(), turn.clone()))
+                })
+        else {
+            self.last_error = Some("this item has no completed annotations".into());
+            return Ok(false);
+        };
+        let Some(result) = turn
+            .result
+            .as_ref()
+            .filter(|result| !result.comments.is_empty())
+        else {
+            self.last_error = Some("this result has no annotations".into());
+            return Ok(false);
+        };
+        if self.resolve_history_turn(&turn).is_none() && Path::new(&turn.location.file).is_file() {
+            self.execute_with_tracking(
+                &Action::OpenFile(turn.location.file.clone()),
+                frame,
+                runtime,
+                false,
+            )
+            .await?;
+        }
+        let annotations = result
+            .comments
+            .iter()
+            .enumerate()
+            .filter_map(|(comment_index, comment)| {
+                let (index, range, state) = self.resolve_history_comment(&turn, comment_index)?;
+                if state == InlineSourceState::Detached {
+                    return None;
+                }
+                let last = range.end.line.saturating_sub(usize::from(
+                    range.end.character == 0 && range.end.line > range.start.line,
+                ));
+                let mut annotation = Self::make_inline_comment_in_buffer(
+                    &self.buffer_manager[index],
+                    range.start.line,
+                    last,
+                    comment.message.clone(),
+                    InlineCommentOrigin::Assist {
+                        group_id: group.clone(),
+                        session_id: turn.session_id.clone().unwrap_or_default(),
+                        request_id: request.into(),
+                        comment_index,
+                    },
+                );
+                if let Some(fingerprint) = turn.comment_fingerprints.get(comment_index) {
+                    annotation.expected_fingerprint = *fingerprint;
+                }
+                annotation.stale = state != InlineSourceState::Unchanged;
+                Some(annotation)
+            })
+            .collect::<Vec<_>>();
+        if annotations.is_empty() {
+            self.last_error = Some(
+                "annotations retained, but their source is detached; recheck against current code"
+                    .into(),
+            );
+            return Ok(false);
+        }
+        let mut counts = HashMap::new();
+        for annotation in &annotations {
+            *counts.entry(annotation.anchor.buffer_id).or_insert(0) += 1;
+        }
+        for (buffer_id, count) in counts {
+            if let Err(error) =
+                self.check_inline_comment_capacity_for_buffer(buffer_id, &group, count)
+            {
+                self.last_error = Some(error.to_string());
+                return Ok(false);
+            }
+        }
+        let restored = annotations.len();
+        let selected = annotations.first().map(|annotation| annotation.id);
+        if let Some(conversation) = self
+            .inline_history
+            .conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == group)
+        {
+            conversation.resolved = false;
+            conversation.visible_request = Some(request.into());
+            if let Some(turn) = conversation
+                .turns
+                .iter_mut()
+                .find(|turn| turn.request_id == request)
+            {
+                turn.hidden_comments.clear();
+            }
+        }
+        self.remove_inline_comment_group(&group);
+        self.inline_comments.extend(annotations);
+        self.active_inline_comment = selected;
+        if let Some(browser) = &mut self.inline_history_browser {
+            browser.active_comment = selected;
+        }
+        self.sync_inline_activity();
+        self.last_error = Some(format!(
+            "showing {restored}/{} retained annotation(s) · source unchanged by this action",
+            result.comments.len()
+        ));
+        Ok(true)
+    }
+
+    pub(super) fn history_location(&self, range: TextRange) -> InlineLocation {
+        Self::history_location_in_buffer(self.current_buffer(), range)
+    }
+
+    pub(super) fn history_location_in_buffer(buffer: &Buffer, range: TextRange) -> InlineLocation {
         let start_char = buffer.position_to_char_idx(range.start);
         let end_char = buffer.position_to_char_idx(range.end);
         InlineLocation {
@@ -546,6 +1076,11 @@ impl Editor {
             .iter()
             .filter_map(|buffer| buffer.file.as_ref().map(|file| (buffer.id(), file.clone())))
             .collect::<HashMap<_, _>>();
+        for job in self.inline_jobs.values_mut() {
+            if let Some(file) = job.location.buffer_id.and_then(|id| files.get(&id)) {
+                job.location.file.clone_from(file);
+            }
+        }
         for conversation in &mut self.inline_history.conversations {
             for turn in &mut conversation.turns {
                 for location in
@@ -584,6 +1119,7 @@ impl Editor {
                 }
             }
         }
+        self.mark_inline_history_dirty();
     }
 
     pub(super) fn rebind_inline_history_file(&mut self, file: &str) {
@@ -653,6 +1189,7 @@ impl Editor {
                 file: turn.location.file.clone(),
                 turns: vec![turn],
                 resolved: false,
+                visible_request: None,
             });
         }
         Ok(())
@@ -670,6 +1207,17 @@ impl Editor {
             .inline_assist
             .as_ref()
             .and_then(|assist| assist.transaction_id.clone());
+        self.complete_inline_history_turn_at(request, session, result, location, transaction);
+    }
+
+    pub(super) fn complete_inline_history_turn_at(
+        &mut self,
+        request: &str,
+        session: &str,
+        result: &InlineAssistResult,
+        location: InlineLocation,
+        transaction: Option<String>,
+    ) {
         let fingerprints = self
             .inline_comments
             .iter()
@@ -685,19 +1233,21 @@ impl Editor {
             .iter()
             .filter_map(|comment| match &comment.origin {
                 InlineCommentOrigin::Assist { request_id, .. } if request_id == request => {
-                    let (start, end) = comment.lines(self.current_buffer());
-                    let location = self.history_location(TextRange::new(
-                        TextPosition::new(start, 0),
-                        TextPosition::new(end.saturating_add(1), 0),
-                    ));
-                    let source = (self
-                        .current_buffer()
-                        .line_range_byte_len(start, end.saturating_add(1))
+                    let buffer = self
+                        .buffer_manager
+                        .iter()
+                        .find(|buffer| buffer.id() == comment.anchor.buffer_id)?;
+                    let (start, end) = comment.lines(buffer);
+                    let location = Self::history_location_in_buffer(
+                        buffer,
+                        TextRange::new(
+                            TextPosition::new(start, 0),
+                            TextPosition::new(end.saturating_add(1), 0),
+                        ),
+                    );
+                    let source = (buffer.line_range_byte_len(start, end.saturating_add(1))
                         <= 256 * 1024)
-                        .then(|| {
-                            self.current_buffer()
-                                .line_range_contents(start, end.saturating_add(1))
-                        });
+                        .then(|| buffer.line_range_contents(start, end.saturating_add(1)));
                     Some((location, source))
                 }
                 _ => None,
@@ -718,10 +1268,14 @@ impl Editor {
                 .iter()
                 .any(|turn| turn.request_id == request)
             {
+                if result.needs_agent.is_none() {
+                    conversation.visible_request = None;
+                }
                 for turn in &mut conversation.turns {
                     if turn.request_id == request {
                         turn.location = location.clone();
                         turn.state = InlineTurnState::Completed;
+                        turn.error = None;
                         turn.result = Some(result.clone());
                         turn.session_id = Some(session.to_string());
                         turn.transaction_id = if result
@@ -736,7 +1290,8 @@ impl Editor {
                         turn.comment_fingerprints.clone_from(&fingerprints);
                         turn.comment_locations.clone_from(&comment_locations);
                         turn.comment_source_ids.clone_from(&comment_source_ids);
-                    } else if turn.state == InlineTurnState::Completed
+                    } else if result.needs_agent.is_none()
+                        && turn.state == InlineTurnState::Completed
                         && turn.disposition == InlineDisposition::Kept
                     {
                         turn.disposition = InlineDisposition::Superseded;
@@ -749,18 +1304,24 @@ impl Editor {
 
     /// Rebind only to the same live buffer, or one unambiguous reopened file.
     /// Exact source relocation is permitted; ambiguous matches never attach.
-    fn resolve_history_turn(
+    pub(super) fn resolve_history_turn(
         &self,
         turn: &InlineHistoryTurn,
     ) -> Option<(usize, TextRange, InlineSourceState)> {
         self.resolve_history_source(
             &turn.location,
-            turn.reviewed(),
-            turn.state == InlineTurnState::Completed
-                || turn
-                    .result
-                    .as_ref()
-                    .is_none_or(|result| result.replacement.is_none()),
+            if turn.state != InlineTurnState::Completed {
+                &turn.before
+            } else {
+                turn.reviewed()
+            },
+            matches!(
+                turn.state,
+                InlineTurnState::Completed | InlineTurnState::Ready
+            ) || turn
+                .result
+                .as_ref()
+                .is_none_or(|result| result.replacement.is_none()),
         )
     }
 
@@ -777,7 +1338,7 @@ impl Editor {
         self.resolve_history_source(location, source, true)
     }
 
-    fn resolve_history_source(
+    pub(super) fn resolve_history_source(
         &self,
         location: &InlineLocation,
         reviewed: &str,
@@ -840,55 +1401,61 @@ impl Editor {
         let file = buffer.file.clone();
         let buffer_index = self.buffer_manager.active_index();
         let buffer = &self.buffer_manager[buffer_index];
-        for turn in self
+        let locations = self
             .inline_history
             .conversations
             .iter_mut()
             .flat_map(|conversation| &mut conversation.turns)
-        {
-            for location in
+            .flat_map(|turn| {
                 std::iter::once(&mut turn.location).chain(turn.comment_locations.iter_mut())
+            })
+            .chain(self.inline_jobs.values_mut().map(|job| &mut job.location));
+        for location in locations {
+            if location.buffer_id != Some(id) {
+                continue;
+            }
+            if edit.new_char_len == 0
+                && edit.start_char <= location.start_char
+                && edit.end_char >= location.end_char
+                && edit.end_char > edit.start_char
             {
-                if location.buffer_id != Some(id) {
-                    continue;
-                }
-                if edit.new_char_len == 0
-                    && edit.start_char <= location.start_char
-                    && edit.end_char >= location.end_char
-                    && edit.end_char > edit.start_char
-                {
-                    location.detached = true;
-                }
-                let mut start = EditAnchor {
-                    buffer_id: id,
-                    file: file.clone(),
-                    char_index: location.start_char,
-                    fallback: location.range.start,
-                    affinity: AnchorAffinity::Right,
-                };
-                let mut end = EditAnchor {
-                    buffer_id: id,
-                    file: file.clone(),
-                    char_index: location.end_char,
-                    fallback: location.range.end,
-                    affinity: AnchorAffinity::Left,
-                };
-                Self::transform_inline_comment_anchor(&mut start, edit, buffer);
-                Self::transform_inline_comment_anchor(&mut end, edit, buffer);
-                location.start_char = start.char_index;
-                location.end_char = end.char_index.max(start.char_index);
-                location.range = TextRange::new(
-                    buffer.char_idx_to_position(location.start_char),
-                    buffer.char_idx_to_position(location.end_char),
-                );
-                if let Some(file) = &file {
-                    location.file.clone_from(file);
-                }
+                location.detached = true;
+            }
+            let mut start = EditAnchor {
+                buffer_id: id,
+                file: file.clone(),
+                char_index: location.start_char,
+                fallback: location.range.start,
+                affinity: AnchorAffinity::Right,
+            };
+            let mut end = EditAnchor {
+                buffer_id: id,
+                file: file.clone(),
+                char_index: location.end_char,
+                fallback: location.range.end,
+                affinity: AnchorAffinity::Left,
+            };
+            Self::transform_inline_comment_anchor(&mut start, edit, buffer);
+            Self::transform_inline_comment_anchor(&mut end, edit, buffer);
+            location.start_char = start.char_index;
+            location.end_char = end.char_index.max(start.char_index);
+            location.range = TextRange::new(
+                buffer.char_idx_to_position(location.start_char),
+                buffer.char_idx_to_position(location.end_char),
+            );
+            if let Some(file) = &file {
+                location.file.clone_from(file);
             }
         }
+        self.mark_inline_history_dirty();
     }
 
     pub(super) fn detach_inline_history_buffer(&mut self, id: BufferId) {
+        for job in self.inline_jobs.values_mut() {
+            if job.location.buffer_id == Some(id) {
+                job.location.buffer_id = None;
+            }
+        }
         for turn in self
             .inline_history
             .conversations
@@ -928,7 +1495,9 @@ impl Editor {
                         request_id,
                         comment_index,
                     } => (request_id, *comment_index),
-                    InlineCommentOrigin::Sample => return None,
+                    InlineCommentOrigin::Sample | InlineCommentOrigin::Activity { .. } => {
+                        return None
+                    }
                 };
                 let turn = self.inline_history.turn(request)?;
                 let resolved = self.resolve_history_comment(turn, index);
@@ -1018,12 +1587,27 @@ impl Editor {
             .filter(|conversation| !conversation.resolved)
             .filter_map(|conversation| {
                 conversation
-                    .turns
-                    .iter()
-                    .rev()
-                    .find(|turn| {
-                        turn.state == InlineTurnState::Completed
-                            && turn.disposition == InlineDisposition::Kept
+                    .visible_request
+                    .as_deref()
+                    .and_then(|request| {
+                        conversation.turns.iter().find(|turn| {
+                            turn.request_id == request
+                                && turn.state == InlineTurnState::Completed
+                                && turn
+                                    .result
+                                    .as_ref()
+                                    .is_some_and(|result| result.needs_agent.is_none())
+                        })
+                    })
+                    .or_else(|| {
+                        conversation.turns.iter().rev().find(|turn| {
+                            turn.state == InlineTurnState::Completed
+                                && turn.disposition == InlineDisposition::Kept
+                                && turn
+                                    .result
+                                    .as_ref()
+                                    .is_some_and(|result| result.needs_agent.is_none())
+                        })
                     })
                     .map(|turn| (conversation.id.clone(), turn.clone()))
             })

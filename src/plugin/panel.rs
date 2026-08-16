@@ -3573,6 +3573,21 @@ impl PanelManager {
         prompt_id: &str,
         expected_draft: Option<TextPanelDraftRevision>,
     ) -> Result<TextPanelReuseOutcome, &'static str> {
+        let text = self
+            .text_panels
+            .get(panel_id)
+            .and_then(|panel| panel.turn_text(prompt_id, TextPanelTurnPart::Prompt))
+            .ok_or("selected prompt is no longer available")?;
+        self.load_text_panel_draft(panel_id, &text, expected_draft)
+    }
+
+    /// Loads reviewable text without sending it or overwriting an unapproved draft.
+    pub(crate) fn load_text_panel_draft(
+        &mut self,
+        panel_id: &str,
+        text: &str,
+        expected_draft: Option<TextPanelDraftRevision>,
+    ) -> Result<TextPanelReuseOutcome, &'static str> {
         if !self.z_order.iter().any(|id| id == panel_id) {
             return Err("conversation pane is no longer visible");
         }
@@ -3580,11 +3595,7 @@ impl PanelManager {
             .text_panels
             .get_mut(panel_id)
             .ok_or("conversation is no longer available")?;
-        let text = normalize_prompt_newlines(
-            &panel
-                .turn_text(prompt_id, TextPanelTurnPart::Prompt)
-                .ok_or("selected prompt is no longer available")?,
-        );
+        let text = normalize_prompt_newlines(text);
         if text.len() > MAX_COMPOSER_BYTES {
             return Err("selected prompt exceeds 128 KiB");
         }
@@ -5557,6 +5568,70 @@ mod tests {
         color::{contrast_ratio, Color},
         theme::parse_vscode_theme,
     };
+
+    #[test]
+    fn inline_handoff_draft_requires_confirmation_and_is_undoable() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".into(),
+            PanelConfig {
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".into(),
+                    rows: 3,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        assert!(matches!(
+            manager.load_text_panel_draft("agent", "my unsent draft", None),
+            Ok(TextPanelReuseOutcome::Loaded)
+        ));
+        let Ok(TextPanelReuseOutcome::Confirm(revision)) =
+            manager.load_text_panel_draft("agent", "inline discussion", None)
+        else {
+            panic!("nonempty draft must require confirmation");
+        };
+        assert_eq!(
+            manager.text_panels["agent"]
+                .composer
+                .as_ref()
+                .unwrap()
+                .prompt
+                .text(),
+            "my unsent draft"
+        );
+        manager
+            .text_panels
+            .get_mut("agent")
+            .unwrap()
+            .composer
+            .as_mut()
+            .unwrap()
+            .prompt
+            .insert("!");
+        assert!(manager
+            .load_text_panel_draft("agent", "inline discussion", Some(revision))
+            .is_err());
+        let Ok(TextPanelReuseOutcome::Confirm(revision)) =
+            manager.load_text_panel_draft("agent", "inline discussion", None)
+        else {
+            panic!("confirmation required");
+        };
+        assert!(matches!(
+            manager.load_text_panel_draft("agent", "inline discussion", Some(revision)),
+            Ok(TextPanelReuseOutcome::Loaded)
+        ));
+        let composer = manager
+            .text_panels
+            .get_mut("agent")
+            .unwrap()
+            .composer
+            .as_mut()
+            .unwrap();
+        assert_eq!(composer.prompt.text(), "inline discussion");
+        assert!(composer.prompt.undo());
+        assert_eq!(composer.prompt.text(), "my unsent draft!");
+    }
 
     fn row(id: &str) -> PanelRow {
         PanelRow {

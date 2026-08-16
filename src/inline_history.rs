@@ -27,6 +27,9 @@ pub enum HistoryAction {
     ScrollUp,
     CycleView,
     Jump,
+    Open,
+    ShowAnnotations,
+    Select(usize),
     Close,
     Continue,
     Recheck,
@@ -40,6 +43,8 @@ pub enum HistoryAction {
 #[serde(rename_all = "snake_case")]
 pub enum InlineTurnState {
     Pending,
+    /// The provider finished, but the editor has not applied the result.
+    Ready,
     Completed,
     Failed,
     Cancelled,
@@ -130,6 +135,20 @@ impl InlineHistoryTurn {
     }
 
     pub fn answer_text(&self) -> String {
+        if self.state != InlineTurnState::Completed {
+            if let Some(replacement) = self
+                .result
+                .as_ref()
+                .and_then(|result| result.replacement.as_deref())
+                .filter(|replacement| *replacement != self.before.as_str())
+            {
+                let diff = similar::TextDiff::from_lines(self.before.as_str(), replacement)
+                    .unified_diff()
+                    .header("before", "proposed")
+                    .to_string();
+                return format!("{}\n\nProposed edit · not applied\n{diff}", self.answer);
+            }
+        }
         if !self.answer.trim().is_empty() {
             return if self.answer_truncated {
                 format!("{}\n[answer exceeded the retained-text limit]", self.answer)
@@ -138,6 +157,9 @@ impl InlineHistoryTurn {
             };
         }
         if let Some(result) = &self.result {
+            if let Some(reason) = &result.needs_agent {
+                return reason.clone();
+            }
             let comments = result
                 .comments
                 .iter()
@@ -163,8 +185,27 @@ impl InlineHistoryTurn {
     }
 
     pub fn status(&self) -> &'static str {
+        if matches!(
+            self.state,
+            InlineTurnState::Completed | InlineTurnState::Ready
+        ) && self
+            .result
+            .as_ref()
+            .is_some_and(|result| result.needs_agent.is_some())
+        {
+            return "needs Agent";
+        }
         match (self.state, self.disposition) {
             (InlineTurnState::Pending, _) => "pending",
+            (InlineTurnState::Ready, _)
+                if self
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| !result.changes_text(&self.before)) =>
+            {
+                "answered"
+            }
+            (InlineTurnState::Ready, _) => "ready",
             (InlineTurnState::Failed, _) => "failed",
             (InlineTurnState::Cancelled, _) => "cancelled",
             (InlineTurnState::Rejected, _) => "not applied",
@@ -183,6 +224,9 @@ pub struct InlineConversation {
     pub turns: Vec<InlineHistoryTurn>,
     #[serde(default)]
     pub resolved: bool,
+    /// Explicitly displayed historical turn; None follows the latest kept result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visible_request: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -267,7 +311,10 @@ impl InlineHistory {
 
     pub fn finish(&mut self, request: &str, state: InlineTurnState, error: Option<String>) {
         if let Some(turn) = self.turn_mut(request) {
-            if turn.state == InlineTurnState::Pending {
+            if matches!(
+                turn.state,
+                InlineTurnState::Pending | InlineTurnState::Ready
+            ) {
                 turn.state = state;
                 turn.error = error;
             }
@@ -306,6 +353,17 @@ impl InlineHistory {
             );
         }
         for conversation in &self.conversations {
+            ensure!(
+                conversation
+                    .visible_request
+                    .as_deref()
+                    .is_none_or(|request| conversation
+                        .turns
+                        .iter()
+                        .any(|turn| turn.request_id == request
+                            && turn.state == InlineTurnState::Completed)),
+                "invalid visible inline history request"
+            );
             for turn in &conversation.turns {
                 ensure!(
                     requests.insert(&turn.request_id),

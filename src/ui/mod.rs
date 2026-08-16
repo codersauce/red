@@ -54,7 +54,7 @@ pub use hover_info::{HoverInfo, HoverInfoFormat};
 pub(crate) use icons::IconCatalog;
 pub use info::Info;
 pub use inline_assist::{InlineAssistPopup, InlineAssistPopupState};
-pub(crate) use inline_history::InlineHistoryPanel;
+pub(crate) use inline_history::{InlineHistoryPanel, InlineHistoryRow};
 pub use input_prompt::InputPrompt;
 pub(crate) use keyboard_shortcuts::{
     is_keyboard_shortcuts_alias, KeyboardShortcuts, ShortcutEntry, ShortcutEvent,
@@ -112,6 +112,15 @@ pub trait Component: Send {
     /// User-facing name used by contextual keyboard help.
     fn shortcut_context(&self) -> &str {
         "Dialog"
+    }
+
+    /// Snapshot of an inline popup, including an unsent draft, before hiding it.
+    fn inline_assist_state(&self) -> Option<InlineAssistPopupState> {
+        None
+    }
+
+    fn is_inline_history(&self) -> bool {
+        false
     }
 
     /// Actions for the surface-local F1 menu. The default keeps passive popups unchanged.

@@ -1,5 +1,7 @@
 //! Cursor-anchored prompt and result controls for bounded inline code edits.
 
+use std::time::Instant;
+
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 
 use crate::{
@@ -26,7 +28,10 @@ const MAX_ERROR_ROWS: usize = 4;
 pub enum InlineAssistPopupState {
     Prompt { initial: String, refining: bool },
     Working,
+    Ready { stale: bool },
+    AnswerRetained(String),
     Applied { edited: bool, comments: usize },
+    NeedsAgent(String),
     Failed(String),
 }
 
@@ -37,7 +42,8 @@ pub struct InlineAssistPopup {
     dialog: Dialog,
     style: Style,
     theme: Theme,
-    spinner_tick: usize,
+    spinner_started: Instant,
+    spinner_frame: u64,
 }
 
 impl InlineAssistPopup {
@@ -110,7 +116,7 @@ impl InlineAssistPopup {
             InlineAssistPopupState::Prompt { initial, .. } => initial.clone(),
             _ => String::new(),
         };
-        let prompt = PromptBuffer::new(&initial);
+        let prompt = PromptBuffer::with_history(&initial, editor.inline_prompt_history());
         let width = Self::content_width(layout.viewport.width);
         let desired_height = Self::content_height(&state, &prompt, width);
         let (x, y, height) = Self::geometry(layout, width, desired_height);
@@ -133,7 +139,8 @@ impl InlineAssistPopup {
             dialog,
             style,
             theme: editor.theme.clone(),
-            spinner_tick: 0,
+            spinner_started: Instant::now(),
+            spinner_frame: 0,
         }
     }
 
@@ -159,8 +166,11 @@ impl InlineAssistPopup {
                     .saturating_add(1)
             }
             InlineAssistPopupState::Working => 2,
+            InlineAssistPopupState::Ready { .. } => 3,
             InlineAssistPopupState::Applied { .. } => 2,
-            InlineAssistPopupState::Failed(message) => wrap_text(message, width.max(1))
+            InlineAssistPopupState::AnswerRetained(message)
+            | InlineAssistPopupState::NeedsAgent(message)
+            | InlineAssistPopupState::Failed(message) => wrap_text(message, width.max(1))
                 .rows
                 .len()
                 .clamp(1, MAX_ERROR_ROWS)
@@ -191,7 +201,7 @@ impl InlineAssistPopup {
                 end.saturating_sub(viewport.y),
             ))
         });
-        let (x, y, height) = avoid_rows.map_or_else(
+        let (x, y, available_height) = avoid_rows.map_or_else(
             || anchored_popup_geometry(anchor, viewport.width, viewport.height, width, height),
             |avoid_rows| {
                 anchored_popup_geometry_avoiding_rows(
@@ -204,6 +214,13 @@ impl InlineAssistPopup {
                 )
             },
         );
+        // A whole function may fill the viewport. Keep the popup usable even
+        // when it is impossible to avoid every line in the edit scope.
+        let (x, y, height) = if available_height < height.min(2) {
+            anchored_popup_geometry(anchor, viewport.width, viewport.height, width, height)
+        } else {
+            (x, y, available_height)
+        };
         (
             viewport.x.saturating_add(x),
             viewport.y.saturating_add(y),
@@ -254,27 +271,90 @@ impl InlineAssistPopup {
                     .saturating_add(2))
                 .contains(&row)
     }
+
+    fn advance_spinner(&mut self, now: Instant) -> bool {
+        if !matches!(self.state, InlineAssistPopupState::Working) {
+            return false;
+        }
+        let frame = now
+            .saturating_duration_since(self.spinner_started)
+            .as_millis() as u64
+            / SPINNER_FRAME_INTERVAL_MS;
+        if frame == self.spinner_frame {
+            return false;
+        }
+        self.spinner_frame = frame;
+        true
+    }
 }
 
 impl Component for InlineAssistPopup {
+    fn inline_assist_state(&self) -> Option<InlineAssistPopupState> {
+        Some(match &self.state {
+            InlineAssistPopupState::Prompt { refining, .. } => InlineAssistPopupState::Prompt {
+                initial: self.prompt.text(),
+                refining: *refining,
+            },
+            state => state.clone(),
+        })
+    }
+
     fn surface_actions(&self) -> Vec<UiAction> {
         let essential =
             |id, key, label| UiAction::new(id, key, label).with_priority(ActionPriority::Essential);
         match &self.state {
             InlineAssistPopupState::Prompt { .. } => vec![
-                essential("apply", "Enter", "apply"),
-                essential("cancel", "Esc", "cancel"),
+                essential("apply", "Enter", "ask"),
+                essential("hide", "Esc", "hide"),
+                UiAction::new("previous-prompt", "Ctrl-p", "previous prompt")
+                    .with_enabled(!self.prompt.history().is_empty()),
+                UiAction::new("next-prompt", "Ctrl-n", "next prompt")
+                    .with_enabled(!self.prompt.history().is_empty()),
+                UiAction::new("cancel", "Ctrl-c", "discard"),
             ],
-            InlineAssistPopupState::Working => vec![essential("cancel", "Esc", "cancel")],
+            InlineAssistPopupState::Working => vec![
+                essential("hide", "Esc", "hide"),
+                UiAction::new("cancel", "Ctrl-c", "cancel request"),
+                UiAction::new("history", "H", "history"),
+            ],
+            InlineAssistPopupState::Ready { stale } => {
+                let mut actions = vec![essential("view", "v", "view result")];
+                if !stale {
+                    actions.push(essential("apply", "Enter", "apply"));
+                }
+                actions.extend([
+                    UiAction::new("refine", "r", "recheck"),
+                    UiAction::new("agent", "A", "Agent"),
+                    essential("hide", "Esc", "hide"),
+                ]);
+                actions
+            }
+            InlineAssistPopupState::AnswerRetained(_) => vec![
+                essential("view", "v", "full answer"),
+                UiAction::new("refine", "r", "recheck"),
+                UiAction::new("agent", "A", "Agent"),
+                essential("hide", "Esc", "hide"),
+            ],
             InlineAssistPopupState::Applied { edited, .. } => vec![
                 essential("keep", "Enter", "keep"),
+                UiAction::new("view", "v", "full answer"),
+                UiAction::new("pin", "p", "pin annotations"),
                 UiAction::new("undo", "u", if *edited { "undo" } else { "dismiss" }),
                 UiAction::new("refine", "r", "refine"),
                 UiAction::new("agent", "A", "agent"),
             ],
+            InlineAssistPopupState::NeedsAgent(_) => vec![
+                essential("agent", "A", "continue in Agent"),
+                UiAction::new("view", "v", "full answer"),
+                UiAction::new("pin", "p", "pin annotations"),
+                UiAction::new("refine", "r", "refine"),
+                essential("close", "Esc", "close"),
+            ],
             InlineAssistPopupState::Failed(_) => vec![
                 essential("retry", "r", "retry/refine"),
-                essential("close", "Esc", "close"),
+                UiAction::new("view", "v", "view result"),
+                UiAction::new("agent", "A", "Agent"),
+                essential("hide", "Esc", "hide"),
             ],
         }
     }
@@ -327,13 +407,26 @@ impl Component for InlineAssistPopup {
             InlineAssistPopupState::Working => {
                 let message = format!(
                     "{} Preparing inline result…",
-                    spinner_frame(self.spinner_tick as u64 * SPINNER_FRAME_INTERVAL_MS)
+                    spinner_frame(self.spinner_frame.saturating_mul(SPINNER_FRAME_INTERVAL_MS))
                 );
                 if self.dialog.height > 0 {
                     buffer.set_text(x, y, &truncate_display_width(&message, width), &self.style);
                 }
                 if self.dialog.height > 1 {
                     self.draw_actions(buffer, x, y.saturating_add(1), width);
+                }
+            }
+            InlineAssistPopupState::Ready { stale } => {
+                let message = if *stale {
+                    "Source changed · result retained"
+                } else {
+                    "Result ready · not applied"
+                };
+                if self.dialog.height > 0 {
+                    buffer.set_text(x, y, &truncate_display_width(message, width), &self.style);
+                }
+                if self.dialog.height > 1 {
+                    self.draw_actions(buffer, x, y.saturating_add(self.dialog.height - 1), width);
                 }
             }
             InlineAssistPopupState::Applied { edited, comments } => {
@@ -350,12 +443,21 @@ impl Component for InlineAssistPopup {
                     self.draw_actions(buffer, x, y.saturating_add(1), width);
                 }
             }
-            InlineAssistPopupState::Failed(message) => {
+            InlineAssistPopupState::AnswerRetained(message)
+            | InlineAssistPopupState::NeedsAgent(message)
+            | InlineAssistPopupState::Failed(message) => {
                 if self.dialog.height > 0 {
                     buffer.set_text(
                         x,
                         y,
-                        &truncate_display_width("Inline assist failed", width),
+                        &truncate_display_width(
+                            match self.state {
+                                InlineAssistPopupState::AnswerRetained(_) => "Answer retained",
+                                InlineAssistPopupState::NeedsAgent(_) => "Needs a broader edit",
+                                _ => "Inline assist failed",
+                            },
+                            width,
+                        ),
                         &self.style,
                     );
                 }
@@ -382,13 +484,7 @@ impl Component for InlineAssistPopup {
     }
 
     fn tick(&mut self) -> anyhow::Result<bool> {
-        if matches!(self.state, InlineAssistPopupState::Working) {
-            self.spinner_tick = self.spinner_tick.saturating_add(1);
-            return Ok(self
-                .spinner_tick
-                .is_multiple_of(SPINNER_FRAME_INTERVAL_MS as usize / 10));
-        }
-        Ok(false)
+        Ok(self.advance_spinner(Instant::now()))
     }
 
     fn resize(&mut self, viewport_width: usize, viewport_height: usize) -> bool {
@@ -418,14 +514,7 @@ impl Component for InlineAssistPopup {
             if matches!(mouse.kind, MouseEventKind::Down(_))
                 && !self.inside(mouse.column as usize, mouse.row as usize)
             {
-                let action = match &self.state {
-                    InlineAssistPopupState::Applied { .. } => Action::KeepInlineAssist,
-                    InlineAssistPopupState::Prompt { refining: true, .. } => {
-                        Action::CancelInlineAssistRefine
-                    }
-                    _ => Action::CancelInlineAssist,
-                };
-                return Some(KeyAction::Single(action));
+                return Some(KeyAction::Single(Action::HideInlineAssist));
             }
             return None;
         }
@@ -436,17 +525,26 @@ impl Component for InlineAssistPopup {
                     self.prompt_changed()
                 }
                 Event::Key(key) => match (key.code, key.modifiers) {
-                    (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                        Some(KeyAction::Single(if *refining {
-                            Action::CancelInlineAssistRefine
-                        } else {
-                            Action::CancelInlineAssist
-                        }))
+                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                        Some(KeyAction::Single(Action::CancelInlineAssist))
                     }
+                    (KeyCode::Esc, _) => Some(KeyAction::Single(if *refining {
+                        Action::CancelInlineAssistRefine
+                    } else {
+                        Action::HideInlineAssist
+                    })),
                     (KeyCode::Enter, _) => {
                         let prompt = self.prompt.text().trim().to_string();
                         (!prompt.is_empty())
                             .then_some(KeyAction::Single(Action::SubmitInlineAssist(prompt)))
+                    }
+                    (KeyCode::Up, _) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                        self.prompt.history_previous();
+                        self.prompt_changed()
+                    }
+                    (KeyCode::Down, _) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                        self.prompt.history_next();
+                        self.prompt_changed()
                     }
                     (KeyCode::Left, _) => {
                         self.prompt
@@ -489,9 +587,27 @@ impl Component for InlineAssistPopup {
                 _ => None,
             },
             InlineAssistPopupState::Working => match event {
-                Event::Key(key) if matches!(key.code, KeyCode::Esc) => {
-                    Some(KeyAction::Single(Action::CancelInlineAssist))
-                }
+                Event::Key(key) => match (key.code, key.modifiers) {
+                    (KeyCode::Esc, _) => Some(KeyAction::Single(Action::HideInlineAssist)),
+                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                        Some(KeyAction::Single(Action::CancelInlineAssist))
+                    }
+                    (KeyCode::Char('H'), _) => Some(KeyAction::Single(Action::OpenInlineHistory)),
+                    _ => None,
+                },
+                _ => None,
+            },
+            InlineAssistPopupState::Ready { stale } => match event {
+                Event::Key(key) => match key.code {
+                    KeyCode::Enter if !stale => {
+                        Some(KeyAction::Single(Action::ApplyPendingInlineAssist))
+                    }
+                    KeyCode::Char('v') => Some(KeyAction::Single(Action::ViewInlineAssistAnswer)),
+                    KeyCode::Char('r') => Some(KeyAction::Single(Action::RefineInlineAssist)),
+                    KeyCode::Char('A') => Some(KeyAction::Single(Action::EscalateInlineAssist)),
+                    KeyCode::Esc => Some(KeyAction::Single(Action::HideInlineAssist)),
+                    _ => None,
+                },
                 _ => None,
             },
             InlineAssistPopupState::Applied { .. } => match event {
@@ -501,23 +617,50 @@ impl Component for InlineAssistPopup {
                     }
                     KeyCode::Char('u') => Some(KeyAction::Single(Action::UndoInlineAssist)),
                     KeyCode::Char('r') => Some(KeyAction::Single(Action::RefineInlineAssist)),
+                    KeyCode::Char('v') => Some(KeyAction::Single(Action::ViewInlineAssistAnswer)),
+                    KeyCode::Char('p' | 's') => {
+                        Some(KeyAction::Single(Action::RestoreInlineAssistAnnotations))
+                    }
                     KeyCode::Char('A') => Some(KeyAction::Single(Action::EscalateInlineAssist)),
                     _ => None,
                 },
                 _ => None,
             },
-            InlineAssistPopupState::Failed(_) => match event {
+            InlineAssistPopupState::NeedsAgent(_) => match event {
                 Event::Key(key) => match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => {
-                        Some(KeyAction::Single(Action::CancelInlineAssist))
+                    KeyCode::Char('A') | KeyCode::Enter => {
+                        Some(KeyAction::Single(Action::EscalateInlineAssist))
                     }
-                    KeyCode::Enter | KeyCode::Char('r') => {
-                        Some(KeyAction::Single(Action::RefineInlineAssist))
+                    KeyCode::Char('v') => Some(KeyAction::Single(Action::ViewInlineAssistAnswer)),
+                    KeyCode::Char('p' | 's') => {
+                        Some(KeyAction::Single(Action::RestoreInlineAssistAnnotations))
+                    }
+                    KeyCode::Char('r') => Some(KeyAction::Single(Action::RefineInlineAssist)),
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        Some(KeyAction::Single(Action::KeepInlineAssist))
                     }
                     _ => None,
                 },
                 _ => None,
             },
+            InlineAssistPopupState::AnswerRetained(_) | InlineAssistPopupState::Failed(_) => {
+                match event {
+                    Event::Key(key) => match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => {
+                            Some(KeyAction::Single(Action::HideInlineAssist))
+                        }
+                        KeyCode::Enter | KeyCode::Char('r') => {
+                            Some(KeyAction::Single(Action::RefineInlineAssist))
+                        }
+                        KeyCode::Char('v') => {
+                            Some(KeyAction::Single(Action::ViewInlineAssistAnswer))
+                        }
+                        KeyCode::Char('A') => Some(KeyAction::Single(Action::EscalateInlineAssist)),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }
         }
     }
 
@@ -617,7 +760,67 @@ mod tests {
             popup.handle_event(&Event::Key(
                 KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE,)
             )),
+            Some(KeyAction::Single(Action::HideInlineAssist))
+        );
+        assert_eq!(
+            popup.handle_event(&Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL
+            ))),
             Some(KeyAction::Single(Action::CancelInlineAssist))
+        );
+    }
+
+    #[test]
+    fn inline_popup_spinner_uses_elapsed_time_not_number_of_ticks() {
+        let editor = editor();
+        let mut popup = InlineAssistPopup::new(&editor, "line 1", InlineAssistPopupState::Working);
+        let since = popup.spinner_started;
+        let interval = std::time::Duration::from_millis(SPINNER_FRAME_INTERVAL_MS);
+        assert!(!popup.advance_spinner(since + interval - std::time::Duration::from_millis(1)));
+        assert!(popup.advance_spinner(since + interval));
+        assert_eq!(popup.spinner_frame, 1);
+        assert!(!popup.advance_spinner(since + interval));
+        assert!(popup.advance_spinner(since + interval * 3));
+        assert_eq!(popup.spinner_frame, 3);
+        popup.state = InlineAssistPopupState::Ready { stale: false };
+        assert!(!popup.advance_spinner(since + interval * 4));
+    }
+
+    #[test]
+    fn inline_prompt_recall_preserves_the_unsent_draft() {
+        let editor = editor();
+        let mut popup = InlineAssistPopup::new(
+            &editor,
+            "line 1",
+            InlineAssistPopupState::Prompt {
+                initial: "unsent draft".into(),
+                refining: false,
+            },
+        );
+        popup.prompt =
+            PromptBuffer::with_history("unsent draft", vec!["newest".into(), "older".into()]);
+        for (key, modifiers, expected) in [
+            (KeyCode::Up, KeyModifiers::NONE, "newest"),
+            (KeyCode::Char('p'), KeyModifiers::CONTROL, "older"),
+            (KeyCode::Down, KeyModifiers::NONE, "newest"),
+            (KeyCode::Char('n'), KeyModifiers::CONTROL, "unsent draft"),
+        ] {
+            assert_eq!(
+                popup.handle_event(&Event::Key(KeyEvent::new(key, modifiers))),
+                Some(KeyAction::Single(Action::Refresh))
+            );
+            assert_eq!(popup.prompt.text(), expected);
+        }
+        popup.handle_event(&Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        assert_eq!(
+            popup.handle_event(&Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE
+            ))),
+            Some(KeyAction::Single(Action::SubmitInlineAssist(
+                "newest".into()
+            )))
         );
     }
 
@@ -636,6 +839,7 @@ mod tests {
             (KeyCode::Enter, Action::KeepInlineAssist),
             (KeyCode::Char('u'), Action::UndoInlineAssist),
             (KeyCode::Char('r'), Action::RefineInlineAssist),
+            (KeyCode::Char('v'), Action::ViewInlineAssistAnswer),
             (KeyCode::Char('A'), Action::EscalateInlineAssist),
         ] {
             assert_eq!(
@@ -671,6 +875,28 @@ mod tests {
                 Some(KeyAction::Single(Action::Refresh))
             );
             assert_eq!(popup.prompt.text(), "first ");
+        }
+    }
+
+    #[test]
+    fn broader_scope_has_actionable_controls_and_large_targets_keep_the_popup_usable() {
+        let editor = editor();
+        let mut popup = InlineAssistPopup::new_avoiding_rows(
+            &editor,
+            "function",
+            InlineAssistPopupState::NeedsAgent("Update another function.".into()),
+            Some((0, editor.vheight().saturating_sub(1))),
+        );
+        assert!(popup.dialog.height >= 2);
+        for (key, action) in [
+            (KeyCode::Enter, Action::EscalateInlineAssist),
+            (KeyCode::Char('v'), Action::ViewInlineAssistAnswer),
+            (KeyCode::Esc, Action::KeepInlineAssist),
+        ] {
+            assert_eq!(
+                popup.handle_event(&Event::Key(KeyEvent::new(key, KeyModifiers::NONE))),
+                Some(KeyAction::Single(action))
+            );
         }
     }
 

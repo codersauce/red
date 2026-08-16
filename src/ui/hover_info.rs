@@ -31,6 +31,7 @@ pub enum HoverInfoFormat {
 
 pub struct HoverInfo {
     label: String,
+    close_action: Action,
     source: String,
     format: HoverInfoFormat,
     actions: Vec<HoverAction>,
@@ -89,6 +90,7 @@ impl HoverInfo {
         let style = theme.ui_style.dialog.clone();
         let mut info = Self {
             label: "Hover".to_string(),
+            close_action: Action::CloseDialog,
             source,
             format,
             selected_action: (!actions.is_empty()).then_some(0),
@@ -129,6 +131,12 @@ impl HoverInfo {
         self
     }
 
+    pub(crate) fn with_close_action(mut self, action: Action) -> Self {
+        self.close_action = action;
+        self.update_chrome();
+        self
+    }
+
     fn content_height(&self) -> usize {
         self.height.saturating_sub(1)
     }
@@ -157,8 +165,16 @@ impl HoverInfo {
             )
         };
         self.dialog.set_title(Some(title));
-        let mut actions =
-            vec![UiAction::new("close", "Esc", "close").with_priority(ActionPriority::Essential)];
+        let mut actions = vec![UiAction::new(
+            "close",
+            "Esc",
+            if matches!(self.close_action, Action::CloseDialog) {
+                "close"
+            } else {
+                "back"
+            },
+        )
+        .with_priority(ActionPriority::Essential)];
         if !self.actions.is_empty() {
             actions.push(
                 UiAction::new("open", "Enter", "open").with_priority(ActionPriority::Essential),
@@ -239,7 +255,7 @@ impl HoverInfo {
     fn activate_action(&self, index: usize) -> Option<KeyAction> {
         let command = self.actions.get(index)?.command.clone();
         Some(KeyAction::Multiple(vec![
-            Action::CloseDialog,
+            self.close_action.clone(),
             Action::ExecuteLspCommand(Box::new(command)),
         ]))
     }
@@ -284,7 +300,7 @@ impl Component for HoverInfo {
         match event {
             Event::Key(key) => match (key.code, key.modifiers) {
                 (KeyCode::Esc | KeyCode::Char('q'), _) => {
-                    Some(KeyAction::Single(Action::CloseDialog))
+                    Some(KeyAction::Single(self.close_action.clone()))
                 }
                 (KeyCode::Up | KeyCode::Char('k'), _) => {
                     self.scroll_by(-1);
@@ -352,7 +368,7 @@ impl Component for HoverInfo {
                         }
                         None
                     } else {
-                        Some(KeyAction::Single(Action::CloseDialog))
+                        Some(KeyAction::Single(self.close_action.clone()))
                     }
                 }
                 _ => None,

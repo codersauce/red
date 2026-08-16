@@ -23,6 +23,8 @@ mod inline_comments;
 mod inline_completion;
 mod inline_history;
 mod keyboard_shortcuts;
+mod inline_jobs;
+mod inline_notifications;
 mod learning;
 mod lsp_coordinator;
 #[cfg(test)]
@@ -2137,7 +2139,7 @@ pub enum Action {
     SaveAs(String),
     EnterMode(Mode),
     RestoreLastVisualSelection,
-    /// Opens a bounded inline edit for the current line or visual selection.
+    /// Opens a bounded inline edit for the enclosing function or exact selection.
     InlineAssist,
     /// Adds a temporary sample annotation for the current line or visual range.
     AddSampleInlineComment,
@@ -2151,6 +2153,16 @@ pub enum Action {
     PreviousInlineComment,
     /// Submits the current inline instruction.
     SubmitInlineAssist(String),
+    /// Hides the popup while retaining its draft or running request.
+    HideInlineAssist,
+    /// Compatibility alias for the unified InlineHistory surface.
+    OpenInlineActivity,
+    RestoreInlineAssistAnnotations,
+    OpenInlineJob(String),
+    /// Reopens the most recent background completion, even after its notice expires.
+    OpenLatestInlineCompletion,
+    OpenInlineCompletion(String),
+    ApplyPendingInlineAssist,
     /// Cancels and destroys the ephemeral inline session.
     CancelInlineAssist,
     /// Leaves refinement and returns to the applied-result controls.
@@ -2161,8 +2173,14 @@ pub enum Action {
     UndoInlineAssist,
     /// Opens a follow-up prompt scoped to the current inline result.
     RefineInlineAssist,
-    /// Hands the edited range to the full Agent workflow.
+    /// Reads the full retained answer without closing its inline session.
+    ViewInlineAssistAnswer,
+    /// Hands the edited range and discussion to the full Agent workflow.
     EscalateInlineAssist,
+    StageInlineAssistHandoff {
+        prompt: String,
+        expected_draft: Option<plugin::panel::TextPanelDraftRevision>,
+    },
     EnterSearch(SearchDirection),
 
     Undo,
@@ -2890,6 +2908,10 @@ pub struct Editor {
 
     /// One editor-owned bounded inline edit, including stale-response guards.
     inline_assist: Option<InlineAssistSession>,
+    /// Hidden jobs remain addressable independently of the foreground dialog.
+    inline_jobs: BTreeMap<String, inline_jobs::ParkedInlineAssist>,
+    inline_activity_animation: inline_jobs::InlineActivityAnimation,
+    inline_completion: inline_notifications::InlineCompletionState,
 
     /// Session-local annotations; never serialized into source or text undo history.
     inline_comments: Vec<inline_comments::InlineComment>,
@@ -4354,6 +4376,9 @@ impl Editor {
             lsp_coordinator,
             agent_manager,
             inline_assist: None,
+            inline_jobs: BTreeMap::new(),
+            inline_activity_animation: inline_jobs::InlineActivityAnimation::default(),
+            inline_completion: inline_notifications::InlineCompletionState::default(),
             inline_comments: Vec::new(),
             active_inline_comment: None,
             inline_history: InlineHistory::default(),
@@ -7227,7 +7252,55 @@ impl Editor {
         })
     }
 
-    fn inline_assist_target(&self) -> anyhow::Result<(TextRange, String)> {
+    fn inline_assist_target(&mut self) -> anyhow::Result<(TextRange, String)> {
+        if !matches!(
+            self.mode,
+            Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+        ) {
+            let position = self.cursor_text_position();
+            let language =
+                self.highlight_language_id_for_buffer_index(self.buffer_manager.active_index());
+            let object = language.and_then(|language| {
+                self.syntax_textobjects
+                    .select(
+                        self.buffer_manager.active_buffer()?,
+                        &language,
+                        position,
+                        SyntaxObjectKind::Function,
+                        TextObjectScope::Around,
+                    )
+                    .ok()
+                    .flatten()
+            });
+            if let Some(object) = object {
+                let key = |position: TextPosition| (position.line, position.character);
+                if key(object.range.start) <= key(position) && key(position) < key(object.range.end)
+                {
+                    let lines = self.linewise_text_object_range(object.range);
+                    let buffer = self.current_buffer();
+                    let range = if buffer
+                        .text_in_range(TextRange::new(lines.start, object.range.start))
+                        .trim()
+                        .is_empty()
+                        && buffer
+                            .text_in_range(TextRange::new(object.range.end, lines.end))
+                            .trim()
+                            .is_empty()
+                    {
+                        lines
+                    } else {
+                        object.range
+                    };
+                    if self.current_buffer().text_in_range(range).len() <= 64 * 1024 {
+                        let last = range.end.line + usize::from(range.end.character > 0);
+                        return Ok((
+                            range,
+                            format!("function · lines {}–{last}", range.start.line + 1),
+                        ));
+                    }
+                }
+            }
+        }
         let range = match self.mode {
             Mode::VisualBlock => anyhow::bail!(
                 "inline assist does not support block selections yet; use a character or line selection"
@@ -7306,6 +7379,9 @@ impl Editor {
             .line_range_contents(first_line, last_line.saturating_add(1));
         let surrounding = truncate_chars(&surrounding_source, MAX_CONTEXT_CHARS);
         let file = safe_context["file"].as_str().unwrap_or("[No Name]");
+        let workspace = get_workspace_path();
+        let workspace = workspace.display();
+        let dirty = self.current_buffer().is_dirty();
         let language = self
             .current_language_id()
             .unwrap_or_else(|| "plain text".to_string());
@@ -7337,15 +7413,23 @@ impl Editor {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        Ok(format!(
-            "File: {file}\nLanguage: {language}\nTarget range: {}:{} to {}:{} (zero-based, end exclusive)\nComment lines are one-based relative to the target below, not the file.\nDiagnostics:\n{diagnostics}\n\n<target>\n{target}</target>\n\n<target_lines>\n{numbered_target}\n</target_lines>\n\n<surrounding lines=\"{}-{}\">\n{surrounding}</surrounding>",
+        let mut context = format!(
+            "Workspace: {workspace}\nFile: {file}\nUnsaved changes: {dirty}\nLanguage: {language}\nTarget range: {}:{} to {}:{} (zero-based, end exclusive)\nComment lines are one-based relative to the target below, not the file.\nDiagnostics:\n{diagnostics}\n\n<target>\n{target}</target>\n\n<target_lines>\n{numbered_target}\n</target_lines>\n\n<surrounding lines=\"{}-{}\">\n{surrounding}</surrounding>",
             range.start.line,
             range.start.character,
             range.end.line,
             range.end.character,
             first_line + 1,
             last_line + 1,
-        ))
+        );
+        if let Some(discussion) = self
+            .agent_manager
+            .conversation_snapshot()
+            .and_then(|conversation| conversation.inline_context(&get_workspace_path()))
+        {
+            context.push_str(&discussion);
+        }
+        Ok(context)
     }
 
     fn close_inline_assist_session(&mut self) {
@@ -7353,6 +7437,11 @@ impl Editor {
             .inline_assist
             .as_ref()
             .and_then(|assist| assist.request_id.as_deref())
+            .filter(|request| {
+                self.inline_history
+                    .turn(request)
+                    .is_some_and(|turn| turn.state == InlineTurnState::Pending)
+            })
         {
             self.inline_history.finish(
                 request,
@@ -7371,6 +7460,7 @@ impl Editor {
         }
         self.inline_assist = None;
         self.current_dialog = None;
+        self.sync_inline_activity();
     }
 
     fn inline_assist_popup(
@@ -7427,14 +7517,13 @@ impl Editor {
     }
 
     fn inline_assist_result_state(&self) -> InlineAssistPopupState {
-        let edited = self
-            .inline_assist
-            .as_ref()
-            .is_some_and(|assist| assist.transaction_id.is_some());
-        let comments = self.inline_assist.as_ref().map_or(0, |assist| {
-            self.inline_comment_group_count(&assist.annotation_group_id)
-        });
-        InlineAssistPopupState::Applied { edited, comments }
+        self.inline_assist.as_ref().map_or(
+            InlineAssistPopupState::Applied {
+                edited: false,
+                comments: 0,
+            },
+            |session| self.inline_session_state(session),
+        )
     }
 
     async fn apply_inline_result(
@@ -7455,7 +7544,11 @@ impl Editor {
                 "inline response is stale"
             );
             anyhow::ensure!(
-                assist.result_request_id.as_deref() != Some(request_id),
+                assist.result_request_id.as_deref() != Some(request_id)
+                    || self
+                        .inline_history
+                        .turn(request_id)
+                        .is_some_and(|turn| turn.state == InlineTurnState::Ready),
                 "inline result was already applied"
             );
             anyhow::ensure!(
@@ -7493,6 +7586,21 @@ impl Editor {
 
         let replacement = result.replacement.as_deref().unwrap_or(&expected_text);
         result.validate_for_target(replacement)?;
+        if result.needs_agent.is_some() {
+            if let Some(assist) = self.inline_assist.as_mut() {
+                assist.session_id = Some(session_id.to_string());
+                assist.has_result = true;
+                assist.result_request_id = Some(request_id.to_string());
+            }
+            self.complete_inline_history_turn(request_id, session_id, result, range);
+            self.sync_inline_activity();
+            let scope = self.inline_assist.as_ref().unwrap().scope.clone();
+            self.current_dialog = Some(Box::new(
+                self.inline_assist_popup(scope, self.inline_assist_result_state()),
+            ));
+            self.render(render_buffer)?;
+            return Ok(());
+        }
         self.check_inline_comment_capacity(&group_id, result.comments.len())?;
 
         let start_char = self.current_buffer().position_to_char_idx(range.start);
@@ -7548,6 +7656,7 @@ impl Editor {
             assist.result_request_id = Some(request_id.to_string());
         }
         self.complete_inline_history_turn(request_id, session_id, result, new_range);
+        self.sync_inline_activity();
         if let Err(error) = if changed {
             self.notify_change(runtime).await
         } else {
@@ -8454,7 +8563,9 @@ impl Editor {
             }
             Some(Ok(Ok(()))) | Some(Err(_)) | None => fallback.to_string(),
         };
-        bounded_agent_failure_message(&message)
+        let message = bounded_agent_failure_message(&message);
+        self.fail_running_inline_jobs(&message);
+        message
     }
 
     async fn service_background(
@@ -8551,104 +8662,141 @@ impl Editor {
                     .await?;
                 continue;
             }
-            let event = match event {
-                CodexEvent::InlineAnswerDelta { request_id, text } => {
-                    self.inline_history.append_answer(&request_id, &text);
-                    continue;
-                }
-                CodexEvent::InlineSessionCreated {
-                    request_id,
-                    session_id,
-                } => {
-                    let active = self.inline_assist.as_ref().is_some_and(|assist| {
-                        assist.request_id.as_deref() == Some(request_id.as_str())
-                    });
-                    if active {
-                        if let Some(assist) = self.inline_assist.as_mut() {
-                            assist.session_id = Some(session_id);
-                        }
-                    } else if let Some(bridge) = self.agent_manager.bridge() {
-                        let _ = bridge.try_send(CodexCommand::CloseSession { session_id });
+            let event =
+                match event {
+                    CodexEvent::InlineAnswerDelta { request_id, text } => {
+                        self.inline_history.append_answer(&request_id, &text);
+                        self.mark_inline_history_dirty();
+                        continue;
                     }
-                    continue;
-                }
-                CodexEvent::InlineResult {
-                    request_id,
-                    session_id,
-                    result,
-                } => {
-                    if let Err(error) = self
-                        .apply_inline_result(&request_id, &session_id, &result, buffer, runtime)
-                        .await
-                    {
-                        if let Some(turn) = self
+                    CodexEvent::InlineSessionCreated {
+                        request_id,
+                        session_id,
+                    } => {
+                        let pending = self
                             .inline_history
-                            .turn_mut(&request_id)
-                            .filter(|turn| turn.state == InlineTurnState::Pending)
+                            .turn(&request_id)
+                            .is_some_and(|turn| turn.state == InlineTurnState::Pending);
+                        if let Some(assist) = self
+                            .inline_request_session_mut(&request_id)
+                            .filter(|_| pending)
                         {
-                            turn.result = Some(result);
-                            turn.session_id = Some(session_id);
-                        }
-                        self.inline_history.finish(
-                            &request_id,
-                            InlineTurnState::Rejected,
-                            Some(error.to_string()),
-                        );
-                        if let Some(scope) = self.inline_assist.as_ref().and_then(|assist| {
-                            (assist.request_id.as_deref() == Some(request_id.as_str()))
-                                .then(|| assist.scope.clone())
-                        }) {
-                            self.current_dialog = Some(Box::new(self.inline_assist_popup(
-                                scope,
-                                InlineAssistPopupState::Failed(error.to_string()),
-                            )));
-                            self.render(buffer)?;
-                        }
-                    }
-                    continue;
-                }
-                CodexEvent::InlineFailed {
-                    request_id,
-                    session_id,
-                    message,
-                } => {
-                    let history_request = request_id.clone().or_else(|| {
-                        self.inline_assist
-                            .as_ref()
-                            .and_then(|assist| assist.request_id.clone())
-                    });
-                    if let Some(request) = history_request {
-                        self.inline_history.finish(
-                            &request,
-                            InlineTurnState::Failed,
-                            Some(message.clone()),
-                        );
-                    }
-                    let scope = self.inline_assist.as_mut().and_then(|assist| {
-                        let active = request_id.as_deref().is_none_or(|request_id| {
-                            assist.request_id.as_deref() == Some(request_id)
-                        });
-                        if active {
-                            if assist.session_id.is_none() {
-                                assist.session_id = session_id;
+                            assist.session_id = Some(session_id.clone());
+                            if let Some(turn) = self.inline_history.turn_mut(&request_id) {
+                                turn.session_id = Some(session_id);
                             }
-                            Some(assist.scope.clone())
-                        } else {
-                            None
+                        } else if let Some(bridge) = self.agent_manager.bridge() {
+                            let _ = bridge.try_send(CodexCommand::CloseSession { session_id });
                         }
-                    });
-                    if let Some(scope) = scope {
-                        self.current_dialog =
-                            Some(Box::new(self.inline_assist_popup(
+                        continue;
+                    }
+                    CodexEvent::InlineResult {
+                        request_id,
+                        session_id,
+                        result,
+                    } => {
+                        // A duplicate or late provider event must never apply a
+                        // staged result without the user's explicit approval.
+                        if !self
+                            .inline_history
+                            .turn(&request_id)
+                            .is_some_and(|turn| turn.state == InlineTurnState::Pending)
+                        {
+                            continue;
+                        }
+                        let foreground = self.inline_assist.as_ref().is_some_and(|assist| {
+                            assist.request_id.as_deref() == Some(&request_id)
+                        }) && self
+                            .current_dialog
+                            .as_ref()
+                            .and_then(|dialog| dialog.inline_assist_state())
+                            .is_some();
+                        if !foreground {
+                            if self.inline_assist.as_ref().is_some_and(|assist| {
+                                assist.request_id.as_deref() == Some(&request_id)
+                            }) {
+                                self.park_inline_assist();
+                            }
+                            self.stage_background_inline_result(&request_id, &session_id, result);
+                            self.render(buffer)?;
+                            continue;
+                        }
+                        if let Err(error) = self
+                            .apply_inline_result(&request_id, &session_id, &result, buffer, runtime)
+                            .await
+                        {
+                            if let Some(turn) =
+                                self.inline_history.turn_mut(&request_id).filter(|turn| {
+                                    matches!(
+                                        turn.state,
+                                        InlineTurnState::Pending | InlineTurnState::Ready
+                                    )
+                                })
+                            {
+                                turn.result = Some(result);
+                                turn.session_id = Some(session_id);
+                            }
+                            self.inline_history.finish(
+                                &request_id,
+                                InlineTurnState::Rejected,
+                                Some(error.to_string()),
+                            );
+                            self.sync_inline_activity();
+                            if let Some(scope) = self.inline_assist.as_ref().and_then(|assist| {
+                                (assist.request_id.as_deref() == Some(request_id.as_str()))
+                                    .then(|| assist.scope.clone())
+                            }) {
+                                self.current_dialog = Some(Box::new(self.inline_assist_popup(
+                                    scope,
+                                    InlineAssistPopupState::Failed(error.to_string()),
+                                )));
+                                self.render(buffer)?;
+                            }
+                        }
+                        continue;
+                    }
+                    CodexEvent::InlineFailed {
+                        request_id,
+                        session_id,
+                        message,
+                    } => {
+                        let request_id = request_id.or_else(|| {
+                            session_id
+                                .as_deref()
+                                .and_then(|provider| self.inline_request_for_provider(provider))
+                        });
+                        if !request_id
+                            .as_deref()
+                            .and_then(|request| self.inline_history.turn(request))
+                            .is_some_and(|turn| turn.state == InlineTurnState::Pending)
+                        {
+                            continue;
+                        }
+                        let scope = self.inline_assist.as_ref().and_then(|assist| {
+                            (assist.request_id == request_id
+                                && self
+                                    .current_dialog
+                                    .as_ref()
+                                    .and_then(|dialog| dialog.inline_assist_state())
+                                    .is_some())
+                            .then(|| assist.scope.clone())
+                        });
+                        if let Some(request) = request_id {
+                            self.record_inline_failure(&request, &message);
+                        }
+                        if let Some(scope) = scope {
+                            self.current_dialog = Some(Box::new(self.inline_assist_popup(
                                 scope,
                                 InlineAssistPopupState::Failed(message),
                             )));
-                        self.render(buffer)?;
+                            self.render(buffer)?;
+                        } else {
+                            self.render(buffer)?;
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                event => event,
-            };
+                    event => event,
+                };
             match &event {
                 CodexEvent::SessionCreated { session_id } => {
                     let root = self
@@ -8758,9 +8906,14 @@ impl Editor {
         {
             let pending_commit_messages = self.agent_manager.take_pending_commit_messages();
             let inline_scope = self
-                .inline_assist
+                .current_dialog
                 .as_ref()
-                .map(|assist| assist.scope.clone());
+                .and_then(|dialog| dialog.inline_assist_state())
+                .and_then(|_| {
+                    self.inline_assist
+                        .as_ref()
+                        .map(|assist| assist.scope.clone())
+                });
             let message = self
                 .finish_agent_bridge("Codex app-server stopped unexpectedly")
                 .await;
@@ -8801,6 +8954,8 @@ impl Editor {
                     .await?;
             }
         }
+
+        self.refresh_live_inline_history(buffer, runtime).await?;
 
         let inline_completion_changed = self.service_inline_completion();
         let completion_changed = if self
@@ -8847,14 +9002,17 @@ impl Editor {
         }
         let panel_animation_changed = self.panel_manager.poll_animation();
         let overlay_animation_changed = self.overlay_manager.poll_animation();
-        if inline_completion_changed
+        let inline_activity_changed = self.poll_inline_activity_animation(Instant::now());
+        let inline_notice_changed = self.poll_inline_completion_notice(Instant::now());
+        let full_animation_changed = inline_notice_changed
             || completion_changed
             || startup_release_changed
             || dialog_changed
             || keymap_hints_changed
             || panel_animation_changed
             || overlay_animation_changed
-        {
+            || inline_completion_changed;
+        if full_animation_changed {
             self.render(buffer)?;
             if startup_release_changed {
                 self.mark_whats_new_presented();
@@ -8878,7 +9036,7 @@ impl Editor {
         // single render at the end of the tick instead of one per item.
         let mut needs_render = false;
         let mut needs_motion_render = false;
-        let mut needs_editor_windows_render = false;
+        let mut needs_editor_windows_render = inline_activity_changed && !full_animation_changed;
 
         // Always pump LSP responses. `recv_response` completes the
         // initialize handshake and flushes queued didOpen/change
@@ -12597,6 +12755,9 @@ impl Editor {
             return Ok(self.handle_substitute_confirmation_event(ev));
         }
 
+        if let Some(action) = self.inline_completion_click(ev) {
+            return Ok(Some(action));
+        }
         if !self.has_term()
             && (self.notifications.records().len() > 0 || self.notification_fallback.is_some())
             && matches!(ev, Event::Mouse(MouseEvent {
@@ -13321,6 +13482,7 @@ impl Editor {
             | Action::FilePicker
             | Action::CommandPalette
             | Action::KeyboardShortcuts
+            | Action::OpenLatestInlineCompletion
             | Action::OpenStatuslineManager
             | Action::OpenDiagnosticsPicker
             | Action::OpenErrorDiagnosticsPicker
@@ -13700,13 +13862,19 @@ impl Editor {
         if cmd == "messages" {
             return vec![Action::OpenMessages];
         }
-        if matches!(cmd, "InlineHistory" | "inline-history") {
+        if matches!(
+            cmd,
+            "InlineHistory" | "inline-history" | "InlineActivity" | "inline-activity"
+        ) {
             return vec![Action::OpenInlineHistory];
         }
         if let Some(path) = cmd.strip_prefix("InlineHistoryExport ") {
             return vec![Action::InlineHistoryAction(
                 crate::inline_history::HistoryAction::Export(path.to_string()),
             )];
+        }
+        if matches!(cmd, "InlineLast" | "inline-last") {
+            return vec![Action::OpenLatestInlineCompletion];
         }
 
         // Handle debug commands first (these don't go through normal command parsing)
@@ -16660,7 +16828,11 @@ impl Editor {
             }
             Action::ShowInlineComment => {
                 add_to_history = false;
-                self.show_inline_comment();
+                if let Some(group) = self.inline_job_on_comment_line(self.buffer_line()) {
+                    self.open_inline_job(&group, buffer, runtime).await?;
+                } else {
+                    self.show_inline_comment();
+                }
                 self.render(buffer)?;
             }
             Action::DismissInlineComment => {
@@ -16685,7 +16857,7 @@ impl Editor {
                             return Ok(false);
                         };
                         let expected_text = self.current_buffer().text_in_range(range);
-                        self.close_inline_assist_session();
+                        self.park_inline_assist();
                         self.inline_assist = Some(InlineAssistSession {
                             buffer_id: self.current_buffer().id(),
                             window_id,
@@ -16717,12 +16889,21 @@ impl Editor {
             }
             Action::SubmitInlineAssist(prompt) => {
                 add_to_history = false;
-                let Some((range, scope, existing_session)) =
+                let range = match self.inline_submission_target() {
+                    Ok(range) => range,
+                    Err(error) => {
+                        self.last_error = Some(error.to_string());
+                        self.render(buffer)?;
+                        return Ok(false);
+                    }
+                };
+                let Some((scope, existing_session, retired_session)) =
                     self.inline_assist.as_ref().map(|assist| {
+                        let reuse = range == assist.range && self.inline_target_matches(assist);
                         (
-                            assist.range,
                             assist.scope.clone(),
-                            assist.session_id.clone(),
+                            reuse.then(|| assist.session_id.clone()).flatten(),
+                            (!reuse).then(|| assist.session_id.clone()).flatten(),
                         )
                     })
                 else {
@@ -16748,6 +16929,22 @@ impl Editor {
                     self.render(buffer)?;
                     return Ok(false);
                 }
+                if let Some(session_id) = retired_session {
+                    if let Some(bridge) = self.agent_manager.bridge() {
+                        let _ = bridge.try_send(CodexCommand::CloseSession { session_id });
+                    }
+                }
+                let revision = self.current_buffer().revision();
+                let expected_text = self.current_buffer().text_in_range(range);
+                let buffer_id = self.current_buffer().id();
+                if let Some(assist) = self.inline_assist.as_mut() {
+                    assist.buffer_id = buffer_id;
+                    assist.range = range;
+                    assist.expected_revision = revision;
+                    assist.expected_text = expected_text;
+                    assist.request_id = Some(request_id.clone());
+                    assist.session_id.clone_from(&existing_session);
+                }
                 let cwd = get_workspace_path();
                 if let Err(error) = self.ensure_agent_bridge(&cwd) {
                     self.inline_history.finish(
@@ -16759,15 +16956,9 @@ impl Editor {
                         scope,
                         InlineAssistPopupState::Failed(error.to_string()),
                     )));
+                    self.sync_inline_activity();
                     self.render(buffer)?;
                     return Ok(false);
-                }
-                let revision = self.current_buffer().revision();
-                let expected_text = self.current_buffer().text_in_range(range);
-                if let Some(assist) = self.inline_assist.as_mut() {
-                    assist.expected_revision = revision;
-                    assist.expected_text = expected_text;
-                    assist.request_id = Some(request_id.clone());
                 }
                 let command = existing_session.map_or_else(
                     || CodexCommand::InlineAssist {
@@ -16806,7 +16997,65 @@ impl Editor {
                         self.inline_assist_popup(scope, InlineAssistPopupState::Working),
                     ));
                 }
+                self.sync_inline_activity();
                 self.render(buffer)?;
+            }
+            Action::HideInlineAssist => {
+                add_to_history = false;
+                self.park_inline_assist();
+                self.render(buffer)?;
+            }
+            Action::OpenInlineJob(group) => {
+                add_to_history = false;
+                self.open_inline_job(group, buffer, runtime).await?;
+            }
+            Action::OpenLatestInlineCompletion => {
+                add_to_history = false;
+                self.open_latest_inline_completion(buffer, runtime).await?;
+            }
+            Action::OpenInlineCompletion(request) => {
+                add_to_history = false;
+                self.open_inline_completion(request, buffer, runtime)
+                    .await?;
+            }
+            Action::ApplyPendingInlineAssist => {
+                add_to_history = false;
+                let pending = self
+                    .inline_assist
+                    .as_ref()
+                    .and_then(|assist| assist.request_id.as_deref())
+                    .and_then(|request| self.inline_history.turn(request))
+                    .filter(|turn| turn.state == InlineTurnState::Ready)
+                    .and_then(|turn| {
+                        Some((
+                            turn.request_id.clone(),
+                            turn.session_id.clone()?,
+                            turn.result.clone()?,
+                        ))
+                    });
+                if let Some((request, session, result)) = pending {
+                    if let Err(error) = self
+                        .apply_inline_result(&request, &session, &result, buffer, runtime)
+                        .await
+                    {
+                        self.inline_history.finish(
+                            &request,
+                            InlineTurnState::Rejected,
+                            Some(error.to_string()),
+                        );
+                        self.sync_inline_activity();
+                        let scope = self
+                            .inline_assist
+                            .as_ref()
+                            .map_or("selection", |assist| assist.scope.as_str())
+                            .to_string();
+                        self.current_dialog = Some(Box::new(self.inline_assist_popup(
+                            scope,
+                            InlineAssistPopupState::Failed(error.to_string()),
+                        )));
+                        self.render(buffer)?;
+                    }
+                }
             }
             Action::CancelInlineAssist => {
                 add_to_history = false;
@@ -16840,6 +17089,9 @@ impl Editor {
                     InlineAssistPopupState::Applied { comments, .. } => format!(
                         "kept {comments} inline comment(s) · Space v view · Space x dismiss"
                     ),
+                    InlineAssistPopupState::NeedsAgent(_) => {
+                        "discussion kept · Space H to continue from history".to_string()
+                    }
                     _ => "inline assist closed".to_string(),
                 }));
                 self.render(buffer)?;
@@ -16887,7 +17139,7 @@ impl Editor {
                     .as_ref()
                     .map(|assist| assist.annotation_group_id.clone())
                 {
-                    self.remove_inline_comment_group(&group_id);
+                    self.dismiss_inline_comment_group(&group_id);
                 }
                 self.close_inline_assist_session();
                 if is_latest {
@@ -16905,6 +17157,23 @@ impl Editor {
             }
             Action::RefineInlineAssist => {
                 add_to_history = false;
+                if let Err(error) = self.inline_submission_target() {
+                    self.last_error = Some(error.to_string());
+                    self.render(buffer)?;
+                    return Ok(false);
+                }
+                let initial = self
+                    .inline_assist
+                    .as_ref()
+                    .and_then(|assist| assist.request_id.as_deref())
+                    .and_then(|request| self.inline_history.turn(request))
+                    .filter(|turn| turn.state == InlineTurnState::Ready)
+                    .map_or_else(String::new, |turn| {
+                        format!(
+                            "Recheck this request against the current code: {}",
+                            turn.prompt
+                        )
+                    });
                 if let Some((scope, refining)) = self
                     .inline_assist
                     .as_ref()
@@ -16912,23 +17181,90 @@ impl Editor {
                 {
                     self.current_dialog = Some(Box::new(self.inline_assist_popup(
                         scope,
-                        InlineAssistPopupState::Prompt {
-                            initial: String::new(),
-                            refining,
-                        },
+                        InlineAssistPopupState::Prompt { initial, refining },
                     )));
                     self.render(buffer)?;
                 }
             }
+            Action::ViewInlineAssistAnswer => {
+                add_to_history = false;
+                if let Some(turn) = self
+                    .inline_assist
+                    .as_ref()
+                    .and_then(|assist| {
+                        assist
+                            .request_id
+                            .as_deref()
+                            .or(assist.result_request_id.as_deref())
+                    })
+                    .and_then(|request| self.inline_history.turn(request))
+                {
+                    self.current_dialog = Some(Box::new(
+                        HoverInfo::new(
+                            self,
+                            turn.answer_text(),
+                            HoverInfoFormat::Plaintext,
+                            Vec::new(),
+                        )
+                        .with_label("Inline answer")
+                        .with_close_action(Action::CancelInlineAssistRefine),
+                    ));
+                }
+                self.render(buffer)?;
+            }
             Action::EscalateInlineAssist => {
                 add_to_history = false;
-                let range = self.inline_assist.as_ref().map(|assist| assist.range);
+                let Some(assist) = self.inline_assist.as_ref() else {
+                    return Ok(false);
+                };
+                let range = assist.range;
+                let Some(prompt) = self.inline_handoff_prompt(&assist.annotation_group_id) else {
+                    self.last_error = Some("inline discussion is no longer available".into());
+                    return Ok(false);
+                };
+                let current_target = self.current_buffer().id() == assist.buffer_id
+                    && self.current_buffer().revision() == assist.expected_revision;
                 self.close_inline_assist_session();
-                if let Some(range) = range {
+                if current_target {
                     self.mode = Mode::Visual;
                     self.select_text_range(range);
                 }
-                self.plugin_registry.execute(runtime, "Agent").await?;
+                self.plugin_registry.execute(runtime, "AgentOpen").await?;
+                // AgentOpen queues pane creation/restoration first. Stage the draft
+                // only after those requests have been processed.
+                runtime.send_request(PluginRequest::Action(Action::StageInlineAssistHandoff {
+                    prompt,
+                    expected_draft: None,
+                }));
+            }
+            Action::StageInlineAssistHandoff {
+                prompt,
+                expected_draft,
+            } => {
+                add_to_history = false;
+                match self.panel_manager.load_text_panel_draft(
+                    "agent-conversation",
+                    prompt,
+                    *expected_draft,
+                ) {
+                    Ok(plugin::panel::TextPanelReuseOutcome::Loaded) => {
+                        self.last_error = Some(
+                            "inline discussion loaded in Agent; review and send when ready".into(),
+                        );
+                    }
+                    Ok(plugin::panel::TextPanelReuseOutcome::Confirm(revision)) => {
+                        self.current_dialog = Some(Box::new(Confirmation::new_actions(
+                            self,
+                            "Replace unsent Agent draft?",
+                            "The inline discussion will replace the draft as one undoable edit. Nothing will be sent.",
+                            "Load discussion", "Keep draft",
+                            Action::StageInlineAssistHandoff { prompt: prompt.clone(), expected_draft: Some(revision) },
+                            Action::Print("current draft kept; inline discussion remains in history".into()),
+                        )));
+                    }
+                    Err(message) => self.last_error = Some(message.to_string()),
+                }
+                self.render(buffer)?;
             }
             Action::EnterMode(new_mode) => {
                 add_to_history = false;
@@ -19622,7 +19958,7 @@ impl Editor {
                 self.completion_snapshot = None;
                 self.render(buffer)?;
             }
-            Action::OpenInlineHistory => {
+            Action::OpenInlineHistory | Action::OpenInlineActivity => {
                 add_to_history = false;
                 self.open_inline_history(buffer, runtime).await?;
             }
@@ -19630,6 +19966,31 @@ impl Editor {
                 add_to_history = false;
                 self.handle_inline_history_action(action, buffer, runtime)
                     .await?;
+            }
+            Action::RestoreInlineAssistAnnotations => {
+                add_to_history = false;
+                if let Some(request) = self.inline_assist.as_ref().and_then(|assist| {
+                    self.inline_annotations_request(
+                        &assist.annotation_group_id,
+                        assist.result_request_id.as_deref(),
+                    )
+                }) {
+                    self.show_inline_history_annotations(&request, buffer, runtime)
+                        .await?;
+                    if let Some(scope) = self
+                        .inline_assist
+                        .as_ref()
+                        .map(|assist| assist.scope.clone())
+                    {
+                        self.current_dialog = Some(Box::new(
+                            self.inline_assist_popup(scope, self.inline_assist_result_state()),
+                        ));
+                    }
+                } else {
+                    self.last_error =
+                        Some("no retained annotations for this inline discussion".into());
+                }
+                self.render(buffer)?;
             }
             Action::RefreshDiagnostics => {
                 add_to_history = false;
@@ -22314,6 +22675,13 @@ impl Editor {
                                         segment.line,
                                     )
                                 } else if let Some(comment) = layout.inline_comment_row(local_y) {
+                                    if let Some(group) =
+                                        self.inline_job_on_comment_line(comment.line)
+                                    {
+                                        return Some(KeyAction::Single(Action::OpenInlineJob(
+                                            group,
+                                        )));
+                                    }
                                     (0, comment.line)
                                 } else {
                                     (content_x, window_vtop + local_y)
@@ -27799,6 +28167,44 @@ mod test {
     }
 
     #[test]
+    fn inline_assist_uses_only_the_enclosing_function_without_a_selection() {
+        let source = "fn first() {\n    work();\n}\n\nfn second() {}\n";
+        let mut editor = inline_test_editor(source);
+        editor
+            .current_buffer_mut()
+            .set_syntax_selection(SyntaxSelection::Language("rust".into()));
+        editor.cy = 1;
+        let (range, scope) = editor.inline_assist_target().unwrap();
+        assert_eq!(
+            editor.current_buffer().text_in_range(range),
+            "fn first() {\n    work();\n}\n"
+        );
+        assert_eq!(scope, "function · lines 1–3");
+        editor.cy = 3;
+        let (range, scope) = editor.inline_assist_target().unwrap();
+        assert_eq!(editor.current_buffer().text_in_range(range), "\n");
+        assert_eq!(scope, "line 4");
+        editor.cy = 1;
+        editor.mode = Mode::VisualLine;
+        editor.selection = Some(Rect::new(0, 1, 0, 1));
+        let (range, _) = editor.inline_assist_target().unwrap();
+        assert_eq!(
+            editor.current_buffer().text_in_range(range),
+            "    work();\n"
+        );
+
+        let mut editor = inline_test_editor("fn first() {} fn second() {}\n");
+        editor
+            .current_buffer_mut()
+            .set_syntax_selection(SyntaxSelection::Language("rust".into()));
+        let (range, _) = editor.inline_assist_target().unwrap();
+        assert_eq!(
+            editor.current_buffer().text_in_range(range),
+            "fn first() {}"
+        );
+    }
+
+    #[test]
     fn inline_assist_layout_remains_owned_by_the_initiating_split() {
         let mut editor = inline_test_editor("alpha\nbeta\n");
         editor.window_manager.split_vertical(0).unwrap();
@@ -27858,6 +28264,7 @@ mod test {
                 "request-inline",
                 "session-inline",
                 &InlineAssistResult {
+                    needs_agent: None,
                     replacement: Some("let answer = 1;\n".to_string()),
                     comments: Vec::new(),
                 },
@@ -27922,6 +28329,7 @@ mod test {
                 "stale-request",
                 "inline-session",
                 &InlineAssistResult {
+                    needs_agent: None,
                     replacement: Some("model output\n".to_string()),
                     comments: Vec::new(),
                 },

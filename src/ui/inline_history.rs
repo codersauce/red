@@ -1,8 +1,11 @@
 //! Bottom-docked, read-only browser for retained inline conversations.
 
+use std::time::Instant;
+
 use super::{
     dialog::{BorderStyle, Dialog, SurfaceRole},
-    wrap_text, ActionBar, ActionPriority, Component, UiAction,
+    spinner_frame, wrap_text, ActionBar, ActionPriority, Component, UiAction,
+    SPINNER_FRAME_INTERVAL_MS,
 };
 use crate::{
     config::KeyAction,
@@ -12,16 +15,24 @@ use crate::{
     theme::Theme,
     unicode_utils::{fit_display_width, truncate_display_width},
 };
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
+
+pub(crate) struct InlineHistoryRow {
+    pub text: String,
+    pub running: bool,
+}
 
 pub(crate) struct InlineHistoryPanel {
-    rows: Vec<String>,
+    rows: Vec<InlineHistoryRow>,
     selected: usize,
     detail: String,
     scroll: usize,
     searching: bool,
     query: String,
     confirm_forget: bool,
+    can_restore: bool,
+    animation_started: Instant,
+    animation_frame: u64,
     title: String,
     width: usize,
     height: usize,
@@ -32,7 +43,7 @@ impl InlineHistoryPanel {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         editor: &Editor,
-        rows: Vec<String>,
+        rows: Vec<InlineHistoryRow>,
         selected: usize,
         detail: String,
         scroll: usize,
@@ -40,6 +51,8 @@ impl InlineHistoryPanel {
         query: String,
         confirm_forget: bool,
         title: String,
+        can_restore: bool,
+        animation_started: Instant,
     ) -> Self {
         Self {
             rows,
@@ -49,6 +62,10 @@ impl InlineHistoryPanel {
             searching,
             query,
             confirm_forget,
+            can_restore,
+            animation_started,
+            animation_frame: animation_started.elapsed().as_millis() as u64
+                / SPINNER_FRAME_INTERVAL_MS,
             title,
             width: editor.vwidth(),
             height: editor.inline_history_viewport_height(),
@@ -58,9 +75,45 @@ impl InlineHistoryPanel {
     fn action(action: HistoryAction) -> Option<KeyAction> {
         Some(KeyAction::Single(Action::InlineHistoryAction(action)))
     }
+
+    fn list_item_at(&self, column: usize, row: usize) -> Option<usize> {
+        let width = self.width.saturating_sub(2);
+        let height = (self.height / 2)
+            .clamp(5, 16)
+            .min(self.height.saturating_sub(2));
+        let y = self.height.saturating_sub(height + 2);
+        let body = height.saturating_sub(1);
+        let wide = width >= 70;
+        let list_width = if wide { (width * 2 / 5).min(72) } else { width };
+        let list_height = if wide { body } else { body.min(2) };
+        if column < 1 || column > list_width || row <= y || row >= y + 1 + list_height {
+            return None;
+        }
+        let first = self
+            .selected
+            .saturating_sub((list_height / 2).max(1).saturating_sub(1));
+        let index = first + (row - y - 1) / 2;
+        (index < self.rows.len()).then_some(index)
+    }
 }
 
 impl Component for InlineHistoryPanel {
+    fn is_inline_history(&self) -> bool {
+        true
+    }
+
+    fn tick(&mut self) -> anyhow::Result<bool> {
+        if !self.rows.iter().any(|row| row.running) {
+            return Ok(false);
+        }
+        let frame = self.animation_started.elapsed().as_millis() as u64 / SPINNER_FRAME_INTERVAL_MS;
+        if frame == self.animation_frame {
+            return Ok(false);
+        }
+        self.animation_frame = frame;
+        Ok(true)
+    }
+
     fn surface_actions(&self) -> Vec<UiAction> {
         let essential =
             |id, key, label| UiAction::new(id, key, label).with_priority(ActionPriority::Essential);
@@ -82,11 +135,13 @@ impl Component for InlineHistoryPanel {
             UiAction::new("search", "/", "search"),
             UiAction::new("workspace", "w", "workspace"),
             UiAction::new("view", "v", "view"),
+            essential("open", "Enter", "open"),
+            UiAction::new("pin", "p", "pin annotations").with_enabled(self.can_restore),
             UiAction::new("continue", "r", "continue"),
             UiAction::new("recheck", "R", "recheck").with_priority(ActionPriority::Secondary),
             UiAction::new("resolve", "d", "resolve").with_priority(ActionPriority::Secondary),
             UiAction::new("forget", "D", "forget…").with_priority(ActionPriority::Secondary),
-            essential("jump", "Enter", "jump"),
+            UiAction::new("jump", "g", "jump"),
             essential("return", "Esc", "return"),
         ]
     }
@@ -115,7 +170,7 @@ impl Component for InlineHistoryPanel {
         dialog.draw(buffer)?;
         let body = height.saturating_sub(1);
         let wide = width >= 70;
-        let list_width = if wide { (width * 2 / 5).min(48) } else { width };
+        let list_width = if wide { (width * 2 / 5).min(72) } else { width };
         let list_height = if wide { body } else { body.min(2) };
         let visible_items = (list_height / 2).max(1);
         let first = self
@@ -129,9 +184,20 @@ impl Component for InlineHistoryPanel {
             };
             let marker = if offset == self.selected { "> " } else { "  " };
             let row_y = y + 1 + (offset - first) * 2;
-            let mut lines = row.lines();
+            let mut lines = row.text.lines();
+            let spinner = if row.running {
+                format!(
+                    "{} ",
+                    spinner_frame(
+                        self.animation_frame
+                            .saturating_mul(SPINNER_FRAME_INTERVAL_MS)
+                    )
+                )
+            } else {
+                String::new()
+            };
             let text = fit_display_width(
-                &format!("{marker}{}", lines.next().unwrap_or_default()),
+                &format!("{marker}{spinner}{}", lines.next().unwrap_or_default()),
                 list_width,
             );
             if row_y < y + 1 + list_height {
@@ -235,6 +301,22 @@ impl Component for InlineHistoryPanel {
                 _ => None,
             };
         }
+        if !self.confirm_forget {
+            if let Event::Mouse(mouse) = event {
+                let index = self.list_item_at(mouse.column as usize, mouse.row as usize)?;
+                return match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) if index == self.selected => {
+                        Self::action(HistoryAction::Open)
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        Self::action(HistoryAction::Select(index))
+                    }
+                    MouseEventKind::ScrollDown => Self::action(HistoryAction::Next),
+                    MouseEventKind::ScrollUp => Self::action(HistoryAction::Previous),
+                    _ => None,
+                };
+            }
+        }
         let Event::Key(key) = event else {
             return None;
         };
@@ -262,7 +344,9 @@ impl Component for InlineHistoryPanel {
             KeyCode::Char('v') => HistoryAction::CycleView,
             KeyCode::PageDown => HistoryAction::ScrollDown,
             KeyCode::PageUp => HistoryAction::ScrollUp,
-            KeyCode::Enter => HistoryAction::Jump,
+            KeyCode::Enter => HistoryAction::Open,
+            KeyCode::Char('g') => HistoryAction::Jump,
+            KeyCode::Char('p' | 's') if self.can_restore => HistoryAction::ShowAnnotations,
             KeyCode::Esc | KeyCode::Char('q') => HistoryAction::Close,
             KeyCode::Char('r') => HistoryAction::Continue,
             KeyCode::Char('R') => HistoryAction::Recheck,
@@ -277,6 +361,8 @@ impl Component for InlineHistoryPanel {
 mod tests {
     use super::*;
     use crate::color::Color;
+    use crate::{buffer::Buffer, config::Config, lsp::LspManager};
+    use crossterm::event::{KeyEvent, MouseEvent};
 
     #[test]
     fn word_backspace_routes_only_active_inline_history_search() {
@@ -332,8 +418,8 @@ mod tests {
         for (viewport_width, list_width) in [(120, 47), (64, 62)] {
             let mut panel = InlineHistoryPanel {
                 rows: vec![
-                    "short\ndetails".into(),
-                    format!("{}\n{}", "界".repeat(80), "👋".repeat(80)),
+                    InlineHistoryRow { text: "short\ndetails".into(), running: false },
+                    InlineHistoryRow { text: format!("{}\n{}", "界".repeat(80), "👋".repeat(80)), running: false },
                 ],
                 selected: 0,
                 detail: "preview".into(),
@@ -341,6 +427,9 @@ mod tests {
                 searching: false,
                 query: String::new(),
                 confirm_forget: false,
+                can_restore: false,
+                animation_started: Instant::now(),
+                animation_frame: 0,
                 title: "History".into(),
                 width: viewport_width,
                 height,
@@ -372,5 +461,81 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn inline_history_exposes_open_jump_restore_and_mouse_selection() {
+        let config = Config::default();
+        let editor = Editor::with_size(
+            Box::new(LspManager::new(config.lsp.clone())),
+            100,
+            30,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, "alpha\n".into())],
+        )
+        .unwrap();
+        let mut panel = InlineHistoryPanel::new(
+            &editor,
+            vec![
+                InlineHistoryRow {
+                    text: "First\nfile.c:1 · running".into(),
+                    running: true,
+                },
+                InlineHistoryRow {
+                    text: "Second\nfile.c:2 · kept".into(),
+                    running: false,
+                },
+            ],
+            0,
+            "Detail".into(),
+            0,
+            false,
+            String::new(),
+            false,
+            "Inline history".into(),
+            true,
+            Instant::now(),
+        );
+        assert!(panel.is_inline_history());
+        for (key, action) in [
+            (KeyCode::Enter, HistoryAction::Open),
+            (KeyCode::Char('g'), HistoryAction::Jump),
+            (KeyCode::Char('s'), HistoryAction::ShowAnnotations),
+            (KeyCode::Char('p'), HistoryAction::ShowAnnotations),
+        ] {
+            assert_eq!(
+                panel.handle_event(&Event::Key(KeyEvent::new(key, KeyModifiers::NONE))),
+                Some(KeyAction::Single(Action::InlineHistoryAction(action)))
+            );
+        }
+        let row = (0..panel.height)
+            .find(|row| panel.list_item_at(1, *row) == Some(1))
+            .unwrap();
+        assert_eq!(
+            panel.handle_event(&Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: row as u16,
+                modifiers: KeyModifiers::NONE
+            })),
+            Some(KeyAction::Single(Action::InlineHistoryAction(
+                HistoryAction::Select(1)
+            )))
+        );
+        panel.animation_started =
+            Instant::now() - std::time::Duration::from_millis(SPINNER_FRAME_INTERVAL_MS);
+        panel.animation_frame = 0;
+        assert!(panel.tick().unwrap());
+        panel.rows[0].running = false;
+        assert!(!panel.tick().unwrap());
+        panel.can_restore = false;
+        assert_eq!(
+            panel.handle_event(&Event::Key(KeyEvent::new(
+                KeyCode::Char('s'),
+                KeyModifiers::NONE
+            ))),
+            None
+        );
     }
 }

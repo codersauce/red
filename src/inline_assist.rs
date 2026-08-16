@@ -33,9 +33,19 @@ pub struct InlineAssistResult {
     pub replacement: Option<String>,
     #[serde(default)]
     pub comments: Vec<InlineCommentInput>,
+    /// A broader request that should continue in the full Agent workflow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs_agent: Option<String>,
 }
 
 impl InlineAssistResult {
+    /// Whether accepting this result would change the reviewed source text.
+    pub fn changes_text(&self, before: &str) -> bool {
+        self.replacement
+            .as_deref()
+            .is_some_and(|replacement| replacement != before)
+    }
+
     pub fn from_tool(tool: &str, arguments: Value) -> Result<Self> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -49,6 +59,11 @@ impl InlineAssistResult {
         struct Comments {
             comments: Vec<InlineCommentInput>,
         }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct NeedsAgent {
+            reason: String,
+        }
         let mut result = match tool {
             "submit_replacement" => {
                 let input: Replacement = serde_json::from_value(arguments)
@@ -56,6 +71,7 @@ impl InlineAssistResult {
                 Self {
                     replacement: Some(input.replacement),
                     comments: input.comments,
+                    needs_agent: None,
                 }
             }
             "submit_comments" => {
@@ -64,10 +80,20 @@ impl InlineAssistResult {
                 Self {
                     replacement: None,
                     comments: input.comments,
+                    needs_agent: None,
+                }
+            }
+            "request_agent" => {
+                let input: NeedsAgent =
+                    serde_json::from_value(arguments).context("invalid request_agent arguments")?;
+                Self {
+                    replacement: None,
+                    comments: Vec::new(),
+                    needs_agent: Some(input.reason.trim().to_string()),
                 }
             }
             _ => {
-                anyhow::bail!("inline assist only supports submit_replacement and submit_comments")
+                anyhow::bail!("unsupported inline-assist submission tool")
             }
         };
         for comment in &mut result.comments {
@@ -86,6 +112,19 @@ impl InlineAssistResult {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if let Some(reason) = &self.needs_agent {
+            ensure!(
+                self.replacement.is_none() && self.comments.is_empty(),
+                "an Agent handoff cannot also edit code or submit comments"
+            );
+            ensure!(
+                !reason.trim().is_empty()
+                    && reason.len() <= MAX_COMMENT_BYTES
+                    && !reason.chars().any(|ch| (ch.is_control() && ch != '\n')
+                        || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')),
+                "invalid Agent handoff reason"
+            );
+        }
         if let Some(replacement) = &self.replacement {
             ensure!(
                 !replacement.is_empty() || self.comments.is_empty(),
@@ -165,13 +204,44 @@ pub fn tool_definitions() -> Value {
          "inputSchema": {"type": "object", "properties": {"replacement": {"type": "string"}, "comments": comments.clone()}, "required": ["replacement"], "additionalProperties": false}},
         {"type": "function", "name": "submit_comments",
          "description": "Leave inline comments without editing code. Lines are one-based and inclusive, relative to the supplied target (not the surrounding file). An empty list means no findings. Call exactly one submission tool per turn.",
-         "inputSchema": {"type": "object", "properties": {"comments": comments}, "required": ["comments"], "additionalProperties": false}}
+         "inputSchema": {"type": "object", "properties": {"comments": comments}, "required": ["comments"], "additionalProperties": false}},
+        {"type": "function", "name": "request_agent",
+         "description": "Request a contextual handoff when the user's task needs code or edits outside the supplied target. Explain what needs to change. This does not edit code, add a comment, or start the Agent automatically. Call exactly one submission tool per turn.",
+         "inputSchema": {"type": "object", "properties": {"reason": {"type": "string", "minLength": 1, "maxLength": MAX_COMMENT_BYTES}}, "required": ["reason"], "additionalProperties": false}}
     ])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_handoff_is_a_separate_bounded_result() {
+        let mut result = InlineAssistResult::from_tool(
+            "request_agent",
+            json!({"reason": "Update both functions."}),
+        )
+        .unwrap();
+        assert_eq!(
+            result.needs_agent.as_deref(),
+            Some("Update both functions.")
+        );
+        assert!(result.validate_for_target("one line").is_ok());
+        result.replacement = Some("changed".into());
+        assert!(result.validate().is_err());
+        for reason in [
+            "".to_string(),
+            "x".repeat(MAX_COMMENT_BYTES + 1),
+            "hidden\u{202e}".into(),
+        ] {
+            assert!(
+                InlineAssistResult::from_tool("request_agent", json!({"reason": reason})).is_err()
+            );
+        }
+        let old: InlineAssistResult =
+            serde_json::from_value(json!({"replacement": null, "comments": []})).unwrap();
+        assert!(old.needs_agent.is_none());
+    }
 
     #[test]
     fn parses_comment_only_and_mixed_results() {

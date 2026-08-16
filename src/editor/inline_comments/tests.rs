@@ -640,6 +640,7 @@ async fn inline_comment_only_result_is_kept_without_a_text_transaction() {
             "review",
             "test-session",
             &InlineAssistResult {
+                needs_agent: None,
                 replacement: None,
                 comments: vec![note(1, 2, "Both lines")],
             },
@@ -671,6 +672,7 @@ async fn inline_comment_only_result_is_kept_without_a_text_transaction() {
             "review",
             "test-session",
             &InlineAssistResult {
+                needs_agent: None,
                 replacement: None,
                 comments: vec![note(1, 1, "Duplicate")]
             },
@@ -702,6 +704,7 @@ async fn inline_mixed_result_validates_before_editing_and_undo_removes_its_group
     let mut frame = RenderBuffer::new(70, 16, &Style::default());
     let mut runtime = Runtime::new();
     let mut result = InlineAssistResult {
+        needs_agent: None,
         replacement: Some("one\ntwo\n".into()),
         comments: vec![note(3, 3, "Outside")],
     };
@@ -745,6 +748,7 @@ async fn inline_comment_refinement_replaces_only_its_own_group() {
                 request,
                 "test-session",
                 &InlineAssistResult {
+                    needs_agent: None,
                     replacement: None,
                     comments: vec![note(1, 2, message)],
                 },
@@ -772,6 +776,7 @@ async fn inline_comment_refinement_replaces_only_its_own_group() {
             "refine",
             "test-session",
             &InlineAssistResult {
+                needs_agent: None,
                 replacement: None,
                 comments: vec![note(1, 1, "Refined")],
             },
