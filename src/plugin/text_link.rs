@@ -128,6 +128,32 @@ fn parse_source_location(value: &str) -> Option<(String, usize, usize)> {
         return None;
     }
 
+    // Range labels retain their full visible text, but navigation opens the
+    // beginning of the range. Split from the right so hyphens in paths survive.
+    if let Some((start, end)) = value.rsplit_once(['-', '–']) {
+        if let Some(target) = parse_single_source_location(start) {
+            let github_style = start.contains("#L");
+            let end = if github_style {
+                end.strip_prefix('L').unwrap_or(end)
+            } else {
+                end
+            };
+            let (line, column) = end
+                .split_once(if github_style { 'C' } else { ':' })
+                .map_or((end, None), |(line, column)| (line, Some(column)));
+            let end_line = parse_positive_integer(line)?;
+            let end_column = match column {
+                Some(column) => parse_positive_integer(column)?,
+                None => usize::MAX,
+            };
+            return ((end_line, end_column) >= (target.1, target.2)).then_some(target);
+        }
+    }
+
+    parse_single_source_location(value)
+}
+
+fn parse_single_source_location(value: &str) -> Option<(String, usize, usize)> {
     if let Some(fragment) = value.rfind("#L") {
         let path = &value[..fragment];
         let location = &value[fragment + 2..];
@@ -138,11 +164,9 @@ fn parse_source_location(value: &str) -> Option<(String, usize, usize)> {
     }
 
     let (before_last, last) = value.rsplit_once(':')?;
-    if !is_positive_integer(last) {
-        return None;
-    }
+    parse_positive_integer(last)?;
     if let Some((path, possible_line)) = before_last.rsplit_once(':') {
-        if is_positive_integer(possible_line) {
+        if parse_positive_integer(possible_line).is_some() {
             return valid_location(path, possible_line, last);
         }
     }
@@ -203,16 +227,62 @@ fn valid_location(path: &str, line: &str, column: &str) -> Option<(String, usize
     {
         return None;
     }
-    Some((path.to_string(), line.parse().ok()?, column.parse().ok()?))
+    Some((
+        path.to_string(),
+        parse_positive_integer(line)?,
+        parse_positive_integer(column)?,
+    ))
 }
 
-fn is_positive_integer(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) && value != "0"
+fn parse_positive_integer(value: &str) -> Option<usize> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok().filter(|number| *number > 0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_ranges_navigate_to_their_first_position() {
+        for (reference, path, line, column) in [
+            ("c/main.c:125–183", "c/main.c", 125, 1),
+            ("c/main.c:125-183", "c/main.c", 125, 1),
+            ("src/my-file.rs:12:4–14:8", "src/my-file.rs", 12, 4),
+            ("src/my-file.rs#L12-L20", "src/my-file.rs", 12, 1),
+            ("src/my-file.rs#L12C4–L14C8", "src/my-file.rs", 12, 4),
+            (r"C:\src\my-file.rs:12-20", r"C:\src\my-file.rs", 12, 1),
+        ] {
+            let expected = TextPanelLinkTarget::File {
+                path: path.into(),
+                location: Some(TextPanelFileLocation { line, column }),
+            };
+            assert_eq!(markdown_link_target(reference), Some(expected.clone()));
+            let text = format!("Read ({reference}) · editor revision 0");
+            let links = linkify_source_locations(&text)
+                .into_iter()
+                .filter_map(|(label, target)| target.map(|target| (label, target)))
+                .collect::<Vec<_>>();
+            assert_eq!(links, [(reference, expected)]);
+        }
+    }
+
+    #[test]
+    fn source_ranges_reject_invalid_or_reversed_positions() {
+        for reference in [
+            "src/main.rs:12–0",
+            "src/main.rs:12–11",
+            "src/main.rs:12:8–12:7",
+            "src/main.rs:12–184467440737095516160",
+            "src/main.rs#L0-L12",
+            "src/main.rs#L12-L0",
+            "src/main.rs#L12C4-L12C0",
+        ] {
+            assert_eq!(parse_source_location(reference), None, "{reference}");
+        }
+    }
 
     #[test]
     fn linkifies_source_locations_without_swallowing_punctuation() {

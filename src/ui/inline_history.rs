@@ -680,6 +680,55 @@ mod tests {
     }
 
     #[test]
+    fn inline_history_context_range_links_use_the_workspace_and_start_line() {
+        let mut panel = rich_panel(120, Theme::default());
+        panel.detail.cwd = "/workspace/asteroids".into();
+        panel.detail.blocks = vec![HistoryBlock::Plain(
+            "Context read:\nRead c/main.c:125–183 · editor revision 0".into(),
+        )];
+        let target = TextPanelLinkTarget::File {
+            path: "c/main.c".into(),
+            location: Some(crate::plugin::TextPanelFileLocation {
+                line: 125,
+                column: 1,
+            }),
+        };
+        for width in [120, 64, 34] {
+            panel.resize(width, 40);
+            let (x, y, _, height) = panel.detail_geometry();
+            let (row, column) = panel
+                .rendered
+                .iter()
+                .enumerate()
+                .find_map(|(row, line)| {
+                    let mut column = 0;
+                    for span in &line.spans {
+                        if span.link.as_ref().is_some_and(|link| link.target == target) {
+                            return Some((row, column));
+                        }
+                        column += display_width(&span.text);
+                    }
+                    None
+                })
+                .expect("context range should remain a source link after wrapping");
+            panel.scroll = row.min(panel.rendered.len().saturating_sub(height));
+            assert_eq!(
+                panel.detail_link_at(x + column, y + row - panel.scroll),
+                InlineHistoryPanel::action(HistoryAction::FollowFile {
+                    path: panel
+                        .detail
+                        .cwd
+                        .join("c/main.c")
+                        .to_string_lossy()
+                        .into_owned(),
+                    line: Some(125),
+                    column: Some(1),
+                })
+            );
+        }
+    }
+
+    #[test]
     fn selection_fills_both_lines_without_crossing_pane_boundary() {
         let mut theme = Theme::default();
         theme.ui_style.picker_selected_item.bg = Some(Color::Rgb {
