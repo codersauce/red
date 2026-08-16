@@ -9,6 +9,7 @@ use crate::{
 };
 use std::{
     collections::VecDeque,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -23,6 +24,7 @@ pub(super) struct InlineCompletionState {
     status: String,
     failed: bool,
     prompts: VecDeque<CopilotEvent>,
+    pub(super) sign_in: Option<Arc<Mutex<CopilotSignInModel>>>,
 }
 
 pub(super) struct Suggestion {
@@ -267,6 +269,9 @@ impl Editor {
             }
             Some(CopilotCommand::Disable) => {
                 self.dismiss_inline_completion();
+                if self.inline_completion.sign_in.take().is_some() {
+                    self.current_dialog = None;
+                }
                 self.inline_completion.enabled_override = Some(false);
                 self.inline_completion.bridge = None;
                 self.inline_completion.prompts.clear();
@@ -284,6 +289,9 @@ impl Editor {
             }
             Some(CopilotCommand::SignOut) => {
                 self.dismiss_inline_completion();
+                if self.inline_completion.sign_in.take().is_some() {
+                    self.current_dialog = None;
+                }
                 self.copilot_control(Control::SignOut);
             }
             Some(CopilotCommand::Status) => {
@@ -313,6 +321,52 @@ impl Editor {
         if let Some(bridge) = &self.inline_completion.bridge {
             bridge.cancel();
         }
+    }
+
+    fn write_copilot_sign_in_code(&mut self, code: &str) -> bool {
+        if !self.config.clipboard.enabled || !self.clipboard.is_available() {
+            return false;
+        }
+        match self.clipboard.set_text(code) {
+            Ok(()) => true,
+            Err(error) => {
+                log!("failed to copy Copilot device code: {error}");
+                false
+            }
+        }
+    }
+
+    fn show_copilot_sign_in(&mut self, user_code: String, command: Value) {
+        let clipboard_copied = self.write_copilot_sign_in_code(&user_code);
+        let model = Arc::new(Mutex::new(CopilotSignInModel {
+            user_code,
+            command,
+            phase: CopilotSignInPhase::Ready,
+            clipboard_copied,
+        }));
+        self.current_dialog = Some(Box::new(CopilotSignInDialog::new(self, model.clone())));
+        self.inline_completion.sign_in = Some(model);
+    }
+
+    pub(super) fn copy_copilot_sign_in_code(&mut self, code: &str) {
+        let copied = self.write_copilot_sign_in_code(code);
+        if let Some(model) = &self.inline_completion.sign_in {
+            if let Ok(mut model) = model.lock() {
+                if model.user_code == code {
+                    model.clipboard_copied = copied;
+                }
+            }
+        }
+        self.last_error = Some(if copied {
+            "Copilot device code copied to clipboard".into()
+        } else {
+            "Unable to copy Copilot device code; it remains visible in the dialog".into()
+        });
+    }
+
+    pub(super) fn retry_copilot_sign_in(&mut self) {
+        self.inline_completion.failed = false;
+        self.copilot_control(Control::SignIn);
     }
 
     pub(super) fn schedule_inline_completion(&mut self) {
@@ -419,11 +473,34 @@ impl Editor {
             };
             match event {
                 CopilotEvent::Status(status) => self.inline_completion.status = status,
+                CopilotEvent::SignInFinished { error } => {
+                    if let Some(error) = error {
+                        if let Some(model) = &self.inline_completion.sign_in {
+                            if let Ok(mut model) = model.lock() {
+                                model.phase = CopilotSignInPhase::Failed(error.clone());
+                            }
+                        }
+                        self.inline_completion.status = format!("Sign-in failed: {error}");
+                        self.last_error = Some(format!("Copilot sign-in failed: {error}"));
+                    } else {
+                        self.inline_completion.status = "Signed in".into();
+                        if self.inline_completion.sign_in.take().is_some() {
+                            self.current_dialog = None;
+                        }
+                        self.last_error = Some("Copilot signed in".into());
+                    }
+                    changed = true;
+                }
                 CopilotEvent::Stopped(status) => {
                     self.inline_completion.status = status.clone();
                     self.inline_completion.failed = true;
                     self.inline_completion.bridge = None;
                     self.dismiss_inline_completion();
+                    if let Some(model) = &self.inline_completion.sign_in {
+                        if let Ok(mut model) = model.lock() {
+                            model.phase = CopilotSignInPhase::Failed(status.clone());
+                        }
+                    }
                     self.last_error = Some(status);
                     changed = true;
                     break;
@@ -452,6 +529,12 @@ impl Editor {
                         changed = true;
                     }
                 }
+                CopilotEvent::SignIn { user_code, command }
+                    if self.inline_completion.sign_in.is_some() =>
+                {
+                    self.show_copilot_sign_in(user_code, command);
+                    changed = true;
+                }
                 prompt @ (CopilotEvent::SignIn { .. } | CopilotEvent::Message { .. }) => {
                     if self.inline_completion.prompts.len() < 32 {
                         self.inline_completion.prompts.push_back(prompt);
@@ -466,25 +549,21 @@ impl Editor {
         }
         if self.current_dialog.is_none() {
             if let Some(prompt) = self.inline_completion.prompts.pop_front() {
-                self.current_dialog = Some(match prompt {
+                match prompt {
                     CopilotEvent::SignIn { user_code, command } => {
-                        Box::new(Confirmation::new_actions(
-                            self,
-                            "Sign in to GitHub Copilot",
-                            format!("Enter code {user_code} in GitHub’s device activation page."),
-                            "Open browser",
-                            "Dismiss",
-                            Action::CopilotFinishSignIn(command),
-                            Action::Refresh,
-                        ))
+                        self.show_copilot_sign_in(user_code, command);
                     }
                     CopilotEvent::Message {
                         id,
                         message,
                         actions,
-                    } => Box::new(CopilotMessagePicker::new(self, id, message, actions)),
+                    } => {
+                        self.current_dialog = Some(Box::new(CopilotMessagePicker::new(
+                            self, id, message, actions,
+                        )));
+                    }
                     _ => unreachable!("only prompts are queued"),
-                });
+                }
                 changed = true;
             }
         }
@@ -582,7 +661,7 @@ fn insertion_for_item(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::EditorTestExt;
+    use crate::{clipboard::MemoryClipboardProvider, test_utils::EditorTestExt};
 
     fn editor(text: &str) -> Editor {
         let mut config = Config::from_user_toml_with_overrides("", &[]).unwrap();
@@ -728,6 +807,83 @@ mod tests {
                 }
             ]))
         );
+    }
+
+    #[tokio::test]
+    async fn sign_in_copies_the_code_stays_open_and_tracks_the_result() {
+        let mut editor = editor("foo");
+        let clipboard = MemoryClipboardProvider::default();
+        let clipboard_text = clipboard.shared_text();
+        editor.test_set_clipboard(Box::new(clipboard));
+        let (bridge, _requests, mut controls, events) = Bridge::test_channels();
+        editor.inline_completion.bridge = Some(bridge);
+        editor.inline_completion.failed = false;
+        let command = json!({
+            "command": "github.copilot.finishDeviceFlow",
+            "arguments": []
+        });
+
+        events
+            .send(CopilotEvent::SignIn {
+                user_code: "ABCD-EFGH".into(),
+                command: command.clone(),
+            })
+            .await
+            .unwrap();
+        editor.service_inline_completion();
+
+        assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("ABCD-EFGH"));
+        let action = editor
+            .current_dialog
+            .as_mut()
+            .unwrap()
+            .handle_event(&Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        assert_eq!(
+            action,
+            KeyAction::Single(Action::CopilotFinishSignIn(command.clone()))
+        );
+        editor
+            .test_execute_action(Action::CopilotFinishSignIn(command))
+            .await
+            .unwrap();
+        assert!(editor.current_dialog.is_some());
+        assert!(matches!(
+            controls.recv().await,
+            Some(Control::FinishSignIn(_))
+        ));
+
+        events
+            .send(CopilotEvent::SignInFinished {
+                error: Some("device code expired".into()),
+            })
+            .await
+            .unwrap();
+        editor.service_inline_completion();
+        assert!(editor.current_dialog.is_some());
+        assert!(matches!(
+            editor
+                .inline_completion
+                .sign_in
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .phase,
+            CopilotSignInPhase::Failed(_)
+        ));
+
+        events
+            .send(CopilotEvent::SignInFinished { error: None })
+            .await
+            .unwrap();
+        editor.service_inline_completion();
+        assert!(editor.current_dialog.is_none());
+        assert!(editor.inline_completion.sign_in.is_none());
+        assert_eq!(editor.last_error.as_deref(), Some("Copilot signed in"));
     }
 
     #[tokio::test]
