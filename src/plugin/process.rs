@@ -249,6 +249,12 @@ impl ProcessManager {
             let process_id = process_id.clone();
             thread::spawn(move || {
                 if let Err(error) = stdin.write_all(input.as_bytes()) {
+                    // A child can reject an operation before consuming its input
+                    // (for example, a failing Git pre-commit hook). Its stderr and
+                    // exit status explain that outcome; EPIPE must not replace them.
+                    if error.kind() == std::io::ErrorKind::BrokenPipe {
+                        return;
+                    }
                     let _ = event_sender.send(ProcessEvent::Error {
                         plugin_name,
                         process_id,
@@ -720,6 +726,37 @@ mod tests {
             code: Some(7),
         }));
         assert_eq!(manager.active_process_count("test"), 0);
+    }
+
+    #[test]
+    fn child_rejection_preserves_stderr_instead_of_reporting_broken_stdin() {
+        let mut options = stdout_stderr_exit_options();
+        // More than a pipe can hold: this child exits without reading stdin.
+        options.stdin = Some("x".repeat(512 * 1024));
+        let mut manager = manager_with_commands(&[options.command.as_str()]);
+        let process_id = manager.spawn("test", options).unwrap();
+
+        let mut events = collect_until_exit(&mut manager);
+        // The stdin writer currently runs independently of the exit supervisor.
+        // Include any late event so a post-exit write error cannot pass unnoticed.
+        thread::sleep(Duration::from_millis(50));
+        events.extend(manager.poll_events());
+        assert!(events.contains(&ProcessEvent::Stderr {
+            plugin_name: "test".to_string(),
+            process_id: process_id.clone(),
+            line: "problem".to_string(),
+        }));
+        assert!(events.contains(&ProcessEvent::Exit {
+            plugin_name: "test".to_string(),
+            process_id,
+            code: Some(7),
+        }));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProcessEvent::Error { .. })),
+            "child rejection was replaced by a transport error: {events:?}"
+        );
     }
 
     #[test]

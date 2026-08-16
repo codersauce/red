@@ -11914,6 +11914,12 @@ mod tests {
             .unwrap()
             .success());
 
+        // Force the stdin writer to observe the hook's early rejection instead
+        // of relying on whether a short message fits in the pipe before Git exits.
+        let rejected_message = format!(
+            "feat(git): describe staged files\n\n{}\n",
+            "commit feedback regression ".repeat(8192)
+        );
         runtime.execute_command("GitSubmitMessage").await.unwrap();
         let buffer_text_request = loop {
             if let PluginRequest::GetBufferText { request_id, .. } =
@@ -11925,12 +11931,12 @@ mod tests {
         runtime
             .resolve_request(
                 buffer_text_request,
-                serde_json::json!({ "text": "feat(git): describe staged files\n" }),
+                serde_json::json!({ "text": rejected_message }),
             )
             .await
             .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut failure_reported = false;
         let mut failure_overlay = false;
         let mut commit_started = false;
@@ -11953,8 +11959,12 @@ mod tests {
                             .unwrap();
                     }
                     PluginRequest::Action(Action::Print(message))
-                        if message == "Git commit failed: blocked by commit feedback test" =>
+                        if message.starts_with("Git commit failed:") =>
                     {
+                        assert_eq!(
+                            message,
+                            "Git commit failed: blocked by commit feedback test"
+                        );
                         failure_reported = true;
                     }
                     PluginRequest::CreateOverlay { id, .. } if id == "git-operation-progress" => {
@@ -11991,7 +12001,10 @@ mod tests {
             {
                 break;
             }
-            assert!(Instant::now() < deadline, "commit failure was not reported");
+            assert!(
+                Instant::now() < deadline,
+                "commit failure was not reported: printed={failure_reported} overlay={failure_overlay} started={commit_started} busy={commit_busy} retry={retry_requested}"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
@@ -12012,7 +12025,7 @@ mod tests {
             }
             if let Some((request_id, text, submit)) = scratch {
                 assert_eq!(submit.as_deref(), Some("GitSubmitMessage"));
-                assert!(text.starts_with("feat(git): describe staged files\n"));
+                assert!(text.starts_with(rejected_message.trim_end()));
                 break request_id;
             }
             assert!(
