@@ -119,6 +119,12 @@ follow-ups submitted during an active turn appear immediately and remain queued
 in FIFO order. Assistant deltas stream into the conversation footer. `Ctrl-c`
 interrupts the active turn with `turn/interrupt`.
 
+In the conversation transcript's Normal mode, `[p` jumps backward to a user
+prompt and `]p` jumps forward. From an answer, the first backward jump returns
+to that turn's prompt; repeating it visits earlier prompts. Jumps reveal the
+prompt card, update its accent, and pause automatic scrolling without changing
+the composer draft. `G` returns to the latest output and resumes following it.
+
 If Codex cannot start, Red preserves the prompt and offers a retry action.
 Install or update Codex, run `codex login`, then retry without retyping.
 

@@ -455,6 +455,19 @@ struct TextPanelScrollback {
     mouse_dragging: bool,
     pending_find: Option<PendingScrollbackFind>,
     last_find: Option<ScrollbackFind>,
+    pending_prompt_jump: Option<PendingPromptJump>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingPromptJump {
+    direction: PromptJumpDirection,
+    count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PromptJumpDirection {
+    Previous,
+    Next,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1226,6 +1239,60 @@ impl TextPanel {
         layout.prompt_cards.last().map(|card| card.block_index)
     }
 
+    fn jump_to_prompt(
+        &mut self,
+        direction: PromptJumpDirection,
+        count: usize,
+        panel_height: usize,
+        width: usize,
+    ) {
+        let layout = self.layout(width);
+        let cursor = if self.follow_tail {
+            // Following output starts the backward search after the entire transcript.
+            layout.len
+        } else if self.scrollback.initialized {
+            layout.clamp(self.scrollback.cursor)
+        } else {
+            layout.offset_at_or_after(self.scroll, 0).unwrap_or(0)
+        };
+        let anchors = layout.prompt_cards.iter().filter_map(|card| {
+            card.rows.clone().find_map(|row| {
+                layout
+                    .offset_at(row, 0)
+                    .map(|offset| (card.rows.start, row, offset))
+            })
+        });
+        let count = count.max(1);
+        let target = match direction {
+            PromptJumpDirection::Previous => anchors
+                .rev()
+                .filter(|(_, _, offset)| *offset < cursor)
+                .take(count)
+                .last(),
+            PromptJumpDirection::Next => anchors
+                .filter(|(_, _, offset)| *offset > cursor)
+                .take(count)
+                .last(),
+        };
+        let Some((card_start, row, offset)) = target else {
+            return;
+        };
+
+        self.scrollback.cursor = offset;
+        self.scrollback.initialized = true;
+        self.scrollback.preferred_column = None;
+        self.scrollback.selection_anchor = None;
+        self.selected_link = None;
+
+        // Include the card's heading and cap whenever the pane is tall enough.
+        let visible_rows = self.visible_rows(panel_height);
+        let max_scroll = layout.lines.len().saturating_sub(visible_rows);
+        self.viewport.restore(card_start.min(max_scroll), false);
+        self.viewport.reveal(row, visible_rows);
+        self.scroll = self.viewport.offset();
+        self.follow_tail = self.viewport.is_following();
+    }
+
     fn focus_scrollback(&mut self, width: usize) {
         if let Some(composer) = self.composer.as_mut() {
             composer.focused = false;
@@ -1233,6 +1300,7 @@ impl TextPanel {
         self.scrollback.focused = true;
         self.scrollback.mode = TextPanelScrollbackMode::Normal;
         self.scrollback.selection_anchor = None;
+        self.scrollback.pending_prompt_jump = None;
         let layout = self.layout(width);
         if !self.scrollback.initialized {
             self.scrollback.cursor = (self.scroll..layout.lines.len())
@@ -1250,6 +1318,7 @@ impl TextPanel {
         self.scrollback.selection_anchor = None;
         self.scrollback.mouse_anchor = None;
         self.scrollback.mouse_dragging = false;
+        self.scrollback.pending_prompt_jump = None;
     }
 
     fn remember_focused_region(&mut self) {
@@ -2592,6 +2661,17 @@ impl PanelManager {
             .presentation
             .height(&panel.id, &panel.config, panel_height);
 
+        if let Some(pending) = panel.scrollback.pending_prompt_jump.take() {
+            if key.code == KeyCode::Char('p')
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+            {
+                panel.jump_to_prompt(pending.direction, pending.count, panel_height, width);
+            }
+            return Some(TextPanelScrollbackInput::Handled);
+        }
+
         if let Some(pending) = panel.scrollback.pending_find.take() {
             if key.code == KeyCode::Esc {
                 return Some(TextPanelScrollbackInput::Handled);
@@ -2648,6 +2728,19 @@ impl PanelManager {
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
         {
             match key.code {
+                KeyCode::Char('[' | ']')
+                    if panel.scrollback.mode == TextPanelScrollbackMode::Normal =>
+                {
+                    panel.scrollback.pending_prompt_jump = Some(PendingPromptJump {
+                        direction: if key.code == KeyCode::Char('[') {
+                            PromptJumpDirection::Previous
+                        } else {
+                            PromptJumpDirection::Next
+                        },
+                        count,
+                    });
+                    return Some(TextPanelScrollbackInput::Handled);
+                }
                 KeyCode::Char('v') => {
                     panel.scrollback.mode =
                         if panel.scrollback.mode == TextPanelScrollbackMode::Visual {
@@ -3918,6 +4011,14 @@ struct TextPanelShortcutHint {
 }
 
 const SCROLLBACK_NORMAL_HINTS: &[TextPanelShortcutHint] = &[
+    TextPanelShortcutHint {
+        keys: "[p/]p",
+        action: "prompt",
+    },
+    TextPanelShortcutHint {
+        keys: "G",
+        action: "latest",
+    },
     TextPanelShortcutHint {
         keys: "hjkl/arrows",
         action: "move",
