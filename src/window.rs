@@ -548,6 +548,45 @@ mod tests {
     }
 
     #[test]
+    fn window_zoom_preserves_nested_layout_and_stable_ids() {
+        let mut manager = nested_window_manager();
+        manager.resize_window(Direction::Right, 3);
+        let before = manager.snapshot();
+        let ids = manager
+            .windows()
+            .iter()
+            .map(|window| window.id)
+            .collect::<Vec<_>>();
+        let target = manager.active_stable_window_id().unwrap();
+
+        manager.set_presentation(WindowPresentation::Zoomed(target));
+        manager.resize_with_origin(Point::new(0, 0), (120, 32));
+        assert_eq!(manager.active_window().unwrap().size, (120, 30));
+        assert_eq!(manager.window_at_position(0, 0).unwrap().1.id, target);
+        assert!(manager.divider_at_position(39, 4).is_none());
+        assert_eq!(manager.snapshot(), before);
+
+        manager.resize((100, 26));
+        assert_eq!(manager.active_window().unwrap().size, (100, 24));
+        manager.set_presentation(WindowPresentation::All);
+        manager.resize((100, 26));
+        assert!(manager.active_window().unwrap().size.0 < 100);
+        assert_eq!(manager.snapshot(), before);
+        assert_eq!(
+            manager
+                .windows()
+                .iter()
+                .map(|window| window.id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+
+        manager.set_presentation(WindowPresentation::Hidden);
+        assert!(manager.window_at_position(0, 0).is_none());
+        assert!(!manager.is_presented(target));
+    }
+
+    #[test]
     fn maximize_window_expands_active_window() {
         let mut manager = WindowManager::new(0, (80, 26));
         manager.split_vertical(0).unwrap();
@@ -1105,6 +1144,15 @@ impl Split {
     }
 }
 
+/// Which live windows participate in the current terminal presentation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum WindowPresentation {
+    #[default]
+    All,
+    Zoomed(WindowId),
+    Hidden,
+}
+
 /// Manages windows and their layout
 pub struct WindowManager {
     /// The root of the split tree
@@ -1112,6 +1160,7 @@ pub struct WindowManager {
 
     /// Currently active window ID (index in the windows list)
     active_window_id: usize,
+    presentation: WindowPresentation,
 }
 
 impl WindowManager {
@@ -1132,6 +1181,7 @@ impl WindowManager {
         Self {
             root,
             active_window_id: 0,
+            presentation: WindowPresentation::All,
         }
     }
 
@@ -1161,6 +1211,7 @@ impl WindowManager {
         let mut manager = Self {
             root,
             active_window_id: 0,
+            presentation: WindowPresentation::All,
         };
         let window_count = manager.root.windows().len();
         if window_count == 0 {
@@ -1295,6 +1346,22 @@ impl WindowManager {
         self.root.windows_mut()
     }
 
+    pub(crate) fn set_presentation(&mut self, presentation: WindowPresentation) {
+        self.presentation = presentation;
+    }
+
+    pub(crate) fn is_presented(&self, id: WindowId) -> bool {
+        match self.presentation {
+            WindowPresentation::All => true,
+            WindowPresentation::Zoomed(target) => target == id,
+            WindowPresentation::Hidden => false,
+        }
+    }
+
+    pub(crate) fn presents_dividers(&self) -> bool {
+        self.presentation == WindowPresentation::All
+    }
+
     /// Updates the layout when terminal is resized
     pub fn resize(&mut self, terminal_size: (usize, usize)) {
         self.resize_with_origin(Point::new(0, 0), terminal_size);
@@ -1302,10 +1369,17 @@ impl WindowManager {
 
     /// Recomputes layout under an explicit terminal origin.
     pub fn resize_with_origin(&mut self, position: Point, terminal_size: (usize, usize)) {
-        self.root.layout(
-            position,
-            (terminal_size.0, terminal_size.1.saturating_sub(2)),
-        );
+        let size = (terminal_size.0, terminal_size.1.saturating_sub(2));
+        self.root.layout(position, size);
+        if let WindowPresentation::Zoomed(id) = self.presentation {
+            if let Some(index) = self.window_index(id) {
+                if let Some(window) = Self::get_window_mut_recursive(&mut self.root, &mut 0, index)
+                {
+                    window.position = position;
+                    window.size = size;
+                }
+            }
+        }
     }
 
     /// Sets the active window by ID
@@ -1328,12 +1402,15 @@ impl WindowManager {
             .windows()
             .iter()
             .enumerate()
-            .find(|(_, w)| w.contains_position(x, y))
+            .find(|(_, w)| self.is_presented(w.id) && w.contains_position(x, y))
             .map(|(id, w)| (id, *w))
     }
 
     /// Finds the split divider actually painted at a terminal-cell position.
     pub(crate) fn divider_at_position(&self, x: usize, y: usize) -> Option<WindowDivider> {
+        if !self.presents_dividers() {
+            return None;
+        }
         let (origin, size) = self.layout_geometry()?;
         let mut path = Vec::new();
         Self::find_divider(&self.root, origin, size, x, y, &mut path)
@@ -1341,6 +1418,9 @@ impl WindowManager {
 
     /// Resolves a captured divider against the current split-tree geometry.
     pub(crate) fn divider_span(&self, divider: &WindowDivider) -> Option<DividerSpan> {
+        if !self.presents_dividers() {
+            return None;
+        }
         let (origin, size) = self.layout_geometry()?;
         Self::find_divider_span(&self.root, origin, size, &divider.path, divider.axis)
     }

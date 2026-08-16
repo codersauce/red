@@ -1659,8 +1659,44 @@ impl PanelSizes {
     }
 }
 
+/// Transient presentation; logical visibility and saved docking remain unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum PanelPresentation {
+    #[default]
+    Docked,
+    Hidden,
+    Zoomed {
+        id: String,
+        size: (usize, usize),
+    },
+}
+
+impl PanelPresentation {
+    fn zoom_size(&self) -> Option<(usize, usize)> {
+        match self {
+            Self::Zoomed { size, .. } => Some(*size),
+            _ => None,
+        }
+    }
+
+    fn width(&self, id: &str, config: &PanelConfig, terminal_width: usize) -> usize {
+        match self {
+            Self::Zoomed { id: target, size } if target == id => size.0,
+            _ => effective_panel_width(config, terminal_width),
+        }
+    }
+
+    fn height(&self, id: &str, config: &PanelConfig, available_height: usize) -> usize {
+        match self {
+            Self::Zoomed { id: target, size } if target == id => size.1,
+            _ => effective_panel_height(config, available_height),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct PanelManager {
+    presentation: PanelPresentation,
     panels: HashMap<String, PluginPanel>,
     text_panels: HashMap<String, TextPanel>,
     default_layouts: HashMap<String, (PanelSide, usize)>,
@@ -1673,6 +1709,51 @@ pub struct PanelManager {
 }
 
 impl PanelManager {
+    pub(crate) fn set_presentation(&mut self, presentation: PanelPresentation) {
+        if self.presentation == presentation {
+            return;
+        }
+        if let Some((terminal_width, content_height)) = presentation
+            .zoom_size()
+            .or_else(|| self.presentation.zoom_size())
+        {
+            for panel in self.text_panels.values_mut() {
+                let old_width = self
+                    .presentation
+                    .width(&panel.id, &panel.config, terminal_width);
+                let width = presentation.width(&panel.id, &panel.config, terminal_width);
+                let old_height = self
+                    .presentation
+                    .height(&panel.id, &panel.config, content_height);
+                let height = presentation.height(&panel.id, &panel.config, content_height);
+                if (old_width, old_height) == (width, height) {
+                    continue;
+                }
+                if panel.follow_tail {
+                    panel.scroll_to_bottom(height, width);
+                    continue;
+                }
+                // Reflow by source offset, not by a row number from the old width.
+                let old_layout = panel.layout(old_width);
+                let anchor = (panel.scroll..old_layout.lines.len())
+                    .find_map(|row| old_layout.offset_at(row, 0));
+                let layout = panel.layout(width);
+                panel.scroll = anchor
+                    .and_then(|offset| layout.position(offset))
+                    .map_or(0, |(row, _, _)| row);
+                panel.clamp_scroll(height, width);
+                if panel.scrollback.focused {
+                    panel.reveal_scrollback_cursor(&layout, height);
+                }
+            }
+        }
+        self.presentation = presentation;
+    }
+
+    pub(crate) fn is_visible(&self, id: &str) -> bool {
+        self.z_order.iter().any(|candidate| candidate == id) && self.panel_config(id).is_some()
+    }
+
     /// Captures durable, plugin-independent pane state by stable resource ID.
     pub fn snapshot(&self, terminal_width: usize) -> PanelManagerSnapshot {
         let panels = self
@@ -1707,7 +1788,9 @@ impl PanelManager {
                 }
 
                 let panel = self.text_panels.get(&id)?;
-                let width = effective_panel_width(&panel.config, terminal_width);
+                let width = self
+                    .presentation
+                    .width(&panel.id, &panel.config, terminal_width);
                 let layout = panel.layout(width);
                 let scroll_anchor = (!panel.follow_tail).then(|| {
                     (panel.scroll..layout.lines.len())
@@ -1870,8 +1953,12 @@ impl PanelManager {
                 let Some(panel) = self.text_panels.get_mut(id) else {
                     return false;
                 };
-                let width = effective_panel_width(&panel.config, terminal_width);
-                let panel_height = effective_panel_height(&panel.config, panel_height);
+                let width = self
+                    .presentation
+                    .width(&panel.id, &panel.config, terminal_width);
+                let panel_height = self
+                    .presentation
+                    .height(&panel.id, &panel.config, panel_height);
                 if let (Some(composer), Some(saved_composer)) =
                     (panel.composer.as_mut(), saved.composer)
                 {
@@ -1953,8 +2040,12 @@ impl PanelManager {
         terminal_width: usize,
     ) {
         if let Some(panel) = self.text_panels.get_mut(id) {
-            let width = effective_panel_width(&panel.config, terminal_width);
-            let panel_height = effective_panel_height(&panel.config, panel_height);
+            let width = self
+                .presentation
+                .width(&panel.id, &panel.config, terminal_width);
+            let panel_height = self
+                .presentation
+                .height(&panel.id, &panel.config, panel_height);
             panel.update_blocks(blocks, panel_height, width);
         }
     }
@@ -1968,8 +2059,12 @@ impl PanelManager {
         terminal_width: usize,
     ) {
         if let Some(panel) = self.text_panels.get_mut(id) {
-            let width = effective_panel_width(&panel.config, terminal_width);
-            let panel_height = effective_panel_height(&panel.config, panel_height);
+            let width = self
+                .presentation
+                .width(&panel.id, &panel.config, terminal_width);
+            let panel_height = self
+                .presentation
+                .height(&panel.id, &panel.config, panel_height);
             panel.append_delta(block_id, delta, panel_height, width);
         }
     }
@@ -2130,7 +2225,9 @@ impl PanelManager {
         {
             self.focused = Some(id.to_string());
             if let Some(panel) = self.text_panels.get_mut(id) {
-                let width = effective_panel_width(&panel.config, usize::MAX);
+                let width = self
+                    .presentation
+                    .width(&panel.id, &panel.config, usize::MAX);
                 panel.focus_scrollback(width);
             }
             true
@@ -2148,7 +2245,9 @@ impl PanelManager {
 
         self.focused = Some(id.to_string());
         if let Some(panel) = self.text_panels.get_mut(id) {
-            let width = effective_panel_width(&panel.config, usize::MAX);
+            let width = self
+                .presentation
+                .width(&panel.id, &panel.config, usize::MAX);
             panel.restore_focused_region(width);
         }
         true
@@ -2286,8 +2385,12 @@ impl PanelManager {
     ) -> Option<PanelEvent> {
         let focused = self.focused.clone()?;
         if let Some(panel) = self.text_panels.get_mut(&focused) {
-            let width = effective_panel_width(&panel.config, terminal_width);
-            let panel_height = effective_panel_height(&panel.config, panel_height);
+            let width = self
+                .presentation
+                .width(&panel.id, &panel.config, terminal_width);
+            let panel_height = self
+                .presentation
+                .height(&panel.id, &panel.config, panel_height);
             match action {
                 "up" => panel.move_scroll(-1, panel_height, width),
                 "down" => panel.move_scroll(1, panel_height, width),
@@ -2318,6 +2421,9 @@ impl PanelManager {
             });
         }
         let panel = self.panels.get_mut(&focused)?;
+        let panel_height = self
+            .presentation
+            .height(&panel.id, &panel.config, panel_height);
 
         match action {
             "up" => panel.move_selection(-1, panel_height),
@@ -2353,8 +2459,12 @@ impl PanelManager {
         let Event::Key(key) = event else {
             return None;
         };
-        let width = effective_panel_width(&panel.config, terminal_width);
-        let panel_height = effective_panel_height(&panel.config, panel_height);
+        let width = self
+            .presentation
+            .width(&panel.id, &panel.config, terminal_width);
+        let panel_height = self
+            .presentation
+            .height(&panel.id, &panel.config, panel_height);
 
         if let Some(pending) = panel.scrollback.pending_find.take() {
             if key.code == KeyCode::Esc {
@@ -2511,8 +2621,12 @@ impl PanelManager {
     ) -> Option<PanelEvent> {
         let action = if delta < 0 { "up" } else { "down" };
         if let Some(panel) = self.text_panels.get_mut(id) {
-            let width = effective_panel_width(&panel.config, terminal_width);
-            let panel_height = effective_panel_height(&panel.config, panel_height);
+            let width = self
+                .presentation
+                .width(&panel.id, &panel.config, terminal_width);
+            let panel_height = self
+                .presentation
+                .height(&panel.id, &panel.config, panel_height);
             panel.move_scroll(delta, panel_height, width);
             if panel.scrollback.focused {
                 let layout = panel.layout(width);
@@ -2562,8 +2676,12 @@ impl PanelManager {
         let Some(panel) = self.text_panels.get_mut(&focused) else {
             return false;
         };
-        let width = effective_panel_width(&panel.config, terminal_width);
-        let panel_height = effective_panel_height(&panel.config, panel_height);
+        let width = self
+            .presentation
+            .width(&panel.id, &panel.config, terminal_width);
+        let panel_height = self
+            .presentation
+            .height(&panel.id, &panel.config, panel_height);
         if let Some(composer) = panel.composer.as_mut() {
             composer.focused = false;
         }
@@ -2577,7 +2695,9 @@ impl PanelManager {
         let Some(panel) = self.text_panels.get_mut(&focused) else {
             return false;
         };
-        let width = effective_panel_width(&panel.config, terminal_width);
+        let width = self
+            .presentation
+            .width(&panel.id, &panel.config, terminal_width);
         panel.focus_scrollback(width);
         true
     }
@@ -2587,7 +2707,9 @@ impl PanelManager {
         terminal_width: usize,
     ) -> Option<TextPanelLinkTarget> {
         let panel = self.text_panels.get(self.focused.as_deref()?)?;
-        let width = effective_panel_width(&panel.config, terminal_width);
+        let width = self
+            .presentation
+            .width(&panel.id, &panel.config, terminal_width);
         if panel.scrollback.focused {
             panel.layout(width).link_at(panel.scrollback.cursor)
         } else {
@@ -2750,7 +2872,9 @@ impl PanelManager {
     ) -> Option<PanelEvent> {
         let focused = self.focused.clone()?;
         let panel = self.text_panels.get_mut(&focused)?;
-        let panel_width = effective_panel_width(&panel.config, terminal_width);
+        let panel_width = self
+            .presentation
+            .width(&panel.id, &panel.config, terminal_width);
         let composer = panel.composer.as_mut()?;
         if !composer.focused || !composer.enabled {
             return None;
@@ -3119,6 +3243,9 @@ impl PanelManager {
         terminal_width: usize,
         terminal_height: usize,
     ) -> Option<PanelDivider> {
+        if self.presentation != PanelPresentation::Docked {
+            return None;
+        }
         if x >= terminal_width || y >= terminal_height.saturating_sub(2) {
             return None;
         }
@@ -3162,6 +3289,23 @@ impl PanelManager {
         terminal_width: usize,
         terminal_height: usize,
     ) -> Vec<PanelPlacement> {
+        match &self.presentation {
+            PanelPresentation::Hidden => return Vec::new(),
+            PanelPresentation::Zoomed { id, .. } => {
+                return self
+                    .is_visible(id)
+                    .then(|| PanelPlacement {
+                        id: id.clone(),
+                        x: 0,
+                        y: 0,
+                        width: terminal_width,
+                        height: terminal_height.saturating_sub(2),
+                    })
+                    .into_iter()
+                    .collect();
+            }
+            PanelPresentation::Docked => {}
+        }
         let mut placements = Vec::new();
         let mut left_x: usize = 0;
         let mut right_x = terminal_width;
@@ -3274,15 +3418,17 @@ impl PanelManager {
             } else {
                 " "
             };
-            render_panel_separator(
-                buffer,
-                position,
-                placement.width,
-                placement.height,
-                config.side,
-                &border_style,
-                separator,
-            );
+            if self.presentation == PanelPresentation::Docked {
+                render_panel_separator(
+                    buffer,
+                    position,
+                    placement.width,
+                    placement.height,
+                    config.side,
+                    &border_style,
+                    separator,
+                );
+            }
 
             if let Some(panel) = self.panels.get(&placement.id) {
                 render_panel_at(
@@ -4372,6 +4518,114 @@ mod tests {
         let position = text_position(buffer, needle)
             .unwrap_or_else(|| panic!("missing rendered text {needle:?}"));
         &buffer.cells[position.y * buffer.width + position.x].style
+    }
+
+    #[test]
+    fn pane_zoom_reflows_scrollback_without_losing_its_source_cursor() {
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "text".to_string(),
+            PanelConfig {
+                width: 18,
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_text_panel(
+            "text",
+            vec![TextPanelBlock {
+                id: "answer".to_string(),
+                kind: TextPanelBlockKind::Text,
+                format: TextPanelBlockFormat::Plain,
+                text: "word ".repeat(180),
+            }],
+            22,
+            100,
+        );
+        assert!(manager.focus_panel("text"));
+        let panel = manager.text_panels.get_mut("text").unwrap();
+        let cursor = panel.layout(18).offset_at(15, 0).unwrap();
+        panel.scrollback.cursor = cursor;
+        panel.scrollback.selection_anchor = Some(cursor.saturating_sub(2));
+        panel.scrollback.mode = TextPanelScrollbackMode::Visual;
+        panel.scroll = 12;
+        panel.follow_tail = false;
+        panel.viewport.restore(12, false);
+
+        manager.set_presentation(PanelPresentation::Zoomed {
+            id: "text".to_string(),
+            size: (100, 22),
+        });
+        assert!(manager
+            .focused_text_panel_cursor_position(100, 24)
+            .is_some());
+        manager.append_text_panel("text", "answer", "more words", 22, 100);
+        manager.set_presentation(PanelPresentation::Docked);
+        let panel = &manager.text_panels["text"];
+        assert_eq!(panel.scrollback.cursor, cursor);
+        assert_eq!(
+            panel.scrollback.selection_anchor,
+            Some(cursor.saturating_sub(2))
+        );
+        assert!(!panel.follow_tail);
+        assert!(manager
+            .focused_text_panel_cursor_position(100, 24)
+            .is_some());
+    }
+
+    #[test]
+    fn pane_zoom_preserves_docking_and_uses_one_fullscreen_placement() {
+        for side in [
+            PanelSide::Left,
+            PanelSide::Right,
+            PanelSide::Top,
+            PanelSide::Bottom,
+        ] {
+            for text in [false, true] {
+                let mut manager = PanelManager::default();
+                manager.create_panel("other".to_string(), PanelConfig::default());
+                let config = PanelConfig {
+                    side,
+                    width: 12,
+                    ..PanelConfig::default()
+                };
+                if text {
+                    manager.create_text_panel("target".to_string(), config);
+                } else {
+                    manager.create_panel("target".to_string(), config);
+                }
+                assert!(manager.focus_panel("target"));
+                let before = manager.snapshot(80);
+                let placements = manager.panel_placements(80, 24);
+                manager.set_presentation(PanelPresentation::Zoomed {
+                    id: "target".to_string(),
+                    size: (80, 22),
+                });
+                assert_eq!(
+                    manager.panel_placements(80, 24),
+                    vec![PanelPlacement {
+                        id: "target".to_string(),
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 22,
+                    }]
+                );
+                assert_eq!(
+                    manager.panel_at_position(79, 21, 80, 24).unwrap().id,
+                    "target"
+                );
+                assert!(manager.panel_divider_at_position(12, 4, 80, 24).is_none());
+                let config = manager.panel_config("target").unwrap();
+                assert_eq!(manager.presentation.width("target", config, 80), 80);
+                assert_eq!(manager.presentation.height("target", config, 22), 22);
+                assert_eq!(manager.snapshot(80), before);
+                manager.set_presentation(PanelPresentation::Hidden);
+                assert!(manager.panel_at_position(0, 0, 80, 24).is_none());
+                manager.set_presentation(PanelPresentation::Docked);
+                assert_eq!(manager.panel_placements(80, 24), placements);
+                assert_eq!(manager.snapshot(80), before);
+            }
+        }
     }
 
     #[test]

@@ -129,7 +129,10 @@ use crate::{
     undo::{AppliedTextEdit, CursorSnapshot, EditOrigin, RevertEdit, TextPosition, TextRange},
     utils::{expand_user_path, get_workspace_path, normalized_file_path, same_file_path},
     whats_new::ReleaseNotes,
-    window::{JumpEntry, JumpList, WindowDivider, WindowId, WindowManager, WindowManagerSnapshot},
+    window::{
+        JumpEntry, JumpList, WindowDivider, WindowId, WindowManager, WindowManagerSnapshot,
+        WindowPresentation,
+    },
 };
 
 use self::display_layout::{
@@ -2517,6 +2520,7 @@ pub enum Action {
     BalanceWindows,
     ResetPanelLayout(Option<String>),
     MaximizeWindow,
+    TogglePaneZoom,
     OnlyWindow,
 }
 
@@ -3015,6 +3019,9 @@ pub struct Editor {
 
     /// Captured dividers moved by directional keys while pane resize mode is active.
     pane_resize_mode: Option<PaneResizeMode>,
+
+    /// Temporary presentation of one live window or docked pane.
+    zoomed_pane: Option<FocusTarget>,
 
     /// Cursor position where the current insert session began.
     insert_entry_cursor: Option<CursorSnapshot>,
@@ -4292,6 +4299,7 @@ impl Editor {
             vx,
             mode: Mode::Normal,
             pane_resize_mode: None,
+            zoomed_pane: None,
             insert_entry_cursor: None,
             generated_indent: None,
             waiting_command: None,
@@ -4589,6 +4597,7 @@ impl Editor {
             return false;
         }
 
+        self.clear_pane_zoom();
         self.sync_to_window();
         self.window_manager.set_active(window_id);
         self.sync_with_window();
@@ -4658,6 +4667,13 @@ impl Editor {
     }
 
     fn focus_target(&mut self, target: &FocusTarget) -> bool {
+        if self
+            .zoomed_pane
+            .as_ref()
+            .is_some_and(|zoomed| zoomed != target)
+        {
+            self.clear_pane_zoom();
+        }
         match target {
             FocusTarget::Panel(id) => {
                 if self.panel_manager.focused_panel_id() == Some(id.as_str()) {
@@ -5150,6 +5166,7 @@ impl Editor {
         &mut self,
         update: impl FnOnce(&mut WindowManager) -> Option<()>,
     ) -> bool {
+        self.clear_pane_zoom();
         self.sync_to_window();
         if update(&mut self.window_manager).is_some() {
             self.sync_with_window();
@@ -5159,8 +5176,78 @@ impl Editor {
         }
     }
 
+    fn clear_pane_zoom(&mut self) -> bool {
+        if self.zoomed_pane.take().is_none() {
+            return false;
+        }
+        self.divider_drag = None;
+        self.pane_resize_mode = None;
+        self.apply_panel_layout();
+        self.force_full_redraw = true;
+        true
+    }
+
+    fn toggle_pane_zoom(&mut self) {
+        if self.clear_pane_zoom() {
+            return;
+        }
+        let Some(target) = self.current_focus_target() else {
+            return;
+        };
+        if matches!(target, FocusTarget::Window(_)) && self.focus_ring().len() <= 1 {
+            return;
+        }
+        self.zoomed_pane = Some(target);
+        self.divider_drag = None;
+        self.pane_resize_mode = None;
+        self.apply_panel_layout();
+        self.force_full_redraw = true;
+    }
+
+    fn clear_replaced_panel_zoom(&mut self, id: &str) {
+        if matches!(&self.zoomed_pane, Some(FocusTarget::Panel(target)) if target == id) {
+            self.clear_pane_zoom();
+        }
+    }
+
+    fn configure_pane_presentation(&mut self, terminal_size: (usize, usize)) {
+        let valid = self.zoomed_pane.as_ref().is_none_or(|target| {
+            self.current_focus_target().as_ref() == Some(target)
+                && match target {
+                    FocusTarget::Window(id) => self.window_manager.window(*id).is_some(),
+                    FocusTarget::Panel(id) => self.panel_manager.is_visible(id),
+                }
+        });
+        if !valid {
+            self.zoomed_pane = None;
+            self.divider_drag = None;
+            self.pane_resize_mode = None;
+            self.force_full_redraw = true;
+        }
+        let (windows, panels) = match &self.zoomed_pane {
+            Some(FocusTarget::Window(id)) => (
+                WindowPresentation::Zoomed(*id),
+                plugin::panel::PanelPresentation::Hidden,
+            ),
+            Some(FocusTarget::Panel(id)) => (
+                WindowPresentation::Hidden,
+                plugin::panel::PanelPresentation::Zoomed {
+                    id: id.clone(),
+                    size: (terminal_size.0, terminal_size.1.saturating_sub(2)),
+                },
+            ),
+            None => (
+                WindowPresentation::All,
+                plugin::panel::PanelPresentation::Docked,
+            ),
+        };
+        self.window_manager.set_presentation(windows);
+        self.panel_manager.set_presentation(panels);
+    }
+
     fn resize_window_layout(&mut self, terminal_size: (usize, usize)) {
         self.sync_to_window();
+        self.configure_pane_presentation(terminal_size);
         let (reserved_left, reserved_right) = self.reserved_panel_widths(terminal_size.0);
         let (reserved_top, reserved_bottom) = self.reserved_panel_heights(terminal_size.1);
         self.window_manager.resize_with_origin(
@@ -5209,23 +5296,13 @@ impl Editor {
     }
 
     fn apply_panel_layout(&mut self) {
-        self.sync_to_window();
-        let (reserved_left, reserved_right) = self.reserved_panel_widths(self.size.0 as usize);
-        let (reserved_top, reserved_bottom) = self.reserved_panel_heights(self.size.1 as usize);
-        self.window_manager.resize_with_origin(
-            Point::new(reserved_left, reserved_top),
-            (
-                (self.size.0 as usize)
-                    .saturating_sub(reserved_left)
-                    .saturating_sub(reserved_right),
-                (self.size.1 as usize)
-                    .saturating_sub(reserved_top)
-                    .saturating_sub(reserved_bottom),
-            ),
-        );
+        self.resize_window_layout((usize::from(self.size.0), usize::from(self.size.1)));
     }
 
     fn reserved_panel_widths(&self, terminal_width: usize) -> (usize, usize) {
+        if matches!(self.zoomed_pane, Some(FocusTarget::Window(_))) {
+            return (0, 0);
+        }
         let max_reserved = terminal_width.saturating_sub(MIN_EDITOR_WINDOW_WIDTH);
         let reserved_left = self.panel_manager.reserved_left_width().min(max_reserved);
         let reserved_right = self
@@ -5236,6 +5313,9 @@ impl Editor {
     }
 
     fn reserved_panel_heights(&self, terminal_height: usize) -> (usize, usize) {
+        if matches!(self.zoomed_pane, Some(FocusTarget::Window(_))) {
+            return (0, 0);
+        }
         let max_reserved = terminal_height.saturating_sub(MIN_EDITOR_WINDOW_HEIGHT);
         let reserved_top = self.panel_manager.reserved_top_height().min(max_reserved);
         let reserved_bottom = self
@@ -9766,6 +9846,7 @@ impl Editor {
                     }
                 }
                 PluginRequest::CreatePanel { id, config } => {
+                    self.clear_replaced_panel_zoom(&id);
                     self.panel_manager.create_panel(id.clone(), config);
                     self.restore_panel_layout(&id);
                     self.panel_manager.apply_pending_shell_restore(&id);
@@ -9782,6 +9863,7 @@ impl Editor {
                     needs_render = true;
                 }
                 PluginRequest::CreateTextPanel { id, config } => {
+                    self.clear_replaced_panel_zoom(&id);
                     self.panel_manager.create_text_panel(id.clone(), config);
                     self.restore_panel_layout(&id);
                     self.panel_manager.apply_pending_shell_restore(&id);
@@ -9876,6 +9958,7 @@ impl Editor {
                     needs_render = true;
                 }
                 PluginRequest::OpenWorkspace { id, config } => {
+                    self.clear_pane_zoom();
                     self.workspace_manager.open(id, config);
                     needs_render = true;
                 }
@@ -13088,6 +13171,7 @@ impl Editor {
             | Action::BalanceWindows
             | Action::ResetPanelLayout(_)
             | Action::MaximizeWindow
+            | Action::TogglePaneZoom
             | Action::OnlyWindow => true,
             Action::PluginCommand(command) => runtime.is_some_and(|runtime| {
                 runtime.command_scope(command).map_or_else(
@@ -16209,6 +16293,37 @@ impl Editor {
         }
 
         let mut add_to_history = tracking;
+        if matches!(
+            action,
+            Action::SplitHorizontal
+                | Action::SplitVertical
+                | Action::SplitHorizontalWithFile(_)
+                | Action::SplitVerticalWithFile(_)
+                | Action::CloseWindow
+                | Action::NextWindow
+                | Action::PreviousWindow
+                | Action::MoveWindowUp
+                | Action::MoveWindowDown
+                | Action::MoveWindowLeft
+                | Action::MoveWindowRight
+                | Action::MoveWindowToLeft
+                | Action::MoveWindowToBottom
+                | Action::MoveWindowToTop
+                | Action::MoveWindowToRight
+                | Action::EnterPaneResizeMode
+                | Action::ResizeWindowUp(_)
+                | Action::ResizeWindowDown(_)
+                | Action::ResizeWindowLeft(_)
+                | Action::ResizeWindowRight(_)
+                | Action::BalanceWindows
+                | Action::ResetPanelLayout(_)
+                | Action::MaximizeWindow
+                | Action::OnlyWindow
+        ) && self.clear_pane_zoom()
+        {
+            self.invalidate_terminal_render_state(buffer);
+            self.render(buffer)?;
+        }
         let action_buffer_id = self.current_buffer().id();
         let action_buffer_revision = self.current_buffer().revision();
         self.lsp_coordinator
@@ -19951,6 +20066,16 @@ impl Editor {
                     self.render(buffer)?;
                 }
             }
+            Action::TogglePaneZoom => {
+                add_to_history = false;
+                if self.workspace_manager.is_active() {
+                    self.workspace_manager.toggle_zoom();
+                } else {
+                    self.toggle_pane_zoom();
+                }
+                self.invalidate_terminal_render_state(buffer);
+                self.render(buffer)?;
+            }
             Action::OnlyWindow => {
                 let panel_ids = self.panel_manager.hide_all_panels();
                 for panel_id in &panel_ids {
@@ -23064,6 +23189,7 @@ impl Editor {
             self.buffer_manager.len() == snapshot.buffers.len(),
             "session buffer count does not match the reconstructed editor"
         );
+        self.clear_pane_zoom();
         let duplicate_file_count = snapshot_duplicate_file_count(snapshot);
         let divergences = detect_disk_divergence(snapshot);
         let buffer_map = snapshot
@@ -23730,6 +23856,7 @@ impl Editor {
             });
         }
 
+        self.clear_pane_zoom();
         let has_panel_restore = !snapshot.panels.panels.is_empty();
         self.panel_manager.stage_restore(snapshot.panels.clone());
         self.panel_manager.apply_pending_to_existing(
@@ -26855,6 +26982,7 @@ impl Editor {
 
     #[doc(hidden)]
     pub fn test_create_panel(&mut self, id: &str, config: plugin::PanelConfig) {
+        self.clear_replaced_panel_zoom(id);
         self.panel_manager.create_panel(id.to_string(), config);
         self.restore_panel_layout(id);
         self.apply_panel_layout();
@@ -26863,6 +26991,7 @@ impl Editor {
 
     #[doc(hidden)]
     pub fn test_create_text_panel(&mut self, id: &str, config: plugin::PanelConfig) {
+        self.clear_replaced_panel_zoom(id);
         self.panel_manager.create_text_panel(id.to_string(), config);
         self.restore_panel_layout(id);
         self.apply_panel_layout();
