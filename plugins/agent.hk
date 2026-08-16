@@ -394,10 +394,13 @@ fn toggle_conversation() {
 )]
 fn open_conversation() {
     let was_created = state().panel_created;
-    ensure_conversation_panel();
     if !was_created {
+        ensure_conversation_panel();
         render_conversation();
     }
+    // An explicit open wins over a recovered hidden-pane preference.
+    red::execute("SetPanelVisible", "agent-conversation", true);
+    red::state_patch(AgentState { panel_open: true });
     red::execute("FocusTextPanelComposer", "agent-conversation");
 }
 

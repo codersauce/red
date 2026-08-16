@@ -16468,6 +16468,7 @@ impl Editor {
                     | Action::CopilotRespond { .. }
             )
             || matches!(action, Action::SubmitInlineAssist(_))
+            || matches!(action, Action::StageInlineAssistHandoff { .. })
             || matches!(action, Action::NotifyPlugins(method, _) if method.starts_with("composer:"));
         if !sensitive_action {
             self.actions.push(action.clone());
@@ -17217,17 +17218,31 @@ impl Editor {
                 let Some(assist) = self.inline_assist.as_ref() else {
                     return Ok(false);
                 };
-                let range = assist.range;
                 let Some(prompt) = self.inline_handoff_prompt(&assist.annotation_group_id) else {
                     self.last_error = Some("inline discussion is no longer available".into());
                     return Ok(false);
                 };
-                let current_target = self.current_buffer().id() == assist.buffer_id
-                    && self.current_buffer().revision() == assist.expected_revision;
+                self.plugin_registry
+                    .ensure_command_registered(runtime, "AgentOpen")
+                    .await;
+                if runtime.command_plugin("AgentOpen").is_none() {
+                    self.last_error = Some(
+                        "Agent is unavailable; the inline discussion remains in history".into(),
+                    );
+                    self.render(buffer)?;
+                    return Ok(false);
+                }
                 self.close_inline_assist_session();
-                if current_target {
-                    self.mode = Mode::Visual;
-                    self.select_text_range(range);
+                // The handoff carries its own location and source context. Do not
+                // leave an artificial visual selection behind in the editor.
+                if !self.is_normal() {
+                    self.execute_with_tracking(
+                        &Action::EnterMode(Mode::Normal),
+                        buffer,
+                        runtime,
+                        false,
+                    )
+                    .await?;
                 }
                 self.plugin_registry.execute(runtime, "AgentOpen").await?;
                 // AgentOpen queues pane creation/restoration first. Stage the draft
@@ -17242,6 +17257,16 @@ impl Editor {
                 expected_draft,
             } => {
                 add_to_history = false;
+                // Session restoration can hide a newly recreated pane, and an
+                // editor zoom can obscure an otherwise visible one. An explicit
+                // handoff must reveal the actual pane before loading its draft.
+                if self
+                    .panel_manager
+                    .set_panel_visible("agent-conversation", true)
+                {
+                    self.clear_pane_zoom();
+                    self.apply_panel_layout();
+                }
                 match self.panel_manager.load_text_panel_draft(
                     "agent-conversation",
                     prompt,

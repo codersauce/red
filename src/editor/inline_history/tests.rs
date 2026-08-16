@@ -101,6 +101,180 @@ fn line_range(start: usize, end: usize) -> TextRange {
     TextRange::new(TextPosition::new(start, 0), TextPosition::new(end, 0))
 }
 
+fn agent_draft(editor: &Editor) -> String {
+    editor
+        .panel_manager
+        .snapshot(100)
+        .panels
+        .into_iter()
+        .find(|panel| panel.id == "agent-conversation")
+        .and_then(|panel| panel.text)
+        .and_then(|text| text.composer)
+        .map(|composer| composer.text)
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn inline_handoff_reopens_a_restored_hidden_agent_pane_without_losing_its_draft() {
+    let mut editor = editor("alpha\nbeta\n");
+    editor.panel_manager.create_text_panel(
+        "agent-conversation".into(),
+        plugin::PanelConfig {
+            composer: Some(plugin::TextPanelComposerConfig {
+                placeholder: "Ask".into(),
+                rows: 3,
+            }),
+            ..plugin::PanelConfig::default()
+        },
+    );
+    editor
+        .panel_manager
+        .load_text_panel_draft("agent-conversation", "unsent Agent draft", None)
+        .unwrap();
+    editor
+        .panel_manager
+        .set_panel_visible("agent-conversation", false);
+    let saved = editor.panel_manager.snapshot(100);
+    editor.panel_manager = plugin::panel::PanelManager::default();
+    editor.panel_manager.stage_restore(saved);
+
+    let mut runtime = Runtime::new();
+    runtime
+        .load_plugin("agent", include_str!("../../../plugins/agent.hk"))
+        .await
+        .unwrap();
+    let mut frame = RenderBuffer::new(100, 30, &Style::default());
+    begin(
+        &mut editor,
+        "discussion",
+        "request",
+        line_range(0, 1),
+        "Compare with the last commit",
+    );
+    let result =
+        InlineAssistResult::from_tool("request_agent", json!({"reason": "Read the Git diff."}))
+            .unwrap();
+    editor
+        .apply_inline_result("request", "provider", &result, &mut frame, &mut runtime)
+        .await
+        .unwrap();
+    let handoff = editor.inline_handoff_prompt("discussion").unwrap();
+    editor
+        .execute(&Action::EscalateInlineAssist, &mut frame, &mut runtime)
+        .await
+        .unwrap();
+    editor
+        .service_background(&mut frame, &mut runtime)
+        .await
+        .unwrap();
+
+    assert!(
+        editor.panel_manager.is_visible("agent-conversation"),
+        "{:?}",
+        editor.last_error
+    );
+    assert_eq!(editor.mode, Mode::Normal);
+    assert!(editor.selection.is_none());
+    assert_eq!(agent_draft(&editor), "unsent Agent draft");
+    let Some(KeyAction::Multiple(confirm)) = editor.current_dialog.as_mut().and_then(|dialog| {
+        dialog.handle_event(&Event::Key(KeyEvent::new(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+        )))
+    }) else {
+        panic!("expected draft replacement confirmation");
+    };
+    for action in confirm {
+        editor
+            .execute(&action, &mut frame, &mut runtime)
+            .await
+            .unwrap();
+    }
+    assert_eq!(agent_draft(&editor), handoff);
+    assert_eq!(
+        editor.panel_manager.focused_panel_id(),
+        Some("agent-conversation")
+    );
+    assert_eq!(editor.current_buffer().contents(), "alpha\nbeta\n");
+    assert!(
+        runtime.try_recv_request().is_none(),
+        "handoff must not send a prompt"
+    );
+}
+
+#[tokio::test]
+async fn inline_handoff_reveals_an_existing_hidden_pane_and_clears_editor_zoom() {
+    let mut editor = editor("alpha\n");
+    editor.panel_manager.create_text_panel(
+        "agent-conversation".into(),
+        plugin::PanelConfig {
+            composer: Some(plugin::TextPanelComposerConfig {
+                placeholder: "Ask".into(),
+                rows: 3,
+            }),
+            ..plugin::PanelConfig::default()
+        },
+    );
+    editor
+        .panel_manager
+        .set_panel_visible("agent-conversation", false);
+    editor.zoomed_pane = Some(FocusTarget::Window(
+        editor.window_manager.active_stable_window_id().unwrap(),
+    ));
+    editor
+        .execute(
+            &Action::StageInlineAssistHandoff {
+                prompt: "reviewable handoff".into(),
+                expected_draft: None,
+            },
+            &mut RenderBuffer::new(100, 30, &Style::default()),
+            &mut Runtime::new(),
+        )
+        .await
+        .unwrap();
+    assert!(editor.panel_manager.is_visible("agent-conversation"));
+    assert!(editor.zoomed_pane.is_none());
+    assert_eq!(agent_draft(&editor), "reviewable handoff");
+    assert_eq!(
+        editor.panel_manager.focused_panel_id(),
+        Some("agent-conversation")
+    );
+}
+
+#[tokio::test]
+async fn inline_handoff_keeps_the_discussion_when_agent_is_unavailable() {
+    let mut editor = editor("alpha\n");
+    begin(
+        &mut editor,
+        "discussion",
+        "request",
+        line_range(0, 1),
+        "Do this in Agent",
+    );
+    editor.current_dialog = Some(Box::new(editor.inline_assist_popup(
+        "test",
+        InlineAssistPopupState::NeedsAgent("Read another file".into()),
+    )));
+    editor
+        .execute(
+            &Action::EscalateInlineAssist,
+            &mut RenderBuffer::new(100, 30, &Style::default()),
+            &mut Runtime::new(),
+        )
+        .await
+        .unwrap();
+    assert!(editor
+        .last_error
+        .as_deref()
+        .unwrap()
+        .contains("Agent is unavailable"));
+    assert!(editor.inline_assist.is_some());
+    assert!(editor.current_dialog.is_some());
+    assert_eq!(editor.mode, Mode::Normal);
+    assert!(editor.selection.is_none());
+    assert_eq!(editor.current_buffer().contents(), "alpha\n");
+}
+
 #[test]
 fn inline_prompt_history_is_workspace_scoped_recent_deduplicated_and_recoverable() {
     let mut editor = editor("alpha\n");

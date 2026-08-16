@@ -113,6 +113,11 @@ In an inline prompt, Up/Down or Ctrl-P/Ctrl-N recall submitted prompts from this
 workspace. Moving forward past the newest entry restores the unsent draft.
 Prompt recall uses retained inline history and survives normal session recovery.
 
+“Continue in Agent” explicitly reveals the conversation pane, leaves the editor
+in normal mode, and loads a reviewable draft. A saved hidden pane or editor zoom
+does not block it. Replacing an unsent Agent draft still requires confirmation;
+nothing is submitted automatically.
+
 Within history, `v` cycles through the conversation, reviewed source, before-edit
 source, and a reviewed/current comparison. `Ctrl-d`/`Ctrl-u` or Page Down/Up
 scroll the detail. `r` continues the selected discussion, while `R` prepares a
