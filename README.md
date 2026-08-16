@@ -107,6 +107,7 @@ is fine: the embedded defaults, plugins, and themes are enough to start editing.
 | Key | Action |
 | --- | --- |
 | `Space ?` | Discover commands and their effective keymaps |
+| `Space m` | Browse notifications and recent messages |
 | `Ctrl-p` | Find a file with fuzzy search and live preview |
 | `Space G` | Open the Git status workspace |
 | `Space A` | Ask the agent with editor context |

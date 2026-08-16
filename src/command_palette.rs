@@ -44,6 +44,7 @@ pub(crate) const BUILTIN_COLON_COMMANDS: &[&str] = &[
     "plugins",
     "statusline",
     "config-diagnostics",
+    "messages",
 ];
 
 const SPECIAL_BUILTIN_COLON_COMMANDS: &[&str] = &[
@@ -382,6 +383,15 @@ pub(crate) fn keymap_hints(
 
 fn builtin_commands() -> Vec<BuiltinCommand> {
     vec![
+        builtin(
+            "editor.messages",
+            "Messages",
+            "Editor",
+            "Browse active notifications and recent message history",
+            Some(":messages"),
+            &["notifications", "message history", "errors"],
+            Action::OpenMessages,
+        ),
         builtin(
             "editor.inline_history",
             "Inline assist history",
@@ -1201,6 +1211,7 @@ fn key_action_label(action: &KeyAction) -> Option<String> {
 fn action_label(action: &Action) -> String {
     match action {
         Action::CommandPalette => "All commands".to_string(),
+        Action::OpenMessages => "Messages".to_string(),
         Action::OpenInlineHistory => "Inline assist history".to_string(),
         Action::ConfigDiagnostics => "Configuration diagnostics".to_string(),
         Action::OpenWhatsNew => "What’s new in Red".to_string(),

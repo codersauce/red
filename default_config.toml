@@ -380,6 +380,7 @@ Esc = { EnterMode = "Normal" }
 "o" = "OnlyWindow"
 
 [keys.normal." "]
+"m" = "OpenMessages"
 "H" = "OpenInlineHistory"
 "C" = "AddSampleInlineComment"
 "X" = "ClearInlineComments"

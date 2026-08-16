@@ -405,3 +405,23 @@ fn progress_percentage_is_clamped() {
         }
     );
 }
+
+#[test]
+fn notification_text_is_safe_to_paint_without_losing_copyable_details() {
+    let now = NotificationTime::now();
+    let mut center = NotificationCenter::default();
+    let original = "line\n\u{1b}[31m\ttext";
+    let id = center
+        .publish(
+            notice(Severity::Error, original).with_details(original),
+            now,
+        )
+        .unwrap();
+    let content = &center.get(id).unwrap().content;
+    assert!(!content.summary.chars().any(char::is_control));
+    assert_eq!(content.details.as_deref(), Some(original));
+    let painted = detail_text(original);
+    assert!(!painted.contains('\u{1b}'));
+    assert!(!painted.contains('\t'));
+    assert!(painted.contains('\n'));
+}

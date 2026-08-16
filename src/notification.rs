@@ -6,6 +6,7 @@
 
 use std::{
     collections::VecDeque,
+    fmt,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -16,8 +17,36 @@ const MAX_DETAILS_BYTES: usize = 64 * 1_024;
 const MAX_KEY_BYTES: usize = 1_024;
 
 /// Identity of one history entry. IDs are never reused by a center.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
 pub struct NotificationId(u64);
+
+impl fmt::Display for NotificationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Commands returned by the message-history surface.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum MessageAction {
+    Close,
+    Next,
+    Previous,
+    Search,
+    Query(String),
+    Backspace,
+    EndSearch,
+    ClearSearch,
+    CycleFilter,
+    Acknowledge,
+    ClearInactive,
+    Copy,
+    ScrollDown,
+    ScrollUp,
+}
 
 /// Producer-local identity. Numeric LSP tokens never alias text tokens such as "1".
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -70,6 +99,15 @@ pub enum NotificationSource {
     },
 }
 
+impl NotificationSource {
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Editor => "Red",
+            Self::Plugin { name, .. } | Self::LanguageServer { name, .. } => name,
+        }
+    }
+}
+
 /// Semantic importance, independent of whether an operation is still running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -77,6 +115,26 @@ pub enum Severity {
     Success,
     Warning,
     Error,
+}
+
+impl Severity {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Success => "success",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+
+    pub fn marker(self) -> &'static str {
+        match self {
+            Self::Info => "i",
+            Self::Success => "✓",
+            Self::Warning => "!",
+            Self::Error => "×",
+        }
+    }
 }
 
 /// A monotonic reading for lifetimes paired with a wall-clock history timestamp.
@@ -118,13 +176,33 @@ impl MessageContent {
     }
 
     fn bounded(mut self) -> Self {
-        self.summary = self.summary.replace(['\r', '\n'], " ");
+        self.summary = single_line(&self.summary);
         self.truncated |= truncate_text(&mut self.summary, MAX_SUMMARY_BYTES);
         if let Some(details) = &mut self.details {
             self.truncated |= truncate_text(details, MAX_DETAILS_BYTES);
         }
         self
     }
+}
+
+/// Terminal-safe summary text; original multiline details remain available for copy.
+pub(crate) fn single_line(text: &str) -> String {
+    text.chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect()
+}
+
+pub(crate) fn detail_text(text: &str) -> String {
+    text.replace('\t', "    ")
+        .chars()
+        .map(|ch| {
+            if ch != '\n' && ch.is_control() {
+                '�'
+            } else {
+                ch
+            }
+        })
+        .collect()
 }
 
 fn truncate_text(text: &mut String, max_bytes: usize) -> bool {
@@ -315,6 +393,7 @@ pub struct NotificationCenter {
     records: VecDeque<Notification>,
     capacity: usize,
     next_id: u64,
+    revision: u64,
 }
 
 impl Default for NotificationCenter {
@@ -329,7 +408,16 @@ impl NotificationCenter {
             records: VecDeque::new(),
             capacity,
             next_id: 1,
+            revision: 0,
         }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn changed(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Entries in creation order; callers may reverse this iterator for history UI.
@@ -409,6 +497,7 @@ impl NotificationCenter {
             record.updated_at = now.wall;
             record.occurrences = record.occurrences.saturating_add(1);
             record.read = false;
+            self.changed();
             return Ok(id);
         }
         let id = self.allocate(now.monotonic)?;
@@ -426,6 +515,7 @@ impl NotificationCenter {
             priority: ProgressPriority::Background,
             display,
         });
+        self.changed();
         Ok(id)
     }
 
@@ -457,6 +547,7 @@ impl NotificationCenter {
             priority,
             display: DisplayState::UntilAcknowledged,
         });
+        self.changed();
         Ok(id)
     }
 
@@ -483,6 +574,7 @@ impl NotificationCenter {
         record.content = content;
         record.state = state;
         record.updated_at = now.wall;
+        self.changed();
         Ok(true)
     }
 
@@ -503,11 +595,16 @@ impl NotificationCenter {
         record.updated_at = now.wall;
         record.display = NoticeLifetime::for_severity(record.severity).display_state(now.monotonic);
         record.read = false;
+        self.changed();
         Ok(())
     }
 
     pub fn mark_read(&mut self, id: NotificationId) -> Result<(), NotificationError> {
-        self.get_mut(id)?.read = true;
+        let record = self.get_mut(id)?;
+        if !record.read {
+            record.read = true;
+            self.changed();
+        }
         Ok(())
     }
 
@@ -518,6 +615,7 @@ impl NotificationCenter {
         if !record.is_running() {
             record.display = DisplayState::Hidden;
         }
+        self.changed();
         Ok(())
     }
 
@@ -529,6 +627,7 @@ impl NotificationCenter {
             return Err(NotificationError::StillRunning);
         }
         record.display = DisplayState::Hidden;
+        self.changed();
         Ok(())
     }
 
@@ -555,7 +654,11 @@ impl NotificationCenter {
     pub fn clear_inactive(&mut self, now: Instant) -> usize {
         let before = self.records.len();
         self.records.retain(|record| record.is_active(now));
-        before - self.records.len()
+        let removed = before - self.records.len();
+        if removed > 0 {
+            self.changed();
+        }
+        removed
     }
 }
 

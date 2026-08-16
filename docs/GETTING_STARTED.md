@@ -216,6 +216,14 @@ Enter Command mode with `:` or `;`.
 | `:languages reload` | Reload custom language definitions, trusted grammars, and changed language servers |
 | `:join [count]` / `:join! [count]` | Join with normalized or preserved spacing |
 | `:commands` | Open the command palette |
+| `:messages` | Browse active notifications and recent messages |
+
+The bottom line shows the current notification and how many are active. Open
+the history with `Space m`, `:messages`, or a click on the message line. Use
+`j`/`k` to browse, `/` to search full message text, `f` to switch filters,
+`Enter` to acknowledge, `y` to copy, and `Esc` to return. `Ctrl-d`/`Ctrl-u`
+scroll long details; `D` clears inactive history. Messages are retained for
+the current Red session, subject to the history limit.
 
 ## Git workspace
 
