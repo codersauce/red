@@ -14582,7 +14582,9 @@ impl Editor {
             let _modifiers = event.modifiers;
 
             match code {
-                KeyCode::Esc => {
+                KeyCode::Esc | KeyCode::Backspace
+                    if code == KeyCode::Esc || self.command.is_empty() =>
+                {
                     self.command = String::new();
                     self.reset_command_history_navigation();
                     self.reset_command_completion();
