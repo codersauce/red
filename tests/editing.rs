@@ -5947,7 +5947,7 @@ fn mouse_drag_selects_agent_scrollback_text_for_visual_yank() {
 }
 
 #[test]
-fn focused_agent_composer_routes_control_navigation_to_the_conversation() {
+fn focused_agent_composer_keeps_control_j_local_and_routes_other_navigation() {
     let buffer = Buffer::new(None, "abcdef".to_string());
     let mut harness = EditorHarness::with_config(buffer, default_key_config());
     harness.editor.test_create_text_panel(
@@ -5967,7 +5967,7 @@ fn focused_agent_composer_routes_control_navigation_to_the_conversation() {
 
     for (code, modifiers, expected) in [
         (KeyCode::Char('h'), KeyModifiers::CONTROL, "up"),
-        (KeyCode::Char('j'), KeyModifiers::CONTROL, "down"),
+        (KeyCode::Char('j'), KeyModifiers::CONTROL, "composer_input"),
         (KeyCode::Char('k'), KeyModifiers::CONTROL, "up"),
         (KeyCode::Char('g'), KeyModifiers::CONTROL, "top"),
         (

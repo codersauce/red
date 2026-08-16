@@ -106,6 +106,11 @@ command = "/path/to/codex"
 
 ## Lifecycle
 
+In the Agent prompt and conversation footer, Enter sends. Alt+Enter,
+Shift+Enter, and Ctrl+J insert a newline; Ctrl+Enter remains a send alias.
+See [keyboard compatibility](KEYBOARD.md) if a terminal does not report a
+modified Enter distinctly.
+
 Open a workspace, press `Space A` (or run `:Agent`), type a request, and press
 Enter. Red lazily starts `codex app-server --stdio`, initializes the connection,
 checks the account, starts a persisted thread, and submits turns with

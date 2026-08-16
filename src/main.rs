@@ -34,7 +34,9 @@ use red::config::{
 };
 use red::editor::{Action, Editor};
 #[cfg(any(unix, test))]
-use red::headless::{InputEvent as DetachedInput, KeyCode as DetachedKeyCode, KeyModifier};
+use red::headless::{
+    InputEvent as DetachedInput, KeyCode as DetachedKeyCode, KeyKind, KeyModifier,
+};
 use red::language::GrammarTrustStore;
 use red::logger::Logger;
 use red::lsp::{LspClient, LspManager};
@@ -85,6 +87,9 @@ async fn run() -> anyhow::Result<()> {
     args.validate_utility_args()?;
 
     match &args.command {
+        Some(RootCommand::Keys(keys)) => {
+            return red::keyboard::inspect_keys(keys.protocol, keys.count);
+        }
         Some(RootCommand::Plugin(plugin)) => return run_plugin_command(&plugin.command).await,
         Some(RootCommand::Language(language)) => {
             return run_language_command(&language.command, &args.config_overrides)
@@ -277,6 +282,7 @@ async fn run() -> anyhow::Result<()> {
         let mut stdout = stdout();
         _ = stdout.execute(terminal::EndSynchronizedUpdate);
         _ = stdout.execute(terminal::EnableLineWrap);
+        red::keyboard::restore_after_panic(&mut stdout);
         _ = write!(stdout, "\x1b]112\x1b\\");
         _ = stdout.execute(event::DisableBracketedPaste);
         _ = stdout.execute(event::DisableFocusChange);
@@ -593,16 +599,18 @@ async fn attach_session(session: &str) -> anyhow::Result<()> {
             red::headless::connect_session(&Config::path("run"), session, None, size).await?;
         let mut rows = Vec::new();
         terminal::enable_raw_mode()?;
-        let terminal_guard = DetachedTerminalGuard;
+        let mut terminal_guard = DetachedTerminalGuard::default();
         let mut output = stdout();
         output
             .execute(event::EnableBracketedPaste)?
             .execute(event::EnableFocusChange)?
             .execute(event::EnableMouseCapture)?
-            .execute(terminal::EnterAlternateScreen)?
-            .execute(event::PushKeyboardEnhancementFlags(
-                event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
-            ))?
+            .execute(terminal::EnterAlternateScreen)?;
+        terminal_guard.keyboard_protocol = red::keyboard::KeyboardProtocol::start(
+            &mut output,
+            red::keyboard::KeyboardPreference::Auto,
+        )?;
+        output
             .execute(terminal::DisableLineWrap)?
             .execute(terminal::Clear(terminal::ClearType::All))?;
         let result = async {
@@ -662,7 +670,10 @@ async fn attach_session(session: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-struct DetachedTerminalGuard;
+#[derive(Default)]
+struct DetachedTerminalGuard {
+    keyboard_protocol: red::keyboard::KeyboardProtocol,
+}
 
 #[cfg(unix)]
 impl Drop for DetachedTerminalGuard {
@@ -673,7 +684,7 @@ impl Drop for DetachedTerminalGuard {
         _ = output.execute(event::DisableFocusChange);
         _ = output.execute(event::DisableMouseCapture);
         _ = output.execute(terminal::EnableLineWrap);
-        _ = output.execute(event::PopKeyboardEnhancementFlags);
+        _ = self.keyboard_protocol.stop(&mut output);
         _ = output.execute(terminal::LeaveAlternateScreen);
         _ = output.execute(cursor::Show);
         _ = terminal::disable_raw_mode();
@@ -723,7 +734,16 @@ fn detached_key_input(key: event::KeyEvent) -> Option<DetachedInput> {
     if key.modifiers.contains(event::KeyModifiers::SHIFT) {
         modifiers.push(KeyModifier::Shift);
     }
-    Some(DetachedInput::Key { code, modifiers })
+    let key_kind = if key.kind == event::KeyEventKind::Repeat {
+        KeyKind::Repeat
+    } else {
+        KeyKind::Press
+    };
+    Some(DetachedInput::Key {
+        code,
+        modifiers,
+        key_kind,
+    })
 }
 
 #[cfg(unix)]
@@ -1286,6 +1306,7 @@ mod tests {
             Some(DetachedInput::Key {
                 code: DetachedKeyCode::Function(1),
                 modifiers: Vec::new(),
+                key_kind: KeyKind::Press,
             })
         );
         assert_eq!(
@@ -1296,7 +1317,32 @@ mod tests {
             Some(DetachedInput::Key {
                 code: DetachedKeyCode::Character('p'),
                 modifiers: vec![KeyModifier::Control, KeyModifier::Shift],
+                key_kind: KeyKind::Press,
             })
+        );
+    }
+
+    #[test]
+    fn detached_key_input_preserves_enter_repeats_and_discards_releases() {
+        assert_eq!(
+            detached_key_input(event::KeyEvent::new_with_kind(
+                event::KeyCode::Enter,
+                event::KeyModifiers::ALT,
+                event::KeyEventKind::Repeat
+            )),
+            Some(DetachedInput::Key {
+                code: DetachedKeyCode::Enter,
+                modifiers: vec![KeyModifier::Alt],
+                key_kind: KeyKind::Repeat
+            })
+        );
+        assert_eq!(
+            detached_key_input(event::KeyEvent::new_with_kind(
+                event::KeyCode::Enter,
+                event::KeyModifiers::NONE,
+                event::KeyEventKind::Release
+            )),
+            None
         );
     }
 

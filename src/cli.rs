@@ -95,10 +95,22 @@ pub struct Args {
 
 #[derive(Debug, Subcommand)]
 pub enum RootCommand {
+    /// Inspect how this terminal reports composer keyboard shortcuts.
+    Keys(KeyboardArgs),
     /// Install and manage external plugin packages.
     Plugin(PluginArgs),
     /// Inspect and approve explicitly configured native language grammars.
     Language(LanguageArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct KeyboardArgs {
+    /// Override automatic keyboard protocol selection for this diagnostic only.
+    #[arg(long, value_enum, default_value_t)]
+    pub protocol: crate::keyboard::KeyboardPreference,
+    /// Exit after this many decoded key events.
+    #[arg(long)]
+    pub count: Option<usize>,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -250,6 +262,17 @@ mod tests {
 
     #[test]
     fn parses_runtime_utility_flags() {
+        let keys =
+            Args::try_parse_from(["red", "keys", "--protocol", "legacy", "--count", "1"]).unwrap();
+        assert!(keys.utility_requested());
+        assert!(matches!(
+            keys.command,
+            Some(RootCommand::Keys(KeyboardArgs {
+                protocol: crate::keyboard::KeyboardPreference::Legacy,
+                count: Some(1)
+            }))
+        ));
+
         let args = Args::try_parse_from(["red", "--runtime-files"]).unwrap();
         assert!(args.runtime_files);
         assert!(args.utility_requested());

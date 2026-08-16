@@ -4,7 +4,7 @@
 //! documents never enter the editor's file-buffer list; this wrapper adds bounded
 //! prompt history plus surface-specific submit and cancellation shortcuts.
 
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::{
     buffer::Buffer,
@@ -29,10 +29,19 @@ pub(crate) enum PromptInput {
     Unhandled,
 }
 
+/// Submission policy belongs to the host surface, not the shared Vim engine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum PromptKeyPolicy {
+    #[default]
+    Vim,
+    EnterSends,
+}
+
 /// Fileless modal text area with thread-local prompt history and submission policy.
 #[derive(Debug)]
 pub(crate) struct PromptBuffer {
     area: TextArea,
+    key_policy: PromptKeyPolicy,
     history: Vec<String>,
     history_position: Option<usize>,
     history_draft: Option<String>,
@@ -48,6 +57,7 @@ impl PromptBuffer {
     pub(crate) fn with_history(text: impl AsRef<str>, history: Vec<String>) -> Self {
         Self {
             area: TextArea::with_max_bytes(text, PROMPT_MAX_BYTES),
+            key_policy: PromptKeyPolicy::default(),
             history: history
                 .into_iter()
                 .filter(|entry| entry.len() <= PROMPT_MAX_BYTES)
@@ -56,6 +66,12 @@ impl PromptBuffer {
             history_position: None,
             history_draft: None,
         }
+    }
+
+    /// Selects the surface-local Enter behavior without changing the text area.
+    pub(crate) fn with_key_policy(mut self, key_policy: PromptKeyPolicy) -> Self {
+        self.key_policy = key_policy;
+        self
     }
 
     /// Returns the underlying unnamed editor buffer.
@@ -199,6 +215,14 @@ impl PromptBuffer {
         let Event::Key(key) = event else {
             return self.apply_area_event(event, wrap_width);
         };
+        if key.kind == KeyEventKind::Release {
+            return PromptInput::Changed;
+        }
+        if self.key_policy == PromptKeyPolicy::EnterSends {
+            if let Some(outcome) = self.handle_composer_key(*key, wrap_width) {
+                return outcome;
+            }
+        }
         let modifiers = key.modifiers;
         match key.code {
             KeyCode::Enter | KeyCode::Char('\n')
@@ -251,6 +275,56 @@ impl PromptBuffer {
         }
     }
 
+    fn handle_composer_key(&mut self, key: KeyEvent, wrap_width: usize) -> Option<PromptInput> {
+        let enter = matches!(key.code, KeyCode::Enter | KeyCode::Char('\r'));
+        let newline = matches!(key.code, KeyCode::Char('\n'))
+            || (matches!(key.code, KeyCode::Char('j' | 'J'))
+                && key.modifiers.contains(KeyModifiers::CONTROL))
+            || (enter
+                && key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT));
+        if !enter && !newline {
+            return None;
+        }
+        if !key
+            .modifiers
+            .difference(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT)
+            .is_empty()
+        {
+            return Some(PromptInput::Changed);
+        }
+
+        // A search owns Enter, and unfinished Vim commands must not send a draft.
+        if self.mode() == Mode::Search || self.area.state().has_pending_input() {
+            let outcome = self.apply_area_event(&Event::Key(key), wrap_width);
+            return Some(match outcome {
+                PromptInput::Unhandled => PromptInput::Changed,
+                outcome => outcome,
+            });
+        }
+        if newline {
+            if self.mode() == Mode::Insert {
+                // Preserve insert-session undo grouping and dot-repeat recording.
+                self.apply_area_event(
+                    &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                    wrap_width,
+                );
+            } else {
+                self.insert("\n");
+            }
+            return Some(PromptInput::Changed);
+        }
+        Some(if key.kind == KeyEventKind::Repeat {
+            PromptInput::Changed
+        } else if matches!(self.mode(), Mode::Insert | Mode::Normal) {
+            PromptInput::Submit
+        } else {
+            // A visual selection remains local until the user leaves visual mode.
+            PromptInput::Changed
+        })
+    }
+
     fn apply_area_event(&mut self, event: &Event, wrap_width: usize) -> PromptInput {
         let previous_revision = self.buffer().revision();
         let result = self.area.handle_event(event, wrap_width);
@@ -287,11 +361,11 @@ pub(crate) fn first_prompt_line(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     use super::{
         first_prompt_line, normalize_prompt_newlines, Mode, PromptBuffer, PromptInput,
-        PROMPT_MAX_BYTES,
+        PromptKeyPolicy, PROMPT_MAX_BYTES,
     };
 
     #[test]
@@ -307,6 +381,128 @@ mod tests {
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
         Event::Key(KeyEvent::new(code, modifiers))
+    }
+
+    fn composer(text: &str) -> PromptBuffer {
+        PromptBuffer::new(text).with_key_policy(PromptKeyPolicy::EnterSends)
+    }
+
+    #[test]
+    fn composer_enter_policy_keeps_submit_and_newline_distinct() {
+        let cases = [
+            (KeyCode::Enter, KeyModifiers::NONE, PromptInput::Submit),
+            (KeyCode::Char('\r'), KeyModifiers::NONE, PromptInput::Submit),
+            (KeyCode::Enter, KeyModifiers::CONTROL, PromptInput::Submit),
+            (KeyCode::Enter, KeyModifiers::ALT, PromptInput::Changed),
+            (KeyCode::Enter, KeyModifiers::SHIFT, PromptInput::Changed),
+            (
+                KeyCode::Enter,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                PromptInput::Changed,
+            ),
+            (
+                KeyCode::Enter,
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+                PromptInput::Changed,
+            ),
+            (
+                KeyCode::Char('j'),
+                KeyModifiers::CONTROL,
+                PromptInput::Changed,
+            ),
+            (
+                KeyCode::Char('\n'),
+                KeyModifiers::NONE,
+                PromptInput::Changed,
+            ),
+            (
+                KeyCode::Char('\n'),
+                KeyModifiers::CONTROL,
+                PromptInput::Changed,
+            ),
+        ];
+        for mode in [Mode::Insert, Mode::Normal] {
+            for (code, modifiers, expected) in cases {
+                let mut prompt = composer("hello");
+                prompt.set_mode(mode);
+                assert_eq!(
+                    prompt.handle_event(&key(code, modifiers), 40),
+                    expected,
+                    "{mode:?} {code:?} {modifiers:?}"
+                );
+                assert_eq!(
+                    prompt.text(),
+                    if expected == PromptInput::Submit {
+                        "hello"
+                    } else {
+                        "hello\n"
+                    }
+                );
+                assert_eq!(prompt.mode(), mode);
+            }
+        }
+        let mut ordinary = PromptBuffer::new("hello");
+        assert_eq!(
+            ordinary.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE), 40),
+            PromptInput::Changed
+        );
+        assert_eq!(ordinary.text(), "hello\n");
+    }
+
+    #[test]
+    fn composer_enter_does_not_escape_vim_substates_or_repeat_submission() {
+        let mut prompt = composer("one two");
+        prompt.set_mode(Mode::Normal);
+        prompt.handle_event(&key(KeyCode::Char('/'), KeyModifiers::NONE), 40);
+        assert_eq!(prompt.mode(), Mode::Search);
+        prompt.handle_event(&key(KeyCode::Char('t'), KeyModifiers::NONE), 40);
+        assert_eq!(
+            prompt.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE), 40),
+            PromptInput::Changed
+        );
+        assert_eq!(prompt.mode(), Mode::Normal);
+        prompt.handle_event(&key(KeyCode::Char('d'), KeyModifiers::NONE), 40);
+        assert_eq!(
+            prompt.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE), 40),
+            PromptInput::Changed
+        );
+        assert_eq!(prompt.text(), "one two");
+        prompt.set_mode(Mode::Visual);
+        assert_eq!(
+            prompt.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE), 40),
+            PromptInput::Changed
+        );
+        prompt.set_mode(Mode::Insert);
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            assert_eq!(
+                prompt.handle_event(
+                    &Event::Key(KeyEvent::new_with_kind(
+                        KeyCode::Enter,
+                        KeyModifiers::NONE,
+                        kind
+                    )),
+                    40
+                ),
+                PromptInput::Changed
+            );
+        }
+        assert_eq!(prompt.text(), "one two");
+    }
+
+    #[test]
+    fn composer_newline_is_undoable_and_paste_never_submits() {
+        let mut prompt = composer("first");
+        prompt.handle_event(&key(KeyCode::Enter, KeyModifiers::ALT), 40);
+        assert_eq!(prompt.text(), "first\n");
+        assert!(prompt.undo());
+        assert_eq!(prompt.text(), "first");
+        assert!(prompt.redo());
+        assert_eq!(prompt.text(), "first\n");
+        assert_eq!(
+            prompt.handle_event(&Event::Paste("second\r\nthird".into()), 40),
+            PromptInput::Changed
+        );
+        assert_eq!(prompt.text(), "first\nsecond\nthird");
     }
 
     #[test]

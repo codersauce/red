@@ -15,7 +15,7 @@ use crate::{
 use super::{
     dialog::{BorderStyle, Dialog, SurfaceRole},
     normalize_prompt_newlines, ActionBar, ActionMode, ActionPriority, Component, PromptBuffer,
-    PromptInput, UiAction, PROMPT_MAX_BYTES,
+    PromptInput, PromptKeyPolicy, UiAction, PROMPT_MAX_BYTES,
 };
 
 const TAB_WIDTH: usize = 4;
@@ -107,7 +107,8 @@ impl AgentComposer {
             .into_iter()
             .filter(|entry| entry.len() <= MAX_PROMPT_BYTES)
             .collect::<Vec<_>>();
-        let prompt = PromptBuffer::with_history(&query, history);
+        let prompt = PromptBuffer::with_history(&query, history)
+            .with_key_policy(PromptKeyPolicy::EnterSends);
         let history_too_large = prompt.history().len() != history_len;
 
         Self {
@@ -247,20 +248,17 @@ impl Component for AgentComposer {
             let status_y = content_y + body_height;
             let prompt_mode = self.prompt.mode();
             let normal_mode = prompt_mode == Mode::Normal;
-            let (send_key, compact_send_key, escape_label) = if normal_mode {
-                ("Enter", "↵", "Cancel")
-            } else {
-                ("Ctrl+Enter", "^↵", "Normal")
-            };
+            let escape_label = if normal_mode { "Cancel" } else { "Normal" };
             let actions = [
-                UiAction::new("send", send_key, "Send")
-                    .with_compact_key(compact_send_key)
+                UiAction::new("send", "Enter", "Send")
+                    .with_modes([ActionMode::Insert, ActionMode::Normal])
+                    .with_compact_key("↵")
                     .with_compact_label("")
                     .with_priority(ActionPriority::Essential),
                 UiAction::new("cancel", "Esc", escape_label)
                     .with_compact_label("")
                     .with_priority(ActionPriority::Essential),
-                UiAction::new("newline", "Enter", "New line").with_modes([ActionMode::Insert]),
+                UiAction::new("newline", "Ctrl+J", "New line").with_modes([ActionMode::Insert]),
                 UiAction::new("history", "Ctrl+P/N", "History")
                     .with_compact_key("^P/N")
                     .with_priority(ActionPriority::Secondary),
@@ -800,12 +798,12 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_enter_edits_the_real_prompt_buffer_in_insert_mode() {
+    fn modified_enter_edits_the_real_prompt_buffer_in_insert_mode() {
         let editor = editor(60, 18);
         let mut composer = new_composer(&editor, None, 802, "first".to_string(), vec![]);
 
         assert_eq!(
-            composer.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE)),
+            composer.handle_event(&key(KeyCode::Enter, KeyModifiers::SHIFT)),
             Some(KeyAction::Single(Action::Refresh))
         );
         assert_eq!(composer.prompt.text(), "first\n");
@@ -824,12 +822,9 @@ mod tests {
         composer.draw(&mut buffer).unwrap();
         let insert_status = rendered_row(&buffer, status_y);
         assert!(insert_status.contains("INSERT"), "{insert_status:?}");
+        assert!(insert_status.contains("Enter Send"), "{insert_status:?}");
         assert!(
-            insert_status.contains("Ctrl+Enter Send"),
-            "{insert_status:?}"
-        );
-        assert!(
-            insert_status.contains("Enter New line"),
+            insert_status.contains("Ctrl+J New line"),
             "{insert_status:?}"
         );
         assert!(insert_status.contains("Esc Normal"), "{insert_status:?}");
@@ -860,15 +855,13 @@ mod tests {
     }
 
     #[test]
-    fn modified_enter_and_modified_linefeed_submit_scoped_callbacks() {
+    fn enter_and_control_enter_submit_scoped_callbacks() {
         let editor = editor(60, 18);
         let handle = ComposerHandle::from_raw(42);
 
         for event in [
+            key(KeyCode::Enter, KeyModifiers::NONE),
             key(KeyCode::Enter, KeyModifiers::CONTROL),
-            key(KeyCode::Char('\n'), KeyModifiers::CONTROL),
-            key(KeyCode::Enter, KeyModifiers::ALT),
-            key(KeyCode::Char('\n'), KeyModifiers::ALT),
         ] {
             let mut composer = AgentComposer::new_callback(
                 &editor,
