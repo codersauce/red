@@ -119,6 +119,12 @@ follow-ups submitted during an active turn appear immediately and remain queued
 in FIFO order. Assistant deltas stream into the conversation footer. `Ctrl-c`
 interrupts the active turn with `turn/interrupt`.
 
+`Tab` or `Shift-Tab` switches between the composer and transcript, preserving
+the draft, composer editing mode, and transcript reading position. Switching
+away from an unfinished transcript search cancels it and restores its starting
+position. In transcript Normal mode, `]l` jumps to the next link and `[l` to the
+previous one, wrapping at the ends. Enter opens the link under the cursor.
+
 In the conversation transcript's Normal mode, `[p` jumps backward to a user
 prompt and `]p` jumps forward. From an answer, the first backward jump returns
 to that turn's prompt; repeating it visits earlier prompts. Jumps reveal the

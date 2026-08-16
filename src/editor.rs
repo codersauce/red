@@ -12726,6 +12726,14 @@ impl Editor {
         ev: &event::Event,
         runtime: Option<&Runtime>,
     ) -> Option<KeyAction> {
+        if matches!(ev, Event::Key(key) if matches!(key.code, KeyCode::Tab | KeyCode::BackTab))
+            && self
+                .panel_manager
+                .toggle_focused_text_region(usize::from(self.size.0))
+        {
+            self.repeater = None;
+            return Some(KeyAction::Single(Action::Refresh));
+        }
         if let Some(event) = self
             .panel_manager
             .handle_focused_text_input(ev, usize::from(self.size.0))
@@ -12783,25 +12791,6 @@ impl Editor {
                     }
                     if !self.panel_manager.focused_row_panel() {
                         self.last_error = Some("selected turn has no answer to copy".to_string());
-                        return Some(KeyAction::Single(Action::Refresh));
-                    }
-                }
-                if matches!(event.code, KeyCode::Tab | KeyCode::BackTab) {
-                    if self.panel_manager.focused_text_input_active()
-                        && self
-                            .panel_manager
-                            .focus_focused_text_scrollback(usize::from(self.size.0))
-                    {
-                        return Some(KeyAction::Single(Action::Refresh));
-                    }
-                    let panel_height = usize::from(self.size.1.saturating_sub(2));
-                    let forward = event.code == KeyCode::Tab;
-                    let selected = self.panel_manager.select_focused_text_link(
-                        forward,
-                        panel_height,
-                        usize::from(self.size.0),
-                    );
-                    if selected || !self.panel_manager.focused_row_panel() {
                         return Some(KeyAction::Single(Action::Refresh));
                     }
                 }

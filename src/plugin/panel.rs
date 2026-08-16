@@ -461,17 +461,17 @@ struct TextPanelScrollback {
     mouse_dragging: bool,
     pending_find: Option<PendingScrollbackFind>,
     last_find: Option<ScrollbackFind>,
-    pending_prompt_jump: Option<PendingPromptJump>,
+    pending_jump: Option<PendingScrollbackJump>,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PendingPromptJump {
-    direction: PromptJumpDirection,
+struct PendingScrollbackJump {
+    direction: ScrollbackJumpDirection,
     count: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
-enum PromptJumpDirection {
+enum ScrollbackJumpDirection {
     Previous,
     Next,
 }
@@ -1078,55 +1078,62 @@ impl TextPanel {
         (!answer.is_empty()).then_some(answer)
     }
 
-    fn links(&self, width: usize) -> Vec<(TextPanelLink, usize)> {
-        let mut links = Vec::new();
+    fn links(&self, width: usize) -> Vec<(TextPanelLink, Range<usize>)> {
+        let mut links: Vec<(TextPanelLink, Range<usize>)> = Vec::new();
         let layout = self.layout(width);
-        for (line_index, line) in layout.rendered.iter().enumerate() {
-            for span in &line.spans {
-                let Some(link) = span.link.clone() else {
+        for line in &layout.lines {
+            for (index, cell) in line.cells.iter().enumerate() {
+                let Some(link) = cell.link.as_ref() else {
                     continue;
                 };
-                if links
-                    .last()
-                    .is_none_or(|(previous, _): &(TextPanelLink, usize)| previous.id != link.id)
-                {
-                    links.push((link, line_index));
+                let offset = line.first + index;
+                if let Some((previous, range)) = links.last_mut() {
+                    if previous.id == link.id {
+                        range.end = offset + 1;
+                        continue;
+                    }
                 }
+                links.push((link.clone(), offset..offset + 1));
             }
         }
         links
     }
 
-    fn select_link(&mut self, forward: bool, panel_height: usize, width: usize) -> bool {
+    fn jump_to_link(
+        &mut self,
+        direction: ScrollbackJumpDirection,
+        count: usize,
+        panel_height: usize,
+        width: usize,
+    ) {
         let links = self.links(width);
         if links.is_empty() {
             self.selected_link = None;
-            return false;
+            return;
         }
-        let current = self
-            .selected_link
-            .and_then(|selected| links.iter().position(|(link, _)| link.id == selected));
-        let index = match (current, forward) {
-            (Some(index), true) => (index + 1) % links.len(),
-            (Some(0), false) => links.len() - 1,
-            (Some(index), false) => index - 1,
-            (None, true) => 0,
-            (None, false) => links.len() - 1,
+        let layout = self.layout(width);
+        let cursor = layout.clamp(self.scrollback.cursor);
+        let step = count.saturating_sub(1) % links.len();
+        // Treat a soft-wrapped link as one destination, skipping it when the
+        // cursor is anywhere inside its label.
+        let index = match direction {
+            ScrollbackJumpDirection::Next => {
+                (links.partition_point(|(_, range)| range.start <= cursor) + step) % links.len()
+            }
+            ScrollbackJumpDirection::Previous => {
+                (links.partition_point(|(_, range)| range.end <= cursor) + links.len() - 1 - step)
+                    % links.len()
+            }
         };
-        let (link, line) = &links[index];
+        let (link, range) = &links[index];
         self.selected_link = Some(link.id);
-        self.scrollback.focused = true;
+        self.scrollback.cursor = range.start;
+        self.scrollback.initialized = true;
+        self.scrollback.preferred_column = None;
         self.scrollback.mode = TextPanelScrollbackMode::Normal;
         self.scrollback.selection_anchor = None;
-        let layout = self.layout(width);
-        if let Some(offset) = layout.link_offset(link.id) {
-            self.scrollback.cursor = offset;
-        }
-        self.viewport.restore(self.scroll, self.follow_tail);
-        self.viewport.reveal(*line, self.visible_rows(panel_height));
-        self.scroll = self.viewport.offset();
-        self.follow_tail = self.viewport.is_following();
-        true
+        self.follow_tail = false;
+        self.reveal_scrollback_cursor(&layout, panel_height);
     }
 
     fn selected_link_target(&self, width: usize) -> Option<TextPanelLinkTarget> {
@@ -1457,15 +1464,6 @@ impl TextPanelLayout {
             .map(|link| link.target.clone())
     }
 
-    fn link_offset(&self, id: u64) -> Option<usize> {
-        self.lines.iter().find_map(|line| {
-            line.cells
-                .iter()
-                .position(|cell| cell.link.as_ref().is_some_and(|link| link.id == id))
-                .map(|index| line.first.saturating_add(index))
-        })
-    }
-
     fn selected_text(&self, start: usize, end: usize, linewise: bool) -> String {
         if self.len == 0 {
             return String::new();
@@ -1591,7 +1589,7 @@ impl TextPanel {
 
     fn jump_to_prompt(
         &mut self,
-        direction: PromptJumpDirection,
+        direction: ScrollbackJumpDirection,
         count: usize,
         panel_height: usize,
         width: usize,
@@ -1614,12 +1612,12 @@ impl TextPanel {
         });
         let count = count.max(1);
         let target = match direction {
-            PromptJumpDirection::Previous => anchors
+            ScrollbackJumpDirection::Previous => anchors
                 .rev()
                 .filter(|(_, _, offset)| *offset < cursor)
                 .take(count)
                 .last(),
-            PromptJumpDirection::Next => anchors
+            ScrollbackJumpDirection::Next => anchors
                 .filter(|(_, _, offset)| *offset > cursor)
                 .take(count)
                 .last(),
@@ -1668,7 +1666,7 @@ impl TextPanel {
             },
         });
         self.scrollback.pending_find = None;
-        self.scrollback.pending_prompt_jump = None;
+        self.scrollback.pending_jump = None;
         self.viewport.restore(scroll, false);
         self.scroll = scroll;
         self.follow_tail = false;
@@ -1828,7 +1826,8 @@ impl TextPanel {
         self.scrollback.focused = true;
         self.scrollback.mode = TextPanelScrollbackMode::Normal;
         self.scrollback.selection_anchor = None;
-        self.scrollback.pending_prompt_jump = None;
+        self.scrollback.pending_find = None;
+        self.scrollback.pending_jump = None;
         let layout = self.layout(width);
         if !self.scrollback.initialized {
             self.scrollback.cursor = (self.scroll..layout.lines.len())
@@ -1847,7 +1846,8 @@ impl TextPanel {
         self.scrollback.selection_anchor = None;
         self.scrollback.mouse_anchor = None;
         self.scrollback.mouse_dragging = false;
-        self.scrollback.pending_prompt_jump = None;
+        self.scrollback.pending_find = None;
+        self.scrollback.pending_jump = None;
     }
 
     fn remember_focused_region(&mut self) {
@@ -3193,13 +3193,20 @@ impl PanelManager {
             return None;
         };
 
-        if let Some(pending) = panel.scrollback.pending_prompt_jump.take() {
-            if key.code == KeyCode::Char('p')
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        if let Some(pending) = panel.scrollback.pending_jump.take() {
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
             {
-                panel.jump_to_prompt(pending.direction, pending.count, panel_height, width);
+                match key.code {
+                    KeyCode::Char('p') => {
+                        panel.jump_to_prompt(pending.direction, pending.count, panel_height, width);
+                    }
+                    KeyCode::Char('l') => {
+                        panel.jump_to_link(pending.direction, pending.count, panel_height, width);
+                    }
+                    _ => {}
+                }
             }
             return Some(TextPanelScrollbackInput::Handled);
         }
@@ -3294,11 +3301,11 @@ impl PanelManager {
                 KeyCode::Char('[' | ']')
                     if panel.scrollback.mode == TextPanelScrollbackMode::Normal =>
                 {
-                    panel.scrollback.pending_prompt_jump = Some(PendingPromptJump {
+                    panel.scrollback.pending_jump = Some(PendingScrollbackJump {
                         direction: if key.code == KeyCode::Char('[') {
-                            PromptJumpDirection::Previous
+                            ScrollbackJumpDirection::Previous
                         } else {
-                            PromptJumpDirection::Next
+                            ScrollbackJumpDirection::Next
                         },
                         count,
                     });
@@ -3446,28 +3453,22 @@ impl PanelManager {
         })
     }
 
-    pub(crate) fn select_focused_text_link(
-        &mut self,
-        forward: bool,
-        panel_height: usize,
-        terminal_width: usize,
-    ) -> bool {
+    pub(crate) fn toggle_focused_text_region(&mut self, terminal_width: usize) -> bool {
         let Some(focused) = self.focused.clone() else {
             return false;
         };
-        let Some(panel) = self.text_panels.get_mut(&focused) else {
+        let Some(panel) = self.text_panels.get(&focused) else {
             return false;
         };
-        let width = self
-            .presentation
-            .width(&panel.id, &panel.config, terminal_width);
-        let panel_height = self
-            .presentation
-            .height(&panel.id, &panel.config, panel_height);
-        if let Some(composer) = panel.composer.as_mut() {
-            composer.focused = false;
+        if panel
+            .composer
+            .as_ref()
+            .is_some_and(|composer| composer.enabled && !composer.focused)
+        {
+            self.focus_text_panel_composer(&focused)
+        } else {
+            self.focus_focused_text_scrollback(terminal_width)
         }
-        panel.select_link(forward, panel_height, width)
     }
 
     pub(crate) fn focus_focused_text_scrollback(&mut self, terminal_width: usize) -> bool {
@@ -3555,7 +3556,9 @@ impl PanelManager {
         if all {
             Some(panel.copy_all())
         } else {
-            let width = effective_panel_width(&panel.config, terminal_width);
+            let width = self
+                .presentation
+                .width(&panel.id, &panel.config, terminal_width);
             match panel.selected_prompt(&panel.layout(width)) {
                 Some(index) => panel.turn_text(&panel.blocks[index].id, TextPanelTurnPart::Answer),
                 None => panel.copy_last_agent(),
@@ -3565,7 +3568,9 @@ impl PanelManager {
 
     pub(crate) fn selected_text_turn(&self, terminal_width: usize) -> Option<TextPanelTurnTarget> {
         let panel = self.text_panels.get(self.focused.as_deref()?)?;
-        let width = effective_panel_width(&panel.config, terminal_width);
+        let width = self
+            .presentation
+            .width(&panel.id, &panel.config, terminal_width);
         let index = panel.selected_prompt(&panel.layout(width))?;
         let prompt = &panel.blocks[index];
         Some(TextPanelTurnTarget {
@@ -4729,6 +4734,10 @@ struct TextPanelShortcutHint {
 
 const SCROLLBACK_NORMAL_HINTS: &[TextPanelShortcutHint] = &[
     TextPanelShortcutHint {
+        keys: "Tab",
+        action: "edit",
+    },
+    TextPanelShortcutHint {
         keys: "m",
         action: "actions",
     },
@@ -4741,16 +4750,16 @@ const SCROLLBACK_NORMAL_HINTS: &[TextPanelShortcutHint] = &[
         action: "prompt",
     },
     TextPanelShortcutHint {
+        keys: "[l/]l",
+        action: "link",
+    },
+    TextPanelShortcutHint {
         keys: "G",
         action: "latest",
     },
     TextPanelShortcutHint {
         keys: "hjkl/arrows",
         action: "move",
-    },
-    TextPanelShortcutHint {
-        keys: "a",
-        action: "edit",
     },
     TextPanelShortcutHint {
         keys: "y",
@@ -4785,8 +4794,8 @@ const COMPOSER_NORMAL_HINTS: &[TextPanelShortcutHint] = &[
         action: "edit",
     },
     TextPanelShortcutHint {
-        keys: "Esc",
-        action: "nav",
+        keys: "Tab",
+        action: "transcript",
     },
     TextPanelShortcutHint {
         keys: "j/k ↑/↓",
@@ -4833,6 +4842,10 @@ const COMPOSER_INSERT_HINTS: &[TextPanelShortcutHint] = &[
     TextPanelShortcutHint {
         keys: "^J",
         action: "newline",
+    },
+    TextPanelShortcutHint {
+        keys: "Tab",
+        action: "transcript",
     },
     TextPanelShortcutHint {
         keys: "Esc",
@@ -7109,6 +7122,8 @@ mod tests {
 
     #[test]
     fn text_panel_links_support_keyboard_navigation_and_clicks() {
+        use crossterm::event::KeyEvent;
+
         let mut manager = PanelManager::default();
         manager.create_text_panel(
             "agent".to_string(),
@@ -7135,14 +7150,28 @@ mod tests {
         );
         assert!(manager.focus_panel("agent"));
 
-        assert!(manager.select_focused_text_link(true, 18, 80));
+        let press = |manager: &mut PanelManager, character| {
+            assert!(matches!(
+                manager.handle_focused_scrollback_input(
+                    &Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+                    18,
+                    80,
+                    1,
+                ),
+                Some(TextPanelScrollbackInput::Handled)
+            ));
+        };
+        press(&mut manager, 'G');
+        press(&mut manager, ']');
+        press(&mut manager, 'l');
         assert_eq!(
             manager.focused_text_link_target(80),
             Some(TextPanelLinkTarget::ExternalUrl(
                 "https://example.com".to_string()
             ))
         );
-        assert!(manager.select_focused_text_link(true, 18, 80));
+        press(&mut manager, ']');
+        press(&mut manager, 'l');
         assert_eq!(
             manager.focused_text_link_target(80),
             Some(TextPanelLinkTarget::File {
@@ -7150,7 +7179,8 @@ mod tests {
                 location: None,
             })
         );
-        assert!(manager.select_focused_text_link(false, 18, 80));
+        press(&mut manager, '[');
+        press(&mut manager, 'l');
         assert_eq!(
             manager.focused_text_link_target(80),
             Some(TextPanelLinkTarget::ExternalUrl(
