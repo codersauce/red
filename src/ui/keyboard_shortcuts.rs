@@ -15,6 +15,13 @@ use super::{
     Component, ScreenRect, UiAction,
 };
 
+/// Alternate help chord. Shift is allowed for layouts that need it to type `/`.
+pub(crate) fn is_keyboard_shortcuts_alias(event: &Event) -> bool {
+    matches!(event, Event::Key(key)
+        if key.code == KeyCode::Char('/')
+            && key.modifiers.difference(KeyModifiers::SHIFT) == KeyModifiers::ALT)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ShortcutTarget {
     Editor(KeyAction),
@@ -113,6 +120,11 @@ impl KeyboardShortcuts {
         mut current: Vec<ShortcutEntry>,
         mut all: Vec<ShortcutEntry>,
     ) -> Self {
+        current.push(ShortcutEntry::new(
+            "Help",
+            "F1 or Alt+/",
+            "Toggle keyboard shortcuts",
+        ));
         current.sort_by(|a, b| (&a.group, &a.label, &a.key).cmp(&(&b.group, &b.label, &b.key)));
         current.dedup_by(|a, b| a.group == b.group && a.key == b.key && a.label == b.label);
         all.extend(
@@ -241,6 +253,7 @@ impl KeyboardShortcuts {
     pub fn handle_event(&mut self, event: &Event, width: usize, height: usize) -> ShortcutEvent {
         let page = Self::rect(width, height).height.saturating_sub(8).max(1) as isize;
         match event {
+            event if is_keyboard_shortcuts_alias(event) => return ShortcutEvent::Close,
             Event::Key(key) if key.code == KeyCode::F(1) => return ShortcutEvent::Close,
             Event::Key(key) if key.code == KeyCode::Esc => {
                 if self.searching || !self.query.is_empty() {
@@ -357,7 +370,7 @@ impl KeyboardShortcuts {
         }
         let palette = SurfacePalette::new(theme, &theme.ui_style.dialog);
         let inner = rect.width - 2;
-        Dialog::new(
+        let mut dialog = Dialog::new(
             Some("Keyboard shortcuts".to_owned()),
             rect.x,
             rect.y,
@@ -368,8 +381,11 @@ impl KeyboardShortcuts {
             theme,
         )
         .with_surface_theme(theme, SurfaceRole::Dialog)
-        .with_left_aligned_title()
-        .draw(buffer)?;
+        .with_left_aligned_title();
+        if inner > display_width(" Keyboard shortcuts ") + display_width(" F1 or Alt+/ ") {
+            dialog.set_header_status(Some("F1 or Alt+/".to_owned()));
+        }
+        dialog.draw(buffer)?;
         let paint = |buffer: &mut RenderBuffer, row: usize, text: &str, style: &Style| {
             if row < rect.height - 1 {
                 buffer.set_text(
@@ -381,7 +397,7 @@ impl KeyboardShortcuts {
             }
         };
         if rect.width < 16 || rect.height < 10 {
-            paint(buffer, 1, "F1 / Esc  back", &palette.secondary);
+            paint(buffer, 1, "F1 or Alt+/ · Esc back", &palette.secondary);
             return Ok(());
         }
         paint(buffer, 1, &self.context, &palette.muted);
@@ -528,6 +544,42 @@ mod tests {
             help.handle_event(&key(KeyCode::Esc), 80, 24),
             ShortcutEvent::Close
         );
+    }
+
+    #[test]
+    fn alternate_help_chord_is_exact_and_closes_during_search() {
+        let alternate = |modifiers| Event::Key(KeyEvent::new(KeyCode::Char('/'), modifiers));
+        assert!(is_keyboard_shortcuts_alias(&alternate(KeyModifiers::ALT)));
+        assert!(is_keyboard_shortcuts_alias(&alternate(
+            KeyModifiers::ALT | KeyModifiers::SHIFT
+        )));
+        assert!(!is_keyboard_shortcuts_alias(&alternate(KeyModifiers::NONE)));
+        assert!(!is_keyboard_shortcuts_alias(&alternate(
+            KeyModifiers::ALT | KeyModifiers::CONTROL
+        )));
+        assert!(!is_keyboard_shortcuts_alias(&Event::Key(KeyEvent::new(
+            KeyCode::Char('?'),
+            KeyModifiers::ALT
+        ))));
+
+        let mut help = KeyboardShortcuts::new("Editor".into(), Vec::new(), Vec::new());
+        help.handle_event(&key(KeyCode::Char('/')), 80, 24);
+        help.handle_event(&Event::Paste("Alt+/".into()), 80, 24);
+        assert_eq!(help.matching()[0].key, "F1 or Alt+/");
+        assert_eq!(
+            help.handle_event(&alternate(KeyModifiers::ALT), 80, 24),
+            ShortcutEvent::Close
+        );
+    }
+
+    #[test]
+    fn dialog_displays_both_help_chords() {
+        let theme = Theme::default();
+        let help = KeyboardShortcuts::new("Editor".into(), Vec::new(), Vec::new());
+        let mut buffer = RenderBuffer::new(80, 24, &theme.style);
+        help.render(&mut buffer, &theme).unwrap();
+        let frame = buffer.cells.iter().map(|cell| cell.c).collect::<String>();
+        assert!(frame.matches("F1 or Alt+/").count() >= 2, "{frame}");
     }
 
     #[test]

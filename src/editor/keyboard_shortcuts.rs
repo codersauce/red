@@ -146,6 +146,7 @@ impl Editor {
             || self.workspace_manager.is_active()
             || self.panel_manager.has_focused_panel();
         let f1 = matches!(event, Event::Key(key) if key.code == KeyCode::F(1) && key.modifiers.is_empty());
+        let alternate_help = crate::ui::is_keyboard_shortcuts_alias(event);
         let workspace_help = self.current_dialog.is_none()
             && self.workspace_manager.is_active()
             && !self.workspace_manager.is_filtering()
@@ -158,10 +159,12 @@ impl Editor {
             Mode::VisualBlock => &self.config.keys.visual_block,
             Mode::Command | Mode::Search => &self.config.keys.command,
         }
-        .get("F1");
+        .get(if alternate_help { "Alt-/" } else { "F1" });
         let editor_help = editor_mapping
             .is_none_or(|mapping| matches!(mapping, KeyAction::Single(Action::KeyboardShortcuts)));
-        if workspace_help || (f1 && !self.has_term() && (local_help || editor_help)) {
+        if workspace_help
+            || (((f1 && !self.has_term()) || alternate_help) && (local_help || editor_help))
+        {
             self.open_keyboard_shortcuts(runtime, None);
             return Some(KeyAction::Single(Action::Refresh));
         }
@@ -284,6 +287,61 @@ mod tests {
             .collect::<String>()
             .contains("Keyboard shortcuts"));
         assert_eq!(editor.render_cursor_position(), None);
+    }
+
+    #[test]
+    fn alternate_shortcut_toggles_in_editor_input_modes() {
+        let alternate = Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT));
+        for mode in [
+            Mode::Normal,
+            Mode::Insert,
+            Mode::Command,
+            Mode::Search,
+            Mode::Visual,
+        ] {
+            let mut editor = editor();
+            editor.mode = mode;
+            assert_eq!(
+                editor.handle_event(&alternate).unwrap(),
+                Some(KeyAction::Single(Action::Refresh))
+            );
+            assert!(editor.keyboard_shortcuts.is_some());
+            editor.handle_event(&alternate).unwrap();
+            assert!(editor.keyboard_shortcuts.is_none());
+            assert_eq!(editor.mode, mode);
+        }
+    }
+
+    #[test]
+    fn alternate_shortcut_preserves_dialog_draft() {
+        let mut editor = editor();
+        let draft = Arc::new(Mutex::new("unsent draft".to_owned()));
+        editor.current_dialog = Some(Box::new(DraftDialog(draft.clone())));
+        let alternate = Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT));
+        editor.handle_event(&alternate).unwrap();
+        assert!(editor.keyboard_shortcuts.is_some());
+        editor.handle_event(&key(KeyCode::Char('/'))).unwrap();
+        editor.handle_event(&key(KeyCode::Char('x'))).unwrap();
+        editor.handle_event(&alternate).unwrap();
+        assert!(editor.keyboard_shortcuts.is_none());
+        assert!(editor.current_dialog.is_some());
+        assert_eq!(*draft.lock().unwrap(), "unsent draft");
+    }
+
+    #[test]
+    fn alternate_shortcut_respects_editor_override() {
+        let mut editor = editor();
+        editor
+            .config
+            .keys
+            .normal
+            .insert("Alt-/".into(), KeyAction::Single(Action::Save));
+        let alternate = Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT));
+        assert_eq!(
+            editor.handle_event(&alternate).unwrap(),
+            Some(KeyAction::Single(Action::Save))
+        );
+        assert!(editor.keyboard_shortcuts.is_none());
     }
 
     #[test]

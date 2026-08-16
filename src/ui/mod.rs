@@ -56,7 +56,8 @@ pub use inline_assist::{InlineAssistPopup, InlineAssistPopupState};
 pub(crate) use inline_history::InlineHistoryPanel;
 pub use input_prompt::InputPrompt;
 pub(crate) use keyboard_shortcuts::{
-    KeyboardShortcuts, ShortcutEntry, ShortcutEvent, ShortcutHelpRegion, ShortcutTarget,
+    is_keyboard_shortcuts_alias, KeyboardShortcuts, ShortcutEntry, ShortcutEvent,
+    ShortcutHelpRegion, ShortcutTarget,
 };
 pub(crate) use keymap_hints::draw_keymap_hints;
 use list::List;
