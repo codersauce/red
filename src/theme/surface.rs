@@ -2,7 +2,9 @@
 
 use crate::color::{blend_color, ensure_minimum_contrast, Color};
 
-use super::{Style, Theme, ThemeMode, MINIMUM_SELECTION_TEXT_CONTRAST};
+use super::{
+    Style, Theme, ThemeMode, MINIMUM_SELECTION_STATE_CONTRAST, MINIMUM_SELECTION_TEXT_CONTRAST,
+};
 
 /// Text roles whose backgrounds always belong to the surrounding surface.
 #[derive(Debug, Clone)]
@@ -17,6 +19,30 @@ pub(crate) struct SurfacePalette {
 }
 
 impl SurfacePalette {
+    /// Keeps the surface's visual roles legible on a different, opaque background.
+    pub fn on_background(&self, background: Color) -> Self {
+        let mut palette = self.clone();
+        for style in [
+            &mut palette.surface,
+            &mut palette.primary,
+            &mut palette.secondary,
+            &mut palette.accent,
+            &mut palette.error,
+        ] {
+            style.bg = Some(background);
+            style.fg = style.fg.map(|foreground| {
+                ensure_minimum_contrast(foreground, background, MINIMUM_SELECTION_TEXT_CONTRAST)
+            });
+        }
+        for style in [&mut palette.muted, &mut palette.divider] {
+            style.bg = Some(background);
+            style.fg = style.fg.map(|foreground| {
+                ensure_minimum_contrast(foreground, background, MINIMUM_SELECTION_STATE_CONTRAST)
+            });
+        }
+        palette
+    }
+
     pub fn new(theme: &Theme, surface: &Style) -> Self {
         let background = blend_color(
             surface.bg.or(theme.style.bg).unwrap_or_default(),

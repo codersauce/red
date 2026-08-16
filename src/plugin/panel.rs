@@ -9,7 +9,7 @@
 //! manager-owned UI state. A plugin may replace content but must use the same panel ID to
 //! preserve that lifecycle intentionally.
 
-use std::{cell::RefCell, collections::HashMap, sync::Arc, time::Instant};
+use std::{cell::RefCell, collections::HashMap, ops::Range, sync::Arc, time::Instant};
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use serde::{Deserialize, Serialize};
@@ -21,9 +21,13 @@ use super::markdown::{
 };
 use super::text_link::{TextPanelLink, TextPanelLinkTarget};
 use crate::{
+    color::{blend_color, ensure_minimum_contrast, Color},
     editor::{render_buffer::RenderBuffer, Point},
     text_layout::{LayoutOptions, TextLayout},
-    theme::{SelectionForegroundPriority, Style, SurfacePalette, Theme, ThemeStyleSpec},
+    theme::{
+        SelectionForegroundPriority, Style, SurfacePalette, Theme, ThemeStyleSpec,
+        MINIMUM_SELECTION_TEXT_CONTRAST,
+    },
     ui::{
         normalize_prompt_newlines, ActionBar, ActionPriority, FollowTailViewport, PromptBuffer,
         PromptInput, PromptKeyPolicy, UiAction, PROMPT_MAX_BYTES,
@@ -290,6 +294,87 @@ fn text_panel_palette(theme: &Theme, config: &PanelConfig) -> TextPanelPalette {
     SurfacePalette::new(theme, &panel_style(theme, config.surface.as_ref()))
 }
 
+/// Prompt surfaces remain theme-derived, while the half-block caps blend back into
+/// the surrounding pane. The explicit color keys make this exploration tunable.
+struct TextPanelPromptPalette {
+    content: TextPanelPalette,
+    edge: Style,
+    cap: Style,
+}
+
+impl TextPanelPromptPalette {
+    fn new(theme: &Theme, panel: &TextPanelPalette, selected: bool) -> Self {
+        let surface = blend_color(
+            panel.surface.bg.unwrap_or_default(),
+            Color::Rgb { r: 0, g: 0, b: 0 },
+        );
+        let light = surface.is_light();
+        let neutral = if light {
+            Color::Rgb { r: 0, g: 0, b: 0 }
+        } else {
+            Color::Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            }
+        };
+        let background = theme_color(theme, &["red.agentPromptBackground"])
+            .map(|color| blend_color(color, surface))
+            .unwrap_or_else(|| tint_color(neutral, surface, if light { 12 } else { 17 }));
+        let accent = panel.accent.fg.unwrap_or(neutral);
+        let background = if selected {
+            theme_color(theme, &["red.agentPromptSelectedBackground"])
+                .map(|color| blend_color(color, surface))
+                .unwrap_or_else(|| tint_color(accent, background, if light { 22 } else { 32 }))
+        } else {
+            background
+        };
+        let edge_color = if selected {
+            theme_color(theme, &["red.agentPromptSelectedBorder"]).unwrap_or(accent)
+        } else {
+            theme_color(theme, &["red.agentPromptBorder"])
+                .or(panel.muted.fg)
+                .unwrap_or(accent)
+        };
+        let edge = Style {
+            fg: Some(ensure_minimum_contrast(
+                edge_color,
+                background,
+                MINIMUM_SELECTION_TEXT_CONTRAST,
+            )),
+            bg: Some(background),
+            bold: selected,
+            ..Style::default()
+        };
+        let mut content = panel.on_background(background);
+        content.accent = edge.clone();
+        Self {
+            content,
+            edge: Style {
+                bg: panel.surface.bg,
+                bold: false,
+                ..edge
+            },
+            cap: Style {
+                fg: Some(background),
+                bg: panel.surface.bg,
+                ..Style::default()
+            },
+        }
+    }
+}
+
+fn tint_color(color: Color, background: Color, alpha: u8) -> Color {
+    let (Color::Rgb { r, g, b } | Color::Rgba { r, g, b, .. }) = color;
+    blend_color(Color::Rgba { r, g, b, a: alpha }, background)
+}
+
+fn theme_color(theme: &Theme, candidates: &[&str]) -> Option<Color> {
+    candidates
+        .iter()
+        .find_map(|candidate| theme.colors.get(*candidate).copied())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TextPanelContentMetrics {
     inset: usize,
@@ -415,7 +500,15 @@ struct TextPanelLayoutLine {
 struct TextPanelLayout {
     rendered: Vec<RenderedTextLine>,
     lines: Vec<TextPanelLayoutLine>,
+    prompt_cards: Vec<TextPanelPromptCard>,
     len: usize,
+}
+
+/// Rendered rows belonging to one source-backed user prompt, including its chrome.
+#[derive(Debug, Clone)]
+struct TextPanelPromptCard {
+    block_index: usize,
+    rows: Range<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -751,25 +844,25 @@ impl TextPanel {
             .map(|(link, _)| link.target)
     }
 
-    fn build_rendered_lines(&self, width: usize) -> Vec<RenderedTextLine> {
+    fn build_rendered_lines(
+        &self,
+        width: usize,
+    ) -> (Vec<RenderedTextLine>, Vec<TextPanelPromptCard>) {
         let mut lines: Vec<RenderedTextLine> = Vec::new();
+        let mut prompt_cards = Vec::new();
         for (block_index, block) in self.blocks.iter().enumerate() {
             if block.kind == TextPanelBlockKind::User {
-                // A new user message starts a turn: separate it with a light
-                // rule and mark its lines with an accent bar instead of a
-                // one-line label.
-                if let Some(last) = lines.last_mut() {
-                    if last.is_empty() {
-                        *last = turn_separator(width);
-                    } else {
-                        lines.push(turn_separator(width));
-                    }
-                }
+                let start = lines.len();
+                let framed = width >= 7;
                 lines.push(RenderedTextLine::chrome(
-                    "▎ You".to_string(),
+                    "▄".repeat(width),
                     TextPanelSpanStyle::User,
                 ));
-                let content_width = width.saturating_sub(2).max(1);
+                lines.push(RenderedTextLine::chrome(
+                    if framed { "  You" } else { "You" }.to_string(),
+                    TextPanelSpanStyle::User,
+                ));
+                let content_width = width.saturating_sub(if framed { 4 } else { 0 }).max(1);
                 let mut block_lines = match block.format {
                     TextPanelBlockFormat::Plain => {
                         wrap_plain_text(&block.text, content_width, TextPanelSpanStyle::Text)
@@ -785,7 +878,21 @@ impl TextPanel {
                     ));
                 }
                 namespace_block_links(&mut block_lines, block_index);
-                lines.extend(block_lines.into_iter().map(user_accented));
+                lines.extend(block_lines.into_iter().map(|line| {
+                    if framed {
+                        user_padded(line)
+                    } else {
+                        line
+                    }
+                }));
+                lines.push(RenderedTextLine::chrome(
+                    "▀".repeat(width),
+                    TextPanelSpanStyle::User,
+                ));
+                prompt_cards.push(TextPanelPromptCard {
+                    block_index,
+                    rows: start..lines.len(),
+                });
             } else {
                 if let Some((label, style)) = block_label(&block.kind) {
                     lines.push(RenderedTextLine::chrome(label.to_string(), style));
@@ -828,7 +935,7 @@ impl TextPanel {
                 });
             }
         }
-        lines
+        (lines, prompt_cards)
     }
 }
 
@@ -893,6 +1000,7 @@ impl TextPanelLayout {
         Self {
             rendered,
             lines,
+            prompt_cards: Vec::new(),
             len: next,
         }
     }
@@ -1086,7 +1194,9 @@ impl TextPanel {
 
         let _span = crate::editor::perf::PerfSpan::start("panel:text_layout_miss");
         let content_width = TextPanelContentMetrics::new(width).width;
-        let mut layout = TextPanelLayout::new(self.build_rendered_lines(content_width));
+        let (rendered, prompt_cards) = self.build_rendered_lines(content_width);
+        let mut layout = TextPanelLayout::new(rendered);
+        layout.prompt_cards = prompt_cards;
         if self.status.as_ref().is_some_and(|status| status.stream) {
             if let Some(line) = layout.lines.last_mut() {
                 if line.cells.last().is_some_and(|cell| cell.text == "▌") {
@@ -1098,6 +1208,22 @@ impl TextPanel {
         let layout = Arc::new(layout);
         *self.layout_cache.borrow_mut() = Some((width, Arc::clone(&layout)));
         layout
+    }
+
+    /// The transcript cursor selects its enclosing turn. While composing, the newest
+    /// prompt stays accented without adding a second, independent selection model.
+    fn selected_prompt(&self, layout: &TextPanelLayout) -> Option<usize> {
+        if self.scrollback.focused && self.scrollback.initialized {
+            if let Some((row, _, _)) = layout.position(self.scrollback.cursor) {
+                return layout
+                    .prompt_cards
+                    .iter()
+                    .rev()
+                    .find(|card| card.rows.start <= row)
+                    .map(|card| card.block_index);
+            }
+        }
+        layout.prompt_cards.last().map(|card| card.block_index)
     }
 
     fn focus_scrollback(&mut self, width: usize) {
@@ -3642,6 +3768,9 @@ fn render_text_panel(
     let max_scroll = layout.lines.len().saturating_sub(visible_rows);
     let scroll = panel.viewport.visible_offset(max_scroll);
     let selection = panel.selection_bounds(&layout);
+    let selected_prompt = panel.selected_prompt(&layout);
+    let normal_prompt = TextPanelPromptPalette::new(theme, &palette, false);
+    let active_prompt = TextPanelPromptPalette::new(theme, &palette, true);
     for (offset, line) in layout
         .rendered
         .iter()
@@ -3650,11 +3779,58 @@ fn render_text_panel(
         .enumerate()
     {
         let line_index = scroll.saturating_add(offset);
+        let y = position.y.saturating_add(title_rows + offset);
+        let prompt_card = layout
+            .prompt_cards
+            .iter()
+            .find(|card| card.rows.contains(&line_index));
+        let prompt_palette = prompt_card.map(|card| {
+            if selected_prompt == Some(card.block_index) {
+                &active_prompt
+            } else {
+                &normal_prompt
+            }
+        });
+        let framed_prompt = prompt_palette.is_some() && metrics.width >= 7;
+        let edge_inset = usize::from(framed_prompt);
+        if let (Some(card), Some(prompt)) = (prompt_card, prompt_palette) {
+            let cap = if line_index == card.rows.start {
+                Some(("▄", "╷"))
+            } else if line_index + 1 == card.rows.end {
+                Some(("▀", "╵"))
+            } else {
+                None
+            };
+            if let Some((cap, rail)) = cap {
+                buffer.set_text(
+                    content_position.x + edge_inset,
+                    y,
+                    &cap.repeat(metrics.width.saturating_sub(edge_inset * 2)),
+                    &prompt.cap,
+                );
+                if framed_prompt {
+                    render_prompt_rails(
+                        buffer,
+                        Point::new(content_position.x, y),
+                        metrics.width,
+                        rail,
+                        &prompt.edge,
+                    );
+                }
+                continue;
+            }
+            buffer.set_text(
+                content_position.x + edge_inset,
+                y,
+                &" ".repeat(metrics.width.saturating_sub(edge_inset * 2)),
+                &prompt.content.surface,
+            );
+        }
         render_text_spans(
             buffer,
             content_position.x,
-            position.y.saturating_add(title_rows + offset),
-            metrics.width,
+            y,
+            metrics.width.saturating_sub(usize::from(framed_prompt)),
             line,
             layout.lines.get(line_index).map_or(0, |line| line.first),
             layout
@@ -3665,8 +3841,19 @@ fn render_text_panel(
                 .flatten(),
             panel.selected_link,
             theme,
-            &palette,
+            prompt_palette.map_or(&palette, |prompt| &prompt.content),
         );
+        if framed_prompt {
+            if let Some(prompt) = prompt_palette {
+                render_prompt_rails(
+                    buffer,
+                    Point::new(content_position.x, y),
+                    metrics.width,
+                    "│",
+                    &prompt.edge,
+                );
+            }
+        }
     }
 
     if let Some(status) = &panel.status {
@@ -4307,7 +4494,7 @@ fn render_panel_separator(
 
 fn block_label(kind: &TextPanelBlockKind) -> Option<(&'static str, TextPanelSpanStyle)> {
     match kind {
-        // User blocks render a rule + accent bar instead of a label.
+        // User blocks render their own prompt card and label.
         TextPanelBlockKind::User => None,
         TextPanelBlockKind::Agent => Some(("◆ Agent", TextPanelSpanStyle::Agent)),
         TextPanelBlockKind::Error => Some(("⚠ Error", TextPanelSpanStyle::Error)),
@@ -4325,15 +4512,27 @@ fn block_style(kind: &TextPanelBlockKind) -> TextPanelSpanStyle {
     }
 }
 
-fn turn_separator(width: usize) -> RenderedTextLine {
-    RenderedTextLine::chrome("─".repeat(width.max(1)), TextPanelSpanStyle::Muted)
+fn render_prompt_rails(
+    buffer: &mut RenderBuffer,
+    position: Point,
+    width: usize,
+    glyph: &str,
+    style: &Style,
+) {
+    buffer.set_text(position.x, position.y, glyph, style);
+    buffer.set_text(
+        position.x + width.saturating_sub(1),
+        position.y,
+        glyph,
+        style,
+    );
 }
 
-fn user_accented(line: RenderedTextLine) -> RenderedTextLine {
+fn user_padded(line: RenderedTextLine) -> RenderedTextLine {
     let break_after = line.break_after;
     let selection = line.selection;
     let mut spans = vec![RenderedTextSpan {
-        text: "▎ ".to_string(),
+        text: "  ".to_string(),
         style: TextPanelSpanStyle::User,
         syntax_style: None,
         link: None,
