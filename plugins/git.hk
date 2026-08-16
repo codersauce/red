@@ -1516,6 +1516,7 @@ fn workspace_event(event: GitWorkspaceEvent) {
         event.action == "horizontal_start" ||
         event.action == "horizontal_end" ||
         event.action == "toggle_wrap" ||
+        event.action == "toggle_diff_highlights" ||
         event.action == "visual" ||
         event.action == "cancel_selection" ||
         event.action == "previous_hunk" ||
@@ -2519,6 +2520,7 @@ fn help_menu() {
         PickerItem { id: "scroll", label: "Ctrl-u/d half page · Ctrl-b/f full page", kind: "Action" },
         PickerItem { id: "hunks", label: "[h / ]h previous or next hunk", kind: "Action" },
         PickerItem { id: "wrap", label: "W toggle diff wrapping", kind: "Action" },
+        PickerItem { id: "highlights", label: "H toggle line / smart word highlights", kind: "Action" },
         PickerItem { id: "select", label: "v select diff lines", kind: "Action" },
         PickerItem { id: "partial", label: "s/u/x line or range · S/U/X hunk", kind: "Staged" },
         PickerItem { id: "c", label: "c commit", kind: "GitCommit" },

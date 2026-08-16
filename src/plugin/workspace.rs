@@ -24,6 +24,28 @@ use crate::{
 
 use super::PanelSegment;
 
+mod diff;
+
+use diff::word_changes;
+
+/// How changed lines are emphasized in a structured diff.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffHighlightMode {
+    #[default]
+    Lines,
+    SmartWords,
+}
+
+impl DiffHighlightMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Lines => "lines",
+            Self::SmartWords => "smart words",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct WorkspaceConfig {
@@ -39,6 +61,9 @@ pub struct WorkspaceConfig {
     /// Whether structured detail documents wrap long lines initially.
     #[serde(default = "default_detail_wrap")]
     pub detail_wrap: bool,
+    /// Initial diff emphasis; line-only colors are the quiet default.
+    #[serde(default)]
+    pub detail_diff_highlights: DiffHighlightMode,
     /// Whether navigation handled entirely by the detail pane is also sent to
     /// the owning plugin. Plugins only need this when they implement custom
     /// navigation behavior; line operations are always delivered.
@@ -74,6 +99,7 @@ impl Default for WorkspaceConfig {
             min_two_pane_width: default_min_two_pane_width(),
             min_stacked_height: default_min_stacked_height(),
             detail_wrap: default_detail_wrap(),
+            detail_diff_highlights: DiffHighlightMode::default(),
             notify_detail_navigation: default_notify_detail_navigation(),
         }
     }
@@ -352,6 +378,7 @@ pub struct WorkspaceEvent {
     pub detail_line: Option<WorkspaceDocumentLine>,
     pub detail_selection: Option<[usize; 2]>,
     pub detail_wrap: bool,
+    pub detail_diff_highlights: DiffHighlightMode,
     /// Core-only delivery policy used by the editor and omitted from the
     /// plugin payload.
     #[serde(skip)]
@@ -371,6 +398,7 @@ pub struct PluginWorkspace {
     detail_scroll: usize,
     detail_horizontal: usize,
     detail_wrap: bool,
+    detail_diff_highlights: DiffHighlightMode,
     detail_selection_anchor: Option<usize>,
     key_prefix: Option<String>,
     detail_highlights: Vec<Vec<crate::editor::StyleInfo>>,
@@ -390,6 +418,7 @@ pub struct PluginWorkspace {
 impl PluginWorkspace {
     fn new(id: String, config: WorkspaceConfig) -> Self {
         let detail_wrap = config.detail_wrap;
+        let detail_diff_highlights = config.detail_diff_highlights;
         Self {
             id,
             config,
@@ -402,6 +431,7 @@ impl PluginWorkspace {
             detail_scroll: 0,
             detail_horizontal: 0,
             detail_wrap,
+            detail_diff_highlights,
             detail_selection_anchor: None,
             key_prefix: None,
             detail_highlights: Vec::new(),
@@ -502,7 +532,12 @@ impl PluginWorkspace {
         if document_changed {
             self.detail_highlights =
                 highlight_document(model.detail_document.as_ref(), theme, registry);
-            self.detail_word_changes = word_changes(model.detail_document.as_ref());
+            self.detail_word_changes =
+                if self.detail_diff_highlights == DiffHighlightMode::SmartWords {
+                    word_changes(model.detail_document.as_ref())
+                } else {
+                    Vec::new()
+                };
         }
         self.model = model;
         self.rebuild_detail_visible();
@@ -648,6 +683,7 @@ impl PluginWorkspace {
             detail_line,
             detail_selection,
             detail_wrap: self.detail_wrap,
+            detail_diff_highlights: self.detail_diff_highlights,
             notify_plugin,
         }
     }
@@ -901,6 +937,7 @@ impl PluginWorkspace {
                 "0" if !self.detail_wrap => "horizontal_start",
                 "$" if !self.detail_wrap => "horizontal_end",
                 "W" => "toggle_wrap",
+                "H" => "toggle_diff_highlights",
                 "M" => "toggle_metadata",
                 "v" => "visual",
                 other => other,
@@ -1055,6 +1092,18 @@ impl PluginWorkspace {
                     self.detail_horizontal = 0;
                 }
             }
+            "toggle_diff_highlights" if self.focus == WorkspaceFocus::Detail => {
+                self.detail_diff_highlights = match self.detail_diff_highlights {
+                    DiffHighlightMode::Lines => DiffHighlightMode::SmartWords,
+                    DiffHighlightMode::SmartWords => DiffHighlightMode::Lines,
+                };
+                self.detail_word_changes =
+                    if self.detail_diff_highlights == DiffHighlightMode::SmartWords {
+                        word_changes(self.model.detail_document.as_ref())
+                    } else {
+                        Vec::new()
+                    };
+            }
             "left" if self.focus == WorkspaceFocus::Detail && !self.detail_wrap => {
                 self.detail_horizontal = self.detail_horizontal.saturating_sub(4);
             }
@@ -1180,6 +1229,16 @@ impl PluginWorkspace {
                         .with_priority(ActionPriority::Secondary),
                     UiAction::new("toggle_wrap", "W", "wrap")
                         .with_priority(ActionPriority::Secondary),
+                    UiAction::new(
+                        "toggle_diff_highlights",
+                        "H",
+                        if self.detail_diff_highlights == DiffHighlightMode::Lines {
+                            "smart word highlights"
+                        } else {
+                            "line highlights"
+                        },
+                    )
+                    .with_priority(ActionPriority::Secondary),
                     UiAction::new("toggle_metadata", "M", "patch metadata")
                         .with_priority(ActionPriority::Secondary),
                 ]);
@@ -1246,6 +1305,7 @@ fn is_core_detail_interaction(focus: WorkspaceFocus, action: &str) -> bool {
                 | "visual"
                 | "cancel_selection"
                 | "toggle_wrap"
+                | "toggle_diff_highlights"
                 | "toggle_metadata"
                 | "left"
                 | "right"
@@ -1569,60 +1629,6 @@ fn highlight_document(
         .collect()
 }
 
-/// Pair replacement lines within a bounded change block. Pure additions/removals
-/// retain their line tint; only actual replacements receive stronger word marks.
-fn word_changes(document: Option<&WorkspaceDocument>) -> Vec<Vec<Range<usize>>> {
-    let Some(document) = document else {
-        return Vec::new();
-    };
-    let mut result = vec![Vec::new(); document.lines.len()];
-    let mut index = 0;
-    while index < document.lines.len() {
-        if document.lines[index].kind != "removed" {
-            index += 1;
-            continue;
-        }
-        let old_start = index;
-        while index < document.lines.len() && document.lines[index].kind == "removed" {
-            index += 1;
-        }
-        let new_start = index;
-        while index < document.lines.len() && document.lines[index].kind == "added" {
-            index += 1;
-        }
-        let pairs = (new_start - old_start).min(index - new_start).min(128);
-        for offset in 0..pairs {
-            let old = &document.lines[old_start + offset].text;
-            let new = &document.lines[new_start + offset].text;
-            if old.len().saturating_add(new.len()) > 8192 {
-                continue;
-            }
-            let old_words = old.split_word_bounds().collect::<Vec<_>>();
-            let new_words = new.split_word_bounds().collect::<Vec<_>>();
-            let diff = similar::TextDiff::from_slices(&old_words, &new_words);
-            let (mut old_byte, mut new_byte) = (0, 0);
-            for change in diff.iter_all_changes() {
-                let length = change.value().len();
-                match change.tag() {
-                    similar::ChangeTag::Equal => {
-                        old_byte += length;
-                        new_byte += length;
-                    }
-                    similar::ChangeTag::Delete => {
-                        result[old_start + offset].push(old_byte..old_byte + length);
-                        old_byte += length;
-                    }
-                    similar::ChangeTag::Insert => {
-                        result[new_start + offset].push(new_byte..new_byte + length);
-                        new_byte += length;
-                    }
-                }
-            }
-        }
-    }
-    result
-}
-
 fn highlight_document_projection(
     document: &WorkspaceDocument,
     highlighter: &mut Highlighter,
@@ -1802,6 +1808,7 @@ fn render_detail_pane(
     } else {
         "nowrap"
     };
+    let highlight_label = workspace.detail_diff_highlights.label();
     let marker = if active { "›" } else { " " };
     let title = workspace.model.detail_document.as_ref().map_or_else(
         || {
@@ -1875,12 +1882,12 @@ fn render_detail_pane(
             .unwrap_or_else(|| "File details".to_string());
         let context = if document.truncated {
             format!(
-                "{context} · first {}/{} lines · L full patch",
+                "{context} · {highlight_label} · first {}/{} lines · L full patch",
                 document.lines.len(),
                 document.total_lines
             )
         } else {
-            format!("{context} · {wrap_label}")
+            format!("{context} · {wrap_label} · {highlight_label}")
         };
         buffer.set_text(
             x,
@@ -1993,7 +2000,10 @@ fn render_detail_pane(
                     .map_or(&[], Vec::as_slice),
                 &line_style,
             );
-            if !selected && !cursor {
+            if workspace.detail_diff_highlights == DiffHighlightMode::SmartWords
+                && !selected
+                && !cursor
+            {
                 let background = match line.kind.as_str() {
                     "added" => Some(palette.added_text),
                     "removed" => Some(palette.removed_text),
@@ -2251,6 +2261,123 @@ mod tests {
         assert_eq!(changed(0), "1");
         assert_eq!(changed(1), "4");
         assert!(ranges[2].is_empty() && ranges[3].is_empty());
+    }
+
+    #[test]
+    fn line_highlights_are_default_and_smart_words_toggle_locally() {
+        let config: WorkspaceConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.detail_diff_highlights, DiffHighlightMode::Lines);
+        let theme = crate::theme::parse_vscode_theme("src/fixtures/mocha.json").unwrap();
+        let palette = DiffPalette::new(&theme);
+        let mut model = action_model();
+        model.actions[0].sections.clear();
+        model.actions[0].change_only = false;
+        model.detail_document.as_mut().unwrap().lines = [
+            ("removed", "    let count = 1;"),
+            ("added", "    let count = 4;"),
+            ("context", "next line"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (kind, text))| WorkspaceDocumentLine {
+            id: index.to_string(),
+            kind: kind.to_string(),
+            text: text.to_string(),
+            ..Default::default()
+        })
+        .collect();
+        let mut manager = WorkspaceManager::default();
+        manager.open(
+            "git".to_string(),
+            WorkspaceConfig {
+                notify_detail_navigation: false,
+                ..config
+            },
+        );
+        manager.update("git", model.clone(), &theme);
+        manager.handle_action("focus_detail".to_string(), 12, 80);
+        manager.active.as_mut().unwrap().detail_cursor = 2;
+        assert!(manager
+            .active
+            .as_ref()
+            .unwrap()
+            .detail_word_changes
+            .is_empty());
+        assert!(manager
+            .active
+            .as_ref()
+            .unwrap()
+            .actions()
+            .iter()
+            .any(|action| action.label == "smart word highlights"));
+
+        let mut buffer = RenderBuffer::new(80, 12, &theme.style);
+        manager.render(&mut buffer, &theme, PickerIconsConfig::default());
+        for (text, background) in [
+            ("let count = 1;", palette.removed.bg),
+            ("let count = 4;", palette.added.bg),
+        ] {
+            let row = buffer
+                .cells
+                .chunks(buffer.width)
+                .find(|row| {
+                    row.iter()
+                        .map(|cell| cell.text.as_str())
+                        .collect::<String>()
+                        .contains(text)
+                })
+                .unwrap();
+            assert!(row.iter().all(|cell| cell.style.bg == background));
+        }
+
+        let event = manager.handle_action("H".to_string(), 12, 80).unwrap();
+        assert_eq!(event.action, "toggle_diff_highlights");
+        assert_eq!(event.detail_diff_highlights, DiffHighlightMode::SmartWords);
+        assert!(!event.notify_plugin);
+        manager.render(&mut buffer, &theme, PickerIconsConfig::default());
+        assert!(buffer_text(&buffer).contains("smart words"));
+        for (text, changed, background) in [
+            ("let count = 1;", "1", palette.removed_text),
+            ("let count = 4;", "4", palette.added_text),
+        ] {
+            let row = buffer
+                .cells
+                .chunks(buffer.width)
+                .find(|row| {
+                    row.iter()
+                        .map(|cell| cell.text.as_str())
+                        .collect::<String>()
+                        .contains(text)
+                })
+                .unwrap();
+            let emphasized = row
+                .iter()
+                .filter(|cell| cell.style.bg == Some(background))
+                .map(|cell| cell.text.as_str())
+                .collect::<String>();
+            assert_eq!(emphasized, changed);
+        }
+
+        model.detail_document.as_mut().unwrap().lines[1].text = "    let count = 9;".to_string();
+        manager.update("git", model, &theme);
+        let workspace = manager.active.as_ref().unwrap();
+        assert_eq!(
+            workspace.detail_diff_highlights,
+            DiffHighlightMode::SmartWords
+        );
+        let document = workspace.model.detail_document.as_ref().unwrap();
+        assert_eq!(
+            &document.lines[1].text[workspace.detail_word_changes[1][0].clone()],
+            "9"
+        );
+        let event = manager.handle_action("H".to_string(), 12, 80).unwrap();
+        assert_eq!(event.detail_diff_highlights, DiffHighlightMode::Lines);
+        assert!(manager
+            .active
+            .as_ref()
+            .unwrap()
+            .detail_word_changes
+            .is_empty());
     }
 
     #[test]
