@@ -234,6 +234,9 @@ pub struct RenderDelta {
     pub lines: Vec<LinePatch>,
     /// Cursor as `(character column, zero-based row)`.
     pub cursor: (usize, usize),
+    /// Native cursor visibility and appearance; absent on older owners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_state: Option<crate::terminal_output::CursorState>,
 }
 
 /// Owner-to-client protocol messages.
@@ -317,6 +320,7 @@ impl HeadlessOwner {
             revision: self.revision,
             lines,
             cursor: self.cursor,
+            cursor_state: None,
         }
     }
 
@@ -384,6 +388,7 @@ impl HeadlessOwner {
                 })
                 .collect(),
             cursor: self.cursor,
+            cursor_state: None,
         })
     }
 
@@ -1493,6 +1498,7 @@ mod tests {
                     })
                     .collect(),
                 cursor: (0, 0),
+                cursor_state: None,
             },
         };
 
