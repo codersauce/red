@@ -275,6 +275,8 @@ async fn run() -> anyhow::Result<()> {
 
     panic::set_hook(Box::new(|info| {
         let mut stdout = stdout();
+        _ = stdout.execute(terminal::EndSynchronizedUpdate);
+        _ = stdout.execute(terminal::EnableLineWrap);
         _ = write!(stdout, "\x1b]112\x1b\\");
         _ = stdout.execute(event::DisableBracketedPaste);
         _ = stdout.execute(event::DisableFocusChange);
@@ -666,6 +668,7 @@ struct DetachedTerminalGuard;
 impl Drop for DetachedTerminalGuard {
     fn drop(&mut self) {
         let mut output = stdout();
+        _ = output.execute(terminal::EndSynchronizedUpdate);
         _ = output.execute(event::DisableBracketedPaste);
         _ = output.execute(event::DisableFocusChange);
         _ = output.execute(event::DisableMouseCapture);

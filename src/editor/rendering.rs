@@ -986,19 +986,99 @@ fn decoration_local_x(
 
 use super::display_layout::leading_whitespace_display_width;
 
-fn queue_cell_attributes(output: &mut impl io::Write, cell_style: &Style) -> anyhow::Result<()> {
-    if cell_style.bold {
-        output.queue(style::SetAttribute(style::Attribute::Bold))?;
-    } else {
-        output.queue(style::SetAttribute(style::Attribute::NormalIntensity))?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalCellStyle {
+    fg: Color,
+    bg: Color,
+    bold: bool,
+    italic: bool,
+}
+
+impl TerminalCellStyle {
+    fn resolve(style: &Style, theme: &Style) -> Self {
+        let (fg, bg) = resolve_cell_colors(style, theme);
+        Self {
+            fg,
+            bg,
+            bold: style.bold,
+            italic: style.italic,
+        }
     }
 
-    if cell_style.italic {
-        output.queue(style::SetAttribute(style::Attribute::Italic))?;
-    } else {
-        output.queue(style::SetAttribute(style::Attribute::NoItalic))?;
+    fn queue_delta(
+        self,
+        output: &mut impl io::Write,
+        previous: Option<Self>,
+    ) -> anyhow::Result<()> {
+        if previous.is_none_or(|old| old.bg != self.bg) {
+            output.queue(style::SetBackgroundColor(self.bg.into()))?;
+        }
+        if previous.is_none_or(|old| old.fg != self.fg) {
+            output.queue(style::SetForegroundColor(self.fg.into()))?;
+        }
+        if previous.is_none_or(|old| old.bold != self.bold) {
+            output.queue(style::SetAttribute(if self.bold {
+                style::Attribute::Bold
+            } else {
+                style::Attribute::NormalIntensity
+            }))?;
+        }
+        if previous.is_none_or(|old| old.italic != self.italic) {
+            output.queue(style::SetAttribute(if self.italic {
+                style::Attribute::Italic
+            } else {
+                style::Attribute::NoItalic
+            }))?;
+        }
+        Ok(())
     }
+}
 
+/// Encode changed cells while retaining only frame-local terminal state.
+/// Every frame establishes its first style, so external terminal users cannot
+/// invalidate a cross-frame style cache.
+fn queue_diff_cells(
+    output: &mut impl io::Write,
+    change_set: &[Change<'_>],
+    theme: &Style,
+) -> anyhow::Result<()> {
+    let mut previous_style = None;
+    let mut cursor_position = None;
+    let mut text = String::new();
+    let mut i = 0;
+    while i < change_set.len() {
+        let change = &change_set[i];
+        let (x, y) = (change.x, change.y);
+        let cell_style = &change.cell.style;
+        let terminal_style = TerminalCellStyle::resolve(cell_style, theme);
+        if cursor_position != Some((x, y)) {
+            output.queue(MoveTo(x as u16, y as u16))?;
+        }
+        terminal_style.queue_delta(output, previous_style)?;
+        previous_style = Some(terminal_style);
+
+        let mut next_x = x;
+        text.clear();
+        while i < change_set.len() {
+            let change = &change_set[i];
+            if change.y != y || change.x != next_x || change.cell.style != *cell_style {
+                break;
+            }
+            let cell_width = display_width(change.cell.text.as_str()).max(1);
+            text.push_str(&change.cell.text);
+            next_x += cell_width;
+            i += 1;
+            while cell_width > 1 && i < change_set.len() {
+                let padding = &change_set[i];
+                if padding.y != y || padding.x >= next_x || padding.cell.text != " " {
+                    break;
+                }
+                i += 1;
+            }
+        }
+        output.queue(style::Print(text.as_str()))?;
+        cursor_position = Some((next_x, y));
+    }
     Ok(())
 }
 
@@ -1088,6 +1168,7 @@ impl Editor {
             .expect("render buffer diff requires a previous frame")
             .apply_changes(changes);
         self.force_full_redraw = false;
+        self.last_rendered_viewport = self.rendered_viewport();
     }
 
     /// Renders the entire editor state to the terminal
@@ -1307,6 +1388,8 @@ impl Editor {
     pub(crate) fn can_render_cursor_motion_delta(&self) -> bool {
         self.terminal_output_enabled
             && self.can_reuse_editor_surfaces()
+            && self.last_rendered_viewport.is_some()
+            && self.last_rendered_viewport == self.rendered_viewport()
             && !self.relative_line_numbers_enabled()
             && self.uses_synthetic_block_cursor()
             && self.current_dialog.is_none()
@@ -1338,6 +1421,10 @@ impl Editor {
         self.update_gutter_width();
         self.fix_cursor_pos();
         self.sync_to_window();
+
+        if self.last_rendered_viewport != self.rendered_viewport() {
+            return self.render_motion_frame(buffer);
+        }
 
         let new_cursor_position = self.render_cursor_position();
         let active_window_id = self.window_manager.active_window_id();
@@ -2834,60 +2921,31 @@ impl Editor {
             return Ok(());
         }
 
-        self.stdout.queue(cursor::Hide)?;
-        self.stdout.queue(terminal::DisableLineWrap)?;
-
-        let mut i = 0;
-        let mut text = String::new();
-        while i < change_set.len() {
-            let change = &change_set[i];
-            let x = change.x;
-            let y = change.y;
-            let style = change.cell.style.clone();
-
-            self.stdout.queue(MoveTo(x as u16, y as u16))?;
-            self.queue_cell_style(&style)?;
-
-            let mut next_x = x;
-            text.clear();
-
-            while i < change_set.len() {
-                let change = &change_set[i];
-                if change.y != y || change.x != next_x || change.cell.style != style {
-                    break;
-                }
-
-                let cell_width = display_width(change.cell.text.as_str()).max(1);
-                text.push_str(change.cell.text.as_str());
-                next_x += cell_width;
-                i += 1;
-
-                while cell_width > 1 && i < change_set.len() {
-                    let padding = &change_set[i];
-                    if padding.y != y || padding.x >= next_x || padding.cell.text != " " {
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-
-            self.stdout.queue(style::Print(text.as_str()))?;
+        // Unsupported terminals ignore this private mode. Keep the end marker
+        // outside the fallible body so an interrupted frame cannot leave a
+        // supporting terminal displaying a frozen screen.
+        let result = (|| -> anyhow::Result<()> {
+            self.stdout.queue(terminal::BeginSynchronizedUpdate)?;
+            self.stdout.queue(cursor::Hide)?;
+            self.stdout.queue(terminal::DisableLineWrap)?;
+            queue_diff_cells(&mut self.stdout, change_set, &self.theme.style)?;
+            self.set_cursor_style()?;
+            self.draw_cursor_preserving_cursor_goal()?;
+            Ok(())
+        })();
+        let restore_wrap = self.stdout.queue(terminal::EnableLineWrap).map(|_| ());
+        let end_frame = self
+            .stdout
+            .queue(terminal::EndSynchronizedUpdate)
+            .map(|_| ());
+        let flush = self.flush_terminal_output();
+        if result.is_err() || restore_wrap.is_err() || end_frame.is_err() || flush.is_err() {
+            self.force_full_redraw = true;
         }
-
-        self.stdout.queue(terminal::EnableLineWrap)?;
-        self.set_cursor_style()?;
-        self.draw_cursor_preserving_cursor_goal()?;
-        self.flush_terminal_output()?;
-
-        Ok(())
-    }
-
-    fn queue_cell_style(&mut self, cell_style: &Style) -> anyhow::Result<()> {
-        let (fg, bg) = resolve_cell_colors(cell_style, &self.theme.style);
-        self.stdout.queue(style::SetBackgroundColor(bg.into()))?;
-        self.stdout.queue(style::SetForegroundColor(fg.into()))?;
-        queue_cell_attributes(&mut self.stdout, cell_style)?;
-
+        result?;
+        restore_wrap?;
+        end_frame?;
+        flush?;
         Ok(())
     }
 
@@ -4538,14 +4596,15 @@ mod tests {
     fn queue_cell_attributes_sets_and_clears_tracked_attributes() {
         let mut output = Vec::new();
 
-        queue_cell_attributes(
-            &mut output,
+        TerminalCellStyle::resolve(
             &Style {
                 bold: true,
                 italic: true,
                 ..Style::default()
             },
+            &Style::default(),
         )
+        .queue_delta(&mut output, None)
         .unwrap();
 
         let output = String::from_utf8(output).unwrap();
@@ -4559,7 +4618,9 @@ mod tests {
         );
 
         let mut output = Vec::new();
-        queue_cell_attributes(&mut output, &Style::default()).unwrap();
+        TerminalCellStyle::resolve(&Style::default(), &Style::default())
+            .queue_delta(&mut output, None)
+            .unwrap();
 
         let output = String::from_utf8(output).unwrap();
         assert!(
@@ -4570,5 +4631,166 @@ mod tests {
             output.contains("\x1b[23m"),
             "plain style should clear italic attribute"
         );
+    }
+
+    #[test]
+    fn terminal_diff_reuses_style_and_position_without_losing_wide_cells() {
+        let first = Style {
+            fg: Some(Color::Rgb { r: 1, g: 2, b: 3 }),
+            bg: Some(Color::Rgb { r: 4, g: 5, b: 6 }),
+            ..Style::default()
+        };
+        let second = Style {
+            fg: Some(Color::Rgb { r: 7, g: 8, b: 9 }),
+            ..first.clone()
+        };
+        let emphasized = Style {
+            bold: true,
+            italic: true,
+            ..second.clone()
+        };
+        let mut buffer = RenderBuffer::new(8, 2, &Style::default());
+        for (x, style) in [
+            (0, &first),
+            (1, &second),
+            (2, &emphasized),
+            (3, &first),
+            (6, &first),
+        ] {
+            buffer.set_text(x, 0, "x", style);
+        }
+        buffer.set_text(0, 1, "界z", &first);
+        let changes = [0, 1, 2, 3, 6, 8, 9, 10]
+            .into_iter()
+            .map(|index| Change {
+                x: index % 8,
+                y: index / 8,
+                cell: &buffer.cells[index],
+            })
+            .collect::<Vec<_>>();
+        let mut output = Vec::new();
+        queue_diff_cells(&mut output, &changes, &Style::default()).unwrap();
+        let mut expected = Vec::new();
+        expected.queue(MoveTo(0, 0)).unwrap();
+        TerminalCellStyle::resolve(&first, &Style::default())
+            .queue_delta(&mut expected, None)
+            .unwrap();
+        expected.queue(style::Print("x")).unwrap();
+        expected
+            .queue(style::SetForegroundColor(second.fg.unwrap().into()))
+            .unwrap()
+            .queue(style::Print("x"))
+            .unwrap()
+            .queue(style::SetAttribute(style::Attribute::Bold))
+            .unwrap()
+            .queue(style::SetAttribute(style::Attribute::Italic))
+            .unwrap()
+            .queue(style::Print("x"))
+            .unwrap()
+            .queue(style::SetForegroundColor(first.fg.unwrap().into()))
+            .unwrap()
+            .queue(style::SetAttribute(style::Attribute::NormalIntensity))
+            .unwrap()
+            .queue(style::SetAttribute(style::Attribute::NoItalic))
+            .unwrap()
+            .queue(style::Print("x"))
+            .unwrap()
+            .queue(MoveTo(6, 0))
+            .unwrap()
+            .queue(style::Print("x"))
+            .unwrap()
+            .queue(MoveTo(0, 1))
+            .unwrap()
+            .queue(style::Print("界z"))
+            .unwrap();
+        assert_eq!(output, expected);
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches("\x1b[22m").count(), 2);
+        assert_eq!(output.matches("\x1b[23m").count(), 2);
+        assert_eq!(output.matches("\x1b[1m").count(), 1);
+        assert_eq!(output.matches("\x1b[3m").count(), 1);
+        assert!(output.contains("\x1b[1;1H"));
+        assert!(output.contains("\x1b[1;7H"));
+        assert!(output.contains("\x1b[2;1H界z"));
+        assert_eq!(output.matches('H').count(), 3);
+    }
+
+    #[test]
+    fn terminal_style_delta_compares_resolved_theme_colors() {
+        let theme = Style {
+            fg: Some(Color::Rgb { r: 1, g: 2, b: 3 }),
+            ..Style::default()
+        };
+        let implicit = TerminalCellStyle::resolve(&Style::default(), &theme);
+        let explicit = TerminalCellStyle::resolve(&theme, &theme);
+        assert_eq!(implicit, explicit);
+        let mut output = Vec::new();
+        explicit.queue_delta(&mut output, Some(implicit)).unwrap();
+        assert!(output.is_empty());
+    }
+
+    struct CapturedOutput {
+        bytes: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        fail_at: Option<usize>,
+    }
+
+    impl io::Write for CapturedOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut output = self.bytes.lock().unwrap();
+            if let Some(limit) = self.fail_at {
+                if output.len() >= limit {
+                    self.fail_at = None;
+                    return Err(io::Error::other("injected frame write failure"));
+                }
+                let count = bytes.len().min(limit - output.len());
+                output.extend_from_slice(&bytes[..count]);
+                return Ok(count);
+            }
+            output.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn synchronized_terminal_frames_end_on_success_and_write_failure() {
+        for fail_at in [None, Some(40)] {
+            let mut editor = rendering_test_editor(Buffer::new(None, "text".into()));
+            editor.terminal_output_enabled = true;
+            let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            editor.stdout = std::io::BufWriter::with_capacity(
+                1,
+                Box::new(CapturedOutput {
+                    bytes: bytes.clone(),
+                    fail_at,
+                }) as super::super::TerminalOutput,
+            );
+            let source =
+                RenderBuffer::new_with_contents(4, 1, Style::default(), vec!["test".into()]);
+            let changes = source
+                .cells
+                .iter()
+                .enumerate()
+                .map(|(x, cell)| Change { x, y: 0, cell })
+                .collect::<Vec<_>>();
+            let result = editor.render_diff(&changes);
+            let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+            assert!(output.starts_with("\x1b[?2026h"));
+            assert!(output.ends_with("\x1b[?7h\x1b[?2026l"));
+            assert_eq!(output.matches("\x1b[?2026h").count(), 1);
+            assert_eq!(output.matches("\x1b[?2026l").count(), 1);
+            if fail_at.is_some() {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected frame write failure"));
+                assert!(editor.force_full_redraw);
+            } else {
+                result.unwrap();
+            }
+        }
     }
 }
