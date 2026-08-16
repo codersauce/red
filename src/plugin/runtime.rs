@@ -4154,11 +4154,12 @@ fn _keep_config_used(_: &Config) {}
 mod tests {
     use std::{
         path::{Path, PathBuf},
+        process::Command,
         time::{Duration, Instant},
     };
 
     #[cfg(not(windows))]
-    use std::{fs, process::Command};
+    use std::fs;
 
     use super::*;
     use crate::{color::Color, editor::PluginRequest, ui::PickerPresentation};
@@ -4612,7 +4613,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(windows))]
     async fn load_git_runtime(root: &Path) -> Runtime {
         let mut runtime = Runtime::new_with_permissions(HashMap::from([(
             "git".to_string(),
@@ -11157,16 +11157,33 @@ mod tests {
     async fn git_menus_and_prompts_use_scoped_picker_callbacks() {
         drain_requests();
 
-        let mut runtime = Runtime::new_with_permissions(HashMap::from([(
-            "git".to_string(),
-            PluginPermissions {
-                process: vec!["git".to_string()],
-            },
-        )]));
-        runtime
-            .load_plugin("git", include_str!("../../plugins/git.hk"))
-            .await
-            .unwrap();
+        // Submitting the branch prompt runs real Git. Resolve the plugin's cwd
+        // before invoking it so the test cannot switch the checkout under test.
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec![
+                "-c",
+                "user.name=Red Tests",
+                "-c",
+                "user.email=red@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "test: initial",
+            ],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let mut runtime = load_git_runtime(root).await;
         drain_requests();
 
         runtime
@@ -11270,6 +11287,35 @@ mod tests {
             }
             _ => panic!("expected callback-backed command log"),
         }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            drain_requests();
+            if runtime
+                .inner
+                .lock()
+                .unwrap()
+                .host
+                .process_manager
+                .active_process_count("git")
+                == 0
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "branch creation did not finish");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let branch = Command::new("git")
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(branch.status.success());
+        assert_eq!(
+            String::from_utf8(branch.stdout).unwrap().trim(),
+            "feature/readable-pickers"
+        );
     }
 
     #[cfg(not(windows))]
