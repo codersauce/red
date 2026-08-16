@@ -157,7 +157,10 @@ impl DiffPalette {
                 .get(text_key)
                 .copied()
                 .unwrap_or_else(|| tint(accent, 72));
-            (theme.style.with_bg(Some(line)), blend_color(text, line))
+            // Keep inline emphasis subordinate to the code and its line tint,
+            // even when a theme supplies a very strong text background.
+            let text = blend_color(tint(blend_color(text, line), 160), line);
+            (theme.style.with_bg(Some(line)), text)
         };
         let (added_style, added_text) = resolve(
             "diffEditor.insertedLineBackground",

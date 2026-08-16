@@ -60,6 +60,6 @@ pub use window_bar::{
     WindowBarOverflow, WindowBarSegment, WindowBarSemanticStyle, WindowBarStyle,
 };
 pub use workspace::{
-    WorkspaceConfig, WorkspaceDocument, WorkspaceDocumentLine, WorkspaceManager, WorkspaceModel,
-    WorkspaceRow,
+    DiffHighlightMode, WorkspaceConfig, WorkspaceDocument, WorkspaceDocumentLine, WorkspaceManager,
+    WorkspaceModel, WorkspaceRow,
 };
