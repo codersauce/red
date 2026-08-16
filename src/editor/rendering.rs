@@ -1187,6 +1187,13 @@ impl Editor {
         let prepare_span = super::perf::PerfSpan::start("render:prepare");
         self.update_gutter_width();
         self.apply_panel_layout();
+        if self.force_full_redraw {
+            *buffer = RenderBuffer::new(
+                usize::from(self.size.0),
+                usize::from(self.size.1),
+                &self.theme.style,
+            );
+        }
         self.fix_cursor_pos();
         self.check_bounds();
         self.sync_to_window();
@@ -1499,6 +1506,9 @@ impl Editor {
         let Some(window) = window_data else {
             return Ok(());
         };
+        if !self.window_manager.is_presented(window.id) {
+            return Ok(());
+        }
 
         let local_rows = terminal_rows
             .iter()
@@ -1822,6 +1832,9 @@ impl Editor {
     /// recomputed per render; once its conditions fail after it has been
     /// shown, the splash is latched off for the rest of the session.
     fn splash_should_render(&mut self) -> bool {
+        if self.zoomed_pane.is_some() {
+            return false;
+        }
         if self.splash_dismissed {
             return false;
         }
@@ -1880,6 +1893,9 @@ impl Editor {
     fn render_window(&mut self, buffer: &mut RenderBuffer, window_id: usize) -> anyhow::Result<()> {
         // Clone the window data to avoid borrowing issues
         if let Some(window) = self.window_manager.window_at_index(window_id).cloned() {
+            if !self.window_manager.is_presented(window.id) {
+                return Ok(());
+            }
             self.render_window_bar(buffer, &window);
 
             // Render the gutter for this window
@@ -1925,6 +1941,9 @@ impl Editor {
 
     /// Render all window separators based on the split tree
     fn render_all_window_separators(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
+        if !self.window_manager.presents_dividers() {
+            return Ok(());
+        }
         let separator_style = Style {
             fg: Some(Color::Rgb {
                 r: 100,
@@ -3181,6 +3200,15 @@ impl Editor {
         let right_start =
             draw_statusline_right(buffer, y, term_width, right, &base_style, right_separator);
         draw_statusline_left(buffer, y, right_start, &left, &base_style, left_separator);
+        if self.zoomed_pane.is_some() {
+            let hint = truncate_display_width(" ZOOM · Ctrl-w z ", term_width);
+            buffer.set_text(
+                term_width.saturating_sub(display_width(&hint)),
+                y,
+                &hint,
+                &base_style,
+            );
+        }
     }
 
     fn refresh_statusline_git(&mut self, file: Option<&str>, load_changes: bool) {
@@ -3478,6 +3506,9 @@ impl Editor {
         range: TextRange,
     ) -> Option<(usize, usize)> {
         let window = self.window_manager.window(window_id)?;
+        if !self.window_manager.is_presented(window_id) {
+            return None;
+        }
         let layout = self.layout_for_window(window);
         let last_line = range.end.line.saturating_sub(usize::from(
             range.end.character == 0 && range.end.line > range.start.line,
@@ -4396,6 +4427,38 @@ mod tests {
             .unwrap();
 
         assert!(editor.search_match_cache.is_none());
+    }
+
+    #[test]
+    fn window_zoom_partial_frames_do_not_repaint_hidden_windows() {
+        let config = Config::default();
+        let lsp = Box::new(LspManager::new(config.lsp.clone()));
+        let source = Buffer::new(None, "visible-marker\n".to_string());
+        let hidden = Buffer::new(None, "hidden-marker\n".to_string());
+        let mut editor =
+            Editor::with_size(lsp, 80, 24, config, Theme::default(), vec![source, hidden]).unwrap();
+        editor.test_disable_terminal_output();
+        editor.window_manager.split_vertical(1).unwrap();
+        editor.window_manager.set_active(0);
+        editor.sync_with_window();
+        editor.toggle_pane_zoom();
+        let mut buffer = RenderBuffer::new(80, 24, &Style::default());
+        editor.render(&mut buffer).unwrap();
+        editor.render_editor_windows_frame(&mut buffer).unwrap();
+        let content = buffer.cells[..80 * 22]
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>();
+        assert!(content.contains("visible-marker"));
+        assert!(!content.contains("hidden-marker"));
+        assert!(!content.contains('│'));
+        editor.clear_pane_zoom();
+        editor.render(&mut buffer).unwrap();
+        let content = buffer.cells[..80 * 22]
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>();
+        assert!(content.contains("hidden-marker"));
     }
 
     #[test]

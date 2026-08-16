@@ -376,6 +376,7 @@ Esc = { EnterMode = "Normal" }
 ">" = { ResizeWindowRight = 1 }
 "=" = "BalanceWindows"
 "_" = "MaximizeWindow"
+"z" = "TogglePaneZoom"
 "o" = "OnlyWindow"
 
 [keys.normal." "]

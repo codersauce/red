@@ -194,6 +194,14 @@ impl WorkspaceLayout {
             width,
             height: height.saturating_sub(3),
         };
+        if let Some(focus) = workspace.zoomed {
+            return Self {
+                mode: WorkspaceLayoutMode::Focused,
+                rows: (focus == WorkspaceFocus::Rows).then_some(body),
+                detail: (focus == WorkspaceFocus::Detail).then_some(body),
+                separator: None,
+            };
+        }
         if workspace.rows_hidden && workspace.model.detail_document.is_some() {
             return Self {
                 mode: WorkspaceLayoutMode::Focused,
@@ -358,6 +366,7 @@ pub struct PluginWorkspace {
     selected: usize,
     scroll: usize,
     focus: WorkspaceFocus,
+    zoomed: Option<WorkspaceFocus>,
     detail_cursor: usize,
     detail_scroll: usize,
     detail_horizontal: usize,
@@ -388,6 +397,7 @@ impl PluginWorkspace {
             selected: 0,
             scroll: 0,
             focus: WorkspaceFocus::Rows,
+            zoomed: None,
             detail_cursor: 0,
             detail_scroll: 0,
             detail_horizontal: 0,
@@ -422,6 +432,9 @@ impl PluginWorkspace {
     ) {
         if model.detail_document.is_none() {
             self.focus = WorkspaceFocus::Rows;
+            if self.zoomed == Some(WorkspaceFocus::Detail) {
+                self.zoomed = None;
+            }
             self.detail_selection_anchor = None;
         }
         let selected_id = self
@@ -857,9 +870,6 @@ impl PluginWorkspace {
             self.action_menu.open();
             return self.event("noop".to_string());
         }
-        let layout = WorkspaceLayout::calculate(self, height, width);
-        let visible_rows = layout.visible_rows(self.focus);
-
         if let Some(prefix) = self.key_prefix.take() {
             action = match (prefix.as_str(), action.as_str()) {
                 ("ctrl_w", "w" | "ctrl_w") => "focus_next",
@@ -867,6 +877,7 @@ impl PluginWorkspace {
                 ("ctrl_w", "h") => "focus_rows",
                 ("ctrl_w", "l") => "focus_detail",
                 ("ctrl_w", "o") => "toggle_rows",
+                ("ctrl_w", "z") => "toggle_zoom",
                 ("ctrl_w", "<") => "narrow_rows",
                 ("ctrl_w", ">") => "widen_rows",
                 ("ctrl_w", "c" | "q") => "escape",
@@ -916,8 +927,26 @@ impl PluginWorkspace {
             .to_string();
         }
 
+        if matches!(
+            action.as_str(),
+            "toggle"
+                | "back_toggle"
+                | "focus_next"
+                | "focus_previous"
+                | "focus_rows"
+                | "focus_detail"
+                | "toggle_rows"
+                | "narrow_rows"
+                | "widen_rows"
+        ) {
+            self.zoomed = None;
+        }
+        let layout = WorkspaceLayout::calculate(self, height, width);
+        let visible_rows = layout.visible_rows(self.focus);
+
         match action.as_str() {
             "filter" => self.filtering = true,
+            "toggle_zoom" => self.toggle_zoom(),
             "collapse_section" => {
                 self.toggle_section();
                 action = "filter_changed".to_string();
@@ -1059,6 +1088,15 @@ impl PluginWorkspace {
         self.event(action)
     }
 
+    fn toggle_zoom(&mut self) {
+        self.zoomed = if self.zoomed.is_some() {
+            None
+        } else {
+            Some(self.focus)
+        };
+        self.dragging_separator = false;
+    }
+
     fn actions(&self) -> Vec<UiAction> {
         if self.filtering {
             return vec![
@@ -1190,6 +1228,7 @@ fn is_core_detail_interaction(focus: WorkspaceFocus, action: &str) -> bool {
             | "focus_detail"
             | "filter"
             | "toggle_rows"
+            | "toggle_zoom"
             | "narrow_rows"
             | "widen_rows"
     ) || (focus == WorkspaceFocus::Detail
@@ -1288,6 +1327,12 @@ impl WorkspaceManager {
 
     pub fn is_active(&self) -> bool {
         self.active.is_some()
+    }
+
+    pub(crate) fn toggle_zoom(&mut self) {
+        if let Some(workspace) = self.active.as_mut() {
+            workspace.toggle_zoom();
+        }
     }
 
     pub fn is_filtering(&self) -> bool {
@@ -1400,7 +1445,12 @@ impl WorkspaceManager {
             return;
         }
 
-        let title = format!(" {} ", workspace.config.title);
+        let zoom_hint = if workspace.zoomed.is_some() {
+            " · ZOOM · Ctrl-w z"
+        } else {
+            ""
+        };
+        let title = format!(" {}{} ", workspace.config.title, zoom_hint);
         buffer.set_text(
             1,
             0,
@@ -2473,6 +2523,53 @@ mod tests {
         assert!(detail.contains("src/main.rs"));
         assert!(detail.contains("wrap"));
         assert!(detail.contains("let first = true"));
+    }
+
+    #[test]
+    fn workspace_zoom_restores_responsive_layout_and_preferences() {
+        let theme = Theme::default();
+        let mut workspace = PluginWorkspace::new(
+            "git".to_string(),
+            WorkspaceConfig {
+                notify_detail_navigation: false,
+                ..WorkspaceConfig::default()
+            },
+        );
+        workspace.update(model_with_document(), &theme);
+        workspace.rows_width = Some(31);
+        for (width, height) in [(120, 28), (80, 24), (60, 12)] {
+            for focus in [WorkspaceFocus::Rows, WorkspaceFocus::Detail] {
+                workspace.focus = focus;
+                let normal = WorkspaceLayout::calculate(&workspace, height, width);
+                workspace.handle_action("ctrl_w".to_string(), height, width);
+                let event = workspace.handle_action("z".to_string(), height, width);
+                assert_eq!(event.action, "toggle_zoom");
+                assert!(!event.notify_plugin);
+                let zoomed = WorkspaceLayout::calculate(&workspace, height, width);
+                assert_eq!(zoomed.pane(focus).unwrap().width, width);
+                assert_eq!(zoomed.pane(focus).unwrap().height, height - 3);
+                assert!(zoomed.separator.is_none());
+                assert_eq!(workspace.rows_width, Some(31));
+                workspace.handle_action("toggle_zoom".to_string(), height, width);
+                assert_eq!(
+                    WorkspaceLayout::calculate(&workspace, height, width),
+                    normal
+                );
+            }
+        }
+        workspace.rows_hidden = true;
+        workspace.focus = WorkspaceFocus::Detail;
+        workspace.toggle_zoom();
+        workspace.toggle_zoom();
+        assert!(workspace.rows_hidden);
+        workspace.toggle_zoom();
+        workspace.handle_action("focus_rows".to_string(), 24, 120);
+        assert_eq!(workspace.zoomed, None);
+        assert_eq!(workspace.focus, WorkspaceFocus::Rows);
+        workspace.focus = WorkspaceFocus::Detail;
+        workspace.toggle_zoom();
+        workspace.update(WorkspaceModel::default(), &theme);
+        assert_eq!(workspace.zoomed, None);
     }
 
     #[test]

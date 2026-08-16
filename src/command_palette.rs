@@ -905,6 +905,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Action::MaximizeWindow,
         ),
         builtin(
+            "window.toggle_zoom",
+            "Maximize/restore pane",
+            "Window",
+            "Toggle a fullscreen view of the focused window or pane",
+            None,
+            &["zoom", "restore"],
+            Action::TogglePaneZoom,
+        ),
+        builtin(
             "lsp.diagnostics",
             "Diagnostics",
             "LSP",
@@ -1239,6 +1248,7 @@ fn action_label(action: &Action) -> String {
         Action::BalanceWindows => "Balance windows".to_string(),
         Action::ResetPanelLayout(_) => "Reset panel layout".to_string(),
         Action::MaximizeWindow => "Maximize window".to_string(),
+        Action::TogglePaneZoom => "Maximize/restore pane".to_string(),
         Action::NextWindow => "Next window".to_string(),
         Action::PreviousWindow => "Previous window".to_string(),
         Action::MoveWindowLeft => "Focus window left".to_string(),
@@ -1416,6 +1426,12 @@ mod tests {
             .shortcuts
             .iter()
             .any(|shortcut| shortcut == "Ctrl-w r"));
+        let zoom = entries
+            .iter()
+            .find(|entry| entry.id == "window.toggle_zoom")
+            .unwrap();
+        assert_eq!(zoom.action, Action::TogglePaneZoom);
+        assert!(zoom.shortcuts.iter().any(|shortcut| shortcut == "Ctrl-w z"));
     }
 
     #[test]

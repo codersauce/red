@@ -189,6 +189,9 @@ The command palette includes descriptions, effective keymaps, and accepted
 - `Ctrl-w c` closes a window.
 - `Ctrl-w =` balances editor splits or restores a focused pane's original size.
 - `Ctrl-w _` and `Ctrl-w o` maximize or keep only the current window.
+- `Ctrl-w z` maximizes the focused window or docked pane; press it again to
+  restore the layout. Moving focus or changing the layout restores it first.
+  The same chord zooms the focused file-list or diff pane in Git workspaces.
 - `Space Space`, `Space n`, and `Space p` move through buffers.
 
 ## Command mode

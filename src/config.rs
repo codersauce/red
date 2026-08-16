@@ -3820,6 +3820,10 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
             Some(&KeyAction::Single(Action::MaximizeWindow))
         );
         assert_eq!(
+            ctrl_w.get("z"),
+            Some(&KeyAction::Single(Action::TogglePaneZoom))
+        );
+        assert_eq!(
             ctrl_w.get("o"),
             Some(&KeyAction::Single(Action::OnlyWindow))
         );
