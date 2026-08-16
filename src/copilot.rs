@@ -222,6 +222,9 @@ pub(crate) enum Event {
         user_code: String,
         command: Value,
     },
+    SignInFinished {
+        error: Option<String>,
+    },
     Message {
         id: Value,
         message: String,
@@ -322,6 +325,7 @@ struct Document {
 enum Pending {
     Initialize,
     SignIn,
+    FinishSignIn,
     Completion(Snapshot),
     Other,
 }
@@ -440,7 +444,7 @@ impl<W: AsyncWrite + Unpin> Protocol<W> {
                 if command.get("command").and_then(Value::as_str)
                     == Some("github.copilot.finishDeviceFlow")
                 {
-                    self.request("workspace/executeCommand", command, Pending::Other)
+                    self.request("workspace/executeCommand", command, Pending::FinishSignIn)
                         .await?;
                 }
             }
@@ -652,7 +656,15 @@ async fn handle_message<W: AsyncWrite + Unpin>(
         if matches!(pending, Pending::Initialize) {
             bail!("initialization failed: {message}");
         }
-        events.send(Event::Status(message)).await?;
+        if matches!(pending, Pending::SignIn | Pending::FinishSignIn) {
+            events
+                .send(Event::SignInFinished {
+                    error: Some(message),
+                })
+                .await?;
+        } else {
+            events.send(Event::Status(message)).await?;
+        }
         return Ok(false);
     }
     let result = &value["result"];
@@ -677,10 +689,11 @@ async fn handle_message<W: AsyncWrite + Unpin>(
                     })
                     .await?;
             } else {
-                events
-                    .send(Event::Status("Already signed in".into()))
-                    .await?;
+                events.send(Event::SignInFinished { error: None }).await?;
             }
+        }
+        Pending::FinishSignIn => {
+            events.send(Event::SignInFinished { error: None }).await?;
         }
         Pending::Completion(snapshot) => {
             let items = result["items"]
@@ -962,7 +975,7 @@ mod tests {
         let command = json!({"command":"github.copilot.finishDeviceFlow","arguments":[]});
         handle_message(
             &mut protocol,
-            json!({"id":signin["id"],"result":{"userCode":"ABCD-EFGH","command":command}}),
+            json!({"id":signin["id"],"result":{"userCode":"ABCD-EFGH","command":command.clone()}}),
             &events,
         )
         .await
@@ -970,6 +983,52 @@ mod tests {
         assert!(
             matches!(received.recv().await,Some(Event::SignIn{user_code,..}) if user_code=="ABCD-EFGH")
         );
+        protocol
+            .control(Control::FinishSignIn(command))
+            .await
+            .unwrap();
+        let finish = read(&mut reader).await;
+        assert_eq!(
+            finish["params"]["command"],
+            "github.copilot.finishDeviceFlow"
+        );
+        handle_message(
+            &mut protocol,
+            json!({"id":finish["id"],"result":null}),
+            &events,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            received.recv().await,
+            Some(Event::SignInFinished { error: None })
+        ));
+        protocol.control(Control::SignIn).await.unwrap();
+        let signin = read(&mut reader).await;
+        handle_message(
+            &mut protocol,
+            json!({"id":signin["id"],"result":{}}),
+            &events,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            received.recv().await,
+            Some(Event::SignInFinished { error: None })
+        ));
+        protocol.control(Control::SignIn).await.unwrap();
+        let signin = read(&mut reader).await;
+        handle_message(
+            &mut protocol,
+            json!({"id":signin["id"],"error":{"code":-32002,"message":"not authorized"}}),
+            &events,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            received.recv().await,
+            Some(Event::SignInFinished { error: Some(error) }) if error == "not authorized"
+        ));
         handle_message(
             &mut protocol,
             json!({"id":"edit","method":"workspace/applyEdit","params":{}}),

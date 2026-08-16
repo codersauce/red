@@ -131,8 +131,9 @@ use crate::{
     textobjects::{ResolvedTextObject, SyntaxObjectKind, SyntaxTextObjectService},
     theme::{parse_vscode_theme, parse_vscode_theme_contents, Style, Theme},
     ui::{
-        AgentComposer, CompletionUI, Component, Confirmation, DiagnosticInfo, FilePicker,
-        HoverInfo, HoverInfoFormat, Info, InlineAssistPopup, InlineAssistPopupState, InputPrompt,
+        AgentComposer, CompletionUI, Component, Confirmation, CopilotSignInDialog,
+        CopilotSignInModel, CopilotSignInPhase, DiagnosticInfo, FilePicker, HoverInfo,
+        HoverInfoFormat, Info, InlineAssistPopup, InlineAssistPopupState, InputPrompt,
         LegacyPickerOptions, OverlayLayout, Picker, PickerItem, PickerOptions, PickerPreview,
         PickerUpdate, ScreenRect, StatuslineLayoutPanel, WhatsNewPanel,
     },
@@ -2474,10 +2475,14 @@ pub enum Action {
 
     RequestCompletion,
     Copilot(String),
+    CopilotEnableAndSignIn,
     RequestInlineCompletion,
     AcceptInlineCompletion,
     DismissInlineCompletion,
     CopilotFinishSignIn(Value),
+    CopilotCopySignInCode(String),
+    CopilotRetrySignIn,
+    CopilotDismissSignIn,
     CopilotRespond {
         id: Value,
         result: Value,
@@ -16290,7 +16295,12 @@ impl Editor {
         let sensitive_action = matches!(action, Action::NotifyPlugin(_, _, _))
             || matches!(
                 action,
-                Action::CopilotFinishSignIn(_) | Action::CopilotRespond { .. }
+                Action::CopilotFinishSignIn(_)
+                    | Action::CopilotEnableAndSignIn
+                    | Action::CopilotCopySignInCode(_)
+                    | Action::CopilotRetrySignIn
+                    | Action::CopilotDismissSignIn
+                    | Action::CopilotRespond { .. }
             )
             || matches!(action, Action::SubmitInlineAssist(_))
             || matches!(action, Action::NotifyPlugins(method, _) if method.starts_with("composer:"));
@@ -19987,6 +19997,11 @@ impl Editor {
                 self.handle_copilot_command(command);
                 self.render(buffer)?;
             }
+            Action::CopilotEnableAndSignIn => {
+                add_to_history = false;
+                self.enable_and_sign_in_copilot();
+                self.render(buffer)?;
+            }
             Action::RequestInlineCompletion => {
                 add_to_history = false;
                 self.request_inline_completion(false);
@@ -20005,6 +20020,20 @@ impl Editor {
                 add_to_history = false;
                 self.copilot_control(crate::copilot::Control::FinishSignIn(command.clone()));
                 self.render(buffer)?;
+            }
+            Action::CopilotCopySignInCode(code) => {
+                add_to_history = false;
+                self.copy_copilot_sign_in_code(code);
+                self.render(buffer)?;
+            }
+            Action::CopilotRetrySignIn => {
+                add_to_history = false;
+                self.retry_copilot_sign_in();
+                self.render(buffer)?;
+            }
+            Action::CopilotDismissSignIn => {
+                add_to_history = false;
+                self.inline_completion.sign_in = None;
             }
             Action::CopilotRespond { id, result } => {
                 add_to_history = false;

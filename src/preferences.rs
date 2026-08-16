@@ -35,6 +35,8 @@ pub struct Preferences {
     last_seen_version: Option<String>,
     #[serde(default)]
     panel_layouts: HashMap<String, HashMap<String, PanelLayoutPreference>>,
+    #[serde(default)]
+    copilot_setup_hint_seen: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +137,21 @@ impl PreferencesStore {
             return Ok(());
         }
         self.preferences.last_seen_version = Some(version.to_string());
+        self.save()
+    }
+
+    /// Whether the optional Copilot setup hint has already been presented.
+    #[must_use]
+    pub fn copilot_setup_hint_seen(&self) -> bool {
+        self.preferences.copilot_setup_hint_seen
+    }
+
+    /// Records presentation of the one-time Copilot setup hint.
+    pub fn mark_copilot_setup_hint_seen(&mut self) -> anyhow::Result<()> {
+        if self.preferences.copilot_setup_hint_seen {
+            return Ok(());
+        }
+        self.preferences.copilot_setup_hint_seen = true;
         self.save()
     }
 
@@ -528,6 +545,20 @@ mod tests {
 
         let reloaded = PreferencesStore::load(&path);
         assert_eq!(reloaded.last_seen_version(), Some("0.5.0"));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn copilot_setup_hint_is_unseen_by_default_and_survives_reload() {
+        let dir = unique_temp_dir("copilot-hint-preferences");
+        let path = dir.join("preferences.json");
+        let mut store = PreferencesStore::load(&path);
+
+        assert!(!store.copilot_setup_hint_seen());
+        store.mark_copilot_setup_hint_seen().unwrap();
+
+        let reloaded = PreferencesStore::load(&path);
+        assert!(reloaded.copilot_setup_hint_seen());
         fs::remove_dir_all(dir).ok();
     }
 

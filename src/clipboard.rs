@@ -9,6 +9,10 @@ use std::sync::{Arc, Mutex};
 
 /// Fallible text clipboard operations required by the editor.
 pub trait ClipboardProvider: Send {
+    /// Reports whether clipboard reads and writes reach a real backing store.
+    fn is_available(&self) -> bool {
+        true
+    }
     /// Reads the current text value, returning `None` when no text is available.
     fn get_text(&mut self) -> anyhow::Result<Option<String>>;
     /// Replaces the current text value.
@@ -52,6 +56,10 @@ impl ClipboardProvider for NativeClipboardProvider {
 pub struct DisabledClipboardProvider;
 
 impl ClipboardProvider for DisabledClipboardProvider {
+    fn is_available(&self) -> bool {
+        false
+    }
+
     fn get_text(&mut self) -> anyhow::Result<Option<String>> {
         Ok(None)
     }
