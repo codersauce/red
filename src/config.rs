@@ -3783,10 +3783,12 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
             ctrl_w.get("s"),
             Some(&KeyAction::Single(Action::SplitHorizontal))
         );
-        assert_eq!(
-            ctrl_w.get("v"),
-            Some(&KeyAction::Single(Action::SplitVertical))
-        );
+        for key in ["v", "d"] {
+            assert_eq!(
+                ctrl_w.get(key),
+                Some(&KeyAction::Single(Action::SplitVertical))
+            );
+        }
         assert_eq!(
             ctrl_w.get("r"),
             Some(&KeyAction::Single(Action::EnterPaneResizeMode))
