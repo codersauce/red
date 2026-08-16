@@ -29,10 +29,13 @@ use crate::{
         MINIMUM_SELECTION_TEXT_CONTRAST,
     },
     ui::{
-        normalize_prompt_newlines, ActionBar, ActionPriority, FollowTailViewport, PromptBuffer,
-        PromptInput, PromptKeyPolicy, UiAction, PROMPT_MAX_BYTES,
+        first_prompt_line, normalize_prompt_newlines, ActionBar, ActionPriority,
+        FollowTailViewport, PromptBuffer, PromptInput, PromptKeyPolicy, UiAction, PROMPT_MAX_BYTES,
     },
-    unicode_utils::{display_width, fit_display_width, truncate_display_width},
+    unicode_utils::{
+        display_width, fit_display_width, grapheme_to_byte, truncate_display_width,
+        truncate_display_width_from_end,
+    },
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -424,8 +427,10 @@ pub struct TextPanel {
     busy_since: Option<Instant>,
     selected_link: Option<u64>,
     scrollback: TextPanelScrollback,
+    search: TextPanelSearch,
     last_focused_region: TextPanelFocusRegion,
     layout_cache: RefCell<Option<(usize, Arc<TextPanelLayout>)>>,
+    search_cache: RefCell<Option<TextPanelSearchCache>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -468,6 +473,96 @@ struct PendingPromptJump {
 enum PromptJumpDirection {
     Previous,
     Next,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TextPanelSearchDirection {
+    Forward,
+    Backward,
+}
+
+impl TextPanelSearchDirection {
+    fn reversed(self) -> Self {
+        match self {
+            Self::Forward => Self::Backward,
+            Self::Backward => Self::Forward,
+        }
+    }
+
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Forward => "/",
+            Self::Backward => "?",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TextPanelSearchQuery {
+    text: String,
+    direction: TextPanelSearchDirection,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TextPanelSearchOrigin {
+    cursor: usize,
+    initialized: bool,
+    preferred_column: Option<usize>,
+    scroll: usize,
+    follow_tail: bool,
+    selected_link: Option<u64>,
+}
+
+#[derive(Debug)]
+struct TextPanelSearchSession {
+    input: PromptBuffer,
+    query: TextPanelSearchQuery,
+    origin: TextPanelSearchOrigin,
+}
+
+#[derive(Debug, Default)]
+struct TextPanelSearch {
+    active: Option<TextPanelSearchSession>,
+    last: Option<TextPanelSearchQuery>,
+    visible: bool,
+}
+
+impl TextPanelSearch {
+    fn query(&self) -> Option<&TextPanelSearchQuery> {
+        self.active
+            .as_ref()
+            .map(|session| &session.query)
+            .or_else(|| self.visible.then_some(self.last.as_ref()).flatten())
+    }
+}
+
+fn text_panel_search_match(
+    matches: &[Range<usize>],
+    cursor: usize,
+    direction: TextPanelSearchDirection,
+    count: usize,
+) -> Option<usize> {
+    let length = matches.len();
+    if length == 0 {
+        return None;
+    }
+    let step = count.max(1).saturating_sub(1) % length;
+    Some(match direction {
+        TextPanelSearchDirection::Forward => {
+            (matches.partition_point(|found| found.start <= cursor) + step) % length
+        }
+        TextPanelSearchDirection::Backward => {
+            (matches.partition_point(|found| found.start < cursor) + length - 1 - step) % length
+        }
+    })
+}
+
+fn current_text_panel_search_match(matches: &[Range<usize>], cursor: usize) -> Option<usize> {
+    let index = matches.partition_point(|found| found.end <= cursor);
+    matches
+        .get(index)
+        .is_some_and(|found| found.contains(&cursor))
+        .then_some(index)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -514,7 +609,133 @@ struct TextPanelLayout {
     rendered: Vec<RenderedTextLine>,
     lines: Vec<TextPanelLayoutLine>,
     prompt_cards: Vec<TextPanelPromptCard>,
+    searchable_rows: Vec<Range<usize>>,
     len: usize,
+}
+
+#[derive(Debug, Clone)]
+struct TextPanelSearchCache {
+    layout: Arc<TextPanelLayout>,
+    query: String,
+    matches: Arc<[Range<usize>]>,
+}
+
+struct TextPanelSearchCell {
+    bytes: Range<usize>,
+    offset: usize,
+}
+
+struct TextPanelSearchHighlights {
+    matches: Arc<[Range<usize>]>,
+    current: Option<usize>,
+    normal_style: Style,
+    current_style: Style,
+}
+
+impl TextPanelSearchHighlights {
+    fn new(
+        matches: Arc<[Range<usize>]>,
+        cursor: usize,
+        theme: &Theme,
+        palette: &TextPanelPalette,
+    ) -> Self {
+        let fallback = Style {
+            bg: Some(tint_color(
+                palette.accent.fg.unwrap_or_default(),
+                palette.surface.bg.unwrap_or_default(),
+                90,
+            )),
+            ..Style::default()
+        };
+        Self {
+            current: current_text_panel_search_match(&matches, cursor),
+            matches,
+            normal_style: theme
+                .find_match_highlight_style
+                .clone()
+                .or_else(|| theme.find_match_style.clone())
+                .unwrap_or(fallback),
+            current_style: theme
+                .find_match_style
+                .clone()
+                .unwrap_or_else(|| theme.list_selection_style()),
+        }
+    }
+
+    fn style_at(&self, offset: usize) -> Option<&Style> {
+        let index = self.matches.partition_point(|found| found.end <= offset);
+        self.matches
+            .get(index)
+            .is_some_and(|found| found.contains(&offset))
+            .then(|| {
+                if self.current == Some(index) {
+                    &self.current_style
+                } else {
+                    &self.normal_style
+                }
+            })
+    }
+}
+
+/// The query and counter share one existing chrome row; long queries scroll to
+/// keep their input cursor visible without changing transcript geometry.
+struct TextPanelSearchBar {
+    prefix: &'static str,
+    text: String,
+    suffix: String,
+    suffix_column: usize,
+    cursor_column: Option<usize>,
+}
+
+impl TextPanelSearchBar {
+    fn new(
+        search: &TextPanelSearch,
+        matches: &[Range<usize>],
+        cursor: usize,
+        width: usize,
+    ) -> Option<Self> {
+        let query = search.query()?;
+        let current = current_text_panel_search_match(matches, cursor).map_or(0, |index| index + 1);
+        let suffix = if search.active.is_some() {
+            format!("{current}/{}", matches.len())
+        } else {
+            format!("n/N · {current}/{}", matches.len())
+        };
+        let suffix_width = display_width(&suffix);
+        let show_suffix = width >= suffix_width.saturating_add(5);
+        let suffix_column = if show_suffix {
+            width - suffix_width
+        } else {
+            width
+        };
+        let query_width = suffix_column.saturating_sub(if show_suffix { 2 } else { 1 });
+        let (start, cursor_column) = if let Some(session) = &search.active {
+            let cursor_byte = grapheme_to_byte(&query.text, session.input.cursor());
+            let before = truncate_display_width_from_end(
+                &query.text[..cursor_byte],
+                query_width.saturating_sub(1),
+            );
+            (
+                cursor_byte - before.len(),
+                Some((1 + display_width(&before)).min(width.saturating_sub(1))),
+            )
+        } else {
+            (0, None)
+        };
+        Some(Self {
+            prefix: query.direction.prefix(),
+            text: truncate_display_width(&query.text[start..], query_width),
+            suffix: if show_suffix { suffix } else { String::new() },
+            suffix_column,
+            cursor_column,
+        })
+    }
+}
+
+struct TextPanelRendered {
+    lines: Vec<RenderedTextLine>,
+    prompt_cards: Vec<TextPanelPromptCard>,
+    searchable_rows: Vec<Range<usize>>,
 }
 
 /// Rendered rows belonging to one source-backed user prompt, including its chrome.
@@ -639,8 +860,10 @@ impl TextPanel {
             busy_since: None,
             selected_link: None,
             scrollback: TextPanelScrollback::default(),
+            search: TextPanelSearch::default(),
             last_focused_region: TextPanelFocusRegion::default(),
             layout_cache: RefCell::new(None),
+            search_cache: RefCell::new(None),
         }
     }
 
@@ -666,6 +889,14 @@ impl TextPanel {
 
     fn status_height(&self) -> usize {
         usize::from(self.status.is_some())
+    }
+
+    fn search_bar_row(&self, height: usize) -> Option<usize> {
+        if self.composer.is_some() {
+            height.checked_sub(1)
+        } else {
+            (text_panel_header_rows(&self.config) > 0).then_some(0)
+        }
     }
 
     fn update_blocks(
@@ -857,13 +1088,12 @@ impl TextPanel {
             .map(|(link, _)| link.target)
     }
 
-    fn build_rendered_lines(
-        &self,
-        width: usize,
-    ) -> (Vec<RenderedTextLine>, Vec<TextPanelPromptCard>) {
+    fn build_rendered_lines(&self, width: usize) -> TextPanelRendered {
         let mut lines: Vec<RenderedTextLine> = Vec::new();
         let mut prompt_cards = Vec::new();
+        let mut searchable_rows = Vec::new();
         for (block_index, block) in self.blocks.iter().enumerate() {
+            let block_start = lines.len();
             if block.kind == TextPanelBlockKind::User {
                 let start = lines.len();
                 let framed = width >= 7;
@@ -922,6 +1152,12 @@ impl TextPanel {
                 namespace_block_links(&mut block_lines, block_index);
                 lines.extend(block_lines);
             }
+            if matches!(
+                block.kind,
+                TextPanelBlockKind::User | TextPanelBlockKind::Agent
+            ) {
+                searchable_rows.push(block_start..lines.len());
+            }
             lines.push(RenderedTextLine::plain(
                 String::new(),
                 TextPanelSpanStyle::Text,
@@ -948,7 +1184,11 @@ impl TextPanel {
                 });
             }
         }
-        (lines, prompt_cards)
+        TextPanelRendered {
+            lines,
+            prompt_cards,
+            searchable_rows,
+        }
     }
 }
 
@@ -1014,12 +1254,56 @@ impl TextPanelLayout {
             rendered,
             lines,
             prompt_cards: Vec::new(),
+            searchable_rows: Vec::new(),
             len: next,
         }
     }
 
     fn clamp(&self, offset: usize) -> usize {
         offset.min(self.len.saturating_sub(1))
+    }
+
+    /// Matches literal visible text, retaining grapheme offsets for cursor movement
+    /// and highlighting. Soft-wrapped rows join without introducing fake newlines.
+    fn find_search_matches(&self, query: &str) -> Arc<[Range<usize>]> {
+        let mut matches = Vec::new();
+        if !query.is_empty() {
+            for rows in &self.searchable_rows {
+                let mut text = String::new();
+                let mut cells = Vec::new();
+                let mut previous_break = None;
+                for row in rows.clone() {
+                    let Some(line) = self.lines.get(row) else {
+                        continue;
+                    };
+                    if line.chrome_only {
+                        continue;
+                    }
+                    if previous_break == Some(RenderedTextLineBreak::Hard) {
+                        text.push('\n');
+                    }
+                    for (index, cell) in line.cells.iter().enumerate() {
+                        text.push_str(&cell.copy_prefix);
+                        let start = text.len();
+                        text.push_str(&cell.text);
+                        cells.push(TextPanelSearchCell {
+                            bytes: start..text.len(),
+                            offset: line.first + index,
+                        });
+                    }
+                    previous_break = Some(line.break_after);
+                }
+                for (start, found) in text.match_indices(query) {
+                    let end = start + found.len();
+                    let first = cells.partition_point(|cell| cell.bytes.end <= start);
+                    let after = cells.partition_point(|cell| cell.bytes.start < end);
+                    if first < after {
+                        matches.push(cells[first].offset..cells[after - 1].offset + 1);
+                    }
+                }
+            }
+        }
+        matches.into()
     }
 
     fn position(&self, offset: usize) -> Option<(usize, usize, usize)> {
@@ -1195,6 +1479,22 @@ impl TextPanelLayout {
 impl TextPanel {
     fn invalidate_layout(&self) {
         self.layout_cache.borrow_mut().take();
+        self.search_cache.borrow_mut().take();
+    }
+
+    fn search_matches(&self, layout: &Arc<TextPanelLayout>, query: &str) -> Arc<[Range<usize>]> {
+        if let Some(cache) = self.search_cache.borrow().as_ref() {
+            if Arc::ptr_eq(&cache.layout, layout) && cache.query == query {
+                return Arc::clone(&cache.matches);
+            }
+        }
+        let matches = layout.find_search_matches(query);
+        *self.search_cache.borrow_mut() = Some(TextPanelSearchCache {
+            layout: Arc::clone(layout),
+            query: query.to_string(),
+            matches: Arc::clone(&matches),
+        });
+        matches
     }
 
     fn layout(&self, width: usize) -> Arc<TextPanelLayout> {
@@ -1207,9 +1507,10 @@ impl TextPanel {
 
         let _span = crate::editor::perf::PerfSpan::start("panel:text_layout_miss");
         let content_width = TextPanelContentMetrics::new(width).width;
-        let (rendered, prompt_cards) = self.build_rendered_lines(content_width);
-        let mut layout = TextPanelLayout::new(rendered);
-        layout.prompt_cards = prompt_cards;
+        let rendered = self.build_rendered_lines(content_width);
+        let mut layout = TextPanelLayout::new(rendered.lines);
+        layout.prompt_cards = rendered.prompt_cards;
+        layout.searchable_rows = rendered.searchable_rows;
         if self.status.as_ref().is_some_and(|status| status.stream) {
             if let Some(line) = layout.lines.last_mut() {
                 if line.cells.last().is_some_and(|cell| cell.text == "▌") {
@@ -1293,7 +1594,185 @@ impl TextPanel {
         self.follow_tail = self.viewport.is_following();
     }
 
+    fn begin_transcript_search(
+        &mut self,
+        direction: TextPanelSearchDirection,
+        panel_height: usize,
+        width: usize,
+    ) {
+        let scroll = self
+            .viewport
+            .visible_offset(self.max_scroll(panel_height, width));
+        self.search.active = Some(TextPanelSearchSession {
+            input: PromptBuffer::new(""),
+            query: TextPanelSearchQuery {
+                text: String::new(),
+                direction,
+            },
+            origin: TextPanelSearchOrigin {
+                cursor: self.scrollback.cursor,
+                initialized: self.scrollback.initialized,
+                preferred_column: self.scrollback.preferred_column,
+                scroll,
+                follow_tail: self.follow_tail,
+                selected_link: self.selected_link,
+            },
+        });
+        self.scrollback.pending_find = None;
+        self.scrollback.pending_prompt_jump = None;
+        self.viewport.restore(scroll, false);
+        self.scroll = scroll;
+        self.follow_tail = false;
+    }
+
+    fn restore_search_origin(&mut self, origin: TextPanelSearchOrigin, following: bool) {
+        self.scrollback.cursor = origin.cursor;
+        self.scrollback.initialized = origin.initialized;
+        self.scrollback.preferred_column = origin.preferred_column;
+        self.selected_link = origin.selected_link;
+        self.viewport.restore(origin.scroll, following);
+        self.scroll = origin.scroll;
+        self.follow_tail = following;
+    }
+
+    fn cancel_transcript_search(&mut self) {
+        if let Some(session) = self.search.active.take() {
+            self.restore_search_origin(session.origin, session.origin.follow_tail);
+        }
+    }
+
+    fn move_to_transcript_match(
+        &mut self,
+        layout: &TextPanelLayout,
+        found: &Range<usize>,
+        panel_height: usize,
+    ) {
+        self.scrollback.cursor = layout.clamp(found.start);
+        self.scrollback.initialized = true;
+        self.scrollback.preferred_column = None;
+        self.selected_link = None;
+        self.follow_tail = false;
+        self.reveal_scrollback_cursor(layout, panel_height);
+    }
+
+    fn preview_transcript_search(&mut self, panel_height: usize, width: usize) {
+        let Some(session) = self.search.active.as_ref() else {
+            return;
+        };
+        let origin = session.origin;
+        let direction = session.query.direction;
+        let layout = self.layout(width);
+        let matches = self.search_matches(&layout, &session.query.text);
+        let cursor = if origin.follow_tail {
+            layout.len
+        } else if origin.initialized {
+            layout.clamp(origin.cursor)
+        } else {
+            layout.offset_at_or_after(origin.scroll, 0).unwrap_or(0)
+        };
+        self.restore_search_origin(origin, false);
+        if let Some(index) = text_panel_search_match(&matches, cursor, direction, 1) {
+            self.move_to_transcript_match(&layout, &matches[index], panel_height);
+        }
+    }
+
+    fn finish_transcript_search(&mut self, panel_height: usize, width: usize) {
+        if let Some(session) = self.search.active.as_mut() {
+            if session.query.text.is_empty() {
+                if let Some(last) = self.search.last.as_ref() {
+                    session.query.text.clone_from(&last.text);
+                }
+            }
+        }
+        self.preview_transcript_search(panel_height, width);
+        let Some(session) = self.search.active.take() else {
+            return;
+        };
+        if session.query.text.is_empty() {
+            self.restore_search_origin(session.origin, session.origin.follow_tail);
+        } else {
+            self.search.last = Some(session.query);
+            self.search.visible = true;
+        }
+    }
+
+    fn repeat_transcript_search(
+        &mut self,
+        reverse: bool,
+        count: usize,
+        panel_height: usize,
+        width: usize,
+    ) {
+        let Some(query) = self.search.last.as_ref() else {
+            return;
+        };
+        let direction = if reverse {
+            query.direction.reversed()
+        } else {
+            query.direction
+        };
+        let layout = self.layout(width);
+        let matches = self.search_matches(&layout, &query.text);
+        let cursor = if self.follow_tail {
+            layout.len
+        } else {
+            layout.clamp(self.scrollback.cursor)
+        };
+        self.search.visible = true;
+        if let Some(index) = text_panel_search_match(&matches, cursor, direction, count) {
+            self.move_to_transcript_match(&layout, &matches[index], panel_height);
+        }
+    }
+
+    fn handle_transcript_search_input(
+        &mut self,
+        event: &Event,
+        panel_height: usize,
+        width: usize,
+    ) -> bool {
+        if self.search.active.is_none() {
+            return false;
+        }
+        if let Event::Key(key) = event {
+            if key.code == KeyCode::Esc
+                || (matches!(key.code, KeyCode::Char('c' | 'g'))
+                    && key.modifiers.contains(KeyModifiers::CONTROL))
+            {
+                self.cancel_transcript_search();
+                return true;
+            }
+            if matches!(key.code, KeyCode::Enter | KeyCode::Char('\n'))
+                || (key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL))
+            {
+                self.finish_transcript_search(panel_height, width);
+                return true;
+            }
+        }
+        let Some(session) = self.search.active.as_mut() else {
+            return false;
+        };
+        match event {
+            Event::Paste(text) => {
+                session.input.insert(&first_prompt_line(text));
+            }
+            Event::Key(_) => {
+                session
+                    .input
+                    .handle_event_with_layout_options(event, LayoutOptions::grapheme(width.max(1)));
+                session.input.set_mode(crate::editor::Mode::Insert);
+            }
+            _ => return false,
+        }
+        let text = session.input.text();
+        if text != session.query.text {
+            session.query.text = text;
+            self.preview_transcript_search(panel_height, width);
+        }
+        true
+    }
+
     fn focus_scrollback(&mut self, width: usize) {
+        self.cancel_transcript_search();
         if let Some(composer) = self.composer.as_mut() {
             composer.focused = false;
         }
@@ -1313,6 +1792,7 @@ impl TextPanel {
     }
 
     fn blur_scrollback(&mut self) {
+        self.cancel_transcript_search();
         self.scrollback.focused = false;
         self.scrollback.mode = TextPanelScrollbackMode::Normal;
         self.scrollback.selection_anchor = None;
@@ -2651,15 +3131,18 @@ impl PanelManager {
         if !panel.scrollback.focused {
             return None;
         }
-        let Event::Key(key) = event else {
-            return None;
-        };
         let width = self
             .presentation
             .width(&panel.id, &panel.config, terminal_width);
         let panel_height = self
             .presentation
             .height(&panel.id, &panel.config, panel_height);
+        if panel.handle_transcript_search_input(event, panel_height, width) {
+            return Some(TextPanelScrollbackInput::Handled);
+        }
+        let Event::Key(key) = event else {
+            return None;
+        };
 
         if let Some(pending) = panel.scrollback.pending_prompt_jump.take() {
             if key.code == KeyCode::Char('p')
@@ -2695,6 +3178,10 @@ impl PanelManager {
             return Some(TextPanelScrollbackInput::Handled);
         }
         if key.code == KeyCode::Esc {
+            if panel.search.visible {
+                panel.search.visible = false;
+                return Some(TextPanelScrollbackInput::Handled);
+            }
             let composer_enabled = panel
                 .composer
                 .as_ref()
@@ -2728,6 +3215,30 @@ impl PanelManager {
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
         {
             match key.code {
+                KeyCode::Char('/' | '?')
+                    if panel.scrollback.mode == TextPanelScrollbackMode::Normal
+                        && (panel.composer.is_some()
+                            || text_panel_header_rows(&panel.config) > 0) =>
+                {
+                    let direction = if key.code == KeyCode::Char('?') {
+                        TextPanelSearchDirection::Backward
+                    } else {
+                        TextPanelSearchDirection::Forward
+                    };
+                    panel.begin_transcript_search(direction, panel_height, width);
+                    return Some(TextPanelScrollbackInput::Handled);
+                }
+                KeyCode::Char('n' | 'N')
+                    if panel.scrollback.mode == TextPanelScrollbackMode::Normal =>
+                {
+                    panel.repeat_transcript_search(
+                        key.code == KeyCode::Char('N'),
+                        count,
+                        panel_height,
+                        width,
+                    );
+                    return Some(TextPanelScrollbackInput::Handled);
+                }
                 KeyCode::Char('[' | ']')
                     if panel.scrollback.mode == TextPanelScrollbackMode::Normal =>
                 {
@@ -3183,6 +3694,9 @@ impl PanelManager {
     pub(crate) fn focused_text_panel_cursor_mode(&self) -> Option<crate::editor::Mode> {
         let panel = self.text_panels.get(self.focused.as_deref()?)?;
         if panel.scrollback.focused {
+            if panel.search.active.is_some() {
+                return Some(crate::editor::Mode::Search);
+            }
             return Some(match panel.scrollback.mode {
                 TextPanelScrollbackMode::Normal => crate::editor::Mode::Normal,
                 TextPanelScrollbackMode::Visual => crate::editor::Mode::Visual,
@@ -3209,6 +3723,20 @@ impl PanelManager {
             let metrics = TextPanelContentMetrics::new(placement.width);
             let visible_rows = panel.visible_rows(placement.height);
             let layout = panel.layout(placement.width);
+            if panel.search.active.is_some() {
+                let query = panel.search.query()?;
+                let matches = panel.search_matches(&layout, &query.text);
+                let bar = TextPanelSearchBar::new(
+                    &panel.search,
+                    &matches,
+                    panel.scrollback.cursor,
+                    metrics.width,
+                )?;
+                return Some((
+                    metrics.x(placement.x) + bar.cursor_column?,
+                    placement.y + panel.search_bar_row(placement.height)?,
+                ));
+            }
             let max_scroll = layout.lines.len().saturating_sub(visible_rows);
             let scroll = panel.viewport.visible_offset(max_scroll);
             let (row, _, column) = layout
@@ -3861,6 +4389,20 @@ fn render_text_panel(
     let max_scroll = layout.lines.len().saturating_sub(visible_rows);
     let scroll = panel.viewport.visible_offset(max_scroll);
     let selection = panel.selection_bounds(&layout);
+    let search_matches = panel
+        .scrollback
+        .focused
+        .then(|| panel.search.query())
+        .flatten()
+        .map(|query| panel.search_matches(&layout, &query.text));
+    let search_highlights = search_matches.as_ref().map(|matches| {
+        TextPanelSearchHighlights::new(
+            Arc::clone(matches),
+            panel.scrollback.cursor,
+            theme,
+            &palette,
+        )
+    });
     let selected_prompt = panel.selected_prompt(&layout);
     let normal_prompt = TextPanelPromptPalette::new(theme, &palette, false);
     let active_prompt = TextPanelPromptPalette::new(theme, &palette, true);
@@ -3933,6 +4475,7 @@ fn render_text_panel(
                 .then_some(selection)
                 .flatten(),
             panel.selected_link,
+            search_highlights.as_ref(),
             theme,
             prompt_palette.map_or(&palette, |prompt| &prompt.content),
         );
@@ -3994,6 +4537,43 @@ fn render_text_panel(
             theme,
         );
     }
+    if let (Some(matches), Some(row)) = (search_matches, panel.search_bar_row(height)) {
+        if let Some(bar) = TextPanelSearchBar::new(
+            &panel.search,
+            &matches,
+            panel.scrollback.cursor,
+            metrics.width,
+        ) {
+            render_text_panel_search_bar(
+                buffer,
+                Point::new(content_position.x, position.y + row),
+                metrics.width,
+                &bar,
+                &palette,
+            );
+        }
+    }
+}
+
+fn render_text_panel_search_bar(
+    buffer: &mut RenderBuffer,
+    position: Point,
+    width: usize,
+    bar: &TextPanelSearchBar,
+    palette: &TextPanelPalette,
+) {
+    buffer.set_text(position.x, position.y, &" ".repeat(width), &palette.surface);
+    if width == 0 {
+        return;
+    }
+    buffer.set_text(position.x, position.y, bar.prefix, &palette.accent);
+    buffer.set_text(position.x + 1, position.y, &bar.text, &palette.primary);
+    buffer.set_text(
+        position.x + bar.suffix_column,
+        position.y,
+        &bar.suffix,
+        &palette.secondary,
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -4011,6 +4591,10 @@ struct TextPanelShortcutHint {
 }
 
 const SCROLLBACK_NORMAL_HINTS: &[TextPanelShortcutHint] = &[
+    TextPanelShortcutHint {
+        keys: "/?",
+        action: "search",
+    },
     TextPanelShortcutHint {
         keys: "[p/]p",
         action: "prompt",
@@ -4457,6 +5041,7 @@ fn render_text_spans(
     line_first: usize,
     selection: Option<(usize, usize)>,
     selected_link: Option<u64>,
+    search: Option<&TextPanelSearchHighlights>,
     theme: &Theme,
     palette: &TextPanelPalette,
 ) {
@@ -4489,6 +5074,15 @@ fn render_text_spans(
             }
             let mut grapheme_style = style.clone();
             let selectable = matches!(span.selection, TextPanelSpanSelection::Content);
+            if selectable {
+                if let Some(search_style) = search.and_then(|search| search.style_at(offset)) {
+                    grapheme_style = theme.selected_style(
+                        &grapheme_style,
+                        search_style,
+                        SelectionForegroundPriority::Content,
+                    );
+                }
+            }
             if selectable && selection.is_some_and(|(start, end)| offset >= start && offset <= end)
             {
                 let selected = theme.list_selection_style();
@@ -5719,7 +6313,19 @@ mod tests {
         let mut buffer = RenderBuffer::new(2, 1, &theme.style);
         let palette = text_panel_palette(&theme, &PanelConfig::default());
 
-        render_text_spans(&mut buffer, 0, 0, 2, &line, 0, None, None, &theme, &palette);
+        render_text_spans(
+            &mut buffer,
+            0,
+            0,
+            2,
+            &line,
+            0,
+            None,
+            None,
+            None,
+            &theme,
+            &palette,
+        );
 
         assert_eq!(
             buffer.cells[0].style,
@@ -5768,7 +6374,19 @@ mod tests {
         let mut selected = RenderBuffer::new(3, 1, &theme.style);
         let palette = text_panel_palette(&theme, &PanelConfig::default());
 
-        render_text_spans(&mut normal, 0, 0, 3, &line, 0, None, None, &theme, &palette);
+        render_text_spans(
+            &mut normal,
+            0,
+            0,
+            3,
+            &line,
+            0,
+            None,
+            None,
+            None,
+            &theme,
+            &palette,
+        );
         render_text_spans(
             &mut selected,
             0,
@@ -5777,6 +6395,7 @@ mod tests {
             &line,
             0,
             Some((0, 0)),
+            None,
             None,
             &theme,
             &palette,

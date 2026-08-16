@@ -125,6 +125,14 @@ to that turn's prompt; repeating it visits earlier prompts. Jumps reveal the
 prompt card, update its accent, and pause automatic scrolling without changing
 the composer draft. `G` returns to the latest output and resumes following it.
 
+`/` searches forward through visible prompt and answer text; `?` searches
+backward. Search is literal and case-sensitive, previews matches as you type,
+and shows a result count. Enter keeps the result, while Escape cancels an
+unfinished search and restores its starting position. `n` repeats the search
+direction and `N` reverses it, wrapping at the ends. After a completed search,
+Escape hides its highlights; `n` or `N` brings them back. Transcript search is
+independent of the composer's draft and prompt-local search.
+
 If Codex cannot start, Red preserves the prompt and offers a retry action.
 Install or update Codex, run `codex login`, then retry without retyping.
 
