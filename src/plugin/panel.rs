@@ -5339,7 +5339,7 @@ fn text_panel_span_style(
         TextPanelSpanStyle::Strikethrough => {
             scoped("markup.strikethrough.markdown", &palette.secondary, false)
         }
-        TextPanelSpanStyle::InlineCode | TextPanelSpanStyle::Code => {
+        TextPanelSpanStyle::InlineCode | TextPanelSpanStyle::Code | TextPanelSpanStyle::Diff => {
             scoped("markup.raw.block.markdown", &palette.primary, true)
         }
         TextPanelSpanStyle::Link => {

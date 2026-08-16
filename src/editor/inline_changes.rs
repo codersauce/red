@@ -312,12 +312,14 @@ impl Editor {
         } else {
             format!("{location}\nHistorical diff · changed-location navigation unavailable")
         };
-        let text = format!(
-            "{status}\n{navigation}\nRequest: {}\n\n{}",
-            turn.prompt,
-            turn.change_diff()
-        );
-        let mut hover = HoverInfo::new(self, text, HoverInfoFormat::Plaintext, Vec::new())
+        let text = format!("{status}\n\n{navigation}\n\nRequest: {}", turn.prompt);
+        let mut hover = HoverInfo::new(self, text, HoverInfoFormat::Markdown, Vec::new())
+            .with_diff(
+                &turn.location.file,
+                &turn.before,
+                turn.reviewed(),
+                "after inline edit",
+            )
             .with_label("Inline changes")
             .with_shortcut('H', "history", Action::OpenInlineHistory);
         if can_navigate && count > 1 {

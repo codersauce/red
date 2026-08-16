@@ -8,7 +8,11 @@ use super::text_link::TextPanelFileLocation;
 use super::text_link::{
     linkify_source_locations, markdown_link_target, TextPanelLink, TextPanelLinkTarget,
 };
-use crate::{highlighter::Highlighter, theme::Style, unicode_utils::display_width};
+use crate::{
+    highlighter::Highlighter,
+    theme::{DiffPalette, Style, Theme},
+    unicode_utils::display_width,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TextPanelSpanStyle {
@@ -22,6 +26,8 @@ pub(crate) enum TextPanelSpanStyle {
     Strikethrough,
     InlineCode,
     Code,
+    /// Verbatim diff content carrying an explicit, theme-resolved row background.
+    Diff,
     Link,
     Quote,
     Muted,
@@ -687,6 +693,120 @@ pub(crate) fn render_hover_markdown_lines_with_highlighter(
         return Vec::new();
     }
     MarkdownRenderer::new(width, highlighter, CodeBlockChrome::Bare).render(text)
+}
+
+/// Render an exact two-sided edit using the same syntax spans and verbatim
+/// wrapping as Markdown code blocks, with the Git workspace's diff palette.
+pub(crate) fn render_diff_lines_with_highlighter(
+    file: &str,
+    before: &str,
+    after: &str,
+    after_label: &str,
+    width: usize,
+    theme: &Theme,
+    mut highlighter: Option<&mut Highlighter>,
+) -> Vec<RenderedTextLine> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let language = highlighter
+        .as_ref()
+        .and_then(|value| value.language_id_for_file(Some(file)))
+        .unwrap_or_default()
+        .to_owned();
+    // Parse the two programs separately: interleaving '-' and '+' lines can
+    // corrupt multiline strings, comments, and parser state.
+    let old = highlighted_code_lines(&language, before, highlighter.as_deref_mut());
+    let new = highlighted_code_lines(&language, after, highlighter);
+    let palette = DiffPalette::new(theme);
+    let span = |text: String, style: Style| RenderedTextSpan {
+        text,
+        style: TextPanelSpanStyle::Diff,
+        syntax_style: Some(style),
+        link: None,
+        selection: TextPanelSpanSelection::Content,
+    };
+    let mut lines = Vec::new();
+    for header in ["--- before".to_owned(), format!("+++ {after_label}")] {
+        lines.extend(wrap_verbatim(
+            &[span(header, palette.hunk.clone())],
+            width,
+            &[],
+            &[],
+        ));
+    }
+    let diff = similar::TextDiff::from_lines(before, after);
+    for hunk in diff.unified_diff().iter_hunks() {
+        lines.extend(wrap_verbatim(
+            &[span(hunk.header().to_string(), palette.hunk.clone())],
+            width,
+            &[],
+            &[],
+        ));
+        for change in hunk.iter_changes() {
+            let (marker, base, marker_color, source) = match change.tag() {
+                similar::ChangeTag::Delete => (
+                    "-",
+                    &palette.removed,
+                    Some(palette.removed_marker),
+                    change.old_index().and_then(|index| old.get(index)),
+                ),
+                similar::ChangeTag::Insert => (
+                    "+",
+                    &palette.added,
+                    Some(palette.added_marker),
+                    change.new_index().and_then(|index| new.get(index)),
+                ),
+                similar::ChangeTag::Equal => (
+                    " ",
+                    &theme.ui_style.dialog,
+                    theme.ui_style.dialog.fg,
+                    change.new_index().and_then(|index| new.get(index)),
+                ),
+            };
+            let mut spans = source.cloned().unwrap_or_else(|| {
+                vec![span(
+                    change
+                        .value()
+                        .trim_end_matches(['\r', '\n'])
+                        .replace('\t', "    "),
+                    base.clone(),
+                )]
+            });
+            for value in &mut spans {
+                let syntax = value.syntax_style.take().unwrap_or_default();
+                value.style = TextPanelSpanStyle::Diff;
+                value.syntax_style = Some(Style {
+                    fg: syntax.fg.or(base.fg),
+                    bg: base.bg,
+                    bold: syntax.bold,
+                    italic: syntax.italic,
+                });
+            }
+            let prefix = span(
+                marker.into(),
+                Style {
+                    fg: marker_color.or(base.fg),
+                    ..base.clone()
+                },
+            );
+            let mut continuation = prefix.clone();
+            continuation.selection = TextPanelSpanSelection::Chrome;
+            lines.extend(wrap_verbatim(&spans, width, &[prefix], &[continuation]));
+            if change.missing_newline() {
+                lines.extend(wrap_verbatim(
+                    &[span(
+                        "\\ No newline at end of file".into(),
+                        palette.hunk.clone(),
+                    )],
+                    width,
+                    &[],
+                    &[],
+                ));
+            }
+        }
+    }
+    lines
 }
 
 fn highlighted_code_lines(

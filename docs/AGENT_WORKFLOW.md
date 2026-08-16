@@ -79,6 +79,10 @@ Changed source disables approval and requires a recheck. Rechecking an
 unapproved proposal starts from the original target, not the proposed range.
 Pending proposals survive normal recovery, but must still pass exact-source
 checks and explicit review. Multi-file work continues through Agent.
+The review renders explanatory Markdown separately from the exact source diff.
+Added and removed rows use Red's Git diff colors; code uses the file's installed
+language highlighter. The applied-change view uses the same rendering, including
+verbatim indentation and readable wrapping in narrow windows.
 
 ### Applying inline results
 

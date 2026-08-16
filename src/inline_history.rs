@@ -210,29 +210,45 @@ impl InlineHistoryTurn {
             .unwrap_or(&self.before)
     }
 
+    pub fn proposed_edit(&self) -> Option<(&str, &str)> {
+        if self.state == InlineTurnState::Completed {
+            return None;
+        }
+        let result = self.result.as_ref()?;
+        let before = result
+            .expanded_scope
+            .as_ref()
+            .map_or(self.before.as_str(), |scope| scope.before.as_str());
+        result
+            .replacement
+            .as_deref()
+            .filter(|replacement| *replacement != before)
+            .map(|after| (before, after))
+    }
+
+    pub fn proposal_description(&self) -> String {
+        let expanded = self
+            .result
+            .as_ref()
+            .and_then(|result| result.expanded_scope.as_ref());
+        let heading = expanded.map_or_else(|| "Proposed edit · not applied".into(), |scope| format!(
+            "Wider edit proposed · not applied\n\n{}:{}–{}\n\nOriginal target: lines {}–{}\n\nReason: {}",
+            self.location.file, scope.start_line, scope.end_line, self.original_range.start.line + 1,
+            self.original_range.end.line + usize::from(self.original_range.end.character > 0), scope.reason));
+        if self.answer.trim().is_empty() {
+            heading
+        } else {
+            format!("{}\n\n{heading}", self.answer)
+        }
+    }
+
     pub fn answer_text(&self) -> String {
-        if self.state != InlineTurnState::Completed {
-            let expanded = self
-                .result
-                .as_ref()
-                .and_then(|result| result.expanded_scope.as_ref());
-            let before = expanded.map_or(self.before.as_str(), |scope| scope.before.as_str());
-            if let Some(replacement) = self
-                .result
-                .as_ref()
-                .and_then(|result| result.replacement.as_deref())
-                .filter(|replacement| *replacement != before)
-            {
-                let diff = similar::TextDiff::from_lines(before, replacement)
-                    .unified_diff()
-                    .header("before", "proposed")
-                    .to_string();
-                let heading = expanded.map_or_else(|| "Proposed edit · not applied".into(), |scope| format!(
-                    "Wider edit proposed · not applied\n{}:{}–{}\nOriginal target: lines {}–{}\nReason: {}",
-                    self.location.file, scope.start_line, scope.end_line, self.original_range.start.line + 1,
-                    self.original_range.end.line + usize::from(self.original_range.end.character > 0), scope.reason));
-                return format!("{}\n\n{heading}\n\n{diff}", self.answer);
-            }
+        if let Some((before, replacement)) = self.proposed_edit() {
+            let diff = similar::TextDiff::from_lines(before, replacement)
+                .unified_diff()
+                .header("before", "proposed")
+                .to_string();
+            return format!("{}\n\n{diff}", self.proposal_description());
         }
         if !self.answer.trim().is_empty() {
             return if self.answer_truncated {

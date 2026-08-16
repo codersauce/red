@@ -17458,22 +17458,31 @@ impl Editor {
                         .inline_assist
                         .as_ref()
                         .and_then(|session| self.pending_inline_expansion_range(session).ok());
+                    let proposed = turn.proposed_edit();
+                    let description = if proposed.is_some() {
+                        turn.proposal_description()
+                    } else {
+                        turn.answer_text()
+                    };
                     let answer = expanded_range.map_or_else(
-                        || turn.answer_text(),
+                        || description.clone(),
                         |range| {
                             format!(
                                 "Current proposed range: {}:{}–{}\n\n{}",
                                 turn.location.file,
                                 range.start.line + 1,
                                 range.end.line + usize::from(range.end.character > 0),
-                                turn.answer_text()
+                                description
                             )
                         },
                     );
                     let mut hover =
-                        HoverInfo::new(self, answer, HoverInfoFormat::Plaintext, Vec::new())
+                        HoverInfo::new(self, answer, HoverInfoFormat::Markdown, Vec::new())
                             .with_label("Inline answer")
                             .with_close_action(Action::CancelInlineAssistRefine);
+                    if let Some((before, after)) = proposed {
+                        hover = hover.with_diff(&turn.location.file, before, after, "proposed");
+                    }
                     if turn.state == InlineTurnState::Ready
                         && turn
                             .result
