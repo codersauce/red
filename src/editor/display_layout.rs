@@ -174,6 +174,8 @@ pub struct LineSegment {
     pub start_grapheme_col: usize,
     pub source_offset: usize,
     pub first_segment: bool,
+    /// Whether this segment reaches the source line's end, not just the viewport edge.
+    pub last_segment: bool,
     /// Blank screen columns drawn before the segment's text. Zero on first
     /// segments; on wrapped continuations it aligns the text with the
     /// line's indentation (vim's 'breakindent').
@@ -187,6 +189,12 @@ impl LineSegment {
         }
 
         col >= self.start_col && col < self.end_col
+    }
+
+    /// Includes the insertion caret after the final character, but keeps
+    /// boundaries between wrapped segments exclusive on the preceding row.
+    pub fn contains_cursor_col(&self, col: usize) -> bool {
+        self.contains_display_col(col) || (self.last_segment && col == self.end_col)
     }
 
     pub fn screen_col_for_display_col(&self, col: usize, width: usize) -> usize {
@@ -308,7 +316,7 @@ impl DisplayLayout {
     pub fn segment_for_cursor(&self, line: usize, display_col: usize) -> Option<&LineSegment> {
         self.rows
             .iter()
-            .find(|segment| segment.line == line && segment.contains_display_col(display_col))
+            .find(|segment| segment.line == line && segment.contains_cursor_col(display_col))
             .or_else(|| self.rows.iter().rev().find(|segment| segment.line == line))
     }
 }
@@ -450,6 +458,7 @@ fn wrap_line_segments_with_limit(
                     start_grapheme_col: start_col,
                     source_offset: 0,
                     first_segment,
+                    last_segment: false,
                     visual_offset: if first_segment { 0 } else { indent },
                 });
                 if segments.len() == max_segments {
@@ -481,6 +490,7 @@ fn wrap_line_segments_with_limit(
             start_grapheme_col: start_col,
             source_offset: 0,
             first_segment,
+            last_segment: true,
             visual_offset: if first_segment { 0 } else { indent },
         });
     }
@@ -526,6 +536,7 @@ fn wrap_line_segments_with_limit(
             start_grapheme_col,
             source_offset: 0,
             first_segment,
+            last_segment: start_col == line_width,
             visual_offset: if first_segment { 0 } else { indent },
         });
     }
@@ -586,6 +597,7 @@ fn nowrap_line_segment(
         start_grapheme_col,
         source_offset: 0,
         first_segment: true,
+        last_segment: end_byte == line.len(),
         visual_offset: 0,
     }]
 }
@@ -602,6 +614,34 @@ mod tests {
         assert_eq!((segments[0].start_col, segments[0].end_col), (0, 3));
         assert_eq!((segments[1].start_col, segments[1].end_col), (3, 6));
         assert!(!segments[1].first_segment);
+    }
+
+    #[test]
+    fn cursor_columns_include_only_the_actual_line_end() {
+        let segments = wrap_line_segments("abcdef", 0, 3, 0, BreakIndentOptions::disabled());
+        assert!(!segments[0].last_segment);
+        assert!(!segments[0].contains_cursor_col(3));
+        assert!(segments[1].last_segment);
+        assert!(segments[1].contains_cursor_col(3));
+        assert!(!segments[1].contains_display_col(6));
+        assert!(segments[1].contains_cursor_col(6));
+        assert!(!segments[1].contains_cursor_col(7));
+
+        let clipped =
+            wrap_line_segments_with_limit("abcdef", 0, 3, 0, BreakIndentOptions::disabled(), 1);
+        assert_eq!(clipped.len(), 1);
+        assert!(!clipped[0].contains_cursor_col(3));
+
+        let nowrap = nowrap_line_segment("abcdef", 0, 3, 0, 4);
+        assert!(!nowrap[0].contains_cursor_col(3));
+        let nowrap_end = nowrap_line_segment("abcdef", 0, 3, 3, 4);
+        assert!(nowrap_end[0].contains_cursor_col(6));
+
+        let unicode = wrap_line_segments("a\t界", 0, 4, 0, BreakIndentOptions::disabled());
+        assert!(!unicode[0].contains_cursor_col(4));
+        assert!(unicode[1].contains_cursor_col(6));
+        let empty = wrap_line_segments("", 0, 3, 0, BreakIndentOptions::disabled());
+        assert!(empty[0].contains_cursor_col(0));
     }
 
     #[test]

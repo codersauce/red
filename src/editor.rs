@@ -6148,7 +6148,7 @@ impl Editor {
         self.layout_for_window(&window)
             .rows
             .iter()
-            .any(|segment| segment.line == line_index && segment.contains_display_col(display_col))
+            .any(|segment| segment.line == line_index && segment.contains_cursor_col(display_col))
     }
 
     fn scroll_wrapped_viewport_down_one_screen_line(&mut self) -> bool {
@@ -6247,7 +6247,7 @@ impl Editor {
         let segments = self.wrapped_line_segments_for_width(line_index, width);
         let current_index = segments
             .iter()
-            .position(|segment| segment.contains_display_col(display_col))
+            .position(|segment| segment.contains_cursor_col(display_col))
             .or_else(|| segments.len().checked_sub(1))?;
         let current = segments[current_index];
         // Preserve the screen column across rows: with break-indent the same
@@ -6398,7 +6398,7 @@ impl Editor {
 
         let layout = self.layout_for_window(&window);
         let Some(current_index) = layout.rows.iter().position(|segment| {
-            segment.line == line_index && segment.contains_display_col(display_col)
+            segment.line == line_index && segment.contains_cursor_col(display_col)
         }) else {
             return;
         };

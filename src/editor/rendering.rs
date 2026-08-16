@@ -3753,6 +3753,7 @@ mod tests {
             start_grapheme_col: start_col,
             source_offset: 0,
             first_segment,
+            last_segment: true,
             visual_offset: 0,
         }
     }

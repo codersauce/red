@@ -614,7 +614,7 @@ impl Editor {
             if let Some(segment) = self
                 .wrapped_line_segments_for_width(line, self.active_content_width())
                 .into_iter()
-                .find(|segment| segment.contains_display_col(display_col))
+                .find(|segment| segment.contains_cursor_col(display_col))
             {
                 self.vtop = line;
                 self.cy = 0;
