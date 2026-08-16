@@ -117,8 +117,8 @@ use crate::{
     },
     matchit::{self, MatchDirection, MatchMotion},
     notification::{
-        MessageAction, Notice, NotificationCenter, NotificationError, NotificationId,
-        NotificationSource, NotificationTime, Severity,
+        AttentionPolicy, MessageAction, Notice, NotificationCenter, NotificationError,
+        NotificationId, NotificationSource, NotificationTime, Severity,
     },
     plugin::{self, ComposerHandle, PickerHandle, PluginRegistry, RequestId, Runtime},
     preferences::{PanelLayoutPreference, PreferencesStore},
@@ -3164,6 +3164,9 @@ pub struct Editor {
     notifications: NotificationCenter,
     message_browser: Option<notifications::MessageBrowser>,
     notification_presentation: notifications::NotificationPresentation,
+    notification_frame_candidate: Option<notifications::NotificationExposureKey>,
+    notification_exposure: Option<notifications::NotificationExposure>,
+    notification_client_attached: bool,
     notification_animation_start: Instant,
     notification_fallback: Option<String>,
     config_notification: Option<NotificationId>,
@@ -3256,6 +3259,7 @@ impl DetachedEditorCore {
     /// while retaining all editor, LSP, recovery, and Codex state.
     pub async fn new(mut editor: Editor) -> anyhow::Result<Self> {
         editor.terminal_output_enabled = false;
+        editor.notification_exposure = None;
         let mut runtime =
             Runtime::try_new_with_permissions(editor.config.plugin_permissions.clone())?;
         runtime.set_typecheck_enabled(!editor.config.disable_plugin_typecheck);
@@ -3455,6 +3459,21 @@ impl DetachedEditorCore {
     /// Claims the version only after its first frame reaches an attached client.
     pub fn mark_whats_new_presented(&mut self) {
         self.editor.mark_whats_new_presented();
+    }
+
+    /// Starts exposure only for the exact frame successfully sent to a client.
+    pub fn mark_frame_presented(&mut self, revision: u64) {
+        self.editor.notification_client_attached = true;
+        if self.revision == revision {
+            self.editor.notification_frame_presented(Instant::now());
+        } else {
+            self.editor.notification_exposure = None;
+        }
+    }
+
+    pub fn client_disconnected(&mut self) {
+        self.editor.notification_client_attached = false;
+        self.editor.notification_exposure = None;
     }
 
     pub async fn shutdown(&mut self) {
@@ -4426,6 +4445,9 @@ impl Editor {
             notifications: NotificationCenter::default(),
             message_browser: None,
             notification_presentation: notifications::NotificationPresentation::default(),
+            notification_frame_candidate: None,
+            notification_exposure: None,
+            notification_client_attached: false,
             notification_animation_start: Instant::now(),
             notification_fallback: None,
             config_notification: None,
@@ -8855,7 +8877,7 @@ impl Editor {
             Ok(None) => {}
             Err(err) => {
                 log!("ERROR: Lsp error: {err}");
-                self.set_legacy_message(Some(err.to_string()));
+                self.set_notification_message(Severity::Error, Some(err.to_string()));
                 needs_render = true;
             }
         }
@@ -12356,7 +12378,7 @@ impl Editor {
                 {
                     return Some(Action::ShowDialog);
                 }
-                self.set_legacy_message(Some(error_msg.message.clone()));
+                self.set_notification_message(Severity::Error, Some(error_msg.message.clone()));
                 let save_as = save.as_ref().is_some_and(|save| save.save_as.is_some());
                 if (error_msg.code == -32601 || save_as)
                     && method.as_deref() == Some("textDocument/formatting")
@@ -12924,7 +12946,7 @@ impl Editor {
                         Content::charwise(yank.text)
                     };
                     self.set_default_register(content);
-                    self.set_legacy_message(Some(if yank.linewise {
+                    self.set_quiet_message(Some(if yank.linewise {
                         format!("{} lines yanked", lines.max(1))
                     } else {
                         format!("{length} characters yanked")
@@ -12942,7 +12964,7 @@ impl Editor {
                         .focused_text_for_copy(copy_all, usize::from(self.size.0))
                     {
                         self.set_default_register(Content::charwise(text));
-                        self.set_legacy_message(Some(if copy_all {
+                        self.set_quiet_message(Some(if copy_all {
                             "conversation copied".to_string()
                         } else {
                             "answer copied".to_string()
@@ -19508,7 +19530,7 @@ impl Editor {
                     Ok(()) => {
                         self.config.statusline = statusline.clone();
                         self.current_dialog = None;
-                        self.set_legacy_message(Some("saved status-line layout".to_string()));
+                        self.set_quiet_message(Some("saved status-line layout".to_string()));
                     }
                     Err(error) => {
                         self.set_legacy_message(Some(format!(
@@ -19696,7 +19718,7 @@ impl Editor {
                     .text_turn_for_copy(panel_id, prompt_id, *part)
                 {
                     self.set_default_register(Content::charwise(text));
-                    self.set_legacy_message(Some(
+                    self.set_quiet_message(Some(
                         match part {
                             plugin::panel::TextPanelTurnPart::Prompt => "prompt copied",
                             plugin::panel::TextPanelTurnPart::Answer => "answer copied",
@@ -19722,7 +19744,7 @@ impl Editor {
                     *expected_draft,
                 ) {
                     Ok(plugin::panel::TextPanelReuseOutcome::Loaded) => {
-                        self.set_legacy_message(Some(
+                        self.set_quiet_message(Some(
                             "prompt loaded for editing; nothing sent".to_string(),
                         ));
                     }
@@ -20876,10 +20898,10 @@ impl Editor {
             if count > 2 {
                 if content.kind == ContentKind::Linewise {
                     log!("yanked {} lines", count);
-                    self.set_legacy_message(Some(format!("{} lines yanked", count)));
+                    self.set_quiet_message(Some(format!("{} lines yanked", count)));
                     needs_update = true;
                 } else if content.kind == ContentKind::Blockwise {
-                    self.set_legacy_message(Some(format!("block of {} lines yanked", count)));
+                    self.set_quiet_message(Some(format!("block of {} lines yanked", count)));
                     needs_update = true;
                 }
             };
@@ -25367,7 +25389,14 @@ impl Editor {
         };
         match result {
             Ok(message) => {
-                self.set_legacy_message(Some(warning.unwrap_or(&message).to_string()));
+                self.set_notification_message(
+                    if warning.is_some() {
+                        Severity::Warning
+                    } else {
+                        Severity::Success
+                    },
+                    Some(warning.unwrap_or(&message).to_string()),
+                );
                 self.sync_lsp_document_identity(previous_uri.as_deref(), index)
                     .await?;
                 let file = self.current_buffer().file.clone();
@@ -25735,12 +25764,12 @@ impl Editor {
                 .await
             {
                 Ok(ExternalFormatOutcome::Applied { name }) => {
-                    self.set_legacy_message(Some(format!("formatted with {name}")));
+                    self.set_quiet_message(Some(format!("formatted with {name}")));
                     self.render(buffer)?;
                     return Ok(());
                 }
                 Ok(ExternalFormatOutcome::Unchanged { name }) => {
-                    self.set_legacy_message(Some(format!("already formatted with {name}")));
+                    self.set_quiet_message(Some(format!("already formatted with {name}")));
                     return Ok(());
                 }
                 Ok(ExternalFormatOutcome::Unavailable { name })
@@ -37162,11 +37191,11 @@ while True:
             ("w", true, "No file name", "× "),
             ("xyz", false, "unknown command \"xyz\"", "× "),
         ] {
-            let mut editor = test_editor(80, 5);
+            let mut editor = test_editor(100, 5);
             editor.current_buffer_mut().dirty = dirty;
             editor.mode = Mode::Command;
             editor.command = command.to_string();
-            let mut render_buffer = RenderBuffer::new(80, 5, &Style::default());
+            let mut render_buffer = RenderBuffer::new(100, 5, &Style::default());
             let mut runtime = Runtime::new();
 
             let processed = editor
@@ -37182,10 +37211,14 @@ while True:
             assert!(!processed.quit, "command {command:?} unexpectedly quit");
             assert_eq!(editor.last_error.as_deref(), Some(expected));
             let row = render_row(&render_buffer, 4);
-            let message = row
-                .trim_end()
-                .strip_suffix("[1 active · :messages]")
-                .expect("command feedback should include the active-message badge");
+            let message = if marker.is_empty() {
+                assert!(!row.contains(":messages"));
+                row.trim_end()
+            } else {
+                row.trim_end()
+                    .strip_suffix("[1 needs attention · :messages]")
+                    .expect("errors should include the attention badge")
+            };
             assert_eq!(message.trim_end(), format!("{marker}{expected}"));
         }
     }

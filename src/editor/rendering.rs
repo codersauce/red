@@ -82,21 +82,35 @@ fn diagnostic_row(diagnostics: &[&Diagnostic], available_width: usize) -> Option
 }
 
 fn notification_badge(counts: NotificationCounts, width: usize, has_message: bool) -> String {
-    let full = if counts.active > 0 {
-        format!("[{} active · :messages]", counts.active)
-    } else if counts.unread > 0 {
-        format!("[{} unread · :messages]", counts.unread)
-    } else if counts.total > 0 {
-        "[:messages]".to_string()
-    } else {
+    let mut parts = Vec::new();
+    if counts.needs_acknowledgment > 0 {
+        parts.push(format!(
+            "{} need{} attention",
+            counts.needs_acknowledgment,
+            if counts.needs_acknowledgment == 1 {
+                "s"
+            } else {
+                ""
+            }
+        ));
+    }
+    if counts.unseen > 0 {
+        parts.push(format!("{} missed", counts.unseen));
+    }
+    if counts.running > 1 || (counts.running > 0 && (!has_message || !parts.is_empty())) {
+        parts.push(format!("{} running", counts.running));
+    }
+    if parts.is_empty() {
         return String::new();
-    };
+    }
+    let full = format!("[{} · :messages]", parts.join(" · "));
     let reserve = if has_message { 16 } else { 0 };
     if display_width(&full) + reserve <= width {
         return full;
     }
-    if counts.active > 1 {
-        let compact = format!("[{}]", counts.active);
+    let pending = counts.needs_acknowledgment + counts.unseen + counts.running;
+    if pending > 0 {
+        let compact = format!("[{pending}]");
         if display_width(&compact) + usize::from(has_message) < width {
             return compact;
         }
@@ -1207,6 +1221,9 @@ impl Editor {
             .apply_changes(changes);
         self.force_full_redraw = false;
         self.last_rendered_viewport = self.rendered_viewport();
+        if self.terminal_output_enabled {
+            self.notification_frame_presented(Instant::now());
+        }
     }
 
     /// Renders the entire editor state to the terminal
@@ -3410,6 +3427,7 @@ impl Editor {
     }
 
     pub fn draw_commandline(&mut self, buffer: &mut RenderBuffer) {
+        self.notification_frame_candidate = None;
         let style = &self.theme.style;
         let width = self.size.0 as usize;
         if width == 0 || self.size.1 == 0 {
@@ -3433,51 +3451,79 @@ impl Editor {
             let now = Instant::now();
             let mut counts = self.notifications.counts(now);
             let primary = self.notifications.primary(now);
-            let (message, severity) = if let Some(fallback) = &self.notification_fallback {
-                counts.active += 1;
-                (
-                    format!("! {fallback} [not retained]"),
-                    Some(Severity::Error),
-                )
-            } else if let Some(record) = primary {
-                let prefix = if record.is_running() {
-                    format!(
-                        "{} ",
-                        crate::ui::spinner_frame(
-                            self.notification_animation_start.elapsed().as_millis() as u64
-                        )
+            let (message, severity, summary_offset) =
+                if let Some(fallback) = &self.notification_fallback {
+                    counts.active += 1;
+                    counts.needs_acknowledgment += 1;
+                    (
+                        format!("! {fallback} [not retained]"),
+                        Some(Severity::Error),
+                        0,
                     )
-                } else if record.severity != Severity::Info {
-                    format!("{} ", record.severity.marker())
+                } else if let Some(record) = primary {
+                    let prefix = if record.is_running() {
+                        format!(
+                            "{} ",
+                            crate::ui::spinner_frame(
+                                self.notification_animation_start.elapsed().as_millis() as u64
+                            )
+                        )
+                    } else if record.severity != Severity::Info {
+                        format!("{} ", record.severity.marker())
+                    } else {
+                        String::new()
+                    };
+                    let source = if matches!(
+                        record.source,
+                        crate::notification::NotificationSource::Editor
+                    ) {
+                        String::new()
+                    } else {
+                        format!("{}: ", record.source.label())
+                    };
+                    let percentage = match record.state {
+                        NotificationState::Running {
+                            percentage: Some(value),
+                        } => format!(" ({value}%)"),
+                        _ => String::new(),
+                    };
+                    (
+                        format!("{prefix}{source}{}{percentage}", record.content.summary),
+                        Some(record.severity),
+                        display_width(&prefix) + display_width(&source),
+                    )
                 } else {
-                    String::new()
+                    (String::new(), None, 0)
                 };
-                let source = if matches!(
-                    record.source,
-                    crate::notification::NotificationSource::Editor
-                ) {
-                    String::new()
-                } else {
-                    format!("{}: ", record.source.label())
-                };
-                let percentage = match record.state {
-                    NotificationState::Running {
-                        percentage: Some(value),
-                    } => format!(" ({value}%)"),
-                    _ => String::new(),
-                };
-                (
-                    format!("{prefix}{source}{}{percentage}", record.content.summary),
-                    Some(record.severity),
-                )
-            } else {
-                (String::new(), None)
-            };
             let available = width.saturating_sub(wc_width);
-            let badge = notification_badge(counts, available, !message.is_empty());
-            let badge_width = display_width(&badge);
-            let message_width =
+            let candidate = primary
+                .filter(|_| self.notification_fallback.is_none())
+                .and_then(|record| {
+                    super::notifications::NotificationExposureKey::for_record(record).map(|key| {
+                        (
+                            key,
+                            summary_offset + display_width(&record.content.summary).clamp(1, 8),
+                        )
+                    })
+                });
+            if candidate.is_some() {
+                counts.unseen = counts.unseen.saturating_sub(1);
+            }
+            let mut badge = notification_badge(counts, available, !message.is_empty());
+            let mut badge_width = display_width(&badge);
+            let mut message_width =
                 available.saturating_sub(badge_width + usize::from(badge_width > 0));
+            if let Some((key, required_width)) = candidate {
+                if message_width >= required_width {
+                    self.notification_frame_candidate = Some(key);
+                } else {
+                    counts.unseen += 1;
+                    badge = notification_badge(counts, available, !message.is_empty());
+                    badge_width = display_width(&badge);
+                    message_width =
+                        available.saturating_sub(badge_width + usize::from(badge_width > 0));
+                }
+            }
             let mut message_style = style.clone();
             let color = match severity {
                 Some(Severity::Error) => Some("notificationsErrorIcon.foreground"),
