@@ -1718,6 +1718,47 @@ async fn command_key(harness: &mut EditorHarness, code: KeyCode) {
         .unwrap();
 }
 
+#[tokio::test]
+async fn command_backspace_exits_an_empty_prompt() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "unchanged".to_string()),
+        default_key_config(),
+    );
+    command_key(&mut harness, KeyCode::Char(':')).await;
+    harness.assert_mode(Mode::Command);
+    assert_eq!(harness.commandline_row().trim_end(), ":");
+
+    command_key(&mut harness, KeyCode::Backspace).await;
+
+    harness.assert_mode(Mode::Normal);
+    assert_eq!(harness.commandline_text(), "");
+    assert_eq!(harness.commandline_row().trim_end(), "");
+    harness.assert_buffer_contents("unchanged");
+}
+
+#[tokio::test]
+async fn command_backspace_deletes_text_before_exiting() {
+    for character in ['x', 'é', ' '] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, "unchanged".to_string()),
+            default_key_config(),
+        );
+        command_key(&mut harness, KeyCode::Char(':')).await;
+        command_key(&mut harness, KeyCode::Char(character)).await;
+
+        command_key(&mut harness, KeyCode::Backspace).await;
+
+        harness.assert_mode(Mode::Command);
+        assert_eq!(harness.commandline_text(), "");
+        assert_eq!(harness.commandline_row().trim_end(), ":");
+
+        command_key(&mut harness, KeyCode::Backspace).await;
+        harness.assert_mode(Mode::Normal);
+        assert_eq!(harness.commandline_row().trim_end(), "");
+        harness.assert_buffer_contents("unchanged");
+    }
+}
+
 struct CurrentDirGuard {
     original: PathBuf,
     _lock: MutexGuard<'static, ()>,
