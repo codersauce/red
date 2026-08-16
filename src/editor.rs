@@ -6525,6 +6525,67 @@ impl Editor {
             .any(|segment| segment.line == line_index && segment.contains_cursor_col(display_col))
     }
 
+    /// Best-effort scrolloff bounds in physical rows, excluding virtual comments.
+    fn viewport_cursor_row_bounds(
+        &self,
+        layout: &self::display_layout::DisplayLayout,
+    ) -> Option<std::ops::RangeInclusive<usize>> {
+        let first = layout.rows.first()?;
+        let last = layout.rows.last()?;
+        let last_row = self.vheight().saturating_sub(1);
+        let margin = self.config.scrolloff.unwrap_or(0).min(last_row / 2);
+        let start = margin.min(first.line);
+        let end = last_row
+            .saturating_sub(margin.min(self.last_navigable_line().saturating_sub(last.line)));
+        let preferred = start..=end;
+        if layout.rows.iter().any(|row| preferred.contains(&row.row)) {
+            Some(preferred)
+        } else {
+            // A tall card or wrapped line can leave no source in the margin.
+            Some(first.row..=last.row)
+        }
+    }
+
+    /// A wheel gesture owns the viewport. Move an offscreen cursor onto the
+    /// nearest visible source segment instead of scrolling back to find it.
+    fn clamp_cursor_to_scrolled_viewport(&mut self) {
+        if !self.wrap && !self.has_inline_comments(self.current_buffer().id()) {
+            return;
+        }
+        let Some(window) = self.active_window_with_editor_view() else {
+            return;
+        };
+        let layout = self.layout_for_window(&window);
+        let Some(bounds) = self.viewport_cursor_row_bounds(&layout) else {
+            return;
+        };
+        let line = self.buffer_line();
+        let display_col = self.current_cursor_display_col();
+        let Some(target) = layout
+            .rows
+            .iter()
+            .filter(|segment| bounds.contains(&segment.row))
+            .min_by_key(|segment| {
+                let nearest_col = display_col.clamp(segment.start_col, segment.end_col);
+                (
+                    segment.line.abs_diff(line),
+                    !segment.contains_cursor_col(display_col),
+                    nearest_col.abs_diff(display_col),
+                )
+            })
+            .copied()
+        else {
+            return;
+        };
+        self.cy = target.line.saturating_sub(self.vtop);
+        let end_col = if target.last_segment && self.is_insert() {
+            target.end_col
+        } else {
+            target.end_col.saturating_sub(1).max(target.start_col)
+        };
+        self.move_to_display_col_on_current_line(display_col.clamp(target.start_col, end_col));
+    }
+
     fn scroll_wrapped_viewport_down_one_screen_line(&mut self) -> bool {
         if !self.wrap {
             return false;
@@ -7098,7 +7159,21 @@ impl Editor {
             .scrolloff
             .unwrap_or(0)
             .min(viewport_height.saturating_sub(1));
-        if scrolloff > 0 {
+        let has_display_row_margin = scrolloff > 0
+            && (self.wrap || has_comments)
+            && self.active_window_with_editor_view().is_some_and(|window| {
+                let layout = self.layout_for_window(&window);
+                let display_col = self.current_cursor_display_col();
+                self.viewport_cursor_row_bounds(&layout)
+                    .is_some_and(|bounds| {
+                        layout.rows.iter().any(|segment| {
+                            segment.line == buffer_line
+                                && segment.contains_cursor_col(display_col)
+                                && bounds.contains(&segment.row)
+                        })
+                    })
+            });
+        if scrolloff > 0 && !has_display_row_margin {
             let top_scrolloff = scrolloff.min(buffer_line);
             let bottom_scrolloff = scrolloff.min(last_line.saturating_sub(buffer_line));
             let mut scrolloff_vtop = self.vtop;
@@ -19663,6 +19738,8 @@ impl Editor {
                         .min(viewport_height.saturating_sub(1));
                     let max_cy = viewport_height.saturating_sub(scrolloff).saturating_sub(1);
                     self.cy = self.cy.saturating_add(scrolled_lines).min(max_cy);
+                    self.skipcol = 0;
+                    self.clamp_cursor_to_scrolled_viewport();
                     self.sync_to_window();
                     self.render_motion_frame(buffer)?;
                 }
@@ -19688,6 +19765,8 @@ impl Editor {
                         .unwrap_or(0)
                         .min(viewport_height.saturating_sub(1));
                     self.cy = self.cy.saturating_sub(scrolled_lines).max(scrolloff);
+                    self.skipcol = 0;
+                    self.clamp_cursor_to_scrolled_viewport();
                     self.sync_to_window();
                     self.render_motion_frame(buffer)?;
                 }

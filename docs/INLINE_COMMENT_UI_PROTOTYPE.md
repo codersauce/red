@@ -44,9 +44,13 @@ independent. The remaining screen columns keep the editor background. The
 block uses `red.inlineCommentBackground` or a dark/light gray fallback. Text
 uses the theme's `red.inlineCommentForeground` color (falling back to the information/comment
 foreground, adjusted for readability). Long comments wrap at word boundaries,
-with a four-text-row preview limit. Tiny splits reduce padding to keep the source
-line visible. Source line numbers, Vim motions, selections, file contents, and
+with a four-text-row preview limit. Card geometry stays stable as it reaches the
+viewport edge; offscreen rows are clipped instead of removing padding. Tiny
+splits still reduce padding to keep the source line visible. Source line numbers,
+Vim motions, selections, file contents, and
 dirty state stay unchanged.
+Mouse-wheel scrolling keeps the requested viewport and moves an offscreen cursor
+to the nearest visible source row, accounting for comment blocks and wrapping.
 Clicking an activity marker reopens its job; clicking ordinary comment text opens
 its full view. Splits show the same buffer's
 comments at their own widths.

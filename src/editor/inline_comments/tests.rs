@@ -112,6 +112,53 @@ fn inline_comment_block_sizes_to_text_with_two_by_one_padding() {
 }
 
 #[test]
+fn inline_comments_keep_their_padding_at_the_viewport_bottom() {
+    let message = "Review this line";
+    let complete = layout(40, 4).with_inline_comments(&[(0, message)], 40, 4);
+    let clipped = layout(40, 4).with_inline_comments(&[(2, message)], 40, 4);
+
+    assert_eq!(clipped.screen_height(), 4);
+    assert_eq!(clipped.inline_comments.len(), 2);
+    assert_eq!(clipped.row(0).unwrap().line, 0);
+    assert_eq!(clipped.row(1).unwrap().line, 1);
+    assert!(clipped.segment_for_cursor(2, 0).is_none());
+    for (visible, original) in clipped
+        .inline_comments
+        .iter()
+        .zip(&complete.inline_comments)
+    {
+        assert_eq!(visible.content, original.content);
+        assert_eq!(visible.block_width, original.block_width);
+        assert_eq!(visible.text_offset, original.text_offset);
+        assert_eq!(visible.starts_connection, original.starts_connection);
+        assert_eq!(visible.row, original.row + 2);
+    }
+    assert_eq!(complete.row(3).unwrap().line, 0);
+}
+
+#[test]
+fn inline_comments_clip_wrapped_previews_without_reflowing_them() {
+    let message = "one two three four five six seven eight nine ten eleven twelve";
+    let complete = layout(16, 7).with_inline_comments(&[(0, message)], 16, 7);
+    let clipped = layout(16, 7).with_inline_comments(&[(2, message)], 16, 7);
+
+    assert_eq!(complete.inline_comments.len(), 6);
+    assert_eq!(clipped.inline_comments.len(), 5);
+    assert_eq!(clipped.screen_height(), 7);
+    for (visible, original) in clipped
+        .inline_comments
+        .iter()
+        .zip(&complete.inline_comments)
+    {
+        assert_eq!(visible.content, original.content);
+        assert_eq!(visible.block_width, original.block_width);
+        assert_eq!(visible.text_offset, original.text_offset);
+    }
+    assert!(clipped.inline_comments[4].content.text().ends_with('…'));
+    assert_eq!(complete.row(6).unwrap().line, 0);
+}
+
+#[test]
 fn inline_comments_wrap_but_always_leave_the_source_visible() {
     assert_eq!(
         super::super::display_layout::wrap_inline_comment("words stay together", 11),
@@ -447,17 +494,116 @@ fn inline_comments_keep_bottom_cursor_visible_in_both_wrap_modes() {
         assert_eq!(editor.buffer_line(), 5);
         assert!(editor.visible_cursor_segment(5, 0));
         let window = editor.active_window_with_editor_view().unwrap();
-        assert!(editor
-            .layout_for_window(&window)
+        let layout = editor.layout_for_window(&window);
+        let comment_rows = layout
             .inline_comments
             .iter()
-            .any(|comment| comment.line == 5));
+            .filter(|comment| comment.line == 5)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            comment_rows.first().unwrap().content,
+            InlineCommentContent::TopEdge
+        );
+        assert_eq!(
+            comment_rows.last().unwrap().content,
+            InlineCommentContent::BottomEdge
+        );
         assert!(editor.vtop > 0);
         editor.test_set_size(24, 6);
         editor.check_bounds();
         assert_eq!(editor.buffer_line(), 5);
         assert!(editor.visible_cursor_segment(5, 0));
     }
+}
+
+#[tokio::test]
+async fn inline_comments_do_not_pin_mouse_wheel_scrolling_to_the_cursor() {
+    let text = (0..300)
+        .map(|line| format!("line {line}: source text that wraps in the narrow editor\n"))
+        .collect::<String>();
+    for wrap in [false, true] {
+        for (width, height, scrolloff) in [
+            (80, 14, 0),
+            (80, 14, 3),
+            (32, 8, 0),
+            (32, 8, 3),
+            (32, 8, 20),
+        ] {
+            let mut editor = editor(&text, width, height, wrap);
+            editor.config.scrolloff = Some(scrolloff);
+            for line in [210, 220, 230, 240, 250] {
+                let comment = editor.make_inline_comment(
+                    line,
+                    line + 2,
+                    "A source-linked annotation that wraps across several rows in a narrow pane."
+                        .into(),
+                    InlineCommentOrigin::Sample,
+                );
+                editor.inline_comments.push(comment);
+            }
+            editor.layout_cache.borrow_mut().clear();
+            editor.test_set_viewport_cursor(230, 0, 0);
+            let window = editor.active_window_with_editor_view().unwrap();
+            let layout = editor.layout_for_window(&window);
+            let last = layout.rows.last().unwrap();
+            editor
+                .test_execute_event(Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: (window.position.x + editor.gutter_width_for_window(&window) + 1)
+                        as u16,
+                    row: editor.window_to_terminal_y(&window, last.row) as u16,
+                    modifiers: KeyModifiers::NONE,
+                }))
+                .await
+                .unwrap();
+
+            for kind in [MouseEventKind::ScrollUp, MouseEventKind::ScrollDown] {
+                for _ in 0..12 {
+                    let old_top = editor.vtop;
+                    let expected = if kind == MouseEventKind::ScrollUp {
+                        old_top - 3
+                    } else {
+                        old_top + 3
+                    };
+                    editor
+                        .test_execute_event(Event::Mouse(MouseEvent {
+                            kind,
+                            column: (window.position.x + 12) as u16,
+                            row: editor.window_to_terminal_y(&window, 2) as u16,
+                            modifiers: KeyModifiers::NONE,
+                        }))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        editor.vtop,
+                        expected,
+                        "{kind:?}: width={width}, height={height}, wrap={wrap}, scrolloff={scrolloff}, cursor={}",
+                        editor.buffer_line()
+                    );
+                    assert!(editor.visible_cursor_segment(
+                        editor.buffer_line(),
+                        editor.current_cursor_display_col()
+                    ));
+                }
+            }
+            assert_eq!(editor.current_buffer().contents(), text);
+        }
+    }
+}
+
+#[test]
+fn wheel_cursor_clamping_preserves_a_visible_wrapped_segment_boundary() {
+    let text = format!("{}\n", "source_text ".repeat(16));
+    let mut editor = editor(&text, 40, 12, true);
+    let segments = editor.wrapped_line_segments_for_width(0, editor.active_content_width());
+    let cursor = segments[1].start_grapheme;
+    editor.test_set_viewport_cursor(0, cursor, 0);
+
+    editor.clamp_cursor_to_scrolled_viewport();
+
+    assert_eq!(editor.cx, cursor);
+    assert_eq!(editor.vtop, 0);
+    assert!(editor.visible_cursor_segment(0, editor.current_cursor_display_col()));
 }
 
 #[tokio::test]
