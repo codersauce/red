@@ -12,6 +12,9 @@ sources:
   - id: editor
     type: file
     path: src/editor/inline_completion.rs
+  - id: preferences
+    type: file
+    path: src/preferences.rs
 ---
 
 # Copilot Inline Completion
@@ -55,6 +58,32 @@ settings still apply [@transport] [@editor].
 
 These checks govern documents Red sends directly. The language server is a
 separate process with normal filesystem access, not a sandbox [@transport].
+
+## Setup Hint And Sign-In State
+
+When Copilot is disabled in config but the configured executable exists, Red can
+show a one-time setup hint instead of starting the Copilot bridge. The hint is
+shown only when global AI is not disabled, preferences are filesystem-backed,
+the hint has not already been recorded, there is no active dialog or message,
+the current file passes the workspace, size, and exclusion checks, and the
+configured `copilot-language-server` can be found [@editor] [@preferences].
+
+Displaying the hint records `copilot_setup_hint_seen` in preferences before the
+bridge starts. Running `:Copilot signin`, `:Copilot enable`, or
+`:Copilot disable` also records the hint as seen [@editor] [@preferences].
+This means the hint is onboarding state, not Copilot enablement state. A user
+can acknowledge the setup flow, reopen Red, and still have Copilot disabled if
+they only used session-level enablement rather than changing `[copilot].enabled`
+in configuration [@defaults] [@editor].
+
+The sign-in flow keeps the device-code dialog open after Red sends
+`github.copilot.finishDeviceFlow` to the language server. Red copies the code to
+the clipboard when possible, leaves the code visible if copying fails, updates
+the dialog on sign-in failure, and closes it only after the server reports a
+successful sign-in [@editor]. Sign-in success, sign-in failure, provider stop
+messages, and `:Copilot status` must be visible through Red's notification
+path; writing them only to the legacy `last_error` field can hide them from the
+user [@editor].
 
 ## Use Suggestions
 
