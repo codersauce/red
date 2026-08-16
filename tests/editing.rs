@@ -1928,6 +1928,67 @@ fn command_tab_completes_edit_file_argument() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[tokio::test]
+async fn command_tab_opens_completed_paths_with_spaces() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("name  with spaces.txt!");
+    let command_directory = directory.path().to_string_lossy().replace('\\', "/");
+    let command_path = format!("{command_directory}/name  with spaces.txt!");
+    fs::write(&path, "completed file contents\n").unwrap();
+
+    for command in ["e", "edit", "e!", "split", "sp", "vsplit", "vs"] {
+        let mut harness = EditorHarness::with_content("");
+        harness.set_commandline(
+            Mode::Command,
+            &format!("{command} {command_directory}/name"),
+        );
+
+        command_key(&mut harness, KeyCode::Tab).await;
+        assert_eq!(
+            harness.commandline_text(),
+            format!("{command} {command_path}")
+        );
+        command_key(&mut harness, KeyCode::Enter).await;
+
+        assert_eq!(
+            harness.buffer_contents(),
+            "completed file contents\n",
+            "{command} did not open the completed path"
+        );
+    }
+}
+
+#[tokio::test]
+async fn command_tab_writes_completed_paths_with_spaces() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("name  with spaces.txt!");
+    let command_directory = directory.path().to_string_lossy().replace('\\', "/");
+    let command_path = format!("{command_directory}/name  with spaces.txt!");
+
+    for command in ["w", "write", "w!", "write!"] {
+        fs::write(&path, "old contents\n").unwrap();
+        let mut harness = EditorHarness::with_content("saved contents\n");
+        harness.set_commandline(
+            Mode::Command,
+            &format!("{command} {command_directory}/name"),
+        );
+
+        command_key(&mut harness, KeyCode::Tab).await;
+        assert_eq!(
+            harness.commandline_text(),
+            format!("{command} {command_path}")
+        );
+        command_key(&mut harness, KeyCode::Enter).await;
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "saved contents\n",
+            "{command} did not write the completed path"
+        );
+        assert!(!directory.path().join("name").exists());
+    }
+}
+
 #[test]
 fn command_tab_preserves_relative_path_prefix() {
     let (root, _guard) = command_completion_temp_dir("relative-prefix");

@@ -13803,8 +13803,8 @@ impl Editor {
             }
 
             if cmd == "write" {
-                if let Some(file) = parsed.args.first() {
-                    actions.push(Action::SaveAs(file.clone()));
+                if let Some(file) = parsed.file_argument() {
+                    actions.push(Action::SaveAs(file));
                 } else {
                     actions.push(Action::Save);
                 }
@@ -13823,8 +13823,8 @@ impl Editor {
             }
 
             if cmd == "edit" {
-                if let Some(file) = parsed.args.first() {
-                    actions.push(Action::OpenFile(file.clone()));
+                if let Some(file) = parsed.file_argument() {
+                    actions.push(Action::OpenFile(file));
                 } else {
                     actions.push(Action::ReloadFile(parsed.is_forced()));
                 }
@@ -13836,8 +13836,8 @@ impl Editor {
                     cmd,
                     parsed.args
                 );
-                if let Some(file) = parsed.args.first() {
-                    actions.push(Action::SplitHorizontalWithFile(file.clone()));
+                if let Some(file) = parsed.file_argument() {
+                    actions.push(Action::SplitHorizontalWithFile(file));
                 } else {
                     actions.push(Action::SplitHorizontal);
                 }
@@ -13849,8 +13849,8 @@ impl Editor {
                     cmd,
                     parsed.args
                 );
-                if let Some(file) = parsed.args.first() {
-                    actions.push(Action::SplitVerticalWithFile(file.clone()));
+                if let Some(file) = parsed.file_argument() {
+                    actions.push(Action::SplitVerticalWithFile(file));
                 } else {
                     actions.push(Action::SplitVertical);
                 }

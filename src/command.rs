@@ -41,6 +41,16 @@ impl ParsedCommand {
     pub fn is_forced(&self) -> bool {
         self.flags.contains(&CommandFlag::Force)
     }
+
+    /// Reassembles the single unexpanded path consumed by file commands.
+    ///
+    /// Splitting and joining on literal spaces preserves whitespace inside the
+    /// path, including repeated spaces returned by command completion.
+    pub(crate) fn file_argument(&self) -> Option<String> {
+        let path = self.args.join(" ");
+        let path = path.trim_start();
+        (!path.is_empty()).then(|| path.to_string())
+    }
 }
 
 /// Resolves a command line against the supplied canonical command names.
@@ -48,9 +58,8 @@ impl ParsedCommand {
 /// Returns `None` when any command in a chain is unknown. Arguments are split on spaces
 /// without shell quoting or expansion.
 pub fn parse(commands: &[&str], input: &str) -> Option<ParsedCommand> {
-    let (flags, input) = parse_flags(input);
     let mut parts = input.splitn(2, ' ');
-    let input = parts.next()?;
+    let (flags, input) = parse_flags(parts.next()?);
     let args = parts
         .next()
         .map(|s| s.split(' ').map(|s| s.to_string()).collect())
@@ -158,6 +167,24 @@ mod test {
                 flags: vec![]
             })
         );
+    }
+
+    #[test]
+    fn file_arguments_preserve_spaces_and_literal_bangs() {
+        let commands = ["edit", "write", "split", "vsplit"];
+        let path = "dir/name  with spaces.txt!";
+
+        for command in commands {
+            let parsed = parse(&commands, &format!("{command} {path}")).unwrap();
+            assert_eq!(parsed.file_argument().as_deref(), Some(path));
+            assert!(!parsed.is_forced());
+
+            let forced = parse(&commands, &format!("{command}! {path}")).unwrap();
+            assert_eq!(forced.file_argument().as_deref(), Some(path));
+            assert!(forced.is_forced());
+        }
+
+        assert_eq!(parse(&commands, "edit   ").unwrap().file_argument(), None);
     }
 
     #[test]
