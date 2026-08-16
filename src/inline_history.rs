@@ -48,6 +48,7 @@ pub enum InlineTurnState {
     Completed,
     Failed,
     Cancelled,
+    Declined,
     Rejected,
 }
 
@@ -94,6 +95,46 @@ pub struct InlineLocation {
     pub buffer_id: Option<BufferId>,
 }
 
+/// Character offsets into the retained post-edit text, not the current buffer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InlineChangeHunk {
+    pub start_char: usize,
+    pub end_char: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InlineChangeSummary {
+    pub hunks: Vec<InlineChangeHunk>,
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+impl InlineChangeSummary {
+    pub fn new(before: &str, after: &str) -> Self {
+        let mut offsets = vec![0];
+        for line in after.split_inclusive('\n') {
+            offsets.push(offsets.last().copied().unwrap_or(0) + line.chars().count());
+        }
+        let diff = similar::TextDiff::from_lines(before, after);
+        let hunks = diff
+            .ops()
+            .iter()
+            .filter(|op| op.tag() != similar::DiffTag::Equal)
+            .map(|op| {
+                let range = op.new_range();
+                InlineChangeHunk {
+                    start_char: offsets[range.start],
+                    end_char: offsets[range.end],
+                }
+            })
+            .collect();
+        Self {
+            hunks,
+            hidden: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InlineHistoryTurn {
     /// False for explicit selections and records created before scope expansion.
@@ -123,6 +164,8 @@ pub struct InlineHistoryTurn {
     pub error: Option<String>,
     #[serde(default)]
     pub transaction_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_summary: Option<InlineChangeSummary>,
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
@@ -136,6 +179,25 @@ pub struct InlineHistoryTurn {
 }
 
 impl InlineHistoryTurn {
+    pub fn has_code_change(&self) -> bool {
+        self.state == InlineTurnState::Completed
+            && self.transaction_id.is_some()
+            && self.reviewed() != self.before
+    }
+
+    pub fn change_diff(&self) -> String {
+        similar::TextDiff::from_lines(self.before.as_str(), self.reviewed())
+            .unified_diff()
+            .header("before inline edit", "after inline edit")
+            .to_string()
+    }
+
+    /// Upgrade older retained edits without needing the provider session.
+    pub fn ensure_change_summary(&mut self) {
+        if self.change_summary.is_none() && self.has_code_change() {
+            self.change_summary = Some(InlineChangeSummary::new(&self.before, self.reviewed()));
+        }
+    }
     pub(crate) fn locations_mut(&mut self) -> impl Iterator<Item = &mut InlineLocation> {
         std::iter::once(&mut self.location)
             .chain(self.expanded_location.iter_mut())
@@ -231,9 +293,11 @@ impl InlineHistoryTurn {
             (InlineTurnState::Ready, _) => "ready",
             (InlineTurnState::Failed, _) => "failed",
             (InlineTurnState::Cancelled, _) => "cancelled",
+            (InlineTurnState::Declined, _) => "declined",
             (InlineTurnState::Rejected, _) => "not applied",
             (_, InlineDisposition::Undone) => "undone",
             (_, InlineDisposition::Superseded) => "superseded",
+            (_, InlineDisposition::Kept) if self.has_code_change() => "applied",
             (_, InlineDisposition::Kept) => "kept",
         }
     }
@@ -401,6 +465,18 @@ impl InlineHistory {
                     turn.location.start_char <= turn.location.end_char,
                     "invalid inline history location"
                 );
+                if let Some(summary) = &turn.change_summary {
+                    let length = turn.reviewed().chars().count();
+                    ensure!(
+                        turn.has_code_change()
+                            && summary
+                                .hunks
+                                .iter()
+                                .all(|hunk| hunk.start_char <= hunk.end_char
+                                    && hunk.end_char <= length),
+                        "invalid inline change summary"
+                    );
+                }
                 ensure!(
                     turn.comment_source_ids
                         .iter()

@@ -62,6 +62,10 @@ read-only tools. Unsaved buffers win over disk, and reads never move editor
 focus. Successful reads are listed in the history conversation view. The write
 boundary remains the original target unless the user explicitly approves a
 validated wider same-file proposal. Explicit selections cannot be widened.
+Enter opens the proposed diff; `a` applies it and `d` declines it. Applied edits
+leave a retained change summary even when the assistant returns no comments.
+Open it for the exact edit diff, `[`/`]` changed-location navigation, and safe
+`u` undo. Closing the result is not another acceptance decision.
 
 To preview a range, press `V`, extend the selection with `j`/`k`, then press
 `Space C`. The status message identifies the inclusive line range. Model tools

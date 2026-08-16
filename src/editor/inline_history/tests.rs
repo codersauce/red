@@ -1251,7 +1251,7 @@ async fn inline_history_restores_dismissed_annotations_without_reapplying_the_ed
     assert!(editor.inline_history_browser.is_none());
     assert_eq!(
         editor.inline_comment_display_messages(editor.current_buffer()),
-        vec![(0, "Renamed value".into())]
+        vec![(0, "[<] [>] Inline 2 of 2 · Space v\nRenamed value".into())]
     );
     assert_eq!(editor.current_buffer().contents(), "renamed\nbeta\n");
     assert_eq!(editor.current_buffer().revision(), revision);

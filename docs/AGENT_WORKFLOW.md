@@ -72,8 +72,8 @@ the source and retains at most 64 KiB of original text and a 128 KiB replacement
 
 A wider proposal is never applied automatically, even with its popup open.
 The source marker says **Review wider edit**. Enter or `v` opens the full diff,
-with the original target, proposed range, and reason. Enter in that review
-approves one unsaved, undoable editor transaction. `d` in the result popup
+with the original target, proposed range, and reason. `a` in that review
+approves one unsaved, undoable editor transaction. Enter does not approve. `d` in the review or result popup
 declines the proposal; Esc hides it. Both keep the discussion in InlineHistory.
 Changed source disables approval and requires a recheck. Rechecking an
 unapproved proposal starts from the original target, not the proposed range.
@@ -87,9 +87,19 @@ range, and original text. A stale response fails without changing the buffer.
 Successful output is applied only after a completed turn and full validation.
 Code changes use one agent-attributed editor transaction and are deliberately
 not saved. Comment-only results do not alter dirty state or text undo history.
-The result controls are Enter/`k` to keep, `u` to undo the latest inline edit
+After a code edit, Red retains an editor-generated **Applied** summary even when
+the assistant supplied no comments. It shows the number of changed locations and
+whether the buffer is unsaved. Click it, use `Space v`, or open the request in
+InlineHistory to see that edit's exact before/after diff. `[` and `]` move between
+changed locations while the retained source still matches. `u` undoes the edit
+only when its transaction is still the latest change; later work is never silently
+discarded. `Space x` hides the summary, and `p` in InlineHistory restores it.
+Applying and declining also produce actionable bottom-line notices. Completed
+edits remain available after recovery; no provider session is needed.
+
+The result controls are Esc to close (Enter/`k` are compatibility aliases), `u` to undo the latest inline edit
 and dismiss its comments (or just dismiss a comment-only result), `r` to
-refine, `v` to read the full answer and return, `p` to pin its annotations,
+refine, `v` to read the full answer or applied diff, `p` to pin its annotations,
 and `A` to prepare a full Agent
 draft containing the latest request, source location, and earlier inline
 discussion. Nothing is sent automatically; replacing an unsent Agent draft

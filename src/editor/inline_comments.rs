@@ -25,6 +25,9 @@ pub(super) enum InlineCommentOrigin {
     Activity {
         group_id: String,
     },
+    ChangeSummary {
+        request_id: String,
+    },
     HistoryPreview {
         request_id: String,
         comment_index: usize,
@@ -68,7 +71,10 @@ impl InlineComment {
     }
 
     pub(super) fn refresh_staleness(&mut self, buffer: &Buffer) {
-        if matches!(self.origin, InlineCommentOrigin::Activity { .. }) {
+        if matches!(
+            self.origin,
+            InlineCommentOrigin::Activity { .. } | InlineCommentOrigin::ChangeSummary { .. }
+        ) {
             return;
         }
         let (start, end) = self.lines(buffer);
@@ -276,6 +282,7 @@ impl Editor {
                     && !matches!(
                         comment.origin,
                         InlineCommentOrigin::Activity { .. }
+                            | InlineCommentOrigin::ChangeSummary { .. }
                             | InlineCommentOrigin::HistoryPreview { .. }
                     )
             })
@@ -518,16 +525,43 @@ impl Editor {
 
     pub(super) fn select_inline_comment_for_group(&mut self, group: &str) {
         let buffer_id = self.current_buffer().id();
+        let current_request = self
+            .inline_assist
+            .as_ref()
+            .filter(|assist| assist.annotation_group_id == group)
+            .and_then(|assist| {
+                assist
+                    .result_request_id
+                    .as_deref()
+                    .or(assist.request_id.as_deref())
+            });
+        let prefer_changes = current_request
+            .and_then(|request| self.inline_history.turn(request))
+            .is_some_and(|turn| turn.has_code_change());
         let belongs = |comment: &InlineComment| {
             comment.anchor.buffer_id == buffer_id
                 && self.inline_comment_visible(comment)
-                && matches!(&comment.origin, InlineCommentOrigin::Assist { group_id, .. } | InlineCommentOrigin::Activity { group_id } if group_id == group)
+                && (matches!(&comment.origin, InlineCommentOrigin::Assist { group_id, .. } | InlineCommentOrigin::Activity { group_id } if group_id == group)
+                    || matches!(&comment.origin, InlineCommentOrigin::ChangeSummary { request_id } if self.inline_history.conversations.iter().any(|conversation| conversation.id == group && conversation.turns.iter().any(|turn| &turn.request_id == request_id))))
         };
         let selected = self
             .inline_comments
             .iter()
             .filter(|comment| belongs(comment))
-            .find(|comment| Some(comment.id) == self.active_inline_comment)
+            .find(|comment| match &comment.origin {
+                InlineCommentOrigin::ChangeSummary { request_id } if prefer_changes => {
+                    Some(request_id.as_str()) == current_request
+                }
+                InlineCommentOrigin::Assist { request_id, .. } if !prefer_changes => {
+                    Some(request_id.as_str()) == current_request
+                }
+                _ => false,
+            })
+            .or_else(|| {
+                self.inline_comments.iter().find(|comment| {
+                    belongs(comment) && Some(comment.id) == self.active_inline_comment
+                })
+            })
             .or_else(|| {
                 self.inline_comments
                     .iter()
@@ -640,6 +674,10 @@ impl Editor {
             let group = group_id.clone();
             return self.open_inline_job(&group, frame, runtime).await;
         }
+        if let InlineCommentOrigin::ChangeSummary { request_id } = &comment.origin {
+            let request = request_id.clone();
+            return self.view_inline_changes(&request, 0, frame, runtime).await;
+        }
         let line = comment.lines(self.current_buffer()).0;
         self.active_inline_comment = Some(id);
         self.layout_cache.borrow_mut().clear();
@@ -696,6 +734,18 @@ impl Editor {
 
     pub(super) fn dismiss_inline_comment(&mut self) {
         if let Some(index) = self.current_inline_comment_index() {
+            if let InlineCommentOrigin::ChangeSummary { request_id } =
+                &self.inline_comments[index].origin
+            {
+                if let Some(summary) = self
+                    .inline_history
+                    .turn_mut(request_id)
+                    .and_then(|turn| turn.change_summary.as_mut())
+                {
+                    summary.hidden = true;
+                }
+                self.last_error = Some("change summary hidden · Space H to restore".into());
+            }
             if matches!(
                 self.inline_comments[index].origin,
                 InlineCommentOrigin::Activity { .. }
@@ -734,6 +784,7 @@ impl Editor {
         let provenance = match &comment.origin {
             InlineCommentOrigin::Sample => "sample".to_string(),
             InlineCommentOrigin::Activity { .. } => "inline activity".to_string(),
+            InlineCommentOrigin::ChangeSummary { .. } => "inline changes".to_string(),
             InlineCommentOrigin::HistoryPreview { .. } => "history preview".to_string(),
             InlineCommentOrigin::Assist {
                 session_id,
@@ -769,6 +820,15 @@ impl Editor {
         let buffer_id = self.current_buffer().id();
         for comment in &self.inline_comments {
             if comment.anchor.buffer_id == buffer_id {
+                if let InlineCommentOrigin::ChangeSummary { request_id } = &comment.origin {
+                    if let Some(summary) = self
+                        .inline_history
+                        .turn_mut(request_id)
+                        .and_then(|turn| turn.change_summary.as_mut())
+                    {
+                        summary.hidden = true;
+                    }
+                }
                 if let InlineCommentOrigin::Assist {
                     request_id,
                     comment_index,

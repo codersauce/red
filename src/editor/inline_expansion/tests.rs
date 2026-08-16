@@ -67,14 +67,15 @@ async fn action(editor: &mut Editor, action: Action) {
 }
 
 fn enter(editor: &mut Editor) -> Option<KeyAction> {
+    press(editor, KeyCode::Enter)
+}
+
+fn press(editor: &mut Editor, code: KeyCode) -> Option<KeyAction> {
     editor
         .current_dialog
         .as_mut()
         .unwrap()
-        .handle_event(&Event::Key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        )))
+        .handle_event(&Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
 }
 
 #[tokio::test]
@@ -135,7 +136,8 @@ async fn inline_expansion_requires_review_and_applies_as_one_unsaved_undo() {
     let text = frame.cells.iter().map(|cell| cell.c).collect::<String>();
     assert!(text.contains("Review wider edit"));
     assert!(text.contains("+new helper"));
-    let approval = enter(&mut editor);
+    assert_eq!(enter(&mut editor), None);
+    let approval = press(&mut editor, KeyCode::Char('a'));
     assert_eq!(
         approval,
         Some(KeyAction::Single(Action::ApplyReviewedInlineAssist(
@@ -209,7 +211,7 @@ async fn inline_expansion_cannot_be_approved_after_source_changes() {
     let result = proposal(&editor);
     editor.stage_background_inline_result("request", "provider", result);
     action(&mut editor, Action::ViewInlineAssistAnswer).await;
-    let Some(KeyAction::Single(approval)) = enter(&mut editor) else {
+    let Some(KeyAction::Single(approval)) = press(&mut editor, KeyCode::Char('a')) else {
         panic!("missing approval")
     };
     editor.begin_transaction("change helper");
@@ -252,7 +254,7 @@ async fn inline_expansion_decline_and_recheck_keep_the_original_boundary() {
     assert_eq!(editor.inline_comment_group_count("earlier"), 1);
     assert_eq!(
         editor.inline_history.turn("request").unwrap().state,
-        InlineTurnState::Rejected
+        InlineTurnState::Declined
     );
     assert!(editor.inline_assist.is_none());
 }
@@ -278,7 +280,7 @@ async fn inline_expansion_recovery_retains_review_and_relocates_exact_source() {
         TextRange::new(TextPosition::new(2, 0), TextPosition::new(3, 0))
     );
     action(&mut recovered, Action::ApplyPendingInlineAssist).await;
-    let Some(KeyAction::Single(approval)) = enter(&mut recovered) else {
+    let Some(KeyAction::Single(approval)) = press(&mut recovered, KeyCode::Char('a')) else {
         panic!("missing recovered approval")
     };
     action(&mut recovered, approval).await;

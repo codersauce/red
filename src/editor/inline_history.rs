@@ -437,10 +437,11 @@ impl Editor {
                 }
             }
             can_restore = turn.state == InlineTurnState::Completed
-                && turn
-                    .result
-                    .as_ref()
-                    .is_some_and(|result| !result.comments.is_empty());
+                && (turn.change_summary.is_some()
+                    || turn
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| !result.comments.is_empty()));
             let view = self
                 .inline_history_browser
                 .as_ref()
@@ -458,6 +459,12 @@ impl Editor {
                 format!("\n\nContext read:\n- {}", turn.context_reads.join("\n- "))
             };
             detail = match view {
+                4 if turn.has_code_change() => format!(
+                    "{header}\n\n{}\n\n{}",
+                    self.inline_change_label(&turn),
+                    turn.change_diff()
+                ),
+                4 => format!("{header}\n\nNo applied code changes in this turn."),
                 1 => format!(
                     "{header}\n\nREVIEWED SOURCE · read-only\n{}",
                     turn.reviewed()
@@ -684,6 +691,13 @@ impl Editor {
         if matches!(action, HistoryAction::Open) {
             if let Some(row) = selected_row {
                 if let Some(request) = row.key.request() {
+                    if self
+                        .inline_history
+                        .turn(request)
+                        .is_some_and(|turn| turn.has_code_change())
+                    {
+                        return self.view_inline_changes(request, 0, buffer, runtime).await;
+                    }
                     let historical = self
                         .inline_history
                         .conversations
@@ -874,7 +888,7 @@ impl Editor {
             HistoryAction::ScrollDown => browser.scroll = browser.scroll.saturating_add(4),
             HistoryAction::ScrollUp => browser.scroll = browser.scroll.saturating_sub(4),
             HistoryAction::CycleView => {
-                browser.view = (browser.view + 1) % 4;
+                browser.view = (browser.view + 1) % 5;
                 browser.scroll = 0;
             }
             HistoryAction::Forget => browser.confirm_forget = !browser.confirm_forget,
@@ -936,10 +950,11 @@ impl Editor {
             .find(|conversation| conversation.id == group)?;
         let has_annotations = |turn: &&InlineHistoryTurn| {
             turn.state == InlineTurnState::Completed
-                && turn
-                    .result
-                    .as_ref()
-                    .is_some_and(|result| !result.comments.is_empty())
+                && (turn.change_summary.is_some()
+                    || turn
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| !result.comments.is_empty()))
         };
         preferred
             .or(conversation.visible_request.as_deref())
@@ -979,6 +994,35 @@ impl Editor {
             self.last_error = Some("this item has no completed annotations".into());
             return Ok(false);
         };
+        if turn.change_summary.is_some() {
+            if let Some(conversation) = self
+                .inline_history
+                .conversations
+                .iter_mut()
+                .find(|conversation| conversation.id == group)
+            {
+                conversation.resolved = false;
+                conversation.visible_request = Some(request.into());
+                if let Some(summary) = conversation
+                    .turns
+                    .iter_mut()
+                    .find(|turn| turn.request_id == request)
+                    .and_then(|turn| turn.change_summary.as_mut())
+                {
+                    summary.hidden = false;
+                }
+            }
+            self.sync_inline_change_summaries();
+            if turn
+                .result
+                .as_ref()
+                .is_none_or(|result| result.comments.is_empty())
+            {
+                self.last_error =
+                    Some("change summary restored · source unchanged by this action".into());
+                return Ok(true);
+            }
+        }
         let Some(result) = turn
             .result
             .as_ref()
@@ -1205,6 +1249,7 @@ impl Editor {
             result: None,
             error: None,
             transaction_id: None,
+            change_summary: None,
             session_id: None,
             hidden_comments: Vec::new(),
             comment_fingerprints: Vec::new(),
@@ -1328,6 +1373,7 @@ impl Editor {
                         turn.comment_fingerprints.clone_from(&fingerprints);
                         turn.comment_locations.clone_from(&comment_locations);
                         turn.comment_source_ids.clone_from(&comment_source_ids);
+                        turn.ensure_change_summary();
                     } else if result.needs_agent.is_none()
                         && turn.state == InlineTurnState::Completed
                         && turn.disposition == InlineDisposition::Kept
@@ -1529,9 +1575,9 @@ impl Editor {
                         request_id,
                         comment_index,
                     } => (request_id, *comment_index),
-                    InlineCommentOrigin::Sample | InlineCommentOrigin::Activity { .. } => {
-                        return None
-                    }
+                    InlineCommentOrigin::Sample
+                    | InlineCommentOrigin::Activity { .. }
+                    | InlineCommentOrigin::ChangeSummary { .. } => return None,
                 };
                 let turn = self.inline_history.turn(request)?;
                 let resolved = self.resolve_history_comment(turn, index);
@@ -1576,6 +1622,14 @@ impl Editor {
 
     /// Reconstruct visible annotations from retained outcomes after recovery.
     pub(super) fn restore_inline_history_comments(&mut self) {
+        for turn in self
+            .inline_history
+            .conversations
+            .iter_mut()
+            .flat_map(|conversation| &mut conversation.turns)
+        {
+            turn.ensure_change_summary();
+        }
         let expansions = self
             .inline_history
             .conversations
@@ -1707,6 +1761,7 @@ impl Editor {
             }
         }
         self.buffer_manager.set_active_index(active);
+        self.sync_inline_change_summaries();
         self.layout_cache.borrow_mut().clear();
     }
 }

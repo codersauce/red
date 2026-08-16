@@ -34,6 +34,7 @@ pub enum InlineAssistPopupState {
     AnswerRetained(String),
     Applied { edited: bool, comments: usize },
     NeedsAgent(String),
+    Declined(String),
     Failed(String),
 }
 
@@ -188,6 +189,7 @@ impl InlineAssistPopup {
                 summary: message, ..
             }
             | InlineAssistPopupState::NeedsAgent(message)
+            | InlineAssistPopupState::Declined(message)
             | InlineAssistPopupState::Failed(message) => wrap_text(message, width.max(1))
                 .rows
                 .len()
@@ -464,12 +466,10 @@ impl Component for InlineAssistPopup {
                 UiAction::new("cancel", "Ctrl-c", "cancel request"),
                 UiAction::new("history", "H", "history"),
             ],
-            InlineAssistPopupState::Ready { stale } => {
-                let mut actions = vec![essential("view", "v", "view result")];
-                if !stale {
-                    actions.push(essential("apply", "Enter", "apply"));
-                }
+            InlineAssistPopupState::Ready { .. } => {
+                let mut actions = vec![essential("view", "Enter", "review diff")];
                 actions.extend([
+                    UiAction::new("discard", "d", "decline"),
                     UiAction::new("refine", "r", "recheck"),
                     UiAction::new("agent", "A", "Agent"),
                     essential("hide", "Esc", "hide"),
@@ -498,8 +498,16 @@ impl Component for InlineAssistPopup {
                 essential("hide", "Esc", "hide"),
             ],
             InlineAssistPopupState::Applied { edited, .. } => vec![
-                essential("keep", "Enter", "keep"),
-                UiAction::new("view", "v", "full answer"),
+                essential("close", "Esc", "close"),
+                UiAction::new(
+                    "view",
+                    "v",
+                    if *edited {
+                        "view changes"
+                    } else {
+                        "full answer"
+                    },
+                ),
                 UiAction::new("pin", "p", "pin annotations"),
                 UiAction::new("undo", "u", if *edited { "undo" } else { "dismiss" }),
                 UiAction::new("refine", "r", "refine"),
@@ -512,7 +520,7 @@ impl Component for InlineAssistPopup {
                 UiAction::new("refine", "r", "refine"),
                 essential("close", "Esc", "close"),
             ],
-            InlineAssistPopupState::Failed(_) => vec![
+            InlineAssistPopupState::Declined(_) | InlineAssistPopupState::Failed(_) => vec![
                 essential("retry", "r", "retry/refine"),
                 UiAction::new("view", "v", "view result"),
                 UiAction::new("agent", "A", "Agent"),
@@ -619,6 +627,7 @@ impl Component for InlineAssistPopup {
                 summary: message, ..
             }
             | InlineAssistPopupState::NeedsAgent(message)
+            | InlineAssistPopupState::Declined(message)
             | InlineAssistPopupState::Failed(message) => {
                 if self.dialog.height > 0 {
                     buffer.set_text(
@@ -634,6 +643,9 @@ impl Component for InlineAssistPopup {
                                     "Review required · source unchanged"
                                 }
                                 InlineAssistPopupState::NeedsAgent(_) => "Needs a broader edit",
+                                InlineAssistPopupState::Declined(_) => {
+                                    "Edit declined · source unchanged"
+                                }
                                 _ => "Inline assist failed",
                             },
                             width,
@@ -787,12 +799,14 @@ impl Component for InlineAssistPopup {
                 },
                 _ => None,
             },
-            InlineAssistPopupState::Ready { stale } => match event {
+            InlineAssistPopupState::Ready { .. } => match event {
                 Event::Key(key) => match key.code {
-                    KeyCode::Enter if !stale => {
-                        Some(KeyAction::Single(Action::ApplyPendingInlineAssist))
+                    KeyCode::Enter | KeyCode::Char('v') => {
+                        Some(KeyAction::Single(Action::ViewInlineAssistAnswer))
                     }
-                    KeyCode::Char('v') => Some(KeyAction::Single(Action::ViewInlineAssistAnswer)),
+                    KeyCode::Char('d') => {
+                        Some(KeyAction::Single(Action::RejectPendingInlineAssist))
+                    }
                     KeyCode::Char('r') => Some(KeyAction::Single(Action::RefineInlineAssist)),
                     KeyCode::Char('A') => Some(KeyAction::Single(Action::EscalateInlineAssist)),
                     KeyCode::Esc => Some(KeyAction::Single(Action::HideInlineAssist)),
@@ -848,24 +862,22 @@ impl Component for InlineAssistPopup {
                 },
                 _ => None,
             },
-            InlineAssistPopupState::AnswerRetained(_) | InlineAssistPopupState::Failed(_) => {
-                match event {
-                    Event::Key(key) => match key.code {
-                        KeyCode::Esc | KeyCode::Char('q') => {
-                            Some(KeyAction::Single(Action::HideInlineAssist))
-                        }
-                        KeyCode::Enter | KeyCode::Char('r') => {
-                            Some(KeyAction::Single(Action::RefineInlineAssist))
-                        }
-                        KeyCode::Char('v') => {
-                            Some(KeyAction::Single(Action::ViewInlineAssistAnswer))
-                        }
-                        KeyCode::Char('A') => Some(KeyAction::Single(Action::EscalateInlineAssist)),
-                        _ => None,
-                    },
+            InlineAssistPopupState::AnswerRetained(_)
+            | InlineAssistPopupState::Declined(_)
+            | InlineAssistPopupState::Failed(_) => match event {
+                Event::Key(key) => match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        Some(KeyAction::Single(Action::HideInlineAssist))
+                    }
+                    KeyCode::Enter | KeyCode::Char('r') => {
+                        Some(KeyAction::Single(Action::RefineInlineAssist))
+                    }
+                    KeyCode::Char('v') => Some(KeyAction::Single(Action::ViewInlineAssistAnswer)),
+                    KeyCode::Char('A') => Some(KeyAction::Single(Action::EscalateInlineAssist)),
                     _ => None,
-                }
-            }
+                },
+                _ => None,
+            },
         }
     }
 

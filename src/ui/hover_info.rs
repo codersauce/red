@@ -33,7 +33,7 @@ pub struct HoverInfo {
     label: String,
     close_action: Action,
     inline_navigation: Option<uuid::Uuid>,
-    confirm_action: Option<(String, Action)>,
+    shortcuts: Vec<(char, String, Action)>,
     source: String,
     format: HoverInfoFormat,
     actions: Vec<HoverAction>,
@@ -94,7 +94,7 @@ impl HoverInfo {
             label: "Hover".to_string(),
             close_action: Action::CloseDialog,
             inline_navigation: None,
-            confirm_action: None,
+            shortcuts: Vec::new(),
             source,
             format,
             selected_action: (!actions.is_empty()).then_some(0),
@@ -147,8 +147,13 @@ impl HoverInfo {
         self
     }
 
-    pub(crate) fn with_confirm_action(mut self, label: impl Into<String>, action: Action) -> Self {
-        self.confirm_action = Some((label.into(), action));
+    pub(crate) fn with_shortcut(
+        mut self,
+        key: char,
+        label: impl Into<String>,
+        action: Action,
+    ) -> Self {
+        self.shortcuts.push((key, label.into(), action));
         self.update_chrome();
         self
     }
@@ -191,9 +196,10 @@ impl HoverInfo {
             },
         )
         .with_priority(ActionPriority::Essential)];
-        if let Some((label, _)) = &self.confirm_action {
+        for (key, label, _) in &self.shortcuts {
             actions.push(
-                UiAction::new("confirm", "Enter", label).with_priority(ActionPriority::Essential),
+                UiAction::new(format!("shortcut-{key}"), key.to_string(), label)
+                    .with_priority(ActionPriority::Essential),
             );
         }
         if self.inline_navigation.is_some() {
@@ -321,9 +327,15 @@ impl Component for HoverInfo {
     }
 
     fn handle_event(&mut self, event: &Event) -> Option<KeyAction> {
-        if let (Some((_, action)), Event::Key(key)) = (&self.confirm_action, event) {
-            if key.code == KeyCode::Enter && key.modifiers.is_empty() {
-                return Some(KeyAction::Single(action.clone()));
+        if let Event::Key(key) = event {
+            if key.modifiers.is_empty() && key.kind == crossterm::event::KeyEventKind::Press {
+                if let Some((_, _, action)) = self
+                    .shortcuts
+                    .iter()
+                    .find(|(shortcut, _, _)| key.code == KeyCode::Char(*shortcut))
+                {
+                    return Some(KeyAction::Single(action.clone()));
+                }
             }
         }
         if let (Some(id), Event::Key(key)) = (self.inline_navigation, event) {

@@ -166,6 +166,11 @@ impl Editor {
                         stale: !self.inline_target_matches(session),
                     };
                 }
+                InlineTurnState::Declined => {
+                    return InlineAssistPopupState::Declined(
+                        "The proposal remains in InlineHistory.".into(),
+                    )
+                }
                 InlineTurnState::Failed
                 | InlineTurnState::Rejected
                 | InlineTurnState::Cancelled => {
@@ -507,6 +512,11 @@ impl Editor {
                 Some(state @ InlineAssistPopupState::Prompt { .. }) => state.clone(),
                 _ => self.inline_session_state(session),
             };
+            if turn.is_some_and(|turn| turn.has_code_change())
+                && matches!(state, InlineAssistPopupState::Applied { .. })
+            {
+                continue;
+            }
             let resolved = self
                 .inline_history
                 .conversations
@@ -519,6 +529,7 @@ impl Editor {
                     state,
                     InlineAssistPopupState::Applied { .. }
                         | InlineAssistPopupState::NeedsAgent(_)
+                        | InlineAssistPopupState::Declined(_)
                         | InlineAssistPopupState::Failed(_)
                 )
             {
@@ -531,6 +542,7 @@ impl Editor {
                 InlineAssistPopupState::AnswerRetained(_) => "✓ Answer retained",
                 InlineAssistPopupState::NeedsAgent(_) => "↗ Needs Agent",
                 InlineAssistPopupState::Failed(_) => "! Stopped",
+                InlineAssistPopupState::Declined(_) => "– Declined",
                 InlineAssistPopupState::Prompt { .. } if parked_state.is_some() => "✎ Draft",
                 InlineAssistPopupState::Applied { comments: 0, .. }
                     if turn.is_none_or(|turn| {
@@ -666,6 +678,7 @@ impl Editor {
             }
         }
         self.inline_activity_animation.running = running;
+        self.sync_inline_change_summaries();
         self.layout_cache.borrow_mut().clear();
         self.mark_inline_history_dirty();
     }

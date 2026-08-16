@@ -52,6 +52,10 @@ impl Editor {
         {
             return;
         }
+        self.notify_inline_outcome(request);
+    }
+
+    pub(super) fn notify_inline_outcome(&mut self, request: &str) {
         self.inline_completion.latest = Some(request.to_owned());
         self.inline_completion.notice = Some(CompletionNotice {
             request_id: request.to_owned(),
@@ -135,7 +139,14 @@ impl Editor {
             {
                 "Inline needs Agent"
             }
+            InlineTurnState::Completed
+                if turn.has_code_change() && turn.disposition == InlineDisposition::Undone =>
+            {
+                "Inline edit undone"
+            }
+            InlineTurnState::Completed if turn.has_code_change() => "Inline edit applied",
             InlineTurnState::Completed => "Inline finished",
+            InlineTurnState::Declined => "Inline edit declined",
             InlineTurnState::Failed | InlineTurnState::Rejected => "Inline failed",
             InlineTurnState::Pending | InlineTurnState::Cancelled => return,
         };
@@ -293,7 +304,13 @@ impl Editor {
                 .await?;
         }
         self.panel_manager.focus_editor();
-        if latest {
+        if self
+            .inline_history
+            .turn(request)
+            .is_some_and(|turn| turn.has_code_change())
+        {
+            self.view_inline_changes(request, 0, frame, runtime).await
+        } else if latest {
             let origin = self.current_jump_entry();
             self.open_inline_job(&group, frame, runtime).await?;
             self.save_to_history(origin);
