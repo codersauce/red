@@ -57,6 +57,15 @@ rg -n 'SourceFileLocation' src
 The old name should have no remaining matches. Do not commit or merge the smoke
 rename unless you independently decide to keep it.
 
+## History responsiveness
+
+After the multi-file result is retained, open `Space H` and cycle to Changes.
+Scroll the detail repeatedly with the mouse or Page Up/Page Down, then try
+`j`/`k` and repeated `h`/`l` at the same item. Navigation should remain
+responsive, and a no-op move must not reset the detail's scroll position.
+Resize the pane and switch themes once: the diff should reflow/recolor without
+losing syntax colors, changed-line backgrounds, or clickable locations.
+
 ## Optional interruption exercise
 
 Start another explicit multi-file handoff, then cancel after the first file

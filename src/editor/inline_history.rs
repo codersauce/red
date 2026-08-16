@@ -55,6 +55,7 @@ pub(super) struct HistoryBrowser {
     dirty: bool,
     refreshed_at: Instant,
     animation_started: Instant,
+    render_cache: Arc<crate::ui::HistoryRenderCache>,
 }
 
 fn history_location_label(location: &InlineLocation) -> String {
@@ -318,6 +319,7 @@ impl Editor {
                 dirty: false,
                 refreshed_at: now,
                 animation_started: now,
+                render_cache: Arc::default(),
             });
         }
         self.refresh_inline_history_browser(buffer, runtime, true)
@@ -511,12 +513,13 @@ impl Editor {
             },
             browser.view.label()
         );
-        let (scroll, searching, query, confirm_forget, animation_started) = (
+        let (scroll, searching, query, confirm_forget, animation_started, render_cache) = (
             browser.scroll,
             browser.searching,
             browser.query.clone(),
             browser.confirm_forget,
             browser.animation_started,
+            Arc::clone(&browser.render_cache),
         );
         let panel = crate::ui::InlineHistoryPanel::new(
             self,
@@ -535,6 +538,7 @@ impl Editor {
             title,
             can_restore,
             animation_started,
+            render_cache,
         );
         if let Some(browser) = &mut self.inline_history_browser {
             browser.scroll = panel.scroll();
@@ -649,6 +653,28 @@ impl Editor {
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        if matches!(action, HistoryAction::ScrollDown | HistoryAction::ScrollUp)
+            && self
+                .inline_history_browser
+                .as_ref()
+                .is_some_and(|browser| !browser.dirty)
+        {
+            let delta = if matches!(action, HistoryAction::ScrollDown) {
+                4
+            } else {
+                -4
+            };
+            if let Some(scroll) = self
+                .current_dialog
+                .as_mut()
+                .and_then(|dialog| dialog.scroll_inline_history(delta))
+            {
+                if let Some(browser) = &mut self.inline_history_browser {
+                    browser.scroll = scroll;
+                }
+                return self.render(buffer);
+            }
+        }
         if let HistoryAction::FollowFile { path, line, column } = action {
             let target = plugin::TextPanelLinkTarget::File {
                 path: path.clone(),
@@ -699,6 +725,21 @@ impl Editor {
             .and_then(|key| rows.iter().position(|row| &row.key == key))
             .unwrap_or(0);
         let selected_row = rows.get(selected).cloned();
+        let navigation_unchanged = !browser.dirty
+            && match action {
+                HistoryAction::Next | HistoryAction::Previous => rows.len() <= 1,
+                HistoryAction::Select(index) => *index == selected || *index >= rows.len(),
+                HistoryAction::Expand => selected_row
+                    .as_ref()
+                    .is_none_or(|row| browser.expanded.contains(&row.group)),
+                HistoryAction::Collapse => selected_row
+                    .as_ref()
+                    .is_none_or(|row| !browser.expanded.contains(&row.group)),
+                _ => false,
+            };
+        if navigation_unchanged {
+            return self.render(buffer);
+        }
         if matches!(action, HistoryAction::Open) {
             if let Some(row) = selected_row {
                 if let Some(request) = row.key.request() {

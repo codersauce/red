@@ -3,7 +3,9 @@
 use std::{sync::Arc, time::Instant};
 
 mod detail;
+mod render_cache;
 pub(crate) use detail::{HistoryBlock, HistoryDetail, HistoryStatus, HistoryTone};
+pub(crate) use render_cache::HistoryRenderCache;
 
 use super::{
     dialog::{BorderStyle, Dialog, SurfaceRole},
@@ -12,7 +14,7 @@ use super::{
 use crate::{
     config::KeyAction,
     editor::{Action, Editor, RenderBuffer},
-    highlighter::{Highlighter, LanguageRegistry},
+    highlighter::LanguageRegistry,
     inline_history::HistoryAction,
     keyboard::is_word_backspace,
     plugin::{markdown::RenderedTextLine, TextPanelLinkTarget},
@@ -30,7 +32,8 @@ pub(crate) struct InlineHistoryPanel {
     rows: Vec<InlineHistoryRow>,
     selected: usize,
     detail: HistoryDetail,
-    rendered: Vec<RenderedTextLine>,
+    rendered: Arc<[RenderedTextLine]>,
+    render_cache: Arc<HistoryRenderCache>,
     registry: Arc<LanguageRegistry>,
     scroll: usize,
     searching: bool,
@@ -59,12 +62,14 @@ impl InlineHistoryPanel {
         title: String,
         can_restore: bool,
         animation_started: Instant,
+        render_cache: Arc<HistoryRenderCache>,
     ) -> Self {
         let mut panel = Self {
             rows,
             selected,
             detail,
-            rendered: Vec::new(),
+            rendered: Arc::from([]),
+            render_cache,
             registry: editor.language_registry(),
             scroll,
             searching,
@@ -135,13 +140,12 @@ impl InlineHistoryPanel {
 
     fn reflow(&mut self) {
         let (_, _, width, height) = self.detail_geometry();
-        let mut highlighter =
-            Highlighter::with_registry(&self.theme, Arc::clone(&self.registry)).ok();
-        self.rendered = self.detail.render(
+        self.rendered = self.render_cache.render(
+            &self.detail,
             width,
             self.width.saturating_sub(2) < 70,
             &self.theme,
-            highlighter.as_mut(),
+            &self.registry,
         );
         self.scroll = self.scroll.min(self.rendered.len().saturating_sub(height));
     }
@@ -182,6 +186,15 @@ impl InlineHistoryPanel {
 impl Component for InlineHistoryPanel {
     fn is_inline_history(&self) -> bool {
         true
+    }
+
+    fn scroll_inline_history(&mut self, delta: isize) -> Option<usize> {
+        let (_, _, _, height) = self.detail_geometry();
+        self.scroll = self
+            .scroll
+            .saturating_add_signed(delta)
+            .min(self.rendered.len().saturating_sub(height));
+        Some(self.scroll)
     }
 
     fn tick(&mut self) -> anyhow::Result<bool> {
@@ -510,11 +523,61 @@ mod tests {
             "Inline history".into(),
             true,
             Instant::now(),
+            Arc::default(),
         )
     }
 
     fn line_text(line: &RenderedTextLine) -> String {
         line.spans.iter().map(|span| span.text.as_str()).collect()
+    }
+
+    #[test]
+    fn large_multifile_history_reuses_detail_until_render_inputs_change() {
+        let mut panel = rich_panel(120, Theme::default());
+        let before = (0..600)
+            .map(|line| format!("fn item_{line}() {{}}\n"))
+            .collect::<String>();
+        panel.detail.blocks = (0..6)
+            .map(|file| HistoryBlock::Diff {
+                file: format!("file_{file}.rs"),
+                before: before.clone(),
+                after: before.replace("item_300", &format!("renamed_{file}")),
+                label: "saved".into(),
+            })
+            .collect();
+        panel.reflow();
+        let rendered = Arc::clone(&panel.rendered);
+        assert!(rendered.len() < 150, "only diff hunks should be displayed");
+        assert!(panel.scroll_inline_history(4).unwrap() > 0);
+        assert!(Arc::ptr_eq(&rendered, &panel.rendered));
+        panel.resize(panel.width, panel.height + 1);
+        assert!(Arc::ptr_eq(&rendered, &panel.rendered));
+
+        let mut refreshed = rich_panel(120, panel.theme.clone());
+        refreshed.render_cache = Arc::clone(&panel.render_cache);
+        refreshed.registry = Arc::clone(&panel.registry);
+        refreshed.detail = panel.detail.clone();
+        refreshed.reflow();
+        assert!(Arc::ptr_eq(&rendered, &refreshed.rendered));
+
+        refreshed
+            .detail
+            .statuses
+            .push(HistoryStatus::new("Unsaved", HistoryTone::Warning));
+        refreshed.reflow();
+        assert!(!Arc::ptr_eq(&rendered, &refreshed.rendered));
+        let before_resize = Arc::clone(&refreshed.rendered);
+        refreshed.resize(65, refreshed.height);
+        assert!(!Arc::ptr_eq(&before_resize, &refreshed.rendered));
+        let before_theme = Arc::clone(&refreshed.rendered);
+        let mut theme = refreshed.theme.clone();
+        theme.ui_style.dialog.fg = Some(Color::Rgb {
+            r: 12,
+            g: 34,
+            b: 56,
+        });
+        refreshed.set_theme(&theme);
+        assert!(!Arc::ptr_eq(&before_theme, &refreshed.rendered));
     }
 
     #[test]
@@ -752,7 +815,8 @@ mod tests {
                 ],
                 selected: 0,
                 detail: "preview".into(),
-                rendered: Vec::new(),
+                rendered: Arc::from([]),
+                render_cache: Arc::default(),
                 registry: Arc::new(LanguageRegistry::bundled()),
                 scroll: 0,
                 searching: false,
@@ -828,6 +892,7 @@ mod tests {
             "Inline history".into(),
             true,
             Instant::now(),
+            Arc::default(),
         );
         assert!(panel.is_inline_history());
         for (key, action) in [

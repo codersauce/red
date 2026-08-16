@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 pub(super) const SOURCE_LINK: u64 = u64::MAX;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HistoryTone {
     Muted,
     Info,
@@ -28,7 +28,7 @@ pub(crate) enum HistoryTone {
     Error,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HistoryStatus {
     pub text: String,
     pub tone: HistoryTone,
@@ -71,7 +71,7 @@ impl HistoryStatus {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HistoryBlock {
     Request(String),
     Plain(String),
@@ -94,7 +94,7 @@ pub(crate) enum HistoryBlock {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HistoryDetail {
     pub location: Option<String>,
     pub can_jump: bool,

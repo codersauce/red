@@ -55,7 +55,8 @@ pub(crate) use icons::IconCatalog;
 pub use info::Info;
 pub use inline_assist::{InlineAssistPopup, InlineAssistPopupState};
 pub(crate) use inline_history::{
-    HistoryBlock, HistoryDetail, HistoryStatus, HistoryTone, InlineHistoryPanel, InlineHistoryRow,
+    HistoryBlock, HistoryDetail, HistoryRenderCache, HistoryStatus, HistoryTone,
+    InlineHistoryPanel, InlineHistoryRow,
 };
 pub use input_prompt::InputPrompt;
 pub(crate) use keyboard_shortcuts::{
@@ -132,6 +133,10 @@ pub trait Component: Send {
 
     fn is_inline_history(&self) -> bool {
         false
+    }
+
+    fn scroll_inline_history(&mut self, _delta: isize) -> Option<usize> {
+        None
     }
 
     /// Actions for the surface-local F1 menu. The default keeps passive popups unchanged.

@@ -862,6 +862,41 @@ async fn run_history_action(editor: &mut Editor, action: HistoryAction) {
 }
 
 #[tokio::test]
+async fn inline_history_scroll_and_noop_navigation_keep_the_existing_detail() {
+    let mut editor = editor("fn demo() {}\n");
+    begin(&mut editor, "group", "one", line_range(0, 1), "Explain");
+    complete(&mut editor, "one", None, &"More detail.\n\n".repeat(40)).await;
+    editor
+        .open_inline_history(
+            &mut RenderBuffer::new(100, 30, &Style::default()),
+            &mut Runtime::new(),
+        )
+        .await
+        .unwrap();
+    let refreshed = editor.inline_history_browser.as_ref().unwrap().refreshed_at;
+    run_history_action(&mut editor, HistoryAction::ScrollDown).await;
+    let scroll = editor.inline_history_browser.as_ref().unwrap().scroll;
+    assert!(scroll > 0);
+    for action in [
+        HistoryAction::Next,
+        HistoryAction::Previous,
+        HistoryAction::Select(0),
+        HistoryAction::Collapse,
+    ] {
+        run_history_action(&mut editor, action).await;
+        let browser = editor.inline_history_browser.as_ref().unwrap();
+        assert_eq!(browser.scroll, scroll);
+        assert_eq!(browser.refreshed_at, refreshed);
+    }
+    run_history_action(&mut editor, HistoryAction::ScrollUp).await;
+    assert_eq!(editor.inline_history_browser.as_ref().unwrap().scroll, 0);
+    assert_eq!(
+        editor.inline_history_browser.as_ref().unwrap().refreshed_at,
+        refreshed
+    );
+}
+
+#[tokio::test]
 async fn inline_history_cycles_all_rich_views_without_editing_source() {
     let mut editor = editor("fn old() {}\n");
     begin(&mut editor, "group", "edit", line_range(0, 1), "Rename it");
