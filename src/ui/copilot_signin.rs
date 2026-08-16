@@ -47,12 +47,18 @@ pub(crate) struct CopilotSignInDialog {
     spinner_frame: u64,
     style: Style,
     theme: Theme,
+    viewport_width: usize,
+    viewport_height: usize,
 }
 
 impl CopilotSignInDialog {
     pub(crate) fn new(editor: &Editor, model: Arc<Mutex<CopilotSignInModel>>) -> Self {
         let style = editor.theme.ui_style.dialog.clone();
-        let (width, height) = dialog_size(editor.vwidth(), editor.vheight());
+        let snapshot = model
+            .lock()
+            .map(|model| model.clone())
+            .unwrap_or_else(|_| unavailable_model());
+        let (width, height) = dialog_size(editor.vwidth(), editor.vheight(), &snapshot);
         let x = editor.vwidth().saturating_sub(width + 2) / 2;
         let y = editor.vheight().saturating_sub(height + 2) / 2;
         let spinner_started = model.lock().ok().and_then(|model| {
@@ -80,6 +86,8 @@ impl CopilotSignInDialog {
             spinner_frame: 0,
             style,
             theme: editor.theme.clone(),
+            viewport_width: editor.vwidth(),
+            viewport_height: editor.vheight(),
         }
     }
 
@@ -87,12 +95,7 @@ impl CopilotSignInDialog {
         self.model
             .lock()
             .map(|model| model.clone())
-            .unwrap_or_else(|_| CopilotSignInModel {
-                user_code: "Unavailable".into(),
-                command: Value::Null,
-                phase: CopilotSignInPhase::Failed("Sign-in state is unavailable".into()),
-                clipboard_copied: false,
-            })
+            .unwrap_or_else(|_| unavailable_model())
     }
 
     fn message(model: &CopilotSignInModel, spinner: &str) -> String {
@@ -130,7 +133,7 @@ impl CopilotSignInDialog {
 
     fn accept(&mut self) -> Option<KeyAction> {
         let mut model = self.model.lock().ok()?;
-        match model.phase {
+        let action = match model.phase {
             CopilotSignInPhase::Ready => {
                 model.phase = CopilotSignInPhase::Waiting;
                 self.spinner_started = Some(Instant::now());
@@ -149,11 +152,25 @@ impl CopilotSignInDialog {
                 self.spinner_frame = 0;
                 Some(KeyAction::Single(Action::CopilotRetrySignIn))
             }
-        }
+        };
+        drop(model);
+        self.sync_size();
+        action
     }
 
     fn dismiss_action() -> KeyAction {
         KeyAction::Multiple(vec![Action::CopilotDismissSignIn, Action::CloseDialog])
+    }
+
+    fn sync_size(&mut self) -> bool {
+        let model = self.snapshot();
+        let (width, height) = dialog_size(self.viewport_width, self.viewport_height, &model);
+        let changed = (self.dialog.width, self.dialog.height) != (width, height);
+        self.dialog.width = width;
+        self.dialog.height = height;
+        self.dialog.x = self.viewport_width.saturating_sub(width + 2) / 2;
+        self.dialog.y = self.viewport_height.saturating_sub(height + 2) / 2;
+        changed
     }
 }
 
@@ -165,9 +182,9 @@ impl Component for CopilotSignInDialog {
     }
 
     fn resize(&mut self, viewport_width: usize, viewport_height: usize) -> bool {
-        (self.dialog.width, self.dialog.height) = dialog_size(viewport_width, viewport_height);
-        self.dialog.x = viewport_width.saturating_sub(self.dialog.width + 2) / 2;
-        self.dialog.y = viewport_height.saturating_sub(self.dialog.height + 2) / 2;
+        self.viewport_width = viewport_width;
+        self.viewport_height = viewport_height;
+        self.sync_size();
         true
     }
 
@@ -255,6 +272,7 @@ impl Component for CopilotSignInDialog {
     }
 
     fn tick(&mut self) -> anyhow::Result<bool> {
+        let size_changed = self.sync_size();
         let busy = self.model.lock().is_ok_and(|model| {
             matches!(
                 model.phase,
@@ -264,23 +282,51 @@ impl Component for CopilotSignInDialog {
         if !busy {
             self.spinner_started = None;
             self.spinner_frame = 0;
-            return Ok(false);
+            return Ok(size_changed);
         }
         let started = self.spinner_started.get_or_insert_with(Instant::now);
         let frame = started.elapsed().as_millis() as u64 / SPINNER_FRAME_INTERVAL_MS;
         if frame == self.spinner_frame {
-            return Ok(false);
+            return Ok(size_changed);
         }
         self.spinner_frame = frame;
         Ok(true)
     }
 }
 
-fn dialog_size(viewport_width: usize, viewport_height: usize) -> (usize, usize) {
-    (
-        60.min(viewport_width.saturating_sub(4)).max(1),
-        7.min(viewport_height.saturating_sub(4)).max(2),
-    )
+fn unavailable_model() -> CopilotSignInModel {
+    CopilotSignInModel {
+        user_code: "Unavailable".into(),
+        command: Value::Null,
+        phase: CopilotSignInPhase::Failed("Sign-in state is unavailable".into()),
+        clipboard_copied: false,
+    }
+}
+
+fn dialog_size(
+    viewport_width: usize,
+    viewport_height: usize,
+    model: &CopilotSignInModel,
+) -> (usize, usize) {
+    let message = CopilotSignInDialog::message(model, "⠋");
+    let (accept, cancel) = CopilotSignInDialog::labels(model);
+    let buttons_width = display_width(&format!("[ {accept} ]"))
+        + BUTTON_GAP
+        + display_width(&format!("[ {cancel} ]"));
+    let message_width = message.lines().map(display_width).max().unwrap_or_default();
+    let width = message_width
+        .max(buttons_width)
+        .min(76)
+        .min(viewport_width.saturating_sub(2))
+        .max(1);
+    let height = wrap_text(&message, width)
+        .rows
+        .len()
+        .max(1)
+        .saturating_add(1)
+        .min(viewport_height.saturating_sub(2))
+        .max(2.min(viewport_height.saturating_sub(2)));
+    (width, height)
 }
 
 #[cfg(test)]
@@ -320,11 +366,14 @@ mod tests {
         let state = model(CopilotSignInPhase::Ready);
         let mut dialog = CopilotSignInDialog::new(&editor(), state.clone());
 
+        assert_eq!(dialog.dialog.height, 3);
+
         assert!(matches!(
             dialog.handle_event(&key(KeyCode::Enter)),
             Some(KeyAction::Single(Action::CopilotFinishSignIn(_)))
         ));
         assert_eq!(state.lock().unwrap().phase, CopilotSignInPhase::Waiting);
+        assert_eq!(dialog.dialog.height, 4);
     }
 
     #[test]
@@ -334,6 +383,7 @@ mod tests {
         let mut buffer = RenderBuffer::new(80, 20, &Style::default());
 
         dialog.draw(&mut buffer).unwrap();
+        assert_eq!(dialog.dialog.height, 4);
         let rendered = buffer
             .cells
             .iter()
