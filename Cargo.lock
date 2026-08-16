@@ -2296,6 +2296,7 @@ dependencies = [
  "tree-sitter-toml-ng",
  "tree-sitter-typescript",
  "tree-sitter-yaml",
+ "unicode-linebreak",
  "unicode-segmentation",
  "unicode-width 0.2.1",
  "uuid",

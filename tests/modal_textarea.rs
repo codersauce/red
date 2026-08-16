@@ -7,6 +7,7 @@ use red::{
     config::Config,
     editing::{TextArea, TextAreaOutcome},
     editor::Mode,
+    text_layout::{LayoutOptions, TextLayout},
 };
 
 fn event(character: char) -> Event {
@@ -16,6 +17,41 @@ fn event(character: char) -> Event {
         KeyCode::Char(character)
     };
     Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+#[test]
+fn word_wrapped_vertical_motion_uses_the_display_projection() {
+    let text = "one two three";
+    let options = LayoutOptions::word(7);
+    let layout = TextLayout::new(text, options);
+    let mut area = TextArea::new(text);
+    area.set_cursor(0);
+    let down = Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    let up = Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    area.handle_event_with_layout_options(&down, options);
+    assert_eq!(area.cursor(), 8);
+    assert_eq!(layout.position(area.cursor()).unwrap().row, 1);
+    area.handle_event_with_layout_options(&up, options);
+    assert_eq!(area.cursor(), 0);
+    assert_eq!(area.text(), text);
+
+    // The old API remains character-wrapped for every caller that has not opted in.
+    area.handle_event(&down, 7);
+    assert_eq!(area.cursor(), 7);
+}
+
+#[test]
+fn word_wrap_does_not_turn_visual_rows_into_logical_lines() {
+    let mut area = TextArea::new("one two three\nlast");
+    let options = LayoutOptions::word(7);
+    area.set_mode(Mode::Normal);
+    area.set_cursor(0);
+    for character in ['d', 'd'] {
+        area.handle_event_with_layout_options(&event(character), options);
+    }
+    assert_eq!(area.text(), "last");
+    area.handle_event_with_layout_options(&event('u'), options);
+    assert_eq!(area.text(), "one two three\nlast");
 }
 
 #[tokio::test]
