@@ -7,15 +7,18 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
-    color::Color,
     config::PickerIconsConfig,
     editor::render_buffer::RenderBuffer,
     highlighter::{Highlighter, LanguageRegistry},
-    theme::{SelectionForegroundPriority, Style, Theme},
-    ui::{IconCatalog, ScreenRect},
+    theme::{DiffPalette, SelectionForegroundPriority, Style, SurfacePalette, Theme},
+    ui::{ActionBar, ActionMenu, ActionPriority, IconCatalog, ScreenRect, UiAction},
     unicode_utils::{display_width, fit_display_width, truncate_display_width},
 };
 
@@ -91,6 +94,30 @@ pub struct WorkspaceModel {
     pub detail_document: Option<WorkspaceDocument>,
     #[serde(default)]
     pub footer: Vec<PanelSegment>,
+    /// Structured actions supersede the legacy footer when present.
+    #[serde(default)]
+    pub actions: Vec<WorkspaceAction>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub detail_title: String,
+}
+
+/// Plugin actions are filtered locally, so cursor movement never requires a plugin round trip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct WorkspaceAction {
+    pub hint: UiAction,
+    #[serde(default)]
+    pub focus: String,
+    #[serde(default)]
+    pub sections: Vec<String>,
+    #[serde(default)]
+    pub selection: String,
+    #[serde(default)]
+    pub change_only: bool,
+    #[serde(default)]
+    pub hunk_only: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +127,14 @@ pub struct WorkspaceDocument {
     pub path: String,
     #[serde(default)]
     pub lines: Vec<WorkspaceDocumentLine>,
+    #[serde(default)]
+    pub added: usize,
+    #[serde(default)]
+    pub removed: usize,
+    #[serde(default)]
+    pub total_lines: usize,
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,12 +194,24 @@ impl WorkspaceLayout {
             width,
             height: height.saturating_sub(3),
         };
+        if workspace.rows_hidden && workspace.model.detail_document.is_some() {
+            return Self {
+                mode: WorkspaceLayoutMode::Focused,
+                rows: None,
+                detail: Some(body),
+                separator: None,
+            };
+        }
         if width >= workspace.config.min_two_pane_width {
             let maximum_rows_width = width.saturating_sub(21).max(20);
             let rows_width = width
                 .saturating_mul(100usize.saturating_sub(workspace.config.detail_ratio as usize))
                 / 100;
-            let rows_width = rows_width.clamp(20, maximum_rows_width).min(width);
+            let rows_width = workspace
+                .rows_width
+                .unwrap_or(rows_width.min(48))
+                .clamp(20, maximum_rows_width)
+                .min(width);
             let separator = WorkspaceRect {
                 x: rows_width,
                 y: body.y,
@@ -233,13 +280,16 @@ impl WorkspaceLayout {
 
     fn visible_rows(self, focus: WorkspaceFocus) -> usize {
         self.pane(focus)
-            .map_or(1, WorkspaceRect::content_height)
+            .map_or(1, |rect| {
+                rect.content_height()
+                    .saturating_sub(usize::from(focus == WorkspaceFocus::Detail))
+            })
             .max(1)
     }
 
-    fn detail_code_width(self) -> usize {
+    fn detail_code_width(self, gutter_width: usize) -> usize {
         self.detail
-            .map_or(1, |rect| rect.width.saturating_sub(14).max(1))
+            .map_or(1, |rect| rect.width.saturating_sub(gutter_width + 1).max(1))
     }
 
     fn focus_at(self, column: usize, row: usize) -> Option<WorkspaceFocus> {
@@ -315,6 +365,17 @@ pub struct PluginWorkspace {
     detail_selection_anchor: Option<usize>,
     key_prefix: Option<String>,
     detail_highlights: Vec<Vec<crate::editor::StyleInfo>>,
+    detail_word_changes: Vec<Vec<Range<usize>>>,
+    detail_visible: Vec<usize>,
+    show_metadata: bool,
+    action_menu: ActionMenu,
+    rows_visible: Vec<usize>,
+    collapsed_sections: HashSet<String>,
+    filter: String,
+    filtering: bool,
+    rows_hidden: bool,
+    rows_width: Option<usize>,
+    dragging_separator: bool,
 }
 
 impl PluginWorkspace {
@@ -334,6 +395,17 @@ impl PluginWorkspace {
             detail_selection_anchor: None,
             key_prefix: None,
             detail_highlights: Vec::new(),
+            detail_word_changes: Vec::new(),
+            detail_visible: Vec::new(),
+            show_metadata: false,
+            action_menu: ActionMenu::default(),
+            rows_visible: Vec::new(),
+            collapsed_sections: HashSet::new(),
+            filter: String::new(),
+            filtering: false,
+            rows_hidden: false,
+            rows_width: None,
+            dragging_separator: false,
         }
     }
 
@@ -357,24 +429,49 @@ impl PluginWorkspace {
             .rows
             .get(self.selected)
             .map(|row| row.id.as_str());
+        let selected_path = self
+            .model
+            .rows
+            .get(self.selected)
+            .and_then(|row| row.path.as_deref());
         let selected = selected_id
             .and_then(|id| model.rows.iter().position(|row| row.id == id))
+            .or_else(|| {
+                selected_path.and_then(|path| {
+                    model
+                        .rows
+                        .iter()
+                        .position(|row| row.path.as_deref() == Some(path))
+                })
+            })
             .or_else(|| model.rows.iter().position(|row| row.selectable))
             .unwrap_or(0);
-        let detail_id = self
-            .model
-            .detail_document
-            .as_ref()
-            .and_then(|document| document.lines.get(self.detail_cursor))
-            .map(|line| line.id.as_str());
-        let restored_detail = detail_id.and_then(|id| {
-            model
-                .detail_document
-                .as_ref()?
-                .lines
-                .iter()
-                .position(|line| line.id == id)
-        });
+        let previous_document = self.model.detail_document.as_ref();
+        let previous_line =
+            previous_document.and_then(|document| document.lines.get(self.detail_cursor));
+        let same_path = previous_document
+            .zip(model.detail_document.as_ref())
+            .is_some_and(|(previous, next)| previous.path == next.path);
+        let restored_detail = same_path
+            .then(|| {
+                let previous = previous_line?;
+                model
+                    .detail_document
+                    .as_ref()?
+                    .lines
+                    .iter()
+                    .position(|line| {
+                        line.kind == previous.kind
+                            && line.text == previous.text
+                            && (line.old_line == previous.old_line
+                                || line.new_line == previous.new_line)
+                    })
+            })
+            .flatten();
+        let document_changed = self.model.detail_document != model.detail_document;
+        if document_changed {
+            self.detail_selection_anchor = None;
+        }
         let first_change = model.detail_document.as_ref().and_then(|document| {
             document
                 .lines
@@ -389,38 +486,123 @@ impl PluginWorkspace {
                     .map_or(0, |document| document.lines.len().saturating_sub(1)),
             )
         });
-        if self.model.detail_document != model.detail_document {
+        if document_changed {
             self.detail_highlights =
                 highlight_document(model.detail_document.as_ref(), theme, registry);
+            self.detail_word_changes = word_changes(model.detail_document.as_ref());
         }
         self.model = model;
+        self.rebuild_detail_visible();
         self.selected = selected;
+        self.rebuild_rows();
         self.scroll = self.scroll.min(self.selected);
         self.detail_scroll = self.detail_scroll.min(self.detail_cursor);
     }
 
     fn move_selection(&mut self, delta: isize, visible_rows: usize) {
-        if self.model.rows.is_empty() {
+        if self.rows_visible.is_empty() {
             return;
         }
-        let mut next = self.selected;
+        let mut next = self
+            .rows_visible
+            .iter()
+            .position(|index| *index == self.selected)
+            .unwrap_or(0);
         loop {
             let candidate = next
                 .saturating_add_signed(delta)
-                .min(self.model.rows.len() - 1);
+                .min(self.rows_visible.len() - 1);
             if candidate == next {
                 break;
             }
             next = candidate;
-            if self.model.rows[next].selectable {
-                self.selected = next;
+            if self.row_selectable(self.rows_visible[next]) {
+                self.selected = self.rows_visible[next];
                 break;
             }
         }
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        } else if self.selected >= self.scroll + visible_rows.max(1) {
-            self.scroll = self.selected.saturating_sub(visible_rows.saturating_sub(1));
+        if next < self.scroll {
+            self.scroll = next;
+        } else if next >= self.scroll + visible_rows.max(1) {
+            self.scroll = next.saturating_sub(visible_rows.saturating_sub(1));
+        }
+    }
+
+    fn row_selectable(&self, index: usize) -> bool {
+        self.model.rows.get(index).is_some_and(|row| {
+            row.selectable || (!self.model.actions.is_empty() && row.id.starts_with("section:"))
+        })
+    }
+
+    fn rebuild_rows(&mut self) {
+        let query = self.filter.to_lowercase();
+        let mut section = None;
+        let mut pending_heading = None;
+        self.rows_visible.clear();
+        for (index, row) in self.model.rows.iter().enumerate() {
+            if row.id.starts_with("section:") {
+                section = Some(row.id.as_str());
+                if query.is_empty() {
+                    self.rows_visible.push(index);
+                } else {
+                    pending_heading = Some(index);
+                }
+                continue;
+            }
+            if query.is_empty()
+                && section.is_some_and(|section| self.collapsed_sections.contains(section))
+            {
+                continue;
+            }
+            let matches = query.is_empty()
+                || row
+                    .path
+                    .as_deref()
+                    .is_some_and(|path| path.to_lowercase().contains(&query))
+                || (!row.selectable
+                    && row
+                        .segments
+                        .iter()
+                        .any(|segment| segment.text.to_lowercase().contains(&query)));
+            if matches {
+                if let Some(heading) = pending_heading.take() {
+                    self.rows_visible.push(heading);
+                }
+                self.rows_visible.push(index);
+            }
+        }
+        if !self.rows_visible.contains(&self.selected) {
+            self.selected = self
+                .rows_visible
+                .iter()
+                .copied()
+                .find(|index| self.model.rows[*index].selectable)
+                .or_else(|| self.rows_visible.first().copied())
+                .unwrap_or(0);
+        }
+        self.scroll = self.scroll.min(self.rows_visible.len().saturating_sub(1));
+    }
+
+    fn toggle_section(&mut self) {
+        if let Some(section) = self
+            .model
+            .rows
+            .iter()
+            .take(self.selected + 1)
+            .rev()
+            .find(|row| row.id.starts_with("section:"))
+            .map(|row| row.id.clone())
+        {
+            if !self.collapsed_sections.remove(&section) {
+                self.collapsed_sections.insert(section.clone());
+            }
+            self.selected = self
+                .model
+                .rows
+                .iter()
+                .position(|row| row.id == section)
+                .unwrap_or(self.selected);
+            self.rebuild_rows();
         }
     }
 
@@ -443,7 +625,11 @@ impl PluginWorkspace {
             workspace_id: self.id.clone(),
             action,
             selected_index: self.selected,
-            row: self.model.rows.get(self.selected).cloned(),
+            row: self
+                .rows_visible
+                .contains(&self.selected)
+                .then(|| self.model.rows.get(self.selected).cloned())
+                .flatten(),
             focus: self.focus,
             detail_index: self.detail_cursor,
             detail_line,
@@ -460,12 +646,63 @@ impl PluginWorkspace {
             .map_or(0, |document| document.lines.len())
     }
 
+    fn rebuild_detail_visible(&mut self) {
+        self.detail_visible = self
+            .model
+            .detail_document
+            .as_ref()
+            .map(|document| {
+                let has_hunks = document.lines.iter().any(|line| line.kind == "hunk");
+                document
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, line)| {
+                        self.show_metadata
+                            || !has_hunks
+                            || line.kind != "meta"
+                            || line.text.starts_with('\\')
+                    })
+                    .map(|(index, _)| index)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !self.detail_visible.contains(&self.detail_cursor) {
+            self.detail_cursor = self
+                .detail_visible
+                .iter()
+                .copied()
+                .find(|index| *index >= self.detail_cursor)
+                .or_else(|| self.detail_visible.last().copied())
+                .unwrap_or(0);
+        }
+    }
+
+    fn gutter_width(&self) -> usize {
+        let maximum = self
+            .model
+            .detail_document
+            .as_ref()
+            .into_iter()
+            .flat_map(|document| &document.lines)
+            .flat_map(|line| [line.old_line, line.new_line])
+            .flatten()
+            .max()
+            .unwrap_or(1);
+        maximum.to_string().len().max(2) * 2 + 4
+    }
+
     fn detail_line_at_visual_offset(&self, offset: usize, code_width: usize) -> usize {
         let Some(document) = self.model.detail_document.as_ref() else {
             return 0;
         };
         let mut remaining = offset;
-        for (index, line) in document.lines.iter().enumerate().skip(self.detail_scroll) {
+        for &index in self
+            .detail_visible
+            .iter()
+            .filter(|index| **index >= self.detail_scroll)
+        {
+            let line = &document.lines[index];
             let visual_rows = if self.detail_wrap {
                 display_width(&line.text).max(1).div_ceil(code_width.max(1))
             } else {
@@ -480,14 +717,18 @@ impl PluginWorkspace {
     }
 
     fn move_detail(&mut self, delta: isize, visible_rows: usize) {
-        let len = self.detail_len();
+        let len = self.detail_visible.len();
         if len == 0 {
             return;
         }
-        self.detail_cursor = self
-            .detail_cursor
+        let position = self
+            .detail_visible
+            .iter()
+            .position(|index| *index == self.detail_cursor)
+            .unwrap_or(0);
+        self.detail_cursor = self.detail_visible[position
             .saturating_add_signed(delta)
-            .min(len.saturating_sub(1));
+            .min(len.saturating_sub(1))];
         if self.detail_cursor < self.detail_scroll {
             self.detail_scroll = self.detail_cursor;
         } else if self.detail_cursor >= self.detail_scroll + visible_rows.max(1) {
@@ -503,16 +744,17 @@ impl PluginWorkspace {
             self.detail_scroll = self.detail_cursor;
             return;
         }
-        let code_width = layout.detail_code_width();
+        let code_width = layout.detail_code_width(self.gutter_width());
         let Some(document) = self.model.detail_document.as_ref() else {
             return;
         };
-        let occupied = document
-            .lines
+        let occupied = self
+            .detail_visible
             .iter()
-            .skip(self.detail_scroll)
-            .take(self.detail_cursor.saturating_sub(self.detail_scroll) + 1)
-            .map(|line| {
+            .copied()
+            .filter(|index| *index >= self.detail_scroll && *index <= self.detail_cursor)
+            .map(|index| {
+                let line = &document.lines[index];
                 if self.detail_wrap {
                     display_width(&line.text).max(1).div_ceil(code_width)
                 } else {
@@ -560,11 +802,61 @@ impl PluginWorkspace {
                 .map(|(index, _)| index)
         };
         if let Some(target) = target {
-            self.move_detail(target as isize - self.detail_cursor as isize, visible_rows);
+            let current = self
+                .detail_visible
+                .iter()
+                .position(|index| *index == self.detail_cursor)
+                .unwrap_or(0);
+            let target = self
+                .detail_visible
+                .iter()
+                .position(|index| *index == target)
+                .unwrap_or(current);
+            self.move_detail(target as isize - current as isize, visible_rows);
         }
     }
 
     fn handle_action(&mut self, mut action: String, height: usize, width: usize) -> WorkspaceEvent {
+        if self.filtering {
+            match action.as_str() {
+                "filter_accept" => self.filtering = false,
+                "filter_cancel" => {
+                    self.filtering = false;
+                    self.filter.clear();
+                }
+                "filter_backspace" => {
+                    self.filter.pop();
+                }
+                _ => {
+                    if let Some(text) = action.strip_prefix("filter_text:") {
+                        self.filter.push_str(text);
+                    }
+                }
+            }
+            self.rebuild_rows();
+            return self.event(
+                if self.filtering {
+                    "noop"
+                } else {
+                    "filter_changed"
+                }
+                .to_string(),
+            );
+        }
+        if self.action_menu.is_open() {
+            let actions = self.actions();
+            let Some(selected) = self.action_menu.handle(&action, &actions) else {
+                return self.event("noop".to_string());
+            };
+            action = selected;
+        } else if matches!(action.as_str(), "?" | "F1") && !self.model.actions.is_empty() {
+            self.action_menu.open();
+            return self.event("noop".to_string());
+        }
+        if action == "?" {
+            self.action_menu.open();
+            return self.event("noop".to_string());
+        }
         let layout = WorkspaceLayout::calculate(self, height, width);
         let visible_rows = layout.visible_rows(self.focus);
 
@@ -574,6 +866,9 @@ impl PluginWorkspace {
                 ("ctrl_w", "W" | "p") => "focus_previous",
                 ("ctrl_w", "h") => "focus_rows",
                 ("ctrl_w", "l") => "focus_detail",
+                ("ctrl_w", "o") => "toggle_rows",
+                ("ctrl_w", "<") => "narrow_rows",
+                ("ctrl_w", ">") => "widen_rows",
                 ("ctrl_w", "c" | "q") => "escape",
                 ("g", "g") => "first",
                 ("[", "h") => "previous_hunk",
@@ -595,22 +890,67 @@ impl PluginWorkspace {
                 "0" if !self.detail_wrap => "horizontal_start",
                 "$" if !self.detail_wrap => "horizontal_end",
                 "W" => "toggle_wrap",
+                "M" => "toggle_metadata",
                 "v" => "visual",
                 other => other,
             }
             .to_string();
         }
 
+        if self.focus == WorkspaceFocus::Rows
+            && action == "activate"
+            && self
+                .model
+                .rows
+                .get(self.selected)
+                .is_some_and(|row| row.id.starts_with("section:"))
+        {
+            action = "collapse_section".to_string();
+        }
+        if self.focus == WorkspaceFocus::Rows {
+            action = match action.as_str() {
+                "/" => "filter",
+                "C" => "collapse_section",
+                other => other,
+            }
+            .to_string();
+        }
+
         match action.as_str() {
+            "filter" => self.filtering = true,
+            "collapse_section" => {
+                self.toggle_section();
+                action = "filter_changed".to_string();
+            }
+            "toggle_rows" => {
+                self.rows_hidden = !self.rows_hidden;
+                if self.rows_hidden && self.model.detail_document.is_some() {
+                    self.focus = WorkspaceFocus::Detail;
+                }
+            }
+            "narrow_rows" | "widen_rows" => {
+                let current = layout.rows.map_or(36, |rect| rect.width);
+                self.rows_width = Some(
+                    current
+                        .saturating_add_signed(if action == "narrow_rows" { -4 } else { 4 })
+                        .clamp(20, width.saturating_sub(21).max(20)),
+                );
+            }
             "toggle" | "back_toggle" | "focus_next" | "focus_previous" => {
                 if self.model.detail_document.is_some() {
                     self.focus = match self.focus {
                         WorkspaceFocus::Rows => WorkspaceFocus::Detail,
                         WorkspaceFocus::Detail => WorkspaceFocus::Rows,
                     };
+                    if self.focus == WorkspaceFocus::Rows {
+                        self.rows_hidden = false;
+                    }
                 }
             }
-            "focus_rows" => self.focus = WorkspaceFocus::Rows,
+            "focus_rows" => {
+                self.rows_hidden = false;
+                self.focus = WorkspaceFocus::Rows;
+            }
             "focus_detail" if self.model.detail_document.is_some() => {
                 self.focus = WorkspaceFocus::Detail;
             }
@@ -675,6 +1015,11 @@ impl PluginWorkspace {
                 };
             }
             "cancel_selection" => self.detail_selection_anchor = None,
+            "toggle_metadata" if self.focus == WorkspaceFocus::Detail => {
+                self.show_metadata = !self.show_metadata;
+                self.rebuild_detail_visible();
+                self.detail_scroll = self.detail_scroll.min(self.detail_cursor);
+            }
             "toggle_wrap" if self.focus == WorkspaceFocus::Detail => {
                 self.detail_wrap = !self.detail_wrap;
                 if self.detail_wrap {
@@ -703,7 +1048,8 @@ impl PluginWorkspace {
                             .max()
                     })
                     .unwrap_or_default();
-                self.detail_horizontal = max_width.saturating_sub(layout.detail_code_width());
+                self.detail_horizontal =
+                    max_width.saturating_sub(layout.detail_code_width(self.gutter_width()));
             }
             _ => {}
         }
@@ -711,6 +1057,123 @@ impl PluginWorkspace {
             self.ensure_detail_cursor_visible(WorkspaceLayout::calculate(self, height, width));
         }
         self.event(action)
+    }
+
+    fn actions(&self) -> Vec<UiAction> {
+        if self.filtering {
+            return vec![
+                UiAction::new("filter_accept", "Enter", "apply filter")
+                    .with_priority(ActionPriority::Essential),
+                UiAction::new("filter_cancel", "Esc", "clear filter")
+                    .with_priority(ActionPriority::Essential),
+            ];
+        }
+        let detail = self.focus == WorkspaceFocus::Detail;
+        let line = self
+            .model
+            .detail_document
+            .as_ref()
+            .and_then(|document| document.lines.get(self.detail_cursor));
+        let row = self
+            .rows_visible
+            .contains(&self.selected)
+            .then(|| self.model.rows.get(self.selected))
+            .flatten();
+        let section = if detail {
+            line.map(|line| &line.data)
+        } else {
+            row.map(|row| &row.data)
+        }
+        .and_then(|data| data.get("section"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+        let selected = self.detail_selection_anchor.is_some();
+        let scope = if detail {
+            self.detail_selection_anchor
+                .map(|anchor| format!("{} lines", anchor.abs_diff(self.detail_cursor) + 1))
+                .unwrap_or_else(|| "line".to_string())
+        } else {
+            "file".to_string()
+        };
+        let mut actions = self
+            .model
+            .actions
+            .iter()
+            .filter(|action| {
+                (action.focus.is_empty() || action.focus == if detail { "detail" } else { "rows" })
+                    && (action.sections.is_empty()
+                        || action.sections.iter().any(|candidate| candidate == section))
+                    && match action.selection.as_str() {
+                        "" => true,
+                        "range" => selected,
+                        "item" => {
+                            if detail {
+                                line.is_some()
+                            } else {
+                                row.is_some_and(|row| row.selectable)
+                            }
+                        }
+                        "none" => !selected,
+                        _ => false,
+                    }
+                    && (!action.change_only
+                        || !detail
+                        || selected
+                        || line
+                            .is_some_and(|line| matches!(line.kind.as_str(), "added" | "removed")))
+                    && (!action.hunk_only || line.is_some_and(|line| line.hunk_id.is_some()))
+            })
+            .map(|action| {
+                let mut hint = action.hint.clone();
+                hint.label = hint.label.replace("{scope}", &scope);
+                hint
+            })
+            .collect::<Vec<_>>();
+        if !actions.is_empty() {
+            if detail {
+                actions.extend([
+                    UiAction::new("visual", "v", "select").with_enabled(!selected),
+                    UiAction::new("cancel_selection", "Esc", "clear selection")
+                        .with_enabled(selected)
+                        .with_priority(ActionPriority::Essential),
+                    UiAction::new("previous_hunk", "[h", "previous hunk")
+                        .with_priority(ActionPriority::Secondary),
+                    UiAction::new("next_hunk", "]h", "next hunk")
+                        .with_priority(ActionPriority::Secondary),
+                    UiAction::new("toggle_wrap", "W", "wrap")
+                        .with_priority(ActionPriority::Secondary),
+                    UiAction::new("toggle_metadata", "M", "patch metadata")
+                        .with_priority(ActionPriority::Secondary),
+                ]);
+            }
+            if !detail {
+                actions.push(UiAction::new("filter", "/", "filter files"));
+                actions.push(
+                    UiAction::new("collapse_section", "C", "collapse section")
+                        .with_priority(ActionPriority::Secondary),
+                );
+            }
+            actions.push(
+                UiAction::new("toggle_rows", "Ctrl+w o", "toggle files")
+                    .with_priority(ActionPriority::Secondary),
+            );
+            actions.push(
+                UiAction::new("narrow_rows", "Ctrl+w <", "narrow files")
+                    .with_priority(ActionPriority::Secondary),
+            );
+            actions.push(
+                UiAction::new("widen_rows", "Ctrl+w >", "widen files")
+                    .with_priority(ActionPriority::Secondary),
+            );
+            actions.push(
+                UiAction::new("focus_next", "Tab", if detail { "files" } else { "diff" })
+                    .with_enabled(self.model.detail_document.is_some()),
+            );
+            actions
+                .push(UiAction::new("?", "?", "actions").with_priority(ActionPriority::Essential));
+            actions.push(UiAction::new("q", "q", "close").with_priority(ActionPriority::Essential));
+        }
+        actions
     }
 }
 
@@ -725,6 +1188,10 @@ fn is_core_detail_interaction(focus: WorkspaceFocus, action: &str) -> bool {
             | "focus_previous"
             | "focus_rows"
             | "focus_detail"
+            | "filter"
+            | "toggle_rows"
+            | "narrow_rows"
+            | "widen_rows"
     ) || (focus == WorkspaceFocus::Detail
         && matches!(
             action,
@@ -740,6 +1207,7 @@ fn is_core_detail_interaction(focus: WorkspaceFocus, action: &str) -> bool {
                 | "visual"
                 | "cancel_selection"
                 | "toggle_wrap"
+                | "toggle_metadata"
                 | "left"
                 | "right"
                 | "horizontal_start"
@@ -755,11 +1223,17 @@ fn is_core_detail_interaction(focus: WorkspaceFocus, action: &str) -> bool {
 #[derive(Debug, Default)]
 pub struct WorkspaceManager {
     active: Option<PluginWorkspace>,
+    widths: HashMap<String, Option<usize>>,
 }
 
 impl WorkspaceManager {
     pub fn open(&mut self, id: String, config: WorkspaceConfig) {
-        self.active = Some(PluginWorkspace::new(id, config));
+        if let Some(active) = &self.active {
+            self.widths.insert(active.id.clone(), active.rows_width);
+        }
+        let mut workspace = PluginWorkspace::new(id.clone(), config);
+        workspace.rows_width = self.widths.get(&id).copied().flatten();
+        self.active = Some(workspace);
     }
 
     pub fn update(&mut self, id: &str, model: WorkspaceModel, theme: &Theme) -> bool {
@@ -787,6 +1261,12 @@ impl WorkspaceManager {
             .as_ref()
             .is_some_and(|workspace| workspace.id == id)
         {
+            self.widths.insert(
+                id.to_string(),
+                self.active
+                    .as_ref()
+                    .and_then(|workspace| workspace.rows_width),
+            );
             self.active = None;
             true
         } else {
@@ -810,6 +1290,12 @@ impl WorkspaceManager {
         self.active.is_some()
     }
 
+    pub fn is_filtering(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|workspace| workspace.filtering)
+    }
+
     pub fn handle_action(
         &mut self,
         action: String,
@@ -830,6 +1316,20 @@ impl WorkspaceManager {
     ) -> Option<WorkspaceEvent> {
         let workspace = self.active.as_mut()?;
         let layout = WorkspaceLayout::calculate(workspace, height, width);
+        if action == "mouse_release" {
+            workspace.dragging_separator = false;
+            return Some(workspace.event("noop".to_string()));
+        }
+        if action == "mouse_click"
+            && matches!(layout.separator, Some(WorkspaceSeparator::Columns(rect)) if rect.contains(column, row))
+        {
+            workspace.dragging_separator = true;
+            return Some(workspace.event("noop".to_string()));
+        }
+        if action == "mouse_drag" && workspace.dragging_separator {
+            workspace.rows_width = Some(column.clamp(20, width.saturating_sub(21).max(20)));
+            return Some(workspace.event("noop".to_string()));
+        }
         if let Some(focus) = layout.focus_at(column, row) {
             if focus == WorkspaceFocus::Rows || workspace.model.detail_document.is_some() {
                 workspace.focus = focus;
@@ -856,21 +1356,26 @@ impl WorkspaceManager {
             "mouse_click" => match workspace.focus {
                 WorkspaceFocus::Rows => {
                     if let Some(offset) = layout.rows.and_then(|rect| rect.content_offset(row)) {
-                        let candidate = workspace.scroll.saturating_add(offset);
-                        if workspace
-                            .model
-                            .rows
-                            .get(candidate)
-                            .is_some_and(|row| row.selectable)
+                        if let Some(candidate) = workspace
+                            .rows_visible
+                            .get(workspace.scroll.saturating_add(offset))
+                            .copied()
+                            .filter(|candidate| workspace.row_selectable(*candidate))
                         {
                             workspace.selected = candidate;
                         }
                     }
                 }
                 WorkspaceFocus::Detail => {
-                    if let Some(offset) = layout.detail.and_then(|rect| rect.content_offset(row)) {
-                        workspace.detail_cursor = workspace
-                            .detail_line_at_visual_offset(offset, layout.detail_code_width());
+                    if let Some(offset) = layout
+                        .detail
+                        .and_then(|rect| rect.content_offset(row))
+                        .and_then(|offset| offset.checked_sub(1))
+                    {
+                        workspace.detail_cursor = workspace.detail_line_at_visual_offset(
+                            offset,
+                            layout.detail_code_width(workspace.gutter_width()),
+                        );
                     }
                 }
             },
@@ -945,14 +1450,41 @@ impl WorkspaceManager {
             );
         }
 
-        render_segments(
-            buffer,
-            (1, buffer.height - 1, buffer.width - 2),
-            &workspace.model.footer,
-            editor_style,
-            theme,
-            false,
-        );
+        if workspace.model.actions.is_empty() {
+            render_segments(
+                buffer,
+                (1, buffer.height - 1, buffer.width - 2),
+                &workspace.model.footer,
+                editor_style,
+                theme,
+                false,
+            );
+        } else {
+            let actions = workspace.actions();
+            let context = if workspace.filtering {
+                "FILTER"
+            } else if workspace.detail_selection_anchor.is_some() {
+                "VISUAL"
+            } else if workspace.focus == WorkspaceFocus::Detail {
+                "DIFF"
+            } else {
+                "FILES"
+            };
+            ActionBar::new(&actions)
+                .with_context(context)
+                .with_status(
+                    (!workspace.model.status.is_empty()).then_some(workspace.model.status.as_str()),
+                )
+                .render(
+                    buffer,
+                    1,
+                    buffer.height - 1,
+                    buffer.width - 2,
+                    theme,
+                    editor_style,
+                );
+            workspace.action_menu.render(buffer, theme, &actions);
+        }
     }
 }
 
@@ -985,6 +1517,60 @@ fn highlight_document(
             _ => Vec::new(),
         })
         .collect()
+}
+
+/// Pair replacement lines within a bounded change block. Pure additions/removals
+/// retain their line tint; only actual replacements receive stronger word marks.
+fn word_changes(document: Option<&WorkspaceDocument>) -> Vec<Vec<Range<usize>>> {
+    let Some(document) = document else {
+        return Vec::new();
+    };
+    let mut result = vec![Vec::new(); document.lines.len()];
+    let mut index = 0;
+    while index < document.lines.len() {
+        if document.lines[index].kind != "removed" {
+            index += 1;
+            continue;
+        }
+        let old_start = index;
+        while index < document.lines.len() && document.lines[index].kind == "removed" {
+            index += 1;
+        }
+        let new_start = index;
+        while index < document.lines.len() && document.lines[index].kind == "added" {
+            index += 1;
+        }
+        let pairs = (new_start - old_start).min(index - new_start).min(128);
+        for offset in 0..pairs {
+            let old = &document.lines[old_start + offset].text;
+            let new = &document.lines[new_start + offset].text;
+            if old.len().saturating_add(new.len()) > 8192 {
+                continue;
+            }
+            let old_words = old.split_word_bounds().collect::<Vec<_>>();
+            let new_words = new.split_word_bounds().collect::<Vec<_>>();
+            let diff = similar::TextDiff::from_slices(&old_words, &new_words);
+            let (mut old_byte, mut new_byte) = (0, 0);
+            for change in diff.iter_all_changes() {
+                let length = change.value().len();
+                match change.tag() {
+                    similar::ChangeTag::Equal => {
+                        old_byte += length;
+                        new_byte += length;
+                    }
+                    similar::ChangeTag::Delete => {
+                        result[old_start + offset].push(old_byte..old_byte + length);
+                        old_byte += length;
+                    }
+                    similar::ChangeTag::Insert => {
+                        result[new_start + offset].push(new_byte..new_byte + length);
+                        new_byte += length;
+                    }
+                }
+            }
+        }
+    }
+    result
 }
 
 fn highlight_document_projection(
@@ -1037,26 +1623,44 @@ fn render_row_pane(
         return;
     }
     let active = workspace.focus == WorkspaceFocus::Rows;
-    let mut title_style = theme.ui_style.popup_title.clone();
+    let mut title_style = SurfacePalette::new(theme, &theme.style).primary;
     title_style.bold = active;
+    let title = if workspace.filtering || !workspace.filter.is_empty() {
+        format!(
+            "{} Changes /{}",
+            if active { "›" } else { " " },
+            workspace.filter
+        )
+    } else {
+        format!("{} Changes", if active { "›" } else { " " })
+    };
     buffer.set_text(
         x + 1,
         top,
-        if active { "› Changes" } else { "  Changes" },
+        &truncate_display_width(&title, width.saturating_sub(1)),
         &title_style,
     );
     let content_top = top + 1;
     let content_height = height.saturating_sub(1);
-    for (screen_row, row) in workspace
-        .model
-        .rows
+    if workspace.rows_visible.is_empty() && !workspace.filter.is_empty() && content_height > 0 {
+        let muted = SurfacePalette::new(theme, &theme.style).muted;
+        buffer.set_text(
+            x + 1,
+            content_top,
+            &truncate_display_width("No matching files", width.saturating_sub(2)),
+            &muted,
+        );
+    }
+    for (screen_row, &row_index) in workspace
+        .rows_visible
         .iter()
         .skip(workspace.scroll)
         .take(content_height)
         .enumerate()
     {
+        let row = &workspace.model.rows[row_index];
         let y = content_top + screen_row;
-        let selected = workspace.scroll + screen_row == workspace.selected && row.selectable;
+        let selected = row_index == workspace.selected && workspace.row_selectable(row_index);
         let row_style = if selected && active {
             theme.selected_style(
                 &theme.style,
@@ -1068,6 +1672,19 @@ fn render_row_pane(
         };
         buffer.set_text(x, y, &fit_display_width("", width), &row_style);
         let mut content_x = x + 1 + row.depth.saturating_mul(2);
+        if row.id.starts_with("section:") && !workspace.model.actions.is_empty() {
+            buffer.set_text(
+                content_x,
+                y,
+                if workspace.collapsed_sections.contains(&row.id) {
+                    "▸ "
+                } else {
+                    "▾ "
+                },
+                &row_style,
+            );
+            content_x += 2;
+        }
         if let Some(path) = row.path.as_deref() {
             let icon = IconCatalog::file(path, icons.style);
             if !icon.glyph.is_empty() {
@@ -1082,23 +1699,23 @@ fn render_row_pane(
                 content_x += 3;
             }
         }
+        let right_width = row
+            .right_segments
+            .iter()
+            .map(|segment| display_width(&segment.text))
+            .sum::<usize>();
         render_segments(
             buffer,
             (
                 content_x,
                 y,
-                width.saturating_sub(content_x.saturating_sub(x) + 1),
+                width.saturating_sub(content_x.saturating_sub(x) + right_width + 2),
             ),
             &row.segments,
             &row_style,
             theme,
             selected,
         );
-        let right_width = row
-            .right_segments
-            .iter()
-            .map(|segment| display_width(&segment.text))
-            .sum::<usize>();
         if right_width > 0 && right_width + 1 < width {
             render_segments(
                 buffer,
@@ -1128,21 +1745,40 @@ fn render_detail_pane(
         return;
     }
     let active = workspace.focus == WorkspaceFocus::Detail;
-    let mut title_style = theme.ui_style.popup_title.clone();
+    let mut title_style = SurfacePalette::new(theme, &theme.style).primary;
     title_style.bold = active;
     let wrap_label = if workspace.detail_wrap {
         "wrap"
     } else {
         "nowrap"
     };
-    let title = if active {
-        format!(" › Diff  {wrap_label}")
-    } else {
-        format!("   Diff  {wrap_label}")
-    };
+    let marker = if active { "›" } else { " " };
+    let title = workspace.model.detail_document.as_ref().map_or_else(
+        || {
+            format!(
+                " {marker} {} · {wrap_label}",
+                if workspace.model.detail_title.is_empty() {
+                    "Diff"
+                } else {
+                    &workspace.model.detail_title
+                }
+            )
+        },
+        |document| {
+            let section = document
+                .lines
+                .iter()
+                .find_map(|line| line.data.get("section").and_then(serde_json::Value::as_str))
+                .unwrap_or("diff");
+            format!(
+                " {marker} {} · {section} · +{} −{}",
+                document.path, document.added, document.removed
+            )
+        },
+    );
     buffer.set_text(x, top, &truncate_display_width(&title, width), &title_style);
-    let content_top = top + 1;
-    let content_height = height.saturating_sub(1);
+    let content_top = top + 2;
+    let content_height = height.saturating_sub(2);
     let Some(document) = workspace.model.detail_document.as_ref() else {
         for (index, line) in workspace
             .model
@@ -1163,7 +1799,49 @@ fn render_detail_pane(
         return;
     };
 
-    let gutter_width = 13.min(width.saturating_sub(1));
+    if height > 1 {
+        let palette = SurfacePalette::new(theme, &theme.style);
+        let hunks = document
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.kind == "hunk")
+            .collect::<Vec<_>>();
+        let current = hunks
+            .iter()
+            .rposition(|(index, _)| *index <= workspace.detail_cursor);
+        let context = current
+            .map(|position| {
+                let header = &hunks[position].1.text;
+                let symbol = header.split("@@").nth(2).unwrap_or_default().trim();
+                format!(
+                    "Hunk {} of {}{}{}",
+                    position + 1,
+                    hunks.len(),
+                    if symbol.is_empty() { "" } else { " · " },
+                    symbol
+                )
+            })
+            .unwrap_or_else(|| "File details".to_string());
+        let context = if document.truncated {
+            format!(
+                "{context} · first {}/{} lines · L full patch",
+                document.lines.len(),
+                document.total_lines
+            )
+        } else {
+            format!("{context} · {wrap_label}")
+        };
+        buffer.set_text(
+            x,
+            top + 1,
+            &fit_display_width(&format!(" {context}"), width),
+            &palette.muted,
+        );
+    }
+
+    let gutter_width = workspace.gutter_width().min(width.saturating_sub(1));
+    let number_width = workspace.gutter_width().saturating_sub(4) / 2;
     let code_width = width.saturating_sub(gutter_width + 1).max(1);
     let selection = workspace.detail_selection_anchor.map(|anchor| {
         (
@@ -1172,12 +1850,13 @@ fn render_detail_pane(
         )
     });
     let mut screen_row = 0;
-    for (line_index, line) in document
-        .lines
+    let palette = DiffPalette::new(theme);
+    for &line_index in workspace
+        .detail_visible
         .iter()
-        .enumerate()
-        .skip(workspace.detail_scroll)
+        .filter(|index| **index >= workspace.detail_scroll)
     {
+        let line = &document.lines[line_index];
         if screen_row >= content_height {
             break;
         }
@@ -1198,7 +1877,7 @@ fn render_detail_pane(
             let selected =
                 selection.is_some_and(|(start, end)| line_index >= start && line_index <= end);
             let cursor = active && line_index == workspace.detail_cursor;
-            let mut line_style = diff_line_style(&line.kind, theme);
+            let mut line_style = diff_line_style(&line.kind, theme, &palette);
             if selected {
                 line_style = theme.selected_style(
                     &line_style,
@@ -1229,12 +1908,16 @@ fn render_detail_pane(
                     _ => " ",
                 };
                 let gutter = format!(
-                    "{:>4} {:>4} {marker} ",
+                    "{:>number_width$} {:>number_width$} {marker} ",
                     line.old_line.map_or(String::new(), |line| line.to_string()),
                     line.new_line.map_or(String::new(), |line| line.to_string()),
                 );
                 let mut gutter_style = line_style.clone();
-                gutter_style.fg = diff_foreground(&line.kind, theme).or(gutter_style.fg);
+                gutter_style.fg = match line.kind.as_str() {
+                    "added" => Some(palette.added_marker),
+                    "removed" => Some(palette.removed_marker),
+                    _ => gutter_style.fg,
+                };
                 buffer.set_text(
                     x,
                     y,
@@ -1260,6 +1943,31 @@ fn render_detail_pane(
                     .map_or(&[], Vec::as_slice),
                 &line_style,
             );
+            if !selected && !cursor {
+                let background = match line.kind.as_str() {
+                    "added" => Some(palette.added_text),
+                    "removed" => Some(palette.removed_text),
+                    _ => None,
+                };
+                if let Some(background) = background {
+                    for range in workspace
+                        .detail_word_changes
+                        .get(line_index)
+                        .into_iter()
+                        .flatten()
+                    {
+                        let start = range.start.max(segment.byte_start).min(segment.byte_end);
+                        let end = range.end.min(segment.byte_end).max(start);
+                        if start < end {
+                            let first = display_width(&line.text[segment.byte_start..start]);
+                            let last = display_width(&line.text[segment.byte_start..end]);
+                            for column in first..last.min(code_width) {
+                                buffer.set_bg(code_x + column, y, &background, theme);
+                            }
+                        }
+                    }
+                }
+            }
             screen_row += 1;
         }
     }
@@ -1346,61 +2054,18 @@ fn render_syntax_overlays(
             continue;
         }
         let highlighted = truncate_display_width(&text[start..end], width - offset);
-        let style = span.style.fallback_bg(line_style);
+        let style = span.style.with_bg(line_style.bg);
         buffer.set_text(x + offset, y, &highlighted, &style);
     }
 }
 
-fn diff_line_style(kind: &str, theme: &Theme) -> Style {
-    let mut style = theme.style.clone();
-    style.bg = match kind {
-        "added" => diff_background(
-            theme,
-            "diffEditor.insertedLineBackground",
-            "gitDecoration.addedResourceForeground",
-        ),
-        "removed" => diff_background(
-            theme,
-            "diffEditor.removedLineBackground",
-            "gitDecoration.deletedResourceForeground",
-        ),
-        "hunk" => theme
-            .colors
-            .get("diffEditor.diagonalFill")
-            .copied()
-            .or_else(|| {
-                theme
-                    .line_highlight_style
-                    .as_ref()
-                    .and_then(|style| style.bg)
-            }),
-        _ => style.bg,
-    };
-    style
-}
-
-fn diff_background(theme: &Theme, preferred: &str, fallback: &str) -> Option<Color> {
-    theme.colors.get(preferred).copied().or_else(|| {
-        theme
-            .colors
-            .get(fallback)
-            .copied()
-            .map(|color| match color {
-                Color::Rgb { r, g, b } | Color::Rgba { r, g, b, .. } => {
-                    Color::Rgba { r, g, b, a: 38 }
-                }
-            })
-    })
-}
-
-fn diff_foreground(kind: &str, theme: &Theme) -> Option<Color> {
-    let key = match kind {
-        "added" => "gitDecoration.addedResourceForeground",
-        "removed" => "gitDecoration.deletedResourceForeground",
-        "hunk" => "gitDecoration.modifiedResourceForeground",
-        _ => return None,
-    };
-    theme.colors.get(key).copied()
+fn diff_line_style(kind: &str, theme: &Theme, palette: &DiffPalette) -> Style {
+    match kind {
+        "added" => palette.added.clone(),
+        "removed" => palette.removed.clone(),
+        "hunk" => palette.hunk.clone(),
+        _ => theme.style.clone(),
+    }
 }
 
 fn render_segments(
@@ -1419,10 +2084,12 @@ fn render_segments(
         }
         let text = truncate_display_width(&segment.text, end - x);
         let mut style = segment
-            .style
-            .clone()
+            .semantic
+            .as_ref()
+            .map(|spec| theme.resolve_style(spec))
+            .or_else(|| segment.style.clone())
             .unwrap_or_else(|| editor_style.clone())
-            .fallback_bg(editor_style);
+            .with_bg(editor_style.bg);
         if selected {
             // Segment styles commonly carry the editor background so they can
             // render correctly on an unselected row. The selected row fill
@@ -1479,6 +2146,7 @@ mod tests {
                     ..WorkspaceDocumentLine::default()
                 },
             ],
+            ..WorkspaceDocument::default()
         }
     }
 
@@ -1488,6 +2156,180 @@ mod tests {
             detail_document: Some(document()),
             ..WorkspaceModel::default()
         }
+    }
+
+    fn action_model() -> WorkspaceModel {
+        let mut model = model_with_document();
+        model.actions = vec![WorkspaceAction {
+            hint: UiAction::new("s", "s", "stage {scope}"),
+            focus: String::new(),
+            sections: vec!["unstaged".to_string()],
+            selection: String::new(),
+            change_only: true,
+            hunk_only: false,
+        }];
+        model.rows[0].path = Some("src/main.rs".to_string());
+        model.rows[0].data = serde_json::json!({"section":"unstaged"});
+        for line in &mut model.detail_document.as_mut().unwrap().lines {
+            line.data = serde_json::json!({"section":"unstaged"});
+        }
+        model
+    }
+
+    #[test]
+    fn word_highlights_cover_only_replaced_words() {
+        let mut document = WorkspaceDocument::default();
+        for (kind, text) in [
+            ("removed", "let count = 1;"),
+            ("added", "let count = 4;"),
+            ("context", "unchanged"),
+            ("added", "brand new line"),
+        ] {
+            document.lines.push(WorkspaceDocumentLine {
+                kind: kind.to_string(),
+                text: text.to_string(),
+                ..Default::default()
+            });
+        }
+        let ranges = word_changes(Some(&document));
+        let changed = |index: usize| {
+            ranges[index]
+                .iter()
+                .map(|range| &document.lines[index].text[range.clone()])
+                .collect::<String>()
+        };
+        assert_eq!(changed(0), "1");
+        assert_eq!(changed(1), "4");
+        assert!(ranges[2].is_empty() && ranges[3].is_empty());
+    }
+
+    #[test]
+    fn metadata_folding_preserves_patch_indices_and_local_action_scope() {
+        let mut model = action_model();
+        model.detail_document.as_mut().unwrap().lines.insert(
+            0,
+            WorkspaceDocumentLine {
+                id: "meta".to_string(),
+                kind: "meta".to_string(),
+                text: "diff --git a/b b/b".to_string(),
+                ..Default::default()
+            },
+        );
+        let mut workspace = PluginWorkspace::new(
+            "git".to_string(),
+            WorkspaceConfig {
+                notify_detail_navigation: false,
+                ..Default::default()
+            },
+        );
+        workspace.update(model, &Theme::default());
+        assert!(!workspace.detail_visible.contains(&0));
+        assert!(workspace
+            .actions()
+            .iter()
+            .any(|action| action.label == "stage file"));
+        workspace.handle_action("toggle".to_string(), 24, 120);
+        assert_eq!(workspace.detail_cursor, 2);
+        assert!(workspace
+            .actions()
+            .iter()
+            .any(|action| action.label == "stage line"));
+        workspace.handle_action("visual".to_string(), 24, 120);
+        workspace.handle_action("down".to_string(), 24, 120);
+        assert!(workspace
+            .actions()
+            .iter()
+            .any(|action| action.label == "stage 2 lines"));
+        let event = workspace.handle_action("M".to_string(), 24, 120);
+        assert!(!event.notify_plugin);
+        assert!(workspace.detail_visible.contains(&0));
+        assert_eq!(event.detail_selection, Some([2, 3]));
+    }
+
+    #[test]
+    fn filter_collapse_and_width_survive_model_updates() {
+        let mut model = action_model();
+        let mut heading = row("section:unstaged", false);
+        heading.segments.push(PanelSegment {
+            text: "Unstaged".to_string(),
+            style: None,
+            semantic: None,
+        });
+        model.rows.insert(0, heading);
+        let mut other = row("other", true);
+        other.path = Some("docs/readme.md".to_string());
+        model.rows.push(other);
+        let mut manager = WorkspaceManager::default();
+        manager.open("git".to_string(), WorkspaceConfig::default());
+        manager.update("git", model.clone(), &Theme::default());
+        manager.handle_action("/".to_string(), 24, 120);
+        manager.handle_action("filter_text:readme".to_string(), 24, 120);
+        let event = manager
+            .handle_action("filter_accept".to_string(), 24, 120)
+            .unwrap();
+        assert_eq!(event.row.unwrap().id, "other");
+        assert_eq!(manager.active.as_ref().unwrap().rows_visible, vec![0, 2]);
+        manager.handle_action("/".to_string(), 24, 120);
+        manager.handle_action("filter_cancel".to_string(), 24, 120);
+        manager.handle_action("C".to_string(), 24, 120);
+        assert_eq!(manager.active.as_ref().unwrap().rows_visible, vec![0]);
+        manager.update("git", model, &Theme::default());
+        assert_eq!(manager.active.as_ref().unwrap().rows_visible, vec![0]);
+        manager.handle_action("widen_rows".to_string(), 24, 120);
+        let width = manager.active.as_ref().unwrap().rows_width;
+        manager.close("git");
+        manager.open("git".to_string(), WorkspaceConfig::default());
+        assert_eq!(manager.active.as_ref().unwrap().rows_width, width);
+    }
+
+    #[test]
+    fn reused_patch_index_does_not_restore_an_unrelated_line() {
+        let mut workspace = PluginWorkspace::new("git".to_string(), WorkspaceConfig::default());
+        let mut model = action_model();
+        workspace.update(model.clone(), &Theme::default());
+        workspace.detail_cursor = 3;
+        workspace.detail_selection_anchor = Some(1);
+        model.detail_document.as_mut().unwrap().lines[3].text = "different change".to_string();
+        workspace.update(model, &Theme::default());
+        assert_eq!(workspace.detail_cursor, 1);
+        assert!(workspace.detail_selection_anchor.is_none());
+    }
+
+    #[test]
+    fn one_dark_plain_text_and_syntax_keep_the_owning_background() {
+        let theme = crate::theme::parse_vscode_theme("themes/one-dark-pro.json").unwrap();
+        let mut model = model_with_document();
+        model.header = vec![PanelSegment {
+            text: "branch".to_string(),
+            style: Some(theme.ui_style.popup_title.clone()),
+            semantic: None,
+        }];
+        let mut manager = WorkspaceManager::default();
+        manager.open("git".to_string(), WorkspaceConfig::default());
+        manager.update("git", model, &theme);
+        let mut buffer = RenderBuffer::new(120, 24, &theme.style);
+        manager.render(&mut buffer, &theme, PickerIconsConfig::default());
+        assert!(buffer.cells[120..240]
+            .iter()
+            .all(|cell| cell.style.bg == theme.style.bg));
+        let added = buffer
+            .cells
+            .chunks(120)
+            .find(|row| {
+                row.iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>()
+                    .contains("let first = true")
+            })
+            .unwrap();
+        let palette = DiffPalette::new(&theme);
+        let detail_start = WorkspaceLayout::calculate(manager.active.as_ref().unwrap(), 24, 120)
+            .detail
+            .unwrap()
+            .x;
+        assert!(added[detail_start..]
+            .iter()
+            .all(|cell| cell.style.bg == palette.added.bg));
     }
 
     fn buffer_text(buffer: &RenderBuffer) -> String {
@@ -1628,7 +2470,8 @@ mod tests {
         manager.handle_action("toggle".to_string(), 12, 80);
         manager.render(&mut buffer, &theme, PickerIconsConfig::default());
         let detail = buffer_text(&buffer);
-        assert!(detail.contains("Diff  wrap"));
+        assert!(detail.contains("src/main.rs"));
+        assert!(detail.contains("wrap"));
         assert!(detail.contains("let first = true"));
     }
 
@@ -1683,7 +2526,8 @@ mod tests {
 
         let rendered = buffer_text(&buffer);
         assert!(rendered.contains("Changes"));
-        assert!(rendered.contains("Diff  wrap"));
+        assert!(rendered.contains("src/main.rs"));
+        assert!(rendered.contains("wrap"));
         assert!(rendered.contains("let first = true"));
         let layout = WorkspaceLayout::calculate(manager.active.as_ref().unwrap(), 24, 80);
         let rows = layout.rows.unwrap();
@@ -1701,7 +2545,7 @@ mod tests {
         assert_eq!(event.row.unwrap().id, "second");
 
         let event = manager
-            .handle_mouse("mouse_click", 20, detail.y + 4, 24, 80)
+            .handle_mouse("mouse_click", 20, detail.y + 5, 24, 80)
             .unwrap();
         assert_eq!(event.focus, WorkspaceFocus::Detail);
         assert_eq!(event.detail_index, 3);
@@ -1852,11 +2696,17 @@ mod tests {
 
         manager.render(&mut buffer, &theme, PickerIconsConfig::default());
 
-        let added_row = &buffer.cells[4 * buffer.width..5 * buffer.width];
-        let expected_background = theme
-            .colors
-            .get("diffEditor.insertedLineBackground")
-            .copied();
+        let added_row = buffer
+            .cells
+            .chunks(buffer.width)
+            .find(|row| {
+                row.iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>()
+                    .contains("let first = true")
+            })
+            .unwrap();
+        let expected_background = DiffPalette::new(&theme).added.bg;
         assert!(added_row
             .iter()
             .any(|cell| cell.style.bg == expected_background));

@@ -3125,6 +3125,7 @@ pub struct Editor {
 
     /// Active dialog/popup component
     current_dialog: Option<Box<dyn Component>>,
+    dialog_action_menu: crate::ui::ActionMenu,
 
     /// Number prefix for repeating commands
     repeater: Option<u16>,
@@ -4334,6 +4335,7 @@ impl Editor {
             search_highlights_suppressed: false,
             last_error: None,
             current_dialog: None,
+            dialog_action_menu: crate::ui::ActionMenu::default(),
             repeater: None,
             selection_start: None,
             selection: None,
@@ -12329,6 +12331,24 @@ impl Editor {
         }
 
         if let Some(current_dialog) = &mut self.current_dialog {
+            let surface_actions = current_dialog.surface_actions();
+            if self.dialog_action_menu.is_open() {
+                let selected = self.dialog_action_menu.handle_event(ev, &surface_actions);
+                return Ok(selected
+                    .and_then(|id| current_dialog.activate_surface_action(&id))
+                    .or(Some(KeyAction::Single(Action::Refresh))));
+            }
+            if matches!(
+                ev,
+                Event::Key(KeyEvent {
+                    code: KeyCode::F(1),
+                    ..
+                })
+            ) && !surface_actions.is_empty()
+            {
+                self.dialog_action_menu.open();
+                return Ok(Some(KeyAction::Single(Action::Refresh)));
+            }
             let action = current_dialog.handle_event(ev);
             let allows_passthrough = current_dialog.allows_event_passthrough();
             if action.is_some() || !allows_passthrough {
@@ -12346,6 +12366,10 @@ impl Editor {
                 };
                 return Ok(action);
             }
+        }
+
+        if !self.panel_manager.has_focused_panel() {
+            self.dialog_action_menu.close();
         }
 
         if self.workspace_manager.is_active() {
@@ -12367,6 +12391,30 @@ impl Editor {
         }
 
         if self.panel_manager.focused_panel_id().is_some() {
+            let surface_actions = self.panel_manager.surface_actions();
+            if self.dialog_action_menu.is_open() {
+                let selected = self.dialog_action_menu.handle_event(ev, &surface_actions);
+                let event = selected.and_then(|id| {
+                    surface_actions
+                        .iter()
+                        .find(|action| action.id == id)
+                        .and_then(crate::ui::UiAction::event)
+                });
+                return Ok(event
+                    .and_then(|event| self.handle_panel_event(&event, runtime))
+                    .or(Some(KeyAction::Single(Action::Refresh))));
+            }
+            if matches!(
+                ev,
+                Event::Key(KeyEvent {
+                    code: KeyCode::F(1),
+                    ..
+                })
+            ) && !surface_actions.is_empty()
+            {
+                self.dialog_action_menu.open();
+                return Ok(Some(KeyAction::Single(Action::Refresh)));
+            }
             if !self.panel_manager.focused_text_input_active() && self.handle_repeater(ev) {
                 return Ok(None);
             }
@@ -12421,6 +12469,8 @@ impl Editor {
                 MouseEventKind::ScrollUp => "mouse_up",
                 MouseEventKind::ScrollDown => "mouse_down",
                 MouseEventKind::Down(MouseButton::Left) => "mouse_click",
+                MouseEventKind::Drag(MouseButton::Left) => "mouse_drag",
+                MouseEventKind::Up(MouseButton::Left) => "mouse_release",
                 _ => return None,
             };
             self.workspace_manager.handle_mouse(
@@ -12430,28 +12480,48 @@ impl Editor {
                 self.size.1 as usize,
                 self.size.0 as usize,
             )?
+        } else if let Event::Paste(text) = ev {
+            if !self.workspace_manager.is_filtering() {
+                return None;
+            }
+            self.workspace_manager.handle_action(
+                format!("filter_text:{}", text.lines().next().unwrap_or_default()),
+                self.size.1 as usize,
+                self.size.0 as usize,
+            )?
         } else if let Event::Key(event) = ev {
             let control = event.modifiers.contains(KeyModifiers::CONTROL);
-            let action = match event.code {
-                KeyCode::Char('w') if control => "ctrl_w".to_string(),
-                KeyCode::Char('u') if control => "half_page_up".to_string(),
-                KeyCode::Char('d') if control => "half_page_down".to_string(),
-                KeyCode::Char('b') if control => "page_up".to_string(),
-                KeyCode::Char('f') if control => "page_down".to_string(),
-                KeyCode::Up | KeyCode::Char('k') => "up".to_string(),
-                KeyCode::Down | KeyCode::Char('j') => "down".to_string(),
-                KeyCode::Left => "left".to_string(),
-                KeyCode::Right => "right".to_string(),
-                KeyCode::Home => "first".to_string(),
-                KeyCode::End => "last".to_string(),
-                KeyCode::PageUp => "page_up".to_string(),
-                KeyCode::PageDown => "page_down".to_string(),
-                KeyCode::Enter => "activate".to_string(),
-                KeyCode::Esc => "escape".to_string(),
-                KeyCode::Tab => "toggle".to_string(),
-                KeyCode::BackTab => "back_toggle".to_string(),
-                KeyCode::Char(c) => c.to_string(),
-                _ => return None,
+            let action = if self.workspace_manager.is_filtering() {
+                match event.code {
+                    KeyCode::Enter => "filter_accept".to_string(),
+                    KeyCode::Esc => "filter_cancel".to_string(),
+                    KeyCode::Backspace => "filter_backspace".to_string(),
+                    KeyCode::Char(character) if !control => format!("filter_text:{character}"),
+                    _ => "noop".to_string(),
+                }
+            } else {
+                match event.code {
+                    KeyCode::Char('w') if control => "ctrl_w".to_string(),
+                    KeyCode::Char('u') if control => "half_page_up".to_string(),
+                    KeyCode::Char('d') if control => "half_page_down".to_string(),
+                    KeyCode::Char('b') if control => "page_up".to_string(),
+                    KeyCode::Char('f') if control => "page_down".to_string(),
+                    KeyCode::Up | KeyCode::Char('k') => "up".to_string(),
+                    KeyCode::Down | KeyCode::Char('j') => "down".to_string(),
+                    KeyCode::Left => "left".to_string(),
+                    KeyCode::Right => "right".to_string(),
+                    KeyCode::Home => "first".to_string(),
+                    KeyCode::End => "last".to_string(),
+                    KeyCode::PageUp => "page_up".to_string(),
+                    KeyCode::PageDown => "page_down".to_string(),
+                    KeyCode::Enter => "activate".to_string(),
+                    KeyCode::Esc => "escape".to_string(),
+                    KeyCode::Tab => "toggle".to_string(),
+                    KeyCode::BackTab => "back_toggle".to_string(),
+                    KeyCode::F(1) => "F1".to_string(),
+                    KeyCode::Char(c) => c.to_string(),
+                    _ => return None,
+                }
             };
             self.workspace_manager.handle_action(
                 action,

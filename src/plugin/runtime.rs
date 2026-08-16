@@ -2588,8 +2588,17 @@ impl RedHost {
     }
 
     fn call_git_core(&mut self, operation: &str, args: &[Value]) -> anyhow::Result<Value> {
+        // The full patch remains in plugin state for staging and the scratch view.
+        // Only the bounded preview enters the instruction-metered document parser.
+        let preview = if operation == "detail_document" {
+            Some(git_detail_preview(args)?)
+        } else {
+            None
+        };
+        let args = preview.as_ref().map_or(args, |(args, _)| args.as_slice());
         let function = match operation {
             "parse_status" => "status::parse_status",
+            "display_entries" => "status::display_entries",
             "sign_hunks" => "patch::sign_hunks",
             "detail_document" => "patch::detail_document",
             "dashboard_hunk" => "patch::dashboard_hunk",
@@ -2620,8 +2629,24 @@ impl RedHost {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Git core VM did not initialize"))?;
         let mut host = NativeCoreHost;
-        let result = vm.call_export("red-git-core", function, args.to_vec(), &mut host)?;
-        Ok(normalize_native_core_value(result))
+        // A structured preview emits several typed records per line. Give only
+        // this trusted, 1,000-line-bounded core call enough instructions to do so.
+        if preview.is_some() {
+            vm.set_instruction_budget(PLUGIN_INSTRUCTION_BUDGET * 4);
+        }
+        let result = vm.call_export("red-git-core", function, args.to_vec(), &mut host);
+        vm.set_instruction_budget(PLUGIN_INSTRUCTION_BUDGET);
+        let result = result?;
+        let result = normalize_native_core_value(result);
+        if let Some((_, summary)) = preview {
+            let mut document = result.to_json();
+            document["added"] = summary.added.into();
+            document["removed"] = summary.removed.into();
+            document["total_lines"] = summary.total_lines.into();
+            document["truncated"] = (summary.total_lines > summary.preview_lines).into();
+            return Ok(Value::Json(document));
+        }
+        Ok(result)
     }
 
     fn call_neotree_core(&mut self, operation: &str, args: &[Value]) -> anyhow::Result<Value> {
@@ -2658,6 +2683,43 @@ impl RedHost {
         let result = vm.call_export("red-neotree-core", function, args.to_vec(), &mut host)?;
         Ok(normalize_native_core_value(result))
     }
+}
+
+#[derive(Default)]
+struct GitDiffSummary {
+    added: usize,
+    removed: usize,
+    total_lines: usize,
+    preview_lines: usize,
+}
+
+fn git_detail_preview(args: &[Value]) -> anyhow::Result<(Vec<Value>, GitDiffSummary)> {
+    const PREVIEW_LINES: usize = 1000;
+    let text = red_required_string(args, 0, "Git detail document")?;
+    let mut summary = GitDiffSummary::default();
+    let mut preview = String::new();
+    let mut in_hunk = false;
+    for line in text.lines() {
+        if summary.preview_lines < PREVIEW_LINES {
+            if summary.preview_lines > 0 {
+                preview.push('\n');
+            }
+            preview.push_str(line);
+            summary.preview_lines += 1;
+        }
+        summary.total_lines += 1;
+        if line.starts_with("diff --git ") {
+            in_hunk = false;
+        } else if line.starts_with("@@ ") {
+            in_hunk = true;
+        } else if in_hunk {
+            summary.added += usize::from(line.starts_with('+'));
+            summary.removed += usize::from(line.starts_with('-'));
+        }
+    }
+    let mut args = args.to_vec();
+    args[0] = Value::String(preview);
+    Ok((args, summary))
 }
 
 struct NativeCoreHost;
@@ -4656,6 +4718,28 @@ mod tests {
             error.to_string().contains("unknown Git core operation"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn git_core_detail_bounds_large_previews_and_reports_full_counts() {
+        let patch = format!("diff --git a/large.txt b/large.txt\n--- a/large.txt\n+++ b/large.txt\n@@ -1 +1,15001 @@\n-old\n{}", "+new\n".repeat(15001));
+        let mut host = RedHost::new(HashMap::new());
+        let document = host
+            .call_git_core(
+                "detail_document",
+                &[
+                    Value::String(patch),
+                    Value::String("large.txt".to_string()),
+                    Value::String("unstaged".to_string()),
+                ],
+            )
+            .unwrap()
+            .to_json();
+        assert_eq!(document["lines"].as_array().unwrap().len(), 1000);
+        assert_eq!(document["added"], 15001);
+        assert_eq!(document["removed"], 1);
+        assert_eq!(document["total_lines"], 15006);
+        assert_eq!(document["truncated"], true);
     }
 
     #[test]
@@ -11003,6 +11087,67 @@ mod tests {
             assert!(
                 Instant::now() < deadline,
                 "git dashboard did not render the bounded status"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn git_dashboard_renders_numstat_for_a_large_tracked_file_list() {
+        drain_requests();
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        let git = |args: &[&str]| {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        git(&["init", "-q"]);
+        for index in 0..500 {
+            fs::write(root.join(format!("tracked_{index}.txt")), "before\n").unwrap();
+        }
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Red Test",
+            "-c",
+            "user.email=red@example.test",
+            "commit",
+            "-qm",
+            "baseline",
+        ]);
+        for index in 0..500 {
+            fs::write(root.join(format!("tracked_{index}.txt")), "after\n").unwrap();
+        }
+        let mut runtime = load_git_runtime(root).await;
+        runtime.execute_command("GitDashboard").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            pump_process_events(&mut runtime).await.unwrap();
+            while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+                if let PluginRequest::UpdateWorkspace { model, .. } = request {
+                    let counted = model
+                        .rows
+                        .iter()
+                        .filter(|row| {
+                            row.right_segments
+                                .iter()
+                                .any(|segment| segment.text.contains("+1 −1"))
+                        })
+                        .count();
+                    if counted == 500 {
+                        return;
+                    }
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "large file list did not receive numstat counts"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

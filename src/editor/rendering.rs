@@ -2890,6 +2890,14 @@ impl Editor {
     fn render_dialog(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         if let Some(current_dialog) = &self.current_dialog {
             current_dialog.draw(buffer)?;
+            self.dialog_action_menu
+                .render(buffer, &self.theme, &current_dialog.surface_actions());
+        } else {
+            self.dialog_action_menu.render(
+                buffer,
+                &self.theme,
+                &self.panel_manager.surface_actions(),
+            );
         }
 
         if self.keymap_hints_visible {

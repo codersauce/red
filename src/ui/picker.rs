@@ -39,8 +39,8 @@ use crate::{
 };
 
 use super::{
-    dialog::BorderStyle, first_prompt_line, spinner_frame, Component, Dialog, IconCatalog, List,
-    ScreenRect, SPINNER_FRAME_INTERVAL_MS,
+    dialog::BorderStyle, first_prompt_line, spinner_frame, ActionBar, ActionPriority, Component,
+    Dialog, IconCatalog, List, ScreenRect, UiAction, SPINNER_FRAME_INTERVAL_MS,
 };
 
 type SelectAction = Box<dyn Fn(String) -> Action + Send>;
@@ -366,6 +366,7 @@ struct PickerLayout {
     preview: Option<PickerPreviewLayout>,
     separator_y: usize,
     query_y: usize,
+    action_y: Option<usize>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1341,6 +1342,8 @@ impl Picker {
     }
 
     fn layout(&self) -> PickerLayout {
+        let action_rows = usize::from(!self.key_actions.is_empty() && self.height >= 6);
+        let action_y = (action_rows > 0).then_some(self.y + self.height.saturating_sub(1));
         let content_y = match self.input_position {
             PickerInputPosition::Top => self.y + 3,
             PickerInputPosition::Bottom => self.y + 1,
@@ -1349,15 +1352,15 @@ impl Picker {
             x: self.x + 1,
             y: content_y,
             width: self.width,
-            height: self.height.saturating_sub(3),
+            height: self.height.saturating_sub(3 + action_rows),
         };
         let separator_y = match self.input_position {
             PickerInputPosition::Top => self.y + 2,
-            PickerInputPosition::Bottom => self.y + self.height.saturating_sub(2),
+            PickerInputPosition::Bottom => self.y + self.height.saturating_sub(2 + action_rows),
         };
         let query_y = match self.input_position {
             PickerInputPosition::Top => self.y + 1,
-            PickerInputPosition::Bottom => self.y + self.height.saturating_sub(1),
+            PickerInputPosition::Bottom => self.y + self.height.saturating_sub(1 + action_rows),
         };
 
         let Some(preview) = self.preview_layout(content) else {
@@ -1366,6 +1369,7 @@ impl Picker {
                 preview: None,
                 separator_y,
                 query_y,
+                action_y,
             };
         };
 
@@ -1401,6 +1405,7 @@ impl Picker {
             preview: Some(preview),
             separator_y,
             query_y,
+            action_y,
         }
     }
 
@@ -3094,6 +3099,23 @@ fn merge_preview_style(base: &Style, syntax: &Style) -> Style {
 }
 
 impl Component for Picker {
+    fn surface_actions(&self) -> Vec<UiAction> {
+        let mut actions = vec![
+            UiAction::new("select", "Enter", "select").with_priority(ActionPriority::Essential)
+        ];
+        actions.extend(self.key_actions.iter().map(|action| {
+            UiAction::new(
+                format!("custom:{}", action.action),
+                action.key.replace("Ctrl-", "Ctrl+").replace("Alt-", "Alt+"),
+                action.label.as_deref().unwrap_or(&action.action),
+            )
+            .with_priority(ActionPriority::Secondary)
+        }));
+        actions.push(
+            UiAction::new("cancel", "Esc", "cancel").with_priority(ActionPriority::Essential),
+        );
+        actions
+    }
     fn tick(&mut self) -> anyhow::Result<bool> {
         let Some(since) = self.busy_since else {
             return Ok(false);
@@ -3312,6 +3334,16 @@ impl Component for Picker {
 
         if let (Some(preview), Some(preview_layout)) = (self.current_preview(), layout.preview) {
             self.draw_preview(buffer, preview.as_ref(), preview_layout)?;
+        }
+        if let Some(y) = layout.action_y {
+            ActionBar::new(&self.surface_actions()).render(
+                buffer,
+                self.x + 1,
+                y,
+                self.width,
+                &self.theme,
+                &self.theme.ui_style.popup,
+            );
         }
 
         Ok(())

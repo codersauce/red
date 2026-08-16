@@ -236,6 +236,18 @@ when there is not enough height for both. In the diff, `j`/`k`,
 `[h`/`]h` provide line, page, and hunk navigation. `W` toggles wrapping; when
 wrapping is off, `h`/`l`, the arrow keys, and `0`/`$` scroll horizontally.
 
+The bottom action strip follows the focused pane and selection. Press `?` or
+`F1` for the complete, actionable list. In the file pane, `/` filters paths;
+`Enter` applies the filter and `Esc` clears it. `C` or `Enter` on a section
+heading collapses that section. Drag the vertical divider, or use `Ctrl-w <`
+and `Ctrl-w >`, to resize the file pane; `Ctrl-w o` hides or restores it.
+The chosen width is retained while the editor remains open.
+
+The diff header keeps the file, staged state, change counts, and current hunk
+visible. `M` toggles raw patch metadata, and `L` opens the complete patch in a
+scratch buffer when the bounded preview is not enough. Line colors and exact
+changed-word highlights use the active theme without replacing syntax colors.
+
 Use `v` to select changed lines. Lowercase `s`, `u`, and `x` stage, unstage,
 or discard the current changed line or selection; uppercase `S`, `U`, and `X`
 apply the same operation to the current hunk. Destructive actions remain

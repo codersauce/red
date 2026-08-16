@@ -4,11 +4,12 @@
 //! picker, or plugin workspace without cutting a key binding or hiding the
 //! number of actions that did not fit.
 
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     editor::RenderBuffer,
-    theme::{Style, Theme},
+    theme::{SelectionForegroundPriority, Style, SurfacePalette, Theme},
     unicode_utils::{display_width, truncate_display_width},
 };
 
@@ -82,6 +83,9 @@ pub struct UiAction {
     /// Optional shorter representation of the same key binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_key: Option<String>,
+    /// Canonical single key used when a grouped display label is chosen from help.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
     /// Responsive display priority.
     #[serde(default)]
     pub priority: ActionPriority,
@@ -103,6 +107,7 @@ impl UiAction {
             label: label.into(),
             compact_label: None,
             compact_key: None,
+            trigger: None,
             priority: ActionPriority::Primary,
             modes: Vec::new(),
             enabled: true,
@@ -130,6 +135,12 @@ impl UiAction {
         self
     }
 
+    #[must_use]
+    pub fn with_trigger(mut self, key: impl Into<String>) -> Self {
+        self.trigger = Some(key.into());
+        self
+    }
+
     /// Restricts this action to the supplied interaction modes.
     #[must_use]
     pub fn with_modes(mut self, modes: impl IntoIterator<Item = ActionMode>) -> Self {
@@ -147,6 +158,68 @@ impl UiAction {
     fn is_available(&self, mode: Option<ActionMode>) -> bool {
         self.enabled
             && (self.modes.is_empty() || mode.is_some_and(|mode| self.modes.contains(&mode)))
+    }
+
+    /// Resolves the first advertised alternative for modal action-menu dispatch.
+    pub(crate) fn event(&self) -> Option<Event> {
+        let binding = self.trigger.as_deref().unwrap_or(&self.key).trim();
+        let binding = if binding == "/" || binding.ends_with("+/") {
+            binding
+        } else {
+            binding.split('/').next()?
+        };
+        let normalized = binding
+            .replace("Ctrl-", "Ctrl+")
+            .replace("Alt-", "Alt+")
+            .replace("Shift-", "Shift+")
+            .replace("C-", "Ctrl+")
+            .replace("A-", "Alt+");
+        let mut key = normalized.as_str();
+        let mut modifiers = KeyModifiers::NONE;
+        for (prefix, modifier) in [
+            ("Ctrl+", KeyModifiers::CONTROL),
+            ("Alt+", KeyModifiers::ALT),
+            ("Shift+", KeyModifiers::SHIFT),
+            ("^", KeyModifiers::CONTROL),
+        ] {
+            if let Some(rest) = key.strip_prefix(prefix) {
+                modifiers |= modifier;
+                key = rest;
+            }
+        }
+        let code = match key {
+            "Enter" | "↵" => KeyCode::Enter,
+            "Esc" => KeyCode::Esc,
+            "Tab" => KeyCode::Tab,
+            "Space" => KeyCode::Char(' '),
+            "Backspace" => KeyCode::Backspace,
+            "Delete" => KeyCode::Delete,
+            "Home" => KeyCode::Home,
+            "End" => KeyCode::End,
+            "PageUp" => KeyCode::PageUp,
+            "PageDown" => KeyCode::PageDown,
+            "↑" | "↑↓" => KeyCode::Up,
+            "↓" => KeyCode::Down,
+            "←" => KeyCode::Left,
+            "→" => KeyCode::Right,
+            value if value.starts_with('F') && value.len() > 1 => {
+                KeyCode::F(value[1..].parse().ok()?)
+            }
+            value if value.chars().count() == 1 => {
+                let character = value.chars().next()?;
+                KeyCode::Char(
+                    if modifiers.contains(KeyModifiers::CONTROL)
+                        && !modifiers.contains(KeyModifiers::SHIFT)
+                    {
+                        character.to_ascii_lowercase()
+                    } else {
+                        character
+                    },
+                )
+            }
+            _ => return None,
+        };
+        Some(Event::Key(KeyEvent::new(code, modifiers)))
     }
 }
 
@@ -205,6 +278,7 @@ pub struct ActionBar<'a> {
     actions: &'a [UiAction],
     mode: Option<ActionMode>,
     status: Option<&'a str>,
+    context: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,6 +295,7 @@ impl<'a> ActionBar<'a> {
             actions,
             mode: None,
             status: None,
+            context: None,
         }
     }
 
@@ -228,6 +303,13 @@ impl<'a> ActionBar<'a> {
     #[must_use]
     pub const fn with_mode(mut self, mode: ActionMode) -> Self {
         self.mode = Some(mode);
+        self
+    }
+
+    /// Identifies the focused surface without pretending it is a Vim mode.
+    #[must_use]
+    pub const fn with_context(mut self, context: &'a str) -> Self {
+        self.context = Some(context);
         self
     }
 
@@ -303,7 +385,7 @@ impl<'a> ActionBar<'a> {
 
         for (_, action, compact) in &packed.visible {
             if used > 0 {
-                push_span(&mut spans, &mut used, "  ", ActionBarRole::Separator);
+                push_span(&mut spans, &mut used, " · ", ActionBarRole::Separator);
             }
             let key = if *compact {
                 action.compact_key.as_deref().unwrap_or(&action.key)
@@ -341,7 +423,10 @@ impl<'a> ActionBar<'a> {
             let separator_width = usize::from(used > 0);
             let marker = overflow_marker(
                 hidden_actions.len(),
-                width.saturating_sub(used).saturating_sub(separator_width),
+                width
+                    .saturating_sub(used)
+                    .saturating_sub(separator_width)
+                    .saturating_sub(status_reserved),
             );
             if !marker.is_empty() {
                 if used > 0 {
@@ -441,7 +526,8 @@ impl<'a> ActionBar<'a> {
             return ActionBarLayout::default();
         }
 
-        buffer.set_text(x, y, &" ".repeat(width), surface);
+        let palette = SurfacePalette::new(theme, surface);
+        buffer.set_text(x, y, &" ".repeat(width), &palette.surface);
         let layout = self.layout(width);
         let mut column = match alignment {
             ActionBarAlignment::Left => x,
@@ -451,14 +537,13 @@ impl<'a> ActionBar<'a> {
         };
         for span in &layout.spans {
             let style = match span.role {
-                ActionBarRole::Mode => theme.ui_style.popup_title.with_bg(surface.bg),
-                ActionBarRole::Key | ActionBarRole::Overflow => {
-                    theme.ui_style.picker_prompt.with_bg(surface.bg)
-                }
-                ActionBarRole::Separator | ActionBarRole::Status => {
-                    theme.ui_style.muted.with_bg(surface.bg)
-                }
-                ActionBarRole::Label => surface.clone(),
+                ActionBarRole::Mode => palette.accent.clone(),
+                ActionBarRole::Key | ActionBarRole::Overflow => Style {
+                    bold: true,
+                    ..palette.secondary.clone()
+                },
+                ActionBarRole::Separator => palette.divider.clone(),
+                ActionBarRole::Status | ActionBarRole::Label => palette.muted.clone(),
             };
             buffer.set_text(column, y, &span.text, &style);
             column = column.saturating_add(display_width(&span.text));
@@ -489,40 +574,43 @@ impl<'a> ActionBar<'a> {
         } else {
             essential_width(actions, false)
         };
-        let mode = self.mode.and_then(|mode| {
-            let full = mode.label();
-            if display_width(full)
-                .saturating_add(usize::from(action_preferred > 0) * 2)
-                .saturating_add(action_preferred)
-                .saturating_add(reserved)
-                <= width
-            {
-                Some(full)
-            } else if display_width(mode.compact_label())
-                .saturating_add(usize::from(action_preferred > 0) * 2)
-                .saturating_add(action_preferred)
-                .saturating_add(reserved)
-                <= width
-            {
-                Some(mode.compact_label())
-            } else if display_width(full)
-                .saturating_add(usize::from(action_minimum > 0) * 2)
-                .saturating_add(action_minimum)
-                .saturating_add(reserved)
-                <= width
-            {
-                Some(full)
-            } else if display_width(mode.compact_label())
-                .saturating_add(usize::from(action_minimum > 0) * 2)
-                .saturating_add(action_minimum)
-                .saturating_add(reserved)
-                <= width
-            {
-                Some(mode.compact_label())
-            } else {
-                None
-            }
-        });
+        let mode = self
+            .context
+            .or(self.mode.map(ActionMode::label))
+            .and_then(|full| {
+                let compact = self.mode.map(ActionMode::compact_label).unwrap_or(full);
+                if display_width(full)
+                    .saturating_add(usize::from(action_preferred > 0) * 3)
+                    .saturating_add(action_preferred)
+                    .saturating_add(reserved)
+                    <= width
+                {
+                    Some(full)
+                } else if display_width(compact)
+                    .saturating_add(usize::from(action_preferred > 0) * 3)
+                    .saturating_add(action_preferred)
+                    .saturating_add(reserved)
+                    <= width
+                {
+                    Some(compact)
+                } else if display_width(full)
+                    .saturating_add(usize::from(action_minimum > 0) * 3)
+                    .saturating_add(action_minimum)
+                    .saturating_add(reserved)
+                    <= width
+                {
+                    Some(full)
+                } else if display_width(compact)
+                    .saturating_add(usize::from(action_minimum > 0) * 3)
+                    .saturating_add(action_minimum)
+                    .saturating_add(reserved)
+                    <= width
+                {
+                    Some(compact)
+                } else {
+                    None
+                }
+            });
 
         let mut used = mode.map_or(0, display_width);
         let mut visible = Vec::new();
@@ -533,7 +621,7 @@ impl<'a> ActionBar<'a> {
                 continue;
             }
 
-            let separator_width = usize::from(used > 0) * 2;
+            let separator_width = usize::from(used > 0) * 3;
             let remaining = width
                 .saturating_sub(used)
                 .saturating_sub(separator_width)
@@ -541,7 +629,7 @@ impl<'a> ActionBar<'a> {
             let full_width = action_width(action, false);
             let compact_width = action_width(action, true);
             let remaining_essentials = minimum_essential_width(&actions[position + 1..]);
-            let following_separator = usize::from(remaining_essentials > 0) * 2;
+            let following_separator = usize::from(remaining_essentials > 0) * 3;
             let preserve_essentials = remaining_essentials.saturating_add(following_separator);
             let compact = if full_width.saturating_add(preserve_essentials) <= remaining {
                 false
@@ -562,6 +650,7 @@ impl<'a> ActionBar<'a> {
             visible.push((*index, *action, compact));
         }
 
+        visible.sort_by_key(|(index, _, _)| *index);
         PackedActions {
             mode,
             visible,
@@ -571,7 +660,7 @@ impl<'a> ActionBar<'a> {
 }
 
 struct PackedActions<'a> {
-    mode: Option<&'static str>,
+    mode: Option<&'a str>,
     visible: Vec<(usize, &'a UiAction, bool)>,
     used: usize,
 }
@@ -588,7 +677,7 @@ fn essential_width(actions: &[(usize, &UiAction)], compact: bool) -> usize {
             continue;
         }
         if count > 0 {
-            width = width.saturating_add(2);
+            width = width.saturating_add(3);
         }
         width = width.saturating_add(action_width(action, compact));
         count = count.saturating_add(1);
@@ -616,7 +705,7 @@ fn overflow_marker(hidden: usize, width: usize) -> String {
     if hidden == 0 || width == 0 {
         return String::new();
     }
-    let marker = format!("… +{hidden}");
+    let marker = format!("… F1 +{hidden}");
     if display_width(&marker) <= width {
         marker
     } else if display_width("…") <= width {
@@ -637,6 +726,174 @@ fn push_span(spans: &mut Vec<ActionBarSpan>, used: &mut usize, text: &str, role:
     });
 }
 
+/// A small, surface-owned menu for the same actions shown in an action strip.
+/// It does not replace the owning dialog or lose its selection/input state.
+#[derive(Debug, Default)]
+pub(crate) struct ActionMenu {
+    selected: Option<usize>,
+}
+
+impl ActionMenu {
+    pub fn is_open(&self) -> bool {
+        self.selected.is_some()
+    }
+
+    pub fn open(&mut self) {
+        self.selected = Some(0);
+    }
+
+    pub fn close(&mut self) {
+        self.selected = None;
+    }
+
+    pub fn handle_event(&mut self, event: &Event, actions: &[UiAction]) -> Option<String> {
+        let Event::Key(key) = event else {
+            return None;
+        };
+        let action = match key.code {
+            KeyCode::Up | KeyCode::Char('k') => "up",
+            KeyCode::Down | KeyCode::Char('j') => "down",
+            KeyCode::Enter => "activate",
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(1) => "escape",
+            _ => "noop",
+        };
+        self.handle(action, actions)
+    }
+
+    /// Returns the selected action ID. Navigation and cancellation are consumed.
+    pub fn handle(&mut self, action: &str, actions: &[UiAction]) -> Option<String> {
+        let selected = self.selected.as_mut()?;
+        let available = actions
+            .iter()
+            .filter(|action| action.enabled)
+            .collect::<Vec<_>>();
+        match action {
+            "up" | "k" => *selected = selected.saturating_sub(1),
+            "down" | "j" => {
+                *selected = selected
+                    .saturating_add(1)
+                    .min(available.len().saturating_sub(1))
+            }
+            "escape" | "q" | "?" | "F1" => self.selected = None,
+            "activate" => {
+                let id = available.get(*selected).map(|action| action.id.clone());
+                self.selected = None;
+                return id;
+            }
+            _ => {}
+        }
+        None
+    }
+
+    pub fn render(&self, buffer: &mut RenderBuffer, theme: &Theme, actions: &[UiAction]) {
+        let Some(selected) = self.selected else {
+            return;
+        };
+        let actions = actions
+            .iter()
+            .filter(|action| action.enabled)
+            .collect::<Vec<_>>();
+        if buffer.width < 8 || buffer.height < 5 {
+            return;
+        }
+        let key_width = actions
+            .iter()
+            .map(|action| display_width(&action.key))
+            .max()
+            .unwrap_or(0);
+        let width = actions
+            .iter()
+            .map(|action| key_width + display_width(&action.label) + 6)
+            .max()
+            .unwrap_or(20)
+            .clamp(32, 76)
+            .min(buffer.width.saturating_sub(4));
+        let height = (actions.len() + 3).min(buffer.height.saturating_sub(2));
+        let x = (buffer.width - width) / 2;
+        let y = (buffer.height - height) / 2;
+        let palette = SurfacePalette::new(theme, &theme.ui_style.popup);
+        for row in y..y + height {
+            buffer.set_text(x, row, &" ".repeat(width), &palette.surface);
+            buffer.set_text(x, row, "│", &palette.divider);
+            buffer.set_text(x + width - 1, row, "│", &palette.divider);
+        }
+        buffer.set_text(
+            x,
+            y,
+            &format!("┌{}┐", "─".repeat(width - 2)),
+            &palette.divider,
+        );
+        buffer.set_text(
+            x,
+            y + height - 1,
+            &format!("└{}┘", "─".repeat(width - 2)),
+            &palette.divider,
+        );
+        let title = format!(
+            " Actions {}/{} ",
+            selected.saturating_add(1).min(actions.len()),
+            actions.len()
+        );
+        if display_width(&title) <= width.saturating_sub(4) {
+            buffer.set_text(x + 2, y, &title, &palette.accent);
+        }
+        let content_width = width.saturating_sub(4);
+        let key_width = key_width.min(content_width);
+        let visible = height.saturating_sub(3);
+        let first = selected.saturating_sub(visible.saturating_sub(1));
+        for (offset, action) in actions.iter().skip(first).take(visible).enumerate() {
+            let row = y + 1 + offset;
+            let style = if first + offset == selected {
+                theme.selected_style(
+                    &palette.surface,
+                    &theme.list_selection_style(),
+                    SelectionForegroundPriority::Selection,
+                )
+            } else {
+                palette.surface.clone()
+            };
+            buffer.set_text(x + 1, row, &" ".repeat(width - 2), &style);
+            let key = if display_width(&action.key) <= key_width {
+                action.key.as_str()
+            } else {
+                action
+                    .compact_key
+                    .as_deref()
+                    .filter(|key| display_width(key) <= key_width)
+                    .unwrap_or("")
+            };
+            let key_style = Style {
+                bold: true,
+                ..style.clone()
+            };
+            buffer.set_text(x + 2, row, key, &key_style);
+            let label_width = content_width.saturating_sub(key_width + 2);
+            if label_width > 0 {
+                buffer.set_text(
+                    x + 2 + key_width + 2,
+                    row,
+                    &truncate_display_width(&action.label, label_width),
+                    &style,
+                );
+            }
+        }
+        let navigation = [
+            UiAction::new("select", "Enter", "select")
+                .with_compact_key("↵")
+                .with_priority(ActionPriority::Essential),
+            UiAction::new("return", "Esc", "back").with_priority(ActionPriority::Essential),
+        ];
+        ActionBar::new(&navigation).render(
+            buffer,
+            x + 1,
+            y + height - 2,
+            width - 2,
+            theme,
+            &palette.surface,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,13 +911,67 @@ mod tests {
     }
 
     #[test]
+    fn overflow_preserves_reserved_validation_status() {
+        let actions = vec![
+            UiAction::new("send", "Ctrl+Enter", "send")
+                .with_compact_key("^↵")
+                .with_priority(ActionPriority::Secondary),
+            UiAction::new("cancel", "Esc", "normal").with_priority(ActionPriority::Essential),
+        ];
+        let layout = ActionBar::new(&actions)
+            .with_status(Some("Prompt exceeds 128 KiB"))
+            .layout(40);
+        assert!(layout.text().contains("Esc normal"));
+        assert!(
+            layout.text().contains("Prompt exceeds 128 KiB"),
+            "{}",
+            layout.text()
+        );
+        assert!(display_width(&layout.text()) <= 40);
+    }
+
+    #[test]
+    fn grouped_hint_dispatches_its_canonical_key() {
+        let action = UiAction::new("move", "hjkl/arrows", "move").with_trigger("h");
+        assert_eq!(
+            action.event(),
+            Some(Event::Key(KeyEvent::new(
+                KeyCode::Char('h'),
+                KeyModifiers::NONE
+            )))
+        );
+        assert_eq!(
+            UiAction::new("scroll", "^J/^K", "scroll").event(),
+            Some(Event::Key(KeyEvent::new(
+                KeyCode::Char('j'),
+                KeyModifiers::CONTROL
+            )))
+        );
+    }
+
+    #[test]
+    fn menu_returns_only_enabled_actions_and_can_cancel() {
+        let actions = vec![
+            UiAction::new("disabled", "x", "disabled").with_enabled(false),
+            UiAction::new("send", "Enter", "send"),
+        ];
+        let mut menu = ActionMenu::default();
+        menu.open();
+        assert_eq!(menu.handle("activate", &actions).as_deref(), Some("send"));
+        assert!(!menu.is_open());
+        menu.open();
+        assert_eq!(menu.handle("escape", &actions), None);
+        assert!(!menu.is_open());
+    }
+
+    #[test]
     fn wide_layout_shows_all_complete_actions_without_overflow() {
         let actions = actions();
         let layout = ActionBar::new(&actions)
             .with_mode(ActionMode::Insert)
             .layout(100);
 
-        assert!(layout.text().starts_with("INSERT  Ctrl+Enter Send"));
+        assert!(layout.text().starts_with("INSERT · Ctrl+Enter Send"));
         assert!(layout.text().contains("Esc Close"));
         assert!(layout.text().contains("Enter New line"));
         assert!(layout.text().contains("Ctrl+P/N History"));

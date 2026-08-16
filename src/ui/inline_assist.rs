@@ -13,8 +13,8 @@ use super::{
     dialog::{BorderStyle, Dialog, SurfaceRole},
     first_prompt_line,
     geometry::{anchored_popup_geometry, anchored_popup_geometry_avoiding_rows},
-    spinner_frame, wrap_text, Component, OverlayLayout, PromptBuffer, ScreenRect,
-    SPINNER_FRAME_INTERVAL_MS,
+    spinner_frame, wrap_text, ActionBar, ActionPriority, Component, OverlayLayout, PromptBuffer,
+    ScreenRect, UiAction, SPINNER_FRAME_INTERVAL_MS,
 };
 
 const MAX_WIDTH: usize = 72;
@@ -40,6 +40,16 @@ pub struct InlineAssistPopup {
 }
 
 impl InlineAssistPopup {
+    fn draw_actions(&self, buffer: &mut RenderBuffer, x: usize, y: usize, width: usize) {
+        ActionBar::new(&self.surface_actions()).render(
+            buffer,
+            x,
+            y,
+            width,
+            &self.theme,
+            &self.style,
+        );
+    }
     pub fn new(editor: &Editor, scope: impl Into<String>, state: InlineAssistPopupState) -> Self {
         let local_anchor = editor.cursor_position();
         let anchor = editor.render_cursor_position().unwrap_or(local_anchor);
@@ -246,6 +256,27 @@ impl InlineAssistPopup {
 }
 
 impl Component for InlineAssistPopup {
+    fn surface_actions(&self) -> Vec<UiAction> {
+        let essential =
+            |id, key, label| UiAction::new(id, key, label).with_priority(ActionPriority::Essential);
+        match &self.state {
+            InlineAssistPopupState::Prompt { .. } => vec![
+                essential("apply", "Enter", "apply"),
+                essential("cancel", "Esc", "cancel"),
+            ],
+            InlineAssistPopupState::Working => vec![essential("cancel", "Esc", "cancel")],
+            InlineAssistPopupState::Applied { edited, .. } => vec![
+                essential("keep", "Enter", "keep"),
+                UiAction::new("undo", "u", if *edited { "undo" } else { "dismiss" }),
+                UiAction::new("refine", "r", "refine"),
+                UiAction::new("agent", "A", "agent"),
+            ],
+            InlineAssistPopupState::Failed(_) => vec![
+                essential("retry", "r", "retry/refine"),
+                essential("close", "Esc", "close"),
+            ],
+        }
+    }
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.dialog.draw(buffer)?;
         let x = self.dialog.x.saturating_add(1);
@@ -284,11 +315,11 @@ impl Component for InlineAssistPopup {
                     }
                 }
                 if show_help {
-                    buffer.set_text(
+                    self.draw_actions(
+                        buffer,
                         x,
                         y.saturating_add(self.dialog.height.saturating_sub(1)),
-                        &truncate_display_width("Enter apply · Esc cancel", width),
-                        &self.theme.ui_style.muted,
+                        width,
                     );
                 }
             }
@@ -301,12 +332,7 @@ impl Component for InlineAssistPopup {
                     buffer.set_text(x, y, &truncate_display_width(&message, width), &self.style);
                 }
                 if self.dialog.height > 1 {
-                    buffer.set_text(
-                        x,
-                        y.saturating_add(1),
-                        &truncate_display_width("Esc cancel", width),
-                        &self.theme.ui_style.muted,
-                    );
+                    self.draw_actions(buffer, x, y.saturating_add(1), width);
                 }
             }
             InlineAssistPopupState::Applied { edited, comments } => {
@@ -320,19 +346,7 @@ impl Component for InlineAssistPopup {
                     buffer.set_text(x, y, &truncate_display_width(&message, width), &self.style);
                 }
                 if self.dialog.height > 1 {
-                    buffer.set_text(
-                        x,
-                        y.saturating_add(1),
-                        &truncate_display_width(
-                            if *edited {
-                                "Enter keep · u undo · r refine · A agent"
-                            } else {
-                                "Enter keep · u dismiss · r refine · A agent"
-                            },
-                            width,
-                        ),
-                        &self.theme.ui_style.muted,
-                    );
+                    self.draw_actions(buffer, x, y.saturating_add(1), width);
                 }
             }
             InlineAssistPopupState::Failed(message) => {
@@ -354,11 +368,11 @@ impl Component for InlineAssistPopup {
                     buffer.set_text(x, y.saturating_add(1 + offset), row, &self.style);
                 }
                 if self.dialog.height > 1 {
-                    buffer.set_text(
+                    self.draw_actions(
+                        buffer,
                         x,
                         y.saturating_add(self.dialog.height.saturating_sub(1)),
-                        &truncate_display_width("r retry/refine · Esc close", width),
-                        &self.theme.ui_style.muted,
+                        width,
                     );
                 }
             }

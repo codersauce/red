@@ -72,6 +72,10 @@ pub struct WorkspaceDocumentLine {
 pub struct WorkspaceDocument {
     path: String,
     lines: [WorkspaceDocumentLine],
+    added: i32,
+    removed: i32,
+    total_lines: i32,
+    truncated: bool,
 }
 
 fn parse_patch(text: String) -> Patch {
@@ -336,7 +340,21 @@ pub fn detail_document(text: String, path: String, section: String) -> Workspace
             }
         }
     }
-    WorkspaceDocument { path: path, lines: lines }
+    let mut added = 0;
+    let mut removed = 0;
+    let mut in_hunk = false;
+    let raw_lines = text.split("\n");
+    for raw in raw_lines {
+        if raw.starts_with("diff --git ") { in_hunk = false; }
+        else if raw.starts_with("@@ ") { in_hunk = true; }
+        else if in_hunk {
+            if raw.starts_with("+") { added += 1; }
+            if raw.starts_with("-") { removed += 1; }
+        }
+    }
+    let mut total = raw_lines.len();
+    if text.ends_with("\n") || text == "" { total -= 1; }
+    WorkspaceDocument { path: path, lines: lines, added: added, removed: removed, total_lines: total, truncated: total > lines.len() }
 }
 
 fn document_meta(raw: String, path: String, section: String, index: i32) -> WorkspaceDocumentLine {

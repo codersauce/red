@@ -205,6 +205,32 @@ impl AgentComposer {
 }
 
 impl Component for AgentComposer {
+    fn surface_actions(&self) -> Vec<UiAction> {
+        let normal = self.prompt.mode() == Mode::Normal;
+        let mut actions = vec![
+            UiAction::new("send", "Enter", "send")
+                .with_compact_key("↵")
+                .with_priority(if self.validation_status.is_some() {
+                    ActionPriority::Secondary
+                } else {
+                    ActionPriority::Essential
+                }),
+            UiAction::new("cancel", "Esc", if normal { "cancel" } else { "normal" })
+                .with_priority(ActionPriority::Essential),
+        ];
+        if self.validation_status.is_none() {
+            if !normal {
+                actions.push(UiAction::new("newline", "Ctrl+J", "new line"));
+            }
+            actions.push(
+                UiAction::new("history", "Ctrl+P/N", "history")
+                    .with_compact_key("^P/N")
+                    .with_priority(ActionPriority::Secondary),
+            );
+        }
+        actions
+    }
+
     fn composer_handle(&self) -> Option<ComposerHandle> {
         match &self.target {
             ComposerTarget::Legacy { .. } => None,
@@ -245,28 +271,8 @@ impl Component for AgentComposer {
         if self.dialog.height > body_height {
             let status_y = content_y + body_height;
             let prompt_mode = self.prompt.mode();
-            let normal_mode = prompt_mode == Mode::Normal;
-            let escape_label = if normal_mode { "Cancel" } else { "Normal" };
-            let actions = [
-                UiAction::new("send", "Enter", "Send")
-                    .with_modes([ActionMode::Insert, ActionMode::Normal])
-                    .with_compact_key("↵")
-                    .with_compact_label("")
-                    .with_priority(ActionPriority::Essential),
-                UiAction::new("cancel", "Esc", escape_label)
-                    .with_compact_label("")
-                    .with_priority(ActionPriority::Essential),
-                UiAction::new("newline", "Ctrl+J", "New line").with_modes([ActionMode::Insert]),
-                UiAction::new("history", "Ctrl+P/N", "History")
-                    .with_compact_key("^P/N")
-                    .with_priority(ActionPriority::Secondary),
-            ];
-            let visible_actions = if self.validation_status.is_some() {
-                &actions[..2]
-            } else {
-                &actions[..]
-            };
-            ActionBar::new(visible_actions)
+            let actions = self.surface_actions();
+            ActionBar::new(&actions)
                 .with_mode(match prompt_mode {
                     Mode::Normal => ActionMode::Normal,
                     Mode::Visual | Mode::VisualLine | Mode::VisualBlock => ActionMode::Visual,
@@ -793,12 +799,12 @@ mod tests {
         composer.draw(&mut buffer).unwrap();
         let insert_status = rendered_row(&buffer, status_y);
         assert!(insert_status.contains("INSERT"), "{insert_status:?}");
-        assert!(insert_status.contains("Enter Send"), "{insert_status:?}");
+        assert!(insert_status.contains("Enter send"), "{insert_status:?}");
         assert!(
-            insert_status.contains("Ctrl+J New line"),
+            insert_status.contains("Ctrl+J new line"),
             "{insert_status:?}"
         );
-        assert!(insert_status.contains("Esc Normal"), "{insert_status:?}");
+        assert!(insert_status.contains("Esc normal"), "{insert_status:?}");
 
         assert_eq!(
             composer.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE)),
@@ -807,10 +813,10 @@ mod tests {
         composer.draw(&mut buffer).unwrap();
         let normal_status = rendered_row(&buffer, status_y);
         assert!(normal_status.contains("NORMAL"), "{normal_status:?}");
-        assert!(normal_status.contains("Enter Send"), "{normal_status:?}");
-        assert!(normal_status.contains("Esc Cancel"), "{normal_status:?}");
+        assert!(normal_status.contains("Enter send"), "{normal_status:?}");
+        assert!(normal_status.contains("Esc cancel"), "{normal_status:?}");
         assert!(!normal_status.contains("Ctrl+Enter"), "{normal_status:?}");
-        assert!(!normal_status.contains("New line"), "{normal_status:?}");
+        assert!(!normal_status.contains("new line"), "{normal_status:?}");
 
         assert_eq!(
             composer.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE)),
@@ -938,7 +944,7 @@ mod tests {
         let status_y = composer.dialog.y + 1 + composer.body_height();
 
         let status = rendered_row(&buffer, status_y);
-        assert!(status.contains("Send"), "{status:?}");
+        assert!(status.contains("send"), "{status:?}");
         assert!(status.contains("Esc"), "{status:?}");
     }
 
@@ -962,9 +968,9 @@ mod tests {
         let status_y = composer.dialog.y + 1 + composer.body_height();
         let status = rendered_row(&buffer, status_y);
 
-        assert!(status.contains("Send"), "{status:?}");
+        assert!(status.contains("send"), "{status:?}");
         assert!(status.contains("Esc"), "{status:?}");
-        assert!(!status.contains("New line"), "{status:?}");
+        assert!(!status.contains("new line"), "{status:?}");
         assert!(!status.contains("^↵"), "{status:?}");
     }
 
