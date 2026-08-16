@@ -10,12 +10,14 @@ Run `cargo run --bin red -- path/to/file` in this worktree.
 | Key | Action |
 | --- | --- |
 | `Space i` | Ask inline assist to edit, explain, or review the enclosing function or exact selection. |
+| Prompt Up/Down / click | Move through word-wrapped prompt rows / place the cursor. |
+| Prompt Ctrl-P / Ctrl-N | Recall older/newer submitted prompts, preserving the unsent draft. |
 | Result-popup `v` / `A` | Read the full answer / prepare a contextualized Agent draft. |
 | `Space H` / `:InlineHistory` | Open unified history with running jobs, ready results, completed discussions, and saved drafts. |
 | Working-popup `Esc` / `Ctrl-c` | Hide without cancelling / explicitly cancel the request. |
 | Activity marker click / `Space v` | Reopen the selected inline job at its source. |
 | Ready-popup `v` / Enter | Inspect an off-screen code edit / apply it if source is unchanged. Explanations appear automatically. |
-| Wider-edit popup Enter / `v` / `d` | Review the proposed same-file diff / review / decline. Enter in the full review approves it. |
+| Wider-edit popup Enter / `v` / `d` | Review the proposed same-file diff / review / decline. `a` in the full review applies it. |
 | History Enter / `g` / `p` | Reopen the item / jump to source / pin the selected turn's annotations. |
 | Result-popup `p` | Pin retained annotations without reapplying a code edit. |
 | `Space ] c` / `Space [ c` | Select the next/previous annotation, including overlapping comments. |

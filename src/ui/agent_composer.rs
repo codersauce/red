@@ -25,7 +25,6 @@ const OVERSIZED_STATUS: &str = "Prompt exceeds 128 KiB";
 #[derive(Debug)]
 pub(crate) struct WrappedText {
     pub(crate) rows: Vec<String>,
-    pub(crate) positions: Vec<(usize, usize)>,
 }
 
 /// A cursor-aware, multiline composer that submits its complete contents atomically.
@@ -392,14 +391,12 @@ impl Component for AgentComposer {
     }
 }
 
+/// Legacy display-only wrapping. Editable surfaces use `TextLayout` directly so
+/// cursor movement and hit-testing share the same source-backed projection.
 pub(crate) fn wrap_text(text: &str, width: usize) -> WrappedText {
-    let (rows, positions) = TextLayout::new(text, LayoutOptions::grapheme(width)).into_parts();
+    let (rows, _) = TextLayout::new(text, LayoutOptions::grapheme(width)).into_parts();
     WrappedText {
         rows: rows.into_iter().map(|row| row.text).collect(),
-        positions: positions
-            .into_iter()
-            .map(|position| (position.row, position.column))
-            .collect(),
     }
 }
 

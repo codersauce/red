@@ -8,6 +8,7 @@ use crate::{
     config::KeyAction,
     editor::{Action, Editor, Mode, RenderBuffer},
     keyboard::is_word_backspace,
+    text_layout::{LayoutOptions, TextLayout},
     theme::{Style, Theme},
     unicode_utils::{grapheme_len, truncate_display_width},
 };
@@ -164,8 +165,16 @@ impl InlineAssistPopup {
         viewport_width.saturating_sub(2).min(MAX_WIDTH)
     }
 
-    fn prompt_width(width: usize) -> usize {
-        width.saturating_sub(2).max(1)
+    fn prompt_inset(width: usize) -> usize {
+        if width >= 3 {
+            2
+        } else {
+            0
+        }
+    }
+
+    fn prompt_layout_options(width: usize) -> LayoutOptions {
+        LayoutOptions::word(width.saturating_sub(Self::prompt_inset(width)))
     }
 
     fn content_height(
@@ -174,13 +183,12 @@ impl InlineAssistPopup {
         width: usize,
     ) -> usize {
         match state {
-            InlineAssistPopupState::Prompt { .. } => {
-                wrap_text(&prompt.text(), Self::prompt_width(width))
-                    .rows
-                    .len()
-                    .clamp(1, MAX_PROMPT_ROWS)
-                    .saturating_add(1)
-            }
+            InlineAssistPopupState::Prompt { .. } => prompt
+                .layout(Self::prompt_layout_options(width))
+                .rows()
+                .len()
+                .clamp(1, MAX_PROMPT_ROWS)
+                .saturating_add(1),
             InlineAssistPopupState::Working => 2,
             InlineAssistPopupState::Ready { .. } => 3,
             InlineAssistPopupState::Applied { .. } => 2,
@@ -375,8 +383,38 @@ impl InlineAssistPopup {
         Self::refresh_action()
     }
 
-    fn wrapped_prompt(&self) -> super::agent_composer::WrappedText {
-        wrap_text(&self.prompt.text(), Self::prompt_width(self.dialog.width))
+    fn prompt_layout(&self) -> TextLayout {
+        self.prompt
+            .layout(Self::prompt_layout_options(self.dialog.width))
+    }
+
+    fn prompt_body_height(&self) -> usize {
+        self.dialog
+            .height
+            .saturating_sub(usize::from(self.dialog.height > 1))
+    }
+
+    fn prompt_scroll(&self, layout: &TextLayout) -> usize {
+        layout
+            .position(self.prompt.cursor())
+            .map_or(0, |position| position.row)
+            .saturating_sub(self.prompt_body_height().saturating_sub(1))
+    }
+
+    fn place_prompt_cursor(&mut self, column: usize, row: usize) -> Option<KeyAction> {
+        let left = self.dialog.x + 1;
+        let top = self.dialog.y + 1;
+        if !(left..left + self.dialog.width).contains(&column)
+            || !(top..top + self.prompt_body_height()).contains(&row)
+        {
+            return None;
+        }
+        let layout = self.prompt_layout();
+        let row = self.prompt_scroll(&layout) + row - top;
+        let column = column.saturating_sub(left + Self::prompt_inset(self.dialog.width));
+        let offset = layout.nearest_offset_on_row(row, column)?;
+        self.prompt.set_cursor(offset);
+        Self::refresh_action()
     }
 
     fn inside(&self, column: usize, row: usize) -> bool {
@@ -455,6 +493,7 @@ impl Component for InlineAssistPopup {
             InlineAssistPopupState::Prompt { .. } => vec![
                 essential("apply", "Enter", "ask"),
                 essential("close", "Esc", "close"),
+                UiAction::new("move", "↑↓", "move through prompt"),
                 UiAction::new("previous-prompt", "Ctrl-p", "previous prompt")
                     .with_enabled(!self.prompt.history().is_empty()),
                 UiAction::new("next-prompt", "Ctrl-n", "next prompt")
@@ -545,16 +584,13 @@ impl Component for InlineAssistPopup {
         match &self.state {
             InlineAssistPopupState::Prompt { .. } => {
                 let show_help = self.dialog.height > 1;
-                let body_height = self.dialog.height.saturating_sub(usize::from(show_help));
+                let body_height = self.prompt_body_height();
                 if body_height > 0 {
-                    let wrapped = self.wrapped_prompt();
-                    let cursor_row = wrapped
-                        .positions
-                        .get(self.prompt.cursor())
-                        .map_or(0, |position| position.0);
-                    let scroll = cursor_row.saturating_sub(body_height.saturating_sub(1));
-                    for (offset, row) in wrapped
-                        .rows
+                    let layout = self.prompt_layout();
+                    let scroll = self.prompt_scroll(&layout);
+                    let inset = Self::prompt_inset(width);
+                    for (offset, row) in layout
+                        .rows()
                         .iter()
                         .skip(scroll)
                         .take(body_height)
@@ -565,11 +601,13 @@ impl Component for InlineAssistPopup {
                         } else {
                             "│"
                         };
-                        buffer.set_text(x, y.saturating_add(offset), marker, &self.style);
+                        if inset > 0 {
+                            buffer.set_text(x, y.saturating_add(offset), marker, &self.style);
+                        }
                         buffer.set_text(
-                            x.saturating_add(2),
+                            x.saturating_add(inset),
                             y.saturating_add(offset),
-                            row,
+                            &row.text,
                             &self.style,
                         );
                     }
@@ -722,6 +760,11 @@ impl Component for InlineAssistPopup {
             {
                 return Some(KeyAction::Single(Action::HideInlineAssist));
             }
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                && matches!(self.state, InlineAssistPopupState::Prompt { .. })
+            {
+                return self.place_prompt_cursor(mouse.column as usize, mouse.row as usize);
+            }
             return None;
         }
         match &self.state {
@@ -740,11 +783,18 @@ impl Component for InlineAssistPopup {
                         (!prompt.is_empty())
                             .then_some(KeyAction::Single(Action::SubmitInlineAssist(prompt)))
                     }
-                    (KeyCode::Up, _) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                    (KeyCode::Up | KeyCode::Down, _) => {
+                        self.prompt.handle_event_with_layout_options(
+                            event,
+                            Self::prompt_layout_options(self.dialog.width),
+                        );
+                        Self::refresh_action()
+                    }
+                    (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                         self.prompt.history_previous();
                         self.prompt_changed()
                     }
-                    (KeyCode::Down, _) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                    (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
                         self.prompt.history_next();
                         self.prompt_changed()
                     }
@@ -887,31 +937,27 @@ impl Component for InlineAssistPopup {
         {
             return None;
         }
-        let body_height = self
-            .dialog
-            .height
-            .saturating_sub(usize::from(self.dialog.height > 1));
-        if body_height == 0 {
+        if self.prompt_body_height() == 0 || self.dialog.width == 0 {
             return None;
         }
-        let wrapped = self.wrapped_prompt();
-        let (row, column) = wrapped
-            .positions
-            .get(self.prompt.cursor())
-            .copied()
-            .unwrap_or_default();
-        let scroll = row.saturating_sub(body_height.saturating_sub(1));
+        let layout = self.prompt_layout();
+        let position = layout.position(self.prompt.cursor())?;
+        let scroll = self.prompt_scroll(&layout);
         Some((
-            self.dialog.x.saturating_add(3).saturating_add(column).min(
-                self.layout
-                    .viewport
-                    .x
-                    .saturating_add(self.layout.viewport.width.saturating_sub(1)),
-            ),
+            self.dialog
+                .x
+                .saturating_add(1 + Self::prompt_inset(self.dialog.width))
+                .saturating_add(position.column)
+                .min(
+                    self.layout
+                        .viewport
+                        .x
+                        .saturating_add(self.layout.viewport.width.saturating_sub(1)),
+                ),
             self.dialog
                 .y
                 .saturating_add(1)
-                .saturating_add(row.saturating_sub(scroll))
+                .saturating_add(position.row.saturating_sub(scroll))
                 .min(
                     self.layout
                         .viewport
@@ -1092,9 +1138,9 @@ mod tests {
         popup.prompt =
             PromptBuffer::with_history("unsent draft", vec!["newest".into(), "older".into()]);
         for (key, modifiers, expected) in [
-            (KeyCode::Up, KeyModifiers::NONE, "newest"),
+            (KeyCode::Char('p'), KeyModifiers::CONTROL, "newest"),
             (KeyCode::Char('p'), KeyModifiers::CONTROL, "older"),
-            (KeyCode::Down, KeyModifiers::NONE, "newest"),
+            (KeyCode::Char('n'), KeyModifiers::CONTROL, "newest"),
             (KeyCode::Char('n'), KeyModifiers::CONTROL, "unsent draft"),
         ] {
             assert_eq!(
@@ -1103,7 +1149,10 @@ mod tests {
             );
             assert_eq!(popup.prompt.text(), expected);
         }
-        popup.handle_event(&Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        popup.handle_event(&Event::Key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL,
+        )));
         assert_eq!(
             popup.handle_event(&Event::Key(KeyEvent::new(
                 KeyCode::Enter,
@@ -1267,6 +1316,147 @@ mod tests {
         popup.draw(&mut buffer).unwrap();
         let rendered = buffer.cells.iter().map(|cell| cell.c).collect::<String>();
         assert!(rendered.contains("TAIL"));
+    }
+
+    fn prompt_in_viewport(text: &str, width: usize) -> InlineAssistPopup {
+        let viewport = ScreenRect {
+            x: 7,
+            y: 2,
+            width,
+            height: 20,
+        };
+        InlineAssistPopup::new_in_layout(
+            &editor(),
+            "line 1",
+            InlineAssistPopupState::Prompt {
+                initial: text.into(),
+                refining: false,
+            },
+            OverlayLayout {
+                viewport,
+                anchor: (7, 3),
+                avoid_rows: None,
+            },
+        )
+    }
+
+    fn prompt_key(popup: &mut InlineAssistPopup, code: KeyCode) -> Option<KeyAction> {
+        popup.handle_event(&Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+    }
+
+    fn prompt_click(popup: &mut InlineAssistPopup, x: usize, y: usize) -> Option<KeyAction> {
+        popup.handle_event(&Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x as u16,
+            row: y as u16,
+            modifiers: KeyModifiers::NONE,
+        }))
+    }
+
+    #[test]
+    fn inline_prompt_word_wrap_render_navigation_and_click_share_source_positions() {
+        let mut popup = prompt_in_viewport("one two three", 12);
+        popup.prompt.set_cursor(0);
+        let rows = popup
+            .prompt_layout()
+            .rows()
+            .iter()
+            .map(|row| row.text.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(rows, ["one two", "three"]);
+        let x = popup.dialog.x + 3;
+        let y = popup.dialog.y + 1;
+        let mut frame = RenderBuffer::new(100, 30, &Style::default());
+        popup.draw(&mut frame).unwrap();
+        for (offset, expected) in rows.iter().enumerate() {
+            let start = (y + offset) * frame.width + x;
+            let actual = frame.cells[start..start + expected.len()]
+                .iter()
+                .map(|cell| cell.c)
+                .collect::<String>();
+            assert_eq!(&actual, expected);
+        }
+        assert_eq!(popup.cursor_position(), Some((x, y)));
+        prompt_key(&mut popup, KeyCode::Down);
+        assert_eq!(popup.prompt.cursor(), 8);
+        assert_eq!(popup.cursor_position(), Some((x, y + 1)));
+        prompt_click(&mut popup, x + 2, y + 1);
+        assert_eq!(popup.prompt.cursor(), 10);
+        popup.handle_event(&Event::Paste("X".into()));
+        assert_eq!(popup.prompt.text(), "one two thXree");
+        assert_eq!(
+            prompt_key(&mut popup, KeyCode::Enter),
+            Some(KeyAction::Single(Action::SubmitInlineAssist(
+                "one two thXree".into()
+            )))
+        );
+        assert!(popup.prompt.undo());
+        assert_eq!(popup.prompt.text(), "one two three");
+    }
+
+    #[test]
+    fn inline_prompt_vertical_motion_keeps_the_preferred_column_and_draft() {
+        let text = "abcdef\nx\nabcdef";
+        let mut popup = prompt_in_viewport(text, 12);
+        popup.prompt = PromptBuffer::with_history(text, vec!["older prompt".into()]);
+        popup.prompt.set_cursor(5);
+        for (key, offset) in [
+            (KeyCode::Down, 8),
+            (KeyCode::Down, 14),
+            (KeyCode::Up, 8),
+            (KeyCode::Up, 5),
+            (KeyCode::Up, 5),
+        ] {
+            prompt_key(&mut popup, key);
+            assert_eq!(popup.prompt.cursor(), offset);
+            assert_eq!(popup.prompt.text(), text);
+        }
+    }
+
+    #[test]
+    fn inline_prompt_reflow_and_scrolled_clicks_preserve_unicode_and_source() {
+        let text = "one   two\n\n  漢👩‍💻e\u{301}\tend  abcdefghijklmnop ".repeat(3);
+        let mut popup = prompt_in_viewport(&text, 30);
+        let revision = popup.prompt.buffer().revision();
+        for width in [3, 4, 5, 9, 12, 20, 30, 72] {
+            popup.resize(width, 20);
+            for offset in [0, grapheme_len(&text) / 2, grapheme_len(&text)] {
+                popup.prompt.set_cursor(offset);
+                let layout = popup.prompt_layout();
+                let options = InlineAssistPopup::prompt_layout_options(popup.dialog.width);
+                assert_eq!(layout, TextLayout::new(&text, options));
+                assert!(layout
+                    .rows()
+                    .iter()
+                    .all(|row| crate::unicode_utils::display_width(&row.text) <= options.width));
+                let (cursor_x, cursor_y) = popup.cursor_position().unwrap();
+                assert!(
+                    (popup.dialog.x + 1..popup.dialog.x + 1 + popup.dialog.width)
+                        .contains(&cursor_x)
+                );
+                assert!(
+                    (popup.dialog.y + 1..popup.dialog.y + 1 + popup.prompt_body_height())
+                        .contains(&cursor_y)
+                );
+                let first = popup.prompt_scroll(&layout);
+                let expected = layout.nearest_offset_on_row(first, 0).unwrap();
+                let x = popup.dialog.x + 1 + InlineAssistPopup::prompt_inset(popup.dialog.width);
+                let y = popup.dialog.y + 1;
+                prompt_click(&mut popup, x, y);
+                assert_eq!(popup.prompt.cursor(), expected);
+                assert_eq!(popup.prompt.text(), text);
+                assert_eq!(popup.prompt.buffer().revision(), revision);
+            }
+        }
+        let x = popup.dialog.x + 1;
+        let footer_y = popup.dialog.y + popup.dialog.height;
+        let cursor = popup.prompt.cursor();
+        assert_eq!(prompt_click(&mut popup, x, footer_y), None);
+        assert_eq!(popup.prompt.cursor(), cursor);
+        assert_eq!(
+            prompt_click(&mut popup, 0, 0),
+            Some(KeyAction::Single(Action::HideInlineAssist))
+        );
     }
 
     #[test]

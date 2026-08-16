@@ -29,8 +29,11 @@ In Visual and Visual-line mode its target is exactly the selection. Visual-block
 unsupported. The popup prefers the space below the target and moves above it
 when needed. It remains inside the editor split where the request started and
 avoids the rendered target when space permits. For a function that fills the
-viewport, the popup remains usable near its source anchor. Long prompts soft-wrap and grow to six rows;
-after that the prompt scrolls internally to keep the cursor visible.
+viewport, the popup remains usable near its source anchor. Long prompts use the
+Agent composer's word-aware wrapping and grow to six rows; after that the prompt
+scrolls internally to keep the cursor visible. Up/Down move through visual rows,
+and clicking prompt text places the cursor there. Wrapping and resizing never
+change the submitted text.
 
 Each invocation starts an ephemeral Codex thread with a read-only sandbox, no
 native tools, four bounded project-reading tools, and four submission tools.
@@ -164,7 +167,7 @@ never reruns the agent or reapplies a code edit. Changed source is marked outdat
 deleted or ambiguous ranges remain in history. The displayed turn is remembered
 across normal recovery, including when you choose an older answer.
 
-In an inline prompt, Up/Down or Ctrl-P/Ctrl-N recall submitted prompts from this
+In an inline prompt, Ctrl-P/Ctrl-N recall submitted prompts from this
 workspace. Moving forward past the newest entry restores the unsent draft.
 Prompt recall uses retained inline history and survives normal session recovery.
 
