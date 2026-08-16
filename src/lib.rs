@@ -40,6 +40,7 @@ pub mod language;
 pub mod logger;
 pub mod lsp;
 pub mod matchit;
+pub mod notification;
 pub mod onboarding;
 pub mod plugin;
 pub mod preferences;

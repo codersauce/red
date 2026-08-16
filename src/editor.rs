@@ -110,6 +110,10 @@ use crate::{
         WorkspaceEditOperation as LspWorkspaceEditOperation, MAX_WORKSPACE_EDIT_TOTAL_BYTES,
     },
     matchit::{self, MatchDirection, MatchMotion},
+    notification::{
+        Notice, NotificationCenter, NotificationError, NotificationId, NotificationSource,
+        NotificationTime, Severity,
+    },
     plugin::{self, ComposerHandle, PickerHandle, PluginRegistry, RequestId, Runtime},
     preferences::{PanelLayoutPreference, PreferencesStore},
     session::{
@@ -3138,7 +3142,10 @@ pub struct Editor {
     /// Whether persistent hlsearch rendering has been cleared with :noh.
     search_highlights_suppressed: bool,
 
-    /// Most recent error message
+    /// Session-local notification records, independent of the legacy display slot.
+    notifications: NotificationCenter,
+
+    /// Compatibility display slot while existing producers are migrated.
     last_error: Option<String>,
 
     /// Active dialog/popup component
@@ -3971,6 +3978,20 @@ impl Content {
 }
 
 impl Editor {
+    /// Session-local messages. Reading history does not acknowledge its entries.
+    pub fn notifications(&self) -> &NotificationCenter {
+        &self.notifications
+    }
+
+    /// Records a typed notice without changing the legacy command-line display slot.
+    /// The bottom-line renderer will consume this store after its layout migration.
+    pub fn publish_notification(
+        &mut self,
+        notice: Notice,
+    ) -> Result<NotificationId, NotificationError> {
+        self.notifications.publish(notice, NotificationTime::now())
+    }
+
     pub fn set_config_diagnostics(
         &mut self,
         diagnostics: Vec<ConfigDiagnostic>,
@@ -4394,6 +4415,7 @@ impl Editor {
             active_search: None,
             search_match_cache: None,
             search_highlights_suppressed: false,
+            notifications: NotificationCenter::default(),
             last_error: None,
             current_dialog: None,
             dialog_action_menu: crate::ui::ActionMenu::default(),
@@ -19609,6 +19631,15 @@ impl Editor {
                 self.render(buffer)?;
             }
             Action::Print(msg) => {
+                // Print has no severity or source metadata. Preserve its visible behavior
+                // while recording each message for the upcoming notification UI.
+                if !msg.is_empty() {
+                    let notice = Notice::new(NotificationSource::Editor, Severity::Info, msg)
+                        .with_details(msg);
+                    if let Err(error) = self.publish_notification(notice) {
+                        log!("could not retain legacy notification: {error}");
+                    }
+                }
                 self.last_error = Some(msg.clone());
                 self.draw_commandline(buffer);
             }
@@ -30822,6 +30853,65 @@ builtin = "rust"
             .last()
             .unwrap()
             .contains("fatal: index.lock already exists"));
+        let retained = editor.notifications().records().next().unwrap();
+        assert_eq!(retained.content.summary, "fatal: index.lock already exists");
+        assert_eq!(retained.severity, Severity::Info);
+    }
+
+    #[tokio::test]
+    async fn notification_history_survives_legacy_action_resets() {
+        let mut editor = test_editor(60, 8);
+        let mut buffer = RenderBuffer::new(60, 8, &Style::default());
+        let mut runtime = Runtime::new();
+
+        for message in ["first\nfull details", "second"] {
+            editor
+                .execute(
+                    &Action::Print(message.to_string()),
+                    &mut buffer,
+                    &mut runtime,
+                )
+                .await
+                .unwrap();
+        }
+        editor
+            .execute(&Action::Refresh, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+
+        assert!(editor.last_error.is_none());
+        let retained = editor.notifications().records().collect::<Vec<_>>();
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0].content.summary, "first full details");
+        assert_eq!(
+            retained[0].content.details.as_deref(),
+            Some("first\nfull details")
+        );
+        assert_eq!(retained[1].content.summary, "second");
+    }
+
+    #[tokio::test]
+    async fn notification_overflow_preserves_legacy_print_feedback() {
+        let mut editor = test_editor(60, 8);
+        editor.notifications = NotificationCenter::with_capacity(0);
+        let mut buffer = RenderBuffer::new(60, 8, &Style::default());
+        let mut runtime = Runtime::new();
+
+        editor
+            .execute(
+                &Action::Print("still visible".to_string()),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.last_error.as_deref(), Some("still visible"));
+        assert!(render_text_rows(&buffer)
+            .last()
+            .unwrap()
+            .contains("still visible"));
+        assert_eq!(editor.notifications().records().len(), 0);
     }
 
     #[test]
