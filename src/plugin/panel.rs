@@ -7547,7 +7547,11 @@ mod tests {
         let status_y = text_position(&buffer, "Waiting for agent…").unwrap().y;
         assert_eq!(status_y, 7);
         assert!(row_text(&buffer, status_y - 1).trim().is_empty());
-        assert!(row_text(&buffer, status_y - 2).contains("follow up"));
+        assert_eq!(
+            row_text(&buffer, status_y - 2).trim(),
+            format!("╵{}╵", "▀".repeat(36))
+        );
+        assert!(row_text(&buffer, status_y - 3).contains("│ follow up"));
 
         panel.set_status(Some(TextPanelStatus {
             busy: false,
@@ -7562,7 +7566,7 @@ mod tests {
     }
 
     #[test]
-    fn text_panel_states_share_one_surface_and_use_foreground_hierarchy() {
+    fn text_panel_states_preserve_prompt_surfaces_and_foreground_hierarchy() {
         let surface_foreground = Color::Rgb {
             r: 225,
             g: 230,
@@ -7636,6 +7640,36 @@ mod tests {
             border: None,
         };
         let palette = text_panel_palette(&theme, &config);
+        let prompt_palette = TextPanelPromptPalette::new(&theme, &palette, true);
+        let assert_surfaces = |buffer: &RenderBuffer| {
+            let label_y = text_position(buffer, "You").unwrap().y;
+            let body_y = text_position(buffer, "question").unwrap().y;
+            assert_eq!(body_y, label_y + 1);
+            assert_ne!(prompt_palette.content.surface.bg, Some(surface_background));
+            for y in 0..buffer.height {
+                for x in 0..buffer.width {
+                    let expected =
+                        if (label_y..=body_y).contains(&y) && (2..buffer.width - 2).contains(&x) {
+                            prompt_palette.content.surface.bg
+                        } else {
+                            Some(surface_background)
+                        };
+                    assert_eq!(
+                        buffer.cells[y * buffer.width + x].style.bg,
+                        expected,
+                        "unexpected background at ({x}, {y})"
+                    );
+                }
+            }
+            assert_eq!(text_style(buffer, "▄▄").fg, prompt_palette.cap.fg);
+            assert_eq!(text_style(buffer, "▀▀").fg, prompt_palette.cap.fg);
+            assert_eq!(text_style(buffer, "╷").fg, prompt_palette.edge.fg);
+            assert_eq!(text_style(buffer, "╵").fg, prompt_palette.edge.fg);
+            assert_eq!(
+                text_style(buffer, "You").fg,
+                prompt_palette.content.accent.fg
+            );
+        };
         let mut panel = TextPanel::new("agent".to_string(), config);
         panel.blocks = vec![
             TextPanelBlock {
@@ -7675,10 +7709,7 @@ mod tests {
 
         render_text_panel(&mut streaming, &panel, Point::new(0, 0), 72, 22, &theme);
 
-        assert!(streaming
-            .cells
-            .iter()
-            .all(|cell| cell.style.bg == Some(surface_background)));
+        assert_surfaces(&streaming);
         assert_eq!(
             text_style(&streaming, "Worked for 13s").fg,
             palette.muted.fg
@@ -7718,19 +7749,13 @@ mod tests {
         let mut scrollback = RenderBuffer::new(72, 22, &theme.style);
         render_text_panel(&mut scrollback, &panel, Point::new(0, 0), 72, 22, &theme);
 
-        assert!(scrollback
-            .cells
-            .iter()
-            .all(|cell| cell.style.bg == Some(surface_background)));
+        assert_surfaces(&scrollback);
         assert_eq!(
             text_style(&scrollback, "SCROLLBACK NORMAL").fg,
             palette.accent.fg
         );
-        assert_eq!(
-            text_style(&scrollback, "hjkl/arrows").fg,
-            palette.secondary.fg
-        );
-        assert_eq!(text_style(&scrollback, "move").fg, palette.muted.fg);
+        assert_eq!(text_style(&scrollback, "Tab").fg, palette.secondary.fg);
+        assert_eq!(text_style(&scrollback, "edit").fg, palette.muted.fg);
     }
 
     #[test]
@@ -7897,11 +7922,20 @@ mod tests {
             .map(|row| row_text(&buffer, row))
             .collect::<Vec<_>>();
         let joined = rendered.join("\n");
-        assert!(joined.contains("▎ You"));
+        assert_eq!(joined.matches("│ You").count(), 2);
+        assert_eq!(joined.matches("╷▄▄").count(), 2);
+        assert_eq!(joined.matches("╵▀▀").count(), 2);
         assert!(joined.contains("✓ Read demo.txt"));
+        let palette = text_panel_palette(&theme, &manager.text_panels["agent"].config);
+        assert_eq!(text_style(&buffer, "✓ Read demo.txt").fg, palette.muted.fg);
+        let first_y = text_position(&buffer, "first").unwrap().y;
+        let activity_y = text_position(&buffer, "✓ Read demo.txt").unwrap().y;
+        let second_y = text_position(&buffer, "second").unwrap().y;
+        assert!(first_y < activity_y && activity_y < second_y);
+        assert!(!joined.contains("▎ You"));
         assert!(!joined.contains("❯ You"));
         let separator_rows = rendered.iter().filter(|row| row.contains("────")).count();
-        assert_eq!(separator_rows, 1);
+        assert_eq!(separator_rows, 0);
     }
 
     #[test]
@@ -8032,7 +8066,7 @@ mod tests {
             .map(|row| row_text(&buffer, row))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(top.contains("SCROLLBACK NORMAL · hjkl/arrows move"));
+        assert!(top.contains("SCROLLBACK NORMAL · Tab edit"));
 
         manager.handle_focused_key("bottom", 15, 80, 0).unwrap();
         let mut buffer = RenderBuffer::new(80, 15, &theme.style);
@@ -8041,7 +8075,7 @@ mod tests {
             .map(|row| row_text(&buffer, row))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(bottom.contains("SCROLLBACK NORMAL · hjkl/arrows move"));
+        assert!(bottom.contains("SCROLLBACK NORMAL · Tab edit"));
     }
 
     #[test]
@@ -8110,9 +8144,10 @@ mod tests {
 
         manager.render(&mut buffer, &theme);
 
-        assert!(row_text(&buffer, 0).contains("│ ▎ You"));
-        assert!(row_text(&buffer, 1).contains("│ ▎ hell"));
-        assert!(row_text(&buffer, 2).contains("│ ▎ o"));
+        assert!(row_text(&buffer, 0).contains("│ ▄▄▄▄▄▄"));
+        assert!(row_text(&buffer, 1).contains("│ You"));
+        assert!(row_text(&buffer, 2).contains("│ hello"));
+        assert!(row_text(&buffer, 3).contains("│ ▀▀▀▀▀▀"));
         assert!(manager.panel_at_position(7, 0, 16, 7).is_none());
         assert!(manager.panel_at_position(8, 0, 16, 7).is_some());
     }
