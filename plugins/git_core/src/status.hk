@@ -71,6 +71,30 @@ pub struct GitState {
     truncated: bool,
 }
 
+pub struct DisplayEntry {
+    entry: GitEntry,
+    filename: String,
+    parent: String,
+    label: String,
+}
+
+// Prepare the bounded file list in the native core. The compatibility plugin
+// can then attach theme styles without repeating path parsing for every paint.
+pub fn display_entries(entries: [GitEntry]) -> [DisplayEntry] {
+    let mut result = [];
+    for entry in entries {
+        let parts = entry.path.rsplit_once("/").unwrap_or(("", entry.path));
+        let mut label = "~";
+        if entry.kind == "untracked" { label = "?"; }
+        else if entry.kind == "conflicted" { label = "!"; }
+        else if entry.x == "R" || entry.y == "R" { label = "R"; }
+        else if entry.x == "A" || entry.y == "A" { label = "+"; }
+        else if entry.x == "D" || entry.y == "D" { label = "−"; }
+        result.push(DisplayEntry { entry: entry, filename: parts.1, parent: parts.0, label: label });
+    }
+    result
+}
+
 pub fn parse_status(output: String) -> GitState {
     status_view(parse_porcelain(output, 500))
 }

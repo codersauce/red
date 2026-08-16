@@ -234,22 +234,22 @@ impl WhatsNewPanel {
             ReleaseView::Changelog => "Highlights",
         };
         let mut actions = vec![
-            UiAction::new("close", "Esc", "Close").with_priority(ActionPriority::Essential),
+            UiAction::new("close", "Esc", "close").with_priority(ActionPriority::Essential),
             UiAction::new("view", "Tab", destination).with_priority(ActionPriority::Essential),
             UiAction::new("github", "o", "GitHub"),
         ];
         if self.max_scroll() > 0 {
             actions.push(
-                UiAction::new("scroll", "j/k", "Scroll").with_priority(ActionPriority::Secondary),
+                UiAction::new("scroll", "j/k", "scroll").with_priority(ActionPriority::Secondary),
             );
         }
         if !self.links.is_empty() {
             if self.links.len() > 1 {
                 actions.push(
-                    UiAction::new("links", "[ ]", "Links").with_priority(ActionPriority::Secondary),
+                    UiAction::new("links", "[/]", "links").with_priority(ActionPriority::Secondary),
                 );
             }
-            actions.push(UiAction::new("link", "Enter", "Open link"));
+            actions.push(UiAction::new("link", "Enter", "open link"));
         }
         self.dialog.set_actions(actions);
         self.dialog
@@ -481,6 +481,9 @@ impl WhatsNewPanel {
 }
 
 impl Component for WhatsNewPanel {
+    fn surface_actions(&self) -> Vec<UiAction> {
+        self.dialog.actions()
+    }
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.dialog.draw(buffer)?;
         self.draw_hero(buffer);
@@ -845,7 +848,7 @@ mod tests {
         let mut buffer = RenderBuffer::new(120, 35, &Style::default());
         panel.draw(&mut buffer).unwrap();
 
-        assert!(rendered_text(&buffer).contains("[ ] Links"));
+        assert!(rendered_text(&buffer).contains("[/] links"));
         assert_eq!(panel.selected_link, Some(0));
 
         panel.handle_event(&Event::Key(crossterm::event::KeyEvent::new(

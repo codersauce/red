@@ -111,7 +111,9 @@ def run(args):
         config_dir = config_home / "red"
         config_dir.mkdir(parents=True)
         log = temp / "red.log"
-        (config_dir / "config.toml").write_text(f'log_file = "{log}"\n', encoding="utf-8")
+        (config_dir / "config.toml").write_text(
+            f'log_file = "{log}"\nshow_whats_new = false\n', encoding="utf-8"
+        )
 
         master, slave = pty.openpty()
         fcntl.ioctl(
@@ -163,6 +165,16 @@ def run(args):
                 raise RuntimeError("editor did not reach first paint")
 
             os.write(master, b":GitDashboard\r")
+            deadline = time.monotonic() + 12
+            while time.monotonic() < deadline:
+                contents = log.read_text(encoding="utf-8", errors="replace")
+                if "[PERF] drain UpdateWorkspace:" in contents:
+                    break
+                if process.poll() is not None:
+                    raise RuntimeError("editor exited before opening Git workspace")
+                time.sleep(0.02)
+            else:
+                raise RuntimeError("Git workspace did not receive its initial model")
             time.sleep(1.2)
             with log.open("a", encoding="utf-8") as stream:
                 stream.write("[GIT BENCH] rows begin\n")
@@ -176,6 +188,8 @@ def run(args):
                 log, "[GIT BENCH] rows begin", "[GIT BENCH] rows end"
             )
             row_processes = process_count(row_samples)
+            if not row_samples.get("notify workspace:event:git-dashboard"):
+                raise RuntimeError("file-list input never reached the Git workspace")
 
             os.write(master, b"\t")
             time.sleep(0.1)

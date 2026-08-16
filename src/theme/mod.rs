@@ -6,7 +6,9 @@
 //! comments through the VS Code adapter but produces the same internal model as bundled
 //! native themes.
 
+mod surface;
 mod vscode;
+pub(crate) use surface::{DiffPalette, SurfacePalette};
 
 use std::collections::BTreeMap;
 

@@ -165,6 +165,10 @@ impl Dialog {
         self.actions = actions;
     }
 
+    pub(crate) fn actions(&self) -> Vec<UiAction> {
+        self.actions.clone()
+    }
+
     /// Keeps responsive footer actions a consistent distance from both borders.
     pub(crate) fn set_action_inset(&mut self, inset: usize) {
         self.action_inset = inset;

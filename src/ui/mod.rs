@@ -30,6 +30,7 @@ mod spinner;
 mod statusline_layout;
 mod whats_new;
 
+pub(crate) use action_bar::ActionMenu;
 pub use action_bar::{
     ActionBar, ActionBarLayout, ActionBarRole, ActionBarSpan, ActionMode, ActionPriority, UiAction,
 };
@@ -76,6 +77,20 @@ use crate::{
 
 pub trait Component: Send {
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()>;
+
+    /// Actions for the surface-local F1 menu. The default keeps passive popups unchanged.
+    fn surface_actions(&self) -> Vec<UiAction> {
+        Vec::new()
+    }
+
+    fn activate_surface_action(&mut self, id: &str) -> Option<KeyAction> {
+        let event = self
+            .surface_actions()
+            .iter()
+            .find(|action| action.id == id && action.enabled)?
+            .event()?;
+        self.handle_event(&event)
+    }
 
     fn tick(&mut self) -> anyhow::Result<bool> {
         Ok(false)

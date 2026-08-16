@@ -14,12 +14,25 @@ use crate::{
 
 use super::{
     dialog::{BorderStyle, Dialog, SurfaceRole},
-    Component, IconCatalog,
+    ActionPriority, Component, IconCatalog, UiAction,
 };
 
 const WIDE_LAYOUT_MIN_WIDTH: usize = 72;
 const DESIRED_WIDTH: usize = 96;
 const BODY_ROWS: usize = 7;
+
+fn statusline_actions() -> Vec<UiAction> {
+    vec![
+        UiAction::new("focus", "h/l", "focus"),
+        UiAction::new("select", "j/k", "select"),
+        UiAction::new("left", "H", "move left"),
+        UiAction::new("right", "L", "move right"),
+        UiAction::new("reorder", "K/J", "reorder"),
+        UiAction::new("remove", "x", "remove"),
+        UiAction::new("save", "s", "save").with_priority(ActionPriority::Essential),
+        UiAction::new("cancel", "Esc", "cancel").with_priority(ActionPriority::Essential),
+    ]
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Bucket {
@@ -76,10 +89,7 @@ impl StatuslineLayoutPanel {
             &editor.theme,
         )
         .with_surface_theme(&editor.theme, SurfaceRole::Dialog);
-        dialog.set_footer(Some(
-            "h/l focus · j/k select · H left · L right · K/J reorder · x remove · s save · esc cancel"
-                .to_string(),
-        ));
+        dialog.set_actions(statusline_actions());
 
         let original = editor.statusline_config().clone();
         let has_available = StatuslineSection::ALL
@@ -380,6 +390,9 @@ impl StatuslineLayoutPanel {
 }
 
 impl Component for StatuslineLayoutPanel {
+    fn surface_actions(&self) -> Vec<UiAction> {
+        self.dialog.actions()
+    }
     fn set_theme(&mut self, theme: &Theme) {
         self.theme = theme.clone();
         self.dialog.apply_surface_theme(theme, SurfaceRole::Dialog);

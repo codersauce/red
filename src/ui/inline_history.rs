@@ -2,7 +2,7 @@
 
 use super::{
     dialog::{BorderStyle, Dialog, SurfaceRole},
-    wrap_text, Component,
+    wrap_text, ActionBar, ActionPriority, Component, UiAction,
 };
 use crate::{
     config::KeyAction,
@@ -60,6 +60,35 @@ impl InlineHistoryPanel {
 }
 
 impl Component for InlineHistoryPanel {
+    fn surface_actions(&self) -> Vec<UiAction> {
+        let essential =
+            |id, key, label| UiAction::new(id, key, label).with_priority(ActionPriority::Essential);
+        if self.confirm_forget {
+            return vec![
+                essential("confirm", "y", "forget conversation"),
+                essential("cancel", "Esc", "cancel"),
+            ];
+        }
+        if self.searching {
+            return vec![
+                essential("done", "Enter", "done"),
+                essential("clear", "Esc", "clear"),
+            ];
+        }
+        vec![
+            UiAction::new("browse", "j/k", "browse"),
+            UiAction::new("turns", "l/h", "turns"),
+            UiAction::new("search", "/", "search"),
+            UiAction::new("workspace", "w", "workspace"),
+            UiAction::new("view", "v", "view"),
+            UiAction::new("continue", "r", "continue"),
+            UiAction::new("recheck", "R", "recheck").with_priority(ActionPriority::Secondary),
+            UiAction::new("resolve", "d", "resolve").with_priority(ActionPriority::Secondary),
+            UiAction::new("forget", "D", "forget…").with_priority(ActionPriority::Secondary),
+            essential("jump", "Enter", "jump"),
+            essential("return", "Esc", "return"),
+        ]
+    }
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         let width = self.width.saturating_sub(2);
         let height = (self.height / 2)
@@ -155,20 +184,23 @@ impl Component for InlineHistoryPanel {
                 &self.theme.ui_style.dialog,
             );
         }
-        let help = if self.confirm_forget {
-            "Forget this entire conversation? y confirm · Esc cancel"
-        } else if self.searching {
-            "Type to search · Enter done · Esc clear"
-        } else {
-            "j/k browse · l/h turns · / search · w workspace · v view · r continue · R recheck · d resolve · D forget · Enter jump · Esc return"
-        };
         if height > 0 {
-            buffer.set_text(
-                1,
-                y + height,
-                &truncate_display_width(help, width),
-                &self.theme.ui_style.muted,
-            );
+            ActionBar::new(&self.surface_actions())
+                .with_context(if self.confirm_forget {
+                    "CONFIRM"
+                } else if self.searching {
+                    "SEARCH"
+                } else {
+                    "HISTORY"
+                })
+                .render(
+                    buffer,
+                    1,
+                    y + height,
+                    width,
+                    &self.theme,
+                    &self.theme.ui_style.dialog,
+                );
         }
         Ok(())
     }

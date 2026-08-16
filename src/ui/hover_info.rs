@@ -158,15 +158,15 @@ impl HoverInfo {
         };
         self.dialog.set_title(Some(title));
         let mut actions =
-            vec![UiAction::new("close", "Esc", "Close").with_priority(ActionPriority::Essential)];
+            vec![UiAction::new("close", "Esc", "close").with_priority(ActionPriority::Essential)];
         if !self.actions.is_empty() {
             actions.push(
-                UiAction::new("open", "Enter", "Open").with_priority(ActionPriority::Essential),
+                UiAction::new("open", "Enter", "open").with_priority(ActionPriority::Essential),
             );
-            actions.push(UiAction::new("actions", "Tab", "Actions"));
+            actions.push(UiAction::new("actions", "Tab", "actions"));
         }
         if self.max_scroll() > 0 {
-            actions.push(UiAction::new("scroll", "↑↓", "Scroll"));
+            actions.push(UiAction::new("scroll", "↑↓", "scroll"));
         }
         self.dialog.set_actions(actions);
     }
@@ -246,6 +246,9 @@ impl HoverInfo {
 }
 
 impl Component for HoverInfo {
+    fn surface_actions(&self) -> Vec<UiAction> {
+        self.dialog.actions()
+    }
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.dialog.draw(buffer)?;
 
@@ -710,7 +713,7 @@ mod tests {
 
         assert!(first.contains("The first documentation line"), "{first:?}");
         assert!(last.contains("The final documentation line"), "{last:?}");
-        assert!(footer.contains("Esc Close"), "{footer:?}");
+        assert!(footer.contains("Esc close"), "{footer:?}");
         assert_eq!(buffer.cells[(footer_y + 1) * buffer.width + info.x].c, '└');
         assert_eq!(
             buffer.cells[(footer_y + 1) * buffer.width + info.x + info.width + 1].c,
