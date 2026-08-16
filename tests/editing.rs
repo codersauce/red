@@ -5297,6 +5297,114 @@ async fn test_preview_theme_reports_missing_theme_without_changing_buffer() {
 }
 
 #[tokio::test]
+async fn test_dirty_clears_after_manual_same_length_replacement() {
+    let mut harness = EditorHarness::with_content("abc");
+    for (character, dirty) in [('z', true), ('a', false)] {
+        harness
+            .execute_action(Action::ReplaceCharsAtCursor {
+                character,
+                count: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(harness.is_dirty(), dirty);
+    }
+    harness.assert_buffer_contents("abc");
+    assert!(harness.editor.test_current_buffer().undo_history.is_dirty());
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("zbc");
+    assert!(harness.is_dirty());
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("abc");
+    assert!(!harness.is_dirty());
+}
+
+#[tokio::test]
+async fn test_dirty_clears_before_leaving_insert_mode() {
+    let mut harness =
+        EditorHarness::with_config(Buffer::new(None, "abc".to_string()), default_key_config());
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness.type_text("z").await.unwrap();
+    assert!(harness.is_dirty());
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("abc");
+    assert!(harness.is_insert());
+    assert!(!harness.is_dirty());
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    assert!(!harness.is_dirty());
+}
+
+#[tokio::test]
+async fn test_dirty_session_baseline_survives_external_disk_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("saved.txt");
+    fs::write(&path, "abc").unwrap();
+    let buffer = Buffer::new(Some(path.to_string_lossy().into_owned()), "abc".into());
+    let mut source = EditorHarness::with_buffer(buffer);
+    source
+        .execute_action(Action::ReplaceCharsAtCursor {
+            character: 'z',
+            count: 1,
+        })
+        .await
+        .unwrap();
+    fs::write(&path, "external").unwrap();
+    let snapshot = source.editor.test_session_snapshot();
+    assert_eq!(snapshot.buffers[0].saved_contents.as_deref(), Some("abc"));
+    assert_eq!(
+        snapshot.buffers[0].disk_contents.as_deref(),
+        Some("external")
+    );
+    let encoded = serde_json::to_vec(&snapshot).unwrap();
+    let snapshot = serde_json::from_slice(&encoded).unwrap();
+    let mut buffers = Editor::buffers_from_session_snapshot(&snapshot);
+    let mut restored = EditorHarness::with_buffer(buffers.remove(0));
+    assert!(restored.is_dirty());
+    restored
+        .execute_action(Action::ReplaceCharsAtCursor {
+            character: 'a',
+            count: 1,
+        })
+        .await
+        .unwrap();
+    assert!(!restored.is_dirty());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "external");
+}
+
+#[tokio::test]
+async fn test_dirty_background_session_writer_keeps_the_saved_baseline() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = red::session::SessionStore::for_owner(directory.path(), "dirty-baseline").unwrap();
+    let mut harness = EditorHarness::with_content("abc");
+    harness.editor.set_session_store(store.clone());
+    harness
+        .execute_action(Action::ReplaceCharsAtCursor {
+            character: 'z',
+            count: 1,
+        })
+        .await
+        .unwrap();
+    harness
+        .editor
+        .test_persist_session_snapshot(/*force*/ true, /*due*/ true);
+    let snapshot = store.load().unwrap();
+    assert_eq!(snapshot.buffers[0].contents, "zbc");
+    assert_eq!(snapshot.buffers[0].saved_contents.as_deref(), Some("abc"));
+}
+
+#[tokio::test]
 async fn test_dirty_clears_when_undo_returns_to_clean_revision() {
     let mut harness = EditorHarness::with_content("abc");
     assert!(!harness.is_dirty());
