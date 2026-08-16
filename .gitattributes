@@ -1,2 +1,6 @@
 *.hk linguist-language=Rust
 *.husk linguist-language=Rust
+
+# Preserve the upstream crate's CRLF and Markdown whitespace.
+vendor/crossterm/** linguist-vendored whitespace=cr-at-eol,-blank-at-eof
+vendor/crossterm/**/*.md whitespace=cr-at-eol,-blank-at-eol,-blank-at-eof

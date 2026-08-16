@@ -57,7 +57,8 @@ pub use picker::{
     PickerPreview, PickerUpdate,
 };
 pub(crate) use prompt_buffer::{
-    first_prompt_line, normalize_prompt_newlines, PromptBuffer, PromptInput, PROMPT_MAX_BYTES,
+    first_prompt_line, normalize_prompt_newlines, PromptBuffer, PromptInput, PromptKeyPolicy,
+    PROMPT_MAX_BYTES,
 };
 pub(crate) use rich_text::paint_rich_text;
 pub(crate) use selection::{FollowTailViewport, SelectionViewport};

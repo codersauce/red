@@ -125,6 +125,7 @@ async fn running_codex_process_survives_disconnect_and_reattach() {
             .input(InputEvent::Key {
                 code: KeyCode::Character('i'),
                 modifiers: Vec::new(),
+                key_kind: red::headless::KeyKind::Press,
             })
             .await
             .unwrap();

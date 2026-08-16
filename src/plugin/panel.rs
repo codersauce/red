@@ -29,7 +29,7 @@ use crate::{
     },
     ui::{
         normalize_prompt_newlines, wrap_text, FollowTailViewport, PromptBuffer, PromptInput,
-        PROMPT_MAX_BYTES,
+        PromptKeyPolicy, PROMPT_MAX_BYTES,
     },
     unicode_utils::{display_width, fit_display_width, truncate_display_width},
 };
@@ -571,7 +571,7 @@ impl TextPanelComposer {
     fn new(config: TextPanelComposerConfig) -> Self {
         Self {
             config,
-            prompt: PromptBuffer::new(""),
+            prompt: PromptBuffer::new("").with_key_policy(PromptKeyPolicy::EnterSends),
             focused: false,
             enabled: true,
             status: None,
@@ -2829,7 +2829,7 @@ impl PanelManager {
                     && matches!(key.code, KeyCode::Char('j' | 'k') | KeyCode::Up | KeyCode::Down))
                     || matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
                     || (key.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(key.code, KeyCode::Char('h' | 'j' | 'k' | 'g' | 'G' | 'w')))
+                        && matches!(key.code, KeyCode::Char('h' | 'k' | 'g' | 'G' | 'w')))
         );
         if delegates_to_panel_navigation {
             // Let the panel-navigation layer scroll the conversation without
@@ -3734,15 +3734,19 @@ const COMPOSER_SEARCH_HINTS: &[TextPanelShortcutHint] = &[
 ];
 const COMPOSER_INSERT_HINTS: &[TextPanelShortcutHint] = &[
     TextPanelShortcutHint {
-        keys: "Ctrl+Enter",
+        keys: "Enter",
         action: "send",
+    },
+    TextPanelShortcutHint {
+        keys: "^J",
+        action: "newline",
     },
     TextPanelShortcutHint {
         keys: "Esc",
         action: "normal",
     },
     TextPanelShortcutHint {
-        keys: "^J/^K",
+        keys: "^K",
         action: "scroll",
     },
     TextPanelShortcutHint {
@@ -5361,7 +5365,7 @@ mod tests {
         assert!(manager.focus_text_panel_composer("agent"));
         manager.handle_focused_text_input(&Event::Paste("one 👨‍👩‍👧\r\ntwo".to_string()), 80);
         manager.handle_focused_text_input(
-            &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
             80,
         );
         manager.handle_focused_text_input(
@@ -5391,6 +5395,53 @@ mod tests {
         let restored = manager.text_panels["agent"].composer.as_ref().unwrap();
         assert_eq!(restored.prompt.text(), "draft");
         assert!(manager.focused_text_panel_cursor_position(80, 20).is_some());
+    }
+
+    #[test]
+    fn focused_composer_newline_shortcuts_take_priority_over_panel_navigation() {
+        use crossterm::event::KeyEvent;
+
+        for (code, modifiers) in [
+            (KeyCode::Enter, KeyModifiers::ALT),
+            (KeyCode::Enter, KeyModifiers::SHIFT),
+            (KeyCode::Char('j'), KeyModifiers::CONTROL),
+            (KeyCode::Char('\n'), KeyModifiers::NONE),
+        ] {
+            let mut manager = PanelManager::default();
+            manager.create_text_panel(
+                "agent".into(),
+                PanelConfig {
+                    composer: Some(TextPanelComposerConfig {
+                        placeholder: "Ask".into(),
+                        rows: 3,
+                    }),
+                    ..PanelConfig::default()
+                },
+            );
+            assert!(manager.focus_text_panel_composer("agent"));
+            manager.handle_focused_text_input(&Event::Paste("first".into()), 80);
+            let event = manager
+                .handle_focused_text_input(&Event::Key(KeyEvent::new(code, modifiers)), 80)
+                .unwrap();
+            assert_eq!(event.action, "composer_input");
+            assert_eq!(
+                manager.text_panels["agent"]
+                    .composer
+                    .as_ref()
+                    .unwrap()
+                    .prompt
+                    .text(),
+                "first\n"
+            );
+            let event = manager
+                .handle_focused_text_input(
+                    &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                    80,
+                )
+                .unwrap();
+            assert_eq!(event.action, "submit");
+            assert_eq!(event.text.as_deref(), Some("first\n"));
+        }
     }
 
     #[test]
@@ -5673,7 +5724,6 @@ mod tests {
             .cursor();
         for (code, modifiers) in [
             (KeyCode::Char('h'), KeyModifiers::CONTROL),
-            (KeyCode::Char('j'), KeyModifiers::CONTROL),
             (KeyCode::Char('k'), KeyModifiers::CONTROL),
             (KeyCode::Char('g'), KeyModifiers::CONTROL),
             (KeyCode::Char('w'), KeyModifiers::CONTROL),
@@ -6329,9 +6379,9 @@ mod tests {
         assert_eq!(text_style(&streaming, "0s").fg, palette.muted.fg);
         assert_eq!(text_style(&streaming, "second line").fg, palette.primary.fg);
         assert_eq!(text_style(&streaming, "INSERT").fg, palette.accent.fg);
-        assert_eq!(text_style(&streaming, "^J/^K").fg, palette.secondary.fg);
-        assert!(text_style(&streaming, "^J/^K").bold);
-        assert_eq!(text_style(&streaming, "scroll").fg, palette.muted.fg);
+        assert_eq!(text_style(&streaming, "^J").fg, palette.secondary.fg);
+        assert!(text_style(&streaming, "^J").bold);
+        assert_eq!(text_style(&streaming, "newline").fg, palette.muted.fg);
         assert_eq!(
             streaming
                 .cells
@@ -6473,7 +6523,7 @@ mod tests {
         render_text_panel(&mut buffer, &panel, Point::new(0, 0), 26, 6, &theme);
 
         let footer = row_text(&buffer, 5).trim_end().to_string();
-        assert_eq!(footer, " INSERT · Ctrl+Enter send");
+        assert_eq!(footer, " INSERT · Enter send");
         assert!(!footer.ends_with('·'));
     }
 

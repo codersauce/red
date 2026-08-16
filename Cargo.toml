@@ -27,6 +27,11 @@ members = [
     "crates/husk-wasm",
 ]
 resolver = "2"
+exclude = ["vendor/crossterm"]
+
+[patch.crates-io]
+# Crossterm 0.27 plus the documented xterm keyboard-decoder compatibility patch.
+crossterm = { path = "vendor/crossterm" }
 
 [workspace.package]
 version = "0.1.0"

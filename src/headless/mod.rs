@@ -48,6 +48,9 @@ pub enum InputEvent {
         code: KeyCode,
         /// Active modifiers; order has no semantic meaning.
         modifiers: Vec<KeyModifier>,
+        /// Press or repeat; omitted by older clients, which sent presses only.
+        #[serde(default, skip_serializing_if = "KeyKind::is_press")]
+        key_kind: KeyKind,
     },
     /// A complete paste payload.
     Paste {
@@ -116,6 +119,21 @@ pub enum KeyModifier {
     Alt,
     /// Shift modifier.
     Shift,
+}
+
+/// Key lifecycle preserved across attachment IPC so repeats cannot resend prompts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyKind {
+    #[default]
+    Press,
+    Repeat,
+}
+
+impl KeyKind {
+    fn is_press(&self) -> bool {
+        *self == Self::Press
+    }
 }
 
 /// Client-to-owner protocol messages.
@@ -311,7 +329,9 @@ impl HeadlessOwner {
             }
         );
         let changed_row = match event {
-            InputEvent::Key { code, modifiers } => {
+            InputEvent::Key {
+                code, modifiers, ..
+            } => {
                 self.pending_paste.clear();
                 anyhow::ensure!(
                     modifiers.is_empty(),
@@ -1355,6 +1375,30 @@ where
 mod tests {
     use super::*;
 
+    #[test]
+    fn keyboard_ipc_defaults_older_clients_to_press_and_preserves_repeat() {
+        let old = serde_json::json!({"kind":"key", "code":"enter", "modifiers":["alt"]});
+        let press: InputEvent = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(
+            press,
+            InputEvent::Key {
+                code: KeyCode::Enter,
+                modifiers: vec![KeyModifier::Alt],
+                key_kind: KeyKind::Press
+            }
+        );
+        assert_eq!(serde_json::to_value(press).unwrap(), old);
+        let repeat = InputEvent::Key {
+            code: KeyCode::Enter,
+            modifiers: Vec::new(),
+            key_kind: KeyKind::Repeat,
+        };
+        assert_eq!(
+            serde_json::from_value::<InputEvent>(serde_json::to_value(&repeat).unwrap()).unwrap(),
+            repeat
+        );
+    }
+
     #[tokio::test]
     async fn rejects_oversized_frames_before_the_delimiter_arrives() {
         let bytes = vec![b'x'; MAX_FRAME_BYTES + 1];
@@ -1561,6 +1605,7 @@ mod tests {
             .input(InputEvent::Key {
                 code: KeyCode::Character('λ'),
                 modifiers: Vec::new(),
+                key_kind: KeyKind::Press,
             })
             .await
             .unwrap();
@@ -1713,6 +1758,7 @@ mod tests {
                 .input(InputEvent::Key {
                     code: KeyCode::Character('i'),
                     modifiers: Vec::new(),
+                    key_kind: KeyKind::Press,
                 })
                 .await
                 .unwrap();
@@ -1733,6 +1779,7 @@ mod tests {
                 .input(InputEvent::Key {
                     code: KeyCode::Escape,
                     modifiers: Vec::new(),
+                    key_kind: KeyKind::Press,
                 })
                 .await
                 .unwrap();
@@ -1755,6 +1802,7 @@ mod tests {
                 .input(InputEvent::Key {
                     code: KeyCode::Character('i'),
                     modifiers: Vec::new(),
+                    key_kind: KeyKind::Press,
                 })
                 .await
                 .unwrap();

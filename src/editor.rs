@@ -2897,6 +2897,9 @@ pub struct Editor {
     /// Terminal output handle
     stdout: std::io::BufWriter<TerminalOutput>,
 
+    /// Keyboard mode owned by this interactive terminal, never by the detached core.
+    keyboard_protocol: crate::keyboard::KeyboardProtocol,
+
     /// Whether render operations should write terminal escape sequences
     terminal_output_enabled: bool,
 
@@ -3495,7 +3498,11 @@ fn detached_input_to_crossterm(event: crate::headless::InputEvent) -> Event {
         crate::headless::InputEvent::Paste { text }
         | crate::headless::InputEvent::PasteChunk { text, .. } => Event::Paste(text),
         crate::headless::InputEvent::Mouse { event } => Event::Mouse(event),
-        crate::headless::InputEvent::Key { code, modifiers } => {
+        crate::headless::InputEvent::Key {
+            code,
+            modifiers,
+            key_kind,
+        } => {
             let code = match code {
                 crate::headless::KeyCode::Character(character) => KeyCode::Char(character),
                 crate::headless::KeyCode::Enter => KeyCode::Enter,
@@ -3522,7 +3529,11 @@ fn detached_input_to_crossterm(event: crate::headless::InputEvent) -> Event {
                     crate::headless::KeyModifier::Shift => KeyModifiers::SHIFT,
                 };
             }
-            Event::Key(KeyEvent::new(code, key_modifiers))
+            let kind = match key_kind {
+                crate::headless::KeyKind::Press => KeyEventKind::Press,
+                crate::headless::KeyKind::Repeat => KeyEventKind::Repeat,
+            };
+            Event::Key(KeyEvent::new_with_kind(code, key_modifiers, kind))
         }
     }
 }
@@ -4241,6 +4252,7 @@ impl Editor {
             layout_cache: std::cell::RefCell::new(HashMap::new()),
             window_manager,
             stdout,
+            keyboard_protocol: crate::keyboard::KeyboardProtocol::default(),
             terminal_output_enabled: true,
             #[cfg(test)]
             pending_terminal_cursor: None,
@@ -7886,10 +7898,10 @@ impl Editor {
             .execute(event::EnableFocusChange)?
             .execute(event::EnableBracketedPaste)?
             .execute(terminal::EnterAlternateScreen)?;
-        #[cfg(unix)]
-        self.stdout.execute(event::PushKeyboardEnhancementFlags(
-            event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
-        ))?;
+        self.keyboard_protocol = crate::keyboard::KeyboardProtocol::start(
+            &mut self.stdout,
+            crate::keyboard::KeyboardPreference::Auto,
+        )?;
         self.stdout
             .execute(terminal::Clear(terminal::ClearType::All))?;
 
@@ -15872,9 +15884,12 @@ impl Editor {
     }
 
     pub fn cleanup(&mut self) -> anyhow::Result<()> {
-        Self::restore_terminal_output(&mut self.stdout)?;
-        terminal::disable_raw_mode()?;
-
+        let keyboard_result = std::mem::take(&mut self.keyboard_protocol).stop(&mut self.stdout);
+        let output_result = Self::restore_terminal_output(&mut self.stdout);
+        let raw_mode_result = terminal::disable_raw_mode();
+        keyboard_result?;
+        output_result?;
+        raw_mode_result?;
         Ok(())
     }
 
@@ -15883,8 +15898,6 @@ impl Editor {
             .execute(terminal::EndSynchronizedUpdate)?
             .execute(terminal::EnableLineWrap)?;
         write!(output, "\x1b]112\x1b\\")?;
-        #[cfg(unix)]
-        output.execute(event::PopKeyboardEnhancementFlags)?;
         output
             .execute(terminal::LeaveAlternateScreen)?
             .execute(cursor::Show)?
@@ -19449,10 +19462,12 @@ impl Editor {
                         .execute(event::EnableMouseCapture)?
                         .execute(event::EnableFocusChange)?
                         .execute(event::EnableBracketedPaste)?
-                        .execute(terminal::EnterAlternateScreen)?
-                        .execute(event::PushKeyboardEnhancementFlags(
-                            event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
-                        ))?
+                        .execute(terminal::EnterAlternateScreen)?;
+                    self.keyboard_protocol = crate::keyboard::KeyboardProtocol::start(
+                        &mut self.stdout,
+                        crate::keyboard::KeyboardPreference::Auto,
+                    )?;
+                    self.stdout
                         .execute(terminal::Clear(terminal::ClearType::All))?;
                     self.invalidate_terminal_render_state(buffer);
                     self.render(buffer)?;
@@ -29294,6 +29309,59 @@ builtin = "rust"
     }
 
     #[tokio::test]
+    async fn detached_composer_preserves_newline_modifiers_and_does_not_resubmit_repeats() {
+        use crate::headless::{InputEvent, KeyCode as DetachedKey, KeyKind, KeyModifier};
+
+        drain_plugin_requests();
+        let mut core = DetachedEditorCore::new(test_editor(/*width*/ 80, /*height*/ 24))
+            .await
+            .unwrap();
+        ACTION_DISPATCHER.send_request(PluginRequest::OpenAgentComposer {
+            owner: "agent".to_string(),
+            title: Some("Agent prompt".to_string()),
+            id: 802,
+            query: "first".to_string(),
+            history: Vec::new(),
+        });
+        core.tick().await.unwrap();
+        for (code, modifiers, key_kind) in [
+            (DetachedKey::Enter, vec![], KeyKind::Repeat),
+            (DetachedKey::Enter, vec![KeyModifier::Alt], KeyKind::Press),
+            (DetachedKey::Enter, vec![KeyModifier::Shift], KeyKind::Press),
+            (
+                DetachedKey::Character('j'),
+                vec![KeyModifier::Control],
+                KeyKind::Press,
+            ),
+        ] {
+            core.input(InputEvent::Key {
+                code,
+                modifiers,
+                key_kind,
+            })
+            .await
+            .unwrap();
+            assert!(core.editor.current_dialog.is_some());
+        }
+        let rendered = core
+            .input(InputEvent::Paste {
+                text: "LAST".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(rendered.lines.iter().any(|line| line.text.contains("LAST")));
+        core.input(InputEvent::Key {
+            code: DetachedKey::Enter,
+            modifiers: vec![],
+            key_kind: KeyKind::Press,
+        })
+        .await
+        .unwrap();
+        assert!(core.editor.current_dialog.is_none());
+        drain_plugin_requests();
+    }
+
+    #[tokio::test]
     async fn detached_plugin_cursor_requests_render_immediately() {
         drain_plugin_requests();
         let config = Config::default();
@@ -29336,6 +29404,7 @@ builtin = "rust"
         core.input(crate::headless::InputEvent::Key {
             code: crate::headless::KeyCode::Character('l'),
             modifiers: Vec::new(),
+            key_kind: crate::headless::KeyKind::Press,
         })
         .await
         .unwrap();
@@ -29498,6 +29567,7 @@ builtin = "rust"
             core.input(crate::headless::InputEvent::Key {
                 code: crate::headless::KeyCode::Character('h'),
                 modifiers: Vec::new(),
+                key_kind: crate::headless::KeyKind::Press,
             }),
         )
         .await

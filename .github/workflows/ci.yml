@@ -83,6 +83,15 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets --all-features --verbose
 
+      - name: Test platform keyboard decoder
+        run: cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib red_
+
+      - name: Test terminal keyboard protocol
+        if: runner.os != 'Windows'
+        run: |
+          cargo build --locked --bin red
+          python3 scripts/test_keyboard_protocol.py
+
   clippy:
     name: Clippy (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
