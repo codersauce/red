@@ -65,6 +65,9 @@ impl Editor {
             turn.status().to_owned()
         };
         let mut statuses = vec![HistoryStatus::new(status, tone)];
+        if let Some(outcome) = turn.agent_outcomes.last() {
+            statuses = vec![Self::inline_agent_status(outcome)];
+        }
         if has_change {
             if let Some((index, _, InlineSourceState::Unchanged)) =
                 self.resolve_inline_change_source(turn)
@@ -128,6 +131,7 @@ impl Editor {
                         turn.context_reads.join("\n")
                     )));
                 }
+                blocks.extend(self.inline_agent_history_blocks(turn, view, &cwd));
             }
             HistoryView::Reviewed => blocks.extend([
                 HistoryBlock::Plain(format!(
@@ -153,6 +157,12 @@ impl Editor {
                     ));
                 }
             }
+            HistoryView::Changes if !turn.agent_outcomes.is_empty() => {
+                if has_change {
+                    blocks.push(diff(&turn.before, turn.reviewed(), "after inline edit"));
+                }
+                blocks.extend(self.inline_agent_history_blocks(turn, view, &cwd));
+            }
             HistoryView::Changes if has_change => {
                 blocks.push(diff(&turn.before, turn.reviewed(), "after inline edit"))
             }
@@ -167,7 +177,9 @@ impl Editor {
             statuses,
             blocks,
             view,
-            open_label: if has_change {
+            open_label: if !turn.agent_outcomes.is_empty() {
+                "review Agent changes"
+            } else if has_change {
                 "review changes"
             } else if turn.proposed_edit().is_some() {
                 "review proposal"

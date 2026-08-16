@@ -28,6 +28,10 @@ pub(super) enum InlineCommentOrigin {
     ChangeSummary {
         request_id: String,
     },
+    AgentOutcome {
+        request_id: String,
+        file: String,
+    },
     HistoryPreview {
         request_id: String,
         comment_index: usize,
@@ -73,7 +77,9 @@ impl InlineComment {
     pub(super) fn refresh_staleness(&mut self, buffer: &Buffer) {
         if matches!(
             self.origin,
-            InlineCommentOrigin::Activity { .. } | InlineCommentOrigin::ChangeSummary { .. }
+            InlineCommentOrigin::Activity { .. }
+                | InlineCommentOrigin::ChangeSummary { .. }
+                | InlineCommentOrigin::AgentOutcome { .. }
         ) {
             return;
         }
@@ -283,6 +289,7 @@ impl Editor {
                         comment.origin,
                         InlineCommentOrigin::Activity { .. }
                             | InlineCommentOrigin::ChangeSummary { .. }
+                            | InlineCommentOrigin::AgentOutcome { .. }
                             | InlineCommentOrigin::HistoryPreview { .. }
                     )
             })
@@ -678,6 +685,15 @@ impl Editor {
             let request = request_id.clone();
             return self.view_inline_changes(&request, 0, frame, runtime).await;
         }
+        if let InlineCommentOrigin::AgentOutcome { request_id, file } = &comment.origin {
+            let request = request_id.clone();
+            let file = file.clone();
+            if let Some((outcome, change)) = self.inline_agent_file_review_target(&request, &file) {
+                return self
+                    .view_inline_agent_changes(&request, outcome, change, frame, runtime)
+                    .await;
+            }
+        }
         let line = comment.lines(self.current_buffer()).0;
         self.active_inline_comment = Some(id);
         self.layout_cache.borrow_mut().clear();
@@ -734,6 +750,16 @@ impl Editor {
 
     pub(super) fn dismiss_inline_comment(&mut self) {
         if let Some(index) = self.current_inline_comment_index() {
+            if let InlineCommentOrigin::AgentOutcome { request_id, file } =
+                &self.inline_comments[index].origin
+            {
+                let request = request_id.clone();
+                let file = file.clone();
+                self.hide_inline_agent_file(&request, &file);
+                self.set_legacy_message(Some(
+                    "Agent change summary hidden · Space H to restore".into(),
+                ));
+            }
             if let InlineCommentOrigin::ChangeSummary { request_id } =
                 &self.inline_comments[index].origin
             {
@@ -786,6 +812,7 @@ impl Editor {
             InlineCommentOrigin::Sample => "sample".to_string(),
             InlineCommentOrigin::Activity { .. } => "inline activity".to_string(),
             InlineCommentOrigin::ChangeSummary { .. } => "inline changes".to_string(),
+            InlineCommentOrigin::AgentOutcome { .. } => "Agent changes".to_string(),
             InlineCommentOrigin::HistoryPreview { .. } => "history preview".to_string(),
             InlineCommentOrigin::Assist {
                 session_id,
@@ -819,6 +846,20 @@ impl Editor {
 
     pub(super) fn clear_inline_comments(&mut self) {
         let buffer_id = self.current_buffer().id();
+        let agent_files = self
+            .inline_comments
+            .iter()
+            .filter(|comment| comment.anchor.buffer_id == buffer_id)
+            .filter_map(|comment| match &comment.origin {
+                InlineCommentOrigin::AgentOutcome { request_id, file } => {
+                    Some((request_id.clone(), file.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (request, file) in agent_files {
+            self.hide_inline_agent_file(&request, &file);
+        }
         for comment in &self.inline_comments {
             if comment.anchor.buffer_id == buffer_id {
                 if let InlineCommentOrigin::ChangeSummary { request_id } = &comment.origin {

@@ -509,6 +509,7 @@ impl Editor {
                 .as_deref()
                 .and_then(|id| self.inline_history.turn(id));
             let state = match parked_state {
+                _ if turn.is_some_and(|turn| !turn.agent_outcomes.is_empty()) => continue,
                 Some(state @ InlineAssistPopupState::Prompt { .. }) => state.clone(),
                 _ => self.inline_session_state(session),
             };

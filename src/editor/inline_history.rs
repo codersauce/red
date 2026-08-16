@@ -152,7 +152,12 @@ impl Editor {
             let expanded = browser.expanded.contains(&conversation.id) || !browser.query.is_empty();
             for (index, turn) in conversation.turns.iter().enumerate().rev() {
                 if (!browser.workspace
-                    && browser.file.as_deref() != Some(turn.location.file.as_str()))
+                    && browser.file.as_deref() != Some(turn.location.file.as_str())
+                    && !turn
+                        .agent_outcomes
+                        .iter()
+                        .flat_map(|outcome| &outcome.files)
+                        .any(|file| browser.file.as_deref() == Some(file.path.as_str())))
                     || (!expanded && index + 1 != conversation.turns.len())
                 {
                     continue;
@@ -163,9 +168,15 @@ impl Editor {
                     &matcher,
                     &browser.query,
                     &format!(
-                        "{location} {} {} {snippet}",
+                        "{location} {} {} {snippet} {}",
                         turn.prompt,
-                        turn.answer_text()
+                        turn.answer_text(),
+                        turn.agent_outcomes
+                            .iter()
+                            .flat_map(|outcome| &outcome.files)
+                            .map(|file| file.path.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ")
                     ),
                 ) else {
                     continue;
@@ -186,7 +197,10 @@ impl Editor {
                 let source_state = self
                     .resolve_history_turn(turn)
                     .map_or(InlineSourceState::Detached, |(_, _, state)| state);
-                let status = if turn.state == InlineTurnState::Pending {
+                let agent_running = turn.agent_outcomes.last().is_some_and(|outcome| {
+                    outcome.state == crate::inline_history::InlineAgentState::Running
+                });
+                let status = if turn.state == InlineTurnState::Pending && !agent_running {
                     "running"
                 } else {
                     turn.status()
@@ -206,17 +220,23 @@ impl Editor {
                             + usize::from(turn.location.range.end.character > 0),
                         source_state.label()
                     ),
-                    running: turn.state == InlineTurnState::Pending,
+                    running: turn.state == InlineTurnState::Pending || agent_running,
                 });
             }
             if rows.is_empty() {
                 continue;
             }
-            let rank = match latest.state {
-                InlineTurnState::Pending => 0,
-                InlineTurnState::Ready => 1,
-                _ if self.has_parked_inline_draft(&conversation.id) => 2,
-                _ => 3,
+            let rank = if latest.agent_outcomes.last().is_some_and(|outcome| {
+                outcome.state == crate::inline_history::InlineAgentState::Running
+            }) {
+                0
+            } else {
+                match latest.state {
+                    InlineTurnState::Pending => 0,
+                    InlineTurnState::Ready => 1,
+                    _ if self.has_parked_inline_draft(&conversation.id) => 2,
+                    _ => 3,
+                }
             };
             groups.push((
                 rank,
@@ -440,12 +460,13 @@ impl Editor {
                     }
                 }
             }
-            can_restore = turn.state == InlineTurnState::Completed
-                && (turn.change_summary.is_some()
-                    || turn
-                        .result
-                        .as_ref()
-                        .is_some_and(|result| !result.comments.is_empty()));
+            can_restore = !turn.agent_outcomes.is_empty()
+                || (turn.state == InlineTurnState::Completed
+                    && (turn.change_summary.is_some()
+                        || turn
+                            .result
+                            .as_ref()
+                            .is_some_and(|result| !result.comments.is_empty())));
             detail = self.history_turn_detail(&turn, state);
         } else if let Some((location, source, prompt)) = draft {
             let resolved = self.resolve_history_source(&location, &source, true);
@@ -612,7 +633,8 @@ impl Editor {
         let latest = conversation.turns.last()?;
         let range = latest.location.range;
         Some(format!(
-            "Continue this inline-assist discussion in the project. Carry out the latest user request below, using the earlier answers as context. Read current files through Red before editing; the discussion may describe older source.\n\nLocation: {}:{}–{}\n\nLatest user request:\n{}\n{}",
+            "Continue this inline-assist discussion in the project. Carry out the latest user request below, using the earlier answers as context. Read current files through Red before editing; the discussion may describe older source.\n\n{}\n\nLocation: {}:{}–{}\n\nLatest user request:\n{}\n{}",
+            super::inline_agent_outcomes::handoff_marker(&latest.request_id),
             latest.location.file,
             range.start.line + 1,
             range.end.line + usize::from(range.end.character > 0),
@@ -680,6 +702,15 @@ impl Editor {
         if matches!(action, HistoryAction::Open) {
             if let Some(row) = selected_row {
                 if let Some(request) = row.key.request() {
+                    if let Some(index) = self
+                        .inline_history
+                        .turn(request)
+                        .and_then(|turn| turn.agent_outcomes.len().checked_sub(1))
+                    {
+                        return self
+                            .view_inline_agent_changes(request, index, 0, buffer, runtime)
+                            .await;
+                    }
                     if self
                         .inline_history
                         .turn(request)
@@ -938,12 +969,13 @@ impl Editor {
             .iter()
             .find(|conversation| conversation.id == group)?;
         let has_annotations = |turn: &&InlineHistoryTurn| {
-            turn.state == InlineTurnState::Completed
-                && (turn.change_summary.is_some()
-                    || turn
-                        .result
-                        .as_ref()
-                        .is_some_and(|result| !result.comments.is_empty()))
+            !turn.agent_outcomes.is_empty()
+                || (turn.state == InlineTurnState::Completed
+                    && (turn.change_summary.is_some()
+                        || turn
+                            .result
+                            .as_ref()
+                            .is_some_and(|result| !result.comments.is_empty())))
         };
         preferred
             .or(conversation.visible_request.as_deref())
@@ -975,7 +1007,9 @@ impl Editor {
                         .turns
                         .iter()
                         .find(|turn| {
-                            turn.request_id == request && turn.state == InlineTurnState::Completed
+                            turn.request_id == request
+                                && (turn.state == InlineTurnState::Completed
+                                    || !turn.agent_outcomes.is_empty())
                         })
                         .map(|turn| (conversation.id.clone(), turn.clone()))
                 })
@@ -983,6 +1017,33 @@ impl Editor {
             self.set_legacy_message(Some("this item has no completed annotations".into()));
             return Ok(false);
         };
+        if !turn.agent_outcomes.is_empty() {
+            if let Some(conversation) = self
+                .inline_history
+                .conversations
+                .iter_mut()
+                .find(|conversation| conversation.id == group)
+            {
+                conversation.resolved = false;
+                conversation.visible_request = Some(request.into());
+                if let Some(turn) = conversation
+                    .turns
+                    .iter_mut()
+                    .find(|turn| turn.request_id == request)
+                {
+                    for file in turn
+                        .agent_outcomes
+                        .iter_mut()
+                        .flat_map(|outcome| &mut outcome.files)
+                    {
+                        file.hidden = false;
+                    }
+                }
+            }
+            self.sync_inline_change_summaries();
+            self.mark_inline_history_dirty();
+            return Ok(true);
+        }
         if turn.change_summary.is_some() {
             if let Some(conversation) = self
                 .inline_history
@@ -1221,6 +1282,7 @@ impl Editor {
                 .as_ref()
                 .is_some_and(|session| session.allow_expansion),
             context_reads: Vec::new(),
+            agent_outcomes: Vec::new(),
             request_id: request.to_string(),
             created_at_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1567,7 +1629,8 @@ impl Editor {
                     } => (request_id, *comment_index),
                     InlineCommentOrigin::Sample
                     | InlineCommentOrigin::Activity { .. }
-                    | InlineCommentOrigin::ChangeSummary { .. } => return None,
+                    | InlineCommentOrigin::ChangeSummary { .. }
+                    | InlineCommentOrigin::AgentOutcome { .. } => return None,
                 };
                 let turn = self.inline_history.turn(request)?;
                 let resolved = self.resolve_history_comment(turn, index);

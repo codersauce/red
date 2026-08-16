@@ -184,6 +184,22 @@ in normal mode, and loads a reviewable draft. A saved hidden pane or editor zoom
 does not block it. Replacing an unsent Agent draft still requires confirmation;
 nothing is submitted automatically.
 
+When that draft is sent, its `Red inline history reference` links the Agent turn
+back to the original inline request. Keep that reference line if you edit the
+draft. `Space H` then shows the turn's actual editor writes grouped by file,
+with saved/unsaved or changed-since status and clickable locations. Enter opens
+the retained, syntax-colored review: `[` / `]` move between changed locations,
+and `f` / `F` move between files. The Changes view shows all retained diffs.
+Each affected open file gets a change marker; `Space x` or `Space X` hides it,
+and History `p` restores it without applying anything. A completion notification
+and `Space N` reopen the review even after navigating away.
+
+These receipts compare the exact text before and after Agent editor-tool writes,
+not the whole Git diff. Consecutive writes may be combined; interleaved user
+edits remain separate. Agent writes retain their existing save-to-disk behavior.
+Cancellation or failure does not roll back already-applied writes, and the
+receipt says so. Historical review never applies, saves, or bulk-undoes files.
+
 Within history, `v` cycles through the conversation, reviewed source, before-edit
 source, and a reviewed/current comparison. `Ctrl-d`/`Ctrl-u` or Page Down/Up
 scroll the detail. `r` continues the selected discussion, while `R` prepares a

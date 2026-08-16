@@ -194,6 +194,13 @@ async fn inline_handoff_reopens_a_restored_hidden_agent_pane_without_losing_its_
     }
     assert_eq!(agent_draft(&editor), handoff);
     assert_eq!(
+        editor
+            .staged_inline_agent_handoff
+            .as_ref()
+            .map(|handoff| handoff.request_id.as_str()),
+        Some("request")
+    );
+    assert_eq!(
         editor.panel_manager.focused_panel_id(),
         Some("agent-conversation")
     );
@@ -226,6 +233,7 @@ async fn inline_handoff_reveals_an_existing_hidden_pane_and_clears_editor_zoom()
     editor
         .execute(
             &Action::StageInlineAssistHandoff {
+                request_id: None,
                 prompt: "reviewable handoff".into(),
                 expected_draft: None,
             },

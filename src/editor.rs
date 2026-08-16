@@ -19,6 +19,7 @@ mod agent_manager;
 mod buffer_manager;
 mod diagnostics_picker;
 mod display_layout;
+mod inline_agent_outcomes;
 mod inline_changes;
 mod inline_comments;
 mod inline_completion;
@@ -2208,8 +2209,14 @@ pub enum Action {
     /// Hands the edited range and discussion to the full Agent workflow.
     EscalateInlineAssist,
     StageInlineAssistHandoff {
+        request_id: Option<String>,
         prompt: String,
         expected_draft: Option<plugin::panel::TextPanelDraftRevision>,
+    },
+    ViewInlineAgentChanges {
+        request_id: String,
+        outcome: usize,
+        change: usize,
     },
     EnterSearch(SearchDirection),
 
@@ -2943,6 +2950,7 @@ pub struct Editor {
     inline_jobs: BTreeMap<String, inline_jobs::ParkedInlineAssist>,
     inline_activity_animation: inline_jobs::InlineActivityAnimation,
     inline_completion: inline_notifications::InlineCompletionState,
+    staged_inline_agent_handoff: Option<inline_agent_outcomes::StagedHandoff>,
 
     /// Session-local annotations; never serialized into source or text undo history.
     inline_comments: Vec<inline_comments::InlineComment>,
@@ -4411,6 +4419,7 @@ impl Editor {
             inline_jobs: BTreeMap::new(),
             inline_activity_animation: inline_jobs::InlineActivityAnimation::default(),
             inline_completion: inline_notifications::InlineCompletionState::default(),
+            staged_inline_agent_handoff: None,
             inline_comments: Vec::new(),
             active_inline_comment: None,
             inline_history: InlineHistory::default(),
@@ -7986,6 +7995,9 @@ impl Editor {
             !contents.contains('\0'),
             "agent file contents cannot contain NUL bytes"
         );
+        let before = self.current_buffer().contents();
+        let created = !path.exists();
+        self.check_inline_agent_receipt_capacity(session_id, &before, &contents)?;
         let turn_id = self
             .agent_manager
             .turn_id(session_id)
@@ -8001,6 +8013,11 @@ impl Editor {
         );
         self.replace_range(TextRange::new(TextPosition::new(0, 0), end), &contents);
         self.commit_transaction(self.cursor_snapshot());
+        let transaction_id = self
+            .current_buffer()
+            .undo_history
+            .latest_transaction()
+            .map(|transaction| transaction.id.clone());
         let root = self
             .agent_manager
             .root()
@@ -8008,6 +8025,22 @@ impl Editor {
             .to_path_buf();
         let notification_error = self.notify_change(runtime).await.err();
         let persistence = self.save_current_agent_buffer(&root, path, runtime).await;
+        if before != contents {
+            if let Some(transaction_id) = transaction_id {
+                self.record_inline_agent_edit(
+                    session_id,
+                    path,
+                    created,
+                    crate::inline_history::InlineAgentEdit::new(
+                        before,
+                        contents,
+                        transaction_id,
+                        persistence["saved"].as_bool().unwrap_or(false),
+                    ),
+                );
+                self.sync_inline_change_summaries();
+            }
+        }
         let render_error = self.render(render_buffer).err();
         let operational_error = notification_error
             .map(|error| format!("change notification failed: {error}"))
@@ -8341,6 +8374,7 @@ impl Editor {
             return Ok(true);
         }
         let turn_id = uuid::Uuid::new_v4().to_string();
+        self.begin_inline_agent_outcome(&session_id, &turn_id, &text)?;
         self.agent_manager
             .set_turn_id(session_id.clone(), turn_id.clone());
         self.agent_manager
@@ -8581,6 +8615,7 @@ impl Editor {
     }
 
     fn abort_agent_bridge(&mut self) {
+        self.stop_inline_agent_outcomes("Agent session closed.");
         drop(self.agent_manager.take_bridge());
         if let Some(task) = self.agent_manager.take_task() {
             task.abort();
@@ -8686,6 +8721,7 @@ impl Editor {
             Some(task) => Some(task.await),
             None => None,
         };
+        self.stop_inline_agent_outcomes(fallback);
         drop(self.agent_manager.take_bridge());
         self.agent_manager.clear_active_sessions();
         self.agent_manager.clear_turns();
@@ -9023,7 +9059,29 @@ impl Editor {
                 }
                 _ => {}
             }
+            match &event {
+                CodexEvent::Completed { session_id, .. } => self.finish_inline_agent_outcome(
+                    session_id,
+                    crate::inline_history::InlineAgentState::Completed,
+                    None,
+                ),
+                CodexEvent::Cancelled { session_id } => self.finish_inline_agent_outcome(
+                    session_id,
+                    crate::inline_history::InlineAgentState::Cancelled,
+                    Some("Agent turn cancelled; any completed writes remain applied."),
+                ),
+                CodexEvent::Failed {
+                    session_id: Some(session_id),
+                    message,
+                } => self.finish_inline_agent_outcome(
+                    session_id,
+                    crate::inline_history::InlineAgentState::Failed,
+                    Some(message),
+                ),
+                _ => {}
+            }
             if let CodexEvent::Completed { session_id, .. }
+            | CodexEvent::Cancelled { session_id }
             | CodexEvent::Failed {
                 session_id: Some(session_id),
                 ..
@@ -9378,6 +9436,11 @@ impl Editor {
                     }
                 }
                 PluginRequest::AgentCloseSession { session_id } => {
+                    self.finish_inline_agent_outcome(
+                        &session_id,
+                        crate::inline_history::InlineAgentState::Cancelled,
+                        Some("Agent session closed."),
+                    );
                     self.agent_manager.mark_session_inactive(&session_id);
                     let Some(bridge) = self.agent_manager.bridge() else {
                         continue;
@@ -9397,9 +9460,19 @@ impl Editor {
                     }
                 }
                 PluginRequest::AgentArchiveSession { session_id } => {
+                    self.finish_inline_agent_outcome(
+                        &session_id,
+                        crate::inline_history::InlineAgentState::Cancelled,
+                        Some("Agent session archived."),
+                    );
                     self.agent_manager.mark_session_inactive(&session_id);
                 }
                 PluginRequest::AgentForgetSession { session_id } => {
+                    self.finish_inline_agent_outcome(
+                        &session_id,
+                        crate::inline_history::InlineAgentState::Cancelled,
+                        Some("Agent session forgotten."),
+                    );
                     self.agent_manager.mark_session_inactive(&session_id);
                     self.agent_manager.forget_conversation(&session_id);
                 }
@@ -17337,6 +17410,15 @@ impl Editor {
                 self.view_inline_changes(request_id, *hunk, buffer, runtime)
                     .await?;
             }
+            Action::ViewInlineAgentChanges {
+                request_id,
+                outcome,
+                change,
+            } => {
+                add_to_history = false;
+                self.view_inline_agent_changes(request_id, *outcome, *change, buffer, runtime)
+                    .await?;
+            }
             Action::UndoInlineChange(request) => {
                 add_to_history = false;
                 self.undo_inline_change(request, buffer, runtime).await?;
@@ -17617,6 +17699,7 @@ impl Editor {
                     ));
                     return Ok(false);
                 };
+                let request_id = assist.request_id.clone();
                 self.plugin_registry
                     .ensure_command_registered(runtime, "AgentOpen")
                     .await;
@@ -17643,11 +17726,13 @@ impl Editor {
                 // AgentOpen queues pane creation/restoration first. Stage the draft
                 // only after those requests have been processed.
                 runtime.send_request(PluginRequest::Action(Action::StageInlineAssistHandoff {
+                    request_id,
                     prompt,
                     expected_draft: None,
                 }));
             }
             Action::StageInlineAssistHandoff {
+                request_id,
                 prompt,
                 expected_draft,
             } => {
@@ -17668,6 +17753,12 @@ impl Editor {
                     *expected_draft,
                 ) {
                     Ok(plugin::panel::TextPanelReuseOutcome::Loaded) => {
+                        self.staged_inline_agent_handoff = request_id
+                            .as_ref()
+                            .filter(|request| self.inline_history.turn(request).is_some())
+                            .map(|request| inline_agent_outcomes::StagedHandoff {
+                                request_id: request.clone(),
+                            });
                         self.set_legacy_message(Some(
                             "inline discussion loaded in Agent; review and send when ready".into(),
                         ));
@@ -17678,7 +17769,7 @@ impl Editor {
                             "Replace unsent Agent draft?",
                             "The inline discussion will replace the draft as one undoable edit. Nothing will be sent.",
                             "Load discussion", "Keep draft",
-                            Action::StageInlineAssistHandoff { prompt: prompt.clone(), expected_draft: Some(revision) },
+                            Action::StageInlineAssistHandoff { request_id: request_id.clone(), prompt: prompt.clone(), expected_draft: Some(revision) },
                             Action::Print("current draft kept; inline discussion remains in history".into()),
                         )));
                     }

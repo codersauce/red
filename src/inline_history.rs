@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{buffer::BufferId, inline_assist::InlineAssistResult, undo::TextRange};
 
+mod agent_outcome;
+pub(crate) use agent_outcome::MAX_IMAGE_BYTES as MAX_AGENT_IMAGE_BYTES;
+pub use agent_outcome::{InlineAgentEdit, InlineAgentFile, InlineAgentOutcome, InlineAgentState};
+
 pub const MAX_HISTORY_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_ANSWER_BYTES: usize = 64 * 1024;
 const TURN_RESERVE_BYTES: usize = 6 * 1024 * 1024;
@@ -187,6 +191,9 @@ pub struct InlineHistoryTurn {
     /// Bounded provenance labels for successful read-only context tools.
     #[serde(default)]
     pub context_reads: Vec<String>,
+    /// Exact editor-tool receipts for explicitly linked Agent continuations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_outcomes: Vec<InlineAgentOutcome>,
     pub before: String,
     pub original_range: TextRange,
     pub location: InlineLocation,
@@ -323,6 +330,9 @@ impl InlineHistoryTurn {
     }
 
     pub fn status(&self) -> &'static str {
+        if let Some(outcome) = self.agent_outcomes.last() {
+            return outcome.state.label();
+        }
         if matches!(
             self.state,
             InlineTurnState::Completed | InlineTurnState::Ready
@@ -474,6 +484,13 @@ impl InlineHistory {
                 turn.state = InlineTurnState::Cancelled;
                 turn.error = Some("The editor stopped before this request completed.".into());
             }
+            for outcome in &mut turn.agent_outcomes {
+                if outcome.state == InlineAgentState::Running {
+                    outcome.state = InlineAgentState::Cancelled;
+                    outcome.error =
+                        Some("The editor stopped before the Agent turn completed.".into());
+                }
+            }
         }
     }
 
@@ -500,10 +517,14 @@ impl InlineHistory {
                         .turns
                         .iter()
                         .any(|turn| turn.request_id == request
-                            && turn.state == InlineTurnState::Completed)),
+                            && (turn.state == InlineTurnState::Completed
+                                || !turn.agent_outcomes.is_empty()))),
                 "invalid visible inline history request"
             );
             for turn in &conversation.turns {
+                for outcome in &turn.agent_outcomes {
+                    outcome.validate()?;
+                }
                 ensure!(
                     requests.insert(&turn.request_id),
                     "duplicate inline history request"

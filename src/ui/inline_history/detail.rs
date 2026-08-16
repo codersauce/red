@@ -76,6 +76,12 @@ pub(crate) enum HistoryBlock {
     Request(String),
     Plain(String),
     Markdown(String),
+    Status(HistoryStatus),
+    FileLink {
+        text: String,
+        path: String,
+        line: usize,
+    },
     Code {
         file: String,
         source: String,
@@ -197,6 +203,30 @@ impl HistoryDetail {
                     wrap_plain_text(&format!("You: {text}"), width, TextPanelSpanStyle::User)
                 }
                 HistoryBlock::Plain(text) => wrap_plain_text(text, width, TextPanelSpanStyle::Text),
+                HistoryBlock::Status(status) => {
+                    let mut span =
+                        RenderedTextLine::plain(status.text.clone(), TextPanelSpanStyle::Text)
+                            .spans
+                            .remove(0);
+                    span.syntax_style = Some(status.style(theme));
+                    wrap_spans(&[span], width, &[], &[])
+                }
+                HistoryBlock::FileLink { text, path, line } => {
+                    let mut span = RenderedTextLine::plain(text.clone(), TextPanelSpanStyle::Link)
+                        .spans
+                        .remove(0);
+                    span.link = Some(TextPanelLink {
+                        id: 0,
+                        target: TextPanelLinkTarget::File {
+                            path: path.clone(),
+                            location: Some(TextPanelFileLocation {
+                                line: *line,
+                                column: 1,
+                            }),
+                        },
+                    });
+                    wrap_spans(&[span], width, &[], &[])
+                }
                 HistoryBlock::Markdown(text) => render_hover_markdown_lines_with_highlighter(
                     text,
                     width,

@@ -111,6 +111,7 @@ impl Editor {
 
     /// A summary is editor-owned and survives the ephemeral provider session.
     pub(super) fn sync_inline_change_summaries(&mut self) {
+        self.sync_inline_agent_markers();
         if !self
             .inline_history
             .conversations

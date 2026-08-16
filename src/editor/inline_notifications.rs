@@ -124,34 +124,38 @@ impl Editor {
         else {
             return;
         };
-        let status = match turn.state {
-            InlineTurnState::Ready
-                if turn
-                    .result
-                    .as_ref()
-                    .is_some_and(|result| result.changes_text(&turn.before)) =>
-            {
-                "Inline edit ready"
+        let status = if let Some(outcome) = turn.agent_outcomes.last() {
+            outcome.state.label()
+        } else {
+            match turn.state {
+                InlineTurnState::Ready
+                    if turn
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result.changes_text(&turn.before)) =>
+                {
+                    "Inline edit ready"
+                }
+                InlineTurnState::Ready => "Inline answer retained",
+                InlineTurnState::Completed
+                    if turn
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result.needs_agent.is_some()) =>
+                {
+                    "Inline needs Agent"
+                }
+                InlineTurnState::Completed
+                    if turn.has_code_change() && turn.disposition == InlineDisposition::Undone =>
+                {
+                    "Inline edit undone"
+                }
+                InlineTurnState::Completed if turn.has_code_change() => "Inline edit applied",
+                InlineTurnState::Completed => "Inline finished",
+                InlineTurnState::Declined => "Inline edit declined",
+                InlineTurnState::Failed | InlineTurnState::Rejected => "Inline failed",
+                InlineTurnState::Pending | InlineTurnState::Cancelled => return,
             }
-            InlineTurnState::Ready => "Inline answer retained",
-            InlineTurnState::Completed
-                if turn
-                    .result
-                    .as_ref()
-                    .is_some_and(|result| result.needs_agent.is_some()) =>
-            {
-                "Inline needs Agent"
-            }
-            InlineTurnState::Completed
-                if turn.has_code_change() && turn.disposition == InlineDisposition::Undone =>
-            {
-                "Inline edit undone"
-            }
-            InlineTurnState::Completed if turn.has_code_change() => "Inline edit applied",
-            InlineTurnState::Completed => "Inline finished",
-            InlineTurnState::Declined => "Inline edit declined",
-            InlineTurnState::Failed | InlineTurnState::Rejected => "Inline failed",
-            InlineTurnState::Pending | InlineTurnState::Cancelled => return,
         };
         let path = Path::new(&turn.location.file);
         let file = if turn.location.file.is_empty() {
@@ -309,6 +313,15 @@ impl Editor {
                 .await?;
         }
         self.panel_manager.focus_editor();
+        if let Some(index) = self
+            .inline_history
+            .turn(request)
+            .and_then(|turn| turn.agent_outcomes.len().checked_sub(1))
+        {
+            return self
+                .view_inline_agent_changes(request, index, 0, frame, runtime)
+                .await;
+        }
         if self
             .inline_history
             .turn(request)
