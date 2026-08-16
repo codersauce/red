@@ -87,6 +87,15 @@ impl Editor {
             })
     }
 
+    pub(super) fn inline_completion_notice_available(&self) -> bool {
+        self.inline_completion_surface_available()
+            && self
+                .inline_completion
+                .notice
+                .as_ref()
+                .is_some_and(|notice| notice.expires_at.is_none_or(|until| Instant::now() < until))
+    }
+
     /// Paint the location as a bounded link; errors and command input own the row first.
     pub(super) fn draw_inline_completion_notice(
         &mut self,
@@ -94,18 +103,12 @@ impl Editor {
         width: usize,
         y: usize,
     ) {
-        if !self.inline_completion_surface_available() || width == 0 {
+        if !self.inline_completion_notice_available() || width == 0 {
             return;
         }
         let Some(notice) = &self.inline_completion.notice else {
             return;
         };
-        if notice
-            .expires_at
-            .is_some_and(|until| Instant::now() >= until)
-        {
-            return;
-        }
         let request = &notice.request_id;
         let Some((conversation, turn)) =
             self.inline_history
@@ -210,9 +213,8 @@ impl Editor {
 
     pub(super) fn inline_completion_click(&self, event: &Event) -> Option<KeyAction> {
         if !self.inline_completion_surface_available()
-            || self.last_error.is_some()
-            || self.session_manager.warning().is_some()
-            || self.config_diagnostics_banner().is_some()
+            || self.notification_fallback.is_some()
+            || self.notifications.primary(Instant::now()).is_some()
         {
             return None;
         }
@@ -249,8 +251,9 @@ impl Editor {
         if let Some(request) = self.inline_completion.latest.clone() {
             self.open_inline_completion(&request, frame, runtime).await
         } else {
-            self.last_error =
-                Some("no background inline completion yet · Space H opens history".into());
+            self.set_legacy_message(Some(
+                "no background inline completion yet · Space H opens history".into(),
+            ));
             self.render(frame)
         }
     }
@@ -281,8 +284,9 @@ impl Editor {
                     })
             });
         let Some((group, latest)) = target else {
-            self.last_error =
-                Some("inline result is no longer available · Space H opens history".into());
+            self.set_legacy_message(Some(
+                "inline result is no longer available · Space H opens history".into(),
+            ));
             return self.render(frame);
         };
         if self

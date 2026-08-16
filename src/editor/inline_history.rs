@@ -738,7 +738,7 @@ impl Editor {
                     return self.close_inline_history(true, buffer, runtime).await;
                 }
             } else {
-                self.last_error = Some("this item has no completed annotations".into());
+                self.set_legacy_message(Some("this item has no completed annotations".into()));
             }
             return self
                 .refresh_inline_history_browser(buffer, runtime, false)
@@ -991,7 +991,7 @@ impl Editor {
                         .map(|turn| (conversation.id.clone(), turn.clone()))
                 })
         else {
-            self.last_error = Some("this item has no completed annotations".into());
+            self.set_legacy_message(Some("this item has no completed annotations".into()));
             return Ok(false);
         };
         if turn.change_summary.is_some() {
@@ -1018,8 +1018,9 @@ impl Editor {
                 .as_ref()
                 .is_none_or(|result| result.comments.is_empty())
             {
-                self.last_error =
-                    Some("change summary restored · source unchanged by this action".into());
+                self.set_legacy_message(Some(
+                    "change summary restored · source unchanged by this action".into(),
+                ));
                 return Ok(true);
             }
         }
@@ -1028,7 +1029,7 @@ impl Editor {
             .as_ref()
             .filter(|result| !result.comments.is_empty())
         else {
-            self.last_error = Some("this result has no annotations".into());
+            self.set_legacy_message(Some("this result has no annotations".into()));
             return Ok(false);
         };
         if self.resolve_history_turn(&turn).is_none() && Path::new(&turn.location.file).is_file() {
@@ -1072,10 +1073,10 @@ impl Editor {
             })
             .collect::<Vec<_>>();
         if annotations.is_empty() {
-            self.last_error = Some(
+            self.set_legacy_message(Some(
                 "annotations retained, but their source is detached; recheck against current code"
                     .into(),
-            );
+            ));
             return Ok(false);
         }
         let mut counts = HashMap::new();
@@ -1086,7 +1087,7 @@ impl Editor {
             if let Err(error) =
                 self.check_inline_comment_capacity_for_buffer(buffer_id, &group, count)
             {
-                self.last_error = Some(error.to_string());
+                self.set_legacy_message(Some(error.to_string()));
                 return Ok(false);
             }
         }
@@ -1115,10 +1116,10 @@ impl Editor {
             browser.active_comment = selected;
         }
         self.sync_inline_activity();
-        self.last_error = Some(format!(
+        self.set_legacy_message(Some(format!(
             "showing {restored}/{} retained annotation(s) · source unchanged by this action",
             result.comments.len()
-        ));
+        )));
         Ok(true)
     }
 

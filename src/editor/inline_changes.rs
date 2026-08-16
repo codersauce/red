@@ -243,7 +243,7 @@ impl Editor {
             .filter(|turn| turn.has_code_change())
             .cloned()
         else {
-            self.last_error = Some("inline edit is no longer available".into());
+            self.set_legacy_message(Some("inline edit is no longer available".into()));
             return self.render(frame);
         };
         self.park_inline_assist();
@@ -363,10 +363,10 @@ impl Editor {
             return Ok(());
         };
         if !self.inline_change_can_undo(&turn) {
-            self.last_error = Some(
+            self.set_legacy_message(Some(
                 "inline edit is no longer the latest change; use transaction history to revert it"
                     .into(),
-            );
+            ));
             return self.render(frame);
         }
         let Some(index) = self.buffer_manager.iter().position(|buffer| {

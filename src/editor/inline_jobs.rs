@@ -780,7 +780,7 @@ impl Editor {
             .map(|turn| turn.location.clone())
             .or_else(|| self.inline_jobs.get(group).map(|job| job.location.clone()));
         let Some(location) = location else {
-            self.last_error = Some("inline item is no longer available".into());
+            self.set_legacy_message(Some("inline item is no longer available".into()));
             return Ok(());
         };
         if !self.buffer_manager.iter().any(|buffer| {

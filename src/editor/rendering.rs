@@ -3515,6 +3515,7 @@ impl Editor {
                     (String::new(), None, 0)
                 };
             let available = width.saturating_sub(wc_width);
+            let has_message = !message.is_empty() || self.inline_completion_notice_available();
             let candidate = primary
                 .filter(|_| self.notification_fallback.is_none())
                 .and_then(|record| {
@@ -3528,7 +3529,7 @@ impl Editor {
             if candidate.is_some() {
                 counts.unseen = counts.unseen.saturating_sub(1);
             }
-            let mut badge = notification_badge(counts, available, !message.is_empty());
+            let mut badge = notification_badge(counts, available, has_message);
             let mut badge_width = display_width(&badge);
             let mut message_width =
                 available.saturating_sub(badge_width + usize::from(badge_width > 0));
@@ -3537,7 +3538,7 @@ impl Editor {
                     self.notification_frame_candidate = Some(key);
                 } else {
                     counts.unseen += 1;
-                    badge = notification_badge(counts, available, !message.is_empty());
+                    badge = notification_badge(counts, available, has_message);
                     badge_width = display_width(&badge);
                     message_width =
                         available.saturating_sub(badge_width + usize::from(badge_width > 0));

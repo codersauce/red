@@ -608,11 +608,11 @@ impl Editor {
         self.layout_cache.borrow_mut().clear();
         self.move_to_text_position(TextPosition::new(line, 0));
         self.refresh_cursor_goal();
-        self.last_error = Some(format!(
+        self.set_legacy_message(Some(format!(
             "inline {} of {} here · Space [/] i cycle · Space v open",
             next + 1,
             view.count
-        ));
+        )));
         Some(id)
     }
 
@@ -667,7 +667,7 @@ impl Editor {
                 && comment.anchor.buffer_id == self.current_buffer().id()
                 && self.inline_comment_visible(comment)
         }) else {
-            self.last_error = Some("inline item is no longer visible".into());
+            self.set_legacy_message(Some("inline item is no longer visible".into()));
             return self.render(frame);
         };
         if let InlineCommentOrigin::Activity { group_id } = &comment.origin {
@@ -744,14 +744,15 @@ impl Editor {
                 {
                     summary.hidden = true;
                 }
-                self.last_error = Some("change summary hidden · Space H to restore".into());
+                self.set_legacy_message(Some("change summary hidden · Space H to restore".into()));
             }
             if matches!(
                 self.inline_comments[index].origin,
                 InlineCommentOrigin::Activity { .. }
             ) {
-                self.last_error =
-                    Some("inline request retained · Space v to open · Ctrl-c to cancel".into());
+                self.set_legacy_message(Some(
+                    "inline request retained · Space v to open · Ctrl-c to cancel".into(),
+                ));
                 return;
             }
             if let InlineCommentOrigin::Assist {

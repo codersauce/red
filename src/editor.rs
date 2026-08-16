@@ -16954,7 +16954,7 @@ impl Editor {
                         matches!(action, Action::PreviousOverlappingInlineComment),
                     );
                 } else {
-                    self.last_error = Some("no inline item at the cursor".into());
+                    self.set_legacy_message(Some("no inline item at the cursor".into()));
                 }
                 self.render(buffer)?;
             }
@@ -17031,7 +17031,7 @@ impl Editor {
                 let range = match self.inline_submission_target() {
                     Ok(range) => range,
                     Err(error) => {
-                        self.last_error = Some(error.to_string());
+                        self.set_legacy_message(Some(error.to_string()));
                         self.render(buffer)?;
                         return Ok(false);
                     }
@@ -17208,7 +17208,9 @@ impl Editor {
                 if let Some((request, session, result)) = pending {
                     if let Action::ApplyReviewedInlineAssist(reviewed) = action {
                         if reviewed != &request || result.expanded_scope.is_none() {
-                            self.last_error = Some("wider edit review is no longer current".into());
+                            self.set_legacy_message(Some(
+                                "wider edit review is no longer current".into(),
+                            ));
                             self.render(buffer)?;
                             return Ok(false);
                         }
@@ -17286,10 +17288,10 @@ impl Editor {
                     );
                     self.close_inline_assist_session();
                     self.notify_inline_outcome(&request);
-                    self.last_error = Some(
+                    self.set_legacy_message(Some(
                         "inline edit declined · source unchanged · retained in InlineHistory"
                             .into(),
-                    );
+                    ));
                     self.render(buffer)?;
                 }
             }
@@ -17401,7 +17403,7 @@ impl Editor {
             Action::RefineInlineAssist => {
                 add_to_history = false;
                 if let Err(error) = self.inline_submission_target() {
-                    self.last_error = Some(error.to_string());
+                    self.set_legacy_message(Some(error.to_string()));
                     self.render(buffer)?;
                     return Ok(false);
                 }
@@ -17534,16 +17536,18 @@ impl Editor {
                     return Ok(false);
                 };
                 let Some(prompt) = self.inline_handoff_prompt(&assist.annotation_group_id) else {
-                    self.last_error = Some("inline discussion is no longer available".into());
+                    self.set_legacy_message(Some(
+                        "inline discussion is no longer available".into(),
+                    ));
                     return Ok(false);
                 };
                 self.plugin_registry
                     .ensure_command_registered(runtime, "AgentOpen")
                     .await;
                 if runtime.command_plugin("AgentOpen").is_none() {
-                    self.last_error = Some(
+                    self.set_legacy_message(Some(
                         "Agent is unavailable; the inline discussion remains in history".into(),
-                    );
+                    ));
                     self.render(buffer)?;
                     return Ok(false);
                 }
@@ -17588,9 +17592,9 @@ impl Editor {
                     *expected_draft,
                 ) {
                     Ok(plugin::panel::TextPanelReuseOutcome::Loaded) => {
-                        self.last_error = Some(
+                        self.set_legacy_message(Some(
                             "inline discussion loaded in Agent; review and send when ready".into(),
-                        );
+                        ));
                     }
                     Ok(plugin::panel::TextPanelReuseOutcome::Confirm(revision)) => {
                         self.current_dialog = Some(Box::new(Confirmation::new_actions(
@@ -17602,7 +17606,7 @@ impl Editor {
                             Action::Print("current draft kept; inline discussion remains in history".into()),
                         )));
                     }
-                    Err(message) => self.last_error = Some(message.to_string()),
+                    Err(message) => self.set_legacy_message(Some(message.to_string())),
                 }
                 self.render(buffer)?;
             }
@@ -20331,8 +20335,9 @@ impl Editor {
                         ));
                     }
                 } else {
-                    self.last_error =
-                        Some("no retained annotations for this inline discussion".into());
+                    self.set_legacy_message(Some(
+                        "no retained annotations for this inline discussion".into(),
+                    ));
                 }
                 self.render(buffer)?;
             }

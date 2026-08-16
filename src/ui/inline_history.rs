@@ -418,8 +418,14 @@ mod tests {
         for (viewport_width, list_width) in [(120, 47), (64, 62)] {
             let mut panel = InlineHistoryPanel {
                 rows: vec![
-                    InlineHistoryRow { text: "short\ndetails".into(), running: false },
-                    InlineHistoryRow { text: format!("{}\n{}", "界".repeat(80), "👋".repeat(80)), running: false },
+                    InlineHistoryRow {
+                        text: "short\ndetails".into(),
+                        running: false,
+                    },
+                    InlineHistoryRow {
+                        text: format!("{}\n{}", "界".repeat(80), "👋".repeat(80)),
+                        running: false,
+                    },
                 ],
                 selected: 0,
                 detail: "preview".into(),
