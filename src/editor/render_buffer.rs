@@ -117,7 +117,18 @@ impl RenderBuffer {
 
     /// Clears the buffer with the given style
     pub fn clear(&mut self) {
-        self.cells = vec![Cell::new(' ', Style::default()); self.width * self.height];
+        self.reset(self.width, self.height, &Style::default());
+    }
+
+    /// Resizes and clears the grid while retaining reusable cell allocations.
+    pub(crate) fn reset(&mut self, width: usize, height: usize, style: &Style) {
+        self.cells
+            .resize_with(width * height, || Cell::new(' ', style.clone()));
+        self.width = width;
+        self.height = height;
+        for cell in &mut self.cells {
+            cell.set_char_in_place(' ', style);
+        }
     }
 
     pub fn write_string(
@@ -456,6 +467,34 @@ impl RenderBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resetting_a_frame_reuses_cell_storage_and_clears_wide_text() {
+        let mut buffer = RenderBuffer::new(8, 2, &Style::default());
+        buffer.set_text(0, 0, "👩‍💻界", &Style::default());
+        buffer.cells[0].text.reserve(32);
+        let storage = buffer.cells.as_ptr();
+        let text_capacity = buffer.cells[0].text.capacity();
+        let style = Style {
+            bold: true,
+            ..Style::default()
+        };
+        buffer.reset(4, 3, &style);
+        assert_eq!(buffer.cells.as_ptr(), storage);
+        assert_eq!(buffer.cells[0].text.capacity(), text_capacity);
+        assert_eq!(
+            (buffer.width, buffer.height, buffer.cells.len()),
+            (4, 3, 12)
+        );
+        assert!(buffer
+            .cells
+            .iter()
+            .all(|cell| cell.text == " " && cell.style == style));
+        buffer.reset(0, 0, &Style::default());
+        assert!(buffer.cells.is_empty());
+        buffer.reset(2, 2, &Style::default());
+        assert_eq!(buffer.cells.len(), 4);
+    }
 
     #[test]
     fn applying_changes_reuses_cell_text_capacity() {

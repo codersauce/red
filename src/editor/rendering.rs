@@ -12,8 +12,7 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsStr,
-    fs,
-    io::{self, Write as _},
+    fs, io,
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
@@ -1073,6 +1072,7 @@ fn queue_diff_cells(
     output: &mut impl io::Write,
     change_set: &[Change<'_>],
     theme: &Style,
+    terminal_width: usize,
 ) -> anyhow::Result<()> {
     let mut previous_style = None;
     let mut cursor_position = None;
@@ -1108,8 +1108,21 @@ fn queue_diff_cells(
                 i += 1;
             }
         }
-        output.queue(style::Print(text.as_str()))?;
-        cursor_position = Some((next_x, y));
+        // A blank suffix can be erased in three bytes instead of printing
+        // hundreds of spaces. EL uses the current background color and does
+        // not advance the cursor. Never erase beyond this changed run.
+        let visible = text.trim_end_matches(' ');
+        let trailing_spaces = text.len() - visible.len();
+        if next_x == terminal_width && trailing_spaces > 3 {
+            if !visible.is_empty() {
+                output.queue(style::Print(visible))?;
+            }
+            output.queue(terminal::Clear(terminal::ClearType::UntilNewLine))?;
+            cursor_position = Some((next_x - trailing_spaces, y));
+        } else {
+            output.queue(style::Print(text.as_str()))?;
+            cursor_position = Some((next_x, y));
+        }
     }
     Ok(())
 }
@@ -1131,28 +1144,21 @@ pub(super) fn resolve_cell_colors(cell_style: &Style, theme_style: &Style) -> (C
     (fg, bg)
 }
 
-fn cursor_style_for_shape(shape: CursorShape) -> cursor::SetCursorStyle {
-    match shape {
-        CursorShape::Default => cursor::SetCursorStyle::DefaultUserShape,
-        CursorShape::BlinkingBlock => cursor::SetCursorStyle::BlinkingBlock,
-        CursorShape::SteadyBlock => cursor::SetCursorStyle::SteadyBlock,
-        CursorShape::BlinkingUnderscore => cursor::SetCursorStyle::BlinkingUnderScore,
-        CursorShape::SteadyUnderscore => cursor::SetCursorStyle::SteadyUnderScore,
-        CursorShape::BlinkingBar => cursor::SetCursorStyle::BlinkingBar,
-        CursorShape::SteadyBar => cursor::SetCursorStyle::SteadyBar,
-    }
-}
-
 impl Editor {
-    fn queue_theme_cursor_color(&mut self) -> anyhow::Result<()> {
+    pub(crate) fn terminal_cursor_state(&self) -> crate::terminal_output::CursorState {
+        let position = (self.is_focused && !self.uses_synthetic_block_cursor())
+            .then(|| self.render_cursor_position())
+            .flatten()
+            .filter(|&(x, y)| x < usize::from(self.size.0) && y < usize::from(self.size.1));
         let surface = self
             .last_rendered_cursor_surface
             .as_ref()
             .unwrap_or(&self.theme.style);
-        let cursor_color = self.theme.terminal_cursor_color(surface);
-        write!(self.stdout, "\x1b]12;{}\x1b\\", cursor_color)?;
-
-        Ok(())
+        crate::terminal_output::CursorState {
+            position,
+            shape: self.active_cursor_shape(),
+            color: Some(self.theme.terminal_cursor_color(surface)),
+        }
     }
 
     fn update_terminal_cursor_surface(&mut self, buffer: &RenderBuffer) {
@@ -1175,7 +1181,7 @@ impl Editor {
         });
 
         if previous.width != buffer.width || previous.height != buffer.height {
-            *previous = RenderBuffer::new(buffer.width, buffer.height, &Style::default());
+            previous.reset(buffer.width, buffer.height, &Style::default());
         }
 
         if self.force_full_redraw {
@@ -1220,7 +1226,7 @@ impl Editor {
         self.update_gutter_width();
         self.apply_panel_layout();
         if self.force_full_redraw {
-            *buffer = RenderBuffer::new(
+            buffer.reset(
                 usize::from(self.size.0),
                 usize::from(self.size.1),
                 &self.theme.style,
@@ -2969,7 +2975,6 @@ impl Editor {
         }
 
         if change_set.is_empty() {
-            self.set_cursor_style()?;
             self.draw_cursor_preserving_cursor_goal()?;
             self.flush_terminal_output()?;
             return Ok(());
@@ -2982,8 +2987,12 @@ impl Editor {
             self.stdout.queue(terminal::BeginSynchronizedUpdate)?;
             self.stdout.queue(cursor::Hide)?;
             self.stdout.queue(terminal::DisableLineWrap)?;
-            queue_diff_cells(&mut self.stdout, change_set, &self.theme.style)?;
-            self.set_cursor_style()?;
+            queue_diff_cells(
+                &mut self.stdout,
+                change_set,
+                &self.theme.style,
+                usize::from(self.size.0),
+            )?;
             self.draw_cursor_preserving_cursor_goal()?;
             Ok(())
         })();
@@ -3487,41 +3496,14 @@ impl Editor {
             return Ok(());
         }
 
-        if !self.is_focused {
-            self.stdout.queue(cursor::Hide)?;
-            #[cfg(test)]
-            {
-                self.pending_terminal_cursor = Some(super::TerminalCursorState::Hidden);
-            }
-            return Ok(());
-        }
-
-        self.set_cursor_style()?;
-
-        if self.uses_synthetic_block_cursor() {
-            self.stdout.queue(cursor::Hide)?;
-            #[cfg(test)]
-            {
-                self.pending_terminal_cursor = Some(super::TerminalCursorState::Hidden);
-            }
-            return Ok(());
-        }
-
-        let cursor_pos = self.render_cursor_position();
-
-        if let Some((x, y)) = cursor_pos {
-            self.stdout.queue(cursor::Show)?;
-            self.stdout.queue(cursor::MoveTo(x as u16, y as u16))?;
-            #[cfg(test)]
-            {
-                self.pending_terminal_cursor = Some(super::TerminalCursorState::Visible((x, y)));
-            }
-        } else {
-            self.stdout.queue(cursor::Hide)?;
-            #[cfg(test)]
-            {
-                self.pending_terminal_cursor = Some(super::TerminalCursorState::Hidden);
-            }
+        let state = self.terminal_cursor_state();
+        state.queue(&mut self.stdout)?;
+        #[cfg(test)]
+        {
+            self.pending_terminal_cursor = Some(state.position.map_or(
+                super::TerminalCursorState::Hidden,
+                super::TerminalCursorState::Visible,
+            ));
         }
 
         Ok(())
@@ -3635,18 +3617,6 @@ impl Editor {
             Mode::VisualLine => self.config.cursor.visual_line,
             Mode::VisualBlock => self.config.cursor.visual_block,
         }
-    }
-
-    fn set_cursor_style(&mut self) -> anyhow::Result<()> {
-        if !self.terminal_output_enabled {
-            return Ok(());
-        }
-
-        self.queue_theme_cursor_color()?;
-        self.stdout
-            .queue(cursor_style_for_shape(self.active_cursor_shape()))?;
-
-        Ok(())
     }
 
     fn update_gutter_width(&mut self) {
@@ -4835,7 +4805,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut output = Vec::new();
-        queue_diff_cells(&mut output, &changes, &Style::default()).unwrap();
+        queue_diff_cells(&mut output, &changes, &Style::default(), buffer.width).unwrap();
         let mut expected = Vec::new();
         expected.queue(MoveTo(0, 0)).unwrap();
         TerminalCellStyle::resolve(&first, &Style::default())
@@ -4882,6 +4852,55 @@ mod tests {
     }
 
     #[test]
+    fn terminal_diff_erases_only_a_complete_blank_suffix() {
+        let background = Style {
+            bg: Some(Color::Rgb {
+                r: 10,
+                g: 20,
+                b: 30,
+            }),
+            ..Style::default()
+        };
+        let mut buffer = RenderBuffer::new(20, 2, &background);
+        buffer.set_text(0, 0, "界A", &background);
+        let changes = buffer
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| Change {
+                x: index % buffer.width,
+                y: index / buffer.width,
+                cell,
+            })
+            .collect::<Vec<_>>();
+        let mut output = Vec::new();
+        queue_diff_cells(&mut output, &changes, &Style::default(), buffer.width).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("界A\x1b[K\x1b[2;1H\x1b[K"));
+        let mut background_command = Vec::new();
+        background_command
+            .queue(style::SetBackgroundColor(background.bg.unwrap().into()))
+            .unwrap();
+        assert!(output.contains(std::str::from_utf8(&background_command).unwrap()));
+        assert!(!output.contains("    "));
+
+        let interior = changes
+            .iter()
+            .filter(|change| change.y == 1 && (3..15).contains(&change.x))
+            .map(|change| Change {
+                x: change.x,
+                y: change.y,
+                cell: change.cell,
+            })
+            .collect::<Vec<_>>();
+        let mut output = Vec::new();
+        queue_diff_cells(&mut output, &interior, &Style::default(), buffer.width).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains("\x1b[K"));
+        assert!(output.ends_with(&" ".repeat(12)));
+    }
+
+    #[test]
     fn terminal_style_delta_compares_resolved_theme_colors() {
         let theme = Style {
             fg: Some(Color::Rgb { r: 1, g: 2, b: 3 }),
@@ -4919,6 +4938,54 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn resize_experience_native_cursor_moves_before_it_is_shown() {
+        let mut editor = rendering_test_editor(Buffer::new(None, "text".into()));
+        editor.mode = Mode::Insert;
+        editor.terminal_output_enabled = true;
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        editor.stdout = std::io::BufWriter::new(Box::new(CapturedOutput {
+            bytes: bytes.clone(),
+            fail_at: None,
+        }) as super::super::TerminalOutput);
+        let source = RenderBuffer::new_with_contents(4, 1, Style::default(), vec!["test".into()]);
+        let changes = source
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(x, cell)| Change { x, y: 0, cell })
+            .collect::<Vec<_>>();
+
+        editor.render_diff(&changes).unwrap();
+
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        let (x, y) = editor.render_cursor_position().unwrap();
+        let cursor_move = format!("\x1b[{};{}H", y + 1, x + 1);
+        assert!(output.rfind(&cursor_move).unwrap() < output.rfind("\x1b[?25h").unwrap());
+        assert_eq!(output.matches("\x1b]12;").count(), 1);
+        assert!(output.starts_with("\x1b[?2026h\x1b[?25l"));
+        assert!(output.ends_with("\x1b[?2026l"));
+    }
+
+    #[test]
+    fn resize_experience_empty_surface_keeps_native_cursor_hidden() {
+        let mut editor = rendering_test_editor(Buffer::new(None, "text".into()));
+        editor.mode = Mode::Insert;
+        editor.size = (0, 0);
+        editor.terminal_output_enabled = true;
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        editor.stdout = std::io::BufWriter::new(Box::new(CapturedOutput {
+            bytes: bytes.clone(),
+            fail_at: None,
+        }) as super::super::TerminalOutput);
+
+        editor.render_diff(&[]).unwrap();
+
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(output.ends_with("\x1b[?25l"));
+        assert!(!output.contains("\x1b[?25h"));
     }
 
     #[test]

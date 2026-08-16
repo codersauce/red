@@ -600,7 +600,7 @@ async fn attach_session(session: &str) -> anyhow::Result<()> {
         let mut rows = Vec::new();
         terminal::enable_raw_mode()?;
         let mut terminal_guard = DetachedTerminalGuard::default();
-        let mut output = stdout();
+        let mut output = std::io::BufWriter::with_capacity(1 << 20, stdout());
         output
             .execute(event::EnableBracketedPaste)?
             .execute(event::EnableFocusChange)?
@@ -613,12 +613,17 @@ async fn attach_session(session: &str) -> anyhow::Result<()> {
         output
             .execute(terminal::DisableLineWrap)?
             .execute(terminal::Clear(terminal::ClearType::All))?;
-        let result = async {
+        let result: anyhow::Result<()> = async {
             paint_detached_delta(&mut output, &mut rows, &client.initial_render)?;
+            let mut last_revision = client.initial_render.revision;
             let mut last_heartbeat = Instant::now();
+            let mut pending_events = std::collections::VecDeque::new();
             loop {
-                if event::poll(DETACHED_POLL_INTERVAL)? {
-                    match event::read()? {
+                if pending_events.is_empty() {
+                    event::poll(DETACHED_POLL_INTERVAL)?;
+                }
+                if let Some(event) = red::terminal_input::read_ready_event(&mut pending_events)? {
+                    match event {
                         event::Event::Key(key) if is_detach_key(&key) => {
                             client.detach().await?;
                             return Ok(());
@@ -626,41 +631,73 @@ async fn attach_session(session: &str) -> anyhow::Result<()> {
                         event::Event::Resize(columns, rows_count) => {
                             let delta = client.resize(columns, rows_count).await?;
                             paint_detached_resize(&mut output, &mut rows, &delta, rows_count)?;
+                            last_revision = delta.revision;
                         }
                         event::Event::FocusGained => {
                             let delta = client.focus(/*focused*/ true).await?;
-                            paint_detached_delta(&mut output, &mut rows, &delta)?;
+                            paint_detached_if_changed(
+                                &mut output,
+                                &mut rows,
+                                &delta,
+                                &mut last_revision,
+                            )?;
                         }
                         event::Event::FocusLost => {
                             let delta = client.focus(/*focused*/ false).await?;
-                            paint_detached_delta(&mut output, &mut rows, &delta)?;
+                            paint_detached_if_changed(
+                                &mut output,
+                                &mut rows,
+                                &delta,
+                                &mut last_revision,
+                            )?;
                         }
                         event::Event::Paste(text) => {
                             let delta = send_detached_paste(&mut client, text).await?;
-                            paint_detached_delta(&mut output, &mut rows, &delta)?;
+                            paint_detached_if_changed(
+                                &mut output,
+                                &mut rows,
+                                &delta,
+                                &mut last_revision,
+                            )?;
                         }
                         event::Event::Mouse(event) => {
                             let delta = client.input(DetachedInput::Mouse { event }).await?;
-                            paint_detached_delta(&mut output, &mut rows, &delta)?;
+                            paint_detached_if_changed(
+                                &mut output,
+                                &mut rows,
+                                &delta,
+                                &mut last_revision,
+                            )?;
                         }
                         event::Event::Key(key) => {
                             if let Some(input) = detached_key_input(key) {
                                 let delta = client.input(input).await?;
-                                paint_detached_delta(&mut output, &mut rows, &delta)?;
+                                paint_detached_if_changed(
+                                    &mut output,
+                                    &mut rows,
+                                    &delta,
+                                    &mut last_revision,
+                                )?;
                             }
                         }
                     }
                 }
                 if last_heartbeat.elapsed() >= DETACHED_RENDER_POLL_INTERVAL {
                     let delta = client.heartbeat().await?;
-                    paint_detached_delta(&mut output, &mut rows, &delta)?;
+                    paint_detached_if_changed(&mut output, &mut rows, &delta, &mut last_revision)?;
                     last_heartbeat = Instant::now();
                 }
             }
         }
         .await;
+        let flush = output.flush();
+        // Discard any bytes retained after a failed write before the guard
+        // restores the real terminal. BufWriter::drop must not replay them.
+        let _ = output.into_parts();
         drop(terminal_guard);
-        result
+        result?;
+        flush?;
+        Ok(())
     }
     #[cfg(not(unix))]
     {
@@ -781,6 +818,43 @@ where
 }
 
 #[cfg(any(unix, test))]
+fn paint_detached_if_changed(
+    output: &mut impl std::io::Write,
+    rows: &mut Vec<red::headless::LinePatch>,
+    delta: &red::headless::RenderDelta,
+    last_revision: &mut u64,
+) -> anyhow::Result<()> {
+    if delta.revision == *last_revision && delta.lines.is_empty() {
+        return Ok(());
+    }
+    paint_detached_delta(output, rows, delta)?;
+    *last_revision = delta.revision;
+    Ok(())
+}
+
+#[cfg(any(unix, test))]
+fn detached_frame<W: std::io::Write>(
+    output: &mut W,
+    paint: impl FnOnce(&mut W) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let result = (|| {
+        output
+            .queue(terminal::BeginSynchronizedUpdate)?
+            .queue(cursor::Hide)?
+            .queue(terminal::DisableLineWrap)?;
+        paint(output)
+    })();
+    let wrap = output.queue(terminal::EnableLineWrap).map(|_| ());
+    let end = output.queue(terminal::EndSynchronizedUpdate).map(|_| ());
+    let flush = output.flush();
+    result?;
+    wrap?;
+    end?;
+    flush?;
+    Ok(())
+}
+
+#[cfg(any(unix, test))]
 fn paint_detached_delta(
     output: &mut impl std::io::Write,
     rows: &mut Vec<red::headless::LinePatch>,
@@ -795,26 +869,27 @@ fn paint_detached_delta(
             });
         }
         rows[patch.row] = patch.clone();
-        paint_detached_row(output, patch)?;
     }
-    finish_detached_paint(output, delta.cursor)
+    detached_frame(output, |output| {
+        for patch in &delta.lines {
+            paint_detached_row(output, patch)?;
+        }
+        finish_detached_paint(output, delta)
+    })
 }
 
 #[cfg(any(unix, test))]
 fn finish_detached_paint(
     output: &mut impl std::io::Write,
-    cursor: (usize, usize),
+    delta: &red::headless::RenderDelta,
 ) -> anyhow::Result<()> {
     output
         .queue(style::ResetColor)?
         .queue(style::SetAttribute(style::Attribute::Reset))?;
-    write!(
-        output,
-        "\x1b[{};{}H",
-        cursor.1.saturating_add(1),
-        cursor.0.saturating_add(1)
-    )?;
-    output.flush()?;
+    delta
+        .cursor_state
+        .unwrap_or_else(|| red::terminal_output::CursorState::visible(delta.cursor))
+        .queue(output)?;
     Ok(())
 }
 
@@ -823,28 +898,59 @@ fn paint_detached_row(
     output: &mut impl std::io::Write,
     row: &red::headless::LinePatch,
 ) -> anyhow::Result<()> {
+    // Establish the final span's background before clearing. Its blank suffix
+    // is then already painted, including on terminals with colored erasure.
+    let background = row.spans.last().and_then(|span| span.style.bg);
+    output
+        .queue(style::ResetColor)?
+        .queue(style::SetAttribute(style::Attribute::Reset))?;
+    if let Some(background) = background {
+        output.queue(style::SetBackgroundColor(background.into()))?;
+    }
     write!(output, "\x1b[{};1H\x1b[2K", row.row.saturating_add(1))?;
     if row.spans.is_empty() {
-        write!(output, "{}", row.text)?;
+        write!(output, "{}", row.text.trim_end_matches(' '))?;
         return Ok(());
     }
-    for span in &row.spans {
-        output
-            .queue(style::ResetColor)?
-            .queue(style::SetAttribute(style::Attribute::Reset))?;
-        if let Some(foreground) = span.style.fg {
-            output.queue(style::SetForegroundColor(foreground.into()))?;
+    let mut previous = red::theme::Style {
+        bg: background,
+        ..Default::default()
+    };
+    for (index, span) in row.spans.iter().enumerate() {
+        let text = if index + 1 == row.spans.len() {
+            span.text.trim_end_matches(' ')
+        } else {
+            span.text.as_str()
+        };
+        if text.is_empty() {
+            continue;
         }
-        if let Some(background) = span.style.bg {
-            output.queue(style::SetBackgroundColor(background.into()))?;
+        if span.style.fg != previous.fg {
+            output.queue(style::SetForegroundColor(
+                span.style.fg.map(Into::into).unwrap_or(style::Color::Reset),
+            ))?;
         }
-        if span.style.bold {
-            output.queue(style::SetAttribute(style::Attribute::Bold))?;
+        if span.style.bg != previous.bg {
+            output.queue(style::SetBackgroundColor(
+                span.style.bg.map(Into::into).unwrap_or(style::Color::Reset),
+            ))?;
         }
-        if span.style.italic {
-            output.queue(style::SetAttribute(style::Attribute::Italic))?;
+        if span.style.bold != previous.bold {
+            output.queue(style::SetAttribute(if span.style.bold {
+                style::Attribute::Bold
+            } else {
+                style::Attribute::NormalIntensity
+            }))?;
         }
-        write!(output, "{}", span.text)?;
+        if span.style.italic != previous.italic {
+            output.queue(style::SetAttribute(if span.style.italic {
+                style::Attribute::Italic
+            } else {
+                style::Attribute::NoItalic
+            }))?;
+        }
+        write!(output, "{text}")?;
+        previous = span.style.clone();
     }
     Ok(())
 }
@@ -867,11 +973,13 @@ fn paint_detached_resize(
         }
         rows[patch.row] = patch.clone();
     }
-    write!(output, "\x1b[H\x1b[2J")?;
-    for row in rows {
-        paint_detached_row(output, row)?;
-    }
-    finish_detached_paint(output, delta.cursor)
+    detached_frame(output, |output| {
+        write!(output, "\x1b[H\x1b[2J")?;
+        for row in rows {
+            paint_detached_row(output, row)?;
+        }
+        finish_detached_paint(output, delta)
+    })
 }
 
 fn print_error(error: &anyhow::Error) {
@@ -1347,6 +1455,76 @@ mod tests {
     }
 
     #[test]
+    fn detached_row_omits_blank_suffix_and_resets_changed_attributes() {
+        let emphasized = red::theme::Style {
+            bold: true,
+            italic: true,
+            ..Default::default()
+        };
+        let row = red::headless::LinePatch {
+            row: 0,
+            text: "ab                    ".into(),
+            spans: vec![
+                red::headless::StyledSpan {
+                    text: "a".into(),
+                    style: emphasized,
+                },
+                red::headless::StyledSpan {
+                    text: "b                    ".into(),
+                    style: Default::default(),
+                },
+            ],
+        };
+        let mut output = Vec::new();
+        paint_detached_row(&mut output, &row).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\x1b[1m\x1b[3ma\x1b[22m\x1b[23mb"));
+        assert!(!output.contains("    "));
+    }
+
+    #[test]
+    fn detached_cursor_state_is_atomic_and_legacy_payloads_still_decode() {
+        let mut delta: red::headless::RenderDelta = serde_json::from_value(serde_json::json!({
+            "revision": 1, "lines": [], "cursor": [5, 1]
+        }))
+        .unwrap();
+        assert_eq!(delta.cursor_state, None);
+        let mut rows = Vec::new();
+        let mut output = Vec::new();
+        paint_detached_delta(&mut output, &mut rows, &delta).unwrap();
+        let text = String::from_utf8(output.clone()).unwrap();
+        assert!(text.starts_with("\x1b[?2026h\x1b[?25l\x1b[?7l"));
+        assert!(text.contains("\x1b[2;6H\x1b[?25h"));
+        assert!(text.ends_with("\x1b[?7h\x1b[?2026l"));
+
+        delta.cursor_state = Some(red::terminal_output::CursorState {
+            position: None,
+            shape: red::config::CursorShape::SteadyBar,
+            color: None,
+        });
+        output.clear();
+        paint_detached_delta(&mut output, &mut rows, &delta).unwrap();
+        let text = String::from_utf8(output.clone()).unwrap();
+        assert!(!text.contains("\x1b[?25h"));
+        output.clear();
+        let mut revision = delta.revision;
+        paint_detached_if_changed(&mut output, &mut rows, &delta, &mut revision).unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn detached_frame_restores_terminal_modes_after_paint_failure() {
+        let mut output = Vec::new();
+        let error = detached_frame(&mut output, |output| {
+            output.extend_from_slice(b"partial frame");
+            anyhow::bail!("injected paint failure")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("injected paint failure"));
+        assert!(output.ends_with(b"\x1b[?7h\x1b[?2026l"));
+    }
+
+    #[test]
     fn detached_resize_drops_rows_below_the_new_terminal_height() {
         let mut rows = (0..5)
             .map(|row| red::headless::LinePatch {
@@ -1365,6 +1543,7 @@ mod tests {
                 })
                 .collect(),
             cursor: (0, 0),
+            cursor_state: None,
         };
         let mut output = Vec::new();
 
@@ -1400,6 +1579,7 @@ mod tests {
                 spans: Vec::new(),
             }],
             cursor: (0, 1),
+            cursor_state: None,
         };
         let mut output = Vec::new();
 
@@ -1433,6 +1613,7 @@ mod tests {
                 spans: Vec::new(),
             }],
             cursor: (0, 0),
+            cursor_state: None,
         };
         let mut output = Vec::new();
 

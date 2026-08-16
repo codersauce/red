@@ -28,6 +28,8 @@ mod notifications;
 pub(crate) mod perf;
 pub mod render_buffer;
 pub mod rendering;
+#[cfg(test)]
+mod resize_tests;
 mod session_manager;
 
 use std::{
@@ -3228,6 +3230,7 @@ pub struct DetachedEditorCore {
     rows: Vec<String>,
     row_spans: Vec<Vec<crate::headless::StyledSpan>>,
     cursor: (usize, usize),
+    cursor_state: crate::terminal_output::CursorState,
     stopped: bool,
     pending_paste: String,
 }
@@ -3266,6 +3269,7 @@ impl DetachedEditorCore {
         let cursor = editor
             .render_cursor_position()
             .unwrap_or((editor.cx, editor.cy));
+        let cursor_state = editor.terminal_cursor_state();
         Ok(Self {
             editor,
             runtime,
@@ -3274,6 +3278,7 @@ impl DetachedEditorCore {
             rows,
             row_spans,
             cursor,
+            cursor_state,
             stopped: false,
             pending_paste: String::new(),
         })
@@ -3297,6 +3302,7 @@ impl DetachedEditorCore {
                     .collect()
             },
             cursor: self.cursor,
+            cursor_state: Some(self.cursor_state),
         }
     }
 
@@ -3449,9 +3455,11 @@ impl DetachedEditorCore {
             .editor
             .render_cursor_position()
             .unwrap_or((self.editor.cx, self.editor.cy));
+        let next_cursor_state = self.editor.terminal_cursor_state();
         let changed = next_rows != self.rows
             || next_row_spans != self.row_spans
-            || next_cursor != self.cursor;
+            || next_cursor != self.cursor
+            || next_cursor_state != self.cursor_state;
         if changed {
             self.revision = self.revision.saturating_add(1);
         }
@@ -3472,10 +3480,12 @@ impl DetachedEditorCore {
         self.rows = next_rows;
         self.row_spans = next_row_spans;
         self.cursor = next_cursor;
+        self.cursor_state = next_cursor_state;
         Ok(crate::headless::RenderDelta {
             revision: self.revision,
             lines,
             cursor: self.cursor,
+            cursor_state: Some(self.cursor_state),
         })
     }
 }
@@ -5366,9 +5376,23 @@ impl Editor {
         self.size = (width, height);
         self.divider_drag = None;
         self.pane_resize_mode = None;
-        let max_y = (height as usize).saturating_sub(2);
-        self.cy = self.cy.min(max_y.saturating_sub(1));
         self.resize_window_layout((width as usize, height as usize));
+
+        // A smaller viewport must scroll to the cursor, not move the cursor
+        // to an earlier buffer line. Preserve inactive split positions too.
+        for window in self.window_manager.windows_mut() {
+            let cursor_line = window.vtop.saturating_add(window.cy);
+            let height = window
+                .inner_height()
+                .saturating_sub(self.window_bar_manager.reserved_top_height(window.id));
+            let cursor_row = window.cy.min(height.saturating_sub(1));
+            if cursor_row != window.cy {
+                window.vtop = cursor_line.saturating_sub(cursor_row);
+                window.cy = cursor_row;
+                window.skipcol = 0;
+            }
+        }
+        self.sync_with_window();
         self.invalidate_terminal_render_state(buffer);
 
         let viewport_width = self.vwidth();
@@ -8138,6 +8162,12 @@ impl Editor {
             let input_started = Instant::now();
             let mut serviced_background = false;
             while let Some(ev) = Self::read_ready_event(&mut pending_events)? {
+                // The tty may have reflowed through intermediate dimensions,
+                // even when a coalesced resize ends at the last painted size.
+                // Its screen contents are no longer safe to diff against.
+                if matches!(ev, Event::Resize(_, _)) {
+                    self.force_full_redraw = true;
+                }
                 if self.can_batch_scroll(&ev) {
                     let events = Self::read_scroll_batch(ev, &mut pending_events)?;
                     if self
@@ -10335,19 +10365,36 @@ impl Editor {
         if mouse_moved && self.current_dialog.is_none() {
             return Ok(ProcessedEvent::default());
         }
+        if !self.force_full_redraw
+            && matches!(ev, Event::Resize(width, height) if self.size == (width, height))
+        {
+            perf::increment("resize:duplicate_events", 1);
+            return Ok(ProcessedEvent::default());
+        }
         let initial_bounds_span = perf::PerfSpan::start("event:initial_bounds");
         self.check_bounds();
         drop(initial_bounds_span);
 
         if let event::Event::Resize(width, height) = ev {
+            let _span = perf::PerfSpan::start("resize:publish");
             self.resize_terminal_surface(width, height, buffer);
-            self.render(buffer)?;
-
-            let action = Action::NotifyPlugins(
-                "editor:resize".to_string(),
-                serde_json::to_value(self.size)?,
-            );
-            self.execute(&action, buffer, runtime).await?;
+            let was_deferring = self.defer_motion_render;
+            self.defer_motion_render = true;
+            self.request_motion_render(MotionRender::Full);
+            let result = async {
+                let action = Action::NotifyPlugins(
+                    "editor:resize".to_string(),
+                    serde_json::to_value(self.size)?,
+                );
+                self.execute(&action, buffer, runtime).await?;
+                self.service_background(buffer, runtime).await
+            }
+            .await;
+            self.defer_motion_render = was_deferring;
+            result?;
+            if !was_deferring {
+                self.flush_deferred_motion_render(buffer)?;
+            }
             return Ok(ProcessedEvent {
                 quit: false,
                 drain_repeated_motion: false,
@@ -10661,41 +10708,8 @@ impl Editor {
         Ok(quit)
     }
 
-    /// Reads the next ready terminal event while collapsing only adjacent
-    /// resize notifications. Crossterm can emit resize events in batches;
-    /// rendering every intermediate size makes terminal divider drags laggy.
-    /// Keeping non-resize events queued preserves their original ordering.
     fn read_ready_event(pending_events: &mut VecDeque<Event>) -> anyhow::Result<Option<Event>> {
-        let first = if let Some(event) = pending_events.pop_front() {
-            event
-        } else {
-            if !event::poll(Duration::from_millis(0))? {
-                return Ok(None);
-            }
-            event::read()?
-        };
-
-        if matches!(first, Event::Resize(_, _)) {
-            while event::poll(Duration::from_millis(0))? {
-                pending_events.push_back(event::read()?);
-            }
-        }
-
-        Ok(Some(Self::coalesce_resize_run(first, pending_events)))
-    }
-
-    fn coalesce_resize_run(first: Event, pending_events: &mut VecDeque<Event>) -> Event {
-        let Event::Resize(mut width, mut height) = first else {
-            return first;
-        };
-
-        while let Some(Event::Resize(next_width, next_height)) = pending_events.front() {
-            width = *next_width;
-            height = *next_height;
-            pending_events.pop_front();
-        }
-
-        Event::Resize(width, height)
+        crate::terminal_input::read_ready_event(pending_events)
     }
 
     fn flush_deferred_motion_render(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
@@ -16167,7 +16181,7 @@ impl Editor {
     }
 
     fn invalidate_terminal_render_state(&mut self, buffer: &mut RenderBuffer) {
-        *buffer = RenderBuffer::new(
+        buffer.reset(
             self.size.0 as usize,
             self.size.1 as usize,
             &Style::default(),
@@ -30245,7 +30259,7 @@ builtin = "rust"
         ]);
 
         assert_eq!(
-            Editor::coalesce_resize_run(Event::Resize(80, 24), &mut pending),
+            crate::terminal_input::coalesce_resize_run(Event::Resize(80, 24), &mut pending),
             Event::Resize(120, 40)
         );
         assert_eq!(pending.pop_front(), Some(key));
@@ -30258,7 +30272,7 @@ builtin = "rust"
         let mut pending = VecDeque::from([key.clone(), Event::Resize(120, 40)]);
 
         assert_eq!(
-            Editor::coalesce_resize_run(Event::Resize(80, 24), &mut pending),
+            crate::terminal_input::coalesce_resize_run(Event::Resize(80, 24), &mut pending),
             Event::Resize(80, 24)
         );
         assert_eq!(pending.pop_front(), Some(key));
