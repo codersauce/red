@@ -10321,6 +10321,25 @@ impl Editor {
         Ok(())
     }
 
+    // Resize publication includes the large background-service future. Keep
+    // its construction and polling out of ordinary input/replay stack frames,
+    // which can nest deeply enough to overflow the default Windows stack.
+    #[inline(never)]
+    fn publish_resize<'a>(
+        &'a mut self,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let action = Action::NotifyPlugins(
+                "editor:resize".to_string(),
+                serde_json::to_value(self.size)?,
+            );
+            self.execute(&action, buffer, runtime).await?;
+            self.service_background(buffer, runtime).await
+        })
+    }
+
     async fn process_editor_event(
         &mut self,
         ev: event::Event,
@@ -10381,15 +10400,7 @@ impl Editor {
             let was_deferring = self.defer_motion_render;
             self.defer_motion_render = true;
             self.request_motion_render(MotionRender::Full);
-            let result = async {
-                let action = Action::NotifyPlugins(
-                    "editor:resize".to_string(),
-                    serde_json::to_value(self.size)?,
-                );
-                self.execute(&action, buffer, runtime).await?;
-                self.service_background(buffer, runtime).await
-            }
-            .await;
+            let result = self.publish_resize(buffer, runtime).await;
             self.defer_motion_render = was_deferring;
             result?;
             if !was_deferring {

@@ -150,6 +150,28 @@ fn resize_editor(width: usize, height: usize) -> (Editor, RenderBuffer) {
     (editor, buffer)
 }
 
+#[test]
+fn resize_experience_keeps_input_event_future_small() {
+    let (mut editor, mut buffer) = resize_editor(80, 24);
+    let mut runtime = Runtime::new();
+    let background_bytes =
+        std::mem::size_of_val(&editor.service_background(&mut buffer, &mut runtime));
+    let event = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    let event_bytes = std::mem::size_of_val(&editor.process_editor_event(
+        event,
+        &mut buffer,
+        &mut runtime,
+        EventRenderMode::Immediate,
+    ));
+
+    // Every input future reserves space for its largest branch. Keep the
+    // resize-only background service out of nested editing and replay calls.
+    assert!(
+        event_bytes <= 4 * 1024,
+        "input event future is {event_bytes} bytes; background future is {background_bytes} bytes"
+    );
+}
+
 #[tokio::test]
 async fn resize_experience_preserves_logical_cursor_through_shrink_and_grow() {
     for wrap in [false, true] {
