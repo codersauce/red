@@ -601,6 +601,7 @@ fn inline_comment_navigation_preserves_treesitter_class_motions() {
 
 fn begin_assist(editor: &mut Editor, range: TextRange, request: &str, group: &str) {
     editor.inline_assist = Some(super::super::InlineAssistSession {
+        allow_expansion: false,
         buffer_id: editor.current_buffer().id(),
         window_id: editor.window_manager.active_stable_window_id().unwrap(),
         expected_revision: editor.current_buffer().revision(),
@@ -625,6 +626,161 @@ fn note(start: usize, end: usize, message: &str) -> InlineCommentInput {
 }
 
 #[tokio::test]
+async fn inline_overlap_navigation_has_stable_mouse_and_keyboard_targets() {
+    let original = "alpha\nbeta\ngamma\ndelta\nepsilon\n";
+    let mut editor = editor(original, 100, 24, false);
+    editor.replace_inline_comment_group(
+        "overlap",
+        "provider",
+        "request",
+        0,
+        &[
+            note(1, 2, "First"),
+            note(2, 3, "Second"),
+            note(3, 3, "Third"),
+        ],
+    );
+    let ids = editor
+        .inline_comments
+        .iter()
+        .map(|comment| comment.id)
+        .collect::<Vec<_>>();
+    editor.replace_inline_comment_group(
+        "separate",
+        "provider",
+        "other",
+        0,
+        &[note(5, 5, "Elsewhere")],
+    );
+    editor.select_inline_comment_for_group("overlap");
+    assert_eq!(editor.current_inline_navigation(), Some((ids[0], 1, 3)));
+    editor.move_to_text_position(TextPosition::new(2, 0));
+    assert_eq!(editor.current_inline_navigation(), Some((ids[0], 1, 3)));
+    assert_eq!(
+        editor.cycle_overlapping_inline_comment(ids[0], true),
+        Some(ids[2])
+    );
+    assert_eq!(
+        editor.cycle_overlapping_inline_comment(ids[2], false),
+        Some(ids[0])
+    );
+
+    editor.sync_to_window();
+    let window = editor.active_window_with_editor_view().unwrap();
+    let layout = editor.layout_for_window(&window);
+    let header = layout
+        .inline_comments
+        .iter()
+        .find(|row| row.starts_connection)
+        .unwrap();
+    assert!(header.content.text().contains("Inline 1 of 3"));
+    assert_eq!(
+        editor.inline_comment_click_action(header, header.text_offset),
+        Some(Action::NavigateOverlappingInlineComment {
+            id: ids[0],
+            backwards: true,
+            open: false
+        })
+    );
+    assert_eq!(
+        editor.inline_comment_click_action(header, header.text_offset + 4),
+        Some(Action::NavigateOverlappingInlineComment {
+            id: ids[0],
+            backwards: false,
+            open: false
+        })
+    );
+    assert_eq!(
+        editor.inline_comment_click_action(header, header.text_offset - 1),
+        None
+    );
+    editor
+        .test_execute_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: (window.position.x
+                + editor.gutter_width_for_window(&window)
+                + 1
+                + header.text_offset
+                + 4) as u16,
+            row: editor.window_to_terminal_y(&window, header.row) as u16,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(editor.current_inline_navigation(), Some((ids[1], 2, 3)));
+
+    editor.sync_to_window();
+    let window = editor.active_window_with_editor_view().unwrap();
+    let layout = editor.layout_for_window(&window);
+    let body = layout
+        .inline_comments
+        .iter()
+        .find(|row| row.content.text() == "Second")
+        .unwrap();
+    editor
+        .test_execute_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: (window.position.x
+                + editor.gutter_width_for_window(&window)
+                + 1
+                + body.text_offset) as u16,
+            row: editor.window_to_terminal_y(&window, body.row) as u16,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .await
+        .unwrap();
+    let next = editor
+        .current_dialog
+        .as_mut()
+        .unwrap()
+        .handle_event(&Event::Key(KeyEvent::new(
+            KeyCode::Char(']'),
+            KeyModifiers::NONE,
+        )));
+    assert_eq!(
+        next,
+        Some(KeyAction::Single(
+            Action::NavigateOverlappingInlineComment {
+                id: ids[1],
+                backwards: false,
+                open: true
+            }
+        ))
+    );
+    let Some(KeyAction::Single(next)) = next else {
+        panic!("expected navigation")
+    };
+    editor.test_execute_production_action(next).await.unwrap();
+    assert_eq!(editor.current_inline_navigation(), Some((ids[2], 3, 3)));
+    editor
+        .test_execute_production_action(Action::CloseDialog)
+        .await
+        .unwrap();
+    for key in [' ', ']', 'i'] {
+        editor
+            .test_execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(key),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+    }
+    assert_eq!(editor.current_inline_navigation(), Some((ids[0], 1, 3)));
+    for key in [' ', '[', 'i'] {
+        editor
+            .test_execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(key),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+    }
+    assert_eq!(editor.current_inline_navigation(), Some((ids[2], 3, 3)));
+    assert_eq!(editor.current_buffer().contents(), original);
+    assert!(!editor.current_buffer().is_dirty());
+}
+
+#[tokio::test]
 async fn inline_comment_only_result_is_kept_without_a_text_transaction() {
     let mut editor = editor("alpha\nbeta\ngamma\n", 70, 16, false);
     begin_assist(
@@ -640,6 +796,7 @@ async fn inline_comment_only_result_is_kept_without_a_text_transaction() {
             "review",
             "test-session",
             &InlineAssistResult {
+                expanded_scope: None,
                 needs_agent: None,
                 replacement: None,
                 comments: vec![note(1, 2, "Both lines")],
@@ -672,6 +829,7 @@ async fn inline_comment_only_result_is_kept_without_a_text_transaction() {
             "review",
             "test-session",
             &InlineAssistResult {
+                expanded_scope: None,
                 needs_agent: None,
                 replacement: None,
                 comments: vec![note(1, 1, "Duplicate")]
@@ -704,6 +862,7 @@ async fn inline_mixed_result_validates_before_editing_and_undo_removes_its_group
     let mut frame = RenderBuffer::new(70, 16, &Style::default());
     let mut runtime = Runtime::new();
     let mut result = InlineAssistResult {
+        expanded_scope: None,
         needs_agent: None,
         replacement: Some("one\ntwo\n".into()),
         comments: vec![note(3, 3, "Outside")],
@@ -748,6 +907,7 @@ async fn inline_comment_refinement_replaces_only_its_own_group() {
                 request,
                 "test-session",
                 &InlineAssistResult {
+                    expanded_scope: None,
                     needs_agent: None,
                     replacement: None,
                     comments: vec![note(1, 2, message)],
@@ -768,7 +928,7 @@ async fn inline_comment_refinement_replaces_only_its_own_group() {
     assert!(
         editor.inline_comment_display_messages(editor.current_buffer())[0]
             .1
-            .contains("[2/2]")
+            .contains("Inline 2 of 2")
     );
     editor.inline_assist.as_mut().unwrap().request_id = Some("refine".into());
     editor
@@ -776,6 +936,7 @@ async fn inline_comment_refinement_replaces_only_its_own_group() {
             "refine",
             "test-session",
             &InlineAssistResult {
+                expanded_scope: None,
                 needs_agent: None,
                 replacement: None,
                 comments: vec![note(1, 1, "Refined")],

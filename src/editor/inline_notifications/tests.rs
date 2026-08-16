@@ -23,6 +23,7 @@ fn start(editor: &mut Editor, group: &str, request: &str, line: usize) {
     editor.park_inline_assist();
     let range = TextRange::new(TextPosition::new(line, 0), TextPosition::new(line + 1, 0));
     editor.inline_assist = Some(InlineAssistSession {
+        allow_expansion: false,
         buffer_id: editor.current_buffer().id(),
         window_id: editor.window_manager.active_stable_window_id().unwrap(),
         expected_revision: editor.current_buffer().revision(),
@@ -56,6 +57,7 @@ fn finish(editor: &mut Editor, request: &str, replacement: Option<&str>) {
         request,
         &format!("provider-{request}"),
         InlineAssistResult {
+            expanded_scope: None,
             needs_agent: None,
             replacement: replacement.map(str::to_owned),
             comments: vec![InlineCommentInput {
@@ -262,6 +264,31 @@ fn inline_completion_notice_does_not_expire_before_it_can_be_seen() {
         .expires_at
         .is_some());
     assert!(editor.poll_inline_completion_notice(Instant::now() + NOTICE_DURATION));
+}
+
+#[tokio::test]
+async fn inline_completion_click_cannot_bypass_a_draft_close_confirmation() {
+    let mut editor = editor();
+    start(&mut editor, "first", "one", 0);
+    editor.park_inline_assist();
+    finish(&mut editor, "one", None);
+    row(&mut editor);
+    let columns = editor.inline_completion.hit.as_ref().unwrap().0.clone();
+    action(&mut editor, Action::InlineAssist).await;
+    editor
+        .current_dialog
+        .as_mut()
+        .unwrap()
+        .handle_event(&Event::Paste("unsent draft".into()));
+    action(&mut editor, Action::HideInlineAssist).await;
+    assert!(editor
+        .current_dialog
+        .as_ref()
+        .unwrap()
+        .is_inline_draft_confirmation());
+    assert!(editor
+        .inline_completion_click(&click(columns.start))
+        .is_none());
 }
 
 #[tokio::test]

@@ -119,6 +119,15 @@ pub trait Component: Send {
         None
     }
 
+    /// Lets an unsent inline prompt confirm dismissal without replacing its editor.
+    fn request_inline_assist_close(&mut self) -> Option<Action> {
+        None
+    }
+
+    fn is_inline_draft_confirmation(&self) -> bool {
+        false
+    }
+
     fn is_inline_history(&self) -> bool {
         false
     }

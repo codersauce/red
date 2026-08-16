@@ -100,6 +100,9 @@ impl Editor {
         let InlineAssistPopupState::Prompt { initial, .. } = &job.state else {
             return None;
         };
+        if initial.trim().is_empty() {
+            return None;
+        }
         if !browser.workspace && browser.file.as_deref() != Some(job.location.file.as_str()) {
             return None;
         }
@@ -449,6 +452,11 @@ impl Editor {
                 history_location_label(&turn.location),
                 crate::ui::first_prompt_line(&turn.before)
             );
+            let context = if turn.context_reads.is_empty() {
+                String::new()
+            } else {
+                format!("\n\nContext read:\n- {}", turn.context_reads.join("\n- "))
+            };
             detail = match view {
                 1 => format!(
                     "{header}\n\nREVIEWED SOURCE · read-only\n{}",
@@ -466,7 +474,7 @@ impl Editor {
                     )
                 }
                 _ => format!(
-                    "{header}\n\nYou: {}\n\nAssistant: {}{}",
+                    "{header}\n\nYou: {}\n\nAssistant: {}{}{context}",
                     turn.prompt,
                     turn.answer_text(),
                     turn.error
@@ -675,6 +683,30 @@ impl Editor {
         let selected_row = rows.get(selected).cloned();
         if matches!(action, HistoryAction::Open) {
             if let Some(row) = selected_row {
+                if let Some(request) = row.key.request() {
+                    let historical = self
+                        .inline_history
+                        .conversations
+                        .iter()
+                        .find(|conversation| conversation.id == row.group)
+                        .and_then(|conversation| conversation.turns.last())
+                        .is_some_and(|latest| latest.request_id != request);
+                    if historical {
+                        if let Some(turn) = self.inline_history.turn(request) {
+                            self.current_dialog = Some(Box::new(
+                                HoverInfo::new(
+                                    self,
+                                    turn.answer_text(),
+                                    HoverInfoFormat::Plaintext,
+                                    Vec::new(),
+                                )
+                                .with_label("Historical inline answer")
+                                .with_close_action(Action::OpenInlineHistory),
+                            ));
+                            return self.render(buffer);
+                        }
+                    }
+                }
                 return self.open_inline_job(&row.group, buffer, runtime).await;
             }
             return Ok(());
@@ -743,6 +775,7 @@ impl Editor {
                                 range.end.line + usize::from(range.end.character > 0)
                             );
                             self.inline_assist = Some(InlineAssistSession {
+                                allow_expansion: turn.allow_expansion,
                                 buffer_id: self.current_buffer().id(),
                                 window_id,
                                 expected_revision: self.current_buffer().revision(),
@@ -1083,9 +1116,7 @@ impl Editor {
         }
         for conversation in &mut self.inline_history.conversations {
             for turn in &mut conversation.turns {
-                for location in
-                    std::iter::once(&mut turn.location).chain(turn.comment_locations.iter_mut())
-                {
+                for location in turn.locations_mut() {
                     if let Some(file) = location.buffer_id.and_then(|id| files.get(&id)) {
                         location.file.clone_from(file);
                     }
@@ -1150,6 +1181,12 @@ impl Editor {
             .annotation_group_id
             .clone();
         let turn = InlineHistoryTurn {
+            expanded_location: None,
+            allow_expansion: self
+                .inline_assist
+                .as_ref()
+                .is_some_and(|session| session.allow_expansion),
+            context_reads: Vec::new(),
             request_id: request.to_string(),
             created_at_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1275,6 +1312,7 @@ impl Editor {
                     if turn.request_id == request {
                         turn.location = location.clone();
                         turn.state = InlineTurnState::Completed;
+                        turn.expanded_location = None;
                         turn.error = None;
                         turn.result = Some(result.clone());
                         turn.session_id = Some(session.to_string());
@@ -1406,9 +1444,7 @@ impl Editor {
             .conversations
             .iter_mut()
             .flat_map(|conversation| &mut conversation.turns)
-            .flat_map(|turn| {
-                std::iter::once(&mut turn.location).chain(turn.comment_locations.iter_mut())
-            })
+            .flat_map(|turn| turn.locations_mut())
             .chain(self.inline_jobs.values_mut().map(|job| &mut job.location));
         for location in locations {
             if location.buffer_id != Some(id) {
@@ -1462,9 +1498,7 @@ impl Editor {
             .iter_mut()
             .flat_map(|conversation| &mut conversation.turns)
         {
-            for location in
-                std::iter::once(&mut turn.location).chain(turn.comment_locations.iter_mut())
-            {
+            for location in turn.locations_mut() {
                 if location.buffer_id == Some(id) {
                     location.buffer_id = None;
                 }
@@ -1542,6 +1576,26 @@ impl Editor {
 
     /// Reconstruct visible annotations from retained outcomes after recovery.
     pub(super) fn restore_inline_history_comments(&mut self) {
+        let expansions = self
+            .inline_history
+            .conversations
+            .iter()
+            .flat_map(|conversation| &conversation.turns)
+            .filter_map(|turn| {
+                let location = turn.expanded_location.as_ref()?;
+                let scope = turn.result.as_ref()?.expanded_scope.as_ref()?;
+                let (index, range, state) =
+                    self.resolve_history_source(location, &scope.before, true)?;
+                Some((turn.request_id.clone(), index, range, state))
+            })
+            .collect::<Vec<_>>();
+        for (request, index, range, state) in expansions {
+            let mut location = Self::history_location_in_buffer(&self.buffer_manager[index], range);
+            location.detached = state == InlineSourceState::Detached;
+            if let Some(turn) = self.inline_history.turn_mut(&request) {
+                turn.expanded_location = Some(location);
+            }
+        }
         let mut bindings = self
             .inline_history
             .conversations

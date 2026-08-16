@@ -96,6 +96,9 @@ pub struct InlineLocation {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InlineHistoryTurn {
+    /// False for explicit selections and records created before scope expansion.
+    #[serde(default)]
+    pub allow_expansion: bool,
     pub request_id: String,
     pub created_at_ms: u64,
     pub prompt: String,
@@ -103,9 +106,15 @@ pub struct InlineHistoryTurn {
     pub answer: String,
     #[serde(default)]
     pub answer_truncated: bool,
+    /// Bounded provenance labels for successful read-only context tools.
+    #[serde(default)]
+    pub context_reads: Vec<String>,
     pub before: String,
     pub original_range: TextRange,
     pub location: InlineLocation,
+    /// Verified wider proposal location; it grants no edit authority until review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expanded_location: Option<InlineLocation>,
     pub state: InlineTurnState,
     #[serde(default)]
     pub disposition: InlineDisposition,
@@ -127,6 +136,11 @@ pub struct InlineHistoryTurn {
 }
 
 impl InlineHistoryTurn {
+    pub(crate) fn locations_mut(&mut self) -> impl Iterator<Item = &mut InlineLocation> {
+        std::iter::once(&mut self.location)
+            .chain(self.expanded_location.iter_mut())
+            .chain(self.comment_locations.iter_mut())
+    }
     pub fn reviewed(&self) -> &str {
         self.result
             .as_ref()
@@ -136,17 +150,26 @@ impl InlineHistoryTurn {
 
     pub fn answer_text(&self) -> String {
         if self.state != InlineTurnState::Completed {
+            let expanded = self
+                .result
+                .as_ref()
+                .and_then(|result| result.expanded_scope.as_ref());
+            let before = expanded.map_or(self.before.as_str(), |scope| scope.before.as_str());
             if let Some(replacement) = self
                 .result
                 .as_ref()
                 .and_then(|result| result.replacement.as_deref())
-                .filter(|replacement| *replacement != self.before.as_str())
+                .filter(|replacement| *replacement != before)
             {
-                let diff = similar::TextDiff::from_lines(self.before.as_str(), replacement)
+                let diff = similar::TextDiff::from_lines(before, replacement)
                     .unified_diff()
                     .header("before", "proposed")
                     .to_string();
-                return format!("{}\n\nProposed edit · not applied\n{diff}", self.answer);
+                let heading = expanded.map_or_else(|| "Proposed edit · not applied".into(), |scope| format!(
+                    "Wider edit proposed · not applied\n{}:{}–{}\nOriginal target: lines {}–{}\nReason: {}",
+                    self.location.file, scope.start_line, scope.end_line, self.original_range.start.line + 1,
+                    self.original_range.end.line + usize::from(self.original_range.end.character > 0), scope.reason));
+                return format!("{}\n\n{heading}\n\n{diff}", self.answer);
             }
         }
         if !self.answer.trim().is_empty() {
@@ -327,8 +350,7 @@ impl InlineHistory {
             .iter_mut()
             .flat_map(|conversation| &mut conversation.turns)
         {
-            turn.location.buffer_id = None;
-            for location in &mut turn.comment_locations {
+            for location in turn.locations_mut() {
                 location.buffer_id = None;
             }
             if turn.state == InlineTurnState::Pending {
@@ -388,6 +410,17 @@ impl InlineHistory {
                 );
                 if let Some(result) = &turn.result {
                     result.validate()?;
+                    if turn.state == InlineTurnState::Ready && result.expanded_scope.is_some() {
+                        ensure!(
+                            turn.allow_expansion
+                                && turn
+                                    .expanded_location
+                                    .as_ref()
+                                    .is_some_and(|location| location.file == turn.location.file
+                                        && location.start_char <= location.end_char),
+                            "invalid pending wider edit location"
+                        );
+                    }
                 }
             }
         }

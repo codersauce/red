@@ -57,6 +57,7 @@ fn editor(text: &str) -> Editor {
 
 fn begin(editor: &mut Editor, group: &str, request: &str, range: TextRange, prompt: &str) {
     editor.inline_assist = Some(InlineAssistSession {
+        allow_expansion: false,
         buffer_id: editor.current_buffer().id(),
         window_id: editor.window_manager.active_stable_window_id().unwrap(),
         expected_revision: editor.current_buffer().revision(),
@@ -77,6 +78,7 @@ fn begin(editor: &mut Editor, group: &str, request: &str, range: TextRange, prom
 
 async fn complete(editor: &mut Editor, request: &str, replacement: Option<&str>, message: &str) {
     let result = InlineAssistResult {
+        expanded_scope: None,
         needs_agent: None,
         replacement: replacement.map(str::to_string),
         comments: vec![InlineCommentInput {
@@ -544,6 +546,7 @@ async fn removing_one_comment_target_detaches_it_without_losing_the_conversation
         "Review the function",
     );
     let result = InlineAssistResult {
+        expanded_scope: None,
         needs_agent: None,
         replacement: None,
         comments: vec![InlineCommentInput {
@@ -851,6 +854,190 @@ async fn run_history_action(editor: &mut Editor, action: HistoryAction) {
 }
 
 #[tokio::test]
+async fn inline_history_open_selects_the_requested_overlapping_result() {
+    let mut editor = editor("alpha\nbeta\ngamma\n");
+    let target = line_range(0, 3);
+    let mut frame = RenderBuffer::new(100, 30, &Style::default());
+    let mut runtime = Runtime::new();
+    begin(&mut editor, "greeting", "hello", target, "hi");
+    editor.inline_history.append_answer("hello", "Hello there");
+    editor
+        .apply_inline_result(
+            "hello",
+            "provider",
+            &InlineAssistResult {
+                expanded_scope: None,
+                replacement: None,
+                needs_agent: None,
+                comments: Vec::new(),
+            },
+            &mut frame,
+            &mut runtime,
+        )
+        .await
+        .unwrap();
+    editor.park_inline_assist();
+    begin(
+        &mut editor,
+        "explanation",
+        "explain",
+        target,
+        "Explain the function",
+    );
+    editor
+        .apply_inline_result(
+            "explain",
+            "provider",
+            &InlineAssistResult {
+                expanded_scope: None,
+                replacement: None,
+                needs_agent: None,
+                comments: (1..=3)
+                    .map(|line| InlineCommentInput {
+                        start_line: line,
+                        end_line: None,
+                        message: format!("Explanation {line}"),
+                    })
+                    .collect(),
+            },
+            &mut frame,
+            &mut runtime,
+        )
+        .await
+        .unwrap();
+    editor
+        .open_inline_job("greeting", &mut frame, &mut runtime)
+        .await
+        .unwrap();
+    let greeting = editor.current_inline_comment_id().unwrap();
+    assert!(
+        editor.inline_comment_display_messages(editor.current_buffer())[0]
+            .1
+            .contains("Hello there")
+    );
+
+    editor
+        .open_inline_history(&mut frame, &mut runtime)
+        .await
+        .unwrap();
+    let index = editor
+        .history_rows()
+        .iter()
+        .position(|row| row.key == HistoryKey::Turn("explain".into()))
+        .unwrap();
+    run_history_action(&mut editor, HistoryAction::Select(index)).await;
+    run_history_action(&mut editor, HistoryAction::Open).await;
+    assert_eq!(
+        editor.inline_assist.as_ref().unwrap().annotation_group_id,
+        "explanation"
+    );
+    let (selected, ordinal, count) = editor.current_inline_navigation().unwrap();
+    assert_ne!(selected, greeting);
+    assert_eq!((ordinal, count), (2, 4));
+    assert!(
+        editor.inline_comment_display_messages(editor.current_buffer())[0]
+            .1
+            .contains("Explanation 1")
+    );
+    let previous = editor
+        .current_dialog
+        .as_mut()
+        .unwrap()
+        .handle_event(&Event::Key(KeyEvent::new(
+            KeyCode::Char('['),
+            KeyModifiers::NONE,
+        )));
+    assert_eq!(
+        previous,
+        Some(KeyAction::Single(
+            Action::NavigateOverlappingInlineComment {
+                id: selected,
+                backwards: true,
+                open: true
+            }
+        ))
+    );
+    editor
+        .execute(&Action::ViewInlineAssistAnswer, &mut frame, &mut runtime)
+        .await
+        .unwrap();
+    assert_eq!(
+        editor
+            .current_dialog
+            .as_mut()
+            .unwrap()
+            .handle_event(&Event::Key(KeyEvent::new(
+                KeyCode::Char('['),
+                KeyModifiers::NONE,
+            ))),
+        previous
+    );
+    let Some(KeyAction::Single(previous)) = previous else {
+        panic!("expected navigation")
+    };
+    editor
+        .execute(&previous, &mut frame, &mut runtime)
+        .await
+        .unwrap();
+    assert_eq!(editor.current_inline_comment_id(), Some(greeting));
+    assert_eq!(
+        editor.inline_assist.as_ref().unwrap().annotation_group_id,
+        "greeting"
+    );
+    assert_eq!(editor.current_buffer().contents(), "alpha\nbeta\ngamma\n");
+}
+
+#[tokio::test]
+async fn inline_history_opens_the_selected_older_answer_not_the_latest() {
+    let mut editor = editor("alpha\n");
+    begin(
+        &mut editor,
+        "conversation",
+        "first",
+        line_range(0, 1),
+        "First question",
+    );
+    complete(&mut editor, "first", None, "First answer").await;
+    begin(
+        &mut editor,
+        "conversation",
+        "second",
+        line_range(0, 1),
+        "Second question",
+    );
+    complete(&mut editor, "second", None, "Second answer").await;
+    editor
+        .open_inline_history(
+            &mut RenderBuffer::new(100, 30, &Style::default()),
+            &mut Runtime::new(),
+        )
+        .await
+        .unwrap();
+    run_history_action(&mut editor, HistoryAction::Expand).await;
+    let index = editor
+        .history_rows()
+        .iter()
+        .position(|row| row.key == HistoryKey::Turn("first".into()))
+        .unwrap();
+    run_history_action(&mut editor, HistoryAction::Select(index)).await;
+    run_history_action(&mut editor, HistoryAction::Open).await;
+    let mut frame = RenderBuffer::new(100, 30, &Style::default());
+    editor.render(&mut frame).unwrap();
+    let text = frame.cells.iter().map(|cell| cell.c).collect::<String>();
+    assert!(text.contains("First answer"));
+    assert!(!text.contains("Second answer"));
+    assert_eq!(
+        editor
+            .current_dialog
+            .as_mut()
+            .unwrap()
+            .handle_event(&Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))),
+        Some(KeyAction::Single(Action::OpenInlineHistory))
+    );
+    assert_eq!(editor.current_buffer().contents(), "alpha\n");
+}
+
+#[tokio::test]
 async fn inline_history_unifies_drafts_running_jobs_ready_edits_and_completed_turns() {
     let mut editor = editor("alpha\nbeta\ngamma\n");
     begin(
@@ -874,6 +1061,7 @@ async fn inline_history_unifies_drafts_running_jobs_ready_edits_and_completed_tu
         "ready",
         "provider",
         InlineAssistResult {
+            expanded_scope: None,
             replacement: Some("BETA\n".into()),
             comments: Vec::new(),
             needs_agent: None,
@@ -906,6 +1094,10 @@ async fn inline_history_unifies_drafts_running_jobs_ready_edits_and_completed_tu
         .handle_event(&Event::Paste("polychromatic zebras".into()));
     editor
         .execute(&Action::HideInlineAssist, &mut frame, &mut runtime)
+        .await
+        .unwrap();
+    editor
+        .execute(&Action::SaveInlineAssistDraft, &mut frame, &mut runtime)
         .await
         .unwrap();
     editor
@@ -988,6 +1180,7 @@ async fn inline_history_live_refresh_preserves_selection_scroll_and_source_posit
         "two",
         "provider",
         InlineAssistResult {
+            expanded_scope: None,
             replacement: None,
             comments: Vec::new(),
             needs_agent: None,
@@ -1157,6 +1350,7 @@ async fn inline_history_restoration_skips_detached_ranges_and_marks_changed_sour
         "Review both lines",
     );
     let result = InlineAssistResult {
+        expanded_scope: None,
         replacement: None,
         needs_agent: None,
         comments: vec![

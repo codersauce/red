@@ -124,6 +124,29 @@ impl Editor {
             match turn.state {
                 InlineTurnState::Pending => return InlineAssistPopupState::Working,
                 InlineTurnState::Ready => {
+                    if let Some(scope) = turn
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.expanded_scope.as_ref())
+                    {
+                        let current = self.pending_inline_expansion_range(session);
+                        let (start, end) =
+                            current
+                                .as_ref()
+                                .map_or((scope.start_line, scope.end_line), |range| {
+                                    (
+                                        range.start.line + 1,
+                                        range.end.line + usize::from(range.end.character > 0),
+                                    )
+                                });
+                        return InlineAssistPopupState::WiderReady {
+                            stale: current.is_err(),
+                            summary: format!(
+                                "Wider edit · lines {}–{}\n{}",
+                                start, end, scope.reason
+                            ),
+                        };
+                    }
                     if let Some(reason) = turn
                         .result
                         .as_ref()
@@ -180,11 +203,31 @@ impl Editor {
         let Some(session) = self.inline_assist.take() else {
             return;
         };
-        let state = self
+        let mut state = self
             .current_dialog
             .as_ref()
             .and_then(|dialog| dialog.inline_assist_state())
             .unwrap_or_else(|| self.inline_session_state(&session));
+        if matches!(&state, InlineAssistPopupState::Prompt { initial, .. } if initial.trim().is_empty())
+        {
+            state = self.inline_session_state(&session);
+            if matches!(state, InlineAssistPopupState::Prompt { .. }) {
+                if let (Some(session_id), Some(bridge)) =
+                    (session.session_id, self.agent_manager.bridge())
+                {
+                    let _ = bridge.try_send(CodexCommand::CloseSession { session_id });
+                }
+                if self
+                    .current_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.inline_assist_state().is_some())
+                {
+                    self.current_dialog = None;
+                }
+                self.sync_inline_activity();
+                return;
+            }
+        }
         if let Some(location) = self.inline_session_location(&session) {
             self.inline_jobs.insert(
                 session.annotation_group_id.clone(),
@@ -233,6 +276,10 @@ impl Editor {
         provider: &str,
         result: InlineAssistResult,
     ) {
+        if result.expanded_scope.is_some() {
+            self.stage_expanded_inline_result(request, provider, result);
+            return;
+        }
         if !self
             .inline_history
             .turn(request)
@@ -299,7 +346,7 @@ impl Editor {
         let Some(result) = turn
             .result
             .as_ref()
-            .filter(|result| !result.changes_text(&turn.before))
+            .filter(|result| result.expanded_scope.is_none() && !result.changes_text(&turn.before))
         else {
             return;
         };
@@ -480,17 +527,17 @@ impl Editor {
             let status = match &state {
                 InlineAssistPopupState::Working => "Working",
                 InlineAssistPopupState::Ready { .. } => "● Ready",
+                InlineAssistPopupState::WiderReady { .. } => "◈ Review wider edit",
                 InlineAssistPopupState::AnswerRetained(_) => "✓ Answer retained",
                 InlineAssistPopupState::NeedsAgent(_) => "↗ Needs Agent",
                 InlineAssistPopupState::Failed(_) => "! Stopped",
                 InlineAssistPopupState::Prompt { .. } if parked_state.is_some() => "✎ Draft",
                 InlineAssistPopupState::Applied { comments: 0, .. }
-                    if parked_state.is_some()
-                        && turn.is_none_or(|turn| {
-                            turn.result
-                                .as_ref()
-                                .is_none_or(|result| result.comments.is_empty())
-                        }) =>
+                    if turn.is_none_or(|turn| {
+                        turn.result
+                            .as_ref()
+                            .is_none_or(|result| result.comments.is_empty())
+                    }) =>
                 {
                     "✓ Done"
                 }
@@ -519,17 +566,30 @@ impl Editor {
             } else {
                 format!("{status} · {} · Space H", display_prompt)
             };
-            let location = turn
-                .map(|turn| turn.location.clone())
-                .or_else(|| {
-                    self.inline_jobs
-                        .get(&session.annotation_group_id)
-                        .map(|job| job.location.clone())
-                })
-                .or_else(|| self.inline_session_location(session));
-            let Some((index, range, source_state)) = location.as_ref().and_then(|location| {
-                self.resolve_history_source(location, &session.expected_text, true)
-            }) else {
+            let expanded = turn
+                .filter(|_| matches!(state, InlineAssistPopupState::WiderReady { .. }))
+                .and_then(|turn| {
+                    Some((
+                        turn.expanded_location.as_ref()?,
+                        turn.result.as_ref()?.expanded_scope.as_ref()?,
+                    ))
+                });
+            let location = expanded.map(|(location, _)| location.clone()).or_else(|| {
+                turn.map(|turn| turn.location.clone())
+                    .or_else(|| {
+                        self.inline_jobs
+                            .get(&session.annotation_group_id)
+                            .map(|job| job.location.clone())
+                    })
+                    .or_else(|| self.inline_session_location(session))
+            });
+            let expected = expanded.map_or(session.expected_text.as_str(), |(_, scope)| {
+                scope.before.as_str()
+            });
+            let Some((index, range, source_state)) = location
+                .as_ref()
+                .and_then(|location| self.resolve_history_source(location, expected, true))
+            else {
                 continue;
             };
             if source_state == InlineSourceState::Detached {
@@ -665,7 +725,7 @@ impl Editor {
     pub(super) fn has_parked_inline_draft(&self, group: &str) -> bool {
         self.inline_jobs
             .get(group)
-            .is_some_and(|job| matches!(job.state, InlineAssistPopupState::Prompt { .. }))
+            .is_some_and(|job| matches!(&job.state, InlineAssistPopupState::Prompt { initial, .. } if !initial.trim().is_empty()))
     }
 
     pub(super) fn release_parked_inline_job(&mut self, group: &str) {
@@ -758,6 +818,7 @@ impl Editor {
                 && self.current_buffer().text_in_range(range) == expected_text;
             (
                 InlineAssistSession {
+                    allow_expansion: turn.allow_expansion,
                     buffer_id: self.current_buffer().id(),
                     window_id,
                     expected_revision: if exact {
@@ -819,8 +880,9 @@ impl Editor {
         };
         let scope = session.scope.clone();
         self.inline_assist = Some(session);
-        self.current_dialog = Some(Box::new(self.inline_assist_popup(scope, state)));
         self.sync_inline_activity();
+        self.select_inline_comment_for_group(group);
+        self.current_dialog = Some(Box::new(self.inline_assist_popup(scope, state)));
         self.render(frame)
     }
 }

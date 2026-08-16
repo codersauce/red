@@ -32,6 +32,8 @@ pub enum HoverInfoFormat {
 pub struct HoverInfo {
     label: String,
     close_action: Action,
+    inline_navigation: Option<uuid::Uuid>,
+    confirm_action: Option<(String, Action)>,
     source: String,
     format: HoverInfoFormat,
     actions: Vec<HoverAction>,
@@ -91,6 +93,8 @@ impl HoverInfo {
         let mut info = Self {
             label: "Hover".to_string(),
             close_action: Action::CloseDialog,
+            inline_navigation: None,
+            confirm_action: None,
             source,
             format,
             selected_action: (!actions.is_empty()).then_some(0),
@@ -137,6 +141,18 @@ impl HoverInfo {
         self
     }
 
+    pub(crate) fn with_inline_navigation(mut self, id: uuid::Uuid) -> Self {
+        self.inline_navigation = Some(id);
+        self.update_chrome();
+        self
+    }
+
+    pub(crate) fn with_confirm_action(mut self, label: impl Into<String>, action: Action) -> Self {
+        self.confirm_action = Some((label.into(), action));
+        self.update_chrome();
+        self
+    }
+
     fn content_height(&self) -> usize {
         self.height.saturating_sub(1)
     }
@@ -175,6 +191,15 @@ impl HoverInfo {
             },
         )
         .with_priority(ActionPriority::Essential)];
+        if let Some((label, _)) = &self.confirm_action {
+            actions.push(
+                UiAction::new("confirm", "Enter", label).with_priority(ActionPriority::Essential),
+            );
+        }
+        if self.inline_navigation.is_some() {
+            actions.push(UiAction::new("previous-inline", "[", "previous inline"));
+            actions.push(UiAction::new("next-inline", "]", "next inline"));
+        }
         if !self.actions.is_empty() {
             actions.push(
                 UiAction::new("open", "Enter", "open").with_priority(ActionPriority::Essential),
@@ -296,6 +321,22 @@ impl Component for HoverInfo {
     }
 
     fn handle_event(&mut self, event: &Event) -> Option<KeyAction> {
+        if let (Some((_, action)), Event::Key(key)) = (&self.confirm_action, event) {
+            if key.code == KeyCode::Enter && key.modifiers.is_empty() {
+                return Some(KeyAction::Single(action.clone()));
+            }
+        }
+        if let (Some(id), Event::Key(key)) = (self.inline_navigation, event) {
+            if matches!(key.code, KeyCode::Char('[' | ']')) && key.modifiers.is_empty() {
+                return Some(KeyAction::Single(
+                    Action::NavigateOverlappingInlineComment {
+                        id,
+                        backwards: key.code == KeyCode::Char('['),
+                        open: true,
+                    },
+                ));
+            }
+        }
         let redraw = || Some(KeyAction::Single(Action::Refresh));
         match event {
             Event::Key(key) => match (key.code, key.modifiers) {

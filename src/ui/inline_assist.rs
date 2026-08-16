@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 
 use crate::{
     config::KeyAction,
@@ -23,12 +23,14 @@ use super::{
 const MAX_WIDTH: usize = 72;
 const MAX_PROMPT_ROWS: usize = 6;
 const MAX_ERROR_ROWS: usize = 4;
+const CLOSE_CHOICES: [&str; 3] = ["Delete", "Edit", "Save draft"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InlineAssistPopupState {
     Prompt { initial: String, refining: bool },
     Working,
     Ready { stale: bool },
+    WiderReady { stale: bool, summary: String },
     AnswerRetained(String),
     Applied { edited: bool, comments: usize },
     NeedsAgent(String),
@@ -38,6 +40,9 @@ pub enum InlineAssistPopupState {
 pub struct InlineAssistPopup {
     state: InlineAssistPopupState,
     prompt: PromptBuffer,
+    title: String,
+    close_choice: Option<usize>,
+    navigation: Option<(uuid::Uuid, usize, usize)>,
     layout: OverlayLayout,
     dialog: Dialog,
     style: Style,
@@ -117,12 +122,19 @@ impl InlineAssistPopup {
             _ => String::new(),
         };
         let prompt = PromptBuffer::with_history(&initial, editor.inline_prompt_history());
+        let navigation = (!matches!(state, InlineAssistPopupState::Prompt { .. }))
+            .then(|| editor.current_inline_navigation())
+            .flatten();
         let width = Self::content_width(layout.viewport.width);
         let desired_height = Self::content_height(&state, &prompt, width);
         let (x, y, height) = Self::geometry(layout, width, desired_height);
         let style = editor.theme.ui_style.dialog.clone();
+        let title = navigation.map_or_else(
+            || format!("Inline assist · {scope}"),
+            |(_, ordinal, count)| format!("Inline assist · {scope} · inline {ordinal} of {count}"),
+        );
         let dialog = Dialog::new(
-            Some(format!("Inline assist · {scope}")),
+            Some(title.clone()),
             x,
             y,
             width,
@@ -135,6 +147,9 @@ impl InlineAssistPopup {
         Self {
             state,
             prompt,
+            title,
+            close_choice: None,
+            navigation,
             layout,
             dialog,
             style,
@@ -169,6 +184,9 @@ impl InlineAssistPopup {
             InlineAssistPopupState::Ready { .. } => 3,
             InlineAssistPopupState::Applied { .. } => 2,
             InlineAssistPopupState::AnswerRetained(message)
+            | InlineAssistPopupState::WiderReady {
+                summary: message, ..
+            }
             | InlineAssistPopupState::NeedsAgent(message)
             | InlineAssistPopupState::Failed(message) => wrap_text(message, width.max(1))
                 .rows
@@ -238,12 +256,116 @@ impl InlineAssistPopup {
 
     fn reflow(&mut self) {
         let width = Self::content_width(self.layout.viewport.width);
-        let desired_height = Self::content_height(&self.state, &self.prompt, width);
+        let desired_height = if self.close_choice.is_some() {
+            5
+        } else {
+            Self::content_height(&self.state, &self.prompt, width)
+        };
         let (x, y, height) = Self::geometry(self.layout, width, desired_height);
         self.dialog.x = x;
         self.dialog.y = y;
         self.dialog.width = width;
         self.dialog.height = height;
+        self.dialog.set_title(Some(if self.close_choice.is_some() {
+            "Unsent inline prompt".into()
+        } else {
+            self.title.clone()
+        }));
+    }
+
+    fn close_choice_rows(&self) -> (usize, usize, usize) {
+        let intro = usize::from(self.dialog.height >= 4);
+        let help = usize::from(self.dialog.height >= 5);
+        let count = self
+            .dialog
+            .height
+            .saturating_sub(intro + help)
+            .min(CLOSE_CHOICES.len());
+        let scroll = self
+            .close_choice
+            .unwrap_or(0)
+            .saturating_sub(count.saturating_sub(1));
+        (self.dialog.y + 1 + intro, count, scroll)
+    }
+
+    fn choose_close_action(&mut self, choice: usize) -> Option<KeyAction> {
+        match choice {
+            0 => Some(KeyAction::Single(Action::DiscardInlineAssistDraft)),
+            1 => {
+                self.close_choice = None;
+                self.prompt_changed()
+            }
+            2 => Some(KeyAction::Single(Action::SaveInlineAssistDraft)),
+            _ => None,
+        }
+    }
+
+    fn handle_close_choice(&mut self, event: &Event) -> Option<KeyAction> {
+        if let Event::Mouse(mouse) = event {
+            let (top, count, scroll) = self.close_choice_rows();
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                && (self.dialog.x + 1..self.dialog.x + 1 + self.dialog.width)
+                    .contains(&usize::from(mouse.column))
+                && (top..top + count).contains(&usize::from(mouse.row))
+            {
+                return self.choose_close_action(scroll + usize::from(mouse.row) - top);
+            }
+            return None;
+        }
+        let Event::Key(key) = event else {
+            return None;
+        };
+        match key.code {
+            KeyCode::Char('d') if key.modifiers.is_empty() => self.choose_close_action(0),
+            KeyCode::Esc | KeyCode::Char('e') => self.choose_close_action(1),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.choose_close_action(1)
+            }
+            KeyCode::Char('s') if key.modifiers.is_empty() => self.choose_close_action(2),
+            KeyCode::Enter => self.choose_close_action(self.close_choice.unwrap_or(0)),
+            KeyCode::Left | KeyCode::Up | KeyCode::BackTab => {
+                self.close_choice = Some((self.close_choice.unwrap_or(0) + 2) % 3);
+                Self::refresh_action()
+            }
+            KeyCode::Right | KeyCode::Down | KeyCode::Tab => {
+                self.close_choice = Some((self.close_choice.unwrap_or(0) + 1) % 3);
+                Self::refresh_action()
+            }
+            _ => None,
+        }
+    }
+
+    fn draw_close_choice(&self, buffer: &mut RenderBuffer) {
+        let x = self.dialog.x + 1;
+        let width = self.dialog.width;
+        if self.dialog.height >= 4 {
+            buffer.set_text(
+                x,
+                self.dialog.y + 1,
+                &truncate_display_width("What should happen to this draft?", width),
+                &self.style,
+            );
+        }
+        let selected_style = self.theme.selected_style(
+            &self.style,
+            &self.theme.ui_style.picker_selected_item,
+            crate::theme::SelectionForegroundPriority::Selection,
+        );
+        let (top, count, scroll) = self.close_choice_rows();
+        for (offset, label) in CLOSE_CHOICES.iter().enumerate().skip(scroll).take(count) {
+            let selected = self.close_choice == Some(offset);
+            let style = if selected {
+                &selected_style
+            } else {
+                &self.style
+            };
+            let label = format!("{} {label}", if selected { "›" } else { " " });
+            let label = crate::unicode_utils::fit_display_width(&label, width);
+            buffer.set_text(x, top + offset - scroll, &label, style);
+        }
+        if self.dialog.height >= 5 {
+            self.draw_actions(buffer, x, self.dialog.y + self.dialog.height, width);
+        }
     }
 
     fn prompt_changed(&mut self) -> Option<KeyAction> {
@@ -289,6 +411,22 @@ impl InlineAssistPopup {
 }
 
 impl Component for InlineAssistPopup {
+    fn is_inline_draft_confirmation(&self) -> bool {
+        self.close_choice.is_some()
+    }
+
+    fn request_inline_assist_close(&mut self) -> Option<Action> {
+        if !matches!(self.state, InlineAssistPopupState::Prompt { .. }) {
+            return None;
+        }
+        if self.prompt.text().trim().is_empty() {
+            return Some(Action::DiscardInlineAssistDraft);
+        }
+        self.close_choice = Some(0);
+        self.reflow();
+        Some(Action::Refresh)
+    }
+
     fn inline_assist_state(&self) -> Option<InlineAssistPopupState> {
         Some(match &self.state {
             InlineAssistPopupState::Prompt { refining, .. } => InlineAssistPopupState::Prompt {
@@ -302,15 +440,24 @@ impl Component for InlineAssistPopup {
     fn surface_actions(&self) -> Vec<UiAction> {
         let essential =
             |id, key, label| UiAction::new(id, key, label).with_priority(ActionPriority::Essential);
-        match &self.state {
+        if self.close_choice.is_some() {
+            return vec![
+                essential("choose", "Enter", "choose"),
+                UiAction::new("delete", "d", "delete"),
+                UiAction::new("edit", "e", "edit"),
+                UiAction::new("save", "s", "save draft"),
+                UiAction::new("cancel", "Esc", "edit"),
+            ];
+        }
+        let mut actions = match &self.state {
             InlineAssistPopupState::Prompt { .. } => vec![
                 essential("apply", "Enter", "ask"),
-                essential("hide", "Esc", "hide"),
+                essential("close", "Esc", "close"),
                 UiAction::new("previous-prompt", "Ctrl-p", "previous prompt")
                     .with_enabled(!self.prompt.history().is_empty()),
                 UiAction::new("next-prompt", "Ctrl-n", "next prompt")
                     .with_enabled(!self.prompt.history().is_empty()),
-                UiAction::new("cancel", "Ctrl-c", "discard"),
+                UiAction::new("cancel", "Ctrl-c", "close"),
             ],
             InlineAssistPopupState::Working => vec![
                 essential("hide", "Esc", "hide"),
@@ -329,6 +476,21 @@ impl Component for InlineAssistPopup {
                 ]);
                 actions
             }
+            InlineAssistPopupState::WiderReady { stale, .. } => vec![
+                essential(
+                    "review",
+                    "Enter",
+                    if *stale {
+                        "view stale diff"
+                    } else {
+                        "review wider diff"
+                    },
+                ),
+                UiAction::new("discard", "d", "decline"),
+                UiAction::new("refine", "r", "recheck"),
+                UiAction::new("agent", "A", "Agent"),
+                essential("hide", "Esc", "hide"),
+            ],
             InlineAssistPopupState::AnswerRetained(_) => vec![
                 essential("view", "v", "full answer"),
                 UiAction::new("refine", "r", "recheck"),
@@ -356,10 +518,19 @@ impl Component for InlineAssistPopup {
                 UiAction::new("agent", "A", "Agent"),
                 essential("hide", "Esc", "hide"),
             ],
+        };
+        if self.navigation.is_some() {
+            actions.push(UiAction::new("previous-inline", "[", "previous inline"));
+            actions.push(UiAction::new("next-inline", "]", "next inline"));
         }
+        actions
     }
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         self.dialog.draw(buffer)?;
+        if self.close_choice.is_some() {
+            self.draw_close_choice(buffer);
+            return Ok(());
+        }
         let x = self.dialog.x.saturating_add(1);
         let y = self.dialog.y.saturating_add(1);
         let width = self.dialog.width;
@@ -444,6 +615,9 @@ impl Component for InlineAssistPopup {
                 }
             }
             InlineAssistPopupState::AnswerRetained(message)
+            | InlineAssistPopupState::WiderReady {
+                summary: message, ..
+            }
             | InlineAssistPopupState::NeedsAgent(message)
             | InlineAssistPopupState::Failed(message) => {
                 if self.dialog.height > 0 {
@@ -453,6 +627,12 @@ impl Component for InlineAssistPopup {
                         &truncate_display_width(
                             match self.state {
                                 InlineAssistPopupState::AnswerRetained(_) => "Answer retained",
+                                InlineAssistPopupState::WiderReady { stale: true, .. } => {
+                                    "Source changed · review only"
+                                }
+                                InlineAssistPopupState::WiderReady { .. } => {
+                                    "Review required · source unchanged"
+                                }
                                 InlineAssistPopupState::NeedsAgent(_) => "Needs a broader edit",
                                 _ => "Inline assist failed",
                             },
@@ -510,6 +690,20 @@ impl Component for InlineAssistPopup {
         if matches!(event, Event::Key(key) if key.kind == KeyEventKind::Release) {
             return None;
         }
+        if self.close_choice.is_some() {
+            return self.handle_close_choice(event);
+        }
+        if let (Some((id, _, _)), Event::Key(key)) = (self.navigation, event) {
+            if matches!(key.code, KeyCode::Char('[' | ']')) && key.modifiers.is_empty() {
+                return Some(KeyAction::Single(
+                    Action::NavigateOverlappingInlineComment {
+                        id,
+                        backwards: key.code == KeyCode::Char('['),
+                        open: true,
+                    },
+                ));
+            }
+        }
         if let Event::Mouse(mouse) = event {
             if matches!(mouse.kind, MouseEventKind::Down(_))
                 && !self.inside(mouse.column as usize, mouse.row as usize)
@@ -519,20 +713,16 @@ impl Component for InlineAssistPopup {
             return None;
         }
         match &self.state {
-            InlineAssistPopupState::Prompt { refining, .. } => match event {
+            InlineAssistPopupState::Prompt { .. } => match event {
                 Event::Paste(text) => {
                     self.insert(text);
                     self.prompt_changed()
                 }
                 Event::Key(key) => match (key.code, key.modifiers) {
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                        Some(KeyAction::Single(Action::CancelInlineAssist))
+                        Some(KeyAction::Single(Action::HideInlineAssist))
                     }
-                    (KeyCode::Esc, _) => Some(KeyAction::Single(if *refining {
-                        Action::CancelInlineAssistRefine
-                    } else {
-                        Action::HideInlineAssist
-                    })),
+                    (KeyCode::Esc, _) => Some(KeyAction::Single(Action::HideInlineAssist)),
                     (KeyCode::Enter, _) => {
                         let prompt = self.prompt.text().trim().to_string();
                         (!prompt.is_empty())
@@ -610,6 +800,21 @@ impl Component for InlineAssistPopup {
                 },
                 _ => None,
             },
+            InlineAssistPopupState::WiderReady { .. } => match event {
+                Event::Key(key) => match key.code {
+                    KeyCode::Enter | KeyCode::Char('v') => {
+                        Some(KeyAction::Single(Action::ViewInlineAssistAnswer))
+                    }
+                    KeyCode::Char('d') => {
+                        Some(KeyAction::Single(Action::RejectPendingInlineAssist))
+                    }
+                    KeyCode::Char('r') => Some(KeyAction::Single(Action::RefineInlineAssist)),
+                    KeyCode::Char('A') => Some(KeyAction::Single(Action::EscalateInlineAssist)),
+                    KeyCode::Esc => Some(KeyAction::Single(Action::HideInlineAssist)),
+                    _ => None,
+                },
+                _ => None,
+            },
             InlineAssistPopupState::Applied { .. } => match event {
                 Event::Key(key) => match key.code {
                     KeyCode::Enter | KeyCode::Esc | KeyCode::Char('k') => {
@@ -665,7 +870,9 @@ impl Component for InlineAssistPopup {
     }
 
     fn cursor_position(&self) -> Option<(usize, usize)> {
-        if !matches!(self.state, InlineAssistPopupState::Prompt { .. }) {
+        if self.close_choice.is_some()
+            || !matches!(self.state, InlineAssistPopupState::Prompt { .. })
+        {
             return None;
         }
         let body_height = self
@@ -703,7 +910,8 @@ impl Component for InlineAssistPopup {
     }
 
     fn cursor_mode(&self) -> Option<Mode> {
-        matches!(self.state, InlineAssistPopupState::Prompt { .. }).then_some(Mode::Insert)
+        (self.close_choice.is_none() && matches!(self.state, InlineAssistPopupState::Prompt { .. }))
+            .then_some(Mode::Insert)
     }
 
     fn is_sensitive_input(&self) -> bool {
@@ -767,8 +975,79 @@ mod tests {
                 KeyCode::Char('c'),
                 KeyModifiers::CONTROL
             ))),
-            Some(KeyAction::Single(Action::CancelInlineAssist))
+            Some(KeyAction::Single(Action::HideInlineAssist))
         );
+    }
+
+    #[test]
+    fn inline_prompt_close_defaults_to_delete_and_edit_preserves_the_prompt_editor() {
+        let editor = editor();
+        let mut popup = InlineAssistPopup::new(
+            &editor,
+            "line 1",
+            InlineAssistPopupState::Prompt {
+                initial: "draft".into(),
+                refining: false,
+            },
+        );
+        popup.prompt.set_cursor(2);
+        popup.prompt.insert("!");
+        let text = popup.prompt.text();
+        let cursor = popup.prompt.cursor();
+        assert_eq!(popup.request_inline_assist_close(), Some(Action::Refresh));
+        assert_eq!(popup.close_choice, Some(0));
+        assert!(popup.cursor_position().is_none());
+        assert_eq!(
+            popup.handle_event(&Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE
+            ))),
+            Some(KeyAction::Single(Action::DiscardInlineAssistDraft))
+        );
+        assert_eq!(
+            popup.handle_event(&Event::Key(KeyEvent::new(
+                KeyCode::Char('e'),
+                KeyModifiers::NONE
+            ))),
+            Some(KeyAction::Single(Action::Refresh))
+        );
+        assert_eq!(popup.prompt.text(), text);
+        assert_eq!(popup.prompt.cursor(), cursor);
+        assert!(popup.prompt.undo());
+        assert_eq!(popup.prompt.text(), "draft");
+        popup.request_inline_assist_close();
+        popup.handle_event(&Event::Key(KeyEvent::new(
+            KeyCode::BackTab,
+            KeyModifiers::SHIFT,
+        )));
+        assert_eq!(popup.close_choice, Some(2));
+        assert_eq!(
+            popup.handle_event(&Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE
+            ))),
+            Some(KeyAction::Single(Action::SaveInlineAssistDraft))
+        );
+        let (top, count, scroll) = popup.close_choice_rows();
+        assert_eq!((count, scroll), (3, 0));
+        assert_eq!(
+            popup.handle_event(&Event::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: (popup.dialog.x + 1) as u16,
+                row: (top + 1) as u16,
+                modifiers: KeyModifiers::NONE,
+            })),
+            Some(KeyAction::Single(Action::Refresh))
+        );
+        assert!(popup.close_choice.is_none());
+        popup.prompt.set_text("  ");
+        assert_eq!(
+            popup.request_inline_assist_close(),
+            Some(Action::DiscardInlineAssistDraft)
+        );
+        assert!(popup.close_choice.is_none());
+        popup.state = InlineAssistPopupState::Working;
+        assert_eq!(popup.request_inline_assist_close(), None);
     }
 
     #[test]

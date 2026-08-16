@@ -78,7 +78,8 @@ impl Editor {
         !self.has_term()
             && !self.workspace_manager.is_active()
             && self.current_dialog.as_ref().is_none_or(|dialog| {
-                dialog.is_inline_history() || dialog.inline_assist_state().is_some()
+                !dialog.is_inline_draft_confirmation()
+                    && (dialog.is_inline_history() || dialog.inline_assist_state().is_some())
             })
     }
 

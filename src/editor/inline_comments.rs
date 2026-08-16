@@ -4,13 +4,16 @@ use sha2::{Digest as _, Sha256};
 use std::collections::HashSet;
 use uuid::Uuid;
 
-use super::{display_layout::LineSegment, AnchorAffinity, EditAnchor, Editor, Mode};
+use super::{
+    display_layout::{InlineCommentRow, LineSegment},
+    Action, AnchorAffinity, EditAnchor, Editor, Mode, RenderBuffer, Runtime,
+};
 use crate::{
     buffer::{Buffer, BufferId},
     inline_assist::InlineCommentInput,
     ui::{HoverInfo, HoverInfoFormat},
     undo::{AppliedTextEdit, TextPosition},
-    unicode_utils::{display_width_with_tabs, trim_line_ending},
+    unicode_utils::{display_width, display_width_with_tabs, trim_line_ending},
 };
 
 const MAX_BUFFER_COMMENTS: usize = 256;
@@ -89,6 +92,7 @@ struct CommentProjection {
     index: usize,
     ordinal: usize,
     count: usize,
+    members: Vec<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -412,6 +416,7 @@ impl Editor {
                 index: group[selected].0,
                 ordinal: selected + 1,
                 count: group.len(),
+                members: group.iter().map(|(index, _)| *index).collect(),
             });
             offset = next;
         }
@@ -425,7 +430,10 @@ impl Editor {
                 let comment = &self.inline_comments[view.index];
                 let mut message = String::new();
                 if view.count > 1 {
-                    message.push_str(&format!("[{}/{}] ", view.ordinal, view.count));
+                    message.push_str(&format!(
+                        "[<] [>] Inline {} of {} · Space v\n",
+                        view.ordinal, view.count
+                    ));
                 }
                 if comment.stale {
                     message.push_str("[outdated] ");
@@ -484,9 +492,161 @@ impl Editor {
             .or_else(|| {
                 self.comment_projections(buffer)
                     .into_iter()
+                    .find(|view| {
+                        view.members
+                            .iter()
+                            .any(|&index| at_line(&self.inline_comments[index]))
+                    })
                     .map(|view| view.index)
-                    .find(|&index| at_line(&self.inline_comments[index]))
             })
+    }
+
+    pub(crate) fn current_inline_navigation(&self) -> Option<(Uuid, usize, usize)> {
+        let index = self.current_inline_comment_index()?;
+        let view = self
+            .comment_projections(self.current_buffer())
+            .into_iter()
+            .find(|view| view.members.contains(&index))?;
+        let ordinal = view.members.iter().position(|&member| member == index)? + 1;
+        (view.count > 1).then_some((self.inline_comments[index].id, ordinal, view.count))
+    }
+
+    pub(super) fn current_inline_comment_id(&self) -> Option<Uuid> {
+        self.current_inline_comment_index()
+            .map(|index| self.inline_comments[index].id)
+    }
+
+    pub(super) fn select_inline_comment_for_group(&mut self, group: &str) {
+        let buffer_id = self.current_buffer().id();
+        let belongs = |comment: &InlineComment| {
+            comment.anchor.buffer_id == buffer_id
+                && self.inline_comment_visible(comment)
+                && matches!(&comment.origin, InlineCommentOrigin::Assist { group_id, .. } | InlineCommentOrigin::Activity { group_id } if group_id == group)
+        };
+        let selected = self
+            .inline_comments
+            .iter()
+            .filter(|comment| belongs(comment))
+            .find(|comment| Some(comment.id) == self.active_inline_comment)
+            .or_else(|| {
+                self.inline_comments
+                    .iter()
+                    .filter(|comment| belongs(comment))
+                    .find(|comment| matches!(comment.origin, InlineCommentOrigin::Assist { .. }))
+            })
+            .or_else(|| self.inline_comments.iter().find(|comment| belongs(comment)))
+            .map(|comment| (comment.id, comment.lines(self.current_buffer()).0));
+        if let Some((id, line)) = selected {
+            self.active_inline_comment = Some(id);
+            self.layout_cache.borrow_mut().clear();
+            self.move_to_text_position(TextPosition::new(line, 0));
+            self.refresh_cursor_goal();
+        }
+    }
+
+    /// Cycle only the connected overlap group containing the specified item.
+    pub(super) fn cycle_overlapping_inline_comment(
+        &mut self,
+        id: Uuid,
+        backwards: bool,
+    ) -> Option<Uuid> {
+        let view = self
+            .comment_projections(self.current_buffer())
+            .into_iter()
+            .find(|view| {
+                view.members
+                    .iter()
+                    .any(|&index| self.inline_comments[index].id == id)
+            })?;
+        let position = view
+            .members
+            .iter()
+            .position(|&index| self.inline_comments[index].id == id)?;
+        let next = if backwards {
+            (position + view.count - 1) % view.count
+        } else {
+            (position + 1) % view.count
+        };
+        let comment = &self.inline_comments[view.members[next]];
+        let id = comment.id;
+        let line = comment.lines(self.current_buffer()).0;
+        self.active_inline_comment = Some(id);
+        self.layout_cache.borrow_mut().clear();
+        self.move_to_text_position(TextPosition::new(line, 0));
+        self.refresh_cursor_goal();
+        self.last_error = Some(format!(
+            "inline {} of {} here · Space [/] i cycle · Space v open",
+            next + 1,
+            view.count
+        ));
+        Some(id)
+    }
+
+    pub(super) fn inline_comment_click_action(
+        &self,
+        row: &InlineCommentRow,
+        content_x: usize,
+    ) -> Option<Action> {
+        let text = row.content.text();
+        let column = content_x.checked_sub(row.text_offset)?;
+        if column >= display_width(text) {
+            return None;
+        }
+        let view = self
+            .comment_projections(self.current_buffer())
+            .into_iter()
+            .find(|view| {
+                self.inline_comments[view.index]
+                    .lines(self.current_buffer())
+                    .0
+                    == row.line
+            })?;
+        let id = self.inline_comments[view.index].id;
+        if row.starts_connection && view.count > 1 {
+            if column < 3 && text.starts_with("[<]") {
+                return Some(Action::NavigateOverlappingInlineComment {
+                    id,
+                    backwards: true,
+                    open: false,
+                });
+            }
+            if (4..7).contains(&column) && text.starts_with("[<] [>]") {
+                return Some(Action::NavigateOverlappingInlineComment {
+                    id,
+                    backwards: false,
+                    open: false,
+                });
+            }
+        }
+        Some(Action::OpenInlineComment(id))
+    }
+
+    pub(super) async fn open_inline_comment_by_id(
+        &mut self,
+        id: Uuid,
+        frame: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        self.park_inline_assist();
+        let Some(comment) = self.inline_comments.iter().find(|comment| {
+            comment.id == id
+                && comment.anchor.buffer_id == self.current_buffer().id()
+                && self.inline_comment_visible(comment)
+        }) else {
+            self.last_error = Some("inline item is no longer visible".into());
+            return self.render(frame);
+        };
+        if let InlineCommentOrigin::Activity { group_id } = &comment.origin {
+            let group = group_id.clone();
+            return self.open_inline_job(&group, frame, runtime).await;
+        }
+        let line = comment.lines(self.current_buffer()).0;
+        self.active_inline_comment = Some(id);
+        self.layout_cache.borrow_mut().clear();
+        self.move_to_text_position(TextPosition::new(line, 0));
+        self.refresh_cursor_goal();
+        self.show_inline_comment();
+        self.render(frame)
     }
 
     pub(super) fn navigate_inline_comment(&mut self, backwards: bool) {
@@ -579,7 +739,10 @@ impl Editor {
                 session_id,
                 request_id,
                 ..
-            } => format!("inline assist · session {session_id} · request {request_id}"),
+            } => self.inline_history.turn(request_id).map_or_else(
+                || format!("inline assist · session {session_id} · request {request_id}"),
+                |turn| format!("You: {}", turn.prompt),
+            ),
         };
         let text = format!(
             "Lines {}–{}{}\n{}\n\n{}",
@@ -589,10 +752,17 @@ impl Editor {
             provenance,
             comment.message
         );
-        self.current_dialog = Some(Box::new(
-            HoverInfo::new(self, text, HoverInfoFormat::Plaintext, Vec::new())
-                .with_label("Inline comment"),
-        ));
+        let navigation = self.current_inline_navigation();
+        let label = navigation.map_or_else(
+            || "Inline comment".into(),
+            |(_, ordinal, count)| format!("Inline {ordinal} of {count}"),
+        );
+        let mut hover =
+            HoverInfo::new(self, text, HoverInfoFormat::Plaintext, Vec::new()).with_label(label);
+        if let Some((id, _, _)) = navigation {
+            hover = hover.with_inline_navigation(id);
+        }
+        self.current_dialog = Some(Box::new(hover));
     }
 
     pub(super) fn clear_inline_comments(&mut self) {

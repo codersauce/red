@@ -36,6 +36,7 @@ pub mod headless;
 pub mod highlighter;
 mod indent;
 pub mod inline_assist;
+pub mod inline_context;
 pub mod inline_history;
 pub mod keyboard;
 pub mod language;

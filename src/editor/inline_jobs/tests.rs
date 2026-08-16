@@ -23,6 +23,7 @@ fn range(start: usize, end: usize) -> TextRange {
 fn start(editor: &mut Editor, group: &str, request: Option<&str>, target: TextRange) {
     editor.park_inline_assist();
     editor.inline_assist = Some(InlineAssistSession {
+        allow_expansion: false,
         buffer_id: editor.current_buffer().id(),
         window_id: editor.window_manager.active_stable_window_id().unwrap(),
         expected_revision: editor.current_buffer().revision(),
@@ -53,6 +54,7 @@ fn start(editor: &mut Editor, group: &str, request: Option<&str>, target: TextRa
 
 fn result(replacement: Option<&str>) -> InlineAssistResult {
     InlineAssistResult {
+        expanded_scope: None,
         needs_agent: None,
         replacement: replacement.map(str::to_string),
         comments: vec![InlineCommentInput {
@@ -103,6 +105,9 @@ async fn inline_draft_survives_click_away_and_source_relocation() {
         Some(KeyAction::Single(Action::HideInlineAssist))
     );
     action(&mut editor, Action::HideInlineAssist).await;
+    assert!(editor.inline_assist.is_some());
+    assert!(!editor.has_parked_inline_draft("draft"));
+    action(&mut editor, Action::SaveInlineAssistDraft).await;
     assert!(editor.inline_assist.is_none());
     assert!(editor.has_parked_inline_draft("draft"));
     editor.begin_transaction("insert above");
@@ -113,6 +118,82 @@ async fn inline_draft_survives_click_away_and_source_relocation() {
     assert!(
         matches!(popup(&editor), InlineAssistPopupState::Prompt { initial, .. } if initial == "Saved question extended")
     );
+}
+
+#[tokio::test]
+async fn inline_empty_prompt_closes_without_creating_a_draft() {
+    let mut editor = editor("alpha\n");
+    for text in ["", "   "] {
+        action(&mut editor, Action::InlineAssist).await;
+        editor
+            .current_dialog
+            .as_mut()
+            .unwrap()
+            .handle_event(&Event::Paste(text.into()));
+        action(&mut editor, Action::HideInlineAssist).await;
+        assert!(editor.current_dialog.is_none());
+        assert!(editor.inline_assist.is_none());
+        assert!(editor.inline_jobs.is_empty());
+        assert!(editor.inline_comments.is_empty());
+    }
+    action(&mut editor, Action::InlineAssist).await;
+    action(&mut editor, Action::OpenInlineHistory).await;
+    assert!(editor.inline_jobs.is_empty());
+    assert!(editor.history_rows().is_empty());
+}
+
+#[tokio::test]
+async fn inline_draft_close_can_edit_save_or_delete_without_losing_prior_results() {
+    let mut editor = editor("alpha\n");
+    start(&mut editor, "discussion", Some("one"), range(0, 1));
+    editor.park_inline_assist();
+    editor.stage_background_inline_result("one", "provider-one", result(None));
+    action(&mut editor, Action::OpenInlineJob("discussion".into())).await;
+    action(&mut editor, Action::RefineInlineAssist).await;
+    editor
+        .current_dialog
+        .as_mut()
+        .unwrap()
+        .handle_event(&Event::Paste("unfinished follow-up".into()));
+    action(&mut editor, Action::HideInlineAssist).await;
+    let edit = editor
+        .current_dialog
+        .as_mut()
+        .unwrap()
+        .handle_event(&Event::Key(KeyEvent::new(
+            KeyCode::Char('e'),
+            KeyModifiers::NONE,
+        )));
+    assert_eq!(edit, Some(KeyAction::Single(Action::Refresh)));
+    assert!(
+        matches!(popup(&editor), InlineAssistPopupState::Prompt { initial, .. } if initial == "unfinished follow-up")
+    );
+    action(&mut editor, Action::HideInlineAssist).await;
+    assert_eq!(
+        editor
+            .current_dialog
+            .as_mut()
+            .unwrap()
+            .handle_event(&Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE
+            ))),
+        Some(KeyAction::Single(Action::DiscardInlineAssistDraft))
+    );
+    action(&mut editor, Action::DiscardInlineAssistDraft).await;
+    assert!(editor.current_dialog.is_none());
+    assert!(!editor.has_parked_inline_draft("discussion"));
+    assert_eq!(
+        editor.inline_history.turn("one").unwrap().state,
+        InlineTurnState::Completed
+    );
+    assert_eq!(editor.inline_comment_group_count("discussion"), 1);
+    action(&mut editor, Action::OpenInlineJob("discussion".into())).await;
+    action(&mut editor, Action::RefineInlineAssist).await;
+    editor.park_inline_assist();
+    assert!(!editor.has_parked_inline_draft("discussion"));
+    assert!(editor.inline_jobs.contains_key("discussion"));
+    assert_eq!(editor.inline_comment_group_count("discussion"), 1);
 }
 
 #[tokio::test]

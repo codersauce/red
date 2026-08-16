@@ -15,9 +15,13 @@ Run `cargo run --bin red -- path/to/file` in this worktree.
 | Working-popup `Esc` / `Ctrl-c` | Hide without cancelling / explicitly cancel the request. |
 | Activity marker click / `Space v` | Reopen the selected inline job at its source. |
 | Ready-popup `v` / Enter | Inspect an off-screen code edit / apply it if source is unchanged. Explanations appear automatically. |
-| History Enter / `g` / `s` | Reopen the item / jump to source / restore the selected turn's annotations. |
-| Result-popup `s` | Restore retained annotations without reapplying a code edit. |
+| Wider-edit popup Enter / `v` / `d` | Review the proposed same-file diff / review / decline. Enter in the full review approves it. |
+| History Enter / `g` / `p` | Reopen the item / jump to source / pin the selected turn's annotations. |
+| Result-popup `p` | Pin retained annotations without reapplying a code edit. |
 | `Space ] c` / `Space [ c` | Select the next/previous annotation, including overlapping comments. |
+| `Space ] i` / `Space [ i` | Select the next/previous item in the current overlapping group. |
+| Card `[<]` / `[>]` | Select the previous/next overlapping item with the mouse. |
+| Full-view `[` / `]` | Browse the overlapping items while reading their full text. |
 | `Space v` | Read the full comment in a scrollable plain-text popup. |
 | `Space x` | Dismiss the selected comment. |
 | Normal-mode `Space C` | Add a random sample comment above the current line. Repeat to replace it with a different sample. |
@@ -40,8 +44,8 @@ foreground, adjusted for readability). Long comments wrap at word boundaries,
 with a four-text-row preview limit. Tiny splits reduce padding to keep the source
 line visible. Source line numbers, Vim motions, selections, file contents, and
 dirty state stay unchanged.
-Clicking an activity marker reopens its job; clicking an ordinary comment moves
-to its source line. Splits show the same buffer's
+Clicking an activity marker reopens its job; clicking ordinary comment text opens
+its full view. Splits show the same buffer's
 comments at their own widths.
 
 Questions, answers, and comments are retained in editor-session history. Edits above them move both range anchors;
@@ -52,6 +56,12 @@ The sample keys remain available for UI development. `:InlineHistory` provides e
 turns, reviewed-source snapshots, continuation, and rechecking. Normal editor
 recovery restores retained conversations; `persist_inline_history = false`
 disables disk retention. Regular-assistant annotation tools are not exposed yet.
+
+Inline assist can inspect project files and `HEAD` differences through bounded,
+read-only tools. Unsaved buffers win over disk, and reads never move editor
+focus. Successful reads are listed in the history conversation view. The write
+boundary remains the original target unless the user explicitly approves a
+validated wider same-file proposal. Explicit selections cannot be widened.
 
 To preview a range, press `V`, extend the selection with `j`/`k`, then press
 `Space C`. The status message identifies the inclusive line range. Model tools

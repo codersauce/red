@@ -424,11 +424,13 @@ Esc = { EnterMode = "Normal" }
 
 [keys.normal." "."]"]
 "c" = "NextInlineComment"
+"i" = "NextOverlappingInlineComment"
 "a" = "SwapNextParameter"
 "m" = "SwapNextFunction"
 
 [keys.normal." "."["]
 "c" = "PreviousInlineComment"
+"i" = "PreviousOverlappingInlineComment"
 "a" = "SwapPreviousParameter"
 "m" = "SwapPreviousFunction"
 

@@ -33,7 +33,19 @@ viewport, the popup remains usable near its source anchor. Long prompts soft-wra
 after that the prompt scrolls internally to keep the cursor visible.
 
 Each invocation starts an ephemeral Codex thread with a read-only sandbox, no
-native tools, and three submission tools. `submit_comments` leaves annotations
+native tools, four bounded project-reading tools, and four submission tools.
+`list_files`, `search_files`, and `read_file` inspect the same workspace without
+opening files or moving focus. Unsaved buffers take precedence over disk.
+`read_git_diff` compares one tracked file at `HEAD` with its current buffer,
+including unsaved changes. The response identifies the exact base commit.
+Reading more context does not expand the editable target. Inline requests have
+at most 12 context reads; file reads are limited to 200 lines and 32 KiB per
+response, and files larger than 512 KiB are omitted. Results report truncation.
+Sensitive, ignored, binary, symlinked, and out-of-workspace files are excluded.
+On platforms without the safe on-disk reader, open-buffer reads remain available
+and other disk reads fail closed.
+
+`submit_comments` leaves annotations
 without editing code; `submit_replacement` submits a complete replacement and
 optional annotations about the resulting code. `request_agent` returns an
 actionable broader-scope result without editing code or replacing earlier
@@ -49,6 +61,27 @@ result, and 4 KiB of plain text per comment. An empty comment list is a valid
 no-findings result. Follow-up
 refinements reuse that ephemeral thread while its job remains available.
 
+### Wider same-file proposals
+
+An invocation started from a cursor may use `propose_expanded_replacement`
+when a local refactor needs a larger range in the same file. An explicit visual
+selection remains exact, including after continuation or recovery. The proposal
+must contain and extend the original target, identify the editor revision, and
+include the exact original text. It cannot choose another file. Red verifies
+the source and retains at most 64 KiB of original text and a 128 KiB replacement.
+
+A wider proposal is never applied automatically, even with its popup open.
+The source marker says **Review wider edit**. Enter or `v` opens the full diff,
+with the original target, proposed range, and reason. Enter in that review
+approves one unsaved, undoable editor transaction. `d` in the result popup
+declines the proposal; Esc hides it. Both keep the discussion in InlineHistory.
+Changed source disables approval and requires a recheck. Rechecking an
+unapproved proposal starts from the original target, not the proposed range.
+Pending proposals survive normal recovery, but must still pass exact-source
+checks and explicit review. Multi-file work continues through Agent.
+
+### Applying inline results
+
 Before applying a response, Red verifies the active buffer identity, revision,
 range, and original text. A stale response fails without changing the buffer.
 Successful output is applied only after a completed turn and full validation.
@@ -56,16 +89,18 @@ Code changes use one agent-attributed editor transaction and are deliberately
 not saved. Comment-only results do not alter dirty state or text undo history.
 The result controls are Enter/`k` to keep, `u` to undo the latest inline edit
 and dismiss its comments (or just dismiss a comment-only result), `r` to
-refine, `v` to read the full answer and return, `s` to restore its annotations,
+refine, `v` to read the full answer and return, `p` to pin its annotations,
 and `A` to prepare a full Agent
 draft containing the latest request, source location, and earlier inline
 discussion. Nothing is sent automatically; replacing an unsent Agent draft
 requires confirmation and is undoable. Refinement replaces only that
 invocation's visible annotation group. Earlier turns remain in Inline History.
-Clicking away or pressing Esc while drafting or working hides the popup without
-losing the draft or cancelling the job. A source-anchored activity marker shows
+Clicking away or pressing Esc closes an empty inline prompt immediately. If it
+contains text, choose Delete (the default), Edit, or Save draft. Edit returns to
+the same prompt; Delete affects only unsent text, not earlier results. Closing a
+working popup still hides it without cancelling the job. A source-anchored activity marker shows
 an animated working spinner, ready, or stopped status. Click it, or use `Space v` on its source line,
-to reopen. `Ctrl-c` explicitly discards an initial draft or cancels a running
+to reopen. `Ctrl-c` opens the same draft choices or cancels a running
 request. Several requests can run independently. Explanations and comment-only
 results appear automatically when their source still matches, without changing
 source or focus. Proposed code edits completed while hidden are retained as
@@ -84,10 +119,14 @@ or run `:InlineLast` to reopen it. The notice lasts 12 seconds once shown; the s
 still opens the latest completion afterward. Existing errors and command input
 take precedence. Notifications never move focus or apply a proposed edit.
 
-Use `Space ] c` and `Space [ c` to navigate comments, `Space v` to read the full
-message, `Space x` to dismiss one, and `Space X` to clear the current buffer.
-Overlapping annotations are retained and collapsed into a numbered group; the
-navigation commands select which range its gutter bracket shows. Comments
+Use `Space ] c` and `Space [ c` to navigate comments across the file,
+`Space v` (or click the card text) to read the full message, `Space x` to dismiss
+one, and `Space X` to clear the current buffer. Overlapping annotations are
+retained and collapsed into a group. `Inline 2 of 4` means the second of four
+overlapping items is current, not a progress count; `✓ Done` is that request's
+completion status. Click `[<]` / `[>]`, or use `Space [ i` / `Space ] i`, to cycle
+only that group. The full viewer and result popup also accept `[` / `]`.
+Opening an item from History makes its annotations current. Comments
 follow edits above them and are marked outdated when their referenced source
 changes. They are never written into source files. Hiding or clearing comments
 does not delete the question or answer.
@@ -102,6 +141,8 @@ mouse previews items, `l` expands earlier turns, `h` collapses them, and `/`
 fuzzy-searches their text. Enter reopens the conversation or draft; `g` keeps
 the selected source location without opening a dialog. Esc restores the original
 location and comment visibility. Browsing never applies an edit.
+The conversation view also lists successful context reads, including editor
+revisions and Git base commits, so the answer's sources are inspectable.
 
 Press `p` to pin the previewed turn's annotations and return to
 the source. This also reopens a resolved discussion. It restores only annotations,

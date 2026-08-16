@@ -1352,6 +1352,8 @@ fn action_label(action: &Action) -> String {
         Action::CommandPalette => "All commands".to_string(),
         Action::OpenMessages => "Messages".to_string(),
         Action::OpenLatestInlineCompletion => "Last inline completion".to_string(),
+        Action::NextOverlappingInlineComment => "Next inline here".to_string(),
+        Action::PreviousOverlappingInlineComment => "Previous inline here".to_string(),
         Action::OpenInlineActivity | Action::OpenInlineHistory => {
             "Inline assist history".to_string()
         }
