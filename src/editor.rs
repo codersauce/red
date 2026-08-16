@@ -38434,6 +38434,57 @@ while True:
     }
 
     #[test]
+    fn scrollback_enter_copies_to_the_system_clipboard_without_sending() {
+        let mut editor = test_editor(80, 24);
+        let clipboard = crate::clipboard::MemoryClipboardProvider::default();
+        let copied = clipboard.shared_text();
+        editor.config.clipboard.enabled = true;
+        editor.config.clipboard.sync_on_yank = true;
+        editor.test_set_clipboard(Box::new(clipboard));
+        editor.test_create_text_panel(
+            "agent-conversation",
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Right,
+                width: 32,
+                composer: Some(plugin::TextPanelComposerConfig {
+                    placeholder: "Ask".into(),
+                    rows: 3,
+                }),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        editor.panel_manager.update_text_panel(
+            "agent-conversation",
+            vec![plugin::TextPanelBlock {
+                id: "answer".into(),
+                kind: plugin::TextPanelBlockKind::Text,
+                format: plugin::TextPanelBlockFormat::Plain,
+                text: "alpha beta".into(),
+            }],
+            22,
+            80,
+        );
+        assert!(editor.panel_manager.focus_panel("agent-conversation"));
+        for key in [
+            KeyCode::Char('g'),
+            KeyCode::Char('v'),
+            KeyCode::Char('e'),
+            KeyCode::Enter,
+        ] {
+            assert!(matches!(
+                editor
+                    .handle_panel_event(&Event::Key(KeyEvent::new(key, KeyModifiers::NONE)), None,),
+                Some(KeyAction::Single(Action::Refresh))
+            ));
+        }
+        assert_eq!(copied.lock().unwrap().as_deref(), Some("alpha"));
+        assert_eq!(
+            editor.panel_manager.focused_text_panel_cursor_mode(),
+            Some(Mode::Insert)
+        );
+    }
+
+    #[test]
     fn focused_text_panel_shift_h_does_not_open_agent_history() {
         let mut editor = test_editor(40, 10);
         editor.test_create_text_panel(

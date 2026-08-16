@@ -187,6 +187,7 @@ fn effective_panel_height(config: &PanelConfig, available_height: usize) -> usiz
 pub struct TextPanelComposerConfig {
     #[serde(default)]
     pub placeholder: String,
+    /// Minimum input rows; wrapped drafts grow within the available pane.
     #[serde(default = "default_composer_rows")]
     pub rows: usize,
 }
@@ -778,6 +779,15 @@ fn format_elapsed(seconds: u64) -> String {
 }
 
 const MAX_COMPOSER_BYTES: usize = PROMPT_MAX_BYTES;
+const COMPOSER_MAX_HEIGHT_PERCENT: usize = 70;
+const COMPOSER_CHROME_ROWS: usize = 2;
+
+struct ComposerLayoutCache {
+    buffer_id: BufferId,
+    revision: u64,
+    options: LayoutOptions,
+    layout: Arc<TextLayout>,
+}
 
 struct TextPanelComposer {
     config: TextPanelComposerConfig,
@@ -786,6 +796,7 @@ struct TextPanelComposer {
     enabled: bool,
     status: Option<String>,
     validation: Option<&'static str>,
+    layout_cache: RefCell<Option<ComposerLayoutCache>>,
 }
 
 impl TextPanelComposer {
@@ -794,8 +805,26 @@ impl TextPanelComposer {
         LayoutOptions::word(content_width.saturating_sub(2).max(1))
     }
 
-    fn layout(&self, content_width: usize) -> TextLayout {
-        self.prompt.layout(Self::layout_options(content_width))
+    fn layout(&self, content_width: usize) -> Arc<TextLayout> {
+        let options = Self::layout_options(content_width);
+        let buffer = self.prompt.buffer();
+        let mut cache = self.layout_cache.borrow_mut();
+        if let Some(cached) = cache.as_ref() {
+            if cached.buffer_id == buffer.id()
+                && cached.revision == buffer.revision()
+                && cached.options == options
+            {
+                return Arc::clone(&cached.layout);
+            }
+        }
+        let layout = Arc::new(self.prompt.layout(options));
+        *cache = Some(ComposerLayoutCache {
+            buffer_id: buffer.id(),
+            revision: buffer.revision(),
+            options,
+            layout: Arc::clone(&layout),
+        });
+        layout
     }
 
     fn handle_event(&mut self, event: &Event, content_width: usize) -> PromptInput {
@@ -811,6 +840,7 @@ impl TextPanelComposer {
             enabled: true,
             status: None,
             validation: None,
+            layout_cache: RefCell::new(None),
         }
     }
 
@@ -940,7 +970,7 @@ impl TextPanel {
     }
 
     fn page_scroll(&mut self, delta: isize, panel_height: usize, panel_width: usize) {
-        let page = self.visible_rows(panel_height).max(1) as isize;
+        let page = self.visible_rows(panel_height, panel_width).max(1) as isize;
         self.move_scroll(delta.saturating_mul(page), panel_height, panel_width);
     }
 
@@ -974,21 +1004,42 @@ impl TextPanel {
         self.layout(panel_width)
             .rendered
             .len()
-            .saturating_sub(self.visible_rows(panel_height))
+            .saturating_sub(self.visible_rows(panel_height, panel_width))
     }
 
-    fn visible_rows(&self, panel_height: usize) -> usize {
+    fn visible_rows(&self, panel_height: usize, panel_width: usize) -> usize {
         panel_height
             .saturating_sub(text_panel_header_rows(&self.config))
-            .saturating_sub(self.composer_height())
+            .saturating_sub(self.composer_height(panel_height, panel_width))
             .saturating_sub(self.status_height())
             .max(1)
     }
 
-    fn composer_height(&self) -> usize {
-        self.composer
-            .as_ref()
-            .map_or(0, |composer| composer.config.rows.max(1).saturating_add(2))
+    fn composer_height(&self, panel_height: usize, panel_width: usize) -> usize {
+        let Some(composer) = &self.composer else {
+            return 0;
+        };
+        let available = panel_height
+            .saturating_sub(text_panel_header_rows(&self.config))
+            .saturating_sub(self.status_height());
+        // Retain one transcript row. If even one input row and its chrome do
+        // not fit, hide the composer rather than drawing outside the pane.
+        let available = available.saturating_sub(1);
+        if available <= COMPOSER_CHROME_ROWS {
+            return 0;
+        }
+        let minimum = composer
+            .config
+            .rows
+            .max(1)
+            .saturating_add(COMPOSER_CHROME_ROWS);
+        let cap = panel_height.saturating_mul(COMPOSER_MAX_HEIGHT_PERCENT) / 100;
+        let desired = composer
+            .layout(TextPanelContentMetrics::new(panel_width).width)
+            .rows()
+            .len()
+            .saturating_add(COMPOSER_CHROME_ROWS);
+        desired.max(minimum).min(cap.max(minimum)).min(available)
     }
 
     fn copy_all(&self) -> String {
@@ -1081,7 +1132,7 @@ impl TextPanel {
         self.scrollback.mode = TextPanelScrollbackMode::Normal;
         self.scrollback.selection_anchor = None;
         self.follow_tail = false;
-        self.reveal_scrollback_cursor(&layout, panel_height);
+        self.reveal_scrollback_cursor(&layout, panel_height, width);
     }
 
     fn selected_link_target(&self, width: usize) -> Option<TextPanelLinkTarget> {
@@ -1581,7 +1632,7 @@ impl TextPanel {
         self.selected_link = None;
 
         // Include the card's heading and cap whenever the pane is tall enough.
-        let visible_rows = self.visible_rows(panel_height);
+        let visible_rows = self.visible_rows(panel_height, width);
         let max_scroll = layout.lines.len().saturating_sub(visible_rows);
         self.viewport.restore(card_start.min(max_scroll), false);
         self.viewport.reveal(row, visible_rows);
@@ -1641,13 +1692,14 @@ impl TextPanel {
         layout: &TextPanelLayout,
         found: &Range<usize>,
         panel_height: usize,
+        width: usize,
     ) {
         self.scrollback.cursor = layout.clamp(found.start);
         self.scrollback.initialized = true;
         self.scrollback.preferred_column = None;
         self.selected_link = None;
         self.follow_tail = false;
-        self.reveal_scrollback_cursor(layout, panel_height);
+        self.reveal_scrollback_cursor(layout, panel_height, width);
     }
 
     fn preview_transcript_search(&mut self, panel_height: usize, width: usize) {
@@ -1667,7 +1719,7 @@ impl TextPanel {
         };
         self.restore_search_origin(origin, false);
         if let Some(index) = text_panel_search_match(&matches, cursor, direction, 1) {
-            self.move_to_transcript_match(&layout, &matches[index], panel_height);
+            self.move_to_transcript_match(&layout, &matches[index], panel_height, width);
         }
     }
 
@@ -1715,7 +1767,7 @@ impl TextPanel {
         };
         self.search.visible = true;
         if let Some(index) = text_panel_search_match(&matches, cursor, direction, count) {
-            self.move_to_transcript_match(&layout, &matches[index], panel_height);
+            self.move_to_transcript_match(&layout, &matches[index], panel_height, width);
         }
     }
 
@@ -1842,12 +1894,18 @@ impl TextPanel {
         Some((start, end))
     }
 
-    fn reveal_scrollback_cursor(&mut self, layout: &TextPanelLayout, panel_height: usize) {
+    fn reveal_scrollback_cursor(
+        &mut self,
+        layout: &TextPanelLayout,
+        panel_height: usize,
+        width: usize,
+    ) {
         let Some((row, _, _)) = layout.position(self.scrollback.cursor) else {
             return;
         };
         self.viewport.restore(self.scroll, self.follow_tail);
-        self.viewport.reveal(row, self.visible_rows(panel_height));
+        self.viewport
+            .reveal(row, self.visible_rows(panel_height, width));
         self.scroll = self.viewport.offset();
         self.follow_tail = self.viewport.is_following();
     }
@@ -1867,7 +1925,7 @@ impl TextPanel {
         self.scrollback.cursor = layout.clamp(self.scrollback.cursor);
         let count = count.max(1);
         let (row, _, column) = layout.position(self.scrollback.cursor).unwrap_or_default();
-        let visible_rows = self.visible_rows(panel_height).max(1);
+        let visible_rows = self.visible_rows(panel_height, width).max(1);
         let target = match motion {
             TextPanelMotion::Left => self.scrollback.cursor.saturating_sub(count),
             TextPanelMotion::Right => self
@@ -1987,7 +2045,7 @@ impl TextPanel {
             self.scroll_to_bottom(panel_height, width);
         } else {
             self.follow_tail = false;
-            self.reveal_scrollback_cursor(&layout, panel_height);
+            self.reveal_scrollback_cursor(&layout, panel_height, width);
         }
         self.selected_link = None;
     }
@@ -2053,7 +2111,7 @@ impl TextPanel {
             self.scrollback.cursor = target;
             self.scrollback.preferred_column = None;
             self.follow_tail = false;
-            self.reveal_scrollback_cursor(&layout, panel_height);
+            self.reveal_scrollback_cursor(&layout, panel_height, width);
             self.selected_link = None;
         }
     }
@@ -2415,7 +2473,7 @@ impl PanelManager {
                     .map_or(0, |(row, _, _)| row);
                 panel.clamp_scroll(height, width);
                 if panel.scrollback.focused {
-                    panel.reveal_scrollback_cursor(&layout, height);
+                    panel.reveal_scrollback_cursor(&layout, height, width);
                 }
             }
         }
@@ -3307,6 +3365,33 @@ impl PanelManager {
                         .yank_scrollback(width)
                         .map(TextPanelScrollbackInput::Yank);
                 }
+                KeyCode::Enter
+                    if key.modifiers.is_empty()
+                        && panel.scrollback.mode != TextPanelScrollbackMode::Normal =>
+                {
+                    let yank = panel.yank_scrollback(width);
+                    panel.scrollback.mode = TextPanelScrollbackMode::Normal;
+                    panel.scrollback.selection_anchor = None;
+                    panel.scrollback.mouse_anchor = None;
+                    panel.scrollback.mouse_dragging = false;
+                    panel.move_scrollback(TextPanelMotion::Bottom, 1, panel_height, width);
+                    panel.scroll_to_bottom(panel_height, width);
+                    if panel
+                        .composer
+                        .as_ref()
+                        .is_some_and(|composer| composer.enabled)
+                    {
+                        panel.blur_scrollback();
+                        if let Some(composer) = panel.composer.as_mut() {
+                            composer.focused = true;
+                        }
+                        panel.last_focused_region = TextPanelFocusRegion::Composer;
+                    }
+                    return Some(yank.map_or(
+                        TextPanelScrollbackInput::Handled,
+                        TextPanelScrollbackInput::Yank,
+                    ));
+                }
                 KeyCode::Char('f' | 'F' | 't' | 'T') => {
                     panel.scrollback.pending_find = Some(PendingScrollbackFind {
                         direction: if matches!(key.code, KeyCode::Char('F' | 'T')) {
@@ -3387,7 +3472,7 @@ impl PanelManager {
             if panel.scrollback.focused {
                 let layout = panel.layout(width);
                 if let Some((row, _, column)) = layout.position(panel.scrollback.cursor) {
-                    let visible = panel.visible_rows(panel_height);
+                    let visible = panel.visible_rows(panel_height, width);
                     let first = panel.scroll;
                     let last = first
                         .saturating_add(visible.saturating_sub(1))
@@ -3480,7 +3565,7 @@ impl PanelManager {
         let metrics = TextPanelContentMetrics::new(placement.width);
         let content_height = placement
             .height
-            .saturating_sub(panel.composer_height())
+            .saturating_sub(panel.composer_height(placement.height, placement.width))
             .saturating_sub(panel.status_height());
         let screen_row = y.saturating_sub(placement.y);
         if screen_row < title_rows
@@ -3841,7 +3926,7 @@ impl PanelManager {
         if panel.scrollback.focused {
             let title_rows = text_panel_header_rows(&panel.config);
             let metrics = TextPanelContentMetrics::new(placement.width);
-            let visible_rows = panel.visible_rows(placement.height);
+            let visible_rows = panel.visible_rows(placement.height, placement.width);
             let layout = panel.layout(placement.width);
             if panel.search.active.is_some() {
                 let query = panel.search.query()?;
@@ -3884,9 +3969,13 @@ impl PanelManager {
             .unwrap_or_default();
         let row = position.row;
         let column = position.column;
-        let rows = composer.config.rows.max(1);
+        let composer_height = panel.composer_height(placement.height, placement.width);
+        let rows = composer_height.checked_sub(COMPOSER_CHROME_ROWS)?;
+        if rows == 0 {
+            return None;
+        }
         let first = row.saturating_sub(rows.saturating_sub(1));
-        let top = placement.height.saturating_sub(panel.composer_height());
+        let top = placement.height.saturating_sub(composer_height);
         Some((
             metrics
                 .x(placement.x)
@@ -3927,10 +4016,12 @@ impl PanelManager {
                 }
             }
 
+            let composer_height = panel.composer_height(placement.height, placement.width);
             let composer_top = placement
                 .y
-                .saturating_add(placement.height.saturating_sub(panel.composer_height()));
-            let action = if y >= composer_top
+                .saturating_add(placement.height.saturating_sub(composer_height));
+            let action = if composer_height > 0
+                && y >= composer_top
                 && panel
                     .composer
                     .as_ref()
@@ -3942,7 +4033,7 @@ impl PanelManager {
                     let cursor_row = wrapped
                         .position(composer.prompt.cursor())
                         .map_or(0, |position| position.row);
-                    let rows = composer.config.rows.max(1);
+                    let rows = composer_height.saturating_sub(COMPOSER_CHROME_ROWS);
                     let first = cursor_row.saturating_sub(rows.saturating_sub(1));
                     let row = first.saturating_add(y.saturating_sub(composer_top + 1));
                     let column = x.saturating_sub(metrics.x(placement.x).saturating_add(2));
@@ -3957,7 +4048,7 @@ impl PanelManager {
                 let title_rows = text_panel_header_rows(&panel.config);
                 let content_height = placement
                     .height
-                    .saturating_sub(panel.composer_height())
+                    .saturating_sub(composer_height)
                     .saturating_sub(panel.status_height());
                 let screen_row = y.saturating_sub(placement.y);
                 if screen_row >= title_rows && screen_row < content_height {
@@ -4029,7 +4120,7 @@ impl PanelManager {
         let metrics = TextPanelContentMetrics::new(placement.width);
         let content_height = placement
             .height
-            .saturating_sub(panel.composer_height())
+            .saturating_sub(panel.composer_height(placement.height, placement.width))
             .saturating_sub(panel.status_height());
         if content_height <= title_rows {
             return false;
@@ -4499,7 +4590,7 @@ fn render_text_panel(
         );
     }
 
-    let composer_height = panel.composer_height();
+    let composer_height = panel.composer_height(height, width);
     let status_height = panel.status_height();
     let content_height = height
         .saturating_sub(composer_height)
@@ -4624,7 +4715,7 @@ fn render_text_panel(
         );
     }
 
-    if let Some(composer) = &panel.composer {
+    if let Some(composer) = panel.composer.as_ref().filter(|_| composer_height > 0) {
         let overflow = match (scroll > 0, scroll < max_scroll) {
             (true, true) => TextPanelOverflow::Both,
             (true, false) => TextPanelOverflow::Above,
@@ -4653,6 +4744,7 @@ fn render_text_panel(
             content_position,
             metrics.width,
             content_height + status_height,
+            composer_height.saturating_sub(COMPOSER_CHROME_ROWS),
             overflow,
             &palette,
             theme,
@@ -4758,6 +4850,10 @@ const SCROLLBACK_NORMAL_HINTS: &[TextPanelShortcutHint] = &[
     },
 ];
 const SCROLLBACK_VISUAL_HINTS: &[TextPanelShortcutHint] = &[
+    TextPanelShortcutHint {
+        keys: "Enter",
+        action: "copy + latest",
+    },
     TextPanelShortcutHint {
         keys: "motions",
         action: "extend",
@@ -5048,6 +5144,7 @@ fn render_text_panel_composer(
     position: Point,
     width: usize,
     top: usize,
+    rows: usize,
     overflow: TextPanelOverflow,
     palette: &TextPanelPalette,
     theme: &Theme,
@@ -5057,7 +5154,6 @@ fn render_text_panel_composer(
     }
     let top = position.y.saturating_add(top);
 
-    let rows = composer.config.rows.max(1);
     let content_width = TextPanelComposer::layout_options(width).width;
     let wrapped = composer.layout(width);
     let cursor_row = wrapped
@@ -7323,6 +7419,113 @@ mod tests {
     }
 
     #[test]
+    fn composer_height_grows_with_wrapping_and_shrinks_with_the_draft() {
+        let mut panel = TextPanel::new(
+            "agent".into(),
+            PanelConfig {
+                title: Some("Agent".into()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".into(),
+                    rows: 3,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        assert_eq!(panel.composer_height(40, 40), 5);
+        panel
+            .composer
+            .as_mut()
+            .unwrap()
+            .prompt
+            .replace_draft(&"word ".repeat(40));
+        let wide = panel.composer_height(40, 40);
+        assert!(wide > 5);
+        assert!(panel.composer_height(40, 20) > wide);
+        assert_eq!(panel.composer_height(40, 8), 28);
+        assert_eq!(panel.visible_rows(40, 8), 10);
+        assert_eq!(panel.composer_height(7, 8), 4);
+        assert_eq!(panel.visible_rows(7, 8), 1);
+        assert_eq!(panel.composer_height(5, 8), 0);
+
+        let composer = panel.composer.as_mut().unwrap();
+        let first = composer.layout(20);
+        assert!(Arc::ptr_eq(&first, &composer.layout(20)));
+        composer.prompt.set_cursor(0);
+        assert!(Arc::ptr_eq(&first, &composer.layout(20)));
+        composer.prompt.replace_draft("short");
+        assert!(!Arc::ptr_eq(&first, &composer.layout(20)));
+        assert_eq!(panel.composer_height(40, 8), 5);
+    }
+
+    #[test]
+    fn expanded_composer_render_click_cursor_and_submission_share_geometry() {
+        use crossterm::event::KeyEvent;
+
+        let mut manager = PanelManager::default();
+        manager.create_text_panel(
+            "agent".into(),
+            PanelConfig {
+                side: PanelSide::Right,
+                width: 32,
+                title: Some("Agent".into()),
+                composer: Some(TextPanelComposerConfig {
+                    placeholder: "Ask".into(),
+                    rows: 3,
+                }),
+                ..PanelConfig::default()
+            },
+        );
+        let draft = (0..30)
+            .map(|line| format!("draft row {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(matches!(
+            manager.load_text_panel_draft("agent", &draft, None),
+            Ok(TextPanelReuseOutcome::Loaded)
+        ));
+        let placement = manager
+            .panel_placements(80, 40)
+            .into_iter()
+            .find(|placement| placement.id == "agent")
+            .unwrap();
+        let height =
+            manager.text_panels["agent"].composer_height(placement.height, placement.width);
+        assert_eq!(height, placement.height * 70 / 100);
+        let first_row = 30 - (height - COMPOSER_CHROME_ROWS);
+        let x = TextPanelContentMetrics::new(placement.width).x(placement.x) + 2;
+        let y = placement.y + placement.height - height + 1;
+        let theme = Theme::default();
+        let mut buffer = RenderBuffer::new(80, 40, &theme.style);
+        manager.render(&mut buffer, &theme);
+        assert_eq!(
+            text_position(&buffer, &format!("draft row {first_row:02}")),
+            Some(Point::new(x, y))
+        );
+        assert_eq!(
+            text_position(&buffer, "draft row 29"),
+            Some(Point::new(x, placement.y + placement.height - 2))
+        );
+        manager.focus_panel_at_position(x, y, 80, 40).unwrap();
+        let composer = manager.text_panels["agent"].composer.as_ref().unwrap();
+        assert_eq!(composer.prompt.cursor(), first_row * "draft row 00\n".len());
+        let (cursor_x, cursor_y) = manager.focused_text_panel_cursor_position(80, 40).unwrap();
+        assert_eq!(cursor_x, x);
+        assert!(cursor_y >= y && cursor_y < placement.y + placement.height - 1);
+        // A short resized pane still reports a cursor inside its own bounds.
+        if let Some((cursor_x, cursor_y)) = manager.focused_text_panel_cursor_position(24, 10) {
+            assert!(cursor_x < 24 && cursor_y < 10);
+        }
+        let submitted = manager
+            .handle_focused_text_input(
+                &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+                80,
+            )
+            .unwrap();
+        assert_eq!(submitted.text.as_deref(), Some(draft.as_str()));
+        assert_eq!(manager.text_panels["agent"].composer_height(40, 32), 5);
+    }
+
+    #[test]
     fn text_panel_composer_click_places_cursor_in_wrapped_text() {
         let mut manager = PanelManager::default();
         manager.create_text_panel(
@@ -7387,7 +7590,9 @@ mod tests {
             .find(|placement| placement.id == "agent")
             .unwrap();
         let x = TextPanelContentMetrics::new(placement.width).x(placement.x) + 2;
-        let y = placement.y + placement.height - manager.text_panels["agent"].composer_height() + 1;
+        let y = placement.y + placement.height
+            - manager.text_panels["agent"].composer_height(placement.height, placement.width)
+            + 1;
         let theme = Theme::default();
         let mut buffer = RenderBuffer::new(40, 20, &theme.style);
         manager.render(&mut buffer, &theme);
@@ -7907,7 +8112,7 @@ mod tests {
         assert!(buffer.cells[40..80].iter().all(|cell| cell.text == "─"));
         assert_eq!(text_position(&buffer, "◆ Agent"), Some(Point::new(1, 2)));
         assert_eq!(text_position(&buffer, "body"), Some(Point::new(1, 3)));
-        let composer_divider = (12 - panel.composer_height()) * 40;
+        let composer_divider = (12 - panel.composer_height(12, 40)) * 40;
         assert!(buffer.cells[composer_divider..composer_divider + 40]
             .iter()
             .all(|cell| cell.text == "─"));
@@ -9125,6 +9330,95 @@ mod tests {
                 linewise: true,
             })
         );
+    }
+
+    #[test]
+    fn scrollback_enter_copies_selection_and_returns_to_latest() {
+        use crossterm::event::KeyEvent;
+
+        for composer_enabled in [Some(true), Some(false), None] {
+            for (selection, expected, linewise) in
+                [('v', "alpha", false), ('V', "alpha beta\n", true)]
+            {
+                let mut manager = PanelManager::default();
+                manager.create_text_panel(
+                    "agent".into(),
+                    PanelConfig {
+                        side: PanelSide::Right,
+                        width: 28,
+                        composer: composer_enabled.map(|_| TextPanelComposerConfig {
+                            placeholder: "Ask".into(),
+                            rows: 3,
+                        }),
+                        ..PanelConfig::default()
+                    },
+                );
+                if let Some(enabled) = composer_enabled {
+                    assert!(matches!(
+                        manager.load_text_panel_draft("agent", "unsent draft", None),
+                        Ok(TextPanelReuseOutcome::Loaded)
+                    ));
+                    let composer = manager
+                        .text_panels
+                        .get_mut("agent")
+                        .unwrap()
+                        .composer
+                        .as_mut()
+                        .unwrap();
+                    composer.enabled = enabled;
+                    composer.prompt.set_mode(crate::editor::Mode::Normal);
+                }
+                manager.update_text_panel(
+                    "agent",
+                    vec![TextPanelBlock {
+                        id: "answer".into(),
+                        kind: TextPanelBlockKind::Text,
+                        format: TextPanelBlockFormat::Plain,
+                        text: format!("alpha beta\n{}latest", "more output\n".repeat(30)),
+                    }],
+                    12,
+                    80,
+                );
+                assert!(manager.focus_panel("agent"));
+                assert!(manager.focus_focused_text_scrollback(80));
+                let press = |manager: &mut PanelManager, key| {
+                    manager.handle_focused_scrollback_input(
+                        &Event::Key(KeyEvent::new(key, KeyModifiers::NONE)),
+                        12,
+                        80,
+                        1,
+                    )
+                };
+                // Normal-mode Enter remains available to the link handler.
+                assert_eq!(press(&mut manager, KeyCode::Enter), None);
+                for key in ['g', selection, 'e'] {
+                    assert_eq!(
+                        press(&mut manager, KeyCode::Char(key)),
+                        Some(TextPanelScrollbackInput::Handled)
+                    );
+                }
+                assert!(!manager.text_panels["agent"].follow_tail);
+                assert_eq!(
+                    press(&mut manager, KeyCode::Enter),
+                    Some(TextPanelScrollbackInput::Yank(TextPanelYank {
+                        text: expected.into(),
+                        linewise,
+                    }))
+                );
+                let panel = &manager.text_panels["agent"];
+                assert_eq!(panel.scrollback.mode, TextPanelScrollbackMode::Normal);
+                assert!(panel.scrollback.selection_anchor.is_none());
+                assert!(panel.follow_tail);
+                assert_eq!(panel.scroll, panel.max_scroll(12, 28));
+                assert_eq!(panel.scrollback.cursor, panel.layout(28).len - 1);
+                assert_eq!(panel.scrollback.focused, composer_enabled != Some(true));
+                if let Some(composer) = &panel.composer {
+                    assert_eq!(composer.prompt.text(), "unsent draft");
+                    assert_eq!(composer.prompt.mode(), crate::editor::Mode::Normal);
+                    assert_eq!(composer.focused, composer_enabled == Some(true));
+                }
+            }
+        }
     }
 
     #[test]

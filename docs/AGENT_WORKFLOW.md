@@ -241,6 +241,11 @@ Shift+Enter, and Ctrl+J insert a newline; Ctrl+Enter remains a send alias.
 See [keyboard compatibility](KEYBOARD.md) if a terminal does not report a
 modified Enter distinctly.
 
+The docked composer starts with three input rows and grows with its wrapped
+draft, up to roughly 70% of the Agent pane. Longer drafts scroll within that
+space. It shrinks again when text is removed or sent, and short panes always
+retain room for the conversation.
+
 Open a workspace, press `Space A` (or run `:Agent`), type a request, and press
 Enter. Red lazily starts `codex app-server --stdio`, initializes the connection,
 checks the account, starts a persisted thread, and submits turns with
@@ -275,6 +280,11 @@ text for editing; it never submits. If an unsent draft would be replaced, Red
 asks first and defaults to keeping it. An approved replacement is one undoable
 composer edit, so Escape followed by `u` restores the previous draft. `y` copies
 the selected turn's answer; `Y` still copies the whole conversation.
+
+With a transcript selection (`v`, `V`, or a mouse drag), `y` copies and keeps
+your reading position. Enter copies the same selection, returns to the latest
+output, resumes tail-following, and focuses the composer without changing or
+sending its draft.
 
 If Codex cannot start, Red preserves the prompt and offers a retry action.
 Install or update Codex, run `codex login`, then retry without retyping.
