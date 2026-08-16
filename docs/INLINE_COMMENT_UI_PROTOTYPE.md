@@ -19,6 +19,7 @@ Run `cargo run --bin red -- path/to/file` in this worktree.
 | Ready-popup `v` / Enter | Inspect an off-screen code edit / apply it if source is unchanged. Explanations appear automatically. |
 | Wider-edit popup Enter / `v` / `d` | Review the proposed same-file diff / review / decline. `a` in the full review applies it. |
 | History Enter / `g` / `p` | Reopen the item / jump to source / pin the selected turn's annotations. |
+| History `v` / source-link click | Cycle rich conversation/code/diff views / jump to the tracked source. |
 | Result-popup `p` | Pin retained annotations without reapplying a code edit. |
 | `Space ] c` / `Space [ c` | Select the next/previous annotation, including overlapping comments. |
 | `Space ] i` / `Space [ i` | Select the next/previous item in the current overlapping group. |

@@ -158,6 +158,14 @@ mouse previews items, `l` expands earlier turns, `h` collapses them, and `/`
 fuzzy-searches their text. Enter reopens the conversation or draft; `g` keeps
 the selected source location without opening a dialog. Esc restores the original
 location and comment visibility. Browsing never applies an edit.
+The embedded detail pane renders Markdown, syntax-highlighted source, and the
+same colored diffs as the full review popup. `v` cycles Conversation, Reviewed
+code, Before, Compare, and Changes. Applied/unsaved/source-state labels use
+semantic colors. Click the underlined workspace-relative location (or use `g`)
+to jump to its tracked range; detached ranges are not presented as live links.
+File references in the answer are also clickable. The mouse wheel scrolls the
+detail under the pointer, while `j`/`k` continue browsing requests. Narrow panes
+show one selected request and its position in the list, leaving room for details.
 The conversation view also lists successful context reads, including editor
 revisions and Git base commits, so the answer's sources are inspectable.
 

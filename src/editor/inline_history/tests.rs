@@ -854,6 +854,107 @@ async fn run_history_action(editor: &mut Editor, action: HistoryAction) {
 }
 
 #[tokio::test]
+async fn inline_history_cycles_all_rich_views_without_editing_source() {
+    let mut editor = editor("fn old() {}\n");
+    begin(&mut editor, "group", "edit", line_range(0, 1), "Rename it");
+    complete(
+        &mut editor,
+        "edit",
+        Some("fn new() {}\n"),
+        "**Renamed** the function.",
+    )
+    .await;
+    editor.inline_history.conversations[0].cwd = "/workspace".into();
+    editor
+        .open_inline_history(
+            &mut RenderBuffer::new(100, 30, &Style::default()),
+            &mut Runtime::new(),
+        )
+        .await
+        .unwrap();
+    let original = editor.current_buffer().contents();
+    let revision = editor.current_buffer().revision();
+    for view in [
+        HistoryView::Conversation,
+        HistoryView::Reviewed,
+        HistoryView::Before,
+        HistoryView::Compare,
+        HistoryView::Changes,
+    ] {
+        assert_eq!(editor.inline_history_browser.as_ref().unwrap().view, view);
+        let turn = editor.inline_history.turn("edit").unwrap();
+        let detail = editor.history_turn_detail(turn, InlineSourceState::Unchanged);
+        assert_eq!(detail.location.as_deref(), Some("sample.c:1"));
+        assert!(detail.can_jump);
+        assert_eq!(detail.open_label, "review changes");
+        assert!(detail
+            .statuses
+            .iter()
+            .any(|status| status.text == "Unsaved"));
+        assert!(detail.blocks.iter().any(|block| matches!(
+            (view, block),
+            (HistoryView::Conversation, HistoryBlock::Markdown(_))
+                | (
+                    HistoryView::Reviewed | HistoryView::Before,
+                    HistoryBlock::Code { .. }
+                )
+                | (
+                    HistoryView::Compare | HistoryView::Changes,
+                    HistoryBlock::Diff { .. }
+                )
+        )));
+        run_history_action(&mut editor, HistoryAction::CycleView).await;
+        assert_eq!(editor.current_buffer().contents(), original);
+        assert_eq!(editor.current_buffer().revision(), revision);
+    }
+    assert_eq!(
+        editor.inline_history_browser.as_ref().unwrap().view,
+        HistoryView::Conversation
+    );
+}
+
+#[tokio::test]
+async fn inline_history_file_link_navigates_without_applying_or_saving() {
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("other.c");
+    std::fs::write(&destination, "first\nsecond\n").unwrap();
+    let mut editor = editor("original\n");
+    begin(&mut editor, "group", "one", line_range(0, 1), "Explain");
+    complete(&mut editor, "one", None, "See another file").await;
+    editor
+        .open_inline_history(
+            &mut RenderBuffer::new(100, 30, &Style::default()),
+            &mut Runtime::new(),
+        )
+        .await
+        .unwrap();
+    run_history_action(
+        &mut editor,
+        HistoryAction::FollowFile {
+            path: destination.to_string_lossy().into_owned(),
+            line: Some(2),
+            column: Some(2),
+        },
+    )
+    .await;
+    assert!(editor.inline_history_browser.is_none());
+    assert_eq!(
+        editor.current_buffer().file.as_deref(),
+        destination.to_str()
+    );
+    assert_eq!(editor.buffer_line(), 1);
+    assert_eq!(editor.current_buffer().contents(), "first\nsecond\n");
+    assert_eq!(
+        std::fs::read_to_string(destination).unwrap(),
+        "first\nsecond\n"
+    );
+    assert_eq!(
+        editor.inline_history.turn("one").unwrap().state,
+        InlineTurnState::Completed
+    );
+}
+
+#[tokio::test]
 async fn inline_history_open_selects_the_requested_overlapping_result() {
     let mut editor = editor("alpha\nbeta\ngamma\n");
     let target = line_range(0, 3);
@@ -1172,9 +1273,13 @@ async fn inline_history_live_refresh_preserves_selection_scroll_and_source_posit
         .as_ref()
         .unwrap()
         .animation_started;
-    editor
-        .inline_history
-        .append_answer("one", "Streaming answer now visible");
+    editor.inline_history.append_answer(
+        "one",
+        &format!(
+            "Streaming answer now visible\n\n{}",
+            "More detail.\n\n".repeat(20)
+        ),
+    );
     editor.mark_inline_history_dirty();
     editor.stage_background_inline_result(
         "two",

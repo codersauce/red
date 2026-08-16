@@ -622,7 +622,7 @@ fn markdown_rule_prefix_width(line: &RenderedTextLine) -> Option<usize> {
     )
 }
 
-fn render_line(
+pub(crate) fn render_line(
     buffer: &mut RenderBuffer,
     x: usize,
     y: usize,
@@ -690,7 +690,9 @@ pub(crate) fn hover_span_style(span: &RenderedTextSpan, theme: &Theme) -> Style 
             TextPanelSpanStyle::InlineCode
             | TextPanelSpanStyle::Code
             | TextPanelSpanStyle::Diff => scoped("markup.raw.block.markdown"),
-            TextPanelSpanStyle::Link => scoped("markup.underline.link.markdown"),
+            TextPanelSpanStyle::Link => theme
+                .get_style("markup.underline.link.markdown")
+                .unwrap_or_else(|| crate::theme::SurfacePalette::new(theme, base).accent),
             TextPanelSpanStyle::Quote | TextPanelSpanStyle::Muted => theme.ui_style.muted.clone(),
         }
     };
@@ -708,6 +710,7 @@ pub(crate) fn hover_span_style(span: &RenderedTextSpan, theme: &Theme) -> Style 
         },
         bold: requested.bold,
         italic: requested.italic,
+        underline: requested.underline || span.style == TextPanelSpanStyle::Link,
     }
 }
 

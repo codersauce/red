@@ -3627,6 +3627,7 @@ fn render_styled_rows(
                     bg: Some(bg),
                     bold: cell.style.bold,
                     italic: cell.style.italic,
+                    underline: cell.style.underline,
                 };
                 if let Some(span) = spans.last_mut().filter(|span| span.style == style) {
                     span.text.push_str(&cell.text);
@@ -39520,6 +39521,7 @@ while True:
             }),
             bold: false,
             italic: false,
+            underline: false,
         };
         let style2 = Style {
             fg: Some(Color::Rgb {
@@ -39530,6 +39532,7 @@ while True:
             bg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
             bold: false,
             italic: false,
+            underline: false,
         };
         let buffer1 = RenderBuffer::new_with_contents(5, 1, style1, contents.clone());
         let buffer2 = RenderBuffer::new_with_contents(5, 1, style2, contents.clone());

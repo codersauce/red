@@ -10,7 +10,7 @@ mod tests;
 impl Editor {
     /// Deleted targets have an empty post-image. Resolve their insertion point
     /// from retained surrounding text instead of matching an empty string.
-    fn resolve_inline_change_source(
+    pub(super) fn resolve_inline_change_source(
         &self,
         turn: &InlineHistoryTurn,
     ) -> Option<(usize, TextRange, InlineSourceState)> {

@@ -5255,6 +5255,7 @@ fn render_text_spans(
                 bg: syntax_style.bg.or(base_style.bg).or(palette.surface.bg),
                 bold: syntax_style.bold || base_style.bold,
                 italic: syntax_style.italic || base_style.italic,
+                underline: syntax_style.underline || base_style.underline,
             }
         } else {
             base_style
@@ -5317,6 +5318,7 @@ fn text_panel_span_style(
             },
             bold: scoped.bold || fallback.bold,
             italic: scoped.italic || fallback.italic,
+            underline: scoped.underline || fallback.underline,
         }
     };
     match style {
@@ -5342,9 +5344,10 @@ fn text_panel_span_style(
         TextPanelSpanStyle::InlineCode | TextPanelSpanStyle::Code | TextPanelSpanStyle::Diff => {
             scoped("markup.raw.block.markdown", &palette.primary, true)
         }
-        TextPanelSpanStyle::Link => {
-            scoped("markup.underline.link.markdown", &palette.accent, false)
-        }
+        TextPanelSpanStyle::Link => Style {
+            underline: true,
+            ..scoped("markup.underline.link.markdown", &palette.accent, false)
+        },
         TextPanelSpanStyle::Quote => palette.secondary.clone(),
         TextPanelSpanStyle::Muted => palette.muted.clone(),
     }
@@ -5524,12 +5527,14 @@ fn segment_style(
         style.bg = resolved.bg.or(style.bg);
         style.bold |= resolved.bold;
         style.italic |= resolved.italic;
+        style.underline |= resolved.underline;
     }
     if let Some(concrete) = &segment.style {
         style.fg = concrete.fg.or(style.fg);
         style.bg = concrete.bg.or(style.bg);
         style.bold = concrete.bold;
         style.italic = concrete.italic;
+        style.underline = concrete.underline;
     }
     if selected {
         let selection_style = theme.list_selection_style();
@@ -5550,6 +5555,7 @@ fn panel_style(theme: &Theme, semantic: Option<&ThemeStyleSpec>) -> Style {
         style.bg = resolved.bg.or(style.bg);
         style.bold |= resolved.bold;
         style.italic |= resolved.italic;
+        style.underline |= resolved.underline;
     }
     style
 }
@@ -6598,6 +6604,7 @@ mod tests {
                 bg: Some(panel_background),
                 bold: true,
                 italic: true,
+                underline: false,
             }
         );
         assert_eq!(
@@ -6607,6 +6614,7 @@ mod tests {
                 bg: Some(syntax_background),
                 bold: true,
                 italic: false,
+                underline: false,
             }
         );
     }
@@ -8477,6 +8485,7 @@ mod tests {
             bg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
             bold: false,
             italic: false,
+            underline: false,
         };
         let theme = Theme {
             style: style.clone(),
@@ -8567,6 +8576,7 @@ mod tests {
             bg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
             bold: false,
             italic: false,
+            underline: false,
         };
         let theme = Theme {
             style: style.clone(),

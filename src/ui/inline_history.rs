@@ -1,19 +1,23 @@
 //! Bottom-docked, read-only browser for retained inline conversations.
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
+
+mod detail;
+pub(crate) use detail::{HistoryBlock, HistoryDetail, HistoryStatus, HistoryTone};
 
 use super::{
     dialog::{BorderStyle, Dialog, SurfaceRole},
-    spinner_frame, wrap_text, ActionBar, ActionPriority, Component, UiAction,
-    SPINNER_FRAME_INTERVAL_MS,
+    spinner_frame, ActionBar, ActionPriority, Component, UiAction, SPINNER_FRAME_INTERVAL_MS,
 };
 use crate::{
     config::KeyAction,
     editor::{Action, Editor, RenderBuffer},
+    highlighter::{Highlighter, LanguageRegistry},
     inline_history::HistoryAction,
     keyboard::is_word_backspace,
+    plugin::{markdown::RenderedTextLine, TextPanelLinkTarget},
     theme::Theme,
-    unicode_utils::{fit_display_width, truncate_display_width},
+    unicode_utils::{display_width, fit_display_width},
 };
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 
@@ -25,7 +29,9 @@ pub(crate) struct InlineHistoryRow {
 pub(crate) struct InlineHistoryPanel {
     rows: Vec<InlineHistoryRow>,
     selected: usize,
-    detail: String,
+    detail: HistoryDetail,
+    rendered: Vec<RenderedTextLine>,
+    registry: Arc<LanguageRegistry>,
     scroll: usize,
     searching: bool,
     query: String,
@@ -45,7 +51,7 @@ impl InlineHistoryPanel {
         editor: &Editor,
         rows: Vec<InlineHistoryRow>,
         selected: usize,
-        detail: String,
+        detail: HistoryDetail,
         scroll: usize,
         searching: bool,
         query: String,
@@ -54,10 +60,12 @@ impl InlineHistoryPanel {
         can_restore: bool,
         animation_started: Instant,
     ) -> Self {
-        Self {
+        let mut panel = Self {
             rows,
             selected,
             detail,
+            rendered: Vec::new(),
+            registry: editor.language_registry(),
             scroll,
             searching,
             query,
@@ -70,7 +78,9 @@ impl InlineHistoryPanel {
             width: editor.vwidth(),
             height: editor.inline_history_viewport_height(),
             theme: editor.theme.clone(),
-        }
+        };
+        panel.reflow();
+        panel
     }
     fn action(action: HistoryAction) -> Option<KeyAction> {
         Some(KeyAction::Single(Action::InlineHistoryAction(action)))
@@ -85,15 +95,87 @@ impl InlineHistoryPanel {
         let body = height.saturating_sub(1);
         let wide = width >= 70;
         let list_width = if wide { (width * 2 / 5).min(72) } else { width };
-        let list_height = if wide { body } else { body.min(2) };
+        let list_height = if wide { body } else { body.min(1) };
+        let item_height = if wide { 2 } else { 1 };
         if column < 1 || column > list_width || row <= y || row >= y + 1 + list_height {
             return None;
         }
         let first = self
             .selected
-            .saturating_sub((list_height / 2).max(1).saturating_sub(1));
-        let index = first + (row - y - 1) / 2;
+            .saturating_sub((list_height / item_height).max(1).saturating_sub(1));
+        let index = first + (row - y - 1) / item_height;
         (index < self.rows.len()).then_some(index)
+    }
+
+    fn detail_geometry(&self) -> (usize, usize, usize, usize) {
+        let width = self.width.saturating_sub(2);
+        let height = (self.height / 2)
+            .clamp(5, 16)
+            .min(self.height.saturating_sub(2));
+        let y = self.height.saturating_sub(height + 2);
+        let body = height.saturating_sub(1);
+        if width >= 70 {
+            let list_width = (width * 2 / 5).min(72);
+            (
+                list_width + 3,
+                y + 1,
+                width.saturating_sub(list_width + 2),
+                body,
+            )
+        } else {
+            let list_height = body.min(1);
+            (
+                1,
+                y + 1 + list_height,
+                width,
+                body.saturating_sub(list_height),
+            )
+        }
+    }
+
+    fn reflow(&mut self) {
+        let (_, _, width, height) = self.detail_geometry();
+        let mut highlighter =
+            Highlighter::with_registry(&self.theme, Arc::clone(&self.registry)).ok();
+        self.rendered = self.detail.render(
+            width,
+            self.width.saturating_sub(2) < 70,
+            &self.theme,
+            highlighter.as_mut(),
+        );
+        self.scroll = self.scroll.min(self.rendered.len().saturating_sub(height));
+    }
+
+    pub(crate) fn scroll(&self) -> usize {
+        self.scroll
+    }
+
+    fn detail_link_at(&self, column: usize, row: usize) -> Option<KeyAction> {
+        let (x, y, width, height) = self.detail_geometry();
+        if !(x..x + width).contains(&column) || !(y..y + height).contains(&row) {
+            return None;
+        }
+        let line = self.rendered.get(self.scroll + row - y)?;
+        let mut start = x;
+        for span in &line.spans {
+            let end = (start + display_width(&span.text)).min(x + width);
+            if (start..end).contains(&column) {
+                let link = span.link.as_ref()?;
+                if link.id == detail::SOURCE_LINK {
+                    return Self::action(HistoryAction::Jump);
+                }
+                return match &link.target {
+                    TextPanelLinkTarget::File { path, location } => {
+                        Self::action(self.detail.file_target(path, location))
+                    }
+                    TextPanelLinkTarget::ExternalUrl(url) => {
+                        Some(KeyAction::Single(Action::OpenExternalUrl(url.clone())))
+                    }
+                };
+            }
+            start = end;
+        }
+        None
     }
 }
 
@@ -134,8 +216,8 @@ impl Component for InlineHistoryPanel {
             UiAction::new("turns", "l/h", "turns"),
             UiAction::new("search", "/", "search"),
             UiAction::new("workspace", "w", "workspace"),
-            UiAction::new("view", "v", "view"),
-            essential("open", "Enter", "open"),
+            UiAction::new("view", "v", self.detail.view.label()),
+            essential("open", "Enter", self.detail.open_label),
             UiAction::new("pin", "p", "pin annotations").with_enabled(self.can_restore),
             UiAction::new("continue", "r", "continue"),
             UiAction::new("recheck", "R", "recheck").with_priority(ActionPriority::Secondary),
@@ -153,6 +235,8 @@ impl Component for InlineHistoryPanel {
         let y = self.height.saturating_sub(height + 2);
         let title = if self.searching {
             format!("Inline history /{}", self.query)
+        } else if width < 70 && !self.rows.is_empty() {
+            format!("Inline history · {}/{}", self.selected + 1, self.rows.len())
         } else {
             self.title.clone()
         };
@@ -171,8 +255,9 @@ impl Component for InlineHistoryPanel {
         let body = height.saturating_sub(1);
         let wide = width >= 70;
         let list_width = if wide { (width * 2 / 5).min(72) } else { width };
-        let list_height = if wide { body } else { body.min(2) };
-        let visible_items = (list_height / 2).max(1);
+        let list_height = if wide { body } else { body.min(1) };
+        let item_height = if wide { 2 } else { 1 };
+        let visible_items = (list_height / item_height).max(1);
         let first = self
             .selected
             .saturating_sub(visible_items.saturating_sub(1));
@@ -183,7 +268,7 @@ impl Component for InlineHistoryPanel {
                 &self.theme.ui_style.picker_item
             };
             let marker = if offset == self.selected { "> " } else { "  " };
-            let row_y = y + 1 + (offset - first) * 2;
+            let row_y = y + 1 + (offset - first) * item_height;
             let mut lines = row.text.lines();
             let spinner = if row.running {
                 format!(
@@ -203,7 +288,7 @@ impl Component for InlineHistoryPanel {
             if row_y < y + 1 + list_height {
                 buffer.set_text(1, row_y, &text, style);
             }
-            if row_y + 1 < y + 1 + list_height {
+            if wide && row_y + 1 < y + 1 + list_height {
                 buffer.set_text(
                     1,
                     row_y + 1,
@@ -219,36 +304,27 @@ impl Component for InlineHistoryPanel {
                 );
             }
         }
-        let (detail_x, detail_y, detail_width, detail_height) = if wide {
+        if wide {
             for row in 0..body {
                 buffer.set_text(list_width + 1, y + 1 + row, "│", &self.theme.ui_style.muted);
             }
-            (
-                list_width + 3,
-                y + 1,
-                width.saturating_sub(list_width + 2),
-                body,
-            )
-        } else {
-            (
-                1,
-                y + 1 + list_height,
-                width,
-                body.saturating_sub(list_height),
-            )
-        };
-        for (offset, row) in wrap_text(&self.detail, detail_width.max(1))
-            .rows
+        }
+        let (detail_x, detail_y, detail_width, detail_height) = self.detail_geometry();
+        for (offset, row) in self
+            .rendered
             .iter()
             .skip(self.scroll)
             .take(detail_height)
             .enumerate()
         {
-            buffer.set_text(
+            super::hover_info::render_line(
+                buffer,
                 detail_x,
                 detail_y + offset,
-                &truncate_display_width(row, detail_width),
-                &self.theme.ui_style.dialog,
+                detail_width,
+                row,
+                false,
+                &self.theme,
             );
         }
         if height > 0 {
@@ -274,10 +350,12 @@ impl Component for InlineHistoryPanel {
     fn resize(&mut self, width: usize, height: usize) -> bool {
         self.width = width;
         self.height = height;
+        self.reflow();
         true
     }
     fn set_theme(&mut self, theme: &Theme) {
         self.theme = theme.clone();
+        self.reflow();
     }
     fn handle_event(&mut self, event: &Event) -> Option<KeyAction> {
         if matches!(event, Event::Key(key) if key.kind == KeyEventKind::Release) {
@@ -303,6 +381,21 @@ impl Component for InlineHistoryPanel {
         }
         if !self.confirm_forget {
             if let Event::Mouse(mouse) = event {
+                let column = mouse.column as usize;
+                let row = mouse.row as usize;
+                if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                    if let Some(action) = self.detail_link_at(column, row) {
+                        return Some(action);
+                    }
+                }
+                let (x, y, width, height) = self.detail_geometry();
+                if (x..x + width).contains(&column) && (y..y + height).contains(&row) {
+                    return match mouse.kind {
+                        MouseEventKind::ScrollDown => Self::action(HistoryAction::ScrollDown),
+                        MouseEventKind::ScrollUp => Self::action(HistoryAction::ScrollUp),
+                        _ => None,
+                    };
+                }
                 let index = self.list_item_at(mouse.column as usize, mouse.row as usize)?;
                 return match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) if index == self.selected => {
@@ -364,21 +457,202 @@ mod tests {
     use crate::{buffer::Buffer, config::Config, lsp::LspManager};
     use crossterm::event::{KeyEvent, MouseEvent};
 
+    fn rich_panel(width: usize, theme: Theme) -> InlineHistoryPanel {
+        let config = Config::default();
+        let editor = Editor::with_size(
+            Box::new(LspManager::new(config.lsp.clone())),
+            width,
+            40,
+            config,
+            theme,
+            vec![Buffer::new(None, String::new())],
+        )
+        .unwrap();
+        InlineHistoryPanel::new(
+            &editor,
+            vec![InlineHistoryRow {
+                text: "Explain this\nmetadata".into(),
+                running: false,
+            }],
+            0,
+            HistoryDetail {
+                location: Some("src/main.rs:10–12".into()),
+                can_jump: true,
+                cwd: "/workspace".into(),
+                statuses: vec![
+                    HistoryStatus::new("✓ Applied", HistoryTone::Success),
+                    HistoryStatus::new("Unsaved", HistoryTone::Warning),
+                    HistoryStatus::new("source unchanged", HistoryTone::Muted),
+                ],
+                blocks: vec![
+                    HistoryBlock::Request("Explain this".into()),
+                    HistoryBlock::Markdown(
+                        "**Useful answer** with [another file](src/other.rs:7:2).".into(),
+                    ),
+                    HistoryBlock::Code {
+                        file: "main.rs".into(),
+                        source: "fn demo() { return 1; }".into(),
+                    },
+                    HistoryBlock::Diff {
+                        file: "main.rs".into(),
+                        before: "fn old() {}\n".into(),
+                        after: "fn new() {}\n".into(),
+                        label: "after".into(),
+                    },
+                ],
+                open_label: "review changes",
+                ..HistoryDetail::default()
+            },
+            0,
+            false,
+            String::new(),
+            false,
+            "Inline history".into(),
+            true,
+            Instant::now(),
+        )
+    }
+
+    fn line_text(line: &RenderedTextLine) -> String {
+        line.spans.iter().map(|span| span.text.as_str()).collect()
+    }
+
+    #[test]
+    fn inline_history_renders_semantic_status_markdown_code_and_diffs() {
+        use crate::plugin::markdown::TextPanelSpanStyle;
+        use crate::theme::{DiffPalette, Style, TokenStyle};
+        for name in ["themes/one-dark-pro.json", "themes/atom-one-light.json"] {
+            let mut theme = crate::theme::parse_vscode_theme(name).unwrap();
+            let keyword = Color::Rgb {
+                r: 19,
+                g: 87,
+                b: 143,
+            };
+            theme.token_styles.insert(
+                0,
+                TokenStyle {
+                    name: None,
+                    scope: vec!["keyword".into()],
+                    style: Style {
+                        fg: Some(keyword),
+                        ..Style::default()
+                    },
+                },
+            );
+            let panel = rich_panel(120, theme.clone());
+            let spans = || panel.rendered.iter().flat_map(|line| &line.spans);
+            assert!(spans().any(|span| span.style == TextPanelSpanStyle::Strong));
+            assert!(spans().any(|span| span.style == TextPanelSpanStyle::Code
+                && span
+                    .syntax_style
+                    .as_ref()
+                    .is_some_and(|style| style.fg == Some(keyword))));
+            let palette = DiffPalette::new(&theme);
+            for (needle, background) in [
+                ("-fn old", palette.removed.bg),
+                ("+fn new", palette.added.bg),
+            ] {
+                let line = panel
+                    .rendered
+                    .iter()
+                    .find(|line| line_text(line).starts_with(needle))
+                    .unwrap();
+                assert!(line
+                    .spans
+                    .iter()
+                    .all(
+                        |span| super::super::hover_info::hover_span_style(span, &theme).bg
+                            == background
+                    ));
+            }
+            let applied = spans().find(|span| span.text.contains("Applied")).unwrap();
+            let unsaved = spans().find(|span| span.text == "Unsaved").unwrap();
+            assert_ne!(
+                applied.syntax_style.as_ref().unwrap().fg,
+                unsaved.syntax_style.as_ref().unwrap().fg
+            );
+            let source = &panel.rendered[0].spans[0];
+            assert!(super::super::hover_info::hover_span_style(source, &theme).underline);
+        }
+    }
+
+    #[test]
+    fn inline_history_links_and_scroll_hit_testing_follow_the_rendered_layout() {
+        let mut panel = rich_panel(120, Theme::default());
+        for width in [120, 64, 34, 8, 3] {
+            panel.resize(width, 40);
+            panel.scroll = 0;
+            let (x, y, available, height) = panel.detail_geometry();
+            assert!(panel
+                .rendered
+                .iter()
+                .all(|line| display_width(&line_text(line)) <= available));
+            assert_eq!(
+                panel.detail_link_at(x, y),
+                InlineHistoryPanel::action(HistoryAction::Jump)
+            );
+            let mut frame = RenderBuffer::new(width, 40, &panel.theme.style);
+            panel.draw(&mut frame).unwrap();
+            assert!(frame.cells[y * width + x].style.underline);
+            if (34..72).contains(&width) {
+                assert!(!panel
+                    .rendered
+                    .iter()
+                    .any(|line| line_text(line).contains("You: Explain this")));
+            }
+            let (row, column) = panel
+                .rendered
+                .iter()
+                .enumerate()
+                .find_map(|(row, line)| {
+                    let mut column = 0;
+                    for span in &line.spans {
+                        if span
+                            .link
+                            .as_ref()
+                            .is_some_and(|link| link.id != detail::SOURCE_LINK)
+                        {
+                            return Some((row, column));
+                        }
+                        column += display_width(&span.text);
+                    }
+                    None
+                })
+                .unwrap();
+            panel.scroll = row.min(panel.rendered.len().saturating_sub(height));
+            assert_eq!(
+                panel.detail_link_at(x + column, y + row - panel.scroll),
+                InlineHistoryPanel::action(HistoryAction::FollowFile {
+                    path: "/workspace/src/other.rs".into(),
+                    line: Some(7),
+                    column: Some(2)
+                })
+            );
+            assert_eq!(
+                panel.handle_event(&Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: x as u16,
+                    row: y as u16,
+                    modifiers: KeyModifiers::NONE
+                })),
+                InlineHistoryPanel::action(HistoryAction::ScrollDown)
+            );
+            panel.scroll = usize::MAX;
+            panel.reflow();
+            assert_eq!(panel.scroll, panel.rendered.len().saturating_sub(height));
+        }
+        panel.detail.can_jump = false;
+        panel.reflow();
+        panel.scroll = 0;
+        let (x, y, _, _) = panel.detail_geometry();
+        assert_eq!(panel.detail_link_at(x, y), None);
+    }
+
     #[test]
     fn word_backspace_routes_only_active_inline_history_search() {
-        let mut panel = InlineHistoryPanel {
-            rows: vec![],
-            selected: 0,
-            detail: String::new(),
-            scroll: 0,
-            searching: true,
-            query: "one two".into(),
-            confirm_forget: false,
-            title: "History".into(),
-            width: 80,
-            height: 24,
-            theme: Theme::default(),
-        };
+        let mut panel = rich_panel(80, Theme::default());
+        panel.searching = true;
+        panel.query = "one two".into();
         for modifiers in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
             let key = crossterm::event::KeyEvent::new(KeyCode::Backspace, modifiers);
             assert_eq!(
@@ -429,6 +703,8 @@ mod tests {
                 ],
                 selected: 0,
                 detail: "preview".into(),
+                rendered: Vec::new(),
+                registry: Arc::new(LanguageRegistry::bundled()),
                 scroll: 0,
                 searching: false,
                 query: String::new(),
@@ -453,7 +729,8 @@ mod tests {
                     } else {
                         0
                     };
-                for row_y in row_y..row_y + 2 {
+                let selected_height = if viewport_width >= 72 { 2 } else { 1 };
+                for row_y in row_y..row_y + selected_height {
                     for column in 1..=list_width {
                         assert_eq!(
                             buffer.cells[row_y * viewport_width + column].style,

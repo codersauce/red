@@ -198,6 +198,7 @@ impl Editor {
             .unwrap_or_else(|| style.clone());
         link_style.bg = style.bg;
         link_style.bold = true;
+        link_style.underline = true;
         buffer.set_text(0, y, &prefix, style);
         buffer.set_text(x, y, &link, &link_style);
         buffer.set_text(x + link_width, y, hint, style);

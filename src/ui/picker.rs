@@ -1085,6 +1085,7 @@ impl Picker {
             bg: base.bg,
             bold: base.bold || semantic.bold,
             italic: base.italic || semantic.italic,
+            underline: base.underline || semantic.underline,
         };
         if selected {
             self.theme.ensure_text_contrast(&style)
@@ -1290,6 +1291,7 @@ impl Picker {
                 .or(base.bg),
             bold: base.bold || themed.is_some_and(|style| style.bold),
             italic: base.italic || themed.is_some_and(|style| style.italic),
+            underline: base.underline || themed.is_some_and(|style| style.underline),
         }
     }
 
@@ -1303,6 +1305,7 @@ impl Picker {
             bg: base.bg,
             bold: base.bold,
             italic: base.italic,
+            underline: base.underline,
         });
         if style.fg == base.fg {
             style.bold = true;
@@ -2348,6 +2351,7 @@ impl Picker {
                 .or(base.bg),
             bold: base.bold || themed.is_some_and(|style| style.bold),
             italic: base.italic || themed.is_some_and(|style| style.italic),
+            underline: base.underline || themed.is_some_and(|style| style.underline),
         }
     }
 }
@@ -3097,6 +3101,7 @@ fn merge_preview_style(base: &Style, syntax: &Style) -> Style {
         bg: syntax.bg.or(base.bg),
         bold: base.bold || syntax.bold,
         italic: base.italic || syntax.italic,
+        underline: base.underline || syntax.underline,
     }
 }
 

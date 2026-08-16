@@ -695,6 +695,27 @@ pub(crate) fn render_hover_markdown_lines_with_highlighter(
     MarkdownRenderer::new(width, highlighter, CodeBlockChrome::Bare).render(text)
 }
 
+/// Render source directly, without interpolating it into a Markdown fence.
+pub(crate) fn render_code_lines_with_highlighter(
+    file: &str,
+    source: &str,
+    width: usize,
+    highlighter: Option<&mut Highlighter>,
+) -> Vec<RenderedTextLine> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let language = highlighter
+        .as_ref()
+        .and_then(|value| value.language_id_for_file(Some(file)))
+        .unwrap_or_default()
+        .to_owned();
+    highlighted_code_lines(&language, source, highlighter)
+        .into_iter()
+        .flat_map(|spans| wrap_verbatim(&spans, width, &[], &[]))
+        .collect()
+}
+
 /// Render an exact two-sided edit using the same syntax spans and verbatim
 /// wrapping as Markdown code blocks, with the Git workspace's diff palette.
 pub(crate) fn render_diff_lines_with_highlighter(
@@ -781,6 +802,7 @@ pub(crate) fn render_diff_lines_with_highlighter(
                     bg: base.bg,
                     bold: syntax.bold,
                     italic: syntax.italic,
+                    underline: syntax.underline,
                 });
             }
             let prefix = span(
@@ -872,7 +894,7 @@ fn highlighted_code_lines(
     lines
 }
 
-fn wrap_spans(
+pub(crate) fn wrap_spans(
     spans: &[RenderedTextSpan],
     width: usize,
     first_prefix: &[RenderedTextSpan],

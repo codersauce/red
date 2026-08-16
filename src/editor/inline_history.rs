@@ -5,8 +5,12 @@ use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use super::inline_comments::InlineCommentOrigin;
 use super::*;
 use crate::inline_history::{
-    HistoryAction, InlineConversation, InlineHistoryTurn, InlineLocation, InlineSourceState,
+    HistoryAction, HistoryView, InlineConversation, InlineHistoryTurn, InlineLocation,
+    InlineSourceState,
 };
+use crate::ui::{HistoryBlock, HistoryDetail, HistoryStatus, HistoryTone};
+
+mod presentation;
 
 #[cfg(test)]
 mod tests;
@@ -45,7 +49,7 @@ pub(super) struct HistoryBrowser {
     searching: bool,
     selected: Option<HistoryKey>,
     expanded: HashSet<String>,
-    view: usize,
+    view: HistoryView,
     scroll: usize,
     confirm_forget: bool,
     dirty: bool,
@@ -288,7 +292,7 @@ impl Editor {
                 searching: false,
                 selected: None,
                 expanded: HashSet::new(),
-                view: 0,
+                view: HistoryView::default(),
                 scroll: 0,
                 confirm_forget: false,
                 dirty: false,
@@ -382,7 +386,7 @@ impl Editor {
             }
         }
         let mut detail =
-            "No inline conversations here yet. Use Space i to ask a question.".to_string();
+            HistoryDetail::from("No inline conversations here yet. Use Space i to ask a question.");
         let mut can_restore = false;
         if let Some(turn) = turn {
             let resolved = self.resolve_history_turn(&turn);
@@ -442,54 +446,7 @@ impl Editor {
                         .result
                         .as_ref()
                         .is_some_and(|result| !result.comments.is_empty()));
-            let view = self
-                .inline_history_browser
-                .as_ref()
-                .map_or(0, |browser| browser.view);
-            let header = format!(
-                "{} · {}\n{}\nSource: {}",
-                state.label(),
-                turn.status(),
-                history_location_label(&turn.location),
-                crate::ui::first_prompt_line(&turn.before)
-            );
-            let context = if turn.context_reads.is_empty() {
-                String::new()
-            } else {
-                format!("\n\nContext read:\n- {}", turn.context_reads.join("\n- "))
-            };
-            detail = match view {
-                4 if turn.has_code_change() => format!(
-                    "{header}\n\n{}\n\n{}",
-                    self.inline_change_label(&turn),
-                    turn.change_diff()
-                ),
-                4 => format!("{header}\n\nNo applied code changes in this turn."),
-                1 => format!(
-                    "{header}\n\nREVIEWED SOURCE · read-only\n{}",
-                    turn.reviewed()
-                ),
-                2 => format!("{header}\n\nBEFORE EDIT · read-only\n{}", turn.before),
-                3 => {
-                    let current = self
-                        .resolve_history_turn(&turn)
-                        .map(|(index, range, _)| self.buffer_manager[index].text_in_range(range))
-                        .unwrap_or_else(|| "[source detached]".into());
-                    format!(
-                        "{header}\n\nREVIEWED\n{}\n\nCURRENT\n{current}",
-                        turn.reviewed()
-                    )
-                }
-                _ => format!(
-                    "{header}\n\nYou: {}\n\nAssistant: {}{}{context}",
-                    turn.prompt,
-                    turn.answer_text(),
-                    turn.error
-                        .as_ref()
-                        .map(|error| format!("\n\nOutcome: {error}"))
-                        .unwrap_or_default()
-                ),
-            };
+            detail = self.history_turn_detail(&turn, state);
         } else if let Some((location, source, prompt)) = draft {
             let resolved = self.resolve_history_source(&location, &source, true);
             let state = resolved
@@ -503,11 +460,21 @@ impl Editor {
                         .await?;
                 }
             }
-            detail = format!(
-                "draft · {}\n{}\n\nUnsent prompt:\n{prompt}\n\nTARGET · read-only\n{source}",
-                state.label(),
-                history_location_label(&location)
-            );
+            detail = HistoryDetail {
+                location: Some(presentation::relative_location(
+                    &location,
+                    &get_workspace_path(),
+                )),
+                can_jump: state != InlineSourceState::Detached,
+                cwd: get_workspace_path(),
+                statuses: vec![
+                    HistoryStatus::new("Draft", HistoryTone::Muted),
+                    presentation::source_status(state),
+                ],
+                blocks: vec![HistoryBlock::Request(prompt)],
+                open_label: "edit draft",
+                ..HistoryDetail::default()
+            };
         }
         let Some(browser) = &mut self.inline_history_browser else {
             return Ok(());
@@ -521,7 +488,7 @@ impl Editor {
             } else {
                 "current file"
             },
-            ["conversation", "reviewed code", "before edit", "compare"][browser.view]
+            browser.view.label()
         );
         let (scroll, searching, query, confirm_forget, animation_started) = (
             browser.scroll,
@@ -548,6 +515,9 @@ impl Editor {
             can_restore,
             animation_started,
         );
+        if let Some(browser) = &mut self.inline_history_browser {
+            browser.scroll = panel.scroll();
+        }
         self.current_dialog = Some(Box::new(panel));
         self.layout_cache.borrow_mut().clear();
         self.render(buffer)
@@ -657,6 +627,25 @@ impl Editor {
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
+        if let HistoryAction::FollowFile { path, line, column } = action {
+            let target = plugin::TextPanelLinkTarget::File {
+                path: path.clone(),
+                location: line.map(|line| plugin::TextPanelFileLocation {
+                    line,
+                    column: column.unwrap_or(1),
+                }),
+            };
+            let action = self.follow_text_panel_link(target);
+            if matches!(action, KeyAction::Single(Action::Refresh)) {
+                return self.render(buffer);
+            }
+            self.close_inline_history(true, buffer, runtime).await?;
+            if let KeyAction::Single(action) = action {
+                self.execute_with_tracking(&action, buffer, runtime, false)
+                    .await?;
+            }
+            return Ok(());
+        }
         if let HistoryAction::Export(path) = action {
             let contents = serde_json::to_vec_pretty(&self.inline_history)?;
             let mut options = fs::OpenOptions::new();
@@ -711,7 +700,7 @@ impl Editor {
                                 HoverInfo::new(
                                     self,
                                     turn.answer_text(),
-                                    HoverInfoFormat::Plaintext,
+                                    HoverInfoFormat::Markdown,
                                     Vec::new(),
                                 )
                                 .with_label("Historical inline answer")
@@ -888,7 +877,7 @@ impl Editor {
             HistoryAction::ScrollDown => browser.scroll = browser.scroll.saturating_add(4),
             HistoryAction::ScrollUp => browser.scroll = browser.scroll.saturating_sub(4),
             HistoryAction::CycleView => {
-                browser.view = (browser.view + 1) % 5;
+                browser.view = browser.view.next();
                 browser.scroll = 0;
             }
             HistoryAction::Forget => browser.confirm_forget = !browser.confirm_forget,

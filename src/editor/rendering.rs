@@ -1037,6 +1037,7 @@ struct TerminalCellStyle {
     bg: Color,
     bold: bool,
     italic: bool,
+    underline: bool,
 }
 
 impl TerminalCellStyle {
@@ -1047,6 +1048,7 @@ impl TerminalCellStyle {
             bg,
             bold: style.bold,
             italic: style.italic,
+            underline: style.underline,
         }
     }
 
@@ -1073,6 +1075,13 @@ impl TerminalCellStyle {
                 style::Attribute::Italic
             } else {
                 style::Attribute::NoItalic
+            }))?;
+        }
+        if previous.is_none_or(|old| old.underline != self.underline) {
+            output.queue(style::SetAttribute(if self.underline {
+                style::Attribute::Underlined
+            } else {
+                style::Attribute::NoUnderline
             }))?;
         }
         Ok(())
@@ -2095,6 +2104,7 @@ impl Editor {
             bg: None,
             bold: false,
             italic: false,
+            underline: false,
         };
         let mut active_dividers = Vec::with_capacity(3);
         if let Some(super::DividerDrag {
@@ -4882,6 +4892,7 @@ mod tests {
             &Style {
                 bold: true,
                 italic: true,
+                underline: true,
                 ..Style::default()
             },
             &Style::default(),
@@ -4890,6 +4901,10 @@ mod tests {
         .unwrap();
 
         let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains("\x1b[4m"),
+            "underline style should emit underline"
+        );
         assert!(
             output.contains("\x1b[1m"),
             "bold style should emit bold attribute"
@@ -4912,6 +4927,10 @@ mod tests {
         assert!(
             output.contains("\x1b[23m"),
             "plain style should clear italic attribute"
+        );
+        assert!(
+            output.contains("\x1b[24m"),
+            "plain style should clear underline"
         );
     }
 

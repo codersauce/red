@@ -54,7 +54,9 @@ pub use hover_info::{HoverInfo, HoverInfoFormat};
 pub(crate) use icons::IconCatalog;
 pub use info::Info;
 pub use inline_assist::{InlineAssistPopup, InlineAssistPopupState};
-pub(crate) use inline_history::{InlineHistoryPanel, InlineHistoryRow};
+pub(crate) use inline_history::{
+    HistoryBlock, HistoryDetail, HistoryStatus, HistoryTone, InlineHistoryPanel, InlineHistoryRow,
+};
 pub use input_prompt::InputPrompt;
 pub(crate) use keyboard_shortcuts::{
     is_keyboard_shortcuts_alias, KeyboardShortcuts, ShortcutEntry, ShortcutEvent,

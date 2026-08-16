@@ -26,6 +26,11 @@ pub enum HistoryAction {
     ScrollDown,
     ScrollUp,
     CycleView,
+    FollowFile {
+        path: String,
+        line: Option<usize>,
+        column: Option<usize>,
+    },
     Jump,
     Open,
     ShowAnnotations,
@@ -37,6 +42,38 @@ pub enum HistoryAction {
     Forget,
     ConfirmForget,
     Export(String),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum HistoryView {
+    #[default]
+    Conversation,
+    Reviewed,
+    Before,
+    Compare,
+    Changes,
+}
+
+impl HistoryView {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Conversation => Self::Reviewed,
+            Self::Reviewed => Self::Before,
+            Self::Before => Self::Compare,
+            Self::Compare => Self::Changes,
+            Self::Changes => Self::Conversation,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Conversation => "Conversation",
+            Self::Reviewed => "Reviewed code",
+            Self::Before => "Before",
+            Self::Compare => "Compare",
+            Self::Changes => "Changes",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

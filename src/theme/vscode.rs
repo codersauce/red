@@ -176,6 +176,7 @@ pub fn parse_vscode_theme_contents(contents: &str) -> anyhow::Result<Theme> {
             .or(default_theme.style.bg),
         bold: false,
         italic: false,
+        underline: false,
     };
     let ui_style = vscode_theme.ui_style(&editor_style, selection_style.as_ref());
 
@@ -248,6 +249,7 @@ impl VsCodeTheme {
             bg,
             bold: false,
             italic: false,
+            underline: false,
         })
     }
 
@@ -528,6 +530,7 @@ impl TryFrom<VsCodeTokenColor> for TokenStyle {
         if let Some(font_style) = tc.settings.get("fontStyle").and_then(Value::as_str) {
             style.bold = font_style.contains("bold");
             style.italic = font_style.contains("italic");
+            style.underline = font_style.contains("underline");
         }
 
         let Some(scope) = tc.scope else {
