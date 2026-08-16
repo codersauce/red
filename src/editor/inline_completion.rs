@@ -250,8 +250,9 @@ impl Editor {
     }
 
     pub(super) fn handle_copilot_command(&mut self, command: &str) {
-        match command {
-            "enable" => {
+        use crate::copilot::CopilotCommand;
+        match CopilotCommand::parse(command) {
+            Some(CopilotCommand::Enable) => {
                 if self.config.disable_ai {
                     self.last_error = Some("Copilot is disabled by disable_ai = true".into());
                     return;
@@ -264,7 +265,7 @@ impl Editor {
                         .into(),
                 );
             }
-            "disable" => {
+            Some(CopilotCommand::Disable) => {
                 self.dismiss_inline_completion();
                 self.inline_completion.enabled_override = Some(false);
                 self.inline_completion.bridge = None;
@@ -272,7 +273,7 @@ impl Editor {
                 self.inline_completion.status = "Disabled".into();
                 self.last_error = Some("Copilot disabled".into());
             }
-            "signin" | "restart" => {
+            Some(CopilotCommand::SignIn | CopilotCommand::Restart) => {
                 self.inline_completion.failed = false;
                 if command == "restart" {
                     self.inline_completion.bridge = None;
@@ -281,11 +282,11 @@ impl Editor {
                     self.copilot_control(Control::SignIn);
                 }
             }
-            "signout" => {
+            Some(CopilotCommand::SignOut) => {
                 self.dismiss_inline_completion();
                 self.copilot_control(Control::SignOut);
             }
-            "" | "status" => {
+            Some(CopilotCommand::Status) => {
                 self.last_error = Some(format!(
                     "Copilot: {}",
                     if !self.copilot_enabled() {
@@ -297,11 +298,7 @@ impl Editor {
                     }
                 ))
             }
-            _ => {
-                self.last_error = Some(
-                    "Usage: Copilot enable|disable|signin|signout|status|restart|complete".into(),
-                )
-            }
+            _ => self.last_error = Some(CopilotCommand::usage()),
         }
     }
 

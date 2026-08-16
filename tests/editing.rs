@@ -2094,6 +2094,22 @@ async fn command_tab_completes_builtin_names_and_cycles_matches() {
 }
 
 #[tokio::test]
+async fn command_tab_completes_arguments_without_executing_them() {
+    let mut harness = EditorHarness::with_content("");
+    harness.set_commandline(Mode::Command, "Copilot sign");
+    command_key(&mut harness, KeyCode::Tab).await;
+    assert_eq!(harness.commandline_text(), "Copilot signin");
+    command_key(&mut harness, KeyCode::Tab).await;
+    assert_eq!(harness.commandline_text(), "Copilot signout");
+    command_key(&mut harness, KeyCode::BackTab).await;
+    assert_eq!(harness.commandline_text(), "Copilot signin");
+    command_key(&mut harness, KeyCode::Char('x')).await;
+    command_key(&mut harness, KeyCode::Tab).await;
+    assert_eq!(harness.commandline_text(), "Copilot signinx");
+    assert_eq!(harness.last_error(), None);
+}
+
+#[tokio::test]
 async fn command_tab_completion_remains_case_sensitive() {
     let mut harness = EditorHarness::with_content("");
     harness.set_commandline(Mode::Command, "Wr");

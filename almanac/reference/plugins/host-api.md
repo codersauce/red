@@ -20,7 +20,7 @@ sources:
     path: docs/plugin_api_changes.json
 ---
 
-The Plugin Host API reference identifies the files that define Red's Husk plugin contract and the rules for changing it. The canonical schema is `src/plugin/host_api.json`; it declares version `0.9.0` and lists host calls by `name`, `kind`, `signature`, and `introduced` [@schema]. The implementation embeds that schema in `src/plugin/api.rs`, validates literal plugin calls against it, and tests that runtime dispatch remains covered by the schema [@api]. This page does not copy the full schema; open the schema when exact call names or signatures are needed.
+The Plugin Host API reference identifies the files that define Red's Husk plugin contract and the rules for changing it. The canonical schema is `src/plugin/host_api.json`; it declares version `0.11.0` and lists host calls by `name`, `kind`, `signature`, and `introduced` [@schema]. The implementation embeds that schema in `src/plugin/api.rs`, validates literal plugin calls against it, and tests that runtime dispatch remains covered by the schema [@api]. This page does not copy the full schema; open the schema when exact call names or signatures are needed.
 
 ## Source Of Truth
 

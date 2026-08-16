@@ -25,6 +25,50 @@ use crate::{
     undo::TextPosition,
 };
 
+/// Operations accepted by the `:Copilot` command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopilotCommand {
+    Enable,
+    Disable,
+    SignIn,
+    SignOut,
+    Status,
+    Restart,
+    Complete,
+}
+
+impl CopilotCommand {
+    pub(crate) const ALL: &[(Self, &str)] = &[
+        (Self::Enable, "enable"),
+        (Self::Disable, "disable"),
+        (Self::SignIn, "signin"),
+        (Self::SignOut, "signout"),
+        (Self::Status, "status"),
+        (Self::Restart, "restart"),
+        (Self::Complete, "complete"),
+    ];
+
+    pub(crate) fn parse(input: &str) -> Option<Self> {
+        if input.is_empty() {
+            return Some(Self::Status);
+        }
+        Self::ALL
+            .iter()
+            .find_map(|(command, name)| (*name == input).then_some(*command))
+    }
+
+    pub(crate) fn usage() -> String {
+        format!(
+            "Usage: Copilot {}",
+            Self::ALL
+                .iter()
+                .map(|(_, name)| *name)
+                .collect::<Vec<_>>()
+                .join("|")
+        )
+    }
+}
+
 const MAX_SUGGESTION_BYTES: usize = 64 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 

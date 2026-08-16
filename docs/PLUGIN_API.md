@@ -1,6 +1,6 @@
 # Husk plugin compatibility
 
-Red host API version `0.10.0` is defined by
+Red host API version `0.11.0` is defined by
 [`src/plugin/host_api.json`](../src/plugin/host_api.json). That file is the canonical,
 machine-readable list of execute actions, request actions, signatures, and introduction
 versions. Runtime dispatch and the bundled-plugin corpus are checked against it in tests.
@@ -24,9 +24,39 @@ required/optional arity (`HUSK-A0002`) and obvious literal argument types
 annotations use `HUSK-A0004`. `--no-typecheck` is an unsupported development
 escape hatch; compatibility guarantees do not apply while it is enabled.
 
-Red `0.10.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, and `0.9.0`
-contracts, so existing packages that declare those minors continue to load. New
-packages should target `"red_api_version": "^0.10.0"`.
+Red `0.11.0` retains the complete `0.4.0`, `0.6.0`, `0.7.0`, `0.8.0`, `0.9.0`,
+and `0.10.0` contracts, so existing packages that declare those minors continue to
+load. New packages should target `"red_api_version": "^0.11.0"`.
+
+## Command arguments and completion
+
+Host API `0.11.0` adds opt-in arguments to plugin commands:
+
+```husk
+#[red::command(
+    name = "Service",
+    arguments = true,
+    completions = [["enable", "disable", "status"], ["local", "workspace"]],
+)]
+fn service(command: CommandInvocation) {
+    red::execute("Print", command.raw_args);
+}
+```
+
+`CommandInvocation` contains the exact registered `name`, whitespace-separated
+`args: [String]`, and unexpanded `raw_args: String`. A callback may also accept
+`Json` when it does not need the typed record. A palette or keymap invocation
+without arguments receives an empty argument list. Existing commands continue to
+take no parameters unless they opt in. The same `arguments` and `completions`
+fields are accepted by `red::add_command` metadata.
+
+Each inner completion array describes one argument position. Choices must be
+nonempty strings without whitespace; an empty array leaves that position without
+suggestions. Choices are hints, not validation: the callback must validate its
+arguments. `Tab` and `Shift-Tab` cycle matching choices without invoking the
+callback. Hidden commands stay out of completion, and built-in colon commands
+retain precedence. There is no shell quoting, expansion, or completion callback.
+Packages using these fields must target `^0.11.0` or later.
 
 ## Language-pack formatters
 
@@ -176,7 +206,7 @@ fn stop_background_work() {
 }
 ```
 
-`#[red::command]` requires a nonempty `name`, a zero-argument function, and
+`#[red::command]` requires a nonempty `name`, a zero-argument function by default, and
 optional string `title`, `category`, and `description` fields plus an optional
 string-array `aliases` field. `visible = false` hides a command from the command
 palette and colon completion without disabling direct invocation or keymaps.

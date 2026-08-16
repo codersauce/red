@@ -6,6 +6,9 @@ sources:
   - id: command-parser
     type: file
     path: src/command.rs
+  - id: command-completion
+    type: file
+    path: src/command_completion.rs
   - id: command-palette
     type: file
     path: src/command_palette.rs
@@ -40,7 +43,7 @@ Advertising a built-in colon form is a parser and dispatch change, not only pale
 
 ## Completion Names
 
-Colon completion uses the palette module's command-name inventory rather than the parser alone. `colon_completion_names` starts with built-in colon commands, adds special built-ins such as `commands`, `command-palette`, debug commands, registers, undotree, `j`, and `join`, and then appends plugin command names that do not collide with built-in colon names [@command-palette]. The editor uses that list for command-line completion when the current command fragment has no whitespace and is not in a file or syntax completion context [@editor-dispatch].
+Colon completion uses the palette module's command-name inventory rather than the parser alone. `colon_completion_names` starts with built-in colon commands, adds special built-ins such as `commands`, `command-palette`, debug commands, registers, undotree, `j`, and `join`, and then appends plugin command names that do not collide with built-in colon names [@command-palette]. The editor uses that list for command-name completion. `src/command_completion.rs` selects argument providers after a space: fixed choices for commands such as `set`, `languages`, and `Copilot`, file paths for file commands, and language ids for syntax commands. `Tab` cycles forward and `Shift-Tab` cycles backward through the original matches; typing resets the cycle. Positional choices replace only the current argument; file completion retains its existing whole-path replacement behavior. Completion never executes a command or plugin callback [@command-completion] [@editor-dispatch].
 
 Built-in precedence is intentional. `colon_name_is_builtin` treats special names and anything the built-in parser can resolve as reserved, so plugin commands with those names can still be active internally but do not create alternate colon command entries in discovery surfaces [@command-palette]. This matches the plugin API boundary described in [Red Host API](../plugins/red-host-api).
 
@@ -66,6 +69,8 @@ The panel-global allowlist currently admits command/search entry, file picker, c
 
 ## Plugin Command Metadata
 
-Plugins register command discovery data through the runtime's `CommandMetadata`, which carries optional title, category, description, aliases, visibility, and panel key-dispatch scope [@plugin-runtime]. Declarative `#[red::command]` metadata accepts `scope = "editor"` or `scope = "global"` and defaults to editor scope, while imperative `red::add_command` metadata is deserialized into the same runtime structure [@plugin-api] [@plugin-runtime]. `Runtime::registered_commands` returns active command records with command name, owning plugin, callback, and metadata sorted by command name for stable discovery UI, and `Runtime::command_scope` is the editor's lookup path when deciding whether a plugin command may run from focused panels [@plugin-runtime] [@editor-dispatch]. Because palette entries retain the owning plugin in their ids, duplicate command names have deterministic runtime behavior before discovery surfaces display them [@plugin-runtime].
+Plugins register command discovery data through the runtime's `CommandMetadata`, which carries optional title, category, description, aliases, visibility, panel key-dispatch scope, and opt-in argument/completion metadata [@plugin-runtime]. Declarative `#[red::command]` metadata accepts `scope = "editor"` or `scope = "global"` and defaults to editor scope, while imperative `red::add_command` metadata is deserialized into the same runtime structure [@plugin-api] [@plugin-runtime]. `Runtime::registered_commands` returns active command records with command name, owning plugin, callback, and metadata sorted by command name for stable discovery UI, and `Runtime::command_scope` is the editor's lookup path when deciding whether a plugin command may run from focused panels [@plugin-runtime] [@editor-dispatch]. Because palette entries retain the owning plugin in their ids, duplicate command names have deterministic runtime behavior before discovery surfaces display them [@plugin-runtime].
 
 This command system does not make colon syntax a general shell. Arguments are split simply, command names are case-sensitive where plugin names are involved, and plugin command execution stays behind the plugin host boundary [@command-parser] [@editor-dispatch]. The CLI-level command surface is documented in [Red Command](../../reference/cli/red-command), and exact default keymaps and plugin command bindings belong in [Default Config](../../reference/configuration/default-config).
+
+Plugin commands may opt in with `arguments = true` and positional `completions = [["enable", "disable"]]`. They receive one `CommandInvocation` record containing the registered name, split arguments, and raw argument text. Legacy callbacks still receive no arguments; exact registered names and built-in precedence are preserved. See [Plugin Host API](../../reference/plugins/host-api) for compatibility requirements [@plugin-api] [@plugin-runtime].

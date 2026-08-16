@@ -5,6 +5,19 @@
 //! arguments are returned; unknown input fails as a whole so a partially recognized
 //! chain cannot execute unintended commands.
 
+/// Accepted values for the first `:set` argument.
+pub(crate) const SET_OPTIONS: &[&str] = &["relativenumber", "rnu", "norelativenumber", "nornu"];
+
+/// Accepted `:languages` operations.
+pub(crate) const LANGUAGE_COMMANDS: &[&str] = &["reload"];
+
+/// Splits an exact plugin command name from its unexpanded argument text.
+pub(crate) fn split_invocation(input: &str) -> (&str, &str) {
+    input
+        .split_once(char::is_whitespace)
+        .map_or((input, ""), |(name, args)| (name, args.trim_start()))
+}
+
 /// Modifier parsed from a built-in colon command.
 #[derive(Debug, PartialEq)]
 pub enum CommandFlag {

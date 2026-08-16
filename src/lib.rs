@@ -23,6 +23,7 @@ pub mod clipboard;
 pub mod codex;
 pub mod color;
 pub mod command;
+mod command_completion;
 pub mod command_palette;
 mod comment;
 pub mod config;

@@ -43,6 +43,7 @@ const MAX_PACKAGE_UNPACKED_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PACKAGE_ARCHIVE_FILES: usize = 1024;
 const MAX_CATALOG_GRAMMAR_BYTES: u64 = 64 * 1024 * 1024;
 const COMMAND_SCOPE_API_VERSION: &str = "0.7.0";
+const COMMAND_ARGUMENTS_API_VERSION: &str = "0.11.0";
 
 /// A parsed and validated stable plugin identifier.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -268,6 +269,12 @@ impl PluginPackageManifest {
                 target.display()
             );
         }
+        if self.uses_command_arguments(package_root) {
+            anyhow::ensure!(host_api_requirement_requires_at_least(
+                &self.plugin.red_api, COMMAND_ARGUMENTS_API_VERSION)?,
+                "plugin uses command arguments introduced in Red host API {COMMAND_ARGUMENTS_API_VERSION}, but manifest range `{}` includes an older supported API; declare `red_api = \"^{COMMAND_ARGUMENTS_API_VERSION}\"` or later",
+                self.plugin.red_api);
+        }
         if self.uses_command_scope(package_root) {
             anyhow::ensure!(
                 host_api_requirement_requires_at_least(
@@ -349,6 +356,24 @@ impl PluginPackageManifest {
         }
         validate_keymaps(&self.keymaps)?;
         Ok(())
+    }
+
+    fn uses_command_arguments(&self, package_root: &Path) -> bool {
+        if let Some(manifest) = &self.plugin.husk_manifest {
+            return ResolvedPackage::open(package_root.join(manifest), PackageLimits::default())
+                .is_ok_and(|package| {
+                    package
+                        .modules
+                        .iter()
+                        .any(|module| super::api::source_uses_command_arguments(&module.syntax))
+                });
+        }
+        self.plugin.entry.as_ref().is_some_and(|entry| {
+            fs::read_to_string(package_root.join(entry))
+                .ok()
+                .and_then(|source| husk_parser::parse_str(&source).file)
+                .is_some_and(|file| super::api::source_uses_command_arguments(&file))
+        })
     }
 
     fn uses_command_scope(&self, package_root: &Path) -> bool {
@@ -1827,6 +1852,39 @@ symbol = "tree_sitter_buildspec"
             manifest.plugin.red_api,
             VersionReq::parse("^0.6.0").unwrap()
         );
+    }
+
+    #[test]
+    fn package_manifest_requires_current_api_for_command_arguments() {
+        for (label, source) in [
+            (
+                "declarative",
+                r#"#[red::command(name = "Test", arguments = true)] fn test(command: CommandInvocation) {}"#,
+            ),
+            (
+                "imperative",
+                r#"pub fn activate() { red::add_command("Test", test, Json { arguments: true }); } fn test(command: CommandInvocation) {}"#,
+            ),
+            (
+                "variable",
+                r#"pub fn activate() { let metadata = Json { arguments: true }; red::add_command("Test", test, metadata); } fn test(command: CommandInvocation) {}"#,
+            ),
+        ] {
+            let package = tempfile::tempdir().unwrap();
+            write_package(package.path(), &format!("{label}-arguments"), "1.0.0");
+            fs::write(package.path().join("src/main.hk"), source).unwrap();
+            PluginPackageManifest::load(package.path()).unwrap();
+            let path = package.path().join(PLUGIN_MANIFEST_FILE);
+            let manifest = fs::read_to_string(&path)
+                .unwrap()
+                .replace(&format!("^{RED_HOST_API_VERSION}"), "^0.10.0");
+            fs::write(path, manifest).unwrap();
+            let error = PluginPackageManifest::load(package.path()).unwrap_err();
+            assert!(
+                error.to_string().contains("command arguments introduced"),
+                "{label}: {error}"
+            );
+        }
     }
 
     #[test]

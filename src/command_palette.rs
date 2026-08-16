@@ -1344,23 +1344,9 @@ fn display_key(key: &str) -> &str {
     }
 }
 
-fn colon_name_is_builtin(name: &str) -> bool {
-    matches!(
-        name,
-        "commands"
-            | "command-palette"
-            | "whats-new"
-            | "changelog"
-            | "db"
-            | "dh"
-            | "di"
-            | "dc"
-            | "dt"
-            | "registers"
-            | "undotree"
-            | "j"
-            | "join"
-    ) || command::parse(BUILTIN_COLON_COMMANDS, name).is_some()
+pub(crate) fn colon_name_is_builtin(name: &str) -> bool {
+    SPECIAL_BUILTIN_COLON_COMMANDS.contains(&name)
+        || command::parse(BUILTIN_COLON_COMMANDS, name).is_some()
 }
 
 fn humanize_identifier(identifier: &str) -> String {

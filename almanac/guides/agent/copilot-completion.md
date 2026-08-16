@@ -39,6 +39,9 @@ excluded_patterns = [".env", ".env.*", "*.pem", "*.key", "**/.git/**"]
 ```
 
 Alternatively, use `:Copilot enable` to opt in for the current editor session.
+Type `:Copilot ` and press `Tab` to cycle through subcommands, or complete a
+prefix such as `:Copilot en`. `Shift-Tab` cycles backward. Completion does not
+enable Copilot or start authentication.
 Then run `:Copilot signin`, copy the displayed device code, and approve opening
 GitHub's sign-in page. Use `:Copilot status` to inspect the latest provider
 status, `:Copilot restart` after changing the executable, and `:Copilot signout`

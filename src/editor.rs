@@ -83,7 +83,9 @@ use crate::{
     clipboard::{ClipboardProvider, DisabledClipboardProvider, NativeClipboardProvider},
     codex::{start_codex, CodexBridge, CodexCommand, CodexEvent, CodexProcessSpec},
     color::Color,
-    command, command_palette,
+    command,
+    command_completion::{self, CommandCompletionState, CompletionDirection},
+    command_palette,
     comment::CommentSyntax,
     config::{
         Config, ConfigDiagnostic, ConfigDiagnosticSource, ConfigRecovery, FormattingProvider,
@@ -3645,35 +3647,6 @@ impl PromptHistoryNavigation {
         *navigation = Some(state);
         changed
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CommandCompletionState {
-    replacement_start: usize,
-    replacement_end: usize,
-    candidates: Vec<String>,
-    selected: usize,
-    needs_leading_space: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CommandCompletionContext {
-    replacement_start: usize,
-    replacement_end: usize,
-    fragment: String,
-    needs_leading_space: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CompletionDirection {
-    Next,
-    Previous,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PathCompletionCandidate {
-    replacement: String,
-    is_dir: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -13580,7 +13553,9 @@ impl Editor {
 
         if cmd == "Copilot" || cmd.starts_with("Copilot ") {
             let command = cmd.strip_prefix("Copilot").unwrap_or_default().trim();
-            return if command == "complete" {
+            return if crate::copilot::CopilotCommand::parse(command)
+                == Some(crate::copilot::CopilotCommand::Complete)
+            {
                 vec![
                     Action::EnterMode(Mode::Insert),
                     Action::RequestInlineCompletion,
@@ -14336,244 +14311,24 @@ impl Editor {
         self.update_search_preview();
     }
 
-    fn command_accepts_file_completion(command: &str) -> bool {
-        matches!(
-            command.trim_end_matches('!'),
-            "e" | "edit" | "w" | "write" | "sp" | "split" | "vs" | "vsplit"
-        )
-    }
-
-    fn command_accepts_syntax_completion(command: &str) -> bool {
-        matches!(command.trim_end_matches('!'), "syntax" | "syn" | "ft")
-    }
-
-    fn command_completion_context(
-        command: &str,
-        accepts_completion: fn(&str) -> bool,
-    ) -> Option<CommandCompletionContext> {
-        let command_start = command
-            .char_indices()
-            .find_map(|(index, ch)| (!ch.is_whitespace()).then_some(index))?;
-        let after_leading = &command[command_start..];
-        let command_end = after_leading
-            .char_indices()
-            .find_map(|(index, ch)| ch.is_whitespace().then_some(command_start + index))
-            .unwrap_or(command.len());
-        let command_name = &command[command_start..command_end];
-        if !accepts_completion(command_name) {
-            return None;
-        }
-
-        let args_start = command[command_end..]
-            .char_indices()
-            .find_map(|(index, ch)| (!ch.is_whitespace()).then_some(command_end + index));
-
-        if let Some(replacement_start) = args_start {
-            Some(CommandCompletionContext {
-                replacement_start,
-                replacement_end: command.len(),
-                fragment: command[replacement_start..].to_string(),
-                needs_leading_space: false,
-            })
-        } else {
-            Some(CommandCompletionContext {
-                replacement_start: command_end,
-                replacement_end: command.len(),
-                fragment: String::new(),
-                needs_leading_space: true,
-            })
-        }
-    }
-
-    fn dot_directory_candidate(fragment: &str) -> Option<PathCompletionCandidate> {
-        match fragment {
-            "." => Some(PathCompletionCandidate {
-                replacement: "./".to_string(),
-                is_dir: true,
-            }),
-            ".." => Some(PathCompletionCandidate {
-                replacement: "../".to_string(),
-                is_dir: true,
-            }),
-            "~" if expand_user_path("~").is_ok() => Some(PathCompletionCandidate {
-                replacement: "~/".to_string(),
-                is_dir: true,
-            }),
-            _ => None,
-        }
-    }
-
-    fn path_completion_candidates(fragment: &str) -> Vec<PathCompletionCandidate> {
-        if let Some(candidate) = Self::dot_directory_candidate(fragment) {
-            return vec![candidate];
-        }
-
-        let (directory_fragment, file_prefix) = fragment
-            .rfind('/')
-            .map(|index| (&fragment[..=index], &fragment[index + 1..]))
-            .unwrap_or(("", fragment));
-        let directory_path = if directory_fragment.is_empty() {
-            PathBuf::from(".")
-        } else {
-            expand_user_path(directory_fragment)
-                .unwrap_or_else(|_| PathBuf::from(directory_fragment))
-        };
-
-        let Ok(read_dir) = fs::read_dir(directory_path) else {
-            return Vec::new();
-        };
-
-        let mut candidates = read_dir
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if !name.starts_with(file_prefix) {
-                    return None;
-                }
-
-                let is_dir = entry
-                    .file_type()
-                    .map(|file_type| file_type.is_dir())
-                    .unwrap_or(false);
-                let suffix = if is_dir { "/" } else { "" };
-                Some(PathCompletionCandidate {
-                    replacement: format!("{directory_fragment}{name}{suffix}"),
-                    is_dir,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        candidates.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-            (true, false) => Ordering::Less,
-            (false, true) => Ordering::Greater,
-            _ => a.replacement.cmp(&b.replacement),
-        });
-        candidates
-    }
-
-    fn apply_command_completion_candidate(&mut self, candidate: &str) {
-        let Some(completion) = self.command_completion.as_mut() else {
-            return;
-        };
-        let replacement = if completion.needs_leading_space {
-            format!(" {candidate}")
-        } else {
-            candidate.to_string()
-        };
-        self.command.replace_range(
-            completion.replacement_start..completion.replacement_end,
-            &replacement,
-        );
-        completion.replacement_end = completion.replacement_start + replacement.len();
-    }
-
     fn complete_command_line(
         &mut self,
         direction: CompletionDirection,
         plugin_commands: &[plugin::RegisteredPluginCommand],
     ) {
-        if let Some(mut completion) = self.command_completion.take() {
-            if completion.candidates.len() > 1 {
-                completion.selected = match direction {
-                    CompletionDirection::Next => {
-                        (completion.selected + 1) % completion.candidates.len()
-                    }
-                    CompletionDirection::Previous => completion
-                        .selected
-                        .checked_sub(1)
-                        .unwrap_or_else(|| completion.candidates.len() - 1),
-                };
-                self.command_completion = Some(completion);
-                let candidate = self
-                    .command_completion
-                    .as_ref()
-                    .and_then(|state| state.candidates.get(state.selected).cloned());
-                if let Some(candidate) = candidate {
-                    self.apply_command_completion_candidate(&candidate);
-                }
-                return;
-            }
-        }
-
-        let (context, candidates) = if let Some(context) =
-            Self::command_completion_context(&self.command, Self::command_accepts_file_completion)
-        {
-            let candidates = Self::path_completion_candidates(&context.fragment)
-                .into_iter()
-                .map(|candidate| candidate.replacement)
-                .collect::<Vec<_>>();
-            (context, candidates)
-        } else if let Some(context) =
-            Self::command_completion_context(&self.command, Self::command_accepts_syntax_completion)
-        {
-            let fragment = context.fragment.to_ascii_lowercase();
-            let mut candidates = if fragment.chars().any(char::is_whitespace) {
-                Vec::new()
-            } else {
-                ["auto", "off"]
+        command_completion::complete(
+            &mut self.command_completion,
+            &mut self.command,
+            direction,
+            plugin_commands,
+            |fragment| {
+                self.highlighter
+                    .matching_language_ids(fragment)
                     .into_iter()
-                    .filter(|language| language.starts_with(&fragment))
                     .map(str::to_string)
-                    .chain(
-                        self.highlighter
-                            .matching_language_ids(&fragment)
-                            .into_iter()
-                            .map(str::to_string),
-                    )
-                    .collect::<Vec<_>>()
-            };
-            candidates.sort_unstable();
-            candidates.dedup();
-            (context, candidates)
-        } else {
-            let command_start = self
-                .command
-                .char_indices()
-                .find_map(|(index, ch)| (!ch.is_whitespace()).then_some(index))
-                .unwrap_or(self.command.len());
-            let fragment = &self.command[command_start..];
-            if fragment.is_empty() || fragment.chars().any(char::is_whitespace) {
-                self.command_completion = None;
-                return;
-            }
-            let candidates = command_palette::colon_completion_names(plugin_commands)
-                .into_iter()
-                .filter(|command| command.starts_with(fragment))
-                .collect::<Vec<_>>();
-            (
-                CommandCompletionContext {
-                    replacement_start: command_start,
-                    replacement_end: self.command.len(),
-                    fragment: fragment.to_string(),
-                    needs_leading_space: false,
-                },
-                candidates,
-            )
-        };
-        if candidates.is_empty() {
-            self.command_completion = None;
-            return;
-        }
-
-        let selected = match direction {
-            CompletionDirection::Next => 0,
-            CompletionDirection::Previous => candidates.len() - 1,
-        };
-
-        self.command_completion = Some(CommandCompletionState {
-            replacement_start: context.replacement_start,
-            replacement_end: context.replacement_end,
-            candidates,
-            selected,
-            needs_leading_space: context.needs_leading_space,
-        });
-        let candidate = self
-            .command_completion
-            .as_ref()
-            .and_then(|state| state.candidates.get(state.selected).cloned());
-        if let Some(candidate) = candidate {
-            self.apply_command_completion_candidate(&candidate);
-        }
+                    .collect()
+            },
+        );
     }
 
     fn record_command_history(&mut self, command: &str) {
@@ -28630,6 +28385,56 @@ builtin = "rust"
             editor.last_error.as_deref(),
             Some("reloaded 1 configured language")
         );
+    }
+
+    #[tokio::test]
+    async fn command_argument_completion_runs_plugin_only_after_enter() {
+        drain_plugin_requests();
+        let mut editor = test_editor(80, 12);
+        let mut buffer = RenderBuffer::new(80, 12, &Style::default());
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin(
+                "argument_completion",
+                r#"
+            #[red::command(name = "Service", arguments = true,
+                completions = [["enable", "disable"], ["local", "workspace"]])]
+            fn service(command: CommandInvocation) {
+                red::execute("Print", format("received: {}", command.raw_args));
+            }
+        "#,
+            )
+            .await
+            .unwrap();
+        editor.test_set_commandline(Mode::Command, "Service en");
+        for key in [
+            KeyCode::Tab,
+            KeyCode::Char(' '),
+            KeyCode::Char('l'),
+            KeyCode::Tab,
+        ] {
+            editor
+                .process_editor_event(
+                    Event::Key(KeyEvent::new(key, KeyModifiers::NONE)),
+                    &mut buffer,
+                    &mut runtime,
+                    EventRenderMode::Immediate,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(editor.command, "Service enable local");
+        assert!(collect_print_requests().is_empty());
+        assert_eq!(editor.last_error, None);
+
+        enter_colon_command(
+            &mut editor,
+            &mut buffer,
+            &mut runtime,
+            "Service enable local",
+        )
+        .await;
+        assert_eq!(editor.last_error.as_deref(), Some("received: enable local"));
     }
 
     #[tokio::test]
