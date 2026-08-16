@@ -11,6 +11,9 @@ from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent
 SKIP = {".git", "node_modules", "target"}
+# Upstream package documentation can refer to files omitted from the release.
+# Keep Red's own vendor/CROSSTERM.md in the checked set.
+VENDORED_TREES = (Path("vendor/crossterm"),)
 INLINE = re.compile(r"!?\[[^\]]*\]\(\s*(?:<([^>]+)>|([^\s)]+))")
 REFERENCE = re.compile(r"^\s{0,3}\[[^\]]+\]:\s*(?:<([^>]+)>|(\S+))", re.MULTILINE)
 HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
@@ -87,6 +90,18 @@ def anchors(contents: str) -> set[str]:
     return result
 
 
+def markdown_files(root: Path) -> list[Path]:
+    files: list[Path] = []
+    for path in root.rglob("*.md"):
+        relative = path.relative_to(root)
+        if any(part in SKIP for part in relative.parts):
+            continue
+        if any(relative.is_relative_to(tree) for tree in VENDORED_TREES):
+            continue
+        files.append(path)
+    return sorted(files)
+
+
 def self_test() -> None:
     sample = """# Heading, with punctuation!
 ## Phase 4 — Typed plugin compatibility contract (10–14 weeks)
@@ -153,6 +168,30 @@ Setext heading
             "(missing `#missing-heading`)",
             "source.md: broken fragment `#missing-local` (missing `#missing-local`)",
         ], errors
+    with tempfile.TemporaryDirectory(prefix="red-markdown-scope-") as directory:
+        root = Path(directory).resolve() / "target" / "repository"
+        included = [
+            Path("README.md"),
+            Path("vendor/CROSSTERM.md"),
+            Path("vendor/crossterm-notes/README.md"),
+            Path("docs/vendor/crossterm/README.md"),
+        ]
+        excluded = [
+            Path("vendor/crossterm/README.md"),
+            Path("vendor/crossterm/examples/README.md"),
+            Path("target/README.md"),
+        ]
+        for relative in included + excluded:
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("[missing](missing.md)\n", encoding="utf-8")
+        files = markdown_files(root)
+        assert files == sorted(root / relative for relative in included), files
+        errors = link_errors(root, files)
+        assert errors == [
+            f"{relative}: broken link `missing.md`"
+            for relative in sorted(included)
+        ], errors
     print("markdown link checker self-test: ok")
 
 
@@ -199,11 +238,7 @@ def main() -> int:
         print("usage: check_markdown_links.py [--self-test]", file=sys.stderr)
         return 2
 
-    files = sorted(
-        path
-        for path in ROOT.rglob("*.md")
-        if not any(part in SKIP for part in path.parts)
-    )
+    files = markdown_files(ROOT)
     errors = link_errors(ROOT, files)
 
     if errors:
