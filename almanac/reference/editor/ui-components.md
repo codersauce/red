@@ -72,6 +72,14 @@ Red's modal UI components implement a common `Component` trait above the editor 
 
 `InputPrompt` is a single-line prompt. It can be normal, secret, or callback-owned, masks secret rendering with asterisks, returns submitted values through an action or composer callback, cancels empty submissions, and keeps cursor edits grapheme-aware [@input-prompt]. It exposes `composer_handle()` for callback prompts and computes cursor position differently for masked and unmasked input, using grapheme count for masked values and display width for visible values [@input-prompt].
 
+Editable dialogs accept `Alt-Backspace` (Option-Delete on macOS) and
+`Ctrl-Backspace` (Windows) to remove the preceding word. Both shortcuts work
+on either platform when the terminal reports the modifier. Selected initial
+values in single-line prompts are cleared as a whole. Composers retain
+`Ctrl-W`; active search fields edit their own query instead of the underlying
+draft. Word boundaries remain whitespace-delimited, including punctuation
+and paths within a word.
+
 ## Resource Ownership
 
 Plugin-owned pickers and composers are identified by handles returned from `picker_handle()` and `composer_handle()` [@ui-core]. [Plugin resource ownership](../../architecture/plugins/resource-ownership) covers the lifecycle around those handles, while [callback-scoped dialogs](../../concepts/plugins/callback-scoped-dialogs) explains why callback-owned dialogs close by notifying the handle owner instead of sending global plugin events.

@@ -438,6 +438,33 @@ mod tests {
         AgentComposer::new(editor, title, id, query, history, "agent".to_string())
     }
 
+    #[test]
+    fn word_backspace_preserves_the_composer_submission_contract() {
+        let editor = editor(60, 18);
+        let handle = ComposerHandle::from_raw(42);
+        for modifiers in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
+            let mut composer = AgentComposer::new_callback(
+                &editor,
+                Some("Prompt".into()),
+                "first second".into(),
+                vec![],
+                handle,
+            );
+            composer.handle_event(&key(KeyCode::Backspace, modifiers));
+            assert_eq!(composer.prompt.text(), "first ");
+            assert_eq!(
+                submit(&mut composer),
+                Some(KeyAction::Multiple(vec![
+                    Action::NotifyComposer(
+                        handle,
+                        Box::new(ComposerCallback::Submitted("first ".into()))
+                    ),
+                    Action::CloseDialog,
+                ]))
+            );
+        }
+    }
+
     fn rendered_row(buffer: &RenderBuffer, y: usize) -> String {
         buffer.cells[y * buffer.width..(y + 1) * buffer.width]
             .iter()

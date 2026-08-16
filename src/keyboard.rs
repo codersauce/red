@@ -36,6 +36,15 @@ pub enum KeyboardProtocol {
 // the active mode before leaving the alternate screen, without a double pop.
 static ACTIVE_PROTOCOL: AtomicU8 = AtomicU8::new(0);
 
+/// Recognizes the macOS and Windows word-backspace shortcuts on either platform.
+/// Terminal protocols and remote sessions can report either modifier.
+pub(crate) fn is_word_backspace(key: KeyEvent) -> bool {
+    key.code == KeyCode::Backspace
+        && key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
+}
+
 impl KeyboardProtocol {
     /// Negotiate before starting the event loop; capability queries share its reader.
     pub fn start(output: &mut impl Write, preference: KeyboardPreference) -> io::Result<Self> {
@@ -167,7 +176,7 @@ pub fn inspect_keys(preference: KeyboardPreference, count: Option<usize>) -> any
     )?;
     writeln!(
         output,
-        "Press Enter, modified Enter, or Ctrl+J; Esc/Ctrl+C exits. Text is not recorded.\r"
+        "Press Enter, Backspace, or their modified shortcuts; Esc/Ctrl+C exits. Text is not recorded.\r"
     )?;
     output.flush()?;
     let mut seen = 0;
@@ -191,6 +200,7 @@ pub fn inspect_keys(preference: KeyboardPreference, count: Option<usize>) -> any
 fn describe_key(key: KeyEvent) -> String {
     let code = match key.code {
         KeyCode::Enter => "Enter",
+        KeyCode::Backspace => "Backspace",
         KeyCode::Char('\r') => "CR",
         KeyCode::Char('\n') => "LF",
         KeyCode::Char('j' | 'J') if key.modifiers.contains(KeyModifiers::CONTROL) => "Ctrl+J",
@@ -206,6 +216,32 @@ fn describe_key(key: KeyEvent) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_backspace_recognizes_both_platform_shortcuts() {
+        for modifiers in [
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            assert!(is_word_backspace(KeyEvent::new(
+                KeyCode::Backspace,
+                modifiers
+            )));
+        }
+        for (code, modifiers) in [
+            (KeyCode::Backspace, KeyModifiers::NONE),
+            (KeyCode::Backspace, KeyModifiers::SHIFT),
+            (KeyCode::Delete, KeyModifiers::CONTROL),
+            (KeyCode::Char('h'), KeyModifiers::CONTROL),
+        ] {
+            assert!(!is_word_backspace(KeyEvent::new(code, modifiers)));
+        }
+        assert!(
+            describe_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT))
+                .contains("code=Backspace modifiers=KeyModifiers(ALT)")
+        );
+    }
 
     #[test]
     fn protocol_commands_are_balanced_and_minimal() {

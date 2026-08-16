@@ -29,6 +29,28 @@ pub fn display_width(s: &str) -> usize {
     s.width()
 }
 
+/// Returns the byte boundary before trailing whitespace and the preceding word.
+/// Words use the prompt editor's existing whitespace-delimited semantics, and
+/// the result always falls on an extended-grapheme boundary.
+pub(crate) fn previous_word_start(text: &str) -> usize {
+    let mut start = text.len();
+    let mut seen_word = false;
+    for (index, grapheme) in text.grapheme_indices(true).rev() {
+        let whitespace = grapheme.chars().all(char::is_whitespace);
+        if seen_word && whitespace {
+            break;
+        }
+        seen_word |= !whitespace;
+        start = index;
+    }
+    start
+}
+
+/// Removes the last whitespace-delimited word without splitting a grapheme.
+pub(crate) fn delete_last_word(text: &mut String) {
+    text.truncate(previous_word_start(text));
+}
+
 /// Calculate terminal display width while expanding tabs to the next tab stop.
 pub fn display_width_with_tabs(s: &str, tab_width: usize) -> usize {
     display_width_with_tabs_from_column(s, 0, tab_width)
@@ -380,6 +402,24 @@ pub fn column_to_grapheme_with_tabs(line: &str, target_column: usize, tab_width:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_backspace_preserves_graphemes_and_existing_word_boundaries() {
+        for (input, expected) in [
+            ("", ""),
+            (" \t\n", ""),
+            ("one two   ", "one "),
+            ("one\nsecond", "one\n"),
+            ("one\n", ""),
+            ("one path/to/file.rs", "one "),
+            ("one 👨‍👩‍👧e\u{301}\u{2003}", "one "),
+            ("中文\u{3000}下一个", "中文\u{3000}"),
+        ] {
+            let mut text = input.to_string();
+            delete_last_word(&mut text);
+            assert_eq!(text, expected, "{input:?}");
+        }
+    }
 
     #[test]
     fn test_display_width() {

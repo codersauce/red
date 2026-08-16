@@ -1,6 +1,45 @@
 use super::*;
 use crate::{inline_assist::InlineCommentInput, lsp::LspManager};
 
+#[tokio::test]
+async fn word_backspace_updates_the_editor_owned_inline_history_query() {
+    for modifiers in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
+        let mut editor = editor("unchanged\n");
+        let mut frame = RenderBuffer::new(100, 30, &Style::default());
+        let mut runtime = Runtime::new();
+        editor
+            .open_inline_history(&mut frame, &mut runtime)
+            .await
+            .unwrap();
+        editor
+            .handle_inline_history_action(&HistoryAction::Search, &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        editor
+            .handle_inline_history_action(
+                &HistoryAction::Query("one 👨‍👩‍👧e\u{301}".into()),
+                &mut frame,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        let event = Event::Key(KeyEvent::new(KeyCode::Backspace, modifiers));
+        let Some(KeyAction::Single(Action::InlineHistoryAction(action))) =
+            editor.current_dialog.as_mut().unwrap().handle_event(&event)
+        else {
+            panic!("inline history search did not handle word backspace");
+        };
+        editor
+            .handle_inline_history_action(&action, &mut frame, &mut runtime)
+            .await
+            .unwrap();
+        let browser = editor.inline_history_browser.as_ref().unwrap();
+        assert_eq!(browser.query, "one ");
+        assert!(browser.searching);
+        assert_eq!(editor.current_buffer().contents(), "unchanged\n");
+    }
+}
+
 fn editor(text: &str) -> Editor {
     let config = Config::default();
     let mut editor = Editor::with_size(

@@ -8,7 +8,7 @@
 //! terminal display columns. Selection actions are returned to the editor or plugin
 //! owner and never applied directly by this module.
 
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use ropey::{Rope, RopeSlice};
@@ -31,10 +31,12 @@ use crate::{
     config::{KeyAction, PickerIconStyle, PickerIconsConfig, PickerInputPosition},
     editor::{Action, Editor, PickerCallback, RenderBuffer, StyleInfo},
     highlighter::{Highlighter, LanguageRegistry},
+    keyboard::is_word_backspace,
     plugin::PickerHandle,
     theme::{SelectionForegroundPriority, Style, Theme},
     unicode_utils::{
-        byte_to_char, char_slice, display_width, fit_display_width, truncate_display_width,
+        byte_to_char, char_slice, delete_last_word, display_width, fit_display_width,
+        truncate_display_width,
     },
 };
 
@@ -3150,6 +3152,9 @@ impl Component for Picker {
     }
 
     fn handle_event(&mut self, ev: &event::Event) -> Option<KeyAction> {
+        if matches!(ev, Event::Key(key) if key.kind == KeyEventKind::Release) {
+            return None;
+        }
         self.sync_list_bounds();
         match ev {
             Event::Paste(text) => {
@@ -3244,7 +3249,11 @@ impl Component for Picker {
                     KeyCode::Backspace => {
                         self.reset_history_navigation();
                         let previous = self.selected_item();
-                        if let Some((start, _)) = self.search.grapheme_indices(true).next_back() {
+                        if is_word_backspace(*event) {
+                            delete_last_word(&mut self.search);
+                        } else if let Some((start, _)) =
+                            self.search.grapheme_indices(true).next_back()
+                        {
                             self.search.truncate(start);
                         }
                         let search = self.search.clone();
@@ -3792,6 +3801,59 @@ mod tests {
         picker.handle_event(&key(KeyCode::Backspace, KeyModifiers::NONE));
 
         assert_eq!(picker.search, "prefix");
+    }
+
+    #[test]
+    fn word_backspace_refilters_and_detaches_picker_history() {
+        let editor = test_editor();
+        let items = vec!["alpha beta".into(), "alpha gamma".into(), "other".into()];
+        for modifiers in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
+            let mut picker = Picker::new(Some("Items".into()), &editor, &items, None);
+            picker.set_history("items", vec!["alpha beta".into()]);
+            picker.handle_event(&key(KeyCode::Char('h'), KeyModifiers::CONTROL));
+            assert_eq!(picker.search, "alpha beta");
+            picker.handle_event(&Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Backspace,
+                modifiers,
+                crossterm::event::KeyEventKind::Release,
+            )));
+            assert_eq!(picker.search, "alpha beta");
+            picker.handle_event(&key(KeyCode::Backspace, modifiers));
+            assert_eq!(picker.search, "alpha ");
+            assert_eq!(picker.list.items().len(), 2);
+            assert_eq!(
+                picker.handle_event(&key(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+                None
+            );
+            assert_eq!(picker.search, "alpha ");
+        }
+    }
+
+    #[test]
+    fn word_backspace_notifies_live_picker_query_once() {
+        let editor = test_editor();
+        let handle = PickerHandle::from_raw(42);
+        for modifiers in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
+            let mut picker = Picker::new_callback(
+                Some("Live".into()),
+                &editor,
+                vec![],
+                handle,
+                PickerOptions::default(),
+            );
+            picker.set_search("first second".into());
+            let expected =
+                Action::NotifyPicker(handle, Box::new(PickerCallback::Query("first ".into())));
+            let actions = match picker.handle_event(&key(KeyCode::Backspace, modifiers)) {
+                Some(KeyAction::Single(action)) => vec![action],
+                Some(KeyAction::Multiple(actions)) => actions,
+                other => panic!("missing query callback: {other:?}"),
+            };
+            assert_eq!(
+                actions.iter().filter(|action| **action == expected).count(),
+                1
+            );
+        }
     }
 
     #[test]

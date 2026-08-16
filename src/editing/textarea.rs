@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::{
@@ -12,9 +12,13 @@ use super::{
 use crate::{
     buffer::Buffer,
     editor::Mode,
+    keyboard::is_word_backspace,
     text_layout::{LayoutOptions, TextLayout},
     undo::{CursorSnapshot, TextPosition, TextRange},
-    unicode_utils::{char_to_grapheme, grapheme_len, grapheme_to_byte, trim_line_ending},
+    unicode_utils::{
+        char_to_grapheme, delete_last_word, grapheme_len, grapheme_to_byte, previous_word_start,
+        trim_line_ending,
+    },
 };
 
 const DEFAULT_MAX_BYTES: usize = 128 * 1024;
@@ -313,16 +317,7 @@ impl TextArea {
         }
         let text = self.text();
         let end = grapheme_to_byte(&text, self.state.cursor);
-        let mut start = self.state.cursor;
-        let mut seen_word = false;
-        for grapheme in text[..end].graphemes(true).rev() {
-            let whitespace = grapheme.chars().all(char::is_whitespace);
-            if seen_word && whitespace {
-                break;
-            }
-            seen_word |= !whitespace;
-            start -= 1;
-        }
+        let start = grapheme_len(&text[..previous_word_start(&text[..end])]);
         self.replace_graphemes(start, self.state.cursor, "", start, "delete previous word")
     }
 
@@ -393,6 +388,9 @@ impl TextArea {
     }
 
     fn handle_key(&mut self, key: KeyEvent, layout: LayoutOptions) -> TextAreaOutcome {
+        if key.kind == KeyEventKind::Release {
+            return TextAreaOutcome::Changed;
+        }
         if self.state.mode == Mode::Search {
             return self.handle_search_key(key);
         }
@@ -455,6 +453,10 @@ impl TextArea {
             }
             KeyCode::End => {
                 self.set_cursor(grapheme_len(&self.text()));
+                return TextAreaOutcome::Changed;
+            }
+            KeyCode::Backspace if is_word_backspace(key) => {
+                self.delete_previous_word();
                 return TextAreaOutcome::Changed;
             }
             KeyCode::Backspace => {
@@ -1411,6 +1413,15 @@ impl TextArea {
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) -> TextAreaOutcome {
+        if is_word_backspace(key)
+            || (matches!(key.code, KeyCode::Char('w' | 'W'))
+                && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            if let Some(search) = self.state.search.as_mut() {
+                delete_last_word(&mut search.pattern);
+            }
+            return TextAreaOutcome::Changed;
+        }
         match key.code {
             KeyCode::Esc => {
                 if let Some(search) = self.state.search.take() {
@@ -1826,6 +1837,23 @@ fn unnamed_buffer(text: &str) -> Buffer {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn word_backspace_in_search_edits_only_the_search_pattern() {
+        for key in [
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        ] {
+            let mut area = normal("keep this draft");
+            keys(&mut area, "/first second");
+            assert_eq!(area.mode(), Mode::Search);
+            area.handle_event(&Event::Key(key), 80);
+            assert_eq!(area.state.search.as_ref().unwrap().pattern, "first ");
+            assert_eq!(area.text(), "keep this draft");
+            assert_eq!(area.mode(), Mode::Search);
+        }
+    }
 
     #[test]
     fn empty_textarea_has_an_exact_clean_baseline() {

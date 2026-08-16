@@ -1,7 +1,7 @@
 mod common;
 
 use common::EditorHarness;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use red::{
     buffer::Buffer,
     config::Config,
@@ -38,6 +38,43 @@ fn word_wrapped_vertical_motion_uses_the_display_projection() {
     // The old API remains character-wrapped for every caller that has not opted in.
     area.handle_event(&down, 7);
     assert_eq!(area.cursor(), 7);
+}
+
+#[test]
+fn word_backspace_is_grapheme_safe_undoable_and_ignores_release() {
+    for modifiers in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
+        let original = "one 👨‍👩‍👧e\u{301} rest";
+        let mut area = TextArea::new(original);
+        area.set_cursor(6);
+        let press = Event::Key(KeyEvent::new(KeyCode::Backspace, modifiers));
+        let release = Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Backspace,
+            modifiers,
+            KeyEventKind::Release,
+        ));
+        area.handle_event(&release, 80);
+        assert_eq!(area.text(), original);
+        area.handle_event(&press, 80);
+        assert_eq!(area.text(), "one  rest");
+        assert_eq!(area.cursor(), 4);
+        assert!(area.undo());
+        assert_eq!(area.text(), original);
+        assert_eq!(area.cursor(), 6);
+        assert!(area.redo());
+        assert_eq!(area.text(), "one  rest");
+        area.handle_event(
+            &Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Backspace,
+                modifiers,
+                KeyEventKind::Repeat,
+            )),
+            80,
+        );
+        assert_eq!(area.text(), " rest");
+        area.set_cursor(0);
+        area.handle_event(&press, 80);
+        assert_eq!(area.text(), " rest");
+    }
 }
 
 #[test]

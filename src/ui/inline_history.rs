@@ -8,10 +8,11 @@ use crate::{
     config::KeyAction,
     editor::{Action, Editor, RenderBuffer},
     inline_history::HistoryAction,
+    keyboard::is_word_backspace,
     theme::Theme,
     unicode_utils::{fit_display_width, truncate_display_width},
 };
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
 pub(crate) struct InlineHistoryPanel {
     rows: Vec<String>,
@@ -213,12 +214,18 @@ impl Component for InlineHistoryPanel {
         self.theme = theme.clone();
     }
     fn handle_event(&mut self, event: &Event) -> Option<KeyAction> {
+        if matches!(event, Event::Key(key) if key.kind == KeyEventKind::Release) {
+            return None;
+        }
         if self.searching {
             return match event {
                 Event::Paste(text) => Self::action(HistoryAction::Query(text.clone())),
                 Event::Key(key) => match key.code {
                     KeyCode::Esc => Self::action(HistoryAction::ClearSearch),
                     KeyCode::Enter => Self::action(HistoryAction::EndSearch),
+                    KeyCode::Backspace if is_word_backspace(*key) => {
+                        Self::action(HistoryAction::DeletePreviousWord)
+                    }
                     KeyCode::Backspace => Self::action(HistoryAction::Backspace),
                     KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                         Self::action(HistoryAction::Query(ch.to_string()))
@@ -270,6 +277,47 @@ impl Component for InlineHistoryPanel {
 mod tests {
     use super::*;
     use crate::color::Color;
+
+    #[test]
+    fn word_backspace_routes_only_active_inline_history_search() {
+        let mut panel = InlineHistoryPanel {
+            rows: vec![],
+            selected: 0,
+            detail: String::new(),
+            scroll: 0,
+            searching: true,
+            query: "one two".into(),
+            confirm_forget: false,
+            title: "History".into(),
+            width: 80,
+            height: 24,
+            theme: Theme::default(),
+        };
+        for modifiers in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
+            let key = crossterm::event::KeyEvent::new(KeyCode::Backspace, modifiers);
+            assert_eq!(
+                panel.handle_event(&Event::Key(key)),
+                Some(KeyAction::Single(Action::InlineHistoryAction(
+                    HistoryAction::DeletePreviousWord
+                )))
+            );
+            assert_eq!(
+                panel.handle_event(&Event::Key(crossterm::event::KeyEvent {
+                    kind: KeyEventKind::Release,
+                    ..key
+                })),
+                None
+            );
+        }
+        panel.searching = false;
+        assert_eq!(
+            panel.handle_event(&Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Backspace,
+                KeyModifiers::CONTROL,
+            ))),
+            None
+        );
+    }
 
     #[test]
     fn selection_fills_both_lines_without_crossing_pane_boundary() {
