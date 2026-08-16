@@ -84,6 +84,9 @@ pair.
 ## Searching
 
 - `/` and `?` search forward and backward with live preview.
+- In either search prompt, Up/Down or Ctrl-p/Ctrl-n recall submitted searches,
+  filtered by what you have typed. Down past the newest match restores your
+  draft. Both directions share a history that persists across restarts.
 - `n` and `N` repeat in the same or opposite direction.
 - `*` searches for the word under the cursor.
 - `:noh` clears highlights.

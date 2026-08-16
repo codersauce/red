@@ -1,6 +1,6 @@
 ---
 title: "Preferences Store"
-summary: "Red's preferences store persists convenience state such as command history, picker history, and plugin-owned JSON without becoming recovery state."
+summary: "Red's preferences store persists convenience state such as command and search history, picker history, and plugin-owned JSON without becoming recovery state."
 topics: [architecture, persistence, preferences, plugins, history]
 sources:
   - id: preferences
@@ -16,17 +16,19 @@ sources:
 
 # Preferences Store
 
-The preferences store is Red's best-effort persistence layer for convenience state. It keeps command-line history, picker query history, and plugin-owned JSON values in `preferences.json`, while session recovery and crash-safe editor state remain owned by a separate snapshot system [@preferences] [@startup]. This boundary lets editor features remember recent user choices without treating a corrupt or unavailable preferences file as a startup failure.
+The preferences store is Red's best-effort persistence layer for convenience state. It keeps command-line history, search history, picker query history, and plugin-owned JSON values in `preferences.json`, while session recovery and crash-safe editor state remain owned by a separate snapshot system [@preferences] [@startup]. This boundary lets editor features remember recent user choices without treating a corrupt or unavailable preferences file as a startup failure.
 
 ## Ownership Boundary
 
 `PreferencesStore` owns a serialized `Preferences` value plus an optional filesystem path [@preferences]. Interactive startup loads it from `Config::path("preferences.json")` after configuration, logging, and theme setup, then passes the store into `Editor::new_with_preferences` [@startup]. Tests and embedded callers can use `PreferencesStore::in_memory`, which gives the same mutation semantics without filesystem writes [@preferences].
 
-The stored fields are deliberately narrow. `command_history` is a list of colon commands, `picker_history` is a map from picker namespace to recent queries, and `plugin_storage` is a JSON map keyed by plugin and logical key [@preferences]. The editor reads these values for command history navigation, picker history, agent transcript restoration, and plugin host storage requests [@editor].
+The stored fields are deliberately narrow. `command_history` is a list of colon commands, `search_history` holds patterns shared by `/` and `?`, `picker_history` is a map from picker namespace to recent queries, and `plugin_storage` is a JSON map keyed by plugin and logical key [@preferences]. The editor reads these values for prompt history navigation, picker history, agent transcript restoration, and plugin host storage requests [@editor].
 
 ## Histories
 
 Command history is stored from oldest to newest. `record_command` ignores blank commands, skips only a duplicate of the newest entry, caps the list at 100 entries, and saves immediately for filesystem-backed stores [@preferences]. The editor records executed command-line commands through this API and uses prefix-filtered history navigation when the user moves through command history [@editor].
+
+Search history uses the same ordering, limit, consecutive-duplicate handling, and immediate persistence. `record_search` ignores empty patterns but preserves meaningful whitespace. The editor records non-empty patterns on Enter, including invalid patterns and searches with no matches; cancellation does not add an entry. Both `/` and `?` use prefix-filtered Up/Down or Ctrl-p/Ctrl-n navigation and restore the original draft when moving past the newest match [@preferences] [@editor].
 
 Picker history is also namespace-scoped and bounded to 100 entries per key [@preferences]. `record_picker_query` ignores blank keys or blank queries, skips consecutive duplicates within the same namespace, and persists immediately [@preferences]. The editor derives picker keys from picker title and optional ID, exposes stored history to picker UI, records accepted picker queries, and removes the legacy agent composer history namespace `picker:802` when the modern agent composer opens [@editor].
 

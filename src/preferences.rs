@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::{plugin::PanelSide, LOGGER};
 
 const COMMAND_HISTORY_LIMIT: usize = 100;
+const SEARCH_HISTORY_LIMIT: usize = 100;
 const PICKER_HISTORY_LIMIT: usize = 100;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +25,8 @@ const PICKER_HISTORY_LIMIT: usize = 100;
 pub struct Preferences {
     #[serde(default)]
     command_history: Vec<String>,
+    #[serde(default)]
+    search_history: Vec<String>,
     #[serde(default)]
     picker_history: HashMap<String, Vec<String>>,
     #[serde(default)]
@@ -106,6 +109,11 @@ impl PreferencesStore {
         &self.preferences.command_history
     }
 
+    /// Returns shared forward/backward search history from oldest to newest.
+    pub fn search_history(&self) -> &[String] {
+        &self.preferences.search_history
+    }
+
     /// Returns history for a picker namespace from oldest to newest.
     pub fn picker_history(&self, key: &str) -> &[String] {
         self.preferences
@@ -155,6 +163,25 @@ impl PreferencesStore {
             .saturating_sub(COMMAND_HISTORY_LIMIT);
         if overflow > 0 {
             self.preferences.command_history.drain(0..overflow);
+        }
+
+        self.save()
+    }
+
+    /// Appends a non-empty search pattern unless it duplicates the newest entry.
+    ///
+    /// Whitespace is meaningful in search patterns. History is bounded and a
+    /// filesystem-backed store saves immediately.
+    pub fn record_search(&mut self, pattern: &str) -> anyhow::Result<()> {
+        let history = &mut self.preferences.search_history;
+        if pattern.is_empty() || history.last().is_some_and(|last| last == pattern) {
+            return Ok(());
+        }
+
+        history.push(pattern.to_string());
+        let overflow = history.len().saturating_sub(SEARCH_HISTORY_LIMIT);
+        if overflow > 0 {
+            history.drain(0..overflow);
         }
 
         self.save()
@@ -487,6 +514,7 @@ mod tests {
         let store = PreferencesStore::load(path);
 
         assert!(store.command_history().is_empty());
+        assert!(store.search_history().is_empty());
         assert_eq!(store.last_seen_version(), None);
     }
 
@@ -513,6 +541,7 @@ mod tests {
         let store = PreferencesStore::load(&path);
 
         assert_eq!(store.command_history(), ["write"]);
+        assert!(store.search_history().is_empty());
         assert_eq!(store.last_seen_version(), None);
         fs::remove_dir_all(dir).ok();
     }
@@ -642,6 +671,45 @@ mod tests {
         store.record_command("quit").unwrap();
 
         assert_eq!(store.command_history(), ["write", "quit"]);
+    }
+
+    #[test]
+    fn search_history_preserves_whitespace_and_skips_empty_or_consecutive_duplicates() {
+        let mut store = PreferencesStore::in_memory();
+
+        for pattern in ["", "alpha", "alpha", "   ", "   ", "alpha"] {
+            store.record_search(pattern).unwrap();
+        }
+
+        assert_eq!(store.search_history(), ["alpha", "   ", "alpha"]);
+        assert!(store.command_history().is_empty());
+    }
+
+    #[test]
+    fn search_history_reloads_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preferences.json");
+        let mut store = PreferencesStore::load(&path);
+        store.record_command("write").unwrap();
+        store.record_search("alpha").unwrap();
+        store.record_search(" beta ").unwrap();
+
+        let reloaded = PreferencesStore::load(&path);
+
+        assert_eq!(reloaded.search_history(), ["alpha", " beta "]);
+        assert_eq!(reloaded.command_history(), ["write"]);
+    }
+
+    #[test]
+    fn search_history_is_capped_at_limit() {
+        let mut store = PreferencesStore::in_memory();
+        for index in 0..(SEARCH_HISTORY_LIMIT + 5) {
+            store.record_search(&format!("pattern-{index}")).unwrap();
+        }
+
+        assert_eq!(store.search_history().len(), SEARCH_HISTORY_LIMIT);
+        assert_eq!(store.search_history().first().unwrap(), "pattern-5");
+        assert_eq!(store.search_history().last().unwrap(), "pattern-104");
     }
 
     #[test]
