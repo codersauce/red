@@ -12,6 +12,65 @@ fn notice(severity: Severity, summary: &str) -> Notice {
     Notice::new(NotificationSource::Editor, severity, summary)
 }
 
+#[test]
+fn quiet_feedback_is_retained_without_unread_attention() {
+    let now = NotificationTime::now();
+    let mut center = NotificationCenter::default();
+    for notice in [
+        notice(Severity::Success, "saved"),
+        notice(Severity::Info, "copied").with_attention(AttentionPolicy::Quiet),
+    ] {
+        center.publish(notice, now).unwrap();
+    }
+    for at in [now, later(now, 10)] {
+        let counts = center.counts(at.monotonic);
+        assert_eq!(counts.total, 2);
+        assert_eq!(counts.unread, 0);
+        assert_eq!(counts.unseen, 0);
+        assert_eq!(counts.needs_acknowledgment, 0);
+    }
+}
+
+#[test]
+fn reading_information_does_not_acknowledge_a_warning() {
+    let now = NotificationTime::now();
+    let mut center = NotificationCenter::default();
+    let info = center
+        .publish(notice(Severity::Info, "finished"), now)
+        .unwrap();
+    let warning = center
+        .publish(notice(Severity::Warning, "check this"), now)
+        .unwrap();
+    assert_eq!(center.counts(now.monotonic).unseen, 1);
+    assert_eq!(center.counts(now.monotonic).needs_acknowledgment, 1);
+    center.mark_read(info).unwrap();
+    center.mark_read(warning).unwrap();
+    assert_eq!(center.counts(now.monotonic).unseen, 0);
+    assert_eq!(center.counts(now.monotonic).needs_acknowledgment, 1);
+    center.resolve(warning).unwrap();
+    assert_eq!(center.counts(now.monotonic).needs_acknowledgment, 0);
+}
+
+#[test]
+fn successful_progress_is_only_attention_worthy_if_missed() {
+    let now = NotificationTime::now();
+    let mut center = NotificationCenter::default();
+    let id = start(&mut center, "push", ProgressPriority::UserInitiated, now);
+    assert_eq!(center.counts(now.monotonic).unseen, 0);
+    center
+        .finish_progress(
+            id,
+            ProgressOutcome::Succeeded,
+            MessageContent::new("pushed"),
+            now,
+        )
+        .unwrap();
+    assert_eq!(center.get(id).unwrap().attention, AttentionPolicy::IfMissed);
+    assert_eq!(center.counts(later(now, 10).monotonic).unseen, 1);
+    center.mark_read(id).unwrap();
+    assert_eq!(center.counts(later(now, 10).monotonic).unseen, 0);
+}
+
 fn start(
     center: &mut NotificationCenter,
     key: &str,

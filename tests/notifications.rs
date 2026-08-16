@@ -46,7 +46,7 @@ async fn message_history_routes_real_keys_through_search_acknowledgement_and_cle
     }
     let status = harness.commandline_row();
     assert!(status.contains("unknown command \"bad-two\""), "{status}");
-    assert!(status.contains("2 active"), "{status}");
+    assert!(status.contains("2 need attention"), "{status}");
 
     text(&mut harness, " m").await;
     let dialog = dialog_text(&mut harness);

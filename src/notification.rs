@@ -247,6 +247,27 @@ impl NoticeLifetime {
     }
 }
 
+/// Whether retained feedback should ask for the user's attention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttentionPolicy {
+    /// Routine feedback stays in history without creating an unread obligation.
+    Quiet,
+    /// Informational feedback is unread until it has actually been displayed.
+    IfMissed,
+    /// Reading does not resolve the condition or acknowledge the notice.
+    RequiresAcknowledgment,
+}
+
+impl AttentionPolicy {
+    pub(crate) fn for_severity(severity: Severity) -> Self {
+        match severity {
+            Severity::Success => Self::Quiet,
+            Severity::Info => Self::IfMissed,
+            Severity::Warning | Severity::Error => Self::RequiresAcknowledgment,
+        }
+    }
+}
+
 /// A one-shot notice, optionally coalesced by a producer-scoped key.
 #[derive(Debug, Clone)]
 pub struct Notice {
@@ -255,6 +276,7 @@ pub struct Notice {
     pub content: MessageContent,
     pub key: Option<NotificationKey>,
     pub lifetime: NoticeLifetime,
+    pub attention: AttentionPolicy,
 }
 
 impl Notice {
@@ -265,11 +287,20 @@ impl Notice {
             content: MessageContent::new(summary),
             key: None,
             lifetime: NoticeLifetime::for_severity(severity),
+            attention: AttentionPolicy::for_severity(severity),
         }
     }
 
     pub fn with_key(mut self, key: impl Into<NotificationKey>) -> Self {
         self.key = Some(key.into());
+        self
+    }
+
+    pub fn with_attention(mut self, attention: AttentionPolicy) -> Self {
+        self.attention = attention;
+        if attention == AttentionPolicy::RequiresAcknowledgment {
+            self.lifetime = NoticeLifetime::UntilAcknowledged;
+        }
         self
     }
 
@@ -329,11 +360,44 @@ pub struct Notification {
     pub updated_at: SystemTime,
     pub occurrences: u64,
     pub read: bool,
+    pub attention: AttentionPolicy,
+    pub(crate) content_version: u64,
     priority: ProgressPriority,
     display: DisplayState,
 }
 
 impl Notification {
+    /// An unresolved notice that must be acknowledged even if it was read.
+    pub fn needs_acknowledgment(&self, now: Instant) -> bool {
+        self.attention == AttentionPolicy::RequiresAcknowledgment
+            && !self.is_running()
+            && self.is_active(now)
+    }
+
+    /// Meaningful information that has not been seen or explicitly dismissed.
+    /// Expiration removes it from the message line, not from this count.
+    pub fn is_unseen(&self) -> bool {
+        self.attention == AttentionPolicy::IfMissed
+            && !self.read
+            && !self.is_running()
+            && !matches!(self.display, DisplayState::Hidden)
+    }
+
+    pub fn needs_attention(&self, now: Instant) -> bool {
+        self.needs_acknowledgment(now) || self.is_unseen()
+    }
+
+    pub(crate) fn visible_until(&self) -> Option<Instant> {
+        match self.display {
+            DisplayState::Until(deadline) => Some(deadline),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_dismissed(&self) -> bool {
+        matches!(self.display, DisplayState::Hidden)
+    }
+
     pub fn is_running(&self) -> bool {
         matches!(self.state, NotificationState::Running { .. })
     }
@@ -366,6 +430,10 @@ pub struct NotificationCounts {
     pub active: usize,
     pub running: usize,
     pub unread: usize,
+    /// Unresolved notices whose policy requires explicit acknowledgment.
+    pub needs_acknowledgment: usize,
+    /// Unseen informational notices/completions, excluding running work.
+    pub unseen: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -493,11 +561,13 @@ impl NotificationCenter {
                 return Err(NotificationError::KeyInUse);
             }
             record.severity = notice.severity;
+            record.attention = notice.attention;
+            record.content_version = record.content_version.wrapping_add(1);
             record.content = content;
             record.display = display;
             record.updated_at = now.wall;
             record.occurrences = record.occurrences.saturating_add(1);
-            record.read = false;
+            record.read = notice.attention == AttentionPolicy::Quiet;
             self.changed();
             return Ok(id);
         }
@@ -507,12 +577,14 @@ impl NotificationCenter {
             source: notice.source,
             key: notice.key,
             severity: notice.severity,
+            attention: notice.attention,
+            content_version: 0,
             content,
             state: NotificationState::Notice,
             created_at: now.wall,
             updated_at: now.wall,
             occurrences: 1,
-            read: false,
+            read: notice.attention == AttentionPolicy::Quiet,
             priority: ProgressPriority::Background,
             display,
         });
@@ -539,6 +611,8 @@ impl NotificationCenter {
             source,
             key: Some(key),
             severity: Severity::Info,
+            attention: AttentionPolicy::IfMissed,
+            content_version: 0,
             content: content.bounded(),
             state: NotificationState::Running { percentage: None },
             created_at: now.wall,
@@ -592,6 +666,11 @@ impl NotificationCenter {
         }
         record.state = NotificationState::Finished(outcome);
         record.severity = outcome.severity();
+        record.attention = match outcome {
+            ProgressOutcome::Failed => AttentionPolicy::RequiresAcknowledgment,
+            ProgressOutcome::Succeeded | ProgressOutcome::Cancelled => AttentionPolicy::IfMissed,
+        };
+        record.content_version = record.content_version.wrapping_add(1);
         record.content = content.bounded();
         record.updated_at = now.wall;
         record.display = NoticeLifetime::for_severity(record.severity).display_state(now.monotonic);
@@ -639,6 +718,8 @@ impl NotificationCenter {
             counts.active += usize::from(record.is_active(now));
             counts.running += usize::from(record.is_running());
             counts.unread += usize::from(!record.read);
+            counts.needs_acknowledgment += usize::from(record.needs_acknowledgment(now));
+            counts.unseen += usize::from(record.is_unseen());
         }
         counts
     }

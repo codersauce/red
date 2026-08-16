@@ -1591,7 +1591,7 @@ async fn unchanged_recovery_snapshots_are_skipped_and_failures_back_off() {
         .unwrap();
     let status = harness.commandline_row();
     assert!(status.contains("a newer LSP error"));
-    assert!(status.contains("2 active"));
+    assert!(status.contains("2 need attention"));
     assert!(harness
         .editor
         .notifications()

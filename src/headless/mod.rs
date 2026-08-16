@@ -740,7 +740,9 @@ pub async fn serve_editor_session(
                             let stop = serve_editor_connection(stream, &token, Rc::clone(&core))
                                 .await
                                 .unwrap_or(false);
-                            core.lock().await.clear_pending_paste();
+                            let mut core = core.lock().await;
+                            core.clear_pending_paste();
+                            core.client_disconnected();
                             attached.set(false);
                             if stop {
                                 _ = stop_sender.send(());
@@ -842,6 +844,7 @@ async fn serve_editor_connection(
     if displayed_whats_new {
         core.lock().await.mark_whats_new_presented();
     }
+    core.lock().await.mark_frame_presented(client_revision);
 
     loop {
         let message = tokio::time::timeout(CLIENT_HEARTBEAT_LEASE, read_frame(&mut reader)).await;
@@ -927,6 +930,7 @@ async fn serve_editor_connection(
                 .await?;
             }
         }
+        core.lock().await.mark_frame_presented(client_revision);
     }
 }
 

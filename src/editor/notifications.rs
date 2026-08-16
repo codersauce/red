@@ -11,6 +11,7 @@ enum MessageFilter {
     #[default]
     All,
     Active,
+    Attention,
     Problems,
 }
 
@@ -18,7 +19,8 @@ impl MessageFilter {
     fn next(self) -> Self {
         match self {
             Self::All => Self::Active,
-            Self::Active => Self::Problems,
+            Self::Active => Self::Attention,
+            Self::Attention => Self::Problems,
             Self::Problems => Self::All,
         }
     }
@@ -26,6 +28,7 @@ impl MessageFilter {
         match self {
             Self::All => "all",
             Self::Active => "active",
+            Self::Attention => "needs attention",
             Self::Problems => "warnings/errors",
         }
     }
@@ -33,6 +36,7 @@ impl MessageFilter {
         match self {
             Self::All => true,
             Self::Active => record.is_active(now),
+            Self::Attention => record.needs_attention(now),
             Self::Problems => matches!(record.severity, Severity::Warning | Severity::Error),
         }
     }
@@ -41,6 +45,8 @@ impl MessageFilter {
 pub(super) struct MessageBrowser {
     return_dialog: Option<Box<dyn Component>>,
     selected: Option<NotificationId>,
+    // Keep the viewed item in the attention filter until the user moves away.
+    viewed_attention: Option<NotificationId>,
     query: String,
     searching: bool,
     filter: MessageFilter,
@@ -55,6 +61,28 @@ pub(super) struct NotificationPresentation {
     revision: u64,
     counts: NotificationCounts,
     frame: u64,
+}
+
+const NOTIFICATION_SEEN_AFTER: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct NotificationExposureKey {
+    id: NotificationId,
+    version: u64,
+}
+
+impl NotificationExposureKey {
+    pub(super) fn for_record(record: &Notification) -> Option<Self> {
+        record.is_unseen().then_some(Self {
+            id: record.id,
+            version: record.content_version,
+        })
+    }
+}
+
+pub(super) struct NotificationExposure {
+    key: NotificationExposureKey,
+    since: Instant,
 }
 
 fn record_state(record: &Notification, now: Instant) -> &'static str {
@@ -99,10 +127,24 @@ impl Editor {
         self.set_notification_message(Severity::Info, message);
     }
 
+    pub(super) fn set_quiet_message(&mut self, message: Option<String>) {
+        self.set_message_with_attention(Severity::Info, AttentionPolicy::Quiet, message);
+    }
+
     pub(super) fn set_notification_message(&mut self, severity: Severity, message: Option<String>) {
+        self.set_message_with_attention(severity, AttentionPolicy::for_severity(severity), message);
+    }
+
+    fn set_message_with_attention(
+        &mut self,
+        severity: Severity,
+        attention: AttentionPolicy,
+        message: Option<String>,
+    ) {
         if let Some(message) = message.as_ref().filter(|message| !message.is_empty()) {
-            let notice =
-                Notice::new(NotificationSource::Editor, severity, message).with_details(message);
+            let notice = Notice::new(NotificationSource::Editor, severity, message)
+                .with_attention(attention)
+                .with_details(message);
             if let Err(error) = self.publish_notification(notice) {
                 self.notification_fallback = Some(crate::notification::single_line(
                     truncate_chars(message, 4_096),
@@ -119,7 +161,61 @@ impl Editor {
         self.notification_presentation_changed_at(Instant::now())
     }
 
+    /// Called only after a native frame flush or a detached-client delivery succeeds.
+    pub(super) fn notification_frame_presented(&mut self, now: Instant) {
+        self.advance_notification_exposure(now);
+        let candidate = self.notification_frame_candidate.filter(|key| {
+            (self.terminal_output_enabled || self.notification_client_attached)
+                && self.is_focused
+                && !self.has_term()
+                && self
+                    .notifications
+                    .get(key.id)
+                    .and_then(NotificationExposureKey::for_record)
+                    == Some(*key)
+        });
+        if self
+            .notification_exposure
+            .as_ref()
+            .map(|exposure| exposure.key)
+            != candidate
+        {
+            self.notification_exposure =
+                candidate.map(|key| NotificationExposure { key, since: now });
+        }
+    }
+
+    fn advance_notification_exposure(&mut self, now: Instant) {
+        if (!self.terminal_output_enabled && !self.notification_client_attached)
+            || !self.is_focused
+            || self.has_term()
+        {
+            self.notification_exposure = None;
+            return;
+        }
+        let Some(exposure) = &self.notification_exposure else {
+            return;
+        };
+        let Some(record) = self
+            .notifications
+            .get(exposure.key.id)
+            .filter(|record| NotificationExposureKey::for_record(record) == Some(exposure.key))
+        else {
+            self.notification_exposure = None;
+            return;
+        };
+        let until = record
+            .visible_until()
+            .map_or(now, |deadline| now.min(deadline));
+        if until.saturating_duration_since(exposure.since) >= NOTIFICATION_SEEN_AFTER {
+            let id = exposure.key.id;
+            self.notification_exposure = None;
+            let _ = self.notifications.mark_read(id);
+        }
+    }
+
     fn notification_presentation_changed_at(&mut self, now: Instant) -> bool {
+        self.advance_notification_exposure(now);
         let mut counts = self.notifications.counts(now);
         counts.active += usize::from(self.notification_fallback.is_some());
         let frame = if !self.has_term()
@@ -208,7 +304,11 @@ impl Editor {
             .notifications
             .records()
             .filter(|record| {
-                browser.filter.includes(record, now)
+                (browser.filter.includes(record, now)
+                    || (matches!(browser.filter, MessageFilter::Attention)
+                        && browser.viewed_attention == Some(record.id)
+                        && browser.selected == Some(record.id)
+                        && !record.is_dismissed()))
                     && (query.is_empty()
                         || record.source.label().to_lowercase().contains(&query)
                         || record.severity.label().contains(&query)
@@ -229,6 +329,7 @@ impl Editor {
             self.message_browser = Some(MessageBrowser {
                 return_dialog: self.current_dialog.take(),
                 selected: None,
+                viewed_attention: None,
                 query: String::new(),
                 searching: false,
                 filter: MessageFilter::All,
@@ -257,6 +358,14 @@ impl Editor {
             .unwrap_or(0);
         browser.selected = ids.get(selected).copied();
         if let Some(id) = browser.selected {
+            if matches!(browser.filter, MessageFilter::Attention)
+                && self
+                    .notifications
+                    .get(id)
+                    .is_some_and(Notification::is_unseen)
+            {
+                browser.viewed_attention = Some(id);
+            }
             let _ = self.notifications.mark_read(id);
         }
         let rows = ids
@@ -364,16 +473,22 @@ impl Editor {
             }
             MessageAction::CycleFilter => {
                 browser.filter = browser.filter.next();
+                browser.viewed_attention = None;
+                browser.selected = None;
                 browser.scroll = 0;
             }
             MessageAction::Acknowledge => {
                 self.notification_fallback = None;
+                browser.viewed_attention = None;
                 if let Some(id) = browser.selected {
                     let running = self
                         .notifications
                         .get(id)
                         .is_some_and(Notification::is_running);
                     let _ = self.notifications.acknowledge(id);
+                    if matches!(browser.filter, MessageFilter::Attention) {
+                        browser.selected = None;
+                    }
                     browser.feedback = Some(
                         if running {
                             "Marked read; operation is still running"
@@ -449,6 +564,189 @@ mod tests {
         editor
     }
 
+    fn publish_info(editor: &mut Editor, text: &str, now: NotificationTime) -> NotificationId {
+        editor
+            .notifications
+            .publish(
+                Notice::new(NotificationSource::Editor, Severity::Info, text),
+                now,
+            )
+            .unwrap()
+    }
+
+    fn present(editor: &mut Editor, now: Instant) {
+        let mut buffer = RenderBuffer::new(
+            usize::from(editor.size.0),
+            usize::from(editor.size.1),
+            &Style::default(),
+        );
+        editor.draw_commandline(&mut buffer);
+        editor.notification_frame_presented(now);
+    }
+
+    #[test]
+    fn only_delivered_information_becomes_seen_after_one_second() {
+        let mut editor = editor(100, 24);
+        let now = NotificationTime::now();
+        let id = publish_info(&mut editor, "meaningful result", now);
+        present(&mut editor, now.monotonic);
+        editor.advance_notification_exposure(now.monotonic + Duration::from_secs(2));
+        assert!(editor.notifications.get(id).unwrap().is_unseen());
+
+        editor.notification_client_attached = true;
+        present(&mut editor, now.monotonic);
+        assert!(editor.notification_presentation_changed_at(now.monotonic));
+        assert!(!editor
+            .notification_presentation_changed_at(now.monotonic + Duration::from_millis(999)));
+        assert!(editor.notifications.get(id).unwrap().is_unseen());
+        editor.advance_notification_exposure(now.monotonic + Duration::from_secs(1));
+        assert!(!editor.notifications.get(id).unwrap().is_unseen());
+        assert!(editor
+            .notifications
+            .get(id)
+            .unwrap()
+            .is_active(now.monotonic));
+        assert!(editor.notification_presentation_changed_at(now.monotonic + Duration::from_secs(1)));
+        assert!(
+            !editor.notification_presentation_changed_at(now.monotonic + Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn a_message_too_narrow_to_read_remains_missed() {
+        let mut editor = editor(7, 4);
+        editor.notification_client_attached = true;
+        let now = NotificationTime::now();
+        let id = publish_info(&mut editor, "meaningful result", now);
+        present(&mut editor, now.monotonic);
+        assert!(editor.notification_frame_candidate.is_none());
+        editor.advance_notification_exposure(now.monotonic + Duration::from_secs(2));
+        assert!(editor.notifications.get(id).unwrap().is_unseen());
+
+        editor.size = (100, 24);
+        present(&mut editor, now.monotonic + Duration::from_secs(2));
+        editor.advance_notification_exposure(now.monotonic + Duration::from_secs(3));
+        assert!(!editor.notifications.get(id).unwrap().is_unseen());
+    }
+
+    #[test]
+    fn replaced_or_obscured_information_remains_missed() {
+        let mut editor = editor(100, 24);
+        editor.notification_client_attached = true;
+        let now = NotificationTime::now();
+        let first = publish_info(&mut editor, "first result", now);
+        present(&mut editor, now.monotonic);
+        let second = publish_info(&mut editor, "second result", now);
+        present(&mut editor, now.monotonic + Duration::from_millis(400));
+        editor.advance_notification_exposure(now.monotonic + Duration::from_millis(1400));
+        assert!(editor.notifications.get(first).unwrap().is_unseen());
+        assert!(!editor.notifications.get(second).unwrap().is_unseen());
+
+        let third = publish_info(&mut editor, "third result", now);
+        present(&mut editor, now.monotonic);
+        editor.mode = Mode::Command;
+        present(&mut editor, now.monotonic + Duration::from_millis(400));
+        editor.advance_notification_exposure(now.monotonic + Duration::from_secs(2));
+        assert!(editor.notifications.get(third).unwrap().is_unseen());
+        editor.mode = Mode::Normal;
+        present(&mut editor, now.monotonic + Duration::from_secs(2));
+        editor.is_focused = false;
+        editor.advance_notification_exposure(now.monotonic + Duration::from_secs(3));
+        assert!(editor.notifications.get(third).unwrap().is_unseen());
+    }
+
+    #[test]
+    fn keyed_replacement_starts_a_fresh_exposure_interval() {
+        let mut editor = editor(100, 24);
+        editor.notification_client_attached = true;
+        let now = NotificationTime::now();
+        let notice =
+            || Notice::new(NotificationSource::Editor, Severity::Info, "result").with_key("job");
+        let id = editor.notifications.publish(notice(), now).unwrap();
+        present(&mut editor, now.monotonic);
+        assert_eq!(editor.notifications.publish(notice(), now).unwrap(), id);
+        present(&mut editor, now.monotonic + Duration::from_millis(700));
+        editor.advance_notification_exposure(now.monotonic + Duration::from_secs(1));
+        assert!(editor.notifications.get(id).unwrap().is_unseen());
+        editor.advance_notification_exposure(now.monotonic + Duration::from_millis(1700));
+        assert!(!editor.notifications.get(id).unwrap().is_unseen());
+    }
+
+    #[test]
+    fn expiry_caps_exposure_and_warnings_are_never_auto_acknowledged() {
+        let mut editor = editor(100, 24);
+        editor.notification_client_attached = true;
+        let now = NotificationTime::now();
+        let info = publish_info(&mut editor, "late result", now);
+        present(&mut editor, now.monotonic + Duration::from_millis(3500));
+        editor.advance_notification_exposure(now.monotonic + Duration::from_secs(10));
+        assert!(editor.notifications.get(info).unwrap().is_unseen());
+
+        let warning = editor
+            .notifications
+            .publish(
+                Notice::new(NotificationSource::Editor, Severity::Warning, "check this"),
+                now,
+            )
+            .unwrap();
+        present(&mut editor, now.monotonic);
+        editor.advance_notification_exposure(now.monotonic + Duration::from_secs(10));
+        assert!(editor
+            .notifications
+            .get(warning)
+            .unwrap()
+            .needs_acknowledgment(now.monotonic));
+    }
+
+    #[tokio::test]
+    async fn detached_delivery_and_disconnect_bound_exposure() {
+        let mut core = DetachedEditorCore::new(editor(100, 24)).await.unwrap();
+        let first = publish_info(&mut core.editor, "detached result", NotificationTime::now());
+        core.editor.render(&mut core.render_buffer).unwrap();
+        core.finish_render().unwrap();
+        assert!(core.editor.notification_exposure.is_none());
+        core.mark_frame_presented(core.revision.saturating_add(1));
+        assert!(core.editor.notification_exposure.is_none());
+        core.mark_frame_presented(core.revision);
+        let since = core.editor.notification_exposure.as_ref().unwrap().since;
+        core.editor
+            .advance_notification_exposure(since + Duration::from_secs(1));
+        assert!(!core.editor.notifications.get(first).unwrap().is_unseen());
+
+        core.client_disconnected();
+        let second = publish_info(&mut core.editor, "another result", NotificationTime::now());
+        core.editor.render(&mut core.render_buffer).unwrap();
+        core.editor
+            .advance_notification_exposure(Instant::now() + Duration::from_secs(2));
+        assert!(core.editor.notifications.get(second).unwrap().is_unseen());
+    }
+
+    #[test]
+    fn quiet_feedback_leaves_no_badge_and_attention_filter_keeps_the_viewed_item() {
+        let mut editor = editor(100, 24);
+        editor.set_notification_message(Severity::Success, Some("file saved".into()));
+        editor.set_quiet_message(Some("copied".into()));
+        let mut buffer = RenderBuffer::new(100, 24, &Style::default());
+        editor.draw_commandline(&mut buffer);
+        let row = render_text_rows(&buffer).pop().unwrap();
+        assert!(row.contains("copied"));
+        assert!(!row.contains(":messages"));
+        assert_eq!(editor.notifications.counts(Instant::now()).unread, 0);
+
+        let first = publish_info(&mut editor, "first result", NotificationTime::now());
+        let second = publish_info(&mut editor, "second result", NotificationTime::now());
+        editor.open_messages(); // Viewing the newest item marks only that item read.
+        assert!(!editor.notifications.get(second).unwrap().is_unseen());
+        editor.handle_message_action(&MessageAction::CycleFilter);
+        editor.handle_message_action(&MessageAction::CycleFilter);
+        assert_eq!(editor.message_ids(Instant::now()), vec![first]);
+        assert!(!editor.notifications.get(first).unwrap().is_unseen());
+        editor.refresh_message_browser();
+        assert_eq!(editor.message_ids(Instant::now()), vec![first]);
+        editor.handle_message_action(&MessageAction::Acknowledge);
+        assert!(editor.message_ids(Instant::now()).is_empty());
+    }
+
     #[test]
     fn presentation_ignores_an_empty_center_but_detects_arrivals_and_expiry() {
         let mut editor = editor(90, 12);
@@ -503,7 +801,7 @@ mod tests {
             .unwrap();
         let row = render_text_rows(&buffer).pop().unwrap();
         assert!(row.contains("second message"), "{row}");
-        assert!(row.contains("2 active"), "{row}");
+        assert!(row.contains("1 missed"), "{row}");
         assert!(editor.last_error.is_none());
 
         editor.mode = Mode::Command;
@@ -511,7 +809,7 @@ mod tests {
         editor.draw_commandline(&mut buffer);
         let row = render_text_rows(&buffer).pop().unwrap();
         assert!(row.starts_with(":write pending.txt"));
-        assert!(row.contains("2 active"));
+        assert!(row.contains("2 missed"));
     }
 
     #[test]
@@ -529,6 +827,18 @@ mod tests {
                 now,
             )
             .unwrap();
+        let mut buffer = RenderBuffer::new(100, 12, &Style::default());
+        editor.draw_commandline(&mut buffer);
+        let row = render_text_rows(&buffer).pop().unwrap();
+        assert!(
+            row.contains("indexing") && !row.contains(":messages"),
+            "{row}"
+        );
+        editor.mode = Mode::Command;
+        editor.draw_commandline(&mut buffer);
+        let row = render_text_rows(&buffer).pop().unwrap();
+        assert!(row.contains("1 running"), "{row}");
+        editor.mode = Mode::Normal;
         let push = editor
             .notifications
             .begin_progress(
@@ -550,18 +860,19 @@ mod tests {
                 "save failed",
             ))
             .unwrap();
-        let mut buffer = RenderBuffer::new(100, 12, &Style::default());
         editor.draw_commandline(&mut buffer);
         let row = render_text_rows(&buffer).pop().unwrap();
         assert!(
-            row.contains("save failed") && row.contains("3 active"),
+            row.contains("save failed")
+                && row.contains("1 needs attention")
+                && row.contains("2 running"),
             "{row}"
         );
         editor.notifications.acknowledge(error).unwrap();
         editor.draw_commandline(&mut buffer);
         let row = render_text_rows(&buffer).pop().unwrap();
         assert!(
-            row.contains("pushing commits (40%)") && row.contains("2 active"),
+            row.contains("pushing commits (40%)") && row.contains("2 running"),
             "{row}"
         );
     }

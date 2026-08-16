@@ -219,9 +219,14 @@ Enter Command mode with `:` or `;`.
 | `:commands` | Open the command palette |
 | `:messages` | Browse active notifications and recent messages |
 
-The bottom line shows the current notification and how many are active. Open
+The bottom line shows the current notification. Routine feedback such as saves
+and copies fades away without leaving a badge. The badge counts warnings or
+errors needing acknowledgment, meaningful messages you may have missed, and
+concurrent running operations. Informational messages count as seen after about
+one second on the focused message line; every message remains in history. Open
 the history with `Space m`, `:messages`, or a click on the message line. Use
-`j`/`k` to browse, `/` to search full message text, `f` to switch filters,
+`j`/`k` to browse, `/` to search full message text, `f` to switch between all,
+active, needs-attention, and warning/error filters,
 `Enter` to acknowledge, `y` to copy, and `Esc` to return. `Ctrl-d`/`Ctrl-u`
 scroll long details; `D` clears inactive history. Messages are retained for
 the current Red session, subject to the history limit.
