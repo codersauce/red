@@ -1,6 +1,6 @@
 ---
 title: "Editor Architecture"
-summary: "Editor architecture routes readers through Red's single-owner event loop, buffer and window model, mutation boundary, rendering pipeline, LSP sync, plugin request handling, and syntax services."
+summary: "Editor architecture routes readers through Red's single-owner event loop, buffer and window model, mutation boundary, rendering pipeline, LSP sync, plugin request handling, and syntax services for highlighting, matchit, and structural text objects."
 topics: [architecture, editor, red-editor]
 sources:
   - id: editor
@@ -18,6 +18,9 @@ sources:
   - id: highlighter
     type: file
     path: src/highlighter.rs
+  - id: textobjects
+    type: file
+    path: src/textobjects.rs
 ---
 
 # Editor Architecture
@@ -40,7 +43,7 @@ Read [LSP Document Sync](lsp-document-sync) when a change concerns editor-side d
 
 Read [Plugin Host Requests](plugin-host-requests) when Husk plugin calls need editor effects. Plugin requests enter the editor's serialized queue, and editor state remains the owner for buffer, window, UI, LSP, agent, and filesystem reconciliation work [@editor].
 
-Use [Syntax Services](syntax-services) for language selection, viewport highlight caching, Tree-sitter and Husk highlighting, Markdown injections, and matchit navigation. `Highlighter` maps filenames, extensions, language names, queries, and Husk lexer tokens into byte-range style spans, while the editor decides which buffer language and viewport slice to render [@highlighter] [@editor].
+Use [Syntax Services](syntax-services) for language selection, viewport highlight caching, Tree-sitter and Husk highlighting, Markdown injections, matchit navigation, and Tree-sitter structural text objects or swaps. `Highlighter` maps filenames, extensions, language names, queries, and Husk lexer tokens into byte-range style spans, while `SyntaxTextObjectService` turns structural captures into editor positions without mutating buffers directly [@highlighter] [@textobjects] [@editor].
 
 Use [Vim Compatibility](../../reference/vim/vim-compatibility) as the lookup page for supported Vim-inspired behavior, intentional differences, and unsupported surface before changing modal editing semantics.
 
