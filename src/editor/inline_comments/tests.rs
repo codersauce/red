@@ -460,6 +460,101 @@ fn inline_comments_keep_bottom_cursor_visible_in_both_wrap_modes() {
     }
 }
 
+#[tokio::test]
+async fn inline_comments_preserve_viewport_at_insert_line_end() {
+    let text = (0..80)
+        .map(|line| format!("    line_{line};\n"))
+        .collect::<String>();
+    let cases: &[(&str, &[KeyCode], usize)] = &[
+        ("o", &[KeyCode::Char('o')], 33),
+        ("O", &[KeyCode::Char('O')], 32),
+        ("A", &[KeyCode::Char('A')], 32),
+        ("Enter", &[KeyCode::Char('A'), KeyCode::Enter], 33),
+    ];
+
+    for wrap in [false, true] {
+        for comment_line in [None, Some(32), Some(34)] {
+            for &(name, keys, target_line) in cases {
+                let mut editor = editor(&text, 80, 24, wrap);
+                if let Some(line) = comment_line {
+                    editor.test_set_viewport_cursor(20, 4, line - 20);
+                    editor.set_inline_comment("Review this line");
+                }
+                editor.test_set_viewport_cursor(20, 4, 12);
+
+                for &key in keys {
+                    editor
+                        .test_execute_event(Event::Key(KeyEvent::new(key, KeyModifiers::NONE)))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        editor.vtop, 20,
+                        "{name}: wrap={wrap}, comment_line={comment_line:?}, key={key:?}"
+                    );
+                }
+
+                assert_eq!(editor.mode, Mode::Insert);
+                assert_eq!(editor.buffer_line(), target_line);
+                let expected = if name == "A" {
+                    "    line_32;\n"
+                } else {
+                    "    \n"
+                };
+                assert_eq!(editor.current_line_contents().as_deref(), Some(expected));
+                assert_eq!(editor.cx, expected.trim_end_matches('\n').len());
+                assert!(editor.visible_cursor_segment(target_line, editor.cx));
+
+                editor
+                    .test_execute_event(Event::Key(KeyEvent::new(
+                        KeyCode::Char('x'),
+                        KeyModifiers::NONE,
+                    )))
+                    .await
+                    .unwrap();
+                assert_eq!(editor.vtop, 20, "typing after {name}");
+                assert_eq!(editor.buffer_line(), target_line);
+                assert!(editor.visible_cursor_segment(target_line, editor.cx));
+            }
+        }
+    }
+}
+
+#[test]
+fn inline_comments_reveal_the_actual_wrapped_cursor_segment() {
+    let text = (0..40)
+        .map(|line| {
+            if line == 26 {
+                format!("{}\n", "x".repeat(300))
+            } else {
+                format!("line {line}\n")
+            }
+        })
+        .collect::<String>();
+    let mut editor = editor(&text, 40, 8, true);
+    editor.test_set_viewport_cursor(20, 0, 15);
+    editor.set_inline_comment("Review a later line");
+    editor.mode = Mode::Insert;
+    let width = editor.active_content_width();
+    let bottom_row = editor.vheight() - 1;
+    let initial_top = 26 - bottom_row;
+    editor.test_set_viewport_cursor(initial_top, width, bottom_row);
+
+    assert!(!editor.visible_cursor_segment(26, width));
+    editor.ensure_inline_comment_cursor_visible();
+    assert_eq!(editor.vtop, initial_top + 1);
+    assert_eq!(editor.buffer_line(), 26);
+    assert!(editor.visible_cursor_segment(26, width));
+
+    // An end-of-line caret beyond a full screen must use the final segment,
+    // even when the fallback has to scroll within the logical line.
+    editor.test_set_viewport_cursor(initial_top, 300, bottom_row);
+    assert!(!editor.visible_cursor_segment(26, 300));
+    editor.ensure_inline_comment_cursor_visible();
+    assert_eq!(editor.buffer_line(), 26);
+    assert!(editor.skipcol > 0);
+    assert!(editor.visible_cursor_segment(26, 300));
+}
+
 #[test]
 fn clearing_inline_comments_preserves_cursor_near_eof() {
     let mut editor = editor("alpha\nbeta\ngamma\ndelta\nepsilon\n", 40, 6, false);
