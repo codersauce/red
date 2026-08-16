@@ -352,6 +352,10 @@ impl Editor {
                 browser.query.pop();
                 browser.scroll = 0;
             }
+            MessageAction::DeletePreviousWord => {
+                crate::unicode_utils::delete_last_word(&mut browser.query);
+                browser.scroll = 0;
+            }
             MessageAction::EndSearch => browser.searching = false,
             MessageAction::ClearSearch => {
                 browser.query.clear();
@@ -407,6 +411,27 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_backspace_updates_the_editor_owned_message_query() {
+        for modifiers in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
+            let mut editor = editor(100, 24);
+            editor.open_messages();
+            editor.handle_message_action(&MessageAction::Search);
+            editor.handle_message_action(&MessageAction::Query("one 👨‍👩‍👧e\u{301}".into()));
+            let event = Event::Key(KeyEvent::new(KeyCode::Backspace, modifiers));
+            let Some(KeyAction::Single(Action::MessageHistory(action))) =
+                editor.current_dialog.as_mut().unwrap().handle_event(&event)
+            else {
+                panic!("message search did not handle word backspace");
+            };
+            editor.handle_message_action(&action);
+            let browser = editor.message_browser.as_ref().unwrap();
+            assert_eq!(browser.query, "one ");
+            assert!(browser.searching);
+            assert_eq!(browser.scroll, 0);
+        }
+    }
 
     fn editor(width: usize, height: usize) -> Editor {
         let config = Config::default();

@@ -1,10 +1,11 @@
 //! Cursor-anchored prompt and result controls for bounded inline code edits.
 
-use crossterm::event::{Event, KeyCode, KeyModifiers, MouseEventKind};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 
 use crate::{
     config::KeyAction,
     editor::{Action, Editor, Mode, RenderBuffer},
+    keyboard::is_word_backspace,
     theme::{Style, Theme},
     unicode_utils::{grapheme_len, truncate_display_width},
 };
@@ -410,6 +411,9 @@ impl Component for InlineAssistPopup {
     }
 
     fn handle_event(&mut self, event: &Event) -> Option<KeyAction> {
+        if matches!(event, Event::Key(key) if key.kind == KeyEventKind::Release) {
+            return None;
+        }
         if let Event::Mouse(mouse) = event {
             if matches!(mouse.kind, MouseEventKind::Down(_))
                 && !self.inside(mouse.column as usize, mouse.row as usize)
@@ -463,7 +467,11 @@ impl Component for InlineAssistPopup {
                         Self::refresh_action()
                     }
                     (KeyCode::Backspace, _) => {
-                        self.prompt.backspace();
+                        if is_word_backspace(*key) {
+                            self.prompt.delete_previous_word();
+                        } else {
+                            self.prompt.backspace();
+                        }
                         self.prompt_changed()
                     }
                     (KeyCode::Delete, _) => {
@@ -634,6 +642,35 @@ mod tests {
                 popup.handle_event(&Event::Key(KeyEvent::new(key, KeyModifiers::NONE))),
                 Some(KeyAction::Single(action))
             );
+        }
+    }
+
+    #[test]
+    fn word_backspace_edits_inline_assist_without_submitting() {
+        let editor = editor();
+        for modifiers in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
+            let mut popup = InlineAssistPopup::new(
+                &editor,
+                "line 1",
+                InlineAssistPopupState::Prompt {
+                    initial: "first second".into(),
+                    refining: false,
+                },
+            );
+            assert_eq!(
+                popup.handle_event(&Event::Key(KeyEvent::new_with_kind(
+                    KeyCode::Backspace,
+                    modifiers,
+                    KeyEventKind::Release,
+                ))),
+                None
+            );
+            assert_eq!(popup.prompt.text(), "first second");
+            assert_eq!(
+                popup.handle_event(&Event::Key(KeyEvent::new(KeyCode::Backspace, modifiers,))),
+                Some(KeyAction::Single(Action::Refresh))
+            );
+            assert_eq!(popup.prompt.text(), "first ");
         }
     }
 

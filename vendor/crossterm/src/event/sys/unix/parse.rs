@@ -1055,6 +1055,34 @@ mod tests {
     }
 
     #[test]
+    fn red_word_backspace_protocols() {
+        for (sequence, modifiers) in [
+            (&b"\x7f"[..], KeyModifiers::NONE),
+            (&b"\x1b\x7f"[..], KeyModifiers::ALT),
+            (&b"\x1b[127;3u"[..], KeyModifiers::ALT),
+            (&b"\x1b[127;5u"[..], KeyModifiers::CONTROL),
+            (&b"\x1b[27;3;127~"[..], KeyModifiers::ALT),
+            (&b"\x1b[27;5;127~"[..], KeyModifiers::CONTROL),
+        ] {
+            assert_eq!(
+                parse_event(sequence, false).unwrap(),
+                Some(InternalEvent::Event(Event::Key(KeyEvent::new(
+                    KeyCode::Backspace,
+                    modifiers,
+                )))),
+                "{sequence:?}"
+            );
+            for length in 1..sequence.len() {
+                assert_eq!(
+                    parse_event(&sequence[..length], true).unwrap(),
+                    None,
+                    "{sequence:?} prefix {length}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn red_modified_enter_protocols() {
         for (sequence, modifiers) in [
             (&b"\r"[..], KeyModifiers::NONE),

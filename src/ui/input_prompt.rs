@@ -6,11 +6,12 @@
 //! [`Component::is_sensitive_input`] so
 //! performance traces do not include their contents.
 
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use crate::{
     config::KeyAction,
     editor::{Action, ComposerCallback, Editor, RenderBuffer},
+    keyboard::is_word_backspace,
     plugin::ComposerHandle,
     theme::{Style, Theme},
     unicode_utils::{display_width, grapheme_len, grapheme_to_byte, truncate_display_width},
@@ -150,6 +151,9 @@ impl Component for InputPrompt {
     }
 
     fn handle_event(&mut self, ev: &Event) -> Option<KeyAction> {
+        if matches!(ev, Event::Key(key) if key.kind == KeyEventKind::Release) {
+            return None;
+        }
         match ev {
             Event::Paste(text) => {
                 self.insert(text);
@@ -196,6 +200,8 @@ impl Component for InputPrompt {
                     if self.selected {
                         self.prompt.clear();
                         self.selected = false;
+                    } else if is_word_backspace(*key) {
+                        self.prompt.delete_previous_word();
                     } else {
                         self.prompt.backspace();
                     }
@@ -272,6 +278,33 @@ mod tests {
 
     fn key(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn word_backspace_respects_selection_cursor_and_secret_input() {
+        let editor = editor();
+        for modifiers in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
+            let shortcut = Event::Key(KeyEvent::new(KeyCode::Backspace, modifiers));
+            let mut selected = InputPrompt::new(&editor, "Rename", "old name", Action::Print);
+            selected.handle_event(&shortcut);
+            assert_eq!(selected.prompt.text(), "");
+            assert!(!selected.selected);
+
+            let mut prompt = InputPrompt::secret(&editor, "Secret", Action::Print);
+            prompt.handle_event(&Event::Paste("one 👨‍👩‍👧e\u{301} rest".into()));
+            prompt.prompt.set_cursor(6);
+            prompt.handle_event(&Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Backspace,
+                modifiers,
+                KeyEventKind::Release,
+            )));
+            assert_eq!(prompt.prompt.text(), "one 👨‍👩‍👧e\u{301} rest");
+            prompt.handle_event(&shortcut);
+            assert_eq!(prompt.prompt.text(), "one  rest");
+            assert_eq!(prompt.prompt.cursor(), 4);
+            assert!(prompt.prompt.undo());
+            assert_eq!(prompt.prompt.text(), "one 👨‍👩‍👧e\u{301} rest");
+        }
     }
 
     #[test]

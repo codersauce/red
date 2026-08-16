@@ -38,6 +38,7 @@ pub enum MessageAction {
     Search,
     Query(String),
     Backspace,
+    DeletePreviousWord,
     EndSearch,
     ClearSearch,
     CycleFilter,

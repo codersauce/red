@@ -472,6 +472,10 @@ impl Editor {
                 browser.query.pop();
                 browser.selected = None;
             }
+            HistoryAction::DeletePreviousWord => {
+                crate::unicode_utils::delete_last_word(&mut browser.query);
+                browser.selected = None;
+            }
             HistoryAction::EndSearch => browser.searching = false,
             HistoryAction::ClearSearch => {
                 browser.searching = false;

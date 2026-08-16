@@ -1,6 +1,6 @@
 //! Read-only notification history with a stable selection and a full-text detail pane.
 
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use super::{
     dialog::{BorderStyle, Dialog, SurfaceRole},
@@ -9,6 +9,7 @@ use super::{
 use crate::{
     config::KeyAction,
     editor::{Action, RenderBuffer},
+    keyboard::is_word_backspace,
     notification::{MessageAction, NotificationCounts},
     theme::Theme,
     unicode_utils::{fit_display_width, truncate_display_width},
@@ -223,12 +224,18 @@ impl Component for MessagesPanel {
     }
 
     fn handle_event(&mut self, event: &Event) -> Option<KeyAction> {
+        if matches!(event, Event::Key(key) if key.kind == KeyEventKind::Release) {
+            return None;
+        }
         if self.view.searching {
             return match event {
                 Event::Paste(text) => Self::action(MessageAction::Query(text.clone())),
                 Event::Key(key) => match key.code {
                     KeyCode::Esc => Self::action(MessageAction::ClearSearch),
                     KeyCode::Enter => Self::action(MessageAction::EndSearch),
+                    KeyCode::Backspace if is_word_backspace(*key) => {
+                        Self::action(MessageAction::DeletePreviousWord)
+                    }
                     KeyCode::Backspace => Self::action(MessageAction::Backspace),
                     KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                         Self::action(MessageAction::Query(ch.to_string()))
@@ -268,6 +275,50 @@ impl Component for MessagesPanel {
 mod tests {
     use super::*;
     use crate::color::Color;
+
+    #[test]
+    fn word_backspace_routes_only_active_message_search() {
+        let mut panel = MessagesPanel::new(
+            MessagesView {
+                rows: vec![],
+                selected: 0,
+                detail: String::new(),
+                scroll: 0,
+                query: "one two".into(),
+                searching: true,
+                filter: "all",
+                counts: NotificationCounts::default(),
+                feedback: None,
+            },
+            80,
+            24,
+            &Theme::default(),
+        );
+        for modifiers in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
+            let key = crossterm::event::KeyEvent::new(KeyCode::Backspace, modifiers);
+            assert_eq!(
+                panel.handle_event(&Event::Key(key)),
+                Some(KeyAction::Single(Action::MessageHistory(
+                    MessageAction::DeletePreviousWord
+                )))
+            );
+            assert_eq!(
+                panel.handle_event(&Event::Key(crossterm::event::KeyEvent {
+                    kind: KeyEventKind::Release,
+                    ..key
+                })),
+                None
+            );
+        }
+        panel.view.searching = false;
+        assert_eq!(
+            panel.handle_event(&Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Backspace,
+                KeyModifiers::ALT,
+            ))),
+            None
+        );
+    }
 
     #[test]
     fn selection_fills_both_lines_without_crossing_pane_boundary() {

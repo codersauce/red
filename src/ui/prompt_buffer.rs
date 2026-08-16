@@ -282,7 +282,9 @@ impl PromptBuffer {
                 self.history_next();
                 PromptInput::Changed
             }
-            KeyCode::Char('w' | 'W') if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('w' | 'W')
+                if modifiers.contains(KeyModifiers::CONTROL) && self.mode() != Mode::Search =>
+            {
                 self.delete_previous_word();
                 PromptInput::Changed
             }
@@ -417,6 +419,41 @@ mod tests {
 
     fn composer(text: &str) -> PromptBuffer {
         PromptBuffer::new(text).with_key_policy(PromptKeyPolicy::EnterSends)
+    }
+
+    #[test]
+    fn word_backspace_detaches_history_under_both_prompt_policies() {
+        for policy in [PromptKeyPolicy::Vim, PromptKeyPolicy::EnterSends] {
+            for modifiers in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
+                let mut prompt =
+                    PromptBuffer::with_history("unsent draft", vec!["recalled entry".to_string()])
+                        .with_key_policy(policy);
+                assert!(prompt.history_previous());
+                prompt.handle_event(&key(KeyCode::Backspace, modifiers), 40);
+                assert_eq!(prompt.text(), "recalled ");
+                assert!(!prompt.history_next());
+                assert!(prompt.undo());
+                assert_eq!(prompt.text(), "recalled entry");
+            }
+        }
+    }
+
+    #[test]
+    fn word_backspace_does_not_delete_the_draft_during_embedded_search() {
+        for shortcut in [
+            key(KeyCode::Backspace, KeyModifiers::ALT),
+            key(KeyCode::Backspace, KeyModifiers::CONTROL),
+            key(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        ] {
+            let mut prompt = composer("keep this draft");
+            prompt.set_mode(Mode::Normal);
+            for character in "/first second".chars() {
+                prompt.handle_event(&key(KeyCode::Char(character), KeyModifiers::NONE), 40);
+            }
+            prompt.handle_event(&shortcut, 40);
+            assert_eq!(prompt.text(), "keep this draft");
+            assert_eq!(prompt.mode(), Mode::Search);
+        }
     }
 
     #[test]

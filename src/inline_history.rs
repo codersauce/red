@@ -20,6 +20,7 @@ pub enum HistoryAction {
     Search,
     Query(String),
     Backspace,
+    DeletePreviousWord,
     EndSearch,
     ClearSearch,
     ScrollDown,

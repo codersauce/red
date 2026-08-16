@@ -85,6 +85,48 @@ mod red_keyboard_tests {
             }
         }
     }
+
+    #[test]
+    fn red_native_word_backspace_preserves_modifiers_and_release() {
+        for (state, modifiers) in [
+            (0, KeyModifiers::NONE),
+            (SHIFT_PRESSED, KeyModifiers::SHIFT),
+            (LEFT_ALT_PRESSED, KeyModifiers::ALT),
+            (RIGHT_ALT_PRESSED, KeyModifiers::ALT),
+            (LEFT_CTRL_PRESSED, KeyModifiers::CONTROL),
+            (RIGHT_CTRL_PRESSED, KeyModifiers::CONTROL),
+        ] {
+            for (down, kind) in [
+                (true, KeyEventKind::Press),
+                (false, KeyEventKind::Release),
+            ] {
+                // INPUT_RECORD is a Windows POD record. Initialize its key-event
+                // union arm before converting through the public WinAPI wrapper.
+                let mut raw: INPUT_RECORD = unsafe { std::mem::zeroed() };
+                raw.EventType = KEY_EVENT;
+                unsafe {
+                    let key = raw.Event.KeyEvent_mut();
+                    key.bKeyDown = i32::from(down);
+                    key.wRepeatCount = 1;
+                    key.wVirtualKeyCode = VK_BACK as u16;
+                    *key.uChar.UnicodeChar_mut() = 8;
+                    key.dwControlKeyState = state;
+                }
+                let record = match InputRecord::from(raw) {
+                    InputRecord::KeyEvent(record) => record,
+                    _ => panic!("expected a key record"),
+                };
+                assert_eq!(
+                    handle_key_event(record, &mut None),
+                    Some(Event::Key(KeyEvent::new_with_kind(
+                        KeyCode::Backspace,
+                        modifiers,
+                        kind,
+                    )))
+                );
+            }
+        }
+    }
 }
 
 pub(crate) fn handle_key_event(
