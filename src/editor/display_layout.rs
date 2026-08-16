@@ -231,17 +231,31 @@ pub struct InlineCommentRow {
     pub text_offset: usize,
 }
 
+/// One row in a transient insertion preview. Byte offsets refer to the projected
+/// logical line; removing the insertion maps them back to source highlighting.
+#[derive(Debug, Clone)]
+pub(super) struct InlinePredictionRow {
+    pub row: usize,
+    pub text: String,
+    pub display_col: usize,
+    pub visual_offset: usize,
+    pub projected_start: usize,
+    pub insertion: std::ops::Range<usize>,
+    pub source_offset: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DisplayLayout {
     /// Source segments only. `segment.row` is the physical screen row and may
     /// have gaps occupied by inline comments.
     pub rows: Vec<LineSegment>,
     pub inline_comments: Vec<InlineCommentRow>,
+    pub(super) inline_prediction: Vec<InlinePredictionRow>,
 }
 
 impl DisplayLayout {
     pub fn row(&self, row: usize) -> Option<&LineSegment> {
-        if self.inline_comments.is_empty() {
+        if self.inline_comments.is_empty() && self.inline_prediction.is_empty() {
             return self.rows.get(row);
         }
         self.rows
@@ -258,11 +272,109 @@ impl DisplayLayout {
     }
 
     pub fn screen_height(&self) -> usize {
-        self.rows.last().map_or(0, |segment| segment.row + 1).max(
-            self.inline_comments
-                .last()
-                .map_or(0, |comment| comment.row + 1),
-        )
+        self.rows
+            .last()
+            .map_or(0, |segment| segment.row + 1)
+            .max(
+                self.inline_comments
+                    .last()
+                    .map_or(0, |comment| comment.row + 1),
+            )
+            .max(self.inline_prediction.last().map_or(0, |row| row.row + 1))
+    }
+
+    /// Projects an insertion without putting virtual bytes into source segments.
+    /// Source motions dismiss the preview before consulting this layout.
+    pub(super) fn with_inline_prediction(
+        mut self,
+        line_index: usize,
+        line: &str,
+        cursor_byte: usize,
+        insertion: &str,
+        config: LayoutConfig,
+    ) -> Self {
+        if insertion.is_empty() || !line.is_char_boundary(cursor_byte) {
+            return self;
+        }
+        let cursor_col = crate::unicode_utils::display_width_with_tabs(
+            &line[..cursor_byte],
+            config.break_indent.tab_width,
+        );
+        let Some(mut anchor) = self.segment_for_cursor(line_index, cursor_col).copied() else {
+            return self;
+        };
+        let start_row = anchor.row;
+        let old_end = self
+            .rows
+            .iter()
+            .filter(|row| row.line == line_index)
+            .map(|row| row.row + 1)
+            .max()
+            .unwrap_or(start_row + 1);
+        let insertion = insertion.replace("\r\n", "\n");
+        let projected = format!(
+            "{}{}{}",
+            &line[..cursor_byte],
+            insertion,
+            &line[cursor_byte..]
+        );
+        let lines = projected
+            .split('\n')
+            .map(|line| format!("{line}\n"))
+            .collect::<Vec<_>>();
+        let preview = layout_lines(
+            &lines,
+            lines.len(),
+            LayoutConfig {
+                vtop: 0,
+                vleft: if config.wrap { 0 } else { anchor.start_col },
+                skipcol: if config.wrap { anchor.start_col } else { 0 },
+                height: config.height.saturating_sub(start_row),
+                ..config
+            },
+        );
+        let insertion_range = cursor_byte..cursor_byte + insertion.len();
+        self.inline_prediction = preview
+            .rows
+            .into_iter()
+            .map(|segment| {
+                let text = trim_line_ending(&lines[segment.line]);
+                InlinePredictionRow {
+                    row: start_row + segment.row,
+                    text: text[segment.start_byte..segment.end_byte].to_string(),
+                    display_col: segment.start_grapheme_col,
+                    visual_offset: segment.visual_offset
+                        + segment.start_grapheme_col.saturating_sub(segment.start_col),
+                    projected_start: segment.source_offset + segment.start_byte,
+                    insertion: insertion_range.clone(),
+                    source_offset: anchor.source_offset,
+                }
+            })
+            .collect();
+        if self.inline_prediction.is_empty() {
+            return self;
+        }
+        let new_end = start_row + self.inline_prediction.len();
+        let shift = |row: usize| new_end + row.saturating_sub(old_end);
+        self.rows
+            .retain(|row| row.row < start_row || row.row >= old_end);
+        for row in &mut self.rows {
+            if row.row >= old_end {
+                row.row = shift(row.row);
+            }
+        }
+        anchor.end_col = cursor_col;
+        anchor.last_segment = true;
+        self.rows.push(anchor);
+        self.rows.sort_unstable_by_key(|row| row.row);
+        self.rows.retain(|row| row.row < config.height);
+        for comment in &mut self.inline_comments {
+            if comment.row >= old_end {
+                comment.row = shift(comment.row);
+            }
+        }
+        self.inline_comments.retain(|row| row.row < config.height);
+        self
     }
 
     /// Inserts bounded display-only comments without changing syntax offsets
@@ -605,6 +717,64 @@ fn nowrap_line_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_prediction_inserts_virtual_rows_and_preserves_source_offsets() {
+        let config = LayoutConfig {
+            content_width: 12,
+            height: 10,
+            wrap: true,
+            vtop: 0,
+            vleft: 0,
+            skipcol: 0,
+            break_indent: BreakIndentOptions::disabled(),
+        };
+        let lines = vec!["foo()\n".into(), "after\n".into()];
+        let layout = layout_lines(&lines, 2, config).with_inline_prediction(
+            0,
+            "foo()",
+            3,
+            "bar\nnext",
+            config,
+        );
+        assert_eq!(
+            layout
+                .inline_prediction
+                .iter()
+                .map(|row| row.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["foobar", "next()"]
+        );
+        assert_eq!(layout.row(0).unwrap().line, 0);
+        assert!(layout.row(1).is_none());
+        assert_eq!(layout.row(2).unwrap().line, 1);
+        assert_eq!(layout.row(2).unwrap().source_offset, 6);
+        assert_eq!(layout.segment_for_cursor(0, 3).unwrap().row, 0);
+    }
+
+    #[test]
+    fn inline_prediction_wraps_unicode_and_keeps_later_comments_aligned() {
+        let config = LayoutConfig {
+            content_width: 5,
+            height: 12,
+            wrap: true,
+            vtop: 0,
+            vleft: 0,
+            skipcol: 0,
+            break_indent: BreakIndentOptions::disabled(),
+        };
+        let lines = vec!["a界z\n".into(), "after\n".into()];
+        let original = layout_lines(&lines, 2, config).with_inline_comments(&[(1, "note")], 5, 12);
+        let original_comment = original.inline_comments[0].row;
+        let layout = original.with_inline_prediction(0, "a界z", "a界".len(), "12\n😀", config);
+        assert!(layout
+            .inline_prediction
+            .iter()
+            .all(|row| display_width(&row.text) <= 5));
+        assert!(layout.inline_comments[0].row > original_comment);
+        assert_eq!(layout.segment_for_cursor(0, 3).unwrap().row, 0);
+        assert_eq!(layout.rows.last().unwrap().line, 1);
+    }
 
     #[test]
     fn wraps_ascii_line_at_width() {

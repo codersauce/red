@@ -26,6 +26,7 @@ pub mod command;
 pub mod command_palette;
 mod comment;
 pub mod config;
+pub mod copilot;
 pub mod dispatcher;
 pub mod editing;
 pub mod editor;

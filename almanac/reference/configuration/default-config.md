@@ -78,6 +78,11 @@ Comment templates are keyed by language or extension and use a single `%s` place
 
 ## Agent Configuration
 
+`[copilot]` configures optional inline AI completion separately from the Codex
+agent. It defaults to disabled; `disable_ai = true` also blocks it. See
+[Copilot Inline Completion](../../guides/agent/copilot-completion) for setup,
+privacy controls, commands, and key bindings.
+
 `[agent]` contains an optional `command` override, plus optional `args` and `env` fields in the code schema [@config]. When `command` is absent, the agent check and runtime Codex integration use `codex` from `PATH` [@config]. Setting `disable_ai = true` removes the bundled agent plugin, resets agent configuration during recovered loading paths, and prevents Red from launching Codex [@defaults] [@config].
 
 See [Agent Check](../agent/agent-check) for the command-line readiness report that reads these agent settings.

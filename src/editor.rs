@@ -20,6 +20,7 @@ mod buffer_manager;
 mod diagnostics_picker;
 mod display_layout;
 mod inline_comments;
+mod inline_completion;
 mod inline_history;
 mod lsp_coordinator;
 #[cfg(test)]
@@ -2468,6 +2469,15 @@ pub enum Action {
     BufferText(Value),
 
     RequestCompletion,
+    Copilot(String),
+    RequestInlineCompletion,
+    AcceptInlineCompletion,
+    DismissInlineCompletion,
+    CopilotFinishSignIn(Value),
+    CopilotRespond {
+        id: Value,
+        result: Value,
+    },
     RequestCompletionWithTrigger(char),
     ApplyCompletion {
         item: Box<CompletionResponseItem>,
@@ -2655,6 +2665,7 @@ struct LayoutCacheKey {
     content_height: usize,
     line_count_override: Option<usize>,
     break_indent: BreakIndentOptions,
+    inline_prediction: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -3214,6 +3225,7 @@ pub struct Editor {
     pending_lsp_revision_snapshots: HashMap<i64, Vec<(String, u64)>>,
     pending_completions: HashMap<i64, PendingCompletion>,
     scheduled_completion: Option<ScheduledCompletion>,
+    inline_completion: inline_completion::InlineCompletionState,
     completion_snapshot: Option<CompletionSnapshot>,
 }
 
@@ -3737,6 +3749,7 @@ struct PendingCompletion {
     buffer_items: Vec<CompletionResponseItem>,
     snapshot: CompletionSnapshot,
     displayed_immediately: bool,
+    superseded: bool,
 }
 
 impl From<PendingLspEdit> for CompletionSnapshot {
@@ -4463,6 +4476,7 @@ impl Editor {
             pending_lsp_revision_snapshots: HashMap::new(),
             pending_completions: HashMap::new(),
             scheduled_completion: None,
+            inline_completion: inline_completion::InlineCompletionState::default(),
             completion_snapshot: None,
         })
     }
@@ -5613,6 +5627,9 @@ impl Editor {
         }
 
         let break_indent = self.break_indent_options_for_buffer_index(window.buffer_index);
+        let prediction = self
+            .visible_inline_suggestion()
+            .filter(|suggestion| window.active && suggestion.snapshot.buffer_id == buffer.id());
         let key = LayoutCacheKey {
             buffer_index: window.buffer_index,
             buffer_id: buffer.id(),
@@ -5626,6 +5643,7 @@ impl Editor {
             content_height: self.window_content_height(window),
             line_count_override,
             break_indent,
+            inline_prediction: prediction.map(|suggestion| suggestion.snapshot.generation),
         };
         if let Some(layout) = self.layout_cache.borrow().get(&key) {
             return layout.clone();
@@ -5645,26 +5663,37 @@ impl Editor {
             .iter()
             .map(|(line, message)| (*line, message.as_str()))
             .collect::<Vec<_>>();
-        let layout = std::sync::Arc::new(
-            layout_lines(
-                &lines,
-                line_count,
-                LayoutConfig {
-                    content_width: self.window_content_width(window),
-                    height: self.window_content_height(window),
-                    wrap: window.wrap,
-                    vtop: window.vtop,
-                    vleft: window.vleft,
-                    skipcol: window.skipcol,
-                    break_indent,
-                },
-            )
-            .with_inline_comments(
-                &comments,
-                self.window_content_width(window),
-                self.window_content_height(window),
-            ),
+        let layout_config = LayoutConfig {
+            content_width: self.window_content_width(window),
+            height: self.window_content_height(window),
+            wrap: window.wrap,
+            vtop: window.vtop,
+            vleft: window.vleft,
+            skipcol: window.skipcol,
+            break_indent,
+        };
+        let mut layout = layout_lines(&lines, line_count, layout_config).with_inline_comments(
+            &comments,
+            self.window_content_width(window),
+            self.window_content_height(window),
         );
+        if let Some(suggestion) = prediction {
+            if let Some(line) = buffer.get(suggestion.snapshot.cursor.line) {
+                let line = trim_line_ending(&line);
+                let cursor_byte = line
+                    .char_indices()
+                    .nth(suggestion.snapshot.cursor.character)
+                    .map_or(line.len(), |(byte, _)| byte);
+                layout = layout.with_inline_prediction(
+                    suggestion.snapshot.cursor.line,
+                    line,
+                    cursor_byte,
+                    &suggestion.insertion,
+                    layout_config,
+                );
+            }
+        }
+        let layout = std::sync::Arc::new(layout);
 
         let mut cache = self.layout_cache.borrow_mut();
         if cache.len() >= 32 {
@@ -8720,6 +8749,7 @@ impl Editor {
             }
         }
 
+        let inline_completion_changed = self.service_inline_completion();
         let completion_changed = if self
             .scheduled_completion
             .is_some_and(|scheduled| Instant::now() >= scheduled.deadline)
@@ -8764,7 +8794,8 @@ impl Editor {
         }
         let panel_animation_changed = self.panel_manager.poll_animation();
         let overlay_animation_changed = self.overlay_manager.poll_animation();
-        if completion_changed
+        if inline_completion_changed
+            || completion_changed
             || startup_release_changed
             || dialog_changed
             || keymap_hints_changed
@@ -11551,6 +11582,9 @@ impl Editor {
         &self,
         pending: &PendingCompletion,
     ) -> Option<CompletionSnapshot> {
+        if pending.superseded {
+            return None;
+        }
         if pending.displayed_immediately {
             let active = self.completion_snapshot.as_ref()?;
             let same_session = active.buffer_id == pending.snapshot.buffer_id
@@ -12192,8 +12226,12 @@ impl Editor {
                                         .map(CompletionSnapshot::from)
                                         .unwrap_or_else(|| self.completion_snapshot()),
                                     displayed_immediately: false,
+                                    superseded: false,
                                 }
                             });
+                        if pending.superseded {
+                            return None;
+                        }
                         if pending.displayed_immediately && self.completion_snapshot.is_none() {
                             return None;
                         }
@@ -12308,6 +12346,12 @@ impl Editor {
                 let pending_completion = self.pending_completions.remove(&id);
                 let save = self.pending_lsp_format_saves.remove(&id);
                 self.pending_lsp_revision_snapshots.remove(&id);
+                if pending_completion
+                    .as_ref()
+                    .is_some_and(|pending| pending.superseded)
+                {
+                    return None;
+                }
                 if method.as_deref() == Some("textDocument/completion")
                     && pending_completion
                         .is_some_and(|pending| self.show_completion_fallback(pending))
@@ -12374,6 +12418,12 @@ impl Editor {
                     let pending_completion = self.pending_completions.remove(id);
                     let save = self.pending_lsp_format_saves.remove(id);
                     self.pending_lsp_revision_snapshots.remove(id);
+                    if pending_completion
+                        .as_ref()
+                        .is_some_and(|pending| pending.superseded)
+                    {
+                        return None;
+                    }
                     if method.as_deref() == Some("textDocument/completion")
                         && pending_completion
                             .is_some_and(|pending| self.show_completion_fallback(pending))
@@ -12455,6 +12505,9 @@ impl Editor {
         ev: &event::Event,
         runtime: Option<&Runtime>,
     ) -> anyhow::Result<Option<KeyAction>> {
+        if let Some(action) = self.handle_inline_completion_event(ev) {
+            return Ok(Some(action));
+        }
         // Pointer motion has no editor/pane action. Let dialogs opt into hover
         // handling without clearing an in-progress key sequence or its hints.
         if matches!(
@@ -13524,6 +13577,18 @@ impl Editor {
         self.waiting_command = None;
         self.repeater = None;
         self.set_legacy_message(None);
+
+        if cmd == "Copilot" || cmd.starts_with("Copilot ") {
+            let command = cmd.strip_prefix("Copilot").unwrap_or_default().trim();
+            return if command == "complete" {
+                vec![
+                    Action::EnterMode(Mode::Insert),
+                    Action::RequestInlineCompletion,
+                ]
+            } else {
+                vec![Action::Copilot(command.to_string())]
+            };
+        }
 
         if let Some(commands) = self.scratch_buffers.get(&self.current_buffer().id()) {
             let routed = match cmd.trim() {
@@ -16419,6 +16484,10 @@ impl Editor {
         // log!("Action: {action:?}");
         self.set_legacy_message(None);
         let sensitive_action = matches!(action, Action::NotifyPlugin(_, _, _))
+            || matches!(
+                action,
+                Action::CopilotFinishSignIn(_) | Action::CopilotRespond { .. }
+            )
             || matches!(action, Action::SubmitInlineAssist(_))
             || matches!(action, Action::NotifyPlugins(method, _) if method.starts_with("composer:"));
         if !sensitive_action {
@@ -20109,6 +20178,38 @@ impl Editor {
                     self.render(buffer)?;
                 }
             }
+            Action::Copilot(command) => {
+                add_to_history = false;
+                self.handle_copilot_command(command);
+                self.render(buffer)?;
+            }
+            Action::RequestInlineCompletion => {
+                add_to_history = false;
+                self.request_inline_completion(false);
+                self.render(buffer)?;
+            }
+            Action::AcceptInlineCompletion => {
+                self.accept_inline_completion(runtime).await?;
+                self.render(buffer)?;
+            }
+            Action::DismissInlineCompletion => {
+                add_to_history = false;
+                self.dismiss_inline_completion();
+                self.render(buffer)?;
+            }
+            Action::CopilotFinishSignIn(command) => {
+                add_to_history = false;
+                self.copilot_control(crate::copilot::Control::FinishSignIn(command.clone()));
+                self.render(buffer)?;
+            }
+            Action::CopilotRespond { id, result } => {
+                add_to_history = false;
+                self.copilot_control(crate::copilot::Control::Respond {
+                    id: id.clone(),
+                    result: result.clone(),
+                });
+                self.render(buffer)?;
+            }
             Action::RequestCompletionWithTrigger(trigger_character) => {
                 if self.request_completion(Some(*trigger_character)).await? {
                     self.render(buffer)?;
@@ -21499,6 +21600,7 @@ impl Editor {
             return Ok(());
         }
 
+        self.schedule_inline_completion();
         let file = self.current_buffer().file.clone();
 
         // Notify LSP if enabled and the buffer has a file.
@@ -24574,7 +24676,8 @@ impl Editor {
             self.scheduled_completion = None;
             return;
         };
-        if !self.config.completion.auto_trigger
+        if self.prefers_inline_completion()
+            || !self.config.completion.auto_trigger
             || prefix.chars().count() < self.config.completion.min_prefix_length
         {
             self.scheduled_completion = None;
@@ -24884,6 +24987,7 @@ impl Editor {
             return Ok(false);
         }
 
+        self.dismiss_inline_completion();
         self.scheduled_completion = None;
         let buffer_items = self.buffer_completion_items();
         let snapshot = self.completion_snapshot();
@@ -24937,6 +25041,7 @@ impl Editor {
                         buffer_items,
                         snapshot: pending_snapshot,
                         displayed_immediately,
+                        superseded: false,
                     },
                 );
                 return Ok(displayed_immediately);
@@ -33025,6 +33130,7 @@ builtin = "rust"
                 buffer_items,
                 snapshot: pending_snapshot,
                 displayed_immediately: true,
+                superseded: false,
             },
         );
         let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
@@ -33074,6 +33180,7 @@ builtin = "rust"
                 buffer_items,
                 snapshot: pending_snapshot,
                 displayed_immediately: true,
+                superseded: false,
             },
         );
         let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());

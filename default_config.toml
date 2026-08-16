@@ -96,6 +96,16 @@ debounce_ms = 0
 buffer_words = true
 max_buffer_words = 100
 
+[copilot]
+# Opt in before any source code is sent to GitHub Copilot. Install the official
+# @github/copilot-language-server separately, then use :Copilot signin.
+enabled = false
+command = "copilot-language-server"
+args = ["--stdio"]
+debounce_ms = 150
+max_file_bytes = 262144
+excluded_patterns = [".env", ".env.*", "*.pem", "*.key", "**/.git/**"]
+
 [picker]
 # Query input position in picker dialogs. Supported values are "bottom" and
 # "top". Bottom matches the default command-line-oriented picker layout.
@@ -244,6 +254,7 @@ Enter = "InsertNewLine"
 Backspace = "DeletePreviousChar"
 Tab = "InsertTab"
 "Ctrl-Space" = "RequestCompletion"
+"Alt-\\" = "RequestInlineCompletion"
 "Ctrl-k" = "SignatureHelp"
 Esc = { EnterMode = "Normal" }
 
