@@ -2,6 +2,9 @@
 
 use crate::editor::{Action, Mode};
 
+mod workspace;
+pub(crate) use workspace::PracticeWorkspace;
+
 pub(crate) const FIRST_LESSON_ID: &str = "essentials.find-your-footing.v1";
 pub(crate) const PRACTICE_CONTENTS: &str = "// This practice buffer never touches your project.\n\nfn add_score(score: u32, points: u32) -> u32 {\n    score + points\n}\n";
 pub(crate) const EDIT_CONTENTS: &str =
@@ -9,6 +12,7 @@ pub(crate) const EDIT_CONTENTS: &str =
 pub(crate) const EDIT_RESULT: &str =
     "let score = 41;\n\n// Remove the extra semicolon on the first line.\n";
 pub(crate) const COMMAND_CONTENTS: &str = "// This deliberately long line makes wrapping visible: use the command palette to change how it is displayed, without changing a single character of the practice text.\n\nlet score = 42;\n";
+pub(crate) const SAVE_CONTENTS: &str = "Today I learned:\n";
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Lesson {
@@ -16,13 +20,15 @@ pub(crate) enum Lesson {
     FindYourFooting,
     EditWithConfidence,
     FindACommand,
+    SaveAPracticeFile,
 }
 
 impl Lesson {
-    pub const AVAILABLE: [Self; 3] = [
+    pub const AVAILABLE: [Self; 4] = [
         Self::FindYourFooting,
         Self::EditWithConfidence,
         Self::FindACommand,
+        Self::SaveAPracticeFile,
     ];
 
     pub fn from_id(id: &str) -> Option<Self> {
@@ -41,6 +47,7 @@ impl Lesson {
             Self::FindYourFooting => 0,
             Self::EditWithConfidence => 1,
             Self::FindACommand => 2,
+            Self::SaveAPracticeFile => 3,
         }
     }
 
@@ -49,6 +56,7 @@ impl Lesson {
             Self::FindYourFooting => FIRST_LESSON_ID,
             Self::EditWithConfidence => "essentials.edit-with-confidence.v1",
             Self::FindACommand => "essentials.find-a-command.v1",
+            Self::SaveAPracticeFile => "essentials.save-a-practice-file.v1",
         }
     }
 
@@ -61,6 +69,7 @@ impl Lesson {
             Self::FindYourFooting => PRACTICE_CONTENTS,
             Self::EditWithConfidence => EDIT_CONTENTS,
             Self::FindACommand => COMMAND_CONTENTS,
+            Self::SaveAPracticeFile => SAVE_CONTENTS,
         }
     }
 
@@ -69,6 +78,7 @@ impl Lesson {
             Self::FindYourFooting => PracticeStep::Insert,
             Self::EditWithConfidence => PracticeStep::EditMove,
             Self::FindACommand => PracticeStep::CommandOpen,
+            Self::SaveAPracticeFile => PracticeStep::SaveEdit,
         }
     }
 
@@ -95,6 +105,12 @@ impl Lesson {
                 "Turn line wrapping off",
                 "Open keyboard shortcuts",
                 "Return to the practice buffer",
+            ],
+            Self::SaveAPracticeFile => &[
+                "Change the practice note",
+                "Write the file to disk",
+                "Make an unsaved change",
+                "Save the latest version",
             ],
         }
     }
@@ -215,6 +231,10 @@ pub(crate) enum PracticeStep {
     CommandRun,
     CommandHelp,
     CommandReturn,
+    SaveEdit,
+    SaveWrite,
+    SaveEditAgain,
+    SaveWriteAgain,
     Complete,
 }
 
@@ -229,6 +249,8 @@ impl PracticeStep {
             Self::EditRedo => Some(Action::Redo),
             Self::CommandOpen => Some(Action::CommandPalette),
             Self::CommandHelp => Some(Action::KeyboardShortcuts),
+            Self::SaveWrite | Self::SaveWriteAgain => Some(Action::Save),
+            Self::SaveEdit | Self::SaveEditAgain => Some(Action::EnterMode(Mode::Insert)),
             Self::Type | Self::CommandRun | Self::CommandReturn | Self::Complete => None,
         }
     }
@@ -265,12 +287,17 @@ impl PracticeStep {
             Self::CommandRun => "Search for Toggle line wrapping and press Enter. The long line should stop wrapping. If you closed the picker, reopen :commands.".into(),
             Self::CommandHelp => format!("The text is unchanged. Press {} to explore the shortcuts available here.", shortcut.unwrap_or("F1")),
             Self::CommandReturn => "Close keyboard shortcuts with Esc to return to the practice buffer.".into(),
+            Self::SaveEdit => format!("Press {} and add a word to the note. This is a disposable practice.txt, outside your project.", shortcut.unwrap_or("i")),
+            Self::SaveWrite => "Return to Normal mode with Esc, then use :w to write practice.txt. Watch the unsaved marker disappear.".into(),
+            Self::SaveEditAgain => "The first version is on disk. Enter Insert mode and change the note again. Notice the unsaved marker return.".into(),
+            Self::SaveWriteAgain => "Return to Normal mode and use :w again. The file on disk should now match your latest text.".into(),
             Self::Complete => match lesson {
                 Lesson::FindYourFooting => "Your original text is restored. Nicely done.",
                 Lesson::EditWithConfidence => {
                     "The extra semicolon is gone. You can edit, undo, and redo with confidence."
                 }
                 Lesson::FindACommand => "You found a command and its shortcuts. The practice text is unchanged, and your original view will return when you leave.",
+                Lesson::SaveAPracticeFile => "Your latest text is saved. Essentials complete! This disposable file is removed when you leave; your own work is untouched.",
             }
             .into(),
         }
@@ -278,10 +305,10 @@ impl PracticeStep {
 
     pub const fn completed_steps(self) -> usize {
         match self {
-            Self::Insert | Self::EditMove | Self::CommandOpen => 0,
-            Self::Type | Self::EditDelete | Self::CommandRun => 1,
-            Self::Normal | Self::EditUndo | Self::CommandHelp => 2,
-            Self::Undo | Self::EditRedo | Self::CommandReturn => 3,
+            Self::Insert | Self::EditMove | Self::CommandOpen | Self::SaveEdit => 0,
+            Self::Type | Self::EditDelete | Self::CommandRun | Self::SaveWrite => 1,
+            Self::Normal | Self::EditUndo | Self::CommandHelp | Self::SaveEditAgain => 2,
+            Self::Undo | Self::EditRedo | Self::CommandReturn | Self::SaveWriteAgain => 3,
             Self::Complete => 4,
         }
     }
@@ -313,6 +340,7 @@ impl PracticeStep {
             }
             (Self::EditUndo, Action::Undo) if original_text => Self::EditRedo,
             (Self::EditRedo, Action::Redo) if contents == EDIT_RESULT => Self::Complete,
+            (Self::SaveEdit, _) if !original_text => Self::SaveWrite,
             _ => return false,
         };
         *self = next;
@@ -328,6 +356,9 @@ impl PracticeStep {
             (Self::CommandRun, Action::ToggleWrap) if !view.wrapping => Self::CommandHelp,
             (Self::CommandHelp, _) if view.shortcuts_open => Self::CommandReturn,
             (Self::CommandReturn, _) if !view.shortcuts_open => Self::Complete,
+            (Self::SaveWrite, Action::Save) if view.file_matches_buffer => Self::SaveEditAgain,
+            (Self::SaveEditAgain, _) if view.dirty => Self::SaveWriteAgain,
+            (Self::SaveWriteAgain, Action::Save) if view.file_matches_buffer => Self::Complete,
             _ => return false,
         };
         *self = next;
@@ -340,15 +371,18 @@ pub(crate) struct PracticeView {
     pub command_palette_open: bool,
     pub wrapping: bool,
     pub shortcuts_open: bool,
+    pub file_matches_buffer: bool,
+    pub dirty: bool,
 }
 
 /// Scratch lessons permit only edits to their isolated practice buffer.
 pub(crate) fn practice_action_allowed(lesson: Lesson, action: &Action) -> bool {
-    (lesson == Lesson::FindACommand
-        && matches!(
-            action,
-            Action::CommandPalette | Action::KeyboardShortcuts | Action::ToggleWrap
-        ))
+    (lesson == Lesson::SaveAPracticeFile && matches!(action, Action::Save))
+        || (lesson == Lesson::FindACommand
+            && matches!(
+                action,
+                Action::CommandPalette | Action::KeyboardShortcuts | Action::ToggleWrap
+            ))
         || matches!(
             action,
             Action::OpenLearn
@@ -521,6 +555,8 @@ mod tests {
             command_palette_open: false,
             wrapping: true,
             shortcuts_open: false,
+            file_matches_buffer: false,
+            dirty: false,
         };
         assert!(!step.observe_view(&Action::CommandPalette, view));
         view.command_palette_open = true;

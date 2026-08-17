@@ -605,7 +605,11 @@ pub(crate) fn draw_learn_coach(
             2,
             0,
             buffer.width.saturating_sub(4),
-            "red ●   Learn / Essentials   ·   Practice buffer",
+            if lesson == Lesson::SaveAPracticeFile {
+                "red ●   Learn / Essentials   ·   Disposable practice file"
+            } else {
+                "red ●   Learn / Essentials   ·   Practice buffer"
+            },
             &palette.primary,
         );
         if layout.top > 1 {

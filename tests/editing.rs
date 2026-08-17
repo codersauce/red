@@ -35,6 +35,81 @@ use std::{
 static COMMAND_COMPLETION_CWD_LOCK: Mutex<()> = Mutex::new(());
 
 #[tokio::test]
+async fn learn_red_save_lesson_writes_only_its_owned_file() {
+    let mut harness = EditorHarness::with_config_and_size(
+        Buffer::new(None, "original workspace\n".into()),
+        default_key_config(),
+        140,
+        38,
+    );
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+    harness
+        .execute_action(Action::Command("tutorial essentials 4".into()))
+        .await
+        .unwrap();
+    let path = PathBuf::from(harness.editor.test_current_buffer().file.as_ref().unwrap());
+    assert!(!path.exists());
+    let outside = tempfile::tempdir().unwrap();
+    let forbidden = outside.path().join("outside.txt");
+    harness
+        .execute_action(Action::SaveAs(forbidden.to_string_lossy().into_owned()))
+        .await
+        .unwrap();
+    assert!(!forbidden.exists());
+    for text in ["first ", "second "] {
+        harness
+            .execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('i'),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+        for character in text.chars() {
+            harness
+                .execute_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                )))
+                .await
+                .unwrap();
+        }
+        harness
+            .execute_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .await
+            .unwrap();
+        assert!(harness.editor.test_current_buffer().is_dirty());
+        harness
+            .execute_action(Action::Command("w".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            harness.buffer_contents()
+        );
+        assert!(!harness.editor.test_current_buffer().is_dirty());
+    }
+    let rows = (0..38)
+        .map(|row| harness.render_row(row).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rows.contains("Essentials complete!"));
+    harness
+        .execute_action(Action::Command("tutorial restart".into()))
+        .await
+        .unwrap();
+    assert!(!path.exists());
+    let restarted = PathBuf::from(harness.editor.test_current_buffer().file.as_ref().unwrap());
+    assert_ne!(path, restarted);
+    harness
+        .execute_action(Action::Command("tutorial quit".into()))
+        .await
+        .unwrap();
+    assert!(!restarted.parent().unwrap().exists());
+    harness.assert_buffer_contents("original workspace\n");
+    assert_eq!(harness.editor.test_window_count(), 2);
+}
+
+#[tokio::test]
 async fn learn_red_command_lesson_uses_the_picker_and_restores_wrap() {
     let mut harness = EditorHarness::with_config_and_size(
         Buffer::new(None, "original workspace\n".into()),

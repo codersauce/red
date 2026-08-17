@@ -1,13 +1,16 @@
 //! Lifecycle for Learn Red's protected practice-buffer lessons.
 
 use super::*;
-use crate::learn::{practice_action_allowed, Lesson, PracticeStep, PracticeView};
+use crate::learn::{
+    practice_action_allowed, Lesson, PracticeStep, PracticeView, PracticeWorkspace,
+};
 use crate::ui::{draw_learn_coach, CoachLayout, LearnHub};
 
 pub(super) struct LearnSession {
     lesson: Lesson,
     pub(super) step: PracticeStep,
     practice_buffer_id: BufferId,
+    workspace: Option<PracticeWorkspace>,
     original_buffer_id: BufferId,
     original_windows: WindowManager,
     original_zoom: Option<FocusTarget>,
@@ -105,6 +108,13 @@ impl Editor {
             ));
             return self.render(buffer);
         }
+        // Create owned storage before changing any editor state, so a failed
+        // setup leaves the user's current workspace untouched.
+        let workspace = if lesson == Lesson::SaveAPracticeFile {
+            Some(PracticeWorkspace::new()?)
+        } else {
+            None
+        };
         if self.inline_assist.is_some()
             || self.workspace_manager.is_active()
             || self.agent_manager.has_active_sessions()
@@ -126,7 +136,13 @@ impl Editor {
         let original_repeat = self.last_semantic_change.take();
         let original_registers = self.registers.clone();
         self.pending_semantic_change = None;
-        let practice = Buffer::new(None, lesson.contents().to_string());
+        let file = workspace.as_ref().map(|workspace| {
+            workspace
+                .path("practice.txt")
+                .to_string_lossy()
+                .into_owned()
+        });
+        let practice = Buffer::new(file, lesson.contents().to_string());
         let practice_buffer_id = practice.id();
         let practice_index = self.buffer_manager.len();
         self.buffer_manager.push_buffer(practice);
@@ -141,6 +157,7 @@ impl Editor {
             lesson,
             step: lesson.first_step(),
             practice_buffer_id,
+            workspace,
             original_buffer_id,
             original_windows,
             original_zoom,
@@ -238,6 +255,34 @@ impl Editor {
             self.render(buffer)?;
             return Ok(true);
         }
+        if matches!(action, Action::Save) && session.workspace.is_some() {
+            let permitted = self.current_buffer().file.as_deref().is_some_and(|file| {
+                session
+                    .workspace
+                    .as_ref()
+                    .is_some_and(|workspace| workspace.permits_file(Path::new(file)))
+            });
+            if !permitted {
+                self.set_legacy_message(Some(
+                    "practice save refused: file is outside the lesson workspace".into(),
+                ));
+            } else {
+                // Use the editor's real buffer save and transaction semantics,
+                // without running project formatters or user plugin hooks.
+                let resume_insert = self.commit_active_transaction_before_save();
+                let result = self.current_buffer_mut().save();
+                self.resume_insert_transaction_after_save(resume_insert);
+                match result {
+                    Ok(message) => self.set_notification_message(Severity::Success, Some(message)),
+                    Err(error) => {
+                        self.set_notification_message(Severity::Error, Some(error.to_string()))
+                    }
+                }
+                self.observe_learn_action(action, buffer)?;
+            }
+            self.render(buffer)?;
+            return Ok(true);
+        }
         Ok(false)
     }
 
@@ -272,6 +317,14 @@ impl Editor {
                 .is_some_and(|dialog| dialog.shortcut_context() == "Commands"),
             wrapping: self.wrap,
             shortcuts_open: self.keyboard_shortcuts.is_some(),
+            file_matches_buffer: session.workspace.as_ref().is_some_and(|workspace| {
+                self.current_buffer().file.as_deref().is_some_and(|file| {
+                    workspace.permits_file(Path::new(file))
+                        && !self.current_buffer().is_dirty()
+                        && std::fs::read_to_string(file).is_ok_and(|saved| saved == contents)
+                })
+            }),
+            dirty: self.current_buffer().is_dirty(),
         };
         let session = self
             .learn_session
