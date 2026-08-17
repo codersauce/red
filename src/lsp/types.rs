@@ -550,6 +550,50 @@ pub struct SignatureHelpOptions {
     pub retrigger_characters: Option<Vec<String>>,
 }
 
+/// Callable signatures returned for the current cursor position.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignatureHelp {
+    pub signatures: Vec<SignatureHelpSignature>,
+    pub active_signature: Option<usize>,
+    pub active_parameter: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignatureHelpSignature {
+    pub label: String,
+    pub documentation: Option<Documentation>,
+    pub parameters: Option<Vec<SignatureHelpParameter>>,
+    pub active_parameter: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignatureHelpParameter {
+    pub label: SignatureHelpParameterLabel,
+    pub documentation: Option<Documentation>,
+}
+
+/// LSP label offsets are UTF-16 code units, not UTF-8 byte offsets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SignatureHelpParameterLabel {
+    Offsets([usize; 2]),
+    Text(String),
+}
+
+/// Why signature help was requested, including the displayed overload on retrigger.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignatureHelpContext {
+    pub trigger_kind: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_character: Option<String>,
+    pub is_retrigger: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_signature_help: Option<SignatureHelp>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeActionOptions {

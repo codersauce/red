@@ -96,6 +96,12 @@ debounce_ms = 0
 buffer_words = true
 max_buffer_words = 100
 
+[signature_help]
+# Show a non-modal call signature while entering arguments. Ctrl-k reopens it.
+auto_trigger = true
+debounce_ms = 120
+show_documentation = true
+
 [copilot]
 # Opt in before any source code is sent to GitHub Copilot. Install the official
 # @github/copilot-language-server separately, then use :Copilot signin.
