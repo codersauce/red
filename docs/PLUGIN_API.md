@@ -76,11 +76,14 @@ expanded in arguments and environment values. Project-local executables under
 `node_modules/.bin`, `.venv/bin`, `venv/bin`, and `vendor/bin` take precedence over
 `PATH`.
 
-The global `[formatting]` table supports `on_save` and a `provider` of `auto`,
+The global `[formatting]` table supports `on_save` (default `true`) and a `provider` of `auto`,
 `external`, or `lsp`. `auto` prefers an installed language-pack formatter and falls
 back to LSP when the formatter is absent; a formatter that starts and fails does not
-silently switch engines. The legacy `lsp.format_on_save` flag remains accepted as an
-on-save enablement alias.
+silently switch engines. Set `formatting.on_save = false` to disable automatic
+formatting without disabling the explicit Format Document action. The legacy
+`lsp.format_on_save` flag remains accepted as an alias for either boolean value.
+The modern key wins when both appear in the same config layer; later command-line
+overrides still take precedence.
 
 ## Scratch-buffer workflows
 

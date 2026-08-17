@@ -407,10 +407,11 @@ fn byte_offset(contents: &str, starts: &[usize], position: Position) -> Result<u
         .get(position.line + 1)
         .copied()
         .unwrap_or(contents.len());
-    if contents.as_bytes().get(end.saturating_sub(1)) == Some(&b'\n') {
+    // The final newline creates an empty EOF line. Never trim into the previous line.
+    if end > start && contents.as_bytes()[end - 1] == b'\n' {
         end -= 1;
     }
-    if contents.as_bytes().get(end.saturating_sub(1)) == Some(&b'\r') {
+    if end > start && contents.as_bytes()[end - 1] == b'\r' {
         end -= 1;
     }
 
@@ -505,6 +506,49 @@ mod tests {
             apply_text_edits(contents, &edits).unwrap(),
             "first!\r\n👋 tea\r\ndone"
         );
+    }
+
+    #[test]
+    fn text_edits_accept_the_empty_line_after_a_final_newline() {
+        for contents in [
+            "",
+            "\n",
+            "\r\n",
+            "👋 café\n",
+            "👋 café\r\n",
+            "a\n\n",
+            "a\r\n\r\n",
+        ] {
+            let eof = (contents.bytes().filter(|byte| *byte == b'\n').count(), 0);
+            let insert = edit(eof, eof, "tail");
+            let char_count = contents.chars().count();
+            assert_eq!(
+                text_edit_char_range(contents, &insert.range).unwrap(),
+                (char_count, char_count),
+                "{contents:?}",
+            );
+            assert_eq!(
+                apply_text_edits(contents, &[insert]).unwrap(),
+                format!("{contents}tail"),
+                "{contents:?}",
+            );
+
+            let replace = edit((0, 0), eof, "formatted\n");
+            assert_eq!(
+                text_edit_char_range(contents, &replace.range).unwrap(),
+                (0, char_count),
+                "{contents:?}",
+            );
+            assert_eq!(
+                apply_text_edits(contents, &[replace]).unwrap(),
+                "formatted\n",
+                "{contents:?}",
+            );
+
+            let outside = edit((eof.0, 1), (eof.0, 1), "invalid");
+            assert!(text_edit_char_range(contents, &outside.range).is_err());
+            assert!(apply_text_edits(contents, &[outside]).is_err());
+        }
     }
 
     #[test]

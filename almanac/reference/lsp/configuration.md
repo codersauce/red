@@ -21,7 +21,9 @@ LSP configuration in Red is the TOML-backed contract for enabling language-serve
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `lsp.enabled` | boolean | `true` | Master switch for language-server activity [@config]. |
-| `lsp.format_on_save` | boolean | `false` | Requests server formatting before saving supported documents [@config]. |
+| `formatting.on_save` | boolean | `true` | Formats supported documents before saving; set to `false` to disable [@config]. |
+| `formatting.provider` | string | `"auto"` | Selects `auto`, `external`, or `lsp` formatting [@config]. |
+| `lsp.format_on_save` | boolean | unset | Legacy alias for `formatting.on_save`; the modern key wins within the same config layer [@config]. |
 | `lsp.servers` | table of named server configs | embedded defaults | Launch and routing definitions keyed by server name [@config]. |
 
 The default config comments show the public TOML shape and note that language servers are selected by file extension [@defaults]. Existing single-language configs remain supported through `language_id` with `file_extensions` or `filenames`, while servers that handle more than one language can use repeated `documents` entries [@defaults] [@config].
