@@ -214,12 +214,7 @@ pub(crate) fn completion_reference_actions() -> Vec<UiAction> {
             "PageUp / PageDown",
             "Previous / next completion page",
         ),
-        ("Completion", "Tab", "Accept selected completion"),
-        (
-            "Completion",
-            "Enter",
-            "Close completions and insert a new line",
-        ),
+        ("Completion", "Tab / Enter", "Accept selected completion"),
         ("Completion", "Ctrl+e", "Close completions"),
         (
             "Completion",

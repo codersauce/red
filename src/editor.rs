@@ -32916,6 +32916,33 @@ builtin = "rust"
     }
 
     #[tokio::test]
+    async fn enter_accepts_completion_without_inserting_a_newline() {
+        let mut editor = completion_typing_editor();
+        let response = completion_response("manual_seed", None);
+        assert!(matches!(
+            editor.handle_lsp_message(&response, Some("textDocument/completion".to_string())),
+            Some(Action::ShowDialog)
+        ));
+        let mut render_buffer = RenderBuffer::new(80, 24, &Style::default());
+        let mut runtime = Runtime::new();
+
+        type_completion_suffix(&mut editor, "ual", &mut render_buffer, &mut runtime).await;
+        editor
+            .process_editor_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &mut render_buffer,
+                &mut runtime,
+                EventRenderMode::Immediate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(editor.current_buffer().contents(), "torch.manual_seed");
+        assert!(editor.current_dialog.is_none());
+        assert_eq!(editor.mode, Mode::Insert);
+    }
+
+    #[tokio::test]
     async fn refreshing_open_completion_preserves_ranges_for_typing_and_acceptance() {
         let mut editor = completion_typing_editor();
         let initial_snapshot = editor.completion_snapshot();
