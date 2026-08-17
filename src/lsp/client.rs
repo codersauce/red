@@ -73,6 +73,13 @@ fn prepare_did_save(params: &mut Value, capabilities: Option<&ServerCapabilities
     true
 }
 
+fn diagnostic_request_uri(request: &Request) -> Option<&str> {
+    if request.method != "textDocument/diagnostic" {
+        return None;
+    }
+    request.params["textDocument"]["uri"].as_str()
+}
+
 fn bytecount_newlines(text: &str) -> usize {
     text.as_bytes().iter().filter(|&&b| b == b'\n').count()
 }
@@ -731,6 +738,45 @@ impl RealLspClient {
             .unwrap_or(false)
     }
 
+    fn has_pending_diagnostics(&self, uri: &str) -> bool {
+        self.pending_responses
+            .values()
+            .any(|request| diagnostic_request_uri(request) == Some(uri))
+    }
+
+    fn schedule_diagnostics(&mut self, uri: &str) {
+        let next = Instant::now() + DIAGNOSTICS_DEBOUNCE;
+        self.pending_diagnostics
+            .entry(uri.to_string())
+            .and_modify(|due| *due = (*due).max(next))
+            .or_insert(next);
+    }
+
+    /// Consume expected background diagnostic cancellations without hiding
+    /// failures of user commands or leaving their request owners unresolved.
+    fn handle_diagnostic_cancellation(&mut self, request: &Request, error: &ResponseError) -> bool {
+        let Some(uri) = diagnostic_request_uri(request) else {
+            return false;
+        };
+        let retry = match error.code {
+            -32800 => false, // RequestCancelled
+            -32801 => true,  // ContentModified
+            // The pull-diagnostics protocol defaults missing cancellation data
+            // to retriggerRequest: true. Never retry immediately in a busy loop.
+            -32802 => error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("retriggerRequest"))
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            _ => return false,
+        };
+        if retry && self.files_versions.contains_key(uri) {
+            self.schedule_diagnostics(uri);
+        }
+        true
+    }
+
     fn position_at_byte(text: &str, byte_offset: usize) -> Position {
         let before = &text[..byte_offset];
         let line = bytecount_newlines(before);
@@ -928,6 +974,12 @@ impl LspClient for RealLspClient {
         if !self.can_request_diagnostics() {
             return Ok(None);
         }
+        if self.has_pending_diagnostics(file_uri) {
+            self.schedule_diagnostics(file_uri);
+            return Ok(None);
+        }
+        // An immediate request also satisfies any queued refresh for this URI.
+        self.pending_diagnostics.remove(file_uri);
 
         let params = json!({
             "textDocument": {
@@ -965,7 +1017,7 @@ impl LspClient for RealLspClient {
         let due = self
             .pending_diagnostics
             .iter()
-            .filter(|(_, due)| now >= **due)
+            .filter(|(uri, due)| now >= **due && !self.has_pending_diagnostics(uri))
             .map(|(uri, _)| uri.clone())
             .collect::<Vec<_>>();
         for uri in due {
@@ -1089,7 +1141,7 @@ impl LspClient for RealLspClient {
                     }
                     InboundMessage::Error(error) => {
                         if let Some(id) = error.id {
-                            if let Some(request) = self.pending_responses.get(&id) {
+                            if let Some(request) = self.pending_responses.remove(&id) {
                                 let method = request.method.clone();
                                 log!(
                                     "[lsp] rcv_error: id={} method={} code={} message={}",
@@ -1099,7 +1151,9 @@ impl LspClient for RealLspClient {
                                     error.message
                                 );
 
-                                self.pending_responses.remove(&id);
+                                if self.handle_diagnostic_cancellation(&request, error) {
+                                    return Ok(None);
+                                }
                                 if method == "initialize" {
                                     let error = LspError::ServerError(format!(
                                         "language server rejected initialization: {}",
@@ -1242,8 +1296,7 @@ impl LspClient for RealLspClient {
         // keystroke, and requesting diagnostics for every one of them floods
         // the server. The request is sent from `recv_response` once the
         // document has been quiet for DIAGNOSTICS_DEBOUNCE.
-        self.pending_diagnostics
-            .insert(uri.clone(), Instant::now() + DIAGNOSTICS_DEBOUNCE);
+        self.schedule_diagnostics(&uri);
 
         // Get or create version for this file
         let version = self.files_versions.entry(uri.clone()).or_insert(0);
@@ -2744,6 +2797,291 @@ mod test {
         assert_eq!(id, 801);
         assert_eq!(method.as_deref(), Some("textDocument/formatting"));
         assert!(error.to_string().contains("invalid stdout frame"));
+    }
+
+    const DIAGNOSTIC_URI: &str = "file:///tmp/diagnostics.rs";
+
+    fn diagnostic_test_client() -> (
+        RealLspClient,
+        mpsc::Receiver<OutboundMessage>,
+        mpsc::Sender<InboundMessage>,
+    ) {
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (response_tx, response_rx) = mpsc::channel(8);
+        let config = default_language_servers().remove("rust").unwrap();
+        let mut client = RealLspClient::with_test_channels(
+            request_tx,
+            response_rx,
+            config,
+            std::env::current_dir().unwrap(),
+        );
+        client.server_capabilities = Some(
+            serde_json::from_value(json!({
+                "diagnosticProvider": {
+                    "interFileDependencies": false,
+                    "workspaceDiagnostics": false
+                }
+            }))
+            .unwrap(),
+        );
+        client.files_versions.insert(DIAGNOSTIC_URI.to_string(), 1);
+        (client, request_rx, response_tx)
+    }
+
+    fn diagnostic_error(id: i64, code: i64, data: Option<Value>) -> InboundMessage {
+        InboundMessage::Error(ResponseError {
+            id: Some(id),
+            code,
+            message: "server cancelled the request".to_string(),
+            data,
+        })
+    }
+
+    #[tokio::test]
+    async fn diagnostic_cancellation_retries_quietly_after_the_debounce() {
+        for (code, data) in [
+            (-32802, Some(json!({ "retriggerRequest": true }))),
+            (-32802, None),
+            (-32802, Some(json!({}))),
+            (-32801, None),
+        ] {
+            let (mut client, mut requests, responses) = diagnostic_test_client();
+            let id = client
+                .request_diagnostics(DIAGNOSTIC_URI)
+                .await
+                .unwrap()
+                .unwrap();
+            let Some(OutboundMessage::Request(original)) = requests.recv().await else {
+                panic!("expected diagnostic request");
+            };
+            responses
+                .send(diagnostic_error(id, code, data))
+                .await
+                .unwrap();
+
+            let before = Instant::now();
+            assert!(client.recv_response().await.unwrap().is_none());
+            assert!(!client.pending_responses.contains_key(&id));
+            assert!(client.pending_diagnostics[DIAGNOSTIC_URI] >= before + DIAGNOSTICS_DEBOUNCE);
+            assert!(requests.try_recv().is_err());
+
+            // Expire the deadline directly so the test does not sleep.
+            client
+                .pending_diagnostics
+                .insert(DIAGNOSTIC_URI.to_string(), Instant::now());
+            assert!(client.recv_response().await.unwrap().is_none());
+            let Some(OutboundMessage::Request(retry)) = requests.recv().await else {
+                panic!("expected a fresh diagnostic request");
+            };
+            assert_ne!(retry.id, id);
+            assert_eq!(retry.method, original.method);
+            assert_eq!(retry.params, original.params);
+            assert!(client.pending_diagnostics.is_empty());
+
+            responses
+                .send(InboundMessage::Message(ResponseMessage {
+                    id: retry.id,
+                    result: json!({ "kind": "full", "items": [] }),
+                    request: None,
+                }))
+                .await
+                .unwrap();
+            let Some((InboundMessage::Message(result), method)) =
+                client.recv_response().await.unwrap()
+            else {
+                panic!("expected successful retry response");
+            };
+            assert_eq!(method.as_deref(), Some("textDocument/diagnostic"));
+            assert_eq!(result.request.unwrap().params, original.params);
+            assert!(client.pending_responses.is_empty());
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_cancellation_honors_no_retry() {
+        for (code, data) in [
+            (-32802, Some(json!({ "retriggerRequest": false }))),
+            (-32800, None),
+        ] {
+            let (mut client, mut requests, responses) = diagnostic_test_client();
+            let id = client
+                .request_diagnostics(DIAGNOSTIC_URI)
+                .await
+                .unwrap()
+                .unwrap();
+            requests.recv().await.unwrap();
+            responses
+                .send(diagnostic_error(id, code, data))
+                .await
+                .unwrap();
+
+            assert!(client.recv_response().await.unwrap().is_none());
+            assert!(client.pending_responses.is_empty());
+            assert!(client.pending_diagnostics.is_empty());
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_cancellation_preserves_a_later_document_refresh() {
+        for retrigger in [true, false] {
+            let (mut client, mut requests, responses) = diagnostic_test_client();
+            let id = client
+                .request_diagnostics(DIAGNOSTIC_URI)
+                .await
+                .unwrap()
+                .unwrap();
+            requests.recv().await.unwrap();
+            let later = Instant::now() + Duration::from_secs(10);
+            client
+                .pending_diagnostics
+                .insert(DIAGNOSTIC_URI.to_string(), later);
+            responses
+                .send(diagnostic_error(
+                    id,
+                    -32802,
+                    Some(json!({
+                        "retriggerRequest": retrigger
+                    })),
+                ))
+                .await
+                .unwrap();
+
+            assert!(client.recv_response().await.unwrap().is_none());
+            assert_eq!(client.pending_diagnostics[DIAGNOSTIC_URI], later);
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_requests_coalesce_per_document_while_in_flight() {
+        let (mut client, mut requests, responses) = diagnostic_test_client();
+        let id = client
+            .request_diagnostics(DIAGNOSTIC_URI)
+            .await
+            .unwrap()
+            .unwrap();
+        requests.recv().await.unwrap();
+        assert!(client
+            .request_diagnostics(DIAGNOSTIC_URI)
+            .await
+            .unwrap()
+            .is_none());
+
+        let other_uri = "file:///tmp/other.rs";
+        let now = Instant::now();
+        client
+            .pending_diagnostics
+            .insert(DIAGNOSTIC_URI.to_string(), now);
+        client
+            .pending_diagnostics
+            .insert(other_uri.to_string(), now);
+        assert!(client.recv_response().await.unwrap().is_none());
+        let Some(OutboundMessage::Request(other)) = requests.recv().await else {
+            panic!("expected diagnostics for the other document");
+        };
+        assert_eq!(diagnostic_request_uri(&other), Some(other_uri));
+        assert!(requests.try_recv().is_err());
+        assert!(client.pending_diagnostics.contains_key(DIAGNOSTIC_URI));
+
+        responses
+            .send(InboundMessage::Message(ResponseMessage {
+                id,
+                result: json!({ "kind": "full", "items": [] }),
+                request: None,
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.recv_response().await.unwrap(),
+            Some((InboundMessage::Message(_), _))
+        ));
+        assert!(client.recv_response().await.unwrap().is_none());
+        let Some(OutboundMessage::Request(refresh)) = requests.recv().await else {
+            panic!("expected one coalesced refresh");
+        };
+        assert_ne!(refresh.id, id);
+        assert_eq!(diagnostic_request_uri(&refresh), Some(DIAGNOSTIC_URI));
+        assert!(client.pending_diagnostics.is_empty());
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn diagnostic_cancellation_does_not_resurrect_closed_documents() {
+        for close_before_response in [true, false] {
+            let (mut client, mut requests, responses) = diagnostic_test_client();
+            let id = client
+                .request_diagnostics(DIAGNOSTIC_URI)
+                .await
+                .unwrap()
+                .unwrap();
+            requests.recv().await.unwrap();
+            if close_before_response {
+                client.did_close("/tmp/diagnostics.rs").await.unwrap();
+                requests.recv().await.unwrap();
+            }
+            responses
+                .send(diagnostic_error(id, -32802, None))
+                .await
+                .unwrap();
+            assert!(client.recv_response().await.unwrap().is_none());
+            if !close_before_response {
+                assert!(client.pending_diagnostics.contains_key(DIAGNOSTIC_URI));
+                client.did_close("/tmp/diagnostics.rs").await.unwrap();
+                requests.recv().await.unwrap();
+            }
+
+            assert!(client.pending_responses.is_empty());
+            assert!(client.pending_diagnostics.is_empty());
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_cancellation_handling_preserves_other_request_errors() {
+        for (method, code) in [
+            ("textDocument/diagnostic", -32603),
+            ("textDocument/formatting", -32802),
+            ("textDocument/completion", -32802),
+            ("workspace/symbol", -32802),
+            ("textDocument/inlayHint", -32801),
+        ] {
+            let (mut client, mut requests, responses) = diagnostic_test_client();
+            let id = client
+                .send_request(
+                    method,
+                    json!({
+                        "textDocument": { "uri": DIAGNOSTIC_URI }
+                    }),
+                    false,
+                )
+                .await
+                .unwrap();
+            requests.recv().await.unwrap();
+            responses
+                .send(diagnostic_error(
+                    id,
+                    code,
+                    Some(json!({
+                        "retriggerRequest": true
+                    })),
+                ))
+                .await
+                .unwrap();
+
+            let Some((InboundMessage::Error(error), response_method)) =
+                client.recv_response().await.unwrap()
+            else {
+                panic!("expected error to reach its request owner");
+            };
+            assert_eq!(error.id, Some(id));
+            assert_eq!(error.code, code);
+            assert_eq!(response_method.as_deref(), Some(method));
+            assert!(client.pending_responses.is_empty());
+            assert!(client.pending_diagnostics.is_empty());
+            assert!(requests.try_recv().is_err());
+        }
     }
 
     #[tokio::test]
