@@ -1234,6 +1234,7 @@ impl Editor {
             return Ok(());
         }
 
+        buffer.shortcut_help_regions.clear();
         let _span = super::perf::PerfSpan::start("render:full");
         #[cfg(test)]
         {
@@ -1299,8 +1300,17 @@ impl Editor {
         self.render_ui_chrome(buffer)?;
         // A modal workspace replaces editor chrome but remains below dialogs
         // and overlays so prompts and transient menus stay interactive.
+        if self.workspace_manager.is_active() {
+            buffer.shortcut_help_regions.clear();
+        }
         self.workspace_manager
             .render(buffer, &self.theme, self.picker_icons());
+        if self.workspace_manager.is_active() {
+            let (context, _) = self.workspace_manager.shortcut_actions();
+            for help in &mut buffer.shortcut_help_regions {
+                help.context.clone_from(&context);
+            }
+        }
         self.render_dialog(buffer)?;
 
         // Render all plugins
@@ -1313,6 +1323,11 @@ impl Editor {
         // The final row belongs to the editor, including inside modal workspaces.
         self.draw_commandline(buffer);
 
+        self.shortcut_help_regions
+            .clone_from(&buffer.shortcut_help_regions);
+        if let Some(help) = &self.keyboard_shortcuts {
+            help.render(buffer, &self.theme)?;
+        }
         self.update_terminal_cursor_surface(buffer);
         self.render_cursor_cell(buffer);
         self.last_rendered_cursor_position = self.render_cursor_position();
@@ -1402,6 +1417,7 @@ impl Editor {
             && !self.force_full_redraw
             && self.last_rendered_window == self.window_manager.active_stable_window_id()
             && self.current_dialog.is_none()
+            && self.keyboard_shortcuts.is_none()
             && !self.keymap_hints_visible
             && !self.panel_manager.has_focused_panel()
             && !self.workspace_manager.is_active()
@@ -3031,15 +3047,14 @@ impl Editor {
 
     fn render_dialog(&mut self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
         if let Some(current_dialog) = &self.current_dialog {
+            if current_dialog.has_shortcut_context() {
+                buffer.shortcut_help_regions.clear();
+            }
+            let first_region = buffer.shortcut_help_regions.len();
             current_dialog.draw(buffer)?;
-            self.dialog_action_menu
-                .render(buffer, &self.theme, &current_dialog.surface_actions());
-        } else {
-            self.dialog_action_menu.render(
-                buffer,
-                &self.theme,
-                &self.panel_manager.surface_actions(),
-            );
+            for help in &mut buffer.shortcut_help_regions[first_region..] {
+                help.context = current_dialog.shortcut_context().to_owned();
+            }
         }
 
         if self.keymap_hints_visible {
@@ -3629,6 +3644,9 @@ impl Editor {
     }
 
     pub(crate) fn render_cursor_position(&self) -> Option<(usize, usize)> {
+        if self.keyboard_shortcuts.is_some() {
+            return None;
+        }
         if let Some(current_dialog) = &self.current_dialog {
             if let Some(cursor_position) = current_dialog.cursor_position() {
                 return Some(cursor_position);

@@ -3015,6 +3015,25 @@ impl PanelManager {
             .is_some_and(|panel| panel.composer.is_some())
     }
 
+    pub(crate) fn shortcut_context(&self) -> String {
+        let Some(panel) = self
+            .focused
+            .as_ref()
+            .and_then(|id| self.text_panels.get(id))
+        else {
+            return "Panel".to_owned();
+        };
+        let mode = panel
+            .composer
+            .as_ref()
+            .map(|composer| text_panel_composer_hints(composer, &panel.scrollback).0)
+            .unwrap_or("READ");
+        format!(
+            "{} · {mode}",
+            panel.config.title.as_deref().unwrap_or("Text panel")
+        )
+    }
+
     pub(crate) fn surface_actions(&self) -> Vec<UiAction> {
         let Some(panel) = self
             .focused
@@ -3029,7 +3048,7 @@ impl PanelManager {
             .map(|composer| {
                 text_panel_actions(composer, &panel.scrollback, TextPanelOverflow::None).1
             })
-            .unwrap_or_default()
+            .unwrap_or_else(|| crate::ui::surface_reference_actions("SCROLLBACK NORMAL"))
     }
 
     pub fn focused_row_panel(&self) -> bool {
@@ -4667,6 +4686,7 @@ fn render_text_panel(
                 &palette.divider
             },
         );
+        let help_start = buffer.shortcut_help_regions.len();
         render_text_panel_composer(
             buffer,
             composer,
@@ -4678,6 +4698,14 @@ fn render_text_panel(
             &palette,
             theme,
         );
+        let context = format!(
+            "{} · {}",
+            panel.config.title.as_deref().unwrap_or("Text panel"),
+            text_panel_composer_hints(composer, &panel.scrollback).0
+        );
+        for help in &mut buffer.shortcut_help_regions[help_start..] {
+            help.context.clone_from(&context);
+        }
     }
     if let (Some(matches), Some(row)) = (search_matches, panel.search_bar_row(height)) {
         if let Some(bar) = TextPanelSearchBar::new(
@@ -4931,6 +4959,76 @@ fn text_panel_composer_hints(
     }
 }
 
+/// Full labels and grouping for the same actions used in the compact footer.
+fn text_panel_hint_action(_mode: &str, hint: &TextPanelShortcutHint, index: usize) -> UiAction {
+    let (group, label) = match (hint.keys, hint.action) {
+        ("a" | "i/a", "edit") => ("Composer", "Edit the follow-up"),
+        ("Tab", "edit") => ("Focus", "Focus the composer"),
+        ("Tab", "transcript") => ("Focus", "Focus the transcript"),
+        ("Enter", "send") => ("Composer", "Send the follow-up"),
+        ("^J", "newline") => ("Composer", "Insert a new line"),
+        ("m", "actions") => ("Conversation", "Actions for the selected turn"),
+        ("/?", "search") => ("Search", "Search forward / backward"),
+        ("[p/]p", "prompt") => ("Navigation", "Previous / next prompt"),
+        ("[l/]l", "link") => ("Navigation", "Previous / next link"),
+        ("G", "latest") => ("Navigation", "Jump to latest output"),
+        ("hjkl/arrows", "move") => ("Navigation", "Move the transcript cursor"),
+        ("j/k" | "j/k ↑/↓", "scroll") => ("Navigation", "Scroll down / up"),
+        ("g/G" | "^g/^G", "ends") => ("Navigation", "Jump to first / latest output"),
+        ("q", "close") => ("Pane", "Close the pane"),
+        ("^C", "stop") => ("Conversation", "Stop the current turn"),
+        ("v/V", "select") => ("Selection", "Select characters / lines"),
+        ("motions", "extend") => ("Selection", "Extend the selection"),
+        ("y", "copy" | "yank") => ("Selection", "Copy the selection"),
+        ("u", "undo") => ("Editing", "Undo the last edit"),
+        ("Esc", "normal") => ("Mode", "Return to Normal mode"),
+        ("Esc", "cancel") => ("Mode", "Cancel the selection or search"),
+        ("Enter", "find") => ("Search", "Accept the search"),
+        _ => ("Actions", hint.action),
+    };
+    let action = UiAction::new(hint.keys, hint.keys, hint.action)
+        .with_group(group)
+        .with_description(label)
+        .with_priority(if index == 0 || hint.keys == "Esc" {
+            ActionPriority::Essential
+        } else {
+            ActionPriority::Secondary
+        });
+    match hint.keys {
+        "Enter" => action.with_compact_key("↵"),
+        "hjkl/arrows" => action.with_trigger("h"),
+        "motions" => action.with_trigger("l"),
+        "g/G" => action.with_trigger("G"),
+        _ => action,
+    }
+}
+
+pub(crate) fn all_text_panel_shortcuts() -> Vec<crate::ui::ShortcutEntry> {
+    let mut entries = Vec::new();
+    for (mode, hints) in [
+        ("NAV", PANEL_NAVIGATION_HINTS),
+        ("SCROLLBACK NORMAL", SCROLLBACK_NORMAL_HINTS),
+        ("SCROLLBACK VISUAL", SCROLLBACK_VISUAL_HINTS),
+        ("NORMAL", COMPOSER_NORMAL_HINTS),
+        ("VISUAL", COMPOSER_VISUAL_HINTS),
+        ("SEARCH", COMPOSER_SEARCH_HINTS),
+        ("INSERT", COMPOSER_INSERT_HINTS),
+    ] {
+        let mut actions = hints
+            .iter()
+            .enumerate()
+            .map(|(index, hint)| text_panel_hint_action(mode, hint, index))
+            .collect::<Vec<_>>();
+        actions.extend(crate::ui::surface_reference_actions(mode));
+        let mut mode_entries = crate::ui::ShortcutEntry::from_actions("Text panel", &actions);
+        for entry in &mut mode_entries {
+            entry.group = format!("Text panel · {mode} · {}", entry.group);
+        }
+        entries.extend(mode_entries);
+    }
+    entries
+}
+
 fn text_panel_actions(
     composer: &TextPanelComposer,
     scrollback: &TextPanelScrollback,
@@ -4940,23 +5038,7 @@ fn text_panel_actions(
     let mut actions = hints
         .iter()
         .enumerate()
-        .map(|(index, hint)| {
-            let action = UiAction::new(hint.keys, hint.keys, hint.action).with_priority(
-                if index == 0 || hint.keys == "Esc" {
-                    ActionPriority::Essential
-                } else {
-                    ActionPriority::Secondary
-                },
-            );
-            match hint.keys {
-                "Enter" => action.with_compact_key("↵"),
-                "Ctrl+Enter" => action.with_compact_key("^↵"),
-                "hjkl/arrows" => action.with_trigger("h"),
-                "motions" => action.with_trigger("l"),
-                "g/G" => action.with_trigger("G"),
-                _ => action,
-            }
-        })
+        .map(|(index, hint)| text_panel_hint_action(mode, hint, index))
         .collect::<Vec<_>>();
     if !scrollback.focused {
         let hint = match overflow {
@@ -4971,6 +5053,11 @@ fn text_panel_actions(
                     .with_priority(ActionPriority::Secondary),
             );
         }
+    }
+    if composer.focused && !scrollback.focused {
+        actions.extend(crate::ui::prompt_reference_actions(composer.prompt.mode()));
+    } else {
+        actions.extend(crate::ui::surface_reference_actions(mode));
     }
     (mode, actions)
 }

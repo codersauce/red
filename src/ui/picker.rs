@@ -3101,6 +3101,9 @@ fn merge_preview_style(base: &Style, syntax: &Style) -> Style {
 }
 
 impl Component for Picker {
+    fn shortcut_context(&self) -> &str {
+        self.dialog.title().unwrap_or("Picker")
+    }
     fn surface_actions(&self) -> Vec<UiAction> {
         let mut actions = vec![
             UiAction::new("select", "Enter", "select").with_priority(ActionPriority::Essential)
@@ -3116,6 +3119,7 @@ impl Component for Picker {
         actions.push(
             UiAction::new("cancel", "Esc", "cancel").with_priority(ActionPriority::Essential),
         );
+        actions.extend(super::picker_reference_actions());
         actions
     }
     fn tick(&mut self) -> anyhow::Result<bool> {

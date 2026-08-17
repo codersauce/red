@@ -21,6 +21,7 @@ mod info;
 mod inline_assist;
 mod inline_history;
 mod input_prompt;
+mod keyboard_shortcuts;
 mod keymap_hints;
 mod list;
 mod messages;
@@ -28,6 +29,7 @@ mod picker;
 mod prompt_buffer;
 mod rich_text;
 mod selection;
+mod shortcut_catalog;
 mod spinner;
 mod statusline_layout;
 mod whats_new;
@@ -53,6 +55,10 @@ pub use info::Info;
 pub use inline_assist::{InlineAssistPopup, InlineAssistPopupState};
 pub(crate) use inline_history::InlineHistoryPanel;
 pub use input_prompt::InputPrompt;
+pub(crate) use keyboard_shortcuts::{
+    is_keyboard_shortcuts_alias, KeyboardShortcuts, ShortcutEntry, ShortcutEvent,
+    ShortcutHelpRegion, ShortcutTarget,
+};
 pub(crate) use keymap_hints::draw_keymap_hints;
 use list::List;
 pub(crate) use messages::{MessageRow, MessagesPanel, MessagesView};
@@ -67,6 +73,10 @@ pub(crate) use prompt_buffer::{
 };
 pub(crate) use rich_text::paint_rich_text;
 pub(crate) use selection::{FollowTailViewport, SelectionViewport};
+pub(crate) use shortcut_catalog::{
+    common_shortcut_entries, picker_reference_actions, prompt_reference_actions, reference_actions,
+    surface_reference_actions,
+};
 pub(crate) use spinner::{spinner_frame, SPINNER_FRAME_INTERVAL_MS};
 pub use statusline_layout::StatuslineLayoutPanel;
 pub use whats_new::WhatsNewPanel;
@@ -84,6 +94,17 @@ pub trait Component: Send {
 
     fn is_message_history(&self) -> bool {
         false
+    }
+
+    /// Whether this component currently owns a visible keyboard-help context.
+    /// Hidden, pass-through popups can leave help with the underlying editor.
+    fn has_shortcut_context(&self) -> bool {
+        true
+    }
+
+    /// User-facing name used by contextual keyboard help.
+    fn shortcut_context(&self) -> &str {
+        "Dialog"
     }
 
     /// Actions for the surface-local F1 menu. The default keeps passive popups unchanged.

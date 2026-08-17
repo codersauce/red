@@ -427,3 +427,13 @@ If either hook fails, the replacement is discarded. Successful replacement remov
 commands, event callbacks, pending requests, and VM state before the new registry becomes
 authoritative. Plugins should clean up host-owned panels, timers, watchers, and processes
 from `deactivate`.
+
+
+### Keyboard-shortcut discovery
+
+Shared `UiAction` records can supply `group` and `description` for contextual
+keyboard help. Use `priority: "reference"` for a supported binding that belongs
+in the complete reference but not in the compact action strip. Disabled actions
+are omitted. The strip and its clickable `F1 shortcuts` affordance use the same
+records, including the current mode and enabled state. `F1` opens help above the
+active surface; closing help does not replace that surface or its draft.

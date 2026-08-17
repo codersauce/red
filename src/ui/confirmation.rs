@@ -241,6 +241,23 @@ impl Confirmation {
 }
 
 impl Component for Confirmation {
+    fn shortcut_context(&self) -> &str {
+        self.dialog.title().unwrap_or("Confirmation")
+    }
+    fn surface_actions(&self) -> Vec<super::UiAction> {
+        vec![
+            super::UiAction::new("select", "Enter", "Choose selected option"),
+            super::UiAction::new("cancel", "Esc", "Cancel"),
+            super::UiAction::new("accept", "y", &self.accept_label),
+            super::UiAction::new("reject", "n", &self.cancel_label),
+            super::UiAction::new("options", "← / → / Tab / Shift+Tab", "Choose an option")
+                .with_priority(super::ActionPriority::Reference),
+            super::UiAction::new("scroll", "↑ / ↓", "Scroll the message")
+                .with_priority(super::ActionPriority::Reference)
+                .with_enabled(self.multiline),
+        ]
+    }
+
     fn picker_handle(&self) -> Option<PickerHandle> {
         match &self.target {
             ConfirmationTarget::Callback(handle) => Some(*handle),

@@ -3913,7 +3913,7 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
         assert!(known_top_level_field("persist_inline_history"));
         assert_eq!(
             config.keys.normal.get("F1"),
-            Some(&KeyAction::Single(Action::CommandPalette))
+            Some(&KeyAction::Single(Action::KeyboardShortcuts))
         );
         assert_eq!(
             config.keys.normal.get("Ctrl-Shift-p"),

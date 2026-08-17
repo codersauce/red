@@ -63,9 +63,20 @@ The same module produces delayed keymap hints for nested key prefixes. `keymap_h
 
 Configured normal-mode bindings are not automatically global when a plugin panel owns focus. After dialogs, workspace mode, command mode, and search mode have had a chance to handle input, `process_editor_event` gives focused panels their own event path and only falls back to `panel_global_key_action` for actions admitted by `action_runs_from_panel` [@editor-dispatch]. This lets panel-local keys such as row navigation, expansion, activation, toggles, and close stay local while selected editor-level commands still work from a focused panel [@editor-dispatch].
 
-Panel-local handling comes first. Row panels prefer unmodified character keys other than `:` and `;`, so a user mapping such as normal-mode `x = FilePicker` does not steal a row-panel `x` action [@editor-dispatch]. The editor also reserves explicit panel chords such as row-panel `Ctrl-r` before trying the global normal-mode map, which lets Neo-tree clear its clipboard even if the user maps `Ctrl-r` globally [@editor-dispatch] [@default-config] [@neotree-plugin]. Other modified keys can fall through to `panel_global_key_action`, so global defaults such as `Ctrl-p` for `FilePicker`, `Ctrl-z` for `Suspend`, and `F1` for the command palette still work from a focused panel [@default-config] [@editor-dispatch].
+Panel-local handling comes first. Row panels prefer unmodified character keys other than `:` and `;`, so a user mapping such as normal-mode `x = FilePicker` does not steal a row-panel `x` action [@editor-dispatch]. The editor also reserves explicit panel chords such as row-panel `Ctrl-r` before trying the global normal-mode map, which lets Neo-tree clear its clipboard even if the user maps `Ctrl-r` globally [@editor-dispatch] [@default-config] [@neotree-plugin]. Other modified keys can fall through to `panel_global_key_action`, so global defaults such as `Ctrl-p` for `FilePicker`, `Ctrl-z` for `Suspend`, and `Alt-x` for the command palette still work from a focused panel [@default-config] [@editor-dispatch].
 
 The panel-global allowlist currently admits command/search entry, file picker, command palette, statusline manager, configuration diagnostics, suspend, logs, plugin listing, window and split management, and nested mappings whose descendants include an admitted action [@editor-dispatch]. Plugin commands are admitted only when the active runtime reports `CommandScope::Global` for that command; an unscoped or missing plugin command remains editor-scoped even if it has a normal-mode key binding [@editor-dispatch] [@plugin-runtime]. A future binding that should work from panels therefore needs both a normal-mode keymap entry and either an allowlisted editor action or plugin command metadata with `scope = "global"` [@editor-dispatch] [@plugin-runtime].
+
+## Keyboard-Shortcut Explorer
+
+`F1` opens contextual keyboard help above the active editor, panel, picker, or
+workspace. `:keys` and the **Keyboard shortcuts** command open the same surface;
+`Space ?`, `Alt-x`, and `Ctrl-Shift-p` still open the command palette. The explorer
+does not replace the underlying dialog, so its selection and unsent input survive.
+Its global view enumerates effective keymap leaves, including nested sequences,
+action chains, and plugin bindings, alongside shared surface-action references.
+The action bar emits its mouse hit target from its actual responsive layout.
+Reference-only and other-context bindings are readable but not executable.
 
 ## Plugin Command Metadata
 

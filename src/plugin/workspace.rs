@@ -1269,6 +1269,26 @@ impl PluginWorkspace {
             actions
                 .push(UiAction::new("?", "?", "actions").with_priority(ActionPriority::Essential));
             actions.push(UiAction::new("q", "q", "close").with_priority(ActionPriority::Essential));
+            actions.extend(crate::ui::reference_actions(&[
+                ("Navigation", "j / k / ↑ / ↓", "Move down / up"),
+                ("Navigation", "Ctrl+u / Ctrl+d", "Move half a page"),
+                (
+                    "Navigation",
+                    "Ctrl+b / Ctrl+f / PageUp / PageDown",
+                    "Move a page",
+                ),
+                ("Navigation", "gg / G", "First / last item"),
+                ("Panes", "Ctrl+w h / Ctrl+w l", "Focus files / diff"),
+                ("Panes", "Ctrl+w w / Ctrl+w W", "Next / previous pane"),
+                ("Panes", "Ctrl+w z", "Maximize / restore the focused pane"),
+            ]));
+            if detail && !self.detail_wrap {
+                actions.extend(crate::ui::reference_actions(&[(
+                    "Navigation",
+                    "h / l / ← / → / 0 / $",
+                    "Scroll horizontally",
+                )]));
+            }
         }
         actions
     }
@@ -1383,6 +1403,25 @@ impl WorkspaceManager {
             workspace.detail_highlights =
                 highlight_document(workspace.model.detail_document.as_ref(), theme, registry);
         }
+    }
+
+    pub(crate) fn shortcut_actions(&self) -> (String, Vec<UiAction>) {
+        self.active
+            .as_ref()
+            .map(|workspace| {
+                let context = if workspace.filtering {
+                    "Filter"
+                } else if workspace.focus == WorkspaceFocus::Detail {
+                    "Diff"
+                } else {
+                    "Files"
+                };
+                (
+                    format!("{} · {context}", workspace.config.title),
+                    workspace.actions(),
+                )
+            })
+            .unwrap_or_default()
     }
 
     pub fn is_active(&self) -> bool {

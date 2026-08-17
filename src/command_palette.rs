@@ -54,6 +54,8 @@ const SPECIAL_BUILTIN_COLON_COMMANDS: &[&str] = &[
     "InlineHistoryExport",
     "commands",
     "command-palette",
+    "keys",
+    "keyboard-shortcuts",
     "whats-new",
     "changelog",
     "db",
@@ -428,6 +430,15 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
             Some(":InlineHistory"),
             &[":inline-history", "inline questions", "reviewed source"],
             Action::OpenInlineHistory,
+        ),
+        builtin(
+            "editor.keyboard_shortcuts",
+            "Keyboard shortcuts",
+            "Editor",
+            "Browse all effective bindings and contextual shortcuts",
+            Some(":keys"),
+            &[":keyboard-shortcuts", "keybindings", "help"],
+            Action::KeyboardShortcuts,
         ),
         builtin(
             "editor.command_palette",
@@ -1145,6 +1156,72 @@ fn builtin(
     }
 }
 
+/// Enumerates every effective leaf, including custom chains, repetitions, and plugin maps.
+pub(crate) fn shortcut_entries(
+    keys: &Keys,
+    commands: &[RegisteredPluginCommand],
+    active_mode: Option<Mode>,
+) -> Vec<crate::ui::ShortcutEntry> {
+    fn collect(
+        mappings: &HashMap<String, KeyAction>,
+        prefix: &mut Vec<String>,
+        mode: Mode,
+        metadata: &[CommandPaletteEntry],
+        executable: bool,
+        output: &mut Vec<crate::ui::ShortcutEntry>,
+    ) {
+        let mut mappings = mappings.iter().collect::<Vec<_>>();
+        mappings.sort_by_key(|(key, _)| *key);
+        for (key, action) in mappings {
+            prefix.push(display_key(key).to_owned());
+            if let KeyAction::Nested(nested) = action {
+                collect(nested, prefix, mode, metadata, executable, output);
+            } else if let Some(label) = key_action_label(action) {
+                let command = metadata
+                    .iter()
+                    .find(|entry| key_action_is(action, &entry.action));
+                let category = command.map_or("Bindings", |entry| entry.category.as_str());
+                let mut entry = crate::ui::ShortcutEntry::new(
+                    format!("Editor · {mode:?} · {category}"),
+                    prefix.join(" "),
+                    command.map_or(label, |entry| entry.title.clone()),
+                );
+                if let Some(command) = command {
+                    entry.description = command.description.clone();
+                }
+                if executable {
+                    entry.target = Some(crate::ui::ShortcutTarget::Editor(action.clone()));
+                }
+                output.push(entry);
+            }
+            prefix.pop();
+        }
+    }
+    let metadata = entries(keys, commands);
+    let mut output = Vec::new();
+    for (mode, mappings) in [
+        (Mode::Normal, &keys.normal),
+        (Mode::Insert, &keys.insert),
+        (Mode::Visual, &keys.visual),
+        (Mode::VisualLine, &keys.visual_line),
+        (Mode::VisualBlock, &keys.visual_block),
+        (Mode::Command, &keys.command),
+    ] {
+        if active_mode.is_none_or(|active| active == mode) {
+            collect(
+                mappings,
+                &mut Vec::new(),
+                mode,
+                &metadata,
+                active_mode.is_some(),
+                &mut output,
+            );
+        }
+    }
+    output.sort_by(|a, b| (&a.group, &a.label, &a.key).cmp(&(&b.group, &b.label, &b.key)));
+    output
+}
+
 fn shortcuts_for_action(keys: &Keys, target: &Action) -> Vec<String> {
     let tables = [
         ("Normal", &keys.normal),
@@ -1238,6 +1315,7 @@ fn key_action_label(action: &KeyAction) -> Option<String> {
 
 fn action_label(action: &Action) -> String {
     match action {
+        Action::KeyboardShortcuts => "Keyboard shortcuts".to_string(),
         Action::CommandPalette => "All commands".to_string(),
         Action::OpenMessages => "Messages".to_string(),
         Action::OpenInlineHistory => "Inline assist history".to_string(),
@@ -1922,5 +2000,37 @@ mod tests {
             "LSP workspace symbols"
         );
         assert_eq!(humanize_identifier("GitHunkStage"), "Git hunk stage");
+    }
+}
+
+#[cfg(test)]
+mod shortcut_catalog_tests {
+    use super::*;
+    #[test]
+    fn shortcut_catalog_keeps_effective_nested_and_chained_bindings() {
+        let mut keys = Keys::default();
+        keys.normal.insert(
+            " ".into(),
+            KeyAction::Nested(HashMap::from([(
+                "x".into(),
+                KeyAction::Multiple(vec![Action::Save, Action::MoveToTop]),
+            )])),
+        );
+        keys.normal.insert("disabled".into(), KeyAction::None);
+        keys.insert
+            .insert("Ctrl-s".into(), KeyAction::Single(Action::Save));
+        let all = shortcut_entries(&keys, &[], None);
+        assert_eq!(all.len(), 2);
+        assert!(all
+            .iter()
+            .any(|entry| entry.key == "Space x" && entry.label.contains("then")));
+        assert!(all.iter().all(|entry| entry.target.is_none()));
+        let insert = shortcut_entries(&keys, &[], Some(Mode::Insert));
+        assert_eq!(insert.len(), 1);
+        assert_eq!(insert[0].key, "Ctrl-s");
+        assert!(insert[0].target.is_some());
+        assert!(entries(&keys, &[])
+            .iter()
+            .any(|entry| entry.colon.as_deref() == Some(":keys")));
     }
 }
