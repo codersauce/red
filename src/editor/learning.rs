@@ -9,6 +9,7 @@ use crate::ui::{draw_learn_coach, draw_learn_panel_coach, CoachLayout, LearnHub}
 mod agent;
 mod git;
 mod language;
+mod symbols;
 
 pub(super) struct LearnSession {
     lesson: Lesson,
@@ -28,6 +29,7 @@ pub(super) struct LearnSession {
     git: Option<git::LearnGitState>,
     original_workspaces: Option<plugin::WorkspaceManager>,
     original_language: language::SavedLanguageState,
+    symbols: Option<symbols::LearnSymbolState>,
 }
 
 impl LearnSession {
@@ -138,11 +140,9 @@ impl Editor {
         // setup leaves the user's current workspace untouched.
         let workspace = if matches!(
             lesson,
-            Lesson::SaveAPracticeFile
-                | Lesson::ContinueInAgent
-                | Lesson::ReviewWhatChanged
-                | Lesson::ReadTheDiagnostic
-        ) {
+            Lesson::SaveAPracticeFile | Lesson::ContinueInAgent | Lesson::ReviewWhatChanged
+        ) || lesson.is_lsp_practice()
+        {
             Some(PracticeWorkspace::new()?)
         } else {
             None
@@ -220,7 +220,10 @@ impl Editor {
                 .to_string_lossy()
                 .into_owned()
         });
-        let practice = Buffer::new(file, lesson.contents().to_string());
+        let mut practice = Buffer::new(file, lesson.contents().to_string());
+        if lesson == Lesson::FollowTheSymbol {
+            practice.pos = (16, 5);
+        }
         let practice_buffer_id = practice.id();
         let practice_index = self.buffer_manager.len();
         self.buffer_manager.push_buffer(practice);
@@ -231,7 +234,7 @@ impl Editor {
                 (usize::from(self.size.0), usize::from(self.size.1)),
             ),
         );
-        self.learn_session = Some(LearnSession {
+        self.learn_session = Some(Box::new(LearnSession {
             lesson,
             step: lesson.first_step(),
             practice_buffer_id,
@@ -249,7 +252,8 @@ impl Editor {
             git,
             original_workspaces,
             original_language,
-        });
+            symbols: (lesson == Lesson::FollowTheSymbol).then(symbols::LearnSymbolState::default),
+        }));
         self.mode = Mode::Normal;
         if lesson == Lesson::FindACommand {
             self.wrap = true;
@@ -514,6 +518,21 @@ impl Editor {
                 .current_dialog
                 .as_ref()
                 .is_some_and(|dialog| dialog.shortcut_context() == "Line diagnostics"),
+            symbol_definition_received: session
+                .symbols
+                .as_ref()
+                .is_some_and(|symbols| symbols.definition_received),
+            symbol_references_received: session
+                .symbols
+                .as_ref()
+                .is_some_and(|symbols| symbols.references_received),
+            references_picker_open: self
+                .current_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.shortcut_context() == "References"),
+            symbol_at_definition: self.learn_symbol_at(0),
+            symbol_at_first_call: self.learn_symbol_at(5),
+            symbol_at_second_call: self.learn_symbol_at(6),
         };
         let session = self
             .learn_session

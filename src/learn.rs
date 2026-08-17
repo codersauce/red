@@ -27,7 +27,8 @@ pub(crate) const AGENT_EXAMPLE: &str = "// Practice usage example\nlet expected_
 pub(crate) const AGENT_EXAMPLE_FIXED: &str =
     "// Practice usage example: add_score(40, 2)\nlet expected_score = 42;\n";
 pub(crate) const HUSK_DIAGNOSTIC: &str = "expected `;` after let binding";
-pub(crate) const HUSK_CONTENTS: &str = "fn add_score(score: i32, points: i32) -> i32 {\n    score + points\n}\n\nfn main() {\n    let score = add_score(40, 2)\n    std::println(\"Score updated\");\n}\n";
+pub(crate) const HUSK_CONTENTS: &str = "fn add_score(score: i32, points: i32) -> i32 {\n    score + points\n}\n\nfn main() {\n    let score = add_score(40, 2)\n    let next = 45;\n}\n";
+pub(crate) const HUSK_SYMBOL_CONTENTS: &str = "fn add_score(score: i32, points: i32) -> i32 {\n    score + points\n}\n\nfn main() {\n    let score = add_score(40, 2);\n    let next = add_score(score, 3);\n}\n";
 pub(crate) const LEARN_GIT_WORKSPACE: &str = "learn-git";
 pub(crate) const LEARN_AGENT_PANEL: &str = "learn-recorded-agent";
 
@@ -44,10 +45,11 @@ pub(crate) enum Lesson {
     ContinueInAgent,
     ReviewWhatChanged,
     ReadTheDiagnostic,
+    FollowTheSymbol,
 }
 
 impl Lesson {
-    pub const AVAILABLE: [Self; 10] = [
+    pub const AVAILABLE: [Self; 11] = [
         Self::FindYourFooting,
         Self::EditWithConfidence,
         Self::FindACommand,
@@ -58,6 +60,7 @@ impl Lesson {
         Self::ContinueInAgent,
         Self::ReviewWhatChanged,
         Self::ReadTheDiagnostic,
+        Self::FollowTheSymbol,
     ];
 
     pub fn from_id(id: &str) -> Option<Self> {
@@ -92,6 +95,7 @@ impl Lesson {
             Self::ContinueInAgent => 7,
             Self::ReviewWhatChanged => 8,
             Self::ReadTheDiagnostic => 9,
+            Self::FollowTheSymbol => 10,
         }
     }
 
@@ -102,7 +106,7 @@ impl Lesson {
             | Self::ChooseWhatToKeep
             | Self::ContinueInAgent
             | Self::ReviewWhatChanged => 1,
-            Self::ReadTheDiagnostic => 2,
+            Self::ReadTheDiagnostic | Self::FollowTheSymbol => 2,
             _ => 0,
         }
     }
@@ -114,7 +118,7 @@ impl Lesson {
     }
 
     pub const fn is_lsp_practice(self) -> bool {
-        matches!(self, Self::ReadTheDiagnostic)
+        matches!(self, Self::ReadTheDiagnostic | Self::FollowTheSymbol)
     }
 
     pub const fn is_ai_practice(self) -> bool {
@@ -139,6 +143,7 @@ impl Lesson {
             Self::ContinueInAgent => "ai.continue-in-agent.v1",
             Self::ReviewWhatChanged => "ai.review-what-changed.v1",
             Self::ReadTheDiagnostic => "ship.read-the-diagnostic.v1",
+            Self::FollowTheSymbol => "ship.follow-the-symbol.v1",
         }
     }
 
@@ -158,6 +163,7 @@ impl Lesson {
             | Self::ContinueInAgent => AI_CONTENTS,
             Self::ReviewWhatChanged => AI_FIXED_CONTENTS,
             Self::ReadTheDiagnostic => HUSK_CONTENTS,
+            Self::FollowTheSymbol => HUSK_SYMBOL_CONTENTS,
         }
     }
 
@@ -173,6 +179,7 @@ impl Lesson {
             Self::ContinueInAgent => PracticeStep::AgentSelect,
             Self::ReviewWhatChanged => PracticeStep::GitOpen,
             Self::ReadTheDiagnostic => PracticeStep::DiagnosticOpen,
+            Self::FollowTheSymbol => PracticeStep::SymbolDefinition,
         }
     }
 
@@ -223,6 +230,12 @@ impl Lesson {
                 "Undo the unwanted change",
                 "Request and refine a suggestion",
                 "Keep only the corrected result",
+            ],
+            Self::FollowTheSymbol => &[
+                "Go to the symbol definition",
+                "Find its references",
+                "Open the second call",
+                "Return with jump history",
             ],
             Self::ReadTheDiagnostic => &[
                 "Open the diagnostics picker",
@@ -394,12 +407,20 @@ pub(crate) enum PracticeStep {
     DiagnosticJump,
     DiagnosticRead,
     DiagnosticReturn,
+    SymbolDefinition,
+    SymbolReferences,
+    SymbolChoose,
+    SymbolReturn,
     Complete,
 }
 
 impl PracticeStep {
     pub fn suggested_action(self) -> Option<Action> {
         match self {
+            Self::SymbolDefinition => Some(Action::GoToDefinition),
+            Self::SymbolReferences => Some(Action::PluginCommand("LspReferences".into())),
+            Self::SymbolChoose => None,
+            Self::SymbolReturn => Some(Action::JumpBack),
             Self::DiagnosticOpen => Some(Action::OpenDiagnosticsPicker),
             Self::DiagnosticRead => Some(Action::ShowLineDiagnostics),
             Self::DiagnosticJump | Self::DiagnosticReturn => None,
@@ -501,6 +522,10 @@ impl PracticeStep {
             Self::DiagnosticJump => "Choose the missing-semicolon error and press Enter. The editor will take you to the reported location. Reopen Diagnostics if you closed the picker.".into(),
             Self::DiagnosticRead => format!("Press {} to read the diagnostic on this line. The parser points at the next token; the incomplete statement is just above it.", shortcut.unwrap_or("D")),
             Self::DiagnosticReturn => "Read the message and diagnostic code, then press Esc to return to the source. You will repair the defect in a later lesson.".into(),
+            Self::SymbolDefinition => format!("The cursor starts on the first add_score call. Press {} to follow it to its definition. This uses the real bundled Husk server. If you moved, use :6, then ^3w.", shortcut.unwrap_or("g d")),
+            Self::SymbolReferences => format!("You are at the function definition. Press {} (or :LspReferences) to find the places that call it.", shortcut.unwrap_or("Space k")),
+            Self::SymbolChoose => "Choose the second call, let next = add_score(score, 3), and press Enter. If you closed the picker, find references again from the definition.".into(),
+            Self::SymbolReturn => format!("Press {} to return to the definition, then press it again to return to the first call. The jump list remembers where you came from.", shortcut.unwrap_or("Ctrl-o")),
             Self::Complete => match lesson {
                 Lesson::FindYourFooting => "Your original text is restored. Nicely done.",
                 Lesson::EditWithConfidence => {
@@ -511,6 +536,7 @@ impl PracticeStep {
                 Lesson::UnderstandSelectedCode => "You explained selected code without editing it. Recorded practice complete; real inline assist sends your selected context only when you submit a prompt.",
                 Lesson::MakeAFocusedChange => "The fix is kept in the buffer, still unsaved. Inline edits use normal undo history; keeping one is not the same as writing a file.",
                 Lesson::ChooseWhatToKeep => "You rejected an unwanted change, refined a suggestion, and kept the corrected result. The final edit is unsaved and remains undoable.",
+                Lesson::FollowTheSymbol => "You followed a real definition, inspected its references, and returned through the jump list. No source was changed.",
                 Lesson::ReadTheDiagnostic => "You found a real language-server error and read it at its source. The file is unchanged. Your original language servers and diagnostics return when you leave.",
                 Lesson::ReviewWhatChanged => "You reviewed the real diff for both files. Build with AI complete! These changes are still unstaged; your own repository was never touched.",
                 Lesson::ContinueInAgent => "Both practice files are saved. Unlike Keep in inline assist, Agent file-edit tools can write to disk. Your real workspace and Agent draft are untouched.",
@@ -533,7 +559,8 @@ impl PracticeStep {
             | Self::AgentInlineOpen
             | Self::AgentInlineSubmit
             | Self::GitOpen
-            | Self::DiagnosticOpen => 0,
+            | Self::DiagnosticOpen
+            | Self::SymbolDefinition => 0,
             Self::Type
             | Self::EditDelete
             | Self::CommandRun
@@ -543,7 +570,8 @@ impl PracticeStep {
             | Self::AiChoiceUndo
             | Self::AgentEscalate
             | Self::GitScore
-            | Self::DiagnosticJump => 1,
+            | Self::DiagnosticJump
+            | Self::SymbolReferences => 1,
             Self::Normal
             | Self::EditUndo
             | Self::CommandHelp
@@ -555,7 +583,8 @@ impl PracticeStep {
             | Self::AiChoiceRefine
             | Self::AgentPrompt
             | Self::GitExample
-            | Self::DiagnosticRead => 2,
+            | Self::DiagnosticRead
+            | Self::SymbolChoose => 2,
             Self::Undo
             | Self::EditRedo
             | Self::CommandReturn
@@ -565,7 +594,8 @@ impl PracticeStep {
             | Self::AiChoiceKeep
             | Self::AgentInspect
             | Self::GitReturn
-            | Self::DiagnosticReturn => 3,
+            | Self::DiagnosticReturn
+            | Self::SymbolReturn => 3,
             Self::Complete => 4,
         }
     }
@@ -630,6 +660,27 @@ impl PracticeStep {
     /// Observes UI state that can change through either a key or an action.
     pub fn observe_view(&mut self, action: &Action, view: PracticeView) -> bool {
         let next = match (*self, action) {
+            (Self::SymbolDefinition, Action::OpenLocation(_, _))
+                if view.symbol_definition_received && view.symbol_at_definition =>
+            {
+                Self::SymbolReferences
+            }
+            (Self::SymbolReferences, Action::ShowDialog)
+                if view.symbol_references_received && view.references_picker_open =>
+            {
+                Self::SymbolChoose
+            }
+            (Self::SymbolChoose, Action::OpenLocation(_, _))
+                if view.symbol_references_received && view.symbol_at_second_call =>
+            {
+                Self::SymbolReturn
+            }
+            (Self::SymbolReturn, Action::JumpBack)
+                if view.symbol_at_first_call && view.original_text =>
+            {
+                Self::Complete
+            }
+
             (
                 Self::DiagnosticOpen,
                 Action::OpenDiagnosticsPicker | Action::OpenErrorDiagnosticsPicker,
@@ -748,25 +799,36 @@ pub(crate) struct PracticeView {
     pub diagnostics_picker_open: bool,
     pub diagnostic_under_cursor: bool,
     pub diagnostic_popup_open: bool,
+    pub symbol_definition_received: bool,
+    pub symbol_references_received: bool,
+    pub references_picker_open: bool,
+    pub symbol_at_definition: bool,
+    pub symbol_at_first_call: bool,
+    pub symbol_at_second_call: bool,
 }
 
 /// Scratch lessons permit only edits to their isolated practice buffer.
 pub(crate) fn practice_action_allowed(lesson: Lesson, action: &Action) -> bool {
-    (lesson.is_lsp_practice()
-        && matches!(
+    (lesson == Lesson::FollowTheSymbol
+        && (matches!(
             action,
-            Action::OpenDiagnosticsPicker
-                | Action::OpenErrorDiagnosticsPicker
-                | Action::ShowLineDiagnostics
-                | Action::NextDiagnostic
-                | Action::PreviousDiagnostic
-                | Action::RefreshDiagnostics
-                | Action::OpenLocation(_, _)
-                | Action::MoveTo(_, _)
-                | Action::ShowDialog
-                | Action::CommandPalette
-                | Action::KeyboardShortcuts
-        ))
+            Action::GoToDefinition | Action::JumpBack | Action::JumpForward
+        ) || matches!(action, Action::PluginCommand(name) if name == "LspReferences")))
+        || (lesson.is_lsp_practice()
+            && matches!(
+                action,
+                Action::OpenDiagnosticsPicker
+                    | Action::OpenErrorDiagnosticsPicker
+                    | Action::ShowLineDiagnostics
+                    | Action::NextDiagnostic
+                    | Action::PreviousDiagnostic
+                    | Action::RefreshDiagnostics
+                    | Action::OpenLocation(_, _)
+                    | Action::MoveTo(_, _)
+                    | Action::ShowDialog
+                    | Action::CommandPalette
+                    | Action::KeyboardShortcuts
+            ))
         || (lesson == Lesson::ReviewWhatChanged
             && (matches!(action, Action::PluginCommand(name) if name == "GitDashboard")
                 || matches!(action, Action::NotifyPlugins(method, _) if method == &format!("workspace:event:{LEARN_GIT_WORKSPACE}"))))
@@ -851,6 +913,39 @@ pub(crate) fn practice_action_allowed(lesson: Lesson, action: &Action) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn symbol_lesson_requires_lsp_results_and_return_to_the_original_call() {
+        let mut step = Lesson::FollowTheSymbol.first_step();
+        let mut view = PracticeView {
+            original_text: true,
+            ..PracticeView::default()
+        };
+        let location = Action::OpenLocation(
+            crate::plugin::PluginLocation {
+                path: "main.hk".into(),
+                line: 0,
+                column: 3,
+                column_encoding: crate::plugin::LocationColumnEncoding::Utf16,
+            },
+            crate::plugin::OpenLocationTarget::Current,
+        );
+        view.symbol_at_definition = true;
+        assert!(!step.observe_view(&location, view));
+        view.symbol_definition_received = true;
+        assert!(step.observe_view(&location, view));
+        view.references_picker_open = true;
+        assert!(!step.observe_view(&Action::ShowDialog, view));
+        view.symbol_references_received = true;
+        assert!(step.observe_view(&Action::ShowDialog, view));
+        assert!(!step.observe_view(&location, view));
+        view.symbol_at_second_call = true;
+        assert!(step.observe_view(&location, view));
+        assert!(!step.observe_view(&Action::JumpBack, view));
+        view.symbol_at_first_call = true;
+        assert!(step.observe_view(&Action::JumpBack, view));
+        assert_eq!(step, PracticeStep::Complete);
+    }
 
     #[test]
     fn diagnostic_lesson_requires_real_picker_location_and_popup_effects() {
@@ -1025,6 +1120,7 @@ mod tests {
             diagnostics_picker_open: false,
             diagnostic_under_cursor: false,
             diagnostic_popup_open: false,
+            ..PracticeView::default()
         };
         assert!(!step.observe_view(&Action::CommandPalette, view));
         view.command_palette_open = true;

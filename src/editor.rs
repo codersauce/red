@@ -3153,7 +3153,9 @@ pub struct Editor {
     preferences: PreferencesStore,
 
     /// Owns the protected practice buffer and original window layout.
-    learn_session: Option<learning::LearnSession>,
+    // A session owns suspended windows, panels, and language services. Keep
+    // that growing snapshot off ordinary editor/replay stack frames.
+    learn_session: Option<Box<learning::LearnSession>>,
 
     /// A release has changed, but no visible client has seen its announcement yet.
     whats_new_startup_pending: bool,
@@ -12200,6 +12202,9 @@ impl Editor {
         msg: &InboundMessage,
         method: Option<String>,
     ) -> Option<Action> {
+        if let Some(action) = self.handle_learn_symbol_response(msg) {
+            return action;
+        }
         fn parse_diagnostics(msg: &ResponseMessage) -> Option<(String, Vec<Diagnostic>)> {
             let req = msg.request.as_ref()?;
             let params = req.params.as_object()?;
@@ -16361,6 +16366,11 @@ impl Editor {
             return Ok(false);
         }
         if self.intercept_learn_git_action(action, buffer)? {
+            return Ok(false);
+        }
+        if self.learn_session.is_some()
+            && self.intercept_learn_symbol_action(action, buffer).await?
+        {
             return Ok(false);
         }
         let sensitive_action = matches!(action, Action::NotifyPlugin(_, _, _))
