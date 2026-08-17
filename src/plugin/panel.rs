@@ -1766,6 +1766,17 @@ impl TextPanel {
         true
     }
 
+    fn focus_width(&self, presentation: &PanelPresentation) -> usize {
+        // Horizontal panes span the terminal, so their configured size is a
+        // height. Reuse the last real layout width; before the first layout,
+        // use a bounded terminal-sized fallback rather than usize::MAX.
+        self.layout_cache
+            .borrow()
+            .as_ref()
+            .map(|(width, _)| *width)
+            .unwrap_or_else(|| presentation.width(&self.id, &self.config, 80))
+    }
+
     fn focus_scrollback(&mut self, width: usize) {
         self.cancel_transcript_search();
         if let Some(composer) = self.composer.as_mut() {
@@ -2897,9 +2908,7 @@ impl PanelManager {
         {
             self.focused = Some(id.to_string());
             if let Some(panel) = self.text_panels.get_mut(id) {
-                let width = self
-                    .presentation
-                    .width(&panel.id, &panel.config, usize::MAX);
+                let width = panel.focus_width(&self.presentation);
                 panel.focus_scrollback(width);
             }
             true
@@ -2917,9 +2926,7 @@ impl PanelManager {
 
         self.focused = Some(id.to_string());
         if let Some(panel) = self.text_panels.get_mut(id) {
-            let width = self
-                .presentation
-                .width(&panel.id, &panel.config, usize::MAX);
+            let width = panel.focus_width(&self.presentation);
             panel.restore_focused_region(width);
         }
         true
@@ -5557,6 +5564,44 @@ mod tests {
         color::{contrast_ratio, Color},
         theme::parse_vscode_theme,
     };
+
+    #[test]
+    fn horizontal_text_panel_focus_uses_a_bounded_real_width() {
+        for side in [PanelSide::Top, PanelSide::Bottom] {
+            let mut manager = PanelManager::default();
+            manager.create_text_panel(
+                "agent".into(),
+                PanelConfig {
+                    side,
+                    width: 12,
+                    ..PanelConfig::default()
+                },
+            );
+            assert!(manager.focus_panel("agent"));
+            assert_eq!(
+                manager.text_panels["agent"].focus_width(&manager.presentation),
+                80
+            );
+            manager.update_text_panel(
+                "agent",
+                vec![TextPanelBlock {
+                    id: "prompt".into(),
+                    kind: TextPanelBlockKind::User,
+                    format: TextPanelBlockFormat::Plain,
+                    text: "a real prompt card".into(),
+                }],
+                24,
+                120,
+            );
+            assert!(manager.focus_panel("agent"));
+            manager.focus_editor();
+            assert!(manager.restore_panel_focus("agent"));
+            assert_eq!(
+                manager.text_panels["agent"].focus_width(&manager.presentation),
+                120
+            );
+        }
+    }
 
     fn row(id: &str) -> PanelRow {
         PanelRow {
