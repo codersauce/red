@@ -42,6 +42,15 @@ pub mod manager;
 pub mod types;
 pub mod workspace_edit;
 
+/// Ordered incremental edits and their cheap, exact document snapshots.
+/// Ranges use UTF-16 coordinates in the document produced by the preceding edit.
+#[derive(Debug, Clone)]
+pub struct DocumentChange {
+    pub before: ropey::Rope,
+    pub after: ropey::Rope,
+    pub changes: Vec<TextDocumentContentChangeEvent>,
+}
+
 #[derive(Debug)]
 /// Failure returned by the LSP transport, protocol, or lifecycle boundary.
 pub enum LspError {
@@ -321,6 +330,15 @@ pub trait LspClient: std::any::Any + Send {
     async fn did_open(&mut self, file: &str, contents: &str) -> Result<(), LspError>;
     /// Publishes the current full document text as the next version.
     async fn did_change(&mut self, file: &str, contents: String) -> Result<(), LspError>;
+    /// Publishes known edits when supported, otherwise falls back to full text.
+    async fn did_change_edits(
+        &mut self,
+        file: &str,
+        change: DocumentChange,
+    ) -> Result<(), LspError> {
+        self.did_change(file, change.after.to_string()).await
+    }
+
     /// Notifies the server after the supplied document contents were saved successfully.
     async fn did_save(&mut self, _file: &str, _contents: &str) -> Result<(), LspError> {
         Ok(())

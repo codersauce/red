@@ -1,6 +1,17 @@
 //! LSP client coordination and document synchronization tracking for the Red editor.
 
 use crate::buffer::{Buffer, BufferId};
+use crate::lsp::{DocumentChange, Range, TextDocumentContentChangeEvent};
+use ropey::Rope;
+
+#[derive(Debug)]
+struct PendingChanges {
+    before: Rope,
+    before_revision: u64,
+    after_revision: u64,
+    changes: Vec<TextDocumentContentChangeEvent>,
+    insert_end: Option<crate::lsp::Position>,
+}
 use std::collections::{HashMap, HashSet};
 
 /// Coordinates LSP client state, opened workspace document tracking, and buffer revision delivery.
@@ -10,6 +21,8 @@ pub struct LspCoordinator {
     opened_documents: HashSet<String>,
     /// Latest buffer revision delivered to LSP servers per buffer ID.
     notified_revisions: HashMap<BufferId, u64>,
+    pending_changes: HashMap<BufferId, PendingChanges>,
+    standard_line_revisions: HashMap<BufferId, (u64, bool)>,
 }
 
 impl LspCoordinator {
@@ -17,6 +30,8 @@ impl LspCoordinator {
     pub fn with_buffers(buffers: &[Buffer]) -> Self {
         Self {
             opened_documents: HashSet::new(),
+            pending_changes: HashMap::new(),
+            standard_line_revisions: HashMap::new(),
             notified_revisions: buffers
                 .iter()
                 .map(|buffer| (buffer.id(), buffer.revision()))
@@ -52,11 +67,97 @@ impl LspCoordinator {
     /// Updates the last notified revision for a buffer.
     pub fn record_notified_revision(&mut self, id: BufferId, revision: u64) {
         self.notified_revisions.insert(id, revision);
+        self.pending_changes.remove(&id);
     }
 
     /// Seeds a revision only when the buffer has not been tracked before.
     pub fn ensure_notified_revision(&mut self, id: BufferId, revision: u64) {
         self.notified_revisions.entry(id).or_insert(revision);
+    }
+
+    /// Records a canonical replacement before external publication. A revision
+    /// gap (for example undo or a raw workspace replacement) forces full sync.
+    pub fn record_edit(
+        &mut self,
+        id: BufferId,
+        before_revision: u64,
+        after_revision: u64,
+        before: Rope,
+        range: Range,
+        text: &str,
+    ) {
+        // Ropey recognizes more line separators than the existing LSP codec.
+        // Cache eligibility by revision, and retain the legacy full-text path
+        // for lone CR and Unicode separators. Canonical ranges cannot split CRLF.
+        let standard_before = self
+            .standard_line_revisions
+            .get(&id)
+            .filter(|(revision, _)| *revision == before_revision)
+            .map_or_else(
+                || standard_lsp_lines(before.chars()),
+                |(_, standard)| *standard,
+            );
+        let standard = standard_before && standard_lsp_lines(text.chars());
+        self.standard_line_revisions
+            .insert(id, (after_revision, standard));
+        if !standard {
+            self.pending_changes.remove(&id);
+            return;
+        }
+        if self
+            .pending_changes
+            .get(&id)
+            .is_some_and(|pending| pending.after_revision != before_revision)
+        {
+            self.pending_changes.remove(&id);
+        }
+        let pending = self
+            .pending_changes
+            .entry(id)
+            .or_insert_with(|| PendingChanges {
+                before,
+                before_revision,
+                after_revision: before_revision,
+                changes: Vec::new(),
+                insert_end: None,
+            });
+        pending.after_revision = after_revision;
+        // Cache the end coordinate instead of rescanning a growing insertion.
+        let insert_end = (range.start == range.end && !text.contains(['\r', '\n'])).then(|| {
+            crate::lsp::Position {
+                line: range.start.line,
+                character: range.start.character + text.encode_utf16().count(),
+            }
+        });
+        if insert_end.is_some() && pending.insert_end.as_ref() == Some(&range.start) {
+            if let Some(previous) = pending.changes.last_mut() {
+                previous.text.push_str(text);
+                pending.insert_end = insert_end;
+                return;
+            }
+        }
+        pending.insert_end = insert_end;
+        pending.changes.push(TextDocumentContentChangeEvent {
+            range: Some(range),
+            range_length: None,
+            text: text.to_string(),
+        });
+    }
+
+    pub fn pending_change(
+        &self,
+        id: BufferId,
+        revision: u64,
+        after: Rope,
+    ) -> Option<DocumentChange> {
+        let pending = self.pending_changes.get(&id)?;
+        (pending.after_revision == revision
+            && self.last_notified_revision(id) == Some(pending.before_revision))
+        .then(|| DocumentChange {
+            before: pending.before.clone(),
+            after,
+            changes: pending.changes.clone(),
+        })
     }
 
     /// Returns whether the exact revision has already been delivered.
@@ -66,14 +167,109 @@ impl LspCoordinator {
 
     /// Removes tracked revision for a closed buffer.
     pub fn forget_buffer(&mut self, id: BufferId) -> Option<u64> {
+        self.standard_line_revisions.remove(&id);
+        self.pending_changes.remove(&id);
         self.notified_revisions.remove(&id)
     }
+}
+
+fn standard_lsp_lines(chars: impl Iterator<Item = char>) -> bool {
+    let mut chars = chars;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' if chars.next() != Some('\n') => return false,
+            '\u{000B}' | '\u{000C}' | '\u{0085}' | '\u{2028}' | '\u{2029}' => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::LspCoordinator;
     use crate::buffer::Buffer;
+
+    #[test]
+    fn canonical_edits_merge_insertions_and_reject_revision_gaps() {
+        use crate::{
+            lsp::{Position, Range},
+            undo::{TextPosition, TextRange},
+        };
+        let mut buffer = Buffer::new(Some("fixture.rs".into()), "😀value\r\nnext".into());
+        let id = buffer.id();
+        let mut coordinator = LspCoordinator::with_buffers(std::slice::from_ref(&buffer));
+        for text in ["λ", "x"] {
+            let before = buffer.contents_snapshot();
+            let revision = buffer.revision();
+            let offset = if text == "λ" { 1 } else { 2 };
+            let position = TextPosition::new(0, offset);
+            let start = buffer.position_to_lsp(position);
+            buffer.replace_range_raw(TextRange::insertion(position), text);
+            coordinator.record_edit(
+                id,
+                revision,
+                buffer.revision(),
+                before,
+                Range { start, end: start },
+                text,
+            );
+        }
+        let change = coordinator
+            .pending_change(id, buffer.revision(), buffer.contents_snapshot())
+            .unwrap();
+        assert_eq!(change.changes.len(), 1);
+        assert_eq!(change.changes[0].text, "λx");
+        assert_eq!(
+            change.changes[0].range.as_ref().unwrap().start,
+            Position {
+                line: 0,
+                character: 2
+            }
+        );
+        assert_eq!(
+            buffer.position_to_lsp(TextPosition::new(1, 0)),
+            Position {
+                line: 1,
+                character: 0
+            }
+        );
+        buffer.insert_str(0, 0, "raw");
+        assert!(coordinator
+            .pending_change(id, buffer.revision(), buffer.contents_snapshot())
+            .is_none());
+        coordinator.record_notified_revision(id, buffer.revision());
+        assert!(coordinator.pending_changes.is_empty());
+    }
+
+    #[test]
+    fn unusual_line_separators_keep_the_full_text_fallback() {
+        use crate::{
+            lsp::Range,
+            undo::{TextPosition, TextRange},
+        };
+        for source in ["one\rtwo", "one\u{2028}two", "one\u{0085}two"] {
+            let mut buffer = Buffer::new(Some("fixture.rs".into()), source.into());
+            let id = buffer.id();
+            let mut coordinator = LspCoordinator::with_buffers(std::slice::from_ref(&buffer));
+            let before = buffer.contents_snapshot();
+            let revision = buffer.revision();
+            let position = TextPosition::new(1, 0);
+            let start = buffer.position_to_lsp(position);
+            buffer.replace_range_raw(TextRange::insertion(position), "x");
+            coordinator.record_edit(
+                id,
+                revision,
+                buffer.revision(),
+                before,
+                Range { start, end: start },
+                "x",
+            );
+            assert!(coordinator
+                .pending_change(id, buffer.revision(), buffer.contents_snapshot())
+                .is_none());
+        }
+    }
 
     #[test]
     fn tracks_documents_and_seeded_buffer_revisions() {
