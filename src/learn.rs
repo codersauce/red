@@ -4,6 +4,7 @@ use crate::editor::{Action, Mode};
 
 mod git;
 pub(crate) mod navigation;
+pub(crate) mod precision;
 pub(crate) mod staging;
 mod workspace;
 pub(crate) use workspace::PracticeWorkspace;
@@ -56,10 +57,11 @@ pub(crate) enum Lesson {
     SearchTheProject,
     FollowSymbols,
     ArrangeYourWorkspace,
+    MoveWithIntent,
 }
 
 impl Lesson {
-    pub const AVAILABLE: [Self; 18] = [
+    pub const AVAILABLE: [Self; 19] = [
         Self::FindYourFooting,
         Self::EditWithConfidence,
         Self::FindACommand,
@@ -78,6 +80,7 @@ impl Lesson {
         Self::SearchTheProject,
         Self::FollowSymbols,
         Self::ArrangeYourWorkspace,
+        Self::MoveWithIntent,
     ];
 
     pub fn from_id(id: &str) -> Option<Self> {
@@ -120,6 +123,7 @@ impl Lesson {
             Self::SearchTheProject => 15,
             Self::FollowSymbols => 16,
             Self::ArrangeYourWorkspace => 17,
+            Self::MoveWithIntent => 18,
         }
     }
 
@@ -139,6 +143,7 @@ impl Lesson {
             | Self::SearchTheProject
             | Self::FollowSymbols
             | Self::ArrangeYourWorkspace => 3,
+            Self::MoveWithIntent => 4,
             _ => 0,
         }
     }
@@ -203,6 +208,7 @@ impl Lesson {
             Self::SearchTheProject => "navigation.search-the-project.v1",
             Self::FollowSymbols => "navigation.follow-symbols.v1",
             Self::ArrangeYourWorkspace => "navigation.arrange-your-workspace.v1",
+            Self::MoveWithIntent => "precision.move-with-intent.v1",
         }
     }
 
@@ -212,6 +218,7 @@ impl Lesson {
 
     pub const fn contents(self) -> &'static str {
         match self {
+            Self::MoveWithIntent => precision::MOTION_CONTENTS,
             Self::FindYourFooting => PRACTICE_CONTENTS,
             Self::EditWithConfidence => EDIT_CONTENTS,
             Self::FindACommand => COMMAND_CONTENTS,
@@ -250,6 +257,7 @@ impl Lesson {
             Self::SearchTheProject => PracticeStep::SearchOpen,
             Self::FollowSymbols => PracticeStep::OutlineOpen,
             Self::ArrangeYourWorkspace => PracticeStep::WorkspaceSplit,
+            Self::MoveWithIntent => PracticeStep::MotionFind,
         }
     }
 
@@ -300,6 +308,12 @@ impl Lesson {
                 "Undo the unwanted change",
                 "Request and refine a suggestion",
                 "Keep only the corrected result",
+            ],
+            Self::MoveWithIntent => &[
+                "Move to the unwanted word",
+                "Delete it with an operator",
+                "Undo the whole change",
+                "Redo the correction",
             ],
             Self::ArrangeYourWorkspace => &[
                 "Open the source in a second view",
@@ -552,12 +566,20 @@ pub(crate) enum PracticeStep {
     WorkspaceFocus,
     WorkspaceZoom,
     WorkspaceRestore,
+    MotionFind,
+    MotionDelete,
+    MotionUndo,
+    MotionRedo,
     Complete,
 }
 
 impl PracticeStep {
     pub fn suggested_action(self) -> Option<Action> {
         match self {
+            Self::MotionFind => Some(Action::MoveToNextWord),
+            Self::MotionDelete => None,
+            Self::MotionUndo => Some(Action::Undo),
+            Self::MotionRedo => Some(Action::Redo),
             Self::WorkspaceSplit => Some(Action::SplitVertical),
             Self::WorkspaceOpen => Some(Action::FilePicker),
             Self::WorkspaceFocus => Some(Action::NextWindow),
@@ -687,6 +709,10 @@ impl PracticeStep {
             Self::DiagnosticJump => "Choose the missing-semicolon error and press Enter. The editor will take you to the reported location. Reopen Diagnostics if you closed the picker.".into(),
             Self::DiagnosticRead => format!("Press {} to read the diagnostic on this line. The parser points at the next token; the incomplete statement is just above it.", shortcut.unwrap_or("D")),
             Self::DiagnosticReturn => "Read the message and diagnostic code, then press Esc to return to the source. You will repair the defect in a later lesson.".into(),
+            Self::MotionFind => format!("Move to unused on the first line. Press {} three times from the start, or use a count such as 3w with the default keymap. Word motions let you describe a destination instead of counting characters.", shortcut.unwrap_or("w")),
+            Self::MotionDelete => "Type dw: delete through the next word boundary. The unwanted word and its following space disappear in one change. This practice uses local registers, not your system clipboard.".into(),
+            Self::MotionUndo => format!("Press {} to undo the entire word deletion. Operators and motions combine into one undoable change.", shortcut.unwrap_or("u")),
+            Self::MotionRedo => format!("Press {} to redo the correction. The next lesson uses text objects to describe what belongs inside an edit.", shortcut.unwrap_or("Ctrl-r")),
             Self::WorkspaceSplit => format!("Press {} to split this view side by side. A window is a view onto a buffer; splitting does not copy or change the file.", shortcut.unwrap_or("Ctrl-w v")),
             Self::WorkspaceOpen => format!("Press {}, find src/score, and open it in the focused view. Keep README visible in the other view. If you closed the split, make another one first.", shortcut.unwrap_or("Ctrl-p")),
             Self::WorkspaceFocus => format!("Press {} to focus the README view. Both buffers stay open; focus only changes which view receives your keys.", shortcut.unwrap_or("Ctrl-w w")),
@@ -730,6 +756,7 @@ impl PracticeStep {
                 Lesson::UnderstandSelectedCode => "You explained selected code without editing it. Recorded practice complete; real inline assist sends your selected context only when you submit a prompt.",
                 Lesson::MakeAFocusedChange => "The fix is kept in the buffer, still unsaved. Inline edits use normal undo history; keeping one is not the same as writing a file.",
                 Lesson::ChooseWhatToKeep => "You rejected an unwanted change, refined a suggestion, and kept the corrected result. The final edit is unsaved and remains undoable.",
+                Lesson::MoveWithIntent => "You combined a word motion with the delete operator, then undid and redid the whole change. The corrected practice text is still unsaved.",
                 Lesson::ArrangeYourWorkspace => "You opened two buffers in separate views, moved focus, and restored a zoomed layout. Find your way complete! Your original layout returns when you leave.",
                 Lesson::FollowSymbols => "You used a real symbol outline and traveled backward and forward through the jump list. No source was changed.",
                 Lesson::SearchTheProject => "You searched real file contents, inspected matching lines, and opened two results at their exact positions. The practice project is unchanged.",
@@ -769,7 +796,8 @@ impl PracticeStep {
             | Self::SearchOpen
             | Self::OutlineOpen
             | Self::WorkspaceSplit
-            | Self::WorkspaceOpen => 0,
+            | Self::WorkspaceOpen
+            | Self::MotionFind => 0,
             Self::Type
             | Self::EditDelete
             | Self::CommandRun
@@ -787,7 +815,8 @@ impl PracticeStep {
             | Self::FilesSource
             | Self::SearchCall
             | Self::OutlineChoose
-            | Self::WorkspaceFocus => 1,
+            | Self::WorkspaceFocus
+            | Self::MotionDelete => 1,
             Self::Normal
             | Self::EditUndo
             | Self::CommandHelp
@@ -807,7 +836,8 @@ impl PracticeStep {
             | Self::FilesTests
             | Self::SearchExpectation
             | Self::OutlineBack
-            | Self::WorkspaceZoom => 2,
+            | Self::WorkspaceZoom
+            | Self::MotionUndo => 2,
             Self::Undo
             | Self::EditRedo
             | Self::CommandReturn
@@ -825,7 +855,8 @@ impl PracticeStep {
             | Self::FilesReturn
             | Self::SearchReturn
             | Self::OutlineForward
-            | Self::WorkspaceRestore => 3,
+            | Self::WorkspaceRestore
+            | Self::MotionRedo => 3,
             Self::Complete => 4,
         }
     }
@@ -841,6 +872,18 @@ impl PracticeStep {
     ) -> bool {
         let original_text = contents == lesson.contents();
         let next = match (*self, action) {
+            (Self::MotionFind, _) if original_text && mode == Mode::Normal && cursor == (12, 0) => {
+                Self::MotionDelete
+            }
+            (Self::MotionDelete, Action::DeleteTextRange(_) | Action::DeleteWord)
+                if contents == precision::MOTION_RESULT =>
+            {
+                Self::MotionUndo
+            }
+            (Self::MotionUndo, Action::Undo) if original_text => Self::MotionRedo,
+            (Self::MotionRedo, Action::Redo) if contents == precision::MOTION_RESULT => {
+                Self::Complete
+            }
             (Self::Insert, _) if mode == Mode::Insert => Self::Type,
             (Self::Type, _) if !original_text => Self::Normal,
             (Self::Normal, Action::EnterMode(Mode::Normal)) if mode == Mode::Normal => Self::Undo,
@@ -1148,22 +1191,24 @@ pub(crate) struct PracticeView {
 
 /// Scratch lessons permit only edits to their isolated practice buffer.
 pub(crate) fn practice_action_allowed(lesson: Lesson, action: &Action) -> bool {
-    (lesson == Lesson::ArrangeYourWorkspace
-        && matches!(
-            action,
-            Action::SplitVertical
-                | Action::SplitHorizontal
-                | Action::CloseWindow
-                | Action::NextWindow
-                | Action::PreviousWindow
-                | Action::MoveWindowLeft
-                | Action::MoveWindowRight
-                | Action::MoveWindowUp
-                | Action::MoveWindowDown
-                | Action::TogglePaneZoom
-                | Action::NextBuffer
-                | Action::PreviousBuffer
-        ))
+    (lesson == Lesson::MoveWithIntent
+        && matches!(action, Action::DeleteTextRange(_) | Action::DeleteWord))
+        || (lesson == Lesson::ArrangeYourWorkspace
+            && matches!(
+                action,
+                Action::SplitVertical
+                    | Action::SplitHorizontal
+                    | Action::CloseWindow
+                    | Action::NextWindow
+                    | Action::PreviousWindow
+                    | Action::MoveWindowLeft
+                    | Action::MoveWindowRight
+                    | Action::MoveWindowUp
+                    | Action::MoveWindowDown
+                    | Action::TogglePaneZoom
+                    | Action::NextBuffer
+                    | Action::PreviousBuffer
+            ))
         || (lesson == Lesson::FollowSymbols
             && (matches!(action, Action::JumpBack | Action::JumpForward)
                 || matches!(action, Action::PluginCommand(name) if name == "LspDocumentSymbols")))

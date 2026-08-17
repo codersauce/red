@@ -26,6 +26,7 @@ pub(super) struct LearnSession {
     original_panel_focus: Option<String>,
     original_repeat: Option<SemanticChange>,
     original_registers: HashMap<char, Content>,
+    original_clipboard_enabled: bool,
     original_inline_history: Option<InlineHistory>,
     original_active_inline_comment: Option<uuid::Uuid>,
     original_panels: Option<plugin::panel::PanelManager>,
@@ -222,7 +223,9 @@ impl Editor {
         self.panel_manager.focus_editor();
         let original_zoom = self.zoomed_pane.take();
         let original_repeat = self.last_semantic_change.take();
-        let original_registers = self.registers.clone();
+        let original_registers = std::mem::take(&mut self.registers);
+        let original_clipboard_enabled =
+            std::mem::replace(&mut self.config.clipboard.enabled, false);
         let original_inline_history = lesson
             .is_ai_practice()
             .then(|| std::mem::take(&mut self.inline_history));
@@ -267,6 +270,7 @@ impl Editor {
             original_panel_focus,
             original_repeat,
             original_registers,
+            original_clipboard_enabled,
             original_inline_history,
             original_active_inline_comment,
             original_panels,
@@ -357,6 +361,7 @@ impl Editor {
         self.last_semantic_change = session.original_repeat;
         self.pending_semantic_change = None;
         self.registers = session.original_registers;
+        self.config.clipboard.enabled = session.original_clipboard_enabled;
         if let Some(history) = session.original_inline_history {
             self.inline_history = history;
         }
@@ -791,5 +796,62 @@ impl Editor {
             session.step,
             shortcut.as_deref(),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn learn_registers_and_clipboard_policy_are_temporary() {
+        let config = Config::default();
+        let clipboard = config.clipboard.clone();
+        let client = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = Editor::with_size(
+            client,
+            100,
+            30,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, "original".into())],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        let mut buffer = RenderBuffer::new(100, 30, &Style::default());
+        let mut runtime = Runtime::new();
+        editor.registers.insert(
+            DEFAULT_REGISTER,
+            Content::charwise("original register".into()),
+        );
+        editor
+            .start_learn_lesson(Lesson::MoveWithIntent, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(!editor.config.clipboard.enabled);
+        assert!(editor.registers.is_empty());
+        editor.move_to_text_position(TextPosition::new(0, 12));
+        editor
+            .observe_learn_action(&Action::MoveToNextWord, &mut buffer)
+            .unwrap();
+        editor
+            .execute(&Action::DeleteWord, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(
+            editor.current_buffer().contents(),
+            crate::learn::precision::MOTION_RESULT
+        );
+        editor.set_default_register(Content::charwise("practice register".into()));
+        editor
+            .finish_learn_lesson(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.config.clipboard, clipboard);
+        assert_eq!(
+            editor.registers.get(&DEFAULT_REGISTER),
+            Some(&Content::charwise("original register".into()))
+        );
+        assert_eq!(editor.current_buffer().contents(), "original");
     }
 }
