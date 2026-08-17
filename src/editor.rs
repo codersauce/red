@@ -3853,7 +3853,8 @@ struct EditorEventSnapshot {
 #[derive(Debug, Clone)]
 struct PendingDocumentSymbols {
     plugin_request_id: RequestId,
-    buffer_index: usize,
+    buffer_id: BufferId,
+    uri: String,
     revision: u64,
 }
 
@@ -6062,6 +6063,8 @@ impl Editor {
 
     fn plugin_windows_payload(&self) -> Value {
         let active_id = self.window_manager.active_stable_window_id();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let home = std::env::home_dir();
         let windows = self
             .window_manager
             .windows()
@@ -6079,7 +6082,11 @@ impl Editor {
                     "window_id": window.id.0,
                     "active": Some(window.id) == active_id,
                     "buffer_index": window.buffer_index,
+                    "document_id": buffer.id(),
                     "buffer_path": buffer.file,
+                    "breadcrumb_components": buffer.file.as_deref().map(|file| {
+                        crate::utils::breadcrumb_path_components(Path::new(file), &cwd, home.as_deref())
+                    }).unwrap_or_default(),
                     "file": buffer.file,
                     "name": buffer.name(),
                     "revision": buffer.revision(),
@@ -8148,6 +8155,7 @@ impl Editor {
                             json!({
                                 "file": file,
                                 "buffer_index": self.buffer_manager.active_index(),
+                                "document_id": self.current_buffer().id(),
                             }),
                         )
                         .await;
@@ -10315,6 +10323,8 @@ impl Editor {
                             .await?;
                         continue;
                     };
+                    let buffer_id = target_buffer.id();
+                    let uri = target_buffer.uri()?.expect("file-backed buffer has a URI");
                     let revision = target_buffer.revision();
 
                     let request_result: anyhow::Result<i64> = async {
@@ -10329,7 +10339,8 @@ impl Editor {
                                 lsp_request_id,
                                 PendingDocumentSymbols {
                                     plugin_request_id: request_id,
-                                    buffer_index,
+                                    buffer_id,
+                                    uri,
                                     revision,
                                 },
                             );
@@ -22005,16 +22016,27 @@ impl Editor {
         response: &ResponseMessage,
         pending: &PendingDocumentSymbols,
     ) -> anyhow::Result<Value> {
-        let file = response_text_document_uri(response)
-            .map(|uri| self.uri_to_file(uri))
-            .or_else(|| self.current_file_name())
-            .ok_or_else(|| anyhow::anyhow!("document symbol response did not include a file"))?;
+        let buffer_index = self
+            .buffer_manager
+            .iter()
+            .position(|buffer| {
+                buffer.id() == pending.buffer_id
+                    && buffer.revision() == pending.revision
+                    && buffer.uri().ok().flatten().as_deref() == Some(pending.uri.as_str())
+            })
+            .ok_or_else(|| anyhow::anyhow!("document symbol response is no longer current"))?;
+        anyhow::ensure!(
+            response_text_document_uri(response).is_none_or(|uri| uri == pending.uri),
+            "document symbol response belongs to another document"
+        );
+        let file = self.uri_to_file(&pending.uri);
         let symbols = self.normalize_document_symbols(&response.result, &file)?;
 
         Ok(json!({
             "ok": true,
             "file": file,
-            "buffer_index": pending.buffer_index,
+            "buffer_index": buffer_index,
+            "document_id": pending.buffer_id,
             "revision": pending.revision,
             "symbols": symbols,
         }))
@@ -25543,7 +25565,7 @@ impl Editor {
                     .notify(
                         runtime,
                         "file:saved",
-                        json!({ "file": file, "buffer_index": index }),
+                        json!({ "file": file, "buffer_index": index, "document_id": self.current_buffer().id() }),
                     )
                     .await?;
             }
@@ -25706,7 +25728,8 @@ impl Editor {
                 if let Some(file) = &self.current_buffer().file {
                     let save_info = serde_json::json!({
                         "file": file,
-                        "buffer_index": self.buffer_manager.active_index()
+                        "buffer_index": self.buffer_manager.active_index(),
+                        "document_id": self.current_buffer().id(),
                     });
                     self.plugin_registry
                         .notify(runtime, "file:saved", save_info)
@@ -25859,7 +25882,8 @@ impl Editor {
                 // Notify plugins about file save
                 let save_info = serde_json::json!({
                     "file": saved_file,
-                    "buffer_index": self.buffer_manager.active_index()
+                    "buffer_index": self.buffer_manager.active_index(),
+                    "document_id": self.current_buffer().id(),
                 });
                 self.plugin_registry
                     .notify(runtime, "file:saved", save_info)
@@ -33961,9 +33985,177 @@ builtin = "rust"
         assert_eq!(overlay_buffer.cells[cursor_index].style, cursor_style);
     }
 
+    fn pending_document_symbols(editor: &Editor, index: usize) -> PendingDocumentSymbols {
+        let buffer = &editor.buffer_manager[index];
+        PendingDocumentSymbols {
+            plugin_request_id: RequestId::from_raw(1),
+            buffer_id: buffer.id(),
+            uri: buffer.uri().unwrap().unwrap(),
+            revision: buffer.revision(),
+        }
+    }
+
+    #[test]
+    fn document_symbols_follow_stable_identity_and_reject_stale_responses() {
+        let mut editor = test_editor(80, 10);
+        let file = std::env::current_dir()
+            .unwrap()
+            .join("src/breadcrumb-fixture.rs");
+        editor.buffer_manager.push_buffer(Buffer::new(
+            Some(file.to_string_lossy().into_owned()),
+            "fn main() {}".into(),
+        ));
+        let pending = pending_document_symbols(&editor, 1);
+        let response = ResponseMessage {
+            id: 1,
+            result: json!([]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/documentSymbol",
+                json!({
+                    "textDocument": { "uri": pending.uri }
+                }),
+            )),
+        };
+        editor.buffer_manager.remove_buffer(0);
+        let payload = editor
+            .plugin_document_symbols_payload(&response, &pending)
+            .unwrap();
+        assert_eq!(payload["buffer_index"], 0);
+        assert_eq!(payload["document_id"], json!(pending.buffer_id));
+        assert_eq!(
+            editor.plugin_windows_payload()["windows"][0]["document_id"],
+            payload["document_id"]
+        );
+
+        editor
+            .current_buffer_mut()
+            .replace_range_raw(TextRange::insertion(TextPosition::new(0, 0)), "// edit\n");
+        assert!(editor
+            .plugin_document_symbols_payload(&response, &pending)
+            .is_err());
+        let renamed = pending_document_symbols(&editor, 0);
+        editor.current_buffer_mut().file =
+            Some(file.with_extension("ts").to_string_lossy().into_owned());
+        assert!(editor
+            .plugin_document_symbols_payload(&response, &renamed)
+            .is_err());
+        editor.buffer_manager.replace_buffers(vec![Buffer::new(
+            Some(file.to_string_lossy().into_owned()),
+            "fn main() {}".into(),
+        )]);
+        assert!(editor
+            .plugin_document_symbols_payload(&response, &pending)
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn barbecue_renders_real_workspace_document_symbol_payload() {
+        drain_plugin_requests();
+        let mut editor = test_editor(100, 10);
+        let file = std::env::current_dir()
+            .unwrap()
+            .join("src/breadcrumb-fixture.rs");
+        editor.buffer_manager.replace_buffers(vec![Buffer::new(
+            Some(file.to_string_lossy().into_owned()),
+            "impl App {\n    fn render() {\n        work();\n    }\n}\n".into(),
+        )]);
+        editor.cy = 2;
+        editor.sync_to_window();
+        let windows = editor.plugin_windows_payload();
+        let pending = pending_document_symbols(&editor, 0);
+        let response = ResponseMessage {
+            id: 1,
+            result: json!([{
+                "name": "App", "kind": 23,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 5, "character": 0 } },
+                "children": [{
+                    "name": "render", "kind": 6,
+                    "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 4, "character": 0 } }
+                }]
+            }]),
+            request: Some(crate::lsp::Request::new(
+                "textDocument/documentSymbol",
+                json!({
+                    "textDocument": { "uri": pending.uri }
+                }),
+            )),
+        };
+        let payload = editor
+            .plugin_document_symbols_payload(&response, &pending)
+            .unwrap();
+        assert_ne!(payload["file"], windows["windows"][0]["buffer_path"]);
+        assert_eq!(
+            windows["windows"][0]["breadcrumb_components"],
+            json!(["src", "breadcrumb-fixture.rs"])
+        );
+
+        let mut runtime = Runtime::new();
+        runtime.set_snapshot("windows", windows.clone());
+        runtime.set_snapshot(
+            "editor_info",
+            json!({ "theme": { "style": { "bg": "#111111" } } }),
+        );
+        runtime
+            .load_plugin("barbecue", include_str!("../plugins/barbecue.hk"))
+            .await
+            .unwrap();
+        let mut symbols_request = None;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            match request {
+                PluginRequest::GetConfig { request_id, .. } => {
+                    runtime
+                        .resolve_request(
+                            request_id,
+                            json!({ "value": {
+                        "plugin_config": { "barbecue": { "nerd_font": false, "separator": ">" } }
+                    } }),
+                        )
+                        .await
+                        .unwrap();
+                }
+                PluginRequest::GetWindows { request_id } => {
+                    runtime
+                        .resolve_request(request_id, windows.clone())
+                        .await
+                        .unwrap();
+                }
+                PluginRequest::DocumentSymbols { request_id, .. } => {
+                    symbols_request = Some(request_id)
+                }
+                PluginRequest::CreateWindowBar { .. } | PluginRequest::UpdateWindowBar { .. } => {}
+                _ => panic!("unexpected breadcrumb startup request"),
+            }
+        }
+        runtime
+            .resolve_request(symbols_request.unwrap(), payload)
+            .await
+            .unwrap();
+        let mut rendered = String::new();
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            if let PluginRequest::UpdateWindowBar { segments, .. } = request {
+                rendered = segments.into_iter().map(|segment| segment.text).collect();
+            }
+        }
+        assert!(
+            rendered.contains("src > breadcrumb-fixture.rs"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("App") && rendered.contains("render"),
+            "{rendered}"
+        );
+    }
+
     #[test]
     fn document_symbols_payload_flattens_hierarchical_symbols() {
-        let editor = test_editor(40, 10);
+        let mut editor = test_editor(40, 10);
+        editor.current_buffer_mut().file = Some(
+            std::env::temp_dir()
+                .join("red-symbol-payload/src/app.ts")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let uri = editor.current_buffer().uri().unwrap().unwrap();
         let response = ResponseMessage {
             id: 1,
             result: serde_json::json!([
@@ -33999,7 +34191,7 @@ builtin = "rust"
                 "textDocument/documentSymbol",
                 serde_json::json!({
                     "textDocument": {
-                        "uri": "file:///tmp/project/src/app.ts"
+                        "uri": uri
                     }
                 }),
             )),
@@ -34010,7 +34202,8 @@ builtin = "rust"
                 &response,
                 &PendingDocumentSymbols {
                     plugin_request_id: RequestId::from_raw(1),
-                    buffer_index: 0,
+                    buffer_id: editor.current_buffer().id(),
+                    uri: editor.current_buffer().uri().unwrap().unwrap(),
                     revision: 0,
                 },
             )
@@ -34018,7 +34211,7 @@ builtin = "rust"
         let symbols = payload["symbols"].as_array().unwrap();
 
         assert_eq!(payload["ok"], true);
-        assert_eq!(payload["file"], "/tmp/project/src/app.ts");
+        assert_eq!(payload["file"], editor.uri_to_file(&uri));
         assert_eq!(symbols.len(), 2);
         assert_eq!(symbols[0]["id"], "root:0:App");
         assert_eq!(symbols[0]["parent_id"], serde_json::Value::Null);
@@ -34035,7 +34228,17 @@ builtin = "rust"
 
     #[test]
     fn document_symbols_payload_accepts_flat_symbol_information() {
-        let editor = test_editor(40, 10);
+        let mut editor = test_editor(40, 10);
+        editor.current_buffer_mut().file = Some(
+            std::env::temp_dir()
+                .join("red-symbol-payload/src/index.ts")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let uri = editor.current_buffer().uri().unwrap().unwrap();
+        let other_uri =
+            crate::lsp::file_uri(std::env::temp_dir().join("red-symbol-payload/src/build.ts"))
+                .unwrap();
         let response = ResponseMessage {
             id: 1,
             result: serde_json::json!([
@@ -34044,7 +34247,7 @@ builtin = "rust"
                     "kind": 12,
                     "containerName": "tools",
                     "location": {
-                        "uri": "file:///tmp/project/src/build.ts",
+                        "uri": other_uri,
                         "range": {
                             "start": { "line": 4, "character": 2 },
                             "end": { "line": 9, "character": 3 }
@@ -34056,7 +34259,7 @@ builtin = "rust"
                 "textDocument/documentSymbol",
                 serde_json::json!({
                     "textDocument": {
-                        "uri": "file:///tmp/project/src/index.ts"
+                        "uri": uri
                     }
                 }),
             )),
@@ -34067,19 +34270,20 @@ builtin = "rust"
                 &response,
                 &PendingDocumentSymbols {
                     plugin_request_id: RequestId::from_raw(1),
-                    buffer_index: 0,
+                    buffer_id: editor.current_buffer().id(),
+                    uri: editor.current_buffer().uri().unwrap().unwrap(),
                     revision: 0,
                 },
             )
             .unwrap();
         let symbols = payload["symbols"].as_array().unwrap();
 
-        assert_eq!(payload["file"], "/tmp/project/src/index.ts");
+        assert_eq!(payload["file"], editor.uri_to_file(&uri));
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0]["name"], "build");
         assert_eq!(symbols[0]["detail"], "tools");
         assert_eq!(symbols[0]["kind_name"], "Function");
-        assert_eq!(symbols[0]["file"], "/tmp/project/src/build.ts");
+        assert_eq!(symbols[0]["file"], editor.uri_to_file(&other_uri));
         assert_eq!(symbols[0]["selection_range"]["start"]["line"], 4);
     }
 

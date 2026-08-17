@@ -1704,7 +1704,10 @@ mod tests {
                 "GetBufferText",
                 "(callback: fn(Json), start_line?: i32, end_line?: i32)",
             ),
-            ("DocumentSymbols", "(callback: fn(Json), buffer_id?: i32)"),
+            (
+                "DocumentSymbols",
+                "(callback: fn(Json), buffer_index?: i32)",
+            ),
             (
                 "References",
                 "(callback: fn(Json), include_declaration?: bool)",

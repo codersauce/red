@@ -27,7 +27,6 @@ struct BarbecuePluginConfig {
 }
 
 struct BarbecueConfigValue {
-    cwd: String,
     plugin_config: BarbecuePluginConfig,
 }
 
@@ -43,7 +42,9 @@ struct BarbecueCursor {
 struct BarbecueWindow {
     window_id: i32,
     buffer_index: i32,
+    document_id: i32,
     buffer_path: String,
+    breadcrumb_components: [String],
     revision: i32,
     cursor: BarbecueCursor,
     lsp_position: Position,
@@ -73,21 +74,20 @@ struct BarbecueSymbol {
 struct BarbecueSymbolsResult {
     ok: bool,
     file: String,
-    buffer_index: i32,
+    document_id: i32,
     revision: i32,
     symbols: [BarbecueSymbol],
 }
 
 struct SymbolRecord {
     file: String,
-    buffer_index: i32,
+    document_id: i32,
     revision: i32,
     symbols: [BarbecueSymbol],
 }
 
 struct FileSavedEvent {
-    file: String,
-    buffer_index: i32,
+    document_id: i32,
 }
 
 struct CursorMovedEvent {
@@ -99,7 +99,7 @@ struct CursorMovedEvent {
 
 struct RenderedWindow {
     window_id: i32,
-    buffer_path: String,
+    document_id: i32,
 }
 
 struct BarbecueThemeStyle {
@@ -137,7 +137,6 @@ struct WindowBarActionEvent {
 }
 
 struct BarbecueState {
-    cwd: String,
     windows: [BarbecueWindow],
     symbols: [SymbolRecord],
     fallback_symbols: [SymbolRecord],
@@ -163,7 +162,6 @@ struct BarbecueState {
 #[red::state]
 fn initial_state() -> BarbecueState {
     return BarbecueState {
-        cwd: "",
         windows: [],
         symbols: [],
         fallback_symbols: [],
@@ -251,7 +249,6 @@ fn timeout_callback(event: TimerEvent) {
 
 fn config_loaded(event: BarbecueConfigEvent) {
     let config = event.value;
-    red::state_patch(BarbecueState { cwd: red::string(config.cwd, "") });
     red::state_patch(BarbecueState { context_loaded: true });
     let options = config.plugin_config.barbecue;
     if options != red::null() {
@@ -285,10 +282,11 @@ fn windows_loaded(result: BarbecueWindowsResult) {
     let buffers: [i32] = [];
     for window in result.windows {
         let buffer_index = red::int(window.buffer_index, -1);
-        if buffer_index < 0 || red::contains(buffers, buffer_index) {
+        if buffer_index < 0 || red::string(window.buffer_path, "") == ""
+            || has_symbols_for(window) || red::contains(buffers, window.document_id) {
             continue;
         }
-        buffers = red::push(buffers, buffer_index);
+        buffers = red::push(buffers, window.document_id);
         red::request("DocumentSymbols", symbols_loaded, buffer_index);
     }
 }
@@ -303,10 +301,19 @@ fn symbols_loaded(result: BarbecueSymbolsResult) {
     if !red::bool(result.ok, false) {
         return;
     }
+    let current = false;
+    for window in state().windows {
+        if window.document_id == result.document_id && window.revision == result.revision {
+            current = true;
+        }
+    }
+    if !current {
+        return;
+    }
     let records: [SymbolRecord] = [];
     let should_add = true;
     for record in state().symbols {
-        if record.file != result.file {
+        if record.document_id != result.document_id {
             records = red::push(records, record);
         } else if red::int(record.revision, -1) > red::int(result.revision, -1) {
             records = red::push(records, record);
@@ -323,7 +330,7 @@ fn symbols_loaded(result: BarbecueSymbolsResult) {
 fn symbol_record(result: BarbecueSymbolsResult) -> SymbolRecord {
     return SymbolRecord {
         file: result.file,
-        buffer_index: red::int(result.buffer_index, -1),
+        document_id: result.document_id,
         revision: result.revision,
         symbols: result.symbols,
     };
@@ -333,16 +340,14 @@ fn symbol_record(result: BarbecueSymbolsResult) -> SymbolRecord {
 fn file_saved(event: FileSavedEvent) {
     let records: [SymbolRecord] = [];
     for record in state().symbols {
-        if record.file != event.file
-            && red::int(record.buffer_index, -1) != red::int(event.buffer_index, -2) {
+        if record.document_id != event.document_id {
             records = red::push(records, record);
         }
     }
     red::state_patch(BarbecueState { symbols: records });
     let fallback_records: [SymbolRecord] = [];
     for record in state().fallback_symbols {
-        if record.file != event.file
-            && red::int(record.buffer_index, -1) != red::int(event.buffer_index, -2) {
+        if record.document_id != event.document_id {
             fallback_records = red::push(fallback_records, record);
         }
     }
@@ -398,7 +403,7 @@ fn should_defer_symbol_render(window: BarbecueWindow) -> bool {
     }
     for rendered in state().rendered_windows {
         if red::int(rendered.window_id, -1) == red::int(window.window_id, -2)
-            && rendered.buffer_path == window.buffer_path {
+            && rendered.document_id == window.document_id {
             return true;
         }
     }
@@ -407,7 +412,7 @@ fn should_defer_symbol_render(window: BarbecueWindow) -> bool {
 
 fn has_symbols_for(window: BarbecueWindow) -> bool {
     for record in state().symbols {
-        if record.file == window.buffer_path && red::int(record.revision, -1) == red::int(window.revision, -1) {
+        if record.document_id == window.document_id && record.revision == window.revision {
             return true;
         }
     }
@@ -423,7 +428,7 @@ fn remember_rendered_window(window: BarbecueWindow) {
     }
     rendered_windows = red::push(rendered_windows, RenderedWindow {
         window_id: window.window_id,
-        buffer_path: window.buffer_path,
+        document_id: window.document_id,
     });
     red::state_patch(BarbecueState { rendered_windows: rendered_windows });
 }
@@ -442,12 +447,7 @@ fn retain_rendered_windows(windows: [BarbecueWindow]) {
 
 fn segments_for(window: BarbecueWindow) -> [BarSegment] {
     let segments: [BarSegment] = [];
-    let path = normalize_path(red::string(window.buffer_path, ""));
-    let cwd = normalize_path(red::string(state().cwd, ""));
-    if cwd != "" && red::starts_with(path, cwd + "/") {
-        path = red::slice(path, red::len(cwd) + 1);
-    }
-    let parts = red::split(path, "/");
+    let parts = window.breadcrumb_components;
     let file = "[No Name]";
     if red::len(parts) > 0 {
         file = red::string(parts[red::len(parts) - 1], "[No Name]");
@@ -495,7 +495,7 @@ fn segments_for(window: BarbecueWindow) -> [BarSegment] {
                 id: "symbol:" + symbol.id,
                 text: symbol_icon(symbol.kind_name) + " " + symbol.name,
                 style: symbol_style(symbol.kind_name, index == red::len(chain) - 1),
-                action: "jump:" + window.buffer_index + ":" + symbol.id,
+                action: "jump:" + window.document_id + ":" + symbol.id,
             });
             index = index + 1;
         }
@@ -514,102 +514,45 @@ fn add_separator(segments: [BarSegment]) -> [BarSegment] {
     return segments;
 }
 
-fn symbols_for(window: BarbecueWindow) -> [BarbecueSymbol] {
-    for record in state().symbols {
-        if record.file == window.buffer_path && red::int(record.revision, -1) == red::int(window.revision, -1) {
-            return record.symbols;
-        }
-    }
-    return [];
-}
-
 fn symbol_chain(window: BarbecueWindow) -> [BarbecueSymbol] {
     let position = window_position(window);
-    let symbols = symbols_for(window);
-    let chain = symbol_chain_for(symbols, position);
-    if red::len(chain) > 0 {
-        remember_fallback_symbols(window, symbols);
-        return chain;
+    for record in state().symbols {
+        if record.document_id == window.document_id && record.revision == window.revision {
+            let chain: [BarbecueSymbol] = red::document_symbol_chain(record.symbols, position, record.file);
+            if red::len(chain) > 0 {
+                remember_fallback_symbols(record);
+                return chain;
+            }
+            // A nonempty current outline is authoritative outside its scopes.
+            if red::len(record.symbols) > 0 {
+                return [];
+            }
+        }
     }
 
     for record in state().fallback_symbols {
-        if record.file == window.buffer_path {
-            return symbol_chain_for(record.symbols, position);
+        if record.document_id == window.document_id {
+            return red::document_symbol_chain(record.symbols, position, record.file);
         }
     }
     return [];
 }
 
-fn remember_fallback_symbols(window: BarbecueWindow, symbols: [BarbecueSymbol]) {
+fn remember_fallback_symbols(snapshot: SymbolRecord) {
     let records: [SymbolRecord] = [];
     let should_add = true;
     for record in state().fallback_symbols {
-        if record.file != window.buffer_path {
+        if record.document_id != snapshot.document_id {
             records = red::push(records, record);
-        } else if red::int(record.revision, -1) > red::int(window.revision, -1) {
+        } else if record.revision > snapshot.revision {
             records = red::push(records, record);
             should_add = false;
         }
     }
     if should_add {
-        records = red::push(records, SymbolRecord {
-            file: window.buffer_path,
-            buffer_index: red::int(window.buffer_index, -1),
-            revision: window.revision,
-            symbols: symbols,
-        });
+        records = red::push(records, snapshot);
     }
     red::state_patch(BarbecueState { fallback_symbols: records });
-}
-
-fn symbol_chain_for(symbols: [BarbecueSymbol], position: Position) -> [BarbecueSymbol] {
-    // Breadcrumb rendering runs once per window, so keep each callback's scan bounded.
-    let leaf = red::null();
-    let leaf_depth = -1;
-    let containing: [BarbecueSymbol] = [];
-    let index = 0;
-    while index < red::len(symbols) && index < 512 {
-        let symbol = symbols[index];
-        if contains_position(symbol.range, position) {
-            containing = red::push(containing, symbol);
-            if red::int(symbol.depth, 0) >= leaf_depth {
-                leaf = symbol;
-                leaf_depth = red::int(symbol.depth, 0);
-            }
-        }
-        index = index + 1;
-    }
-    if leaf == red::null() {
-        return [];
-    }
-    let chain: [BarbecueSymbol] = [];
-    let current = leaf;
-    let steps = 0;
-    while current != red::null() && steps <= red::len(containing) {
-        if contains_position(current.range, position) {
-            chain = red::unshift(chain, current);
-        }
-        if let Some(parent_id) = symbol_parent_id(current) {
-            current = symbol_by_id(containing, parent_id);
-        } else {
-            current = red::null();
-        }
-        steps = steps + 1;
-    }
-    return chain;
-}
-
-fn symbol_parent_id(symbol: BarbecueSymbol) -> Option<String> {
-    return symbol.parent_id;
-}
-
-fn symbol_by_id(symbols: [BarbecueSymbol], id: String) -> Json {
-    for symbol in symbols {
-        if red::string(symbol.id, "") == id {
-            return symbol;
-        }
-    }
-    return red::null();
 }
 
 fn window_position(window: BarbecueWindow) -> Position {
@@ -620,23 +563,6 @@ fn window_position(window: BarbecueWindow) -> Position {
         line: red::int(window.cursor.y, 0),
         character: red::int(window.cursor.x, 0),
     };
-}
-
-fn contains_position(range: BarbecueRange, position: Position) -> bool {
-    if range.start == red::null() || range.end == red::null() {
-        return false;
-    }
-    let after_start = position.line > range.start.line || (position.line == range.start.line && position.character >= range.start.character);
-    let before_end = position.line < range.end.line || (position.line == range.end.line && position.character < range.end.character);
-    return after_start && before_end;
-}
-
-fn normalize_path(path: String) -> String {
-    path = red::replace_all(path, "\\", "/");
-    if red::ends_with(path, "/") {
-        path = red::slice(path, 0, red::len(path) - 1);
-    }
-    return path;
 }
 
 fn file_icon(file: String) -> String {
@@ -813,10 +739,12 @@ fn bar_action(event: WindowBarActionEvent) {
         return;
     }
     let parts = red::split(action, ":");
-    let buffer_index = red::int(parts[1], 0);
-    let symbol_id = red::string(parts[2], "");
+    let document_id = red::int(parts[1], -1);
+    // Symbol IDs themselves contain colons; preserve the complete suffix.
+    let prefix = "jump:" + document_id + ":";
+    let symbol_id = red::slice(action, red::len(prefix));
     for record in state().symbols {
-        if red::int(record.buffer_index, buffer_index) != buffer_index {
+        if record.document_id != document_id {
             continue;
         }
         for symbol in record.symbols {
