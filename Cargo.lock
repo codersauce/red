@@ -2235,7 +2235,7 @@ dependencies = [
 
 [[package]]
 name = "red"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "arboard",
