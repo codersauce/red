@@ -444,6 +444,11 @@ impl Editor {
             return Ok(true);
         }
         let location_allowed = match action {
+            Action::OpenLocation(location, target) if session.lesson.is_navigation_practice() => {
+                *target == plugin::OpenLocationTarget::Current
+                    && location.column_encoding == plugin::LocationColumnEncoding::Utf8Byte
+                    && self.learn_navigation_path(&location.path).is_some()
+            }
             Action::OpenFile(path) if session.lesson.is_navigation_practice() => {
                 self.learn_navigation_path(path).is_some()
             }
@@ -594,6 +599,13 @@ impl Editor {
                 .flatten()
                 .and_then(|uri| self.diagnostics.get(&uri))
                 .is_some_and(Vec::is_empty),
+            project_search_open: self
+                .current_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.shortcut_context() == "Find in Files"),
+            search_call_visible: self.learn_navigation_file_is("src/main.hk") && cursor.1 == 2,
+            search_expectation_visible: self.learn_navigation_file_is("tests/score.hk")
+                && cursor.1 == 2,
             files_picker_open: self
                 .current_dialog
                 .as_ref()

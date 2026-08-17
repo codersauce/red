@@ -2,8 +2,24 @@
 
 use super::*;
 use crate::learn::navigation as fixture;
+use crate::ui::ScopedProjectSearch;
 
 impl Editor {
+    fn learn_navigation_failure(
+        &mut self,
+        error: impl std::fmt::Display,
+        buffer: &mut RenderBuffer,
+    ) -> anyhow::Result<bool> {
+        self.set_notification_message(
+            Severity::Error,
+            Some(format!(
+                "practice navigation: {error}; use :tutorial restart to reset the files"
+            )),
+        );
+        self.render(buffer)?;
+        Ok(true)
+    }
+
     pub(super) fn learn_navigation_path(&self, path: &str) -> Option<PathBuf> {
         let session = self.learn_session.as_ref()?;
         if !session.lesson.is_navigation_practice() {
@@ -54,7 +70,55 @@ impl Editor {
         runtime: &'a mut Runtime,
     ) -> BoxFuture<'a, anyhow::Result<bool>> {
         Box::pin(async move {
+            let before = self.event_snapshot();
             match action {
+                Action::PluginCommand(name) if name == "ProjectSearch" => {
+                    let root = self
+                        .learn_session
+                        .as_ref()
+                        .and_then(|session| session.workspace.as_ref())
+                        .expect("navigation workspace was checked")
+                        .root()
+                        .to_path_buf();
+                    let files = fixture::FILES
+                        .iter()
+                        .map(|(name, _)| PathBuf::from(name))
+                        .collect();
+                    self.release_current_dialog_callbacks(runtime);
+                    let search = match ScopedProjectSearch::new(self, root, files) {
+                        Ok(search) => search,
+                        Err(error) => return self.learn_navigation_failure(error, buffer),
+                    };
+                    self.current_dialog = Some(Box::new(search));
+                }
+                Action::OpenLocation(location, plugin::OpenLocationTarget::Current) => {
+                    let Some(path) = self.learn_navigation_path(&location.path) else {
+                        return Ok(true);
+                    };
+                    let previous = self.current_jump_entry();
+                    let (index, _, _) = match self
+                        .load_or_reuse_file_buffer(&path.to_string_lossy())
+                        .await
+                    {
+                        Ok(opened) => opened,
+                        Err(error) => return self.learn_navigation_failure(error, buffer),
+                    };
+                    let Some(line) = self.buffer_manager[index].get(location.line) else {
+                        return Ok(true);
+                    };
+                    let line = line.trim_end_matches('\n');
+                    if location.column > line.len() || !line.is_char_boundary(location.column) {
+                        self.set_quiet_message(Some("search result is stale; search again".into()));
+                        self.render(buffer)?;
+                        return Ok(true);
+                    }
+                    let character = line[..location.column].chars().count();
+                    self.set_current_buffer(buffer, index).await?;
+                    self.move_to_text_position(TextPosition::new(location.line, character));
+                    self.check_bounds();
+                    self.sync_to_window();
+                    self.save_to_history(previous);
+                }
                 Action::FilePicker => {
                     let root = self
                         .learn_session
@@ -64,7 +128,11 @@ impl Editor {
                         .root()
                         .to_path_buf();
                     self.release_current_dialog_callbacks(runtime);
-                    self.current_dialog = Some(Box::new(FilePicker::new_scoped(self, root)?));
+                    let picker = match FilePicker::new_scoped(self, root) {
+                        Ok(picker) => picker,
+                        Err(error) => return self.learn_navigation_failure(error, buffer),
+                    };
+                    self.current_dialog = Some(Box::new(picker));
                 }
                 Action::OpenFile(path) => {
                     let Some(path) = self.learn_navigation_path(path) else {
@@ -76,13 +144,20 @@ impl Editor {
                     };
                     // Use the production loader and buffer-switching behavior,
                     // without notifying user plugins about a disposable file.
-                    let (index, _, _) = self
+                    let (index, _, _) = match self
                         .load_or_reuse_file_buffer(&path.to_string_lossy())
-                        .await?;
+                        .await
+                    {
+                        Ok(opened) => opened,
+                        Err(error) => return self.learn_navigation_failure(error, buffer),
+                    };
                     self.set_current_buffer(buffer, index).await?;
                 }
                 _ => return Ok(false),
             }
+            self.sync_to_window();
+            self.notify_editor_event_changes(before, runtime, "LearnNavigation")
+                .await?;
             self.observe_learn_action(action, buffer)?;
             self.render(buffer)?;
             Ok(true)
@@ -93,6 +168,63 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn learn_search_missing_fixture_is_recoverable() {
+        let config = Config::default();
+        let client = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = Editor::with_size(
+            client,
+            100,
+            30,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, "original".into())],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        let mut buffer = RenderBuffer::new(100, 30, &Style::default());
+        let mut runtime = Runtime::new();
+        editor
+            .start_learn_lesson(Lesson::SearchTheProject, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        let missing = editor
+            .learn_session
+            .as_ref()
+            .unwrap()
+            .workspace
+            .as_ref()
+            .unwrap()
+            .path("src/score.hk");
+        std::fs::remove_file(missing).unwrap();
+        editor
+            .execute(
+                &Action::PluginCommand("ProjectSearch".into()),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        assert!(editor.current_dialog.is_none());
+        assert!(editor
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains(":tutorial restart")));
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::SearchOpen
+        );
+        editor
+            .restart_learn_lesson(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(editor.learn_navigation_path("src/score.hk").is_some());
+        editor
+            .finish_learn_lesson(&mut buffer, &mut runtime)
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn learn_file_navigation_uses_owned_files_and_restores_the_original_buffers() {

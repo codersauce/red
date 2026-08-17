@@ -869,7 +869,7 @@ impl Picker {
         self.status = status;
     }
 
-    fn set_busy(&mut self, busy: bool) {
+    pub(crate) fn set_busy(&mut self, busy: bool) {
         if busy {
             if self.busy_since.is_none() {
                 self.busy_since = Some(Instant::now());
@@ -3454,6 +3454,7 @@ pub struct PickerBuilder {
     placeholder: Option<String>,
     status: Option<String>,
     busy: bool,
+    external_filter: bool,
     history_key: Option<String>,
     location_preview_contents: HashMap<String, Rope>,
     content_sizing: Option<PickerContentSizing>,
@@ -3480,6 +3481,7 @@ impl PickerBuilder {
             placeholder: None,
             status: None,
             busy: false,
+            external_filter: false,
             history_key: None,
             location_preview_contents: HashMap::new(),
             content_sizing: None,
@@ -3559,6 +3561,12 @@ impl PickerBuilder {
         self
     }
 
+    /// Keep caller-supplied search results in their original order.
+    pub(crate) fn external_filter(mut self) -> Self {
+        self.external_filter = true;
+        self
+    }
+
     pub fn history_key(mut self, key: impl Into<String>) -> Self {
         self.history_key = Some(key.into());
         self
@@ -3610,6 +3618,7 @@ impl PickerBuilder {
         let placeholder = self.placeholder;
         let status = self.status;
         let busy = self.busy;
+        let external_filter = self.external_filter;
         let history_key = self.history_key;
         let location_preview_contents = self.location_preview_contents;
         let content_sizing = self.content_sizing;
@@ -3630,6 +3639,7 @@ impl PickerBuilder {
         picker.placeholder = placeholder;
         picker.status = status;
         picker.set_busy(busy);
+        picker.external_filter = external_filter;
         if let Some(history_key) = history_key {
             let history = editor.picker_history(&history_key).to_vec();
             picker.set_history(history_key, history);

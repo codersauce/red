@@ -29,6 +29,7 @@ mod messages;
 mod picker;
 mod prompt_buffer;
 mod rich_text;
+mod scoped_search;
 mod selection;
 mod shortcut_catalog;
 mod spinner;
@@ -74,6 +75,7 @@ pub(crate) use prompt_buffer::{
     PROMPT_MAX_BYTES,
 };
 pub(crate) use rich_text::paint_rich_text;
+pub(crate) use scoped_search::ScopedProjectSearch;
 pub(crate) use selection::{FollowTailViewport, SelectionViewport};
 pub(crate) use shortcut_catalog::{
     common_shortcut_entries, picker_reference_actions, prompt_reference_actions, reference_actions,

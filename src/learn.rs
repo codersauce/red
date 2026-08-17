@@ -53,10 +53,11 @@ pub(crate) enum Lesson {
     StageTheRightHunk,
     MakeALocalCommit,
     OpenAFileByName,
+    SearchTheProject,
 }
 
 impl Lesson {
-    pub const AVAILABLE: [Self; 15] = [
+    pub const AVAILABLE: [Self; 16] = [
         Self::FindYourFooting,
         Self::EditWithConfidence,
         Self::FindACommand,
@@ -72,6 +73,7 @@ impl Lesson {
         Self::StageTheRightHunk,
         Self::MakeALocalCommit,
         Self::OpenAFileByName,
+        Self::SearchTheProject,
     ];
 
     pub fn from_id(id: &str) -> Option<Self> {
@@ -111,6 +113,7 @@ impl Lesson {
             Self::StageTheRightHunk => 12,
             Self::MakeALocalCommit => 13,
             Self::OpenAFileByName => 14,
+            Self::SearchTheProject => 15,
         }
     }
 
@@ -126,7 +129,7 @@ impl Lesson {
             | Self::RepairTheCode
             | Self::StageTheRightHunk
             | Self::MakeALocalCommit => 2,
-            Self::OpenAFileByName => 3,
+            Self::OpenAFileByName | Self::SearchTheProject => 3,
             _ => 0,
         }
     }
@@ -138,7 +141,7 @@ impl Lesson {
     }
 
     pub const fn is_navigation_practice(self) -> bool {
-        matches!(self, Self::OpenAFileByName)
+        matches!(self, Self::OpenAFileByName | Self::SearchTheProject)
     }
 
     pub const fn is_git_practice(self) -> bool {
@@ -182,6 +185,7 @@ impl Lesson {
             Self::StageTheRightHunk => "ship.stage-the-right-hunk.v1",
             Self::MakeALocalCommit => "ship.make-a-local-commit.v1",
             Self::OpenAFileByName => "navigation.open-a-file-by-name.v1",
+            Self::SearchTheProject => "navigation.search-the-project.v1",
         }
     }
 
@@ -203,7 +207,7 @@ impl Lesson {
             Self::ReadTheDiagnostic | Self::RepairTheCode => HUSK_CONTENTS,
             Self::FollowTheSymbol => HUSK_SYMBOL_CONTENTS,
             Self::StageTheRightHunk | Self::MakeALocalCommit => staging::WORKTREE,
-            Self::OpenAFileByName => navigation::GUIDE,
+            Self::OpenAFileByName | Self::SearchTheProject => navigation::GUIDE,
         }
     }
 
@@ -224,6 +228,7 @@ impl Lesson {
             Self::StageTheRightHunk => PracticeStep::StageOpen,
             Self::MakeALocalCommit => PracticeStep::CommitOpen,
             Self::OpenAFileByName => PracticeStep::FilesOpen,
+            Self::SearchTheProject => PracticeStep::SearchOpen,
         }
     }
 
@@ -274,6 +279,12 @@ impl Lesson {
                 "Undo the unwanted change",
                 "Request and refine a suggestion",
                 "Keep only the corrected result",
+            ],
+            Self::SearchTheProject => &[
+                "Open project search",
+                "Find the add_score call",
+                "Find the zero-point expectation",
+                "Return to the project guide",
             ],
             Self::OpenAFileByName => &[
                 "Open the file picker",
@@ -495,12 +506,21 @@ pub(crate) enum PracticeStep {
     FilesSource,
     FilesTests,
     FilesReturn,
+    SearchOpen,
+    SearchCall,
+    SearchExpectation,
+    SearchReturn,
     Complete,
 }
 
 impl PracticeStep {
     pub fn suggested_action(self) -> Option<Action> {
         match self {
+            Self::SearchOpen | Self::SearchExpectation => {
+                Some(Action::PluginCommand("ProjectSearch".into()))
+            }
+            Self::SearchCall => None,
+            Self::SearchReturn => Some(Action::FilePicker),
             Self::FilesOpen | Self::FilesTests | Self::FilesReturn => Some(Action::FilePicker),
             Self::FilesSource => None,
             Self::CommitOpen => Some(Action::PluginCommand("GitDashboard".into())),
@@ -617,6 +637,10 @@ impl PracticeStep {
             Self::DiagnosticJump => "Choose the missing-semicolon error and press Enter. The editor will take you to the reported location. Reopen Diagnostics if you closed the picker.".into(),
             Self::DiagnosticRead => format!("Press {} to read the diagnostic on this line. The parser points at the next token; the incomplete statement is just above it.", shortcut.unwrap_or("D")),
             Self::DiagnosticReturn => "Read the message and diagnostic code, then press Esc to return to the source. You will repair the defect in a later lesson.".into(),
+            Self::SearchOpen => format!("Press {} (or :ProjectSearch) to search the contents of the practice project. This uses real ripgrep, with literal text and smart case.", shortcut.unwrap_or("Space g")),
+            Self::SearchCall => "Search for add_score. Read the matching lines and their previews, then choose the call in src/main.hk. If you closed the picker, reopen :ProjectSearch.".into(),
+            Self::SearchExpectation => format!("Press {} again and search for zero-point. Open the matching expectation in tests/score.hk. Project search finds text even when you do not know its filename.", shortcut.unwrap_or("Space g")),
+            Self::SearchReturn => format!("Press {}, find README, and return to the project guide. Search results opened at their exact match positions.", shortcut.unwrap_or("Ctrl-p")),
             Self::FilesOpen => format!("Press {} to find a file in this small, owned project. The real picker searches filenames and their paths; your own project is not included.", shortcut.unwrap_or("Ctrl-p")),
             Self::FilesSource => "Type src/score and press Enter to open src/score.hk. Notice the directory beside the filename; two files share the name score.hk. Reopen the file picker if you closed it.".into(),
             Self::FilesTests => format!("Now press {} again, type tests/score, and open tests/score.hk. Including part of the directory makes duplicate names easy to distinguish.", shortcut.unwrap_or("Ctrl-p")),
@@ -647,6 +671,7 @@ impl PracticeStep {
                 Lesson::UnderstandSelectedCode => "You explained selected code without editing it. Recorded practice complete; real inline assist sends your selected context only when you submit a prompt.",
                 Lesson::MakeAFocusedChange => "The fix is kept in the buffer, still unsaved. Inline edits use normal undo history; keeping one is not the same as writing a file.",
                 Lesson::ChooseWhatToKeep => "You rejected an unwanted change, refined a suggestion, and kept the corrected result. The final edit is unsaved and remains undoable.",
+                Lesson::SearchTheProject => "You searched real file contents, inspected matching lines, and opened two results at their exact positions. The practice project is unchanged.",
                 Lesson::OpenAFileByName => "You found two files with the same name, used their paths to choose the right one, and returned to the guide. No project files were changed.",
                 Lesson::MakeALocalCommit => "You created and inspected a local commit containing only the score fix. Fix & ship complete! The title change remains unstaged, and nothing was pushed.",
                 Lesson::StageTheRightHunk => "Only the score fix is staged. The title change stays in the working tree, and no commit was created. Your own repository was never touched.",
@@ -679,7 +704,8 @@ impl PracticeStep {
             | Self::RepairLocate
             | Self::StageOpen
             | Self::CommitOpen
-            | Self::FilesOpen => 0,
+            | Self::FilesOpen
+            | Self::SearchOpen => 0,
             Self::Type
             | Self::EditDelete
             | Self::CommandRun
@@ -694,7 +720,8 @@ impl PracticeStep {
             | Self::RepairActions
             | Self::StageChoose
             | Self::CommitWrite
-            | Self::FilesSource => 1,
+            | Self::FilesSource
+            | Self::SearchCall => 1,
             Self::Normal
             | Self::EditUndo
             | Self::CommandHelp
@@ -711,7 +738,8 @@ impl PracticeStep {
             | Self::RepairApply
             | Self::StageInspect
             | Self::CommitInspect
-            | Self::FilesTests => 2,
+            | Self::FilesTests
+            | Self::SearchExpectation => 2,
             Self::Undo
             | Self::EditRedo
             | Self::CommandReturn
@@ -726,7 +754,8 @@ impl PracticeStep {
             | Self::RepairSave
             | Self::StageReturn
             | Self::CommitReturn
-            | Self::FilesReturn => 3,
+            | Self::FilesReturn
+            | Self::SearchReturn => 3,
             Self::Complete => 4,
         }
     }
@@ -791,6 +820,22 @@ impl PracticeStep {
     /// Observes UI state that can change through either a key or an action.
     pub fn observe_view(&mut self, action: &Action, view: PracticeView) -> bool {
         let next = match (*self, action) {
+            (Self::SearchOpen, Action::PluginCommand(name))
+                if name == "ProjectSearch" && view.project_search_open =>
+            {
+                Self::SearchCall
+            }
+            (Self::SearchCall, Action::OpenLocation(_, _)) if view.search_call_visible => {
+                Self::SearchExpectation
+            }
+            (Self::SearchExpectation, Action::OpenLocation(_, _))
+                if view.search_expectation_visible =>
+            {
+                Self::SearchReturn
+            }
+            (Self::SearchReturn, Action::OpenFile(_)) if view.navigation_guide_visible => {
+                Self::Complete
+            }
             (Self::FilesOpen, Action::FilePicker) if view.files_picker_open => Self::FilesSource,
             (Self::FilesSource, Action::OpenFile(_)) if view.navigation_source_visible => {
                 Self::FilesTests
@@ -961,6 +1006,9 @@ pub(crate) struct PracticeView {
     pub code_actions_open: bool,
     pub husk_fixed_text: bool,
     pub diagnostics_clean: bool,
+    pub project_search_open: bool,
+    pub search_call_visible: bool,
+    pub search_expectation_visible: bool,
     pub files_picker_open: bool,
     pub navigation_source_visible: bool,
     pub navigation_tests_visible: bool,
@@ -975,14 +1023,17 @@ pub(crate) struct PracticeView {
 
 /// Scratch lessons permit only edits to their isolated practice buffer.
 pub(crate) fn practice_action_allowed(lesson: Lesson, action: &Action) -> bool {
-    (lesson.is_navigation_practice()
-        && matches!(
-            action,
-            Action::FilePicker
-                | Action::OpenFile(_)
-                | Action::CommandPalette
-                | Action::KeyboardShortcuts
-        ))
+    (lesson == Lesson::SearchTheProject
+        && (matches!(action, Action::OpenLocation(_, _))
+            || matches!(action,Action::PluginCommand(name) if name == "ProjectSearch")))
+        || (lesson.is_navigation_practice()
+            && matches!(
+                action,
+                Action::FilePicker
+                    | Action::OpenFile(_)
+                    | Action::CommandPalette
+                    | Action::KeyboardShortcuts
+            ))
         || (lesson == Lesson::MakeALocalCommit
             && (matches!(action, Action::Save | Action::ShowDialog)
                 || matches!(action, Action::PluginCommand(name) if matches!(name.as_str(), "LearnGitWriteMessage" | "GitSubmitMessage" | "GitCancelMessage"))))
