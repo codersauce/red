@@ -449,7 +449,8 @@ pub trait LspClient: std::any::Any + Send {
 
     /// Pulls diagnostics when the server advertises support.
     ///
-    /// Returns `None` when the capability is unavailable.
+    /// Returns `None` when the capability is unavailable or the refresh was
+    /// queued behind an in-flight diagnostic request for the same document.
     async fn request_diagnostics(&mut self, file_uri: &str) -> Result<Option<i64>, LspError>;
 
     // TODO: Request code lens information if this capability is enabled, returns None otherwise
