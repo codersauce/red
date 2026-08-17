@@ -910,8 +910,26 @@ async fn counted_replace_and_dot_recompute_at_the_new_cursor() {
     harness.assert_buffer_contents("XXXd\nXXXh");
 }
 
-#[tokio::test]
-async fn dot_repeats_linewise_paste_and_visual_block_insert() {
+#[test]
+fn dot_repeats_linewise_paste_and_visual_block_insert() {
+    // Pin the normal test-thread budget even when RUST_MIN_STACK is larger.
+    // Dot-repeat nests action dispatch while completing visual-block replay.
+    std::thread::Builder::new()
+        .name("dot-repeat-stack-regression".into())
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(assert_dot_repeats_linewise_paste_and_visual_block_insert());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn assert_dot_repeats_linewise_paste_and_visual_block_insert() {
     let buffer = Buffer::new(None, "one\ntwo\nthree\nfour".to_string());
     let mut harness = EditorHarness::with_config(buffer, default_key_config());
     type_normal_keys(&mut harness, "yyjpj.").await;
