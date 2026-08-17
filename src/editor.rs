@@ -31997,14 +31997,111 @@ builtin = "rust"
         let partner_y = editor.window_to_terminal_y(window, partner_y);
         let partner_x = editor.window_to_terminal_x(window, partner_x);
         let partner = &render_buffer.cells[partner_y * render_buffer.width + partner_x];
-        let expected = editor.theme.selected_style(
-            &editor.theme.style,
-            &editor.theme.editor_bracket_match_style(),
-            crate::theme::SelectionForegroundPriority::Content,
-        );
+        let expected = editor.theme.matched_bracket_style(&editor.theme.style);
 
         assert_eq!(partner.c, '}');
         assert_eq!(partner.style.bg, expected.bg);
+    }
+
+    #[test]
+    fn bracket_matching_keeps_block_cursor_stable_across_themes_and_render_paths() {
+        for theme_name in [
+            "kanagawa",
+            "rose-pine-moon",
+            "mocha",
+            "latte",
+            "github-dark-default",
+        ] {
+            let mut editor = bracket_test_editor("x()y", 30, 8);
+            editor.theme = parse_vscode_theme(&format!("themes/{theme_name}.json")).unwrap();
+            let mut render_buffer = RenderBuffer::new(30, 8, &Style::default());
+            editor.render(&mut render_buffer).unwrap();
+            let (x, y) = editor.render_cursor_position().unwrap();
+            let start_index = y * render_buffer.width + x;
+            let cursor_style = render_buffer.cells[start_index].style.clone();
+            let surface_bg = editor.last_rendered_cursor_surface.as_ref().unwrap().bg;
+
+            for column in [1, 2, 3] {
+                editor.cx = column;
+                editor.cursor_goal = CursorGoal::DisplayCol(column);
+                editor
+                    .render_cursor_motion_delta(&mut render_buffer)
+                    .unwrap();
+                let (x, y) = editor.render_cursor_position().unwrap();
+                let cursor_index = y * render_buffer.width + x;
+                assert_eq!(
+                    render_buffer.cells[cursor_index].style, cursor_style,
+                    "{theme_name}: cursor changed at column {column}"
+                );
+                assert_eq!(
+                    editor.last_rendered_cursor_surface.as_ref().unwrap().bg,
+                    surface_bg,
+                    "{theme_name}: bracket decoration reached the cursor surface"
+                );
+                if column < 3 {
+                    let partner_index = start_index + (3 - column);
+                    assert!(render_buffer.cells[partner_index].style.underline);
+                } else {
+                    for bracket_index in [start_index + 1, start_index + 2] {
+                        assert_eq!(render_buffer.cells[bracket_index].style.bg, surface_bg);
+                        assert!(!render_buffer.cells[bracket_index].style.underline);
+                    }
+                }
+
+                let delta_cells = render_buffer.cells.clone();
+                editor.render(&mut render_buffer).unwrap();
+                assert_eq!(
+                    render_buffer.cells, delta_cells,
+                    "{theme_name}: full and delta renders differ at column {column}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bracket_matching_does_not_change_visual_mode_cursor_style() {
+        for mode in [Mode::Visual, Mode::VisualLine, Mode::VisualBlock] {
+            let mut editor = bracket_test_editor("(value)", 30, 8);
+            editor.theme = parse_vscode_theme("themes/kanagawa.json").unwrap();
+            editor.mode = mode;
+            editor.selection_start = Some(Point::new(0, 0));
+            let pairs = std::mem::take(&mut editor.config.matchit.pairs);
+            let mut render_buffer = RenderBuffer::new(30, 8, &Style::default());
+            editor.render(&mut render_buffer).unwrap();
+            let (x, y) = editor.render_cursor_position().unwrap();
+            let index = y * render_buffer.width + x;
+            let expected = render_buffer.cells[index].style.clone();
+
+            editor.config.matchit.pairs = pairs;
+            editor.render(&mut render_buffer).unwrap();
+
+            assert_eq!(render_buffer.cells[index].style, expected, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn insert_mode_bracket_matching_keeps_both_decorations_and_cursor_contrast() {
+        let mut editor = bracket_test_editor("()", 30, 8);
+        editor.theme = parse_vscode_theme("themes/kanagawa.json").unwrap();
+        editor.mode = Mode::Insert;
+        let mut render_buffer = RenderBuffer::new(30, 8, &Style::default());
+        editor.render(&mut render_buffer).unwrap();
+        let (x, y) = editor.render_cursor_position().unwrap();
+        let index = y * render_buffer.width + x;
+
+        assert!(!editor.uses_synthetic_block_cursor());
+        assert!(render_buffer.cells[index].style.underline);
+        assert!(render_buffer.cells[index + 1].style.underline);
+        assert_eq!(
+            editor.last_rendered_cursor_surface.as_ref(),
+            Some(&render_buffer.cells[index].style)
+        );
+        assert!(
+            crate::color::contrast_ratio(
+                editor.terminal_cursor_state().color.unwrap(),
+                render_buffer.cells[index].style.bg.unwrap(),
+            ) >= crate::theme::MINIMUM_CURSOR_STATE_CONTRAST
+        );
     }
 
     #[tokio::test]

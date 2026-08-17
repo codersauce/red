@@ -234,6 +234,24 @@ impl Theme {
             .unwrap_or_else(|| self.editor_selection_style())
     }
 
+    /// Keeps bracket decorations secondary to the cursor and visual selection.
+    pub(crate) fn matched_bracket_style(&self, content: &Style) -> Style {
+        let highlight = self.editor_bracket_match_style();
+        let editor_bg = blend_color(self.style.bg.unwrap_or_default(), Color::default());
+        let surface_bg = blend_color(content.bg.unwrap_or(editor_bg), editor_bg);
+        let background = blend_color(highlight.bg.unwrap_or(surface_bg), surface_bg);
+
+        // Preserve subtle theme fills. An underline stands in for a GUI bracket
+        // border, including when the theme supplies no distinct background.
+        self.ensure_text_contrast(&Style {
+            fg: highlight.fg.or(content.fg),
+            bg: Some(background),
+            bold: content.bold || highlight.bold,
+            italic: content.italic || highlight.italic,
+            underline: true,
+        })
+    }
+
     pub(crate) fn list_selection_style(&self) -> Style {
         Style {
             fg: self
@@ -1093,6 +1111,50 @@ mod tests {
         assert_eq!(active.fg, Some(blue));
         assert!(contrast_ratio(blue, white) >= MINIMUM_SELECTION_STATE_CONTRAST);
         assert_eq!(active.bg, inactive.bg);
+    }
+
+    #[test]
+    fn bracket_match_style_preserves_subtle_fill_and_readable_text() {
+        let theme = parse_vscode_theme("themes/mocha.json").unwrap();
+        let content = Style {
+            bg: theme
+                .line_highlight_style
+                .as_ref()
+                .and_then(|style| style.bg),
+            italic: true,
+            ..theme.style.clone()
+        };
+        let surface = blend_color(content.bg.unwrap(), theme.style.bg.unwrap());
+        let requested = theme.editor_bracket_match_style();
+        let expected_bg = blend_color(requested.bg.unwrap(), surface);
+
+        let matched = theme.matched_bracket_style(&content);
+
+        assert_eq!(matched.bg, Some(expected_bg));
+        assert!(contrast_ratio(expected_bg, surface) < MINIMUM_SELECTION_STATE_CONTRAST);
+        assert!(
+            contrast_ratio(matched.fg.unwrap(), expected_bg) >= MINIMUM_SELECTION_TEXT_CONTRAST
+        );
+        assert!(matched.italic);
+        assert!(matched.underline);
+    }
+
+    #[test]
+    fn bracket_match_style_marks_border_only_themes() {
+        let theme = parse_vscode_theme_contents(
+            r##"{"colors": {
+                "editor.background": "#101010",
+                "editor.foreground": "#ffffff",
+                "editorBracketMatch.border": "#00ffff"
+            }, "tokenColors": []}"##,
+        )
+        .unwrap();
+
+        let matched = theme.matched_bracket_style(&theme.style);
+
+        assert_eq!(matched.bg, theme.style.bg);
+        assert_eq!(matched.fg, theme.editor_bracket_match_style().fg);
+        assert!(matched.underline);
     }
 
     #[test]
