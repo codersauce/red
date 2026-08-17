@@ -766,11 +766,26 @@ impl Server {
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if code == Some("HUSK-P0001")
-                    && (message.contains("`;`")
-                        || message.to_ascii_lowercase().contains("semicolon"))
-                    && let Some(end) = diagnostic.pointer("/range/end")
-                {
+                if code == Some("HUSK-P0001") && message.starts_with("expected `;`") {
+                    // Parser errors point at the unexpected next token. Insert
+                    // after the preceding token, before any intervening comment
+                    // or whitespace. Only trust a diagnostic for this revision.
+                    let Some(current) = document.diagnostics().iter().find(|current| {
+                        current.code == "HUSK-P0001"
+                            && current.message == message
+                            && self.range(document, &current.span) == diagnostic["range"]
+                    }) else {
+                        continue;
+                    };
+                    let Some(end) = Lexer::new(document.text())
+                        .take_while(|token| token.span.range.end <= current.span.start)
+                        .filter(|token| !matches!(token.kind, TokenKind::Eof))
+                        .last()
+                        .map(|token| token.span.range.end)
+                    else {
+                        continue;
+                    };
+                    let range = self.range(document, &(end..end));
                     actions.push(json!({
                         "title": "Insert missing semicolon",
                         "kind": "quickfix",
@@ -779,7 +794,7 @@ impl Server {
                         "edit": {
                             "changes": {
                                 uri.clone(): [{
-                                    "range": {"start": end, "end": end},
+                                    "range": range,
                                     "newText": ";"
                                 }]
                             }
@@ -1534,6 +1549,93 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn semicolon_quickfix_inserts_before_the_unexpected_token_and_rejects_stale_diagnostics() {
+        for (source, preceding) in [
+            (
+                "fn main() {\n    let score = 42\n    std::println(\"Score updated\");\n}\n",
+                "42",
+            ),
+            (
+                "fn main() {\n    let message = \"😀\" // keep this comment\n    std::println(message);\n}\n",
+                "\"😀\"",
+            ),
+            ("fn main() { let score = 42 }\n", "42"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("main.hk");
+            fs::write(&path, source).unwrap();
+            let uri = file_uri(&path).unwrap();
+            let mut server = Server::new(ServerOptions::default());
+            server.handle(json!({"jsonrpc":"2.0", "id":1, "method":"initialize",
+                "params":{"rootUri":file_uri(root.path()).unwrap()}}));
+            let published = server.handle(json!({"jsonrpc":"2.0", "method":"textDocument/didOpen",
+                "params":{"textDocument":{"uri":uri,"languageId":"husk","version":1,"text":source}}}));
+            let diagnostic = published[0]["params"]["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|diagnostic| {
+                    diagnostic["code"] == "HUSK-P0001"
+                        && diagnostic["message"]
+                            .as_str()
+                            .is_some_and(|message| message.starts_with("expected `;`"))
+                })
+                .unwrap()
+                .clone();
+            let params = json!({"textDocument":{"uri":uri},"range":diagnostic["range"],
+                "context":{"diagnostics":[diagnostic]}});
+            let actions = server.code_actions(params.clone()).unwrap();
+            let action = actions
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|action| action["title"] == "Insert missing semicolon")
+                .unwrap();
+            let changes = action["edit"]["changes"].as_object().unwrap();
+            assert_eq!(changes.len(), 1);
+            let (target, edits) = changes.iter().next().unwrap();
+            assert_eq!(
+                file_path(target).unwrap().canonicalize().unwrap(),
+                path.canonicalize().unwrap()
+            );
+            let edit = &edits[0];
+            assert_eq!(edit["range"]["start"], edit["range"]["end"]);
+            let position = parse_position(&edit["range"]["start"]).unwrap();
+            let byte = server
+                .document(&path)
+                .unwrap()
+                .byte_offset(position)
+                .unwrap();
+            assert_eq!(
+                byte,
+                source.find(preceding).unwrap() + preceding.len(),
+                "{source}"
+            );
+            let mut fixed = source.to_owned();
+            fixed.insert(byte, ';');
+            let published = server.handle(json!({"jsonrpc":"2.0","method":"textDocument/didChange",
+                "params":{"textDocument":{"uri":uri,"version":2},"contentChanges":[{"text":fixed}]}}));
+            assert!(
+                published[0]["params"]["diagnostics"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|diagnostic| diagnostic["code"] != "HUSK-P0001"),
+                "{published:?}"
+            );
+            assert!(
+                server
+                    .code_actions(params)
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|action| action["title"] != "Insert missing semicolon")
+            );
+        }
+    }
 
     #[test]
     fn completion_context_handles_flat_external_paths() {
