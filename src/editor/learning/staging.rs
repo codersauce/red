@@ -117,7 +117,11 @@ impl LearnStageState {
             Self::side(workspace, runtime, Section::Unstaged).await?,
             Self::side(workspace, runtime, Section::Staged).await?,
         ];
-        self.index_correct = workspace.git(&["show", ":score.rs"]).await? == fixture::INDEX;
+        self.index_correct = workspace.git(&["show", ":score.rs"]).await? == fixture::INDEX
+            && workspace
+                .git(&["diff", "--cached", "--name-only", "--no-ext-diff"])
+                .await?
+                == "score.rs\n";
         if !self.index_correct {
             self.inspected = false;
         }

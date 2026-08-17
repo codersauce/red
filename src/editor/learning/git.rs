@@ -13,6 +13,7 @@ pub(super) struct LearnGitState {
     selected: String,
     inspected: HashSet<String>,
     pub(super) staging: Option<staging::LearnStageState>,
+    pub(super) committing: Option<committing::LearnCommitState>,
 }
 
 impl LearnGitState {
@@ -21,12 +22,22 @@ impl LearnGitState {
         runtime: &mut Runtime,
         lesson: Lesson,
     ) -> anyhow::Result<Self> {
+        if lesson == Lesson::MakeALocalCommit {
+            return Ok(Self {
+                documents: Vec::new(),
+                selected: String::new(),
+                inspected: HashSet::new(),
+                staging: None,
+                committing: Some(committing::LearnCommitState::prepare(workspace, runtime).await?),
+            });
+        }
         if lesson == Lesson::StageTheRightHunk {
             return Ok(Self {
                 documents: Vec::new(),
                 selected: String::new(),
                 inspected: HashSet::new(),
                 staging: Some(staging::LearnStageState::prepare(workspace, runtime).await?),
+                committing: None,
             });
         }
         workspace
@@ -49,10 +60,20 @@ impl LearnGitState {
             selected: "score.rs".into(),
             inspected: HashSet::new(),
             staging: None,
+            committing: None,
         })
     }
 
+    pub fn owns_buffer(&self, id: BufferId) -> bool {
+        self.committing
+            .as_ref()
+            .is_some_and(|state| state.scratch_buffer == Some(id))
+    }
+
     fn model(&self) -> WorkspaceModel {
+        if let Some(committing) = &self.committing {
+            return committing.model();
+        }
         if let Some(staging) = &self.staging {
             return staging.model();
         }
@@ -172,6 +193,16 @@ impl Editor {
         runtime: &'a mut Runtime,
     ) -> BoxFuture<'a, anyhow::Result<bool>> {
         Box::pin(async move {
+            if self
+                .learn_session
+                .as_ref()
+                .and_then(|session| session.git.as_ref())
+                .is_some_and(|git| git.committing.is_some())
+            {
+                return self
+                    .intercept_learn_commit_action(action, buffer, runtime)
+                    .await;
+            }
             if self
                 .learn_session
                 .as_ref()

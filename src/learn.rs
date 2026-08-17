@@ -50,10 +50,11 @@ pub(crate) enum Lesson {
     FollowTheSymbol,
     RepairTheCode,
     StageTheRightHunk,
+    MakeALocalCommit,
 }
 
 impl Lesson {
-    pub const AVAILABLE: [Self; 13] = [
+    pub const AVAILABLE: [Self; 14] = [
         Self::FindYourFooting,
         Self::EditWithConfidence,
         Self::FindACommand,
@@ -67,6 +68,7 @@ impl Lesson {
         Self::FollowTheSymbol,
         Self::RepairTheCode,
         Self::StageTheRightHunk,
+        Self::MakeALocalCommit,
     ];
 
     pub fn from_id(id: &str) -> Option<Self> {
@@ -104,6 +106,7 @@ impl Lesson {
             Self::FollowTheSymbol => 10,
             Self::RepairTheCode => 11,
             Self::StageTheRightHunk => 12,
+            Self::MakeALocalCommit => 13,
         }
     }
 
@@ -117,7 +120,8 @@ impl Lesson {
             Self::ReadTheDiagnostic
             | Self::FollowTheSymbol
             | Self::RepairTheCode
-            | Self::StageTheRightHunk => 2,
+            | Self::StageTheRightHunk
+            | Self::MakeALocalCommit => 2,
             _ => 0,
         }
     }
@@ -129,7 +133,10 @@ impl Lesson {
     }
 
     pub const fn is_git_practice(self) -> bool {
-        matches!(self, Self::ReviewWhatChanged | Self::StageTheRightHunk)
+        matches!(
+            self,
+            Self::ReviewWhatChanged | Self::StageTheRightHunk | Self::MakeALocalCommit
+        )
     }
 
     pub const fn is_lsp_practice(self) -> bool {
@@ -164,6 +171,7 @@ impl Lesson {
             Self::FollowTheSymbol => "ship.follow-the-symbol.v1",
             Self::RepairTheCode => "ship.repair-the-code.v1",
             Self::StageTheRightHunk => "ship.stage-the-right-hunk.v1",
+            Self::MakeALocalCommit => "ship.make-a-local-commit.v1",
         }
     }
 
@@ -184,7 +192,7 @@ impl Lesson {
             Self::ReviewWhatChanged => AI_FIXED_CONTENTS,
             Self::ReadTheDiagnostic | Self::RepairTheCode => HUSK_CONTENTS,
             Self::FollowTheSymbol => HUSK_SYMBOL_CONTENTS,
-            Self::StageTheRightHunk => staging::WORKTREE,
+            Self::StageTheRightHunk | Self::MakeALocalCommit => staging::WORKTREE,
         }
     }
 
@@ -203,6 +211,7 @@ impl Lesson {
             Self::FollowTheSymbol => PracticeStep::SymbolDefinition,
             Self::RepairTheCode => PracticeStep::RepairLocate,
             Self::StageTheRightHunk => PracticeStep::StageOpen,
+            Self::MakeALocalCommit => PracticeStep::CommitOpen,
         }
     }
 
@@ -253,6 +262,12 @@ impl Lesson {
                 "Undo the unwanted change",
                 "Request and refine a suggestion",
                 "Keep only the corrected result",
+            ],
+            Self::MakeALocalCommit => &[
+                "Open a commit message",
+                "Create the local commit",
+                "Inspect the committed fix",
+                "Return with the other change unstaged",
             ],
             Self::StageTheRightHunk => &[
                 "Open the practice Git workspace",
@@ -454,12 +469,19 @@ pub(crate) enum PracticeStep {
     StageChoose,
     StageInspect,
     StageReturn,
+    CommitOpen,
+    CommitWrite,
+    CommitInspect,
+    CommitReturn,
     Complete,
 }
 
 impl PracticeStep {
     pub fn suggested_action(self) -> Option<Action> {
         match self {
+            Self::CommitOpen => Some(Action::PluginCommand("GitDashboard".into())),
+            Self::CommitWrite => Some(Action::Save),
+            Self::CommitInspect | Self::CommitReturn => None,
             Self::StageOpen => Some(Action::PluginCommand("GitDashboard".into())),
             Self::StageChoose | Self::StageInspect | Self::StageReturn => None,
             Self::RepairLocate => Some(Action::OpenDiagnosticsPicker),
@@ -571,6 +593,10 @@ impl PracticeStep {
             Self::DiagnosticJump => "Choose the missing-semicolon error and press Enter. The editor will take you to the reported location. Reopen Diagnostics if you closed the picker.".into(),
             Self::DiagnosticRead => format!("Press {} to read the diagnostic on this line. The parser points at the next token; the incomplete statement is just above it.", shortcut.unwrap_or("D")),
             Self::DiagnosticReturn => "Read the message and diagnostic code, then press Esc to return to the source. You will repair the defect in a later lesson.".into(),
+            Self::CommitOpen => format!("Only the score fix is staged. Open Git with {} (or :GitDashboard), press c, and choose Write message. This practice repository has no remote.", shortcut.unwrap_or("Space g g")),
+            Self::CommitWrite => "Write a short message on the first line. Return to Normal mode, then use :w to create the local commit. :q cancels the message without committing. The commented diff is context, not part of your message.".into(),
+            Self::CommitInspect => "The local commit exists. Press Tab to focus its diff, then move onto the changed score line. Check the short commit ID and verify that the title change was left out.".into(),
+            Self::CommitReturn => "You inspected the committed arithmetic fix. Press q to return to code. The separate title change is still unstaged; nothing was pushed.".into(),
             Self::StageOpen => format!("This saved file has two unrelated changes. Open Git with {} (or :GitDashboard). You will stage only the score fix in a disposable local repository.", shortcut.unwrap_or("Space g g")),
             Self::StageChoose => "Press Tab to focus the unstaged diff. Move onto the score + points hunk, then press S to stage that hunk. Leave the title change out. If you stage the wrong hunk, select Staged, focus its diff, and press U to unstage it.".into(),
             Self::StageInspect => "Press Tab to focus the file list, choose Staged, then Tab into its diff. Move onto the changed score line and check that only the arithmetic fix is included.".into(),
@@ -593,6 +619,7 @@ impl PracticeStep {
                 Lesson::UnderstandSelectedCode => "You explained selected code without editing it. Recorded practice complete; real inline assist sends your selected context only when you submit a prompt.",
                 Lesson::MakeAFocusedChange => "The fix is kept in the buffer, still unsaved. Inline edits use normal undo history; keeping one is not the same as writing a file.",
                 Lesson::ChooseWhatToKeep => "You rejected an unwanted change, refined a suggestion, and kept the corrected result. The final edit is unsaved and remains undoable.",
+                Lesson::MakeALocalCommit => "You created and inspected a local commit containing only the score fix. Fix & ship complete! The title change remains unstaged, and nothing was pushed.",
                 Lesson::StageTheRightHunk => "Only the score fix is staged. The title change stays in the working tree, and no commit was created. Your own repository was never touched.",
                 Lesson::RepairTheCode => "You applied a real language-server quick fix and saved the corrected file. The diagnostic is gone; your own project was never touched.",
                 Lesson::FollowTheSymbol => "You followed a real definition, inspected its references, and returned through the jump list. No source was changed.",
@@ -621,7 +648,8 @@ impl PracticeStep {
             | Self::DiagnosticOpen
             | Self::SymbolDefinition
             | Self::RepairLocate
-            | Self::StageOpen => 0,
+            | Self::StageOpen
+            | Self::CommitOpen => 0,
             Self::Type
             | Self::EditDelete
             | Self::CommandRun
@@ -634,7 +662,8 @@ impl PracticeStep {
             | Self::DiagnosticJump
             | Self::SymbolReferences
             | Self::RepairActions
-            | Self::StageChoose => 1,
+            | Self::StageChoose
+            | Self::CommitWrite => 1,
             Self::Normal
             | Self::EditUndo
             | Self::CommandHelp
@@ -649,7 +678,8 @@ impl PracticeStep {
             | Self::DiagnosticRead
             | Self::SymbolChoose
             | Self::RepairApply
-            | Self::StageInspect => 2,
+            | Self::StageInspect
+            | Self::CommitInspect => 2,
             Self::Undo
             | Self::EditRedo
             | Self::CommandReturn
@@ -662,7 +692,8 @@ impl PracticeStep {
             | Self::DiagnosticReturn
             | Self::SymbolReturn
             | Self::RepairSave
-            | Self::StageReturn => 3,
+            | Self::StageReturn
+            | Self::CommitReturn => 3,
             Self::Complete => 4,
         }
     }
@@ -897,11 +928,14 @@ pub(crate) struct PracticeView {
 
 /// Scratch lessons permit only edits to their isolated practice buffer.
 pub(crate) fn practice_action_allowed(lesson: Lesson, action: &Action) -> bool {
-    (lesson == Lesson::RepairTheCode
-        && matches!(
-            action,
-            Action::CodeAction | Action::ApplyLspWorkspaceEdit { .. } | Action::Save
-        ))
+    (lesson == Lesson::MakeALocalCommit
+        && (matches!(action, Action::Save | Action::ShowDialog)
+            || matches!(action, Action::PluginCommand(name) if matches!(name.as_str(), "LearnGitWriteMessage" | "GitSubmitMessage" | "GitCancelMessage"))))
+        || (lesson == Lesson::RepairTheCode
+            && matches!(
+                action,
+                Action::CodeAction | Action::ApplyLspWorkspaceEdit { .. } | Action::Save
+            ))
         || (lesson == Lesson::FollowTheSymbol
             && (matches!(
                 action,

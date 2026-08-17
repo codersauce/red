@@ -7,6 +7,7 @@ use crate::learn::{
 use crate::ui::{draw_learn_coach, draw_learn_panel_coach, CoachLayout, LearnHub};
 
 mod agent;
+mod committing;
 mod git;
 mod language;
 mod staging;
@@ -36,6 +37,10 @@ pub(super) struct LearnSession {
 impl LearnSession {
     fn owns_buffer(&self, buffer: &Buffer) -> bool {
         buffer.id() == self.practice_buffer_id
+            || self
+                .git
+                .as_ref()
+                .is_some_and(|git| git.owns_buffer(buffer.id()))
             || self.workspace.as_ref().is_some_and(|workspace| {
                 buffer
                     .file
@@ -306,6 +311,7 @@ impl Editor {
             .map(|(index, candidate)| (index, candidate.id()))
             .collect::<Vec<_>>();
         for &(index, id) in owned.iter().rev() {
+            self.scratch_buffers.remove(&id);
             self.buffer_manager.remove_buffer(index);
             self.lsp_coordinator.forget_buffer(id);
             self.local_marks.remove(&id);
@@ -384,6 +390,20 @@ impl Editor {
         let Some(session) = self.learn_session.as_ref() else {
             return Ok(false);
         };
+        if self.learn_commit_scratch_active() && matches!(action, Action::Save | Action::Quit(_)) {
+            let command = if matches!(action, Action::Save) {
+                "GitSubmitMessage"
+            } else {
+                "GitCancelMessage"
+            };
+            return self
+                .intercept_learn_commit_action(
+                    &Action::PluginCommand(command.into()),
+                    buffer,
+                    runtime,
+                )
+                .await;
+        }
         if matches!(action, Action::Quit(_)) {
             self.finish_learn_lesson(buffer, runtime).await?;
             return Ok(true);

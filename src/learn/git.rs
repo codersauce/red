@@ -144,6 +144,21 @@ impl PracticeWorkspace {
         self.git(&args).await
     }
 
+    /// Create a local commit with a message passed on stdin, never as shell code.
+    pub async fn commit_index(&self, message: &str, expected_parent: &str) -> Result<String> {
+        anyhow::ensure!(
+            !message.trim().is_empty() && message.len() <= 4096 && !message.contains('\0'),
+            "write a commit message of at most 4096 bytes"
+        );
+        anyhow::ensure!(
+            self.git(&["rev-parse", "HEAD"]).await?.trim() == expected_parent,
+            "practice HEAD changed; restart the lesson"
+        );
+        self.git_with_input(&["commit", "--quiet", "--file=-"], Some(message))
+            .await?;
+        Ok(self.git(&["rev-parse", "HEAD"]).await?.trim().to_string())
+    }
+
     /// Apply a parser-selected patch only to this repository's index.
     pub async fn apply_index_patch(&self, patch: &str, reverse: bool) -> Result<()> {
         anyhow::ensure!(
