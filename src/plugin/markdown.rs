@@ -1,5 +1,7 @@
 //! Width-aware Markdown rendering for source-backed text panels.
 
+use std::collections::BTreeSet;
+
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -8,7 +10,12 @@ use super::text_link::TextPanelFileLocation;
 use super::text_link::{
     linkify_source_locations, markdown_link_target, TextPanelLink, TextPanelLinkTarget,
 };
-use crate::{highlighter::Highlighter, theme::Style, unicode_utils::display_width};
+use crate::{
+    editor::StyleInfo,
+    highlighter::Highlighter,
+    theme::{DiffPalette, Style, Theme},
+    unicode_utils::display_width,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TextPanelSpanStyle {
@@ -22,6 +29,8 @@ pub(crate) enum TextPanelSpanStyle {
     Strikethrough,
     InlineCode,
     Code,
+    /// Verbatim diff content carrying an explicit, theme-resolved row background.
+    Diff,
     Link,
     Quote,
     Muted,
@@ -689,70 +698,304 @@ pub(crate) fn render_hover_markdown_lines_with_highlighter(
     MarkdownRenderer::new(width, highlighter, CodeBlockChrome::Bare).render(text)
 }
 
+/// Render source directly, without interpolating it into a Markdown fence.
+pub(crate) fn render_code_lines_with_highlighter(
+    file: &str,
+    source: &str,
+    width: usize,
+    highlighter: Option<&mut Highlighter>,
+) -> Vec<RenderedTextLine> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let language = highlighter
+        .as_ref()
+        .and_then(|value| value.language_id_for_file(Some(file)))
+        .unwrap_or_default()
+        .to_owned();
+    highlighted_code_lines(&language, source, highlighter)
+        .into_iter()
+        .flat_map(|spans| wrap_verbatim(&spans, width, &[], &[]))
+        .collect()
+}
+
+/// Render an exact two-sided edit using the same syntax spans and verbatim
+/// wrapping as Markdown code blocks, with the Git workspace's diff palette.
+pub(crate) fn render_diff_lines_with_highlighter(
+    file: &str,
+    before: &str,
+    after: &str,
+    after_label: &str,
+    width: usize,
+    theme: &Theme,
+    mut highlighter: Option<&mut Highlighter>,
+) -> Vec<RenderedTextLine> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let language = highlighter
+        .as_ref()
+        .and_then(|value| value.language_id_for_file(Some(file)))
+        .unwrap_or_default()
+        .to_owned();
+    let diff = similar::TextDiff::from_lines(before, after);
+    let mut old_lines = BTreeSet::new();
+    let mut new_lines = BTreeSet::new();
+    for hunk in diff.unified_diff().iter_hunks() {
+        for change in hunk.iter_changes() {
+            if change.tag() == similar::ChangeTag::Delete {
+                old_lines.extend(change.old_index());
+            } else {
+                new_lines.extend(change.new_index());
+            }
+        }
+    }
+    // Parse complete programs separately for correct multiline syntax, but
+    // materialize spans only for source lines actually displayed in the diff.
+    let old = highlighted_code_lines_selected(
+        &language,
+        before,
+        highlighter.as_deref_mut(),
+        Some(&old_lines),
+    );
+    let new = highlighted_code_lines_selected(&language, after, highlighter, Some(&new_lines));
+    let palette = DiffPalette::new(theme);
+    let span = |text: String, style: Style| RenderedTextSpan {
+        text,
+        style: TextPanelSpanStyle::Diff,
+        syntax_style: Some(style),
+        link: None,
+        selection: TextPanelSpanSelection::Content,
+    };
+    let mut lines = Vec::new();
+    for header in ["--- before".to_owned(), format!("+++ {after_label}")] {
+        lines.extend(wrap_verbatim(
+            &[span(header, palette.hunk.clone())],
+            width,
+            &[],
+            &[],
+        ));
+    }
+    for hunk in diff.unified_diff().iter_hunks() {
+        lines.extend(wrap_verbatim(
+            &[span(hunk.header().to_string(), palette.hunk.clone())],
+            width,
+            &[],
+            &[],
+        ));
+        for change in hunk.iter_changes() {
+            let (marker, base, marker_color, source) = match change.tag() {
+                similar::ChangeTag::Delete => (
+                    "-",
+                    &palette.removed,
+                    Some(palette.removed_marker),
+                    change.old_index().and_then(|index| old.get(index)),
+                ),
+                similar::ChangeTag::Insert => (
+                    "+",
+                    &palette.added,
+                    Some(palette.added_marker),
+                    change.new_index().and_then(|index| new.get(index)),
+                ),
+                similar::ChangeTag::Equal => (
+                    " ",
+                    &theme.ui_style.dialog,
+                    theme.ui_style.dialog.fg,
+                    change.new_index().and_then(|index| new.get(index)),
+                ),
+            };
+            let mut spans = source.cloned().unwrap_or_else(|| {
+                vec![span(
+                    change
+                        .value()
+                        .trim_end_matches(['\r', '\n'])
+                        .replace('\t', "    "),
+                    base.clone(),
+                )]
+            });
+            for value in &mut spans {
+                let syntax = value.syntax_style.take().unwrap_or_default();
+                value.style = TextPanelSpanStyle::Diff;
+                value.syntax_style = Some(Style {
+                    fg: syntax.fg.or(base.fg),
+                    bg: base.bg,
+                    bold: syntax.bold,
+                    italic: syntax.italic,
+                    underline: syntax.underline,
+                });
+            }
+            let prefix = span(
+                marker.into(),
+                Style {
+                    fg: marker_color.or(base.fg),
+                    ..base.clone()
+                },
+            );
+            let mut continuation = prefix.clone();
+            continuation.selection = TextPanelSpanSelection::Chrome;
+            lines.extend(wrap_verbatim(&spans, width, &[prefix], &[continuation]));
+            if change.missing_newline() {
+                lines.extend(wrap_verbatim(
+                    &[span(
+                        "\\ No newline at end of file".into(),
+                        palette.hunk.clone(),
+                    )],
+                    width,
+                    &[],
+                    &[],
+                ));
+            }
+        }
+    }
+    lines
+}
+
 fn highlighted_code_lines(
     language: &str,
     code: &str,
     highlighter: Option<&mut Highlighter>,
 ) -> Vec<Vec<RenderedTextSpan>> {
+    highlighted_code_lines_selected(language, code, highlighter, None)
+}
+
+/// Maintain original capture indices so equal-length captures retain the
+/// existing later-capture-wins rule, regardless of the start-order sweep.
+struct LineStyleSweep<'a> {
+    styles: &'a [StyleInfo],
+    ordered: Vec<usize>,
+    next: usize,
+    active: Vec<usize>,
+}
+
+impl<'a> LineStyleSweep<'a> {
+    fn new(styles: &'a [StyleInfo]) -> Self {
+        let mut ordered = (0..styles.len()).collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|&index| styles[index].start);
+        Self {
+            styles,
+            ordered,
+            next: 0,
+            active: Vec::new(),
+        }
+    }
+
+    fn overlapping(&mut self, start: usize, end: usize) -> &[usize] {
+        self.active.retain(|&index| self.styles[index].end > start);
+        while let Some(&index) = self.ordered.get(self.next) {
+            if self.styles[index].start >= end {
+                break;
+            }
+            if self.styles[index].end > start {
+                self.active.push(index);
+            }
+            self.next += 1;
+        }
+        &self.active
+    }
+}
+
+fn highlighted_code_lines_selected(
+    language: &str,
+    code: &str,
+    highlighter: Option<&mut Highlighter>,
+    selected: Option<&BTreeSet<usize>>,
+) -> Vec<Vec<RenderedTextSpan>> {
+    if selected.is_some_and(BTreeSet::is_empty) {
+        return Vec::new();
+    }
     let styles = highlighter
         .and_then(|highlighter| {
             let language = highlighter.language_id_for_name(language)?.to_string();
             highlighter.highlight(&language, code).ok()
         })
         .unwrap_or_default();
+    project_highlighted_lines(code, &styles, selected)
+}
+
+fn project_highlighted_lines(
+    code: &str,
+    styles: &[StyleInfo],
+    selected: Option<&BTreeSet<usize>>,
+) -> Vec<Vec<RenderedTextSpan>> {
+    let mut sweep = LineStyleSweep::new(styles);
     let mut lines = Vec::new();
     let mut line_start = 0;
 
-    for raw_line in code.split_inclusive('\n') {
+    for (index, raw_line) in code.split_inclusive('\n').enumerate() {
+        if selected.is_some_and(|selected| !selected.contains(&index)) {
+            lines.push(Vec::new());
+            line_start += raw_line.len();
+            continue;
+        }
         let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
         let line = line.strip_suffix('\r').unwrap_or(line);
         let line_end = line_start + line.len();
-        let mut boundaries = vec![line_start, line_end];
-        for style in &styles {
-            let start = style.start.max(line_start).min(line_end);
-            let end = style.end.max(line_start).min(line_end);
-            if start < end && code.is_char_boundary(start) && code.is_char_boundary(end) {
-                boundaries.push(start);
-                boundaries.push(end);
-            }
-        }
-        boundaries.sort_unstable();
-        boundaries.dedup();
-
-        let mut spans = Vec::new();
-        for range in boundaries.windows(2) {
-            let start = range[0];
-            let end = range[1];
-            if start == end {
-                continue;
-            }
-            let syntax_style = styles
-                .iter()
-                .enumerate()
-                .filter(|(_, style)| style.start <= start && style.end >= end)
-                .min_by(|(left_order, left), (right_order, right)| {
-                    (left.end - left.start)
-                        .cmp(&(right.end - right.start))
-                        .then_with(|| right_order.cmp(left_order))
-                })
-                .map(|(_, style)| style.style.clone());
-            push_span_with_syntax(
-                &mut spans,
-                code[start..end].replace('\t', "    "),
-                syntax_style,
-            );
-        }
-        if spans.is_empty() {
-            push_span_with_syntax(&mut spans, line.replace('\t', "    "), None);
-        }
-        lines.push(spans);
+        lines.push(highlighted_line(
+            code,
+            line_start,
+            line_end,
+            styles,
+            sweep.overlapping(line_start, line_end),
+        ));
         line_start += raw_line.len();
     }
-
     lines
 }
 
-fn wrap_spans(
+fn highlighted_line(
+    code: &str,
+    line_start: usize,
+    line_end: usize,
+    styles: &[StyleInfo],
+    candidates: &[usize],
+) -> Vec<RenderedTextSpan> {
+    let mut boundaries = vec![line_start, line_end];
+    for &index in candidates {
+        let style = &styles[index];
+        let start = style.start.max(line_start).min(line_end);
+        let end = style.end.max(line_start).min(line_end);
+        if start < end && code.is_char_boundary(start) && code.is_char_boundary(end) {
+            boundaries.push(start);
+            boundaries.push(end);
+        }
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let mut spans = Vec::new();
+    for range in boundaries.windows(2) {
+        let start = range[0];
+        let end = range[1];
+        if start == end {
+            continue;
+        }
+        let syntax_style = candidates
+            .iter()
+            .map(|&index| (index, &styles[index]))
+            .filter(|(_, style)| style.start <= start && style.end >= end)
+            .min_by(|(left_order, left), (right_order, right)| {
+                (left.end - left.start)
+                    .cmp(&(right.end - right.start))
+                    .then_with(|| right_order.cmp(left_order))
+            })
+            .map(|(_, style)| style.style.clone());
+        push_span_with_syntax(
+            &mut spans,
+            code[start..end].replace('\t', "    "),
+            syntax_style,
+        );
+    }
+    if spans.is_empty() {
+        push_span_with_syntax(
+            &mut spans,
+            code[line_start..line_end].replace('\t', "    "),
+            None,
+        );
+    }
+    spans
+}
+
+pub(crate) fn wrap_spans(
     spans: &[RenderedTextSpan],
     width: usize,
     first_prefix: &[RenderedTextSpan],
@@ -1388,6 +1631,94 @@ fn push_span_with_syntax(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn legacy_projected_lines(code: &str, styles: &[StyleInfo]) -> Vec<Vec<RenderedTextSpan>> {
+        let all = (0..styles.len()).collect::<Vec<_>>();
+        let mut start = 0;
+        code.split_inclusive('\n')
+            .map(|raw| {
+                let line = raw.strip_suffix('\n').unwrap_or(raw);
+                let line = line.strip_suffix('\r').unwrap_or(line);
+                let spans = highlighted_line(code, start, start + line.len(), styles, &all);
+                start += raw.len();
+                spans
+            })
+            .collect()
+    }
+
+    #[test]
+    fn line_local_highlighting_preserves_capture_precedence_and_sparse_lines() {
+        let code = "alpha\r\nβeta\n\nlast";
+        let style = |start, end, bold, italic| StyleInfo {
+            start,
+            end,
+            style: Style {
+                bold,
+                italic,
+                ..Style::default()
+            },
+        };
+        // Deliberately unordered, nested, duplicate, and multiline captures.
+        let styles = vec![
+            style(7, 12, false, true),
+            style(0, code.len(), false, false),
+            style(0, 5, true, false),
+            style(0, 5, false, true),
+            style(9, 11, true, true),
+        ];
+        let expected = legacy_projected_lines(code, &styles);
+        assert_eq!(project_highlighted_lines(code, &styles, None), expected);
+        assert_eq!(
+            expected[0][0]
+                .syntax_style
+                .as_ref()
+                .map(|style| (style.bold, style.italic)),
+            Some((false, true))
+        );
+        let selected = BTreeSet::from([1, 3]);
+        let sparse = project_highlighted_lines(code, &styles, Some(&selected));
+        for (index, line) in sparse.iter().enumerate() {
+            if selected.contains(&index) {
+                assert_eq!(*line, expected[index]);
+            } else {
+                assert!(line.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn line_style_sweep_does_not_revisit_unrelated_file_captures() {
+        let row_count = 10_000;
+        let styles = (0..row_count)
+            .rev()
+            .map(|row| StyleInfo {
+                start: row * 12,
+                end: row * 12 + 11,
+                style: Style::default(),
+            })
+            .collect::<Vec<_>>();
+        let mut sweep = LineStyleSweep::new(&styles);
+        let candidates = (0..row_count)
+            .map(|row| sweep.overlapping(row * 12, row * 12 + 11).len())
+            .sum::<usize>();
+        assert_eq!(candidates, row_count);
+        assert_eq!(sweep.next, styles.len());
+    }
+
+    #[test]
+    fn line_local_highlighting_matches_real_rust_captures() {
+        let theme = crate::theme::parse_vscode_theme("themes/red.json").unwrap();
+        let mut highlighter = Highlighter::new(&theme).unwrap();
+        let source = (0..150)
+            .map(|i| format!("// item {i}\nfn item_{i}(value: usize) -> usize {{ value + {i} }}\n"))
+            .collect::<String>();
+        let styles = highlighter.highlight("rust", &source).unwrap();
+        assert!(!styles.is_empty());
+        assert_eq!(
+            project_highlighted_lines(&source, &styles, None),
+            legacy_projected_lines(&source, &styles)
+        );
+    }
 
     fn plain(lines: &[RenderedTextLine]) -> Vec<String> {
         lines

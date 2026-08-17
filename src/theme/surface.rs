@@ -77,6 +77,7 @@ impl SurfacePalette {
             bg: Some(background),
             bold,
             italic: false,
+            underline: false,
         };
         Self {
             surface: surface.with_bg(Some(background)),

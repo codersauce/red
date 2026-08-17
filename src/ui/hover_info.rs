@@ -7,8 +7,8 @@ use crate::{
     highlighter::{Highlighter, LanguageRegistry},
     lsp::{Command as LspCommand, CommandLinkGroup},
     plugin::markdown::{
-        render_hover_markdown_lines_with_highlighter, wrap_plain_text, RenderedTextLine,
-        RenderedTextSpan, TextPanelSpanStyle,
+        render_diff_lines_with_highlighter, render_hover_markdown_lines_with_highlighter,
+        wrap_plain_text, RenderedTextLine, RenderedTextSpan, TextPanelSpanStyle,
     },
     theme::{SelectionForegroundPriority, Style, Theme},
     unicode_utils::display_width,
@@ -17,7 +17,7 @@ use crate::{
 use super::{
     dialog::{BorderStyle, Dialog, SurfaceRole},
     geometry::anchored_popup_geometry,
-    paint_rich_text, ActionPriority, Component, UiAction,
+    paint_rich_text, ActionPriority, Component, OverlayLayout, UiAction,
 };
 
 const MAX_PROSE_HOVER_WIDTH: usize = 80;
@@ -31,7 +31,14 @@ pub enum HoverInfoFormat {
 
 pub struct HoverInfo {
     label: String,
+    close_action: Action,
+    inline_navigation: Option<uuid::Uuid>,
+    inline_card: Option<uuid::Uuid>,
+    source_inline_comment: Option<uuid::Uuid>,
+    overlay_layout: Option<OverlayLayout>,
+    shortcuts: Vec<(char, String, Action)>,
     source: String,
+    diff: Option<HoverDiff>,
     format: HoverInfoFormat,
     actions: Vec<HoverAction>,
     line_actions: Vec<Option<usize>>,
@@ -49,6 +56,13 @@ pub struct HoverInfo {
     theme: Theme,
     registry: Arc<LanguageRegistry>,
     dialog: Dialog,
+}
+
+struct HoverDiff {
+    file: String,
+    before: String,
+    after: String,
+    after_label: String,
 }
 
 #[derive(Clone)]
@@ -74,6 +88,7 @@ impl HoverInfo {
         let (lines, line_actions, width) = render_lines(
             &source,
             format,
+            None,
             hover_width_limit(&source, format, viewport_width),
             &theme,
             &editor.language_registry(),
@@ -89,7 +104,14 @@ impl HoverInfo {
         let style = theme.ui_style.dialog.clone();
         let mut info = Self {
             label: "Hover".to_string(),
+            close_action: Action::CloseDialog,
+            inline_navigation: None,
+            inline_card: None,
+            source_inline_comment: None,
+            overlay_layout: None,
+            shortcuts: Vec::new(),
             source,
+            diff: None,
             format,
             selected_action: (!actions.is_empty()).then_some(0),
             actions,
@@ -129,6 +151,61 @@ impl HoverInfo {
         self
     }
 
+    pub(crate) fn with_diff(
+        mut self,
+        file: &str,
+        before: &str,
+        after: &str,
+        after_label: &str,
+    ) -> Self {
+        self.diff = Some(HoverDiff {
+            file: file.into(),
+            before: before.into(),
+            after: after.into(),
+            after_label: after_label.into(),
+        });
+        self.reflow(
+            self.viewport_width,
+            self.viewport_height.saturating_sub(self.viewport_y_offset),
+        );
+        self
+    }
+
+    pub(crate) fn with_close_action(mut self, action: Action) -> Self {
+        self.close_action = action;
+        self.update_chrome();
+        self
+    }
+
+    pub(crate) fn with_inline_navigation(mut self, id: uuid::Uuid) -> Self {
+        self.inline_navigation = Some(id);
+        self.update_chrome();
+        self
+    }
+
+    pub(crate) fn with_inline_card(mut self, id: uuid::Uuid) -> Self {
+        self.inline_card = Some(id);
+        self.update_chrome();
+        self
+    }
+
+    pub(crate) fn with_inline_source(mut self, id: uuid::Uuid, layout: OverlayLayout) -> Self {
+        self.source_inline_comment = Some(id);
+        self.update_overlay_layout(layout);
+        self
+    }
+
+    pub(crate) fn with_shortcut(
+        mut self,
+        key: char,
+        label: impl Into<String>,
+        action: Action,
+    ) -> Self {
+        self.shortcuts.push((key, label.into(), action));
+        self.update_chrome();
+        self
+    }
+
     fn content_height(&self) -> usize {
         self.height.saturating_sub(1)
     }
@@ -157,8 +234,32 @@ impl HoverInfo {
             )
         };
         self.dialog.set_title(Some(title));
-        let mut actions =
-            vec![UiAction::new("close", "Esc", "close").with_priority(ActionPriority::Essential)];
+        let mut actions = vec![UiAction::new(
+            "close",
+            "Esc",
+            if matches!(self.close_action, Action::CloseDialog) {
+                "close"
+            } else {
+                "back"
+            },
+        )
+        .with_priority(ActionPriority::Essential)];
+        for (key, label, _) in &self.shortcuts {
+            actions.push(
+                UiAction::new(format!("shortcut-{key}"), key.to_string(), label)
+                    .with_priority(ActionPriority::Essential),
+            );
+        }
+        if self.inline_navigation.is_some() {
+            actions.push(UiAction::new("previous-inline", "h", "previous inline"));
+            actions.push(UiAction::new("next-inline", "l", "next inline"));
+        }
+        if self.inline_card.is_some() {
+            actions.push(
+                UiAction::new("expand-inline", "Enter", "expand")
+                    .with_priority(ActionPriority::Essential),
+            );
+        }
         if !self.actions.is_empty() {
             actions.push(
                 UiAction::new("open", "Enter", "open").with_priority(ActionPriority::Essential),
@@ -176,17 +277,28 @@ impl HoverInfo {
         let (lines, line_actions, width) = render_lines(
             &self.source,
             self.format,
-            hover_width_limit(&self.source, self.format, viewport_width),
+            self.diff.as_ref(),
+            if self.diff.is_some() {
+                viewport_width.saturating_sub(2).min(MAX_CODE_HOVER_WIDTH)
+            } else {
+                hover_width_limit(&self.source, self.format, viewport_width)
+            },
             &self.theme,
             &self.registry,
             &self.actions,
         );
-        let (x, y, height) = anchored_popup_geometry(
-            self.anchor,
-            viewport_width,
-            viewport_height,
-            width,
-            lines.len().saturating_add(1),
+        let desired_height = lines.len().saturating_add(1);
+        let (x, y, height) = self.overlay_layout.map_or_else(
+            || {
+                anchored_popup_geometry(
+                    self.anchor,
+                    viewport_width,
+                    viewport_height,
+                    width,
+                    desired_height,
+                )
+            },
+            |layout| layout.popup_geometry(width, desired_height),
         );
         self.viewport_width = viewport_width;
         self.viewport_height = viewport_height;
@@ -239,13 +351,16 @@ impl HoverInfo {
     fn activate_action(&self, index: usize) -> Option<KeyAction> {
         let command = self.actions.get(index)?.command.clone();
         Some(KeyAction::Multiple(vec![
-            Action::CloseDialog,
+            self.close_action.clone(),
             Action::ExecuteLspCommand(Box::new(command)),
         ]))
     }
 }
 
 impl Component for HoverInfo {
+    fn inline_comment_id(&self) -> Option<uuid::Uuid> {
+        self.source_inline_comment
+    }
     fn surface_actions(&self) -> Vec<UiAction> {
         self.dialog.actions()
     }
@@ -280,11 +395,45 @@ impl Component for HoverInfo {
     }
 
     fn handle_event(&mut self, event: &Event) -> Option<KeyAction> {
+        if let (Some(id), Event::Key(key)) = (self.inline_card, event) {
+            if key.code == KeyCode::Enter && key.modifiers.is_empty() {
+                return Some(KeyAction::Single(Action::OpenInlineComment(id)));
+            }
+        }
+        if let Event::Key(key) = event {
+            if key.modifiers.is_empty() && key.kind == crossterm::event::KeyEventKind::Press {
+                if let Some((_, _, action)) = self
+                    .shortcuts
+                    .iter()
+                    .find(|(shortcut, _, _)| key.code == KeyCode::Char(*shortcut))
+                {
+                    return Some(KeyAction::Single(action.clone()));
+                }
+            }
+        }
+        if let (Some(id), Event::Key(key)) = (self.inline_navigation, event) {
+            if matches!(
+                key.code,
+                KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l' | '[' | ']')
+            ) && key.modifiers.is_empty()
+            {
+                let backwards = matches!(key.code, KeyCode::Left | KeyCode::Char('h' | '['));
+                return Some(KeyAction::Single(if self.inline_card.is_some() {
+                    Action::NavigateInlineCommentCard { id, backwards }
+                } else {
+                    Action::NavigateOverlappingInlineComment {
+                        id,
+                        backwards,
+                        open: true,
+                    }
+                }));
+            }
+        }
         let redraw = || Some(KeyAction::Single(Action::Refresh));
         match event {
             Event::Key(key) => match (key.code, key.modifiers) {
                 (KeyCode::Esc | KeyCode::Char('q'), _) => {
-                    Some(KeyAction::Single(Action::CloseDialog))
+                    Some(KeyAction::Single(self.close_action.clone()))
                 }
                 (KeyCode::Up | KeyCode::Char('k'), _) => {
                     self.scroll_by(-1);
@@ -352,7 +501,7 @@ impl Component for HoverInfo {
                         }
                         None
                     } else {
-                        Some(KeyAction::Single(Action::CloseDialog))
+                        Some(KeyAction::Single(self.close_action.clone()))
                     }
                 }
                 _ => None,
@@ -362,20 +511,37 @@ impl Component for HoverInfo {
     }
 
     fn resize(&mut self, viewport_width: usize, viewport_height: usize) -> bool {
+        if let Some(layout) = &mut self.overlay_layout {
+            layout.viewport.width = viewport_width;
+            layout.viewport.height = viewport_height;
+        }
         self.reflow(viewport_width, viewport_height);
+        true
+    }
+
+    fn update_overlay_layout(&mut self, layout: OverlayLayout) -> bool {
+        if self.overlay_layout != Some(layout) {
+            self.overlay_layout = Some(layout);
+            self.viewport_y_offset = 0;
+            self.reflow(layout.viewport.width, layout.viewport.height);
+        }
         true
     }
 
     fn set_theme(&mut self, theme: &Theme) {
         self.theme = theme.clone();
         self.dialog.apply_surface_theme(theme, SurfaceRole::Dialog);
-        self.reflow(self.viewport_width, self.viewport_height);
+        self.reflow(
+            self.viewport_width,
+            self.viewport_height.saturating_sub(self.viewport_y_offset),
+        );
     }
 }
 
 fn render_lines(
     source: &str,
     format: HoverInfoFormat,
+    diff: Option<&HoverDiff>,
     available_width: usize,
     theme: &Theme,
     registry: &Arc<LanguageRegistry>,
@@ -385,7 +551,7 @@ fn render_lines(
         return (Vec::new(), Vec::new(), 0);
     }
     let mut highlighter = Highlighter::with_registry(theme, Arc::clone(registry)).ok();
-    let content_lines = match format {
+    let mut content_lines = match format {
         HoverInfoFormat::Markdown => render_hover_markdown_lines_with_highlighter(
             source,
             available_width,
@@ -395,6 +561,23 @@ fn render_lines(
             wrap_plain_text(source, available_width, TextPanelSpanStyle::Text)
         }
     };
+    if let Some(diff) = diff {
+        if !content_lines.is_empty() {
+            content_lines.push(RenderedTextLine::plain(
+                String::new(),
+                TextPanelSpanStyle::Text,
+            ));
+        }
+        content_lines.extend(render_diff_lines_with_highlighter(
+            &diff.file,
+            &diff.before,
+            &diff.after,
+            &diff.after_label,
+            available_width,
+            theme,
+            highlighter.as_mut(),
+        ));
+    }
     let action_lines = actions
         .iter()
         .enumerate()
@@ -497,7 +680,7 @@ fn markdown_rule_prefix_width(line: &RenderedTextLine) -> Option<usize> {
     )
 }
 
-fn render_line(
+pub(crate) fn render_line(
     buffer: &mut RenderBuffer,
     x: usize,
     y: usize,
@@ -506,6 +689,13 @@ fn render_line(
     selected: bool,
     theme: &Theme,
 ) {
+    if let Some(span) = line
+        .spans
+        .first()
+        .filter(|span| span.style == TextPanelSpanStyle::Diff)
+    {
+        buffer.set_text(x, y, &" ".repeat(width), &hover_span_style(span, theme));
+    }
     if selected {
         let selection = theme.list_selection_style();
         let selected_style = theme.selected_style(
@@ -555,16 +745,20 @@ pub(crate) fn hover_span_style(span: &RenderedTextSpan, theme: &Theme) -> Style 
                 ..base.clone()
             },
             TextPanelSpanStyle::Strikethrough => scoped("markup.strikethrough.markdown"),
-            TextPanelSpanStyle::InlineCode | TextPanelSpanStyle::Code => {
-                scoped("markup.raw.block.markdown")
-            }
-            TextPanelSpanStyle::Link => scoped("markup.underline.link.markdown"),
+            TextPanelSpanStyle::InlineCode
+            | TextPanelSpanStyle::Code
+            | TextPanelSpanStyle::Diff => scoped("markup.raw.block.markdown"),
+            TextPanelSpanStyle::Link => theme
+                .get_style("markup.underline.link.markdown")
+                .unwrap_or_else(|| crate::theme::SurfacePalette::new(theme, base).accent),
             TextPanelSpanStyle::Quote | TextPanelSpanStyle::Muted => theme.ui_style.muted.clone(),
         }
     };
     Style {
         fg: requested.fg.or(base.fg),
-        bg: if matches!(
+        bg: if span.style == TextPanelSpanStyle::Diff {
+            requested.bg.or(base.bg)
+        } else if matches!(
             span.style,
             TextPanelSpanStyle::InlineCode | TextPanelSpanStyle::Code
         ) {
@@ -574,6 +768,7 @@ pub(crate) fn hover_span_style(span: &RenderedTextSpan, theme: &Theme) -> Style 
         },
         bold: requested.bold,
         italic: requested.italic,
+        underline: requested.underline || span.style == TextPanelSpanStyle::Link,
     }
 }
 
@@ -594,6 +789,41 @@ mod tests {
             vec![Buffer::new(None, String::new())],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn inline_comment_hover_stays_inside_its_source_window_and_reanchors_on_resize() {
+        let editor = test_editor(Theme::default(), 130, 50);
+        let id = uuid::Uuid::new_v4();
+        let mut layout = OverlayLayout {
+            viewport: super::super::ScreenRect {
+                x: 47,
+                y: 5,
+                width: 48,
+                height: 35,
+            },
+            anchor: (60, 12),
+            avoid_rows: Some((12, 17)),
+            protected_rows: None,
+        };
+        let mut info = HoverInfo::new(
+            &editor,
+            "A full comment. ".repeat(12),
+            HoverInfoFormat::Plaintext,
+            Vec::new(),
+        )
+        .with_inline_source(id, layout);
+        assert_eq!(info.inline_comment_id(), Some(id));
+        assert!(info.x >= 47 && info.x + info.width + 2 <= 95);
+        assert!(info.y > 17 || info.y + info.height + 2 <= 12);
+        layout.viewport.x = 20;
+        layout.viewport.width = 30;
+        layout.anchor.0 = 25;
+        assert!(info.update_overlay_layout(layout));
+        assert!(info.x >= 20 && info.x + info.width + 2 <= 50);
+        let position = (info.x, info.y, info.width, info.height);
+        assert!(info.update_overlay_layout(layout));
+        assert_eq!(position, (info.x, info.y, info.width, info.height));
     }
 
     #[test]
@@ -639,6 +869,114 @@ mod tests {
         assert!(!rendered.contains("└─"));
         assert!(!rendered.contains("│ "));
         assert!(!rendered.contains("rust"));
+    }
+
+    fn text(line: &RenderedTextLine) -> String {
+        line.spans.iter().map(|span| span.text.as_str()).collect()
+    }
+
+    #[test]
+    fn inline_diff_hover_combines_markdown_syntax_and_diff_backgrounds() {
+        for name in ["themes/one-dark-pro.json", "themes/atom-one-light.json"] {
+            let mut theme = crate::theme::parse_vscode_theme(name).unwrap();
+            let keyword = Color::Rgb {
+                r: 19,
+                g: 87,
+                b: 143,
+            };
+            theme.token_styles.insert(
+                0,
+                crate::theme::TokenStyle {
+                    name: None,
+                    scope: vec!["keyword".into()],
+                    style: Style {
+                        fg: Some(keyword),
+                        ..Style::default()
+                    },
+                },
+            );
+            let editor = test_editor(theme.clone(), 120, 40);
+            let before = "fn demo() {\n    return old_name();\n}\n";
+            let after = "fn demo() {\n    return new_name();\n}\n";
+            let info = HoverInfo::new(
+                &editor,
+                "**Rename** the call.".into(),
+                HoverInfoFormat::Markdown,
+                Vec::new(),
+            )
+            .with_diff("main.rs", before, after, "proposed");
+            assert!(info
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.style == TextPanelSpanStyle::Strong));
+            let palette = crate::theme::DiffPalette::new(&theme);
+            for (needle, background) in [
+                ("-    return old_name();", palette.removed.bg),
+                ("+    return new_name();", palette.added.bg),
+            ] {
+                let line = info.lines.iter().find(|line| text(line) == needle).unwrap();
+                assert!(line
+                    .spans
+                    .iter()
+                    .all(|span| hover_span_style(span, &theme).bg == background));
+                assert!(
+                    line.spans.iter().any(|span| span.text.contains("return")
+                        && hover_span_style(span, &theme).fg == Some(keyword)),
+                    "{name}: {line:?}"
+                );
+                let mut frame = RenderBuffer::new(100, 2, &theme.style);
+                render_line(&mut frame, 0, 0, 100, line, false, &theme);
+                assert_eq!(frame.cells[99].style.bg, background);
+            }
+            assert!(info.lines.iter().any(|line| text(line) == "+++ proposed"));
+            assert!(info.lines.iter().any(|line| text(line).starts_with("@@")
+                && line
+                    .spans
+                    .iter()
+                    .all(|span| hover_span_style(span, &theme).bg == palette.hunk.bg)));
+        }
+    }
+
+    #[test]
+    fn inline_diff_hover_preserves_code_and_styles_across_narrow_resize() {
+        let theme = crate::theme::parse_vscode_theme("themes/one-dark-pro.json").unwrap();
+        let editor = test_editor(theme.clone(), 100, 24);
+        let before = "    old_name(\"``` **literal**\");\n";
+        let after = "    new_name(\"``` **literal**\");\n";
+        let mut info = HoverInfo::new(
+            &editor,
+            "A **small** edit.".into(),
+            HoverInfoFormat::Markdown,
+            Vec::new(),
+        )
+        .with_diff("unknown.extension", before, after, "after");
+        assert!(info
+            .lines
+            .iter()
+            .any(|line| text(line) == format!("-{}", before.trim_end())));
+        assert!(info
+            .lines
+            .iter()
+            .any(|line| text(line) == format!("+{}", after.trim_end())));
+        for width in [35, 15, 4, 1, 100] {
+            info.resize(width, 24);
+            assert!(info
+                .lines
+                .iter()
+                .all(|line| line_width(line) <= width.saturating_sub(2)));
+        }
+        let light = crate::theme::parse_vscode_theme("themes/atom-one-light.json").unwrap();
+        info.set_theme(&light);
+        let removed = info
+            .lines
+            .iter()
+            .find(|line| text(line).contains("old_name"))
+            .unwrap();
+        assert_eq!(
+            hover_span_style(&removed.spans[0], &light).bg,
+            crate::theme::DiffPalette::new(&light).removed.bg
+        );
     }
 
     #[test]

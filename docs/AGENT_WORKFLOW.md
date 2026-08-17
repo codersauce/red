@@ -23,60 +23,201 @@ Authentication is verified by `account/read` when the first session starts.
 
 `Space i` is the limited-blast-radius path for code changes, explanations, and
 inline reviews. In
-Normal mode its target is exactly the current line; in Visual and Visual-line
-mode its target is exactly the selection. Visual-block mode is intentionally
+Normal mode its target is the enclosing function when syntax information is
+available, otherwise the current line. The popup identifies the chosen range.
+In Visual and Visual-line mode its target is exactly the selection. Visual-block mode is intentionally
 unsupported. The popup prefers the space below the target and moves above it
 when needed. It remains inside the editor split where the request started and
-never covers the rendered target. Long prompts soft-wrap and grow to six rows;
-after that the prompt scrolls internally to keep the cursor visible.
+avoids the rendered target when space permits. For a function that fills the
+viewport, the popup remains usable near its source anchor. Long prompts use the
+Agent composer's word-aware wrapping and grow to six rows; after that the prompt
+scrolls internally to keep the cursor visible. Up/Down move through visual rows,
+and clicking prompt text places the cursor there. Wrapping and resizing never
+change the submitted text.
 
 Each invocation starts an ephemeral Codex thread with a read-only sandbox, no
-native tools, and two submission tools. `submit_comments` leaves annotations
+native tools, four bounded project-reading tools, and four submission tools.
+`list_files`, `search_files`, and `read_file` inspect the same workspace without
+opening files or moving focus. Unsaved buffers take precedence over disk.
+`read_git_diff` compares one tracked file at `HEAD` with its current buffer,
+including unsaved changes. The response identifies the exact base commit.
+Reading more context does not expand the editable target. Inline requests have
+at most 12 context reads; file reads are limited to 200 lines and 32 KiB per
+response, and files larger than 512 KiB are omitted. Results report truncation.
+Sensitive, ignored, binary, symlinked, and out-of-workspace files are excluded.
+On platforms without the safe on-disk reader, open-buffer reads remain available
+and other disk reads fail closed.
+
+`submit_comments` leaves annotations
 without editing code; `submit_replacement` submits a complete replacement and
-optional annotations about the resulting code. Exactly one submission is
+optional annotations about the resulting code. `request_agent` returns an
+actionable broader-scope result without editing code or replacing earlier
+annotations. Exactly one submission is
 accepted per turn. Comment ranges are one-based and inclusive, relative to the
 supplied target or replacement, and cannot escape it. Codex cannot choose a
 file. Red supplies the immutable target plus at most 20 surrounding
-lines on either side, rejects sensitive/ignored/out-of-workspace and binary
+lines on either side and a bounded recap of the current Agent conversation
+when it belongs to the same workspace. Current buffer contents remain
+authoritative. Red rejects sensitive/ignored/out-of-workspace and binary
 contexts, and accepts at most a 128 KiB complete replacement, 16 comments per
 result, and 4 KiB of plain text per comment. An empty comment list is a valid
 no-findings result. Follow-up
-refinements reuse that ephemeral thread while the popup remains open.
+refinements reuse that ephemeral thread while its job remains available.
+
+### Wider same-file proposals
+
+An invocation started from a cursor may use `propose_expanded_replacement`
+when a local refactor needs a larger range in the same file. An explicit visual
+selection remains exact, including after continuation or recovery. The proposal
+must contain and extend the original target, identify the editor revision, and
+include the exact original text. It cannot choose another file. Red verifies
+the source and retains at most 64 KiB of original text and a 128 KiB replacement.
+
+A wider proposal is never applied automatically, even with its popup open.
+The source marker says **Review wider edit**. Enter or `v` opens the full diff,
+with the original target, proposed range, and reason. `a` in that review
+approves one unsaved, undoable editor transaction. Enter does not approve. `d` in the review or result popup
+declines the proposal; Esc hides it. Both keep the discussion in InlineHistory.
+Changed source disables approval and requires a recheck. Rechecking an
+unapproved proposal starts from the original target, not the proposed range.
+Pending proposals survive normal recovery, but must still pass exact-source
+checks and explicit review. Multi-file work continues through Agent.
+The review renders explanatory Markdown separately from the exact source diff.
+Added and removed rows use Red's Git diff colors; code uses the file's installed
+language highlighter. The applied-change view uses the same rendering, including
+verbatim indentation and readable wrapping in narrow windows.
+
+### Applying inline results
 
 Before applying a response, Red verifies the active buffer identity, revision,
 range, and original text. A stale response fails without changing the buffer.
-Successful output is applied only after a completed turn and full validation.
+Every code-changing result waits for explicit review, including results that
+finish while their dialog is open. Enter opens the proposed diff; `a` applies
+that reviewed request, `d` declines it, and Esc returns or hides it. Enter in
+the diff does not apply it. Successful output is applied only after a completed
+turn and full validation.
 Code changes use one agent-attributed editor transaction and are deliberately
 not saved. Comment-only results do not alter dirty state or text undo history.
-The result controls are Enter/`k` to keep, `u` to undo the latest inline edit
-and dismiss its comments (or just dismiss a comment-only result), `r` to
-refine, and `A` to open the full Agent workflow. Refinement replaces only that
-invocation's visible annotation group. Earlier turns remain in Inline History.
-Closing the popup destroys the ephemeral Codex session, not the retained
-conversation. Kept comments remain available until hidden or resolved.
+After a code edit, Red retains an editor-generated **Applied** summary even when
+the assistant supplied no comments. It shows the number of changed locations and
+whether the buffer is unsaved. Click it, use `Space v`, or open the request in
+InlineHistory to see that edit's exact before/after diff. `[` and `]` move between
+changed locations while the retained source still matches. `u` undoes the edit
+only when its transaction is still the latest change; later work is never silently
+discarded. `Space x` hides the summary, and `p` in InlineHistory restores it.
+Applying and declining also produce actionable bottom-line notices. Completed
+edits remain available after recovery; no provider session is needed.
 
-Use `Space ] c` and `Space [ c` to navigate comments, `Space v` to read the full
-message, `Space x` to dismiss one, and `Space X` to clear the current buffer.
-Overlapping annotations are retained and collapsed into a numbered group; the
-navigation commands select which range its gutter bracket shows. Comments
+The result controls are Esc to close (Enter/`k` are compatibility aliases), `u` to undo the latest inline edit
+and dismiss its comments (or just dismiss a comment-only result), `r` to
+refine, `v` to read the full answer or applied diff, `p` to pin its annotations,
+and `A` to prepare a full Agent
+draft containing the latest request, source location, and earlier inline
+discussion. Nothing is sent automatically; replacing an unsent Agent draft
+requires confirmation and is undoable. Refinement replaces only that
+invocation's visible annotation group. Earlier turns remain in Inline History.
+Clicking away or pressing Esc closes an empty inline prompt immediately. If it
+contains text, choose Delete (the default), Edit, or Save draft. Edit returns to
+the same prompt; Delete affects only unsent text, not earlier results. Closing a
+working popup still hides it without cancelling the job. A source-anchored activity marker shows
+an animated working spinner, ready, or stopped status. Click it, or use `Space v` on its source line,
+to reopen. `Ctrl-c` opens the same draft choices or cancels a running
+request. Several requests can run independently. Explanations and comment-only
+results appear automatically when their source still matches, without changing
+source or focus. Proposed code edits completed while hidden are retained as
+**ready**; reopen, use Enter or `v` to inspect, and `a` in the diff to apply. Changed source disables application and offers a
+fresh recheck or Agent handoff. Kept comments remain until hidden or resolved.
+
+`Space H` opens the unified bottom-docked InlineHistory panel. It includes
+running jobs, ready edits, saved drafts, and completed discussions. Unsubmitted
+drafts live for this editor session; submitted questions and completed results
+use normal history recovery. `:InlineActivity` remains a compatibility alias
+for `:InlineHistory`; there is no separate activity picker.
+
+When a hidden request finishes, the bottom message line shows its outcome and
+a clickable file/range. Click that location, press `Space N` in normal mode,
+or run `:InlineLast` to reopen it. The notice lasts 12 seconds once shown; the shortcut
+still opens the latest completion afterward. Existing errors and command input
+take precedence. Notifications never move focus or apply a proposed edit.
+
+Use `Space ] c` and `Space [ c` to navigate comments across the file,
+`Space v` to read the full message, `Space x` to dismiss
+one, and `Space X` to clear the current buffer. Overlapping annotations are
+retained and collapsed into a group. `‹ 2/4 ›` means the second of four
+overlapping items is current, not a progress count; `✓ Done` is that request's
+completion status. Click `‹` / `›`, or use `[ i` / `] i`, to cycle
+only that group. Click the count to choose from the group's titles. Clicking
+ordinary card text focuses a compact action view; Enter expands it and Esc
+returns to the editor. Left/Right or `h`/`l` cycle that location's items in the
+focused card, full viewer, or result popup; `[` / `]` remain aliases. These keys
+remain ordinary text/cursor input while composing a reply. `i` asks a new inline
+question about that exact comment, `A` asks Agent, `r` refines its discussion,
+`x` dismisses the comment, and `d` resolves its discussion. Each pane remembers
+its current item separately, highlights its card and connector, and advances
+to the next overlapping item after dismissal. Hovering does not change it.
+Opening an item from History makes its annotations current. Comments
 follow edits above them and are marked outdated when their referenced source
 changes. They are never written into source files. Hiding or clearing comments
 does not delete the question or answer.
 
 ### Inline history
 
-Press `Space H` or run `:InlineHistory` to browse retained questions, answers,
-edits, and outcomes. The bottom panel initially shows the current file; `w`
-switches to the workspace session. `j`/`k` previews conversations in the editor,
-`l` expands earlier turns, `h` collapses them, and `/` searches their text.
-`Enter` keeps the selected location; `Esc` restores the original location and
-comment visibility. Browsing never applies an edit or modifies a source file.
+Run `:InlineHistory` or press `Space H` for retained questions, answers, edits,
+and outcomes. The panel starts with the workspace; `w` switches to the current
+file. Running jobs and ready edits come first, with live status and answer
+updates. Rows include their file/range and a source snippet. `j`/`k` or the
+mouse previews items, `l` expands earlier turns, `h` collapses them, and `/`
+fuzzy-searches their text. Enter reopens the conversation or draft; `g` keeps
+the selected source location without opening a dialog. Esc restores the original
+location and comment visibility. Browsing never applies an edit.
+The embedded detail pane renders Markdown, syntax-highlighted source, and the
+same colored diffs as the full review popup. `v` cycles Conversation, Reviewed
+code, Before, Compare, and Changes. Applied/unsaved/source-state labels use
+semantic colors. Click the underlined workspace-relative location (or use `g`)
+to jump to its tracked range; detached ranges are not presented as live links.
+File references in the answer are also clickable. The mouse wheel scrolls the
+detail under the pointer, while `j`/`k` continue browsing requests. Narrow panes
+show one selected request and its position in the list, leaving room for details.
+The conversation view also lists successful context reads, including editor
+revisions and Git base commits, so the answer's sources are inspectable.
+
+Press `p` to pin the previewed turn's annotations and return to
+the source. This also reopens a resolved discussion. It restores only annotations,
+never reruns the agent or reapplies a code edit. Changed source is marked outdated;
+deleted or ambiguous ranges remain in history. The displayed turn is remembered
+across normal recovery, including when you choose an older answer.
+
+In an inline prompt, Ctrl-P/Ctrl-N recall submitted prompts from this
+workspace. Moving forward past the newest entry restores the unsent draft.
+Prompt recall uses retained inline history and survives normal session recovery.
+
+“Continue in Agent” explicitly reveals the conversation pane, leaves the editor
+in normal mode, and loads a reviewable draft. A saved hidden pane or editor zoom
+does not block it. Replacing an unsent Agent draft still requires confirmation;
+nothing is submitted automatically.
+
+When that draft is sent, its `Red inline history reference` links the Agent turn
+back to the original inline request. Keep that reference line if you edit the
+draft. `Space H` then shows the turn's actual editor writes grouped by file,
+with saved/unsaved or changed-since status and clickable locations. Enter opens
+the retained, syntax-colored review: `[` / `]` move between changed locations,
+and `f` / `F` move between files. The Changes view shows all retained diffs.
+Each affected open file gets a change marker; `Space x` or `Space X` hides it,
+and History `p` restores it without applying anything. A completion notification
+and `Space N` reopen the review even after navigating away.
+
+These receipts compare the exact text before and after Agent editor-tool writes,
+not the whole Git diff. Consecutive writes may be combined; interleaved user
+edits remain separate. Agent writes retain their existing save-to-disk behavior.
+Cancellation or failure does not roll back already-applied writes, and the
+receipt says so. Historical review never applies, saves, or bulk-undoes files.
 
 Within history, `v` cycles through the conversation, reviewed source, before-edit
 source, and a reviewed/current comparison. `Ctrl-d`/`Ctrl-u` or Page Down/Up
 scroll the detail. `r` continues the selected discussion, while `R` prepares a
-recheck against current source. Both use a new ephemeral provider thread with
-bounded recovered conversation context and the usual fresh-target guards.
+recheck against current source. Existing running or ready jobs are reopened;
+otherwise a new ephemeral provider thread uses bounded recovered conversation
+context and the usual fresh-target guards.
 Detached source must be selected again explicitly in the editor.
 
 `d` toggles resolved state. `D` asks before forgetting the whole conversation.
@@ -86,7 +227,8 @@ treat them as private workspace data.
 
 History belongs to the editor core and is included in normal recovery snapshots.
 Set top-level `persist_inline_history = false` to keep it in memory only. Pending
-requests become cancelled on recovery; Red never pretends an ephemeral provider
+requests become cancelled on recovery; ready results remain available for
+inspection and guarded application. Red never pretends an ephemeral provider
 thread survived a restart. The store is bounded to 32 MiB and refuses new turns
 before silently dropping old ones. Large repeated annotation source snapshots
 are content-addressed. User-visible assistant prose is retained up to 64 KiB
@@ -110,6 +252,11 @@ In the Agent prompt and conversation footer, Enter sends. Alt+Enter,
 Shift+Enter, and Ctrl+J insert a newline; Ctrl+Enter remains a send alias.
 See [keyboard compatibility](KEYBOARD.md) if a terminal does not report a
 modified Enter distinctly.
+
+The docked composer starts with three input rows and grows with its wrapped
+draft, up to roughly 70% of the Agent pane. Longer drafts scroll within that
+space. It shrinks again when text is removed or sent, and short panes always
+retain room for the conversation.
 
 Open a workspace, press `Space A` (or run `:Agent`), type a request, and press
 Enter. Red lazily starts `codex app-server --stdio`, initializes the connection,
@@ -145,6 +292,11 @@ text for editing; it never submits. If an unsent draft would be replaced, Red
 asks first and defaults to keeping it. An approved replacement is one undoable
 composer edit, so Escape followed by `u` restores the previous draft. `y` copies
 the selected turn's answer; `Y` still copies the whole conversation.
+
+With a transcript selection (`v`, `V`, or a mouse drag), `y` copies and keeps
+your reading position. Enter copies the same selection, returns to the latest
+output, resumes tail-following, and focuses the composer without changing or
+sending its draft.
 
 If Codex cannot start, Red preserves the prompt and offers a retry action.
 Install or update Codex, run `codex login`, then retry without retyping.

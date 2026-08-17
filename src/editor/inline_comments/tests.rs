@@ -21,6 +21,8 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 
+mod current;
+
 fn editor(text: &str, width: usize, height: usize, wrap: bool) -> Editor {
     let defaults: Config = toml::from_str(include_str!("../../../default_config.toml")).unwrap();
     let config = Config {
@@ -112,6 +114,53 @@ fn inline_comment_block_sizes_to_text_with_two_by_one_padding() {
 }
 
 #[test]
+fn inline_comments_keep_their_padding_at_the_viewport_bottom() {
+    let message = "Review this line";
+    let complete = layout(40, 4).with_inline_comments(&[(0, message)], 40, 4);
+    let clipped = layout(40, 4).with_inline_comments(&[(2, message)], 40, 4);
+
+    assert_eq!(clipped.screen_height(), 4);
+    assert_eq!(clipped.inline_comments.len(), 2);
+    assert_eq!(clipped.row(0).unwrap().line, 0);
+    assert_eq!(clipped.row(1).unwrap().line, 1);
+    assert!(clipped.segment_for_cursor(2, 0).is_none());
+    for (visible, original) in clipped
+        .inline_comments
+        .iter()
+        .zip(&complete.inline_comments)
+    {
+        assert_eq!(visible.content, original.content);
+        assert_eq!(visible.block_width, original.block_width);
+        assert_eq!(visible.text_offset, original.text_offset);
+        assert_eq!(visible.starts_connection, original.starts_connection);
+        assert_eq!(visible.row, original.row + 2);
+    }
+    assert_eq!(complete.row(3).unwrap().line, 0);
+}
+
+#[test]
+fn inline_comments_clip_wrapped_previews_without_reflowing_them() {
+    let message = "one two three four five six seven eight nine ten eleven twelve";
+    let complete = layout(16, 7).with_inline_comments(&[(0, message)], 16, 7);
+    let clipped = layout(16, 7).with_inline_comments(&[(2, message)], 16, 7);
+
+    assert_eq!(complete.inline_comments.len(), 6);
+    assert_eq!(clipped.inline_comments.len(), 5);
+    assert_eq!(clipped.screen_height(), 7);
+    for (visible, original) in clipped
+        .inline_comments
+        .iter()
+        .zip(&complete.inline_comments)
+    {
+        assert_eq!(visible.content, original.content);
+        assert_eq!(visible.block_width, original.block_width);
+        assert_eq!(visible.text_offset, original.text_offset);
+    }
+    assert!(clipped.inline_comments[4].content.text().ends_with('…'));
+    assert_eq!(complete.row(6).unwrap().line, 0);
+}
+
+#[test]
 fn inline_comments_wrap_but_always_leave_the_source_visible() {
     assert_eq!(
         super::super::display_layout::wrap_inline_comment("words stay together", 11),
@@ -166,7 +215,7 @@ fn inline_comment_rendering_is_not_a_text_edit() {
             .collect::<String>(),
         "╭───"
     );
-    let comment_style = editor.theme.inline_comment_style();
+    let comment_style = editor.theme.current_inline_comment_style();
     assert_ne!(comment_style.bg, editor.theme.style.bg);
     for comment in &layout.inline_comments {
         let cells = &frame.cells[comment.row * 60..(comment.row + 1) * 60];
@@ -236,6 +285,7 @@ fn inline_comment_surfaces_and_faded_guides_follow_dark_and_light_themes() {
         editor.theme.style.bg = Some(background);
         editor.cy = 1;
         editor.set_inline_comment("This comment wraps onto several rows in a narrow editor.");
+        editor.set_active_inline_comment(None);
         let mut frame = RenderBuffer::new(40, 10, &Style::default());
         editor.render(&mut frame).unwrap();
         let window = editor.active_window_with_editor_view().unwrap();
@@ -320,7 +370,7 @@ fn inline_comment_half_height_edges_fall_back_to_solid_padding_in_ascii_mode() {
         );
         assert!(cells[x..x + comment.block_width]
             .iter()
-            .all(|cell| cell.style.bg == editor.theme.inline_comment_style().bg));
+            .all(|cell| cell.style.bg == editor.theme.current_inline_comment_style().bg));
         if !matches!(comment.content, InlineCommentContent::Text(_)) {
             assert!(cells[x..x + comment.block_width]
                 .iter()
@@ -447,17 +497,116 @@ fn inline_comments_keep_bottom_cursor_visible_in_both_wrap_modes() {
         assert_eq!(editor.buffer_line(), 5);
         assert!(editor.visible_cursor_segment(5, 0));
         let window = editor.active_window_with_editor_view().unwrap();
-        assert!(editor
-            .layout_for_window(&window)
+        let layout = editor.layout_for_window(&window);
+        let comment_rows = layout
             .inline_comments
             .iter()
-            .any(|comment| comment.line == 5));
+            .filter(|comment| comment.line == 5)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            comment_rows.first().unwrap().content,
+            InlineCommentContent::TopEdge
+        );
+        assert_eq!(
+            comment_rows.last().unwrap().content,
+            InlineCommentContent::BottomEdge
+        );
         assert!(editor.vtop > 0);
         editor.test_set_size(24, 6);
         editor.check_bounds();
         assert_eq!(editor.buffer_line(), 5);
         assert!(editor.visible_cursor_segment(5, 0));
     }
+}
+
+#[tokio::test]
+async fn inline_comments_do_not_pin_mouse_wheel_scrolling_to_the_cursor() {
+    let text = (0..300)
+        .map(|line| format!("line {line}: source text that wraps in the narrow editor\n"))
+        .collect::<String>();
+    for wrap in [false, true] {
+        for (width, height, scrolloff) in [
+            (80, 14, 0),
+            (80, 14, 3),
+            (32, 8, 0),
+            (32, 8, 3),
+            (32, 8, 20),
+        ] {
+            let mut editor = editor(&text, width, height, wrap);
+            editor.config.scrolloff = Some(scrolloff);
+            for line in [210, 220, 230, 240, 250] {
+                let comment = editor.make_inline_comment(
+                    line,
+                    line + 2,
+                    "A source-linked annotation that wraps across several rows in a narrow pane."
+                        .into(),
+                    InlineCommentOrigin::Sample,
+                );
+                editor.inline_comments.push(comment);
+            }
+            editor.layout_cache.borrow_mut().clear();
+            editor.test_set_viewport_cursor(230, 0, 0);
+            let window = editor.active_window_with_editor_view().unwrap();
+            let layout = editor.layout_for_window(&window);
+            let last = layout.rows.last().unwrap();
+            editor
+                .test_execute_event(Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: (window.position.x + editor.gutter_width_for_window(&window) + 1)
+                        as u16,
+                    row: editor.window_to_terminal_y(&window, last.row) as u16,
+                    modifiers: KeyModifiers::NONE,
+                }))
+                .await
+                .unwrap();
+
+            for kind in [MouseEventKind::ScrollUp, MouseEventKind::ScrollDown] {
+                for _ in 0..12 {
+                    let old_top = editor.vtop;
+                    let expected = if kind == MouseEventKind::ScrollUp {
+                        old_top - 3
+                    } else {
+                        old_top + 3
+                    };
+                    editor
+                        .test_execute_event(Event::Mouse(MouseEvent {
+                            kind,
+                            column: (window.position.x + 12) as u16,
+                            row: editor.window_to_terminal_y(&window, 2) as u16,
+                            modifiers: KeyModifiers::NONE,
+                        }))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        editor.vtop,
+                        expected,
+                        "{kind:?}: width={width}, height={height}, wrap={wrap}, scrolloff={scrolloff}, cursor={}",
+                        editor.buffer_line()
+                    );
+                    assert!(editor.visible_cursor_segment(
+                        editor.buffer_line(),
+                        editor.current_cursor_display_col()
+                    ));
+                }
+            }
+            assert_eq!(editor.current_buffer().contents(), text);
+        }
+    }
+}
+
+#[test]
+fn wheel_cursor_clamping_preserves_a_visible_wrapped_segment_boundary() {
+    let text = format!("{}\n", "source_text ".repeat(16));
+    let mut editor = editor(&text, 40, 12, true);
+    let segments = editor.wrapped_line_segments_for_width(0, editor.active_content_width());
+    let cursor = segments[1].start_grapheme;
+    editor.test_set_viewport_cursor(0, cursor, 0);
+
+    editor.clamp_cursor_to_scrolled_viewport();
+
+    assert_eq!(editor.cx, cursor);
+    assert_eq!(editor.vtop, 0);
+    assert!(editor.visible_cursor_segment(0, editor.current_cursor_display_col()));
 }
 
 #[tokio::test]
@@ -586,9 +735,19 @@ fn inline_comment_navigation_preserves_treesitter_class_motions() {
         nested(&editor.config.keys.normal, "[", "c"),
         Some(KeyAction::Single(Action::MoveToPreviousClass))
     );
+    assert_eq!(
+        nested(&editor.config.keys.normal, "]", "i"),
+        Some(KeyAction::Single(Action::NextOverlappingInlineComment))
+    );
+    assert_eq!(
+        nested(&editor.config.keys.normal, "[", "i"),
+        Some(KeyAction::Single(Action::PreviousOverlappingInlineComment))
+    );
     let Some(KeyAction::Nested(leader)) = editor.config.keys.normal.get(" ") else {
         panic!("missing leader");
     };
+    assert_eq!(nested(leader, "]", "i"), None);
+    assert_eq!(nested(leader, "[", "i"), None);
     assert_eq!(
         nested(leader, "]", "c"),
         Some(KeyAction::Single(Action::NextInlineComment))
@@ -601,6 +760,8 @@ fn inline_comment_navigation_preserves_treesitter_class_motions() {
 
 fn begin_assist(editor: &mut Editor, range: TextRange, request: &str, group: &str) {
     editor.inline_assist = Some(super::super::InlineAssistSession {
+        parent_comment: None,
+        allow_expansion: false,
         buffer_id: editor.current_buffer().id(),
         window_id: editor.window_manager.active_stable_window_id().unwrap(),
         expected_revision: editor.current_buffer().revision(),
@@ -625,6 +786,276 @@ fn note(start: usize, end: usize, message: &str) -> InlineCommentInput {
 }
 
 #[tokio::test]
+async fn inline_overlap_navigation_has_stable_mouse_and_keyboard_targets() {
+    let original = "alpha\nbeta\ngamma\ndelta\nepsilon\n";
+    let mut editor = editor(original, 100, 24, false);
+    editor.replace_inline_comment_group(
+        "overlap",
+        "provider",
+        "request",
+        0,
+        &[
+            note(1, 2, "First"),
+            note(2, 3, "Second"),
+            note(3, 3, "Third"),
+        ],
+    );
+    let ids = editor
+        .inline_comments
+        .iter()
+        .map(|comment| comment.id)
+        .collect::<Vec<_>>();
+    editor.replace_inline_comment_group(
+        "separate",
+        "provider",
+        "other",
+        0,
+        &[note(5, 5, "Elsewhere")],
+    );
+    editor.select_inline_comment_for_group("overlap");
+    assert_eq!(editor.current_inline_navigation(), Some((ids[0], 1, 3)));
+    editor.move_to_text_position(TextPosition::new(2, 0));
+    assert_eq!(editor.current_inline_navigation(), Some((ids[0], 1, 3)));
+    assert_eq!(
+        editor.cycle_overlapping_inline_comment(ids[0], true),
+        Some(ids[2])
+    );
+    assert_eq!(
+        editor.cycle_overlapping_inline_comment(ids[2], false),
+        Some(ids[0])
+    );
+
+    editor.sync_to_window();
+    let window = editor.active_window_with_editor_view().unwrap();
+    let layout = editor.layout_for_window(&window);
+    let header = layout
+        .inline_comments
+        .iter()
+        .find(|row| row.starts_connection)
+        .unwrap();
+    assert!(header.content.text().contains("‹ 1/3 ›"));
+    assert_eq!(
+        editor.inline_comment_click_action(header, header.text_offset),
+        Some(Action::NavigateOverlappingInlineComment {
+            id: ids[0],
+            backwards: true,
+            open: false
+        })
+    );
+    assert_eq!(
+        editor.inline_comment_click_action(header, header.text_offset + 6),
+        Some(Action::NavigateOverlappingInlineComment {
+            id: ids[0],
+            backwards: false,
+            open: false
+        })
+    );
+    assert_eq!(
+        editor.inline_comment_click_action(header, header.text_offset - 1),
+        None
+    );
+    editor
+        .test_execute_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: (window.position.x
+                + editor.gutter_width_for_window(&window)
+                + 1
+                + header.text_offset
+                + 6) as u16,
+            row: editor.window_to_terminal_y(&window, header.row) as u16,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(editor.current_inline_navigation(), Some((ids[1], 2, 3)));
+
+    editor.sync_to_window();
+    let window = editor.active_window_with_editor_view().unwrap();
+    let layout = editor.layout_for_window(&window);
+    let body = layout
+        .inline_comments
+        .iter()
+        .find(|row| row.content.text() == "Second")
+        .unwrap();
+    editor
+        .test_execute_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: (window.position.x
+                + editor.gutter_width_for_window(&window)
+                + 1
+                + body.text_offset) as u16,
+            row: editor.window_to_terminal_y(&window, body.row) as u16,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .await
+        .unwrap();
+    let next = editor
+        .current_dialog
+        .as_mut()
+        .unwrap()
+        .handle_event(&Event::Key(KeyEvent::new(
+            KeyCode::Char(']'),
+            KeyModifiers::NONE,
+        )));
+    assert_eq!(
+        next,
+        Some(KeyAction::Single(Action::NavigateInlineCommentCard {
+            id: ids[1],
+            backwards: false,
+        }))
+    );
+    let Some(KeyAction::Single(next)) = next else {
+        panic!("expected navigation")
+    };
+    editor.test_execute_production_action(next).await.unwrap();
+    assert_eq!(editor.current_inline_navigation(), Some((ids[2], 3, 3)));
+    editor
+        .test_execute_production_action(Action::CloseDialog)
+        .await
+        .unwrap();
+    for key in [']', 'i'] {
+        editor
+            .test_execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(key),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+    }
+    assert_eq!(editor.current_inline_navigation(), Some((ids[0], 1, 3)));
+    for key in ['[', 'i'] {
+        editor
+            .test_execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(key),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+    }
+    assert_eq!(editor.current_inline_navigation(), Some((ids[2], 3, 3)));
+    assert_eq!(editor.current_buffer().contents(), original);
+    assert!(!editor.current_buffer().is_dirty());
+}
+
+#[test]
+fn inline_pager_hit_targets_follow_the_rendered_counter() {
+    for ascii in [false, true] {
+        let pager = InlinePager::new(12, 123, ascii);
+        let label = format!("{} · Space v", pager.text);
+        assert_eq!(
+            pager.text,
+            if ascii {
+                "< 12/123 >"
+            } else {
+                "‹ 12/123 ›"
+            }
+        );
+        assert_eq!(pager.direction_at(&label, 0), Some(true));
+        assert_eq!(pager.direction_at(&label, 3), None);
+        assert_eq!(
+            pager.direction_at(&label, pager.next_start + 1),
+            Some(false)
+        );
+        assert_eq!(pager.direction_at(&label, pager.next_start + 4), None);
+    }
+}
+
+fn full_comment_rect(editor: &Editor, width: usize, height: usize) -> (usize, usize, usize, usize) {
+    let mut frame = RenderBuffer::new(width, height, &Style::default());
+    editor
+        .current_dialog
+        .as_ref()
+        .unwrap()
+        .draw(&mut frame)
+        .unwrap();
+    let first = frame.cells.iter().position(|cell| cell.c == '┌').unwrap();
+    let (x, y) = (first % width, first / width);
+    let right = frame.cells[first..(y + 1) * width]
+        .iter()
+        .position(|cell| cell.c == '┐')
+        .unwrap();
+    let bottom = (y..height)
+        .find(|row| frame.cells[row * width + x].c == '└')
+        .unwrap();
+    (x, y, right + 1, bottom - y + 1)
+}
+
+#[tokio::test]
+async fn cycling_full_comments_uses_the_same_source_geometry_as_a_fresh_open() {
+    for wrap in [false, true] {
+        let source = (0..35)
+            .map(|line| format!("source line {line}\n"))
+            .collect::<String>();
+        let mut editor = editor(&source, 100, 46, wrap);
+        editor.replace_inline_comment_group(
+            "leading",
+            "provider",
+            "leading",
+            0,
+            &[note(
+                2,
+                3,
+                &"An earlier annotation adds real display rows. ".repeat(4),
+            )],
+        );
+        editor.replace_inline_comment_group(
+            "first",
+            "provider",
+            "first",
+            0,
+            &[note(9, 13, &"The longer original explanation. ".repeat(5))],
+        );
+        let first = editor.inline_comments.last().unwrap().id;
+        editor.replace_inline_comment_group(
+            "second",
+            "provider",
+            "second",
+            0,
+            &[note(9, 13, "A shorter explanation.")],
+        );
+        let second = editor.inline_comments.last().unwrap().id;
+        editor
+            .test_execute_production_action(Action::OpenInlineComment(second))
+            .await
+            .unwrap();
+        let initial = full_comment_rect(&editor, 100, 46);
+        for (from, backwards, selected) in [(second, false, first), (first, true, second)] {
+            editor
+                .test_execute_production_action(Action::NavigateOverlappingInlineComment {
+                    id: from,
+                    backwards,
+                    open: true,
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                editor.current_dialog.as_ref().unwrap().inline_comment_id(),
+                Some(selected)
+            );
+            let cycled = full_comment_rect(&editor, 100, 46);
+            let layout = editor.inline_comment_overlay_layout(selected).unwrap();
+            let (start, end) = layout.avoid_rows.unwrap();
+            assert!(
+                cycled.1 + cycled.3 <= start || cycled.1 > end,
+                "viewer should avoid its source when space permits"
+            );
+            editor.current_dialog = None;
+            editor
+                .test_execute_production_action(Action::OpenInlineComment(selected))
+                .await
+                .unwrap();
+            assert_eq!(
+                cycled,
+                full_comment_rect(&editor, 100, 46),
+                "cycling must not use modal-hidden cursor coordinates"
+            );
+        }
+        assert_eq!(initial, full_comment_rect(&editor, 100, 46));
+        assert_eq!(editor.current_buffer().contents(), source);
+    }
+}
+
+#[tokio::test]
 async fn inline_comment_only_result_is_kept_without_a_text_transaction() {
     let mut editor = editor("alpha\nbeta\ngamma\n", 70, 16, false);
     begin_assist(
@@ -640,6 +1071,8 @@ async fn inline_comment_only_result_is_kept_without_a_text_transaction() {
             "review",
             "test-session",
             &InlineAssistResult {
+                expanded_scope: None,
+                needs_agent: None,
                 replacement: None,
                 comments: vec![note(1, 2, "Both lines")],
             },
@@ -671,6 +1104,8 @@ async fn inline_comment_only_result_is_kept_without_a_text_transaction() {
             "review",
             "test-session",
             &InlineAssistResult {
+                expanded_scope: None,
+                needs_agent: None,
                 replacement: None,
                 comments: vec![note(1, 1, "Duplicate")]
             },
@@ -702,6 +1137,8 @@ async fn inline_mixed_result_validates_before_editing_and_undo_removes_its_group
     let mut frame = RenderBuffer::new(70, 16, &Style::default());
     let mut runtime = Runtime::new();
     let mut result = InlineAssistResult {
+        expanded_scope: None,
+        needs_agent: None,
         replacement: Some("one\ntwo\n".into()),
         comments: vec![note(3, 3, "Outside")],
     };
@@ -745,6 +1182,8 @@ async fn inline_comment_refinement_replaces_only_its_own_group() {
                 request,
                 "test-session",
                 &InlineAssistResult {
+                    expanded_scope: None,
+                    needs_agent: None,
                     replacement: None,
                     comments: vec![note(1, 2, message)],
                 },
@@ -764,7 +1203,7 @@ async fn inline_comment_refinement_replaces_only_its_own_group() {
     assert!(
         editor.inline_comment_display_messages(editor.current_buffer())[0]
             .1
-            .contains("[2/2]")
+            .contains("‹ 2/2 ›")
     );
     editor.inline_assist.as_mut().unwrap().request_id = Some("refine".into());
     editor
@@ -772,6 +1211,8 @@ async fn inline_comment_refinement_replaces_only_its_own_group() {
             "refine",
             "test-session",
             &InlineAssistResult {
+                expanded_scope: None,
+                needs_agent: None,
                 replacement: None,
                 comments: vec![note(1, 1, "Refined")],
             },

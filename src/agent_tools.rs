@@ -76,6 +76,12 @@ pub enum EditorActionName {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "tool", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EditorToolCall {
+    /// Internal, request-bound read-only inspection for an inline provider.
+    #[serde(skip)]
+    InlineContext {
+        request_id: String,
+        call: crate::inline_context::InlineContextCall,
+    },
     /// Read the authoritative visible contents of a workspace file.
     ReadFile {
         /// Workspace-relative or accepted absolute path.
@@ -159,6 +165,7 @@ impl EditorToolCall {
     /// Formats a bounded user-facing description of the in-progress call.
     pub fn activity_title(&self) -> String {
         match self {
+            Self::InlineContext { .. } => "Inspecting inline context".to_string(),
             Self::ReadFile { path } => format!("Reading {path}"),
             Self::WriteFile { path, .. } => format!("Writing {path}"),
             Self::GetEditorState {} => "Inspecting editor state".to_string(),

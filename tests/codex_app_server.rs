@@ -164,9 +164,10 @@ for line in sys.stdin:
         assert message["params"]["ephemeral"] is True
         assert message["params"]["sandbox"] == "read-only"
         tools = message["params"]["dynamicTools"]
-        assert len(tools) == 2
+        assert len(tools) == 8
         assert tools[0]["name"] == "submit_replacement"
         assert tools[1]["name"] == "submit_comments"
+        assert {tool["name"] for tool in tools[2:]} == {"request_agent", "propose_expanded_replacement", "list_files", "search_files", "read_file", "read_git_diff"}
         assert "inline code editor" in message["params"]["baseInstructions"]
         send({"id": ident, "result": {"thread": {"id": "inline-red"}}})
     elif method == "turn/start":

@@ -26,6 +26,7 @@ fn foreground_style(base: &Style, semantic: &Style) -> Style {
         bg: base.bg,
         bold: base.bold || semantic.bold,
         italic: base.italic || semantic.italic,
+        underline: base.underline || semantic.underline,
     }
 }
 

@@ -92,6 +92,7 @@ impl WindowBarStyle {
             }
             resolved.bold = concrete.bold;
             resolved.italic = concrete.italic;
+            resolved.underline = concrete.underline;
         }
         resolved
     }

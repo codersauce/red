@@ -6,6 +6,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{buffer::BufferId, inline_assist::InlineAssistResult, undo::TextRange};
 
+mod agent_outcome;
+pub(crate) mod comment_context;
+pub(crate) use agent_outcome::MAX_IMAGE_BYTES as MAX_AGENT_IMAGE_BYTES;
+pub use agent_outcome::{InlineAgentEdit, InlineAgentFile, InlineAgentOutcome, InlineAgentState};
+pub use comment_context::InlineCommentContext;
+
 pub const MAX_HISTORY_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_ANSWER_BYTES: usize = 64 * 1024;
 const TURN_RESERVE_BYTES: usize = 6 * 1024 * 1024;
@@ -26,7 +32,15 @@ pub enum HistoryAction {
     ScrollDown,
     ScrollUp,
     CycleView,
+    FollowFile {
+        path: String,
+        line: Option<usize>,
+        column: Option<usize>,
+    },
     Jump,
+    Open,
+    ShowAnnotations,
+    Select(usize),
     Close,
     Continue,
     Recheck,
@@ -36,13 +50,48 @@ pub enum HistoryAction {
     Export(String),
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum HistoryView {
+    #[default]
+    Conversation,
+    Reviewed,
+    Before,
+    Compare,
+    Changes,
+}
+
+impl HistoryView {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Conversation => Self::Reviewed,
+            Self::Reviewed => Self::Before,
+            Self::Before => Self::Compare,
+            Self::Compare => Self::Changes,
+            Self::Changes => Self::Conversation,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Conversation => "Conversation",
+            Self::Reviewed => "Reviewed code",
+            Self::Before => "Before",
+            Self::Compare => "Compare",
+            Self::Changes => "Changes",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InlineTurnState {
     Pending,
+    /// The provider finished, but the editor has not applied the result.
+    Ready,
     Completed,
     Failed,
     Cancelled,
+    Declined,
     Rejected,
 }
 
@@ -89,8 +138,54 @@ pub struct InlineLocation {
     pub buffer_id: Option<BufferId>,
 }
 
+/// Character offsets into the retained post-edit text, not the current buffer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InlineChangeHunk {
+    pub start_char: usize,
+    pub end_char: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InlineChangeSummary {
+    pub hunks: Vec<InlineChangeHunk>,
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+impl InlineChangeSummary {
+    pub fn new(before: &str, after: &str) -> Self {
+        let mut offsets = vec![0];
+        for line in after.split_inclusive('\n') {
+            offsets.push(offsets.last().copied().unwrap_or(0) + line.chars().count());
+        }
+        let diff = similar::TextDiff::from_lines(before, after);
+        let hunks = diff
+            .ops()
+            .iter()
+            .filter(|op| op.tag() != similar::DiffTag::Equal)
+            .map(|op| {
+                let range = op.new_range();
+                InlineChangeHunk {
+                    start_char: offsets[range.start],
+                    end_char: offsets[range.end],
+                }
+            })
+            .collect();
+        Self {
+            hunks,
+            hidden: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InlineHistoryTurn {
+    /// Immutable provenance for a new discussion started from one annotation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_comment: Option<Box<InlineCommentContext>>,
+    /// False for explicit selections and records created before scope expansion.
+    #[serde(default)]
+    pub allow_expansion: bool,
     pub request_id: String,
     pub created_at_ms: u64,
     pub prompt: String,
@@ -98,9 +193,18 @@ pub struct InlineHistoryTurn {
     pub answer: String,
     #[serde(default)]
     pub answer_truncated: bool,
+    /// Bounded provenance labels for successful read-only context tools.
+    #[serde(default)]
+    pub context_reads: Vec<String>,
+    /// Exact editor-tool receipts for explicitly linked Agent continuations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_outcomes: Vec<InlineAgentOutcome>,
     pub before: String,
     pub original_range: TextRange,
     pub location: InlineLocation,
+    /// Verified wider proposal location; it grants no edit authority until review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expanded_location: Option<InlineLocation>,
     pub state: InlineTurnState,
     #[serde(default)]
     pub disposition: InlineDisposition,
@@ -109,6 +213,8 @@ pub struct InlineHistoryTurn {
     pub error: Option<String>,
     #[serde(default)]
     pub transaction_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_summary: Option<InlineChangeSummary>,
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
@@ -122,6 +228,69 @@ pub struct InlineHistoryTurn {
 }
 
 impl InlineHistoryTurn {
+    pub(crate) fn new(
+        request_id: String,
+        prompt: String,
+        before: String,
+        location: InlineLocation,
+    ) -> Self {
+        Self {
+            parent_comment: None,
+            allow_expansion: false,
+            request_id,
+            created_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            prompt,
+            answer: String::new(),
+            answer_truncated: false,
+            context_reads: Vec::new(),
+            agent_outcomes: Vec::new(),
+            before,
+            original_range: location.range,
+            location,
+            expanded_location: None,
+            state: InlineTurnState::Pending,
+            disposition: InlineDisposition::Kept,
+            result: None,
+            error: None,
+            transaction_id: None,
+            change_summary: None,
+            session_id: None,
+            hidden_comments: Vec::new(),
+            comment_fingerprints: Vec::new(),
+            comment_locations: Vec::new(),
+            comment_source_ids: Vec::new(),
+        }
+    }
+
+    pub fn has_code_change(&self) -> bool {
+        self.state == InlineTurnState::Completed
+            && self.transaction_id.is_some()
+            && self.reviewed() != self.before
+    }
+
+    pub fn change_diff(&self) -> String {
+        similar::TextDiff::from_lines(self.before.as_str(), self.reviewed())
+            .unified_diff()
+            .header("before inline edit", "after inline edit")
+            .to_string()
+    }
+
+    /// Upgrade older retained edits without needing the provider session.
+    pub fn ensure_change_summary(&mut self) {
+        if self.change_summary.is_none() && self.has_code_change() {
+            self.change_summary = Some(InlineChangeSummary::new(&self.before, self.reviewed()));
+        }
+    }
+    pub(crate) fn locations_mut(&mut self) -> impl Iterator<Item = &mut InlineLocation> {
+        std::iter::once(&mut self.location)
+            .chain(self.expanded_location.iter_mut())
+            .chain(self.comment_locations.iter_mut())
+    }
     pub fn reviewed(&self) -> &str {
         self.result
             .as_ref()
@@ -129,7 +298,46 @@ impl InlineHistoryTurn {
             .unwrap_or(&self.before)
     }
 
+    pub fn proposed_edit(&self) -> Option<(&str, &str)> {
+        if self.state == InlineTurnState::Completed {
+            return None;
+        }
+        let result = self.result.as_ref()?;
+        let before = result
+            .expanded_scope
+            .as_ref()
+            .map_or(self.before.as_str(), |scope| scope.before.as_str());
+        result
+            .replacement
+            .as_deref()
+            .filter(|replacement| *replacement != before)
+            .map(|after| (before, after))
+    }
+
+    pub fn proposal_description(&self) -> String {
+        let expanded = self
+            .result
+            .as_ref()
+            .and_then(|result| result.expanded_scope.as_ref());
+        let heading = expanded.map_or_else(|| "Proposed edit · not applied".into(), |scope| format!(
+            "Wider edit proposed · not applied\n\n{}:{}–{}\n\nOriginal target: lines {}–{}\n\nReason: {}",
+            self.location.file, scope.start_line, scope.end_line, self.original_range.start.line + 1,
+            self.original_range.end.line + usize::from(self.original_range.end.character > 0), scope.reason));
+        if self.answer.trim().is_empty() {
+            heading
+        } else {
+            format!("{}\n\n{heading}", self.answer)
+        }
+    }
+
     pub fn answer_text(&self) -> String {
+        if let Some((before, replacement)) = self.proposed_edit() {
+            let diff = similar::TextDiff::from_lines(before, replacement)
+                .unified_diff()
+                .header("before", "proposed")
+                .to_string();
+            return format!("{}\n\n{diff}", self.proposal_description());
+        }
         if !self.answer.trim().is_empty() {
             return if self.answer_truncated {
                 format!("{}\n[answer exceeded the retained-text limit]", self.answer)
@@ -138,6 +346,9 @@ impl InlineHistoryTurn {
             };
         }
         if let Some(result) = &self.result {
+            if let Some(reason) = &result.needs_agent {
+                return reason.clone();
+            }
             let comments = result
                 .comments
                 .iter()
@@ -163,13 +374,37 @@ impl InlineHistoryTurn {
     }
 
     pub fn status(&self) -> &'static str {
+        if let Some(outcome) = self.agent_outcomes.last() {
+            return outcome.state.label();
+        }
+        if matches!(
+            self.state,
+            InlineTurnState::Completed | InlineTurnState::Ready
+        ) && self
+            .result
+            .as_ref()
+            .is_some_and(|result| result.needs_agent.is_some())
+        {
+            return "needs Agent";
+        }
         match (self.state, self.disposition) {
             (InlineTurnState::Pending, _) => "pending",
+            (InlineTurnState::Ready, _)
+                if self
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| !result.changes_text(&self.before)) =>
+            {
+                "answered"
+            }
+            (InlineTurnState::Ready, _) => "ready",
             (InlineTurnState::Failed, _) => "failed",
             (InlineTurnState::Cancelled, _) => "cancelled",
+            (InlineTurnState::Declined, _) => "declined",
             (InlineTurnState::Rejected, _) => "not applied",
             (_, InlineDisposition::Undone) => "undone",
             (_, InlineDisposition::Superseded) => "superseded",
+            (_, InlineDisposition::Kept) if self.has_code_change() => "applied",
             (_, InlineDisposition::Kept) => "kept",
         }
     }
@@ -183,6 +418,9 @@ pub struct InlineConversation {
     pub turns: Vec<InlineHistoryTurn>,
     #[serde(default)]
     pub resolved: bool,
+    /// Explicitly displayed historical turn; None follows the latest kept result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visible_request: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -267,7 +505,10 @@ impl InlineHistory {
 
     pub fn finish(&mut self, request: &str, state: InlineTurnState, error: Option<String>) {
         if let Some(turn) = self.turn_mut(request) {
-            if turn.state == InlineTurnState::Pending {
+            if matches!(
+                turn.state,
+                InlineTurnState::Pending | InlineTurnState::Ready
+            ) {
                 turn.state = state;
                 turn.error = error;
             }
@@ -280,13 +521,19 @@ impl InlineHistory {
             .iter_mut()
             .flat_map(|conversation| &mut conversation.turns)
         {
-            turn.location.buffer_id = None;
-            for location in &mut turn.comment_locations {
+            for location in turn.locations_mut() {
                 location.buffer_id = None;
             }
             if turn.state == InlineTurnState::Pending {
                 turn.state = InlineTurnState::Cancelled;
                 turn.error = Some("The editor stopped before this request completed.".into());
+            }
+            for outcome in &mut turn.agent_outcomes {
+                if outcome.state == InlineAgentState::Running {
+                    outcome.state = InlineAgentState::Cancelled;
+                    outcome.error =
+                        Some("The editor stopped before the Agent turn completed.".into());
+                }
             }
         }
     }
@@ -306,7 +553,25 @@ impl InlineHistory {
             );
         }
         for conversation in &self.conversations {
+            ensure!(
+                conversation
+                    .visible_request
+                    .as_deref()
+                    .is_none_or(|request| conversation
+                        .turns
+                        .iter()
+                        .any(|turn| turn.request_id == request
+                            && (turn.state == InlineTurnState::Completed
+                                || !turn.agent_outcomes.is_empty()))),
+                "invalid visible inline history request"
+            );
             for turn in &conversation.turns {
+                if let Some(context) = &turn.parent_comment {
+                    context.validate()?;
+                }
+                for outcome in &turn.agent_outcomes {
+                    outcome.validate()?;
+                }
                 ensure!(
                     requests.insert(&turn.request_id),
                     "duplicate inline history request"
@@ -321,6 +586,18 @@ impl InlineHistory {
                     turn.location.start_char <= turn.location.end_char,
                     "invalid inline history location"
                 );
+                if let Some(summary) = &turn.change_summary {
+                    let length = turn.reviewed().chars().count();
+                    ensure!(
+                        turn.has_code_change()
+                            && summary
+                                .hunks
+                                .iter()
+                                .all(|hunk| hunk.start_char <= hunk.end_char
+                                    && hunk.end_char <= length),
+                        "invalid inline change summary"
+                    );
+                }
                 ensure!(
                     turn.comment_source_ids
                         .iter()
@@ -330,6 +607,17 @@ impl InlineHistory {
                 );
                 if let Some(result) = &turn.result {
                     result.validate()?;
+                    if turn.state == InlineTurnState::Ready && result.expanded_scope.is_some() {
+                        ensure!(
+                            turn.allow_expansion
+                                && turn
+                                    .expanded_location
+                                    .as_ref()
+                                    .is_some_and(|location| location.file == turn.location.file
+                                        && location.start_char <= location.end_char),
+                            "invalid pending wider edit location"
+                        );
+                    }
                 }
             }
         }

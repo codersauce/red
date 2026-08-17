@@ -1037,6 +1037,7 @@ struct TerminalCellStyle {
     bg: Color,
     bold: bool,
     italic: bool,
+    underline: bool,
 }
 
 impl TerminalCellStyle {
@@ -1047,6 +1048,7 @@ impl TerminalCellStyle {
             bg,
             bold: style.bold,
             italic: style.italic,
+            underline: style.underline,
         }
     }
 
@@ -1073,6 +1075,13 @@ impl TerminalCellStyle {
                 style::Attribute::Italic
             } else {
                 style::Attribute::NoItalic
+            }))?;
+        }
+        if previous.is_none_or(|old| old.underline != self.underline) {
+            output.queue(style::SetAttribute(if self.underline {
+                style::Attribute::Underlined
+            } else {
+                style::Attribute::NoUnderline
             }))?;
         }
         Ok(())
@@ -1253,6 +1262,16 @@ impl Editor {
         self.fix_cursor_pos();
         self.check_bounds();
         self.sync_to_window();
+        if let Some(layout) = self
+            .current_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.inline_comment_id())
+            .and_then(|id| self.inline_comment_overlay_layout(id))
+        {
+            if let Some(dialog) = &mut self.current_dialog {
+                dialog.update_overlay_layout(layout);
+            }
+        }
         drop(prepare_span);
         // Render all windows
         let windows_span = super::perf::PerfSpan::start("render:windows");
@@ -1311,9 +1330,6 @@ impl Editor {
                 help.context.clone_from(&context);
             }
         }
-        self.render_learn_coach(buffer);
-        self.render_dialog(buffer)?;
-
         // Render all plugins
         self.render_from_plugins(buffer)?;
         drop(chrome_span);
@@ -1321,6 +1337,10 @@ impl Editor {
         // Update overlay positions and render them
         let overlays_span = super::perf::PerfSpan::start("render:overlays+cursor");
         self.update_and_render_overlays(buffer)?;
+        self.render_learn_coach(buffer);
+        // Modal content and its action menu must be above plugin paint commands
+        // and floating overlays, which may otherwise erase text or borders.
+        self.render_dialog(buffer)?;
         // The final row belongs to the editor, including inside modal workspaces.
         self.draw_commandline(buffer);
 
@@ -1445,9 +1465,9 @@ impl Editor {
             self.render_window(buffer, self.window_manager.active_window_id())?;
         }
         self.render_ui_chrome(buffer)?;
+        self.update_and_render_overlays(buffer)?;
         self.render_learn_coach(buffer);
         self.render_dialog(buffer)?;
-        self.update_and_render_overlays(buffer)?;
         self.update_terminal_cursor_surface(buffer);
         self.render_cursor_cell(buffer);
         self.last_rendered_cursor_position = self.render_cursor_position();
@@ -1650,7 +1670,11 @@ impl Editor {
                     lane_x,
                     term_y,
                     guide,
-                    &self.theme.inline_comment_guide_style(),
+                    &if self.inline_comment_is_current_at(window, comment.line, false) {
+                        self.theme.current_inline_comment_guide_style()
+                    } else {
+                        self.theme.inline_comment_guide_style()
+                    },
                 );
             }
             return;
@@ -1709,7 +1733,12 @@ impl Editor {
                 .row(row)
                 .and_then(|segment| self.inline_comment_connector_for_segment(window, segment))
             {
-                self.render_inline_comment_connector(buffer, lane_x, term_y, lane_width, connector);
+                let current = layout.row(row).is_some_and(|segment| {
+                    self.inline_comment_is_current_at(window, segment.line, true)
+                });
+                self.render_inline_comment_connector(
+                    buffer, lane_x, term_y, lane_width, connector, current,
+                );
             }
         }
 
@@ -1737,6 +1766,7 @@ impl Editor {
         y: usize,
         lane_width: usize,
         connector: InlineCommentConnector,
+        current: bool,
     ) {
         use InlineCommentConnector::{End, Middle, Single, Start};
 
@@ -1756,7 +1786,12 @@ impl Editor {
             (true, false, Single | Start) => ">",
             (true, false, End) => "`",
         };
-        buffer.set_text(x, y, text, &self.theme.inline_comment_guide_style());
+        let guide = if current {
+            self.theme.current_inline_comment_guide_style()
+        } else {
+            self.theme.inline_comment_guide_style()
+        };
+        buffer.set_text(x, y, text, &guide);
         if matches!(connector, Single | Start) {
             buffer.set_text(
                 x + if full { 2 } else { 0 },
@@ -2095,6 +2130,7 @@ impl Editor {
             bg: None,
             bold: false,
             italic: false,
+            underline: false,
         };
         let mut active_dividers = Vec::with_capacity(3);
         if let Some(super::DividerDrag {
@@ -2436,7 +2472,11 @@ impl Editor {
         let term_x = self.window_to_terminal_x(window, content_start);
         let content_width = self.window_content_width(window);
         let editor_style = self.theme.style.clone();
-        let comment_style = self.theme.inline_comment_style();
+        let comment_style = if self.inline_comment_is_current_at(window, comment.line, false) {
+            self.theme.current_inline_comment_style()
+        } else {
+            self.theme.inline_comment_style()
+        };
         let block_width = comment.block_width.min(content_width);
         self.fill_line_in_window(buffer, term_x, term_y, content_width, &editor_style);
         let half_block = match comment.content {
@@ -3446,7 +3486,8 @@ impl Editor {
 
     pub fn draw_commandline(&mut self, buffer: &mut RenderBuffer) {
         self.notification_frame_candidate = None;
-        let style = &self.theme.style;
+        self.inline_completion_notice.clear_hit();
+        let style = self.theme.style.clone();
         let width = self.size.0 as usize;
         if width == 0 || self.size.1 == 0 {
             return;
@@ -3454,7 +3495,7 @@ impl Editor {
 
         let y = self.size.1 as usize - 1;
         let clear_line = " ".repeat(width);
-        buffer.set_text(0, y, &clear_line, style);
+        buffer.set_text(0, y, &clear_line, &style);
 
         if !self.has_term() {
             let wc = if let Some(ref waiting_command) = self.waiting_command {
@@ -3514,6 +3555,7 @@ impl Editor {
                     (String::new(), None, 0)
                 };
             let available = width.saturating_sub(wc_width);
+            let has_message = !message.is_empty() || self.inline_completion_notice_available();
             let candidate = primary
                 .filter(|_| self.notification_fallback.is_none())
                 .and_then(|record| {
@@ -3527,7 +3569,7 @@ impl Editor {
             if candidate.is_some() {
                 counts.unseen = counts.unseen.saturating_sub(1);
             }
-            let mut badge = notification_badge(counts, available, !message.is_empty());
+            let mut badge = notification_badge(counts, available, has_message);
             let mut badge_width = display_width(&badge);
             let mut message_width =
                 available.saturating_sub(badge_width + usize::from(badge_width > 0));
@@ -3536,7 +3578,7 @@ impl Editor {
                     self.notification_frame_candidate = Some(key);
                 } else {
                     counts.unseen += 1;
-                    badge = notification_badge(counts, available, !message.is_empty());
+                    badge = notification_badge(counts, available, has_message);
                     badge_width = display_width(&badge);
                     message_width =
                         available.saturating_sub(badge_width + usize::from(badge_width > 0));
@@ -3552,12 +3594,16 @@ impl Editor {
             if let Some(color) = color.and_then(|key| self.theme.colors.get(key)).copied() {
                 message_style.fg = Some(color);
             }
-            buffer.set_text(
-                0,
-                y,
-                &notification_summary(&message, message_width),
-                &message_style,
-            );
+            if message.is_empty() {
+                self.draw_inline_completion_notice(buffer, message_width, y);
+            } else {
+                buffer.set_text(
+                    0,
+                    y,
+                    &notification_summary(&message, message_width),
+                    &message_style,
+                );
+            }
             if badge_width > 0 {
                 let mut badge_style = style.clone();
                 badge_style.fg = self.theme.ui_style.muted.fg.or(style.fg);
@@ -3566,7 +3612,7 @@ impl Editor {
 
             if wc_width > 0 {
                 let wc = fit_display_width(&wc, wc_width);
-                buffer.set_text(width.saturating_sub(wc_width), y, &wc, style);
+                buffer.set_text(width.saturating_sub(wc_width), y, &wc, &style);
             }
 
             return;
@@ -3583,7 +3629,7 @@ impl Editor {
             self.search_commandline_prefix()
         };
         let cmdline = format!("{}{}", prefix, text);
-        buffer.set_text(0, y, &cmdline, style);
+        buffer.set_text(0, y, &cmdline, &style);
         let badge = notification_badge(self.notifications.counts(Instant::now()), width, false);
         let badge_width = display_width(&badge);
         if badge_width > 0 && display_width(&cmdline).saturating_add(badge_width + 2) <= width {
@@ -3799,6 +3845,79 @@ mod tests {
     }
 
     #[test]
+    fn modal_dialogs_cover_plugin_text_and_floating_overlays() {
+        let mut editor = rendering_test_editor(Buffer::new(None, "source\n".into()));
+        let layout = crate::ui::OverlayLayout {
+            viewport: crate::ui::ScreenRect {
+                x: 0,
+                y: 0,
+                width: 60,
+                height: 10,
+            },
+            anchor: (5, 0),
+            avoid_rows: None,
+            protected_rows: None,
+        };
+        editor.current_dialog = Some(Box::new(
+            crate::ui::HoverInfo::new(
+                &editor,
+                "Modal text must stay readable".into(),
+                crate::ui::HoverInfoFormat::Plaintext,
+                Vec::new(),
+            )
+            .with_inline_source(uuid::Uuid::new_v4(), layout),
+        ));
+        let mut expected = RenderBuffer::new(60, 12, &editor.theme.style);
+        editor
+            .current_dialog
+            .as_ref()
+            .unwrap()
+            .draw(&mut expected)
+            .unwrap();
+        let first = expected
+            .cells
+            .iter()
+            .position(|cell| cell.c == '┌')
+            .unwrap();
+        let (left, top) = (first % 60, first / 60);
+        let right = left
+            + expected.cells[first..(top + 1) * 60]
+                .iter()
+                .position(|cell| cell.c == '┐')
+                .unwrap();
+        let bottom = (top..10)
+            .find(|row| expected.cells[row * 60 + left].c == '└')
+            .unwrap();
+        editor.render_commands.push_back(RenderCommand::BufferText {
+            x: 0,
+            y: top + 1,
+            text: "X".repeat(60),
+            style: Style::default(),
+        });
+        editor
+            .overlay_manager
+            .create_overlay(
+                "over-dialog".into(),
+                crate::plugin::OverlayConfig {
+                    align: crate::plugin::OverlayAlignment::Top,
+                    x_padding: 0,
+                    y_padding: top + 2,
+                    relative: "editor".into(),
+                },
+            )
+            .update_content(vec![("Z".repeat(60), Style::default())]);
+        let mut actual = RenderBuffer::new(60, 12, &editor.theme.style);
+        editor.render(&mut actual).unwrap();
+        for row in top..=bottom {
+            assert_eq!(
+                &actual.cells[row * 60 + left..=row * 60 + right],
+                &expected.cells[row * 60 + left..=row * 60 + right],
+                "modal row {row} was overwritten"
+            );
+        }
+    }
+
+    #[test]
     fn partial_inline_comment_repaint_fills_only_the_padded_block() {
         let mut editor = rendering_test_editor(Buffer::new(None, "alpha\nbeta\n".to_string()));
         editor.cy = 1;
@@ -3818,7 +3937,7 @@ mod tests {
         editor
             .render_main_content_rows_in_window(&mut frame, &window, &rows)
             .unwrap();
-        let background = editor.theme.inline_comment_style().bg;
+        let background = editor.theme.current_inline_comment_style().bg;
         let content_start = editor.gutter_width_for_window(&window) + 1;
         for comment in &layout.inline_comments {
             let y = editor.window_to_terminal_y(&window, comment.row);
@@ -4876,6 +4995,7 @@ mod tests {
             &Style {
                 bold: true,
                 italic: true,
+                underline: true,
                 ..Style::default()
             },
             &Style::default(),
@@ -4884,6 +5004,10 @@ mod tests {
         .unwrap();
 
         let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains("\x1b[4m"),
+            "underline style should emit underline"
+        );
         assert!(
             output.contains("\x1b[1m"),
             "bold style should emit bold attribute"
@@ -4906,6 +5030,10 @@ mod tests {
         assert!(
             output.contains("\x1b[23m"),
             "plain style should clear italic attribute"
+        );
+        assert!(
+            output.contains("\x1b[24m"),
+            "plain style should clear underline"
         );
     }
 

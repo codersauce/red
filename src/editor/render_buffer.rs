@@ -147,6 +147,7 @@ impl RenderBuffer {
             bg: None,
             bold: false,
             italic: false,
+            underline: false,
         };
         self.set_text(x, y, text, &style);
         Ok(())
@@ -247,6 +248,7 @@ impl RenderBuffer {
                 bg,
                 bold: style.bold,
                 italic: style.italic,
+                underline: style.underline,
             },
         );
     }
@@ -280,6 +282,7 @@ impl RenderBuffer {
             bg,
             bold: style.bold,
             italic: style.italic,
+            underline: style.underline,
         };
 
         for row in y..end_y {
@@ -561,6 +564,7 @@ mod tests {
             bg: Some(background),
             bold: true,
             italic: true,
+            underline: false,
         };
         let mut buffer = RenderBuffer::new(4, 3, &Style::default());
         buffer.cells[6].text.reserve(32);

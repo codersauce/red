@@ -351,6 +351,7 @@ Esc = { EnterMode = "Normal" }
 "d" = "PreviousDiagnostic"
 "f" = "MoveToPreviousFunction"
 "h" = { PluginCommand = "GitHunkPrevious" }
+"i" = "PreviousOverlappingInlineComment"
 "m" = "MoveToPreviousCall"
 
 [keys.normal."]"]
@@ -359,6 +360,7 @@ Esc = { EnterMode = "Normal" }
 "d" = "NextDiagnostic"
 "f" = "MoveToNextFunction"
 "h" = { PluginCommand = "GitHunkNext" }
+"i" = "NextOverlappingInlineComment"
 "m" = "MoveToNextCall"
 
 [keys.normal."Ctrl-w"]
@@ -394,6 +396,7 @@ Esc = { EnterMode = "Normal" }
 [keys.normal." "]
 "m" = "OpenMessages"
 "H" = "OpenInlineHistory"
+"N" = "OpenLatestInlineCompletion"
 "C" = "AddSampleInlineComment"
 "X" = "ClearInlineComments"
 "v" = "ShowInlineComment"

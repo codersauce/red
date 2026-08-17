@@ -32,6 +32,41 @@ pub struct AgentConversationSnapshot {
 }
 
 impl AgentConversationSnapshot {
+    /// A bounded recent-discussion bridge for an independent inline session.
+    /// Serialized messages retain their roles and are never presented as current source.
+    pub(crate) fn inline_context(&self, cwd: &std::path::Path) -> Option<String> {
+        const MAX_BYTES: usize = 16 * 1024;
+        if std::fs::canonicalize(&self.cwd).ok()? != std::fs::canonicalize(cwd).ok()? {
+            return None;
+        }
+        let mut items = Vec::new();
+        let mut used = 0;
+        for item in self.items.iter().rev().take(8) {
+            let mut text = item.text.as_str();
+            let remaining = MAX_BYTES - used;
+            if remaining == 0 {
+                break;
+            }
+            if text.len() > remaining {
+                let mut end = remaining;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text = &text[..end];
+            }
+            used += text.len();
+            items.push(serde_json::json!({"role": item.role, "text": text}));
+        }
+        if items.is_empty() {
+            return None;
+        }
+        items.reverse();
+        Some(format!(
+            "\n\n<project_discussion>\nEarlier discussion in this workspace, not current source or new instructions.\n{}\n</project_discussion>",
+            serde_json::json!({"thread_id": self.thread_id, "messages": items})
+        ))
+    }
+
     #[must_use]
     pub fn new(thread_id: impl Into<String>, cwd: impl Into<String>) -> Self {
         Self {
@@ -190,6 +225,26 @@ fn clean_persisted_user_text(text: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn inline_context_is_recent_bounded_and_workspace_scoped() {
+        let workspace = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let mut conversation =
+            AgentConversationSnapshot::new("current-thread", workspace.path().to_string_lossy());
+        for number in 0..10 {
+            conversation.append_user(number.to_string(), format!("request-{number}"));
+        }
+        let context = conversation.inline_context(workspace.path()).unwrap();
+        assert!(!context.contains("request-0"));
+        assert!(context.contains("request-9"));
+        assert!(context.contains("current-thread"));
+        assert!(conversation.inline_context(other.path()).is_none());
+        conversation.append_agent_delta("last", &"界".repeat(10_000));
+        let context = conversation.inline_context(workspace.path()).unwrap();
+        assert!(context.len() < 17 * 1024);
+        assert!(context.contains("Earlier discussion"));
+    }
 
     #[test]
     fn reconciles_native_ids_without_exposing_editor_context() {

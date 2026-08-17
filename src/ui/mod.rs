@@ -54,7 +54,10 @@ pub use hover_info::{HoverInfo, HoverInfoFormat};
 pub(crate) use icons::IconCatalog;
 pub use info::Info;
 pub use inline_assist::{InlineAssistPopup, InlineAssistPopupState};
-pub(crate) use inline_history::InlineHistoryPanel;
+pub(crate) use inline_history::{
+    HistoryBlock, HistoryDetail, HistoryRenderCache, HistoryStatus, HistoryTone,
+    InlineHistoryPanel, InlineHistoryRow,
+};
 pub use input_prompt::InputPrompt;
 pub(crate) use keyboard_shortcuts::{
     is_keyboard_shortcuts_alias, KeyboardShortcuts, ShortcutEntry, ShortcutEvent,
@@ -112,6 +115,33 @@ pub trait Component: Send {
     /// User-facing name used by contextual keyboard help.
     fn shortcut_context(&self) -> &str {
         "Dialog"
+    }
+
+    /// Snapshot of an inline popup, including an unsent draft, before hiding it.
+    fn inline_assist_state(&self) -> Option<InlineAssistPopupState> {
+        None
+    }
+
+    /// Lets an unsent inline prompt confirm dismissal without replacing its editor.
+    fn request_inline_assist_close(&mut self) -> Option<Action> {
+        None
+    }
+
+    fn is_inline_draft_confirmation(&self) -> bool {
+        false
+    }
+
+    fn is_inline_history(&self) -> bool {
+        false
+    }
+
+    /// Stable source annotation owning a full-comment viewer, if any.
+    fn inline_comment_id(&self) -> Option<uuid::Uuid> {
+        None
+    }
+
+    fn scroll_inline_history(&mut self, _delta: isize) -> Option<usize> {
+        None
     }
 
     /// Actions for the surface-local F1 menu. The default keeps passive popups unchanged.

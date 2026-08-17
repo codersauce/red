@@ -949,6 +949,13 @@ fn paint_detached_row(
                 style::Attribute::NoItalic
             }))?;
         }
+        if span.style.underline != previous.underline {
+            output.queue(style::SetAttribute(if span.style.underline {
+                style::Attribute::Underlined
+            } else {
+                style::Attribute::NoUnderline
+            }))?;
+        }
         write!(output, "{text}")?;
         previous = span.style.clone();
     }
@@ -1589,6 +1596,35 @@ mod tests {
         assert!(output.contains("changed"));
         assert!(!output.contains("unchanged"));
         assert!(!output.contains("\u{1b}[H\u{1b}[2J"));
+    }
+
+    #[test]
+    fn detached_row_preserves_underlined_links_and_clears_the_next_span() {
+        let row = red::headless::LinePatch {
+            row: 0,
+            text: "link plain".into(),
+            spans: vec![
+                red::headless::StyledSpan {
+                    text: "link".into(),
+                    style: red::theme::Style {
+                        underline: true,
+                        ..Default::default()
+                    },
+                },
+                red::headless::StyledSpan {
+                    text: " plain".into(),
+                    style: Default::default(),
+                },
+            ],
+        };
+        let mut output = Vec::new();
+        paint_detached_row(&mut output, &row).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\x1b[4mlink"));
+        let suffix = output.split_once("link").unwrap().1;
+        assert!(suffix.starts_with("\x1b[24m plain"));
+        assert!(!suffix.contains("\x1b[0m"));
+        assert!(!suffix.contains("\x1b[4m"));
     }
 
     #[test]

@@ -1479,6 +1479,7 @@ mod tests {
             }),
             bold: true,
             italic: true,
+            underline: true,
         };
         let row_width = usize::from(MAX_TERMINAL_COLUMNS);
         let rows = MAX_TERMINAL_CELLS / row_width;

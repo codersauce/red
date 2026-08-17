@@ -454,6 +454,12 @@ async fn wheel_batches_keep_inline_comments_identical_to_a_full_frame() {
                 MouseEventKind::ScrollDown,
                 MouseEventKind::ScrollUp,
             ] {
+                let old_top = editor.vtop;
+                let expected_top = if kind == MouseEventKind::ScrollUp {
+                    old_top.saturating_sub(12)
+                } else {
+                    old_top + 12
+                };
                 let full_renders = editor.full_render_count;
                 let events = (0..4)
                     .flat_map(|_| [mouse(kind, 12, 3), mouse(MouseEventKind::Moved, 16, 4)])
@@ -462,6 +468,7 @@ async fn wheel_batches_keep_inline_comments_identical_to_a_full_frame() {
                     .process_scroll_batch(events, &mut buffer, &mut runtime)
                     .await
                     .unwrap();
+                assert_eq!(editor.vtop, expected_top);
                 assert_eq!(editor.full_render_count, full_renders);
                 assert_matches_full_frame(&mut editor, &buffer);
             }

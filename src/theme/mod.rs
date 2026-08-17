@@ -156,6 +156,31 @@ impl Theme {
         style
     }
 
+    pub(crate) fn current_inline_comment_style(&self) -> Style {
+        let mut style = self.inline_comment_style();
+        if let (Some(foreground), Some(background)) = (style.fg, style.bg) {
+            let (Color::Rgb { r, g, b } | Color::Rgba { r, g, b, .. }) = foreground;
+            let background = self
+                .colors
+                .get("red.inlineCommentActiveBackground")
+                .copied()
+                .unwrap_or_else(|| blend_color(Color::Rgba { r, g, b, a: 24 }, background));
+            style.bg = Some(background);
+            style.fg = Some(ensure_minimum_contrast(foreground, background, 4.5));
+        }
+        style
+    }
+
+    pub(crate) fn current_inline_comment_guide_style(&self) -> Style {
+        let mut style = self.inline_comment_arrow_style();
+        style.fg = self
+            .colors
+            .get("red.inlineCommentActiveBorder")
+            .copied()
+            .or(style.fg);
+        style
+    }
+
     pub(crate) fn inline_comment_arrow_style(&self) -> Style {
         let mut style = self.inline_comment_style();
         let background = self.style.bg.unwrap_or_default();
@@ -352,6 +377,7 @@ impl Theme {
             bg: self.resolve_color_references(&spec.background, StyleColorComponent::Background),
             bold: spec.bold.unwrap_or(false),
             italic: spec.italic.unwrap_or(false),
+            underline: false,
         }
     }
 
@@ -414,6 +440,7 @@ pub(crate) fn compose_synthetic_cursor_style(
         bg: Some(cursor_bg),
         bold: false,
         italic: false,
+        underline: false,
     }
 }
 
@@ -453,6 +480,7 @@ pub(crate) fn compose_selection_style(
         bg: Some(selected_bg),
         bold: content.bold || selection.bold,
         italic: content.italic || selection.italic,
+        underline: content.underline || selection.underline,
     }
 }
 
@@ -546,6 +574,7 @@ impl Default for Theme {
                 bg: Some(Color::Rgb { r: 0, g: 0, b: 0 }),
                 bold: false,
                 italic: false,
+                underline: false,
             },
             gutter_style: Style::default(),
             statusline_style: StatuslineStyle::default(),
@@ -666,6 +695,8 @@ pub struct Style {
     pub bg: Option<Color>,
     pub bold: bool,
     pub italic: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub underline: bool,
 }
 
 impl Style {
@@ -687,6 +718,7 @@ impl Style {
             bg: self.fg,
             bold: self.bold,
             italic: self.italic,
+            underline: self.underline,
         }
     }
 }
@@ -709,6 +741,33 @@ impl Style {
 mod tests {
     use super::*;
     use crate::color::contrast_ratio;
+
+    #[test]
+    fn underline_style_is_backward_compatible_and_survives_selection() {
+        let legacy = r#"{"fg":null,"bg":null,"bold":false,"italic":false}"#;
+        let plain: Style = serde_json::from_str(legacy).unwrap();
+        assert!(!plain.underline);
+        assert!(!serde_json::to_string(&plain).unwrap().contains("underline"));
+        let linked = Style {
+            underline: true,
+            ..plain
+        };
+        assert!(
+            serde_json::from_str::<Style>(&serde_json::to_string(&linked).unwrap())
+                .unwrap()
+                .underline
+        );
+        assert!(linked.inverted().underline);
+        assert!(
+            Theme::default()
+                .selected_style(
+                    &linked,
+                    &Style::default(),
+                    SelectionForegroundPriority::Content
+                )
+                .underline
+        );
+    }
 
     #[test]
     fn theme_mode_uses_perceived_background_luminance() {

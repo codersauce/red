@@ -396,11 +396,12 @@ impl DisplayLayout {
             }
             if segment.first_segment {
                 for &(_, message) in comments.iter().filter(|(line, _)| *line == segment.line) {
-                    // Always leave room for the source line itself.
-                    let block =
-                        inline_comment_block(message, width, height.saturating_sub(row + 1));
+                    // Size cards for the whole pane, reserving a source row.
+                    // Near the bottom, clip the card instead of changing its
+                    // padding, wrapping, or preview truncation as it scrolls.
+                    let block = inline_comment_block(message, width, height.saturating_sub(1));
                     let mut waiting_for_text = true;
-                    for content in block.rows {
+                    for content in block.rows.into_iter().take(height - row) {
                         let starts_connection =
                             waiting_for_text && matches!(content, InlineCommentContent::Text(_));
                         if starts_connection {
@@ -415,6 +416,9 @@ impl DisplayLayout {
                             text_offset: block.text_offset,
                         });
                         row += 1;
+                    }
+                    if row == height {
+                        return layout;
                     }
                 }
             }
