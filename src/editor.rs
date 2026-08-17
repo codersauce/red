@@ -3031,6 +3031,7 @@ pub struct Editor {
 
     /// Full-document structural queries, independent from viewport highlighting.
     syntax_textobjects: SyntaxTextObjectService,
+    syntax_indentation: crate::syntax_indent::SyntaxIndentation,
 
     /// Cached syntax highlight spans per buffer for the most recently parsed
     /// viewport-plus-margin slice.
@@ -4257,6 +4258,7 @@ impl Editor {
         self.sync_persistent_notifications();
         self.highlighter = highlighter;
         self.syntax_textobjects.reset(Arc::clone(&registry));
+        self.syntax_indentation.reset(Arc::clone(&registry));
         self.indentation = indentation;
         self.highlight_cache.clear();
         self.bracket_match_cache = None;
@@ -4432,6 +4434,8 @@ impl Editor {
             &Config::config_dir(),
         )?);
         let highlighter = Highlighter::with_registry(&theme, Arc::clone(&registry))?;
+        let syntax_indentation =
+            crate::syntax_indent::SyntaxIndentation::new(Arc::clone(&registry));
         let syntax_textobjects = SyntaxTextObjectService::new(registry);
 
         let mut plugin_registry = PluginRegistry::new();
@@ -4483,6 +4487,7 @@ impl Editor {
             )),
             highlighter,
             syntax_textobjects,
+            syntax_indentation,
             highlight_cache: HashMap::new(),
             bracket_match_cache: None,
             layout_cache: std::cell::RefCell::new(HashMap::new()),
@@ -16644,13 +16649,41 @@ impl Editor {
         })
     }
 
-    fn indentation_decision_for_line(&self, line: usize) -> IndentDecision {
+    fn indentation_decision_for_line(&mut self, line: usize) -> IndentDecision {
+        self.indentation_decision(line, crate::syntax_indent::IndentReason::NewLine)
+    }
+
+    fn indentation_decision(
+        &mut self,
+        line: usize,
+        reason: crate::syntax_indent::IndentReason,
+    ) -> IndentDecision {
         let indentation = self.indentation();
         let language =
             self.highlight_language_id_for_buffer_index(self.buffer_manager.active_index());
+        let document = self.current_buffer().contents();
+        if let Some(language) = language.as_deref() {
+            let id = self.current_buffer().id();
+            let revision = self.current_buffer().revision();
+            let decision = self
+                .syntax_indentation
+                .indent(crate::syntax_indent::IndentRequest {
+                    id,
+                    revision,
+                    language,
+                    source: &document,
+                    line,
+                    shift_width: indentation.shift_width,
+                    tab_width: indentation.tab_width,
+                    reason,
+                });
+            if decision != IndentDecision::Keep {
+                return decision;
+            }
+        }
         indent::indent_for_line(
             language.as_deref(),
-            &self.current_buffer().contents(),
+            &document,
             line,
             indentation.shift_width,
             indentation.tab_width,
@@ -17339,10 +17372,12 @@ impl Editor {
                         language.as_deref(),
                         *c,
                         contents.trim_end_matches(&['\r', '\n'][..]),
-                    )
+                    ) || (language.as_deref() != Some("python")
+                        && crate::syntax_indent::is_reindent_candidate(*c, &contents))
                 });
                 if should_reindent {
-                    let decision = self.indentation_decision_for_line(line);
+                    let decision =
+                        self.indentation_decision(line, crate::syntax_indent::IndentReason::Typed);
                     self.apply_indentation_to_line(line, decision);
                 }
                 self.notify_change(runtime).await?;
@@ -17758,14 +17793,43 @@ impl Editor {
                 let before_cursor = char_prefix(current_line_for_split, cursor_char).to_string();
                 let after_cursor = char_suffix(current_line_for_split, cursor_char).to_string();
 
+                let split_pair = if let Some(language) =
+                    self.highlight_language_id_for_buffer_index(self.buffer_manager.active_index())
+                {
+                    let document = self.current_buffer().contents();
+                    let byte = document
+                        .split_inclusive('\n')
+                        .take(source_line)
+                        .map(str::len)
+                        .sum::<usize>()
+                        + before_cursor.len();
+                    let id = self.current_buffer().id();
+                    let revision = self.current_buffer().revision();
+                    self.syntax_indentation
+                        .split_pair(id, revision, &language, &document, byte)
+                } else {
+                    false
+                };
+
                 let line = self.buffer_line();
                 let fallback_indent = self.indentation().whitespace_for_columns(fallback_columns);
+                let replacement = if split_pair {
+                    format!(
+                        "{}\n{}\n{}{}",
+                        before_cursor.trim_end(),
+                        fallback_indent,
+                        fallback_indent,
+                        after_cursor.trim_start()
+                    )
+                } else {
+                    format!("{}\n{}{}", before_cursor, fallback_indent, after_cursor)
+                };
                 self.replace_range(
                     TextRange::new(
                         TextPosition::new(line, 0),
                         TextPosition::new(line, current_line_without_ending.chars().count()),
                     ),
-                    &format!("{}\n{}{}", before_cursor, fallback_indent, after_cursor),
+                    &replacement,
                 );
 
                 self.cx = grapheme_len(&fallback_indent);
@@ -17774,6 +17838,10 @@ impl Editor {
                 let target_line = line + 1;
                 let decision = self.indentation_decision_for_line(target_line);
                 let target_columns = self.apply_indentation_to_line(target_line, decision);
+                if split_pair {
+                    let closer = self.indentation_decision_for_line(target_line + 1);
+                    self.apply_indentation_to_line(target_line + 1, closer);
+                }
                 self.mark_generated_indent(target_line, target_columns);
                 self.notify_change(runtime).await?;
 

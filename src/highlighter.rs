@@ -66,6 +66,7 @@ struct RuntimeLanguageDefinition {
     grammar: Option<GrammarSource>,
     highlight_queries: Vec<String>,
     textobject_queries: Vec<String>,
+    indent_queries: Vec<String>,
     injection_query: Option<String>,
     specialized: Option<SpecializedHighlighter>,
 }
@@ -118,6 +119,10 @@ impl LanguageRegistry {
                     .iter()
                     .map(ToString::to_string)
                     .collect(),
+                indent_queries: bundled_indent_query(definition.id)
+                    .into_iter()
+                    .map(ToString::to_string)
+                    .collect(),
                 injection_query: definition.injection_query.map(ToString::to_string),
                 specialized: definition.specialized,
             });
@@ -163,6 +168,7 @@ impl LanguageRegistry {
             grammar: None,
             highlight_queries: Vec::new(),
             textobject_queries: Vec::new(),
+            indent_queries: Vec::new(),
             injection_query: None,
             specialized: None,
         });
@@ -190,6 +196,9 @@ impl LanguageRegistry {
                 definition
                     .textobject_queries
                     .clone_from(&bundled.textobject_queries);
+                definition
+                    .indent_queries
+                    .clone_from(&bundled.indent_queries);
                 definition
                     .injection_query
                     .clone_from(&bundled.injection_query);
@@ -223,11 +232,22 @@ impl LanguageRegistry {
                     .map(|path| read_query(path, config_dir, "text object"))
                     .collect::<anyhow::Result<_>>()?;
             }
+            if !grammar.indents.is_empty() {
+                definition.indent_queries = grammar
+                    .indents
+                    .iter()
+                    .map(|path| read_query(path, config_dir, "indentation"))
+                    .collect::<anyhow::Result<_>>()?;
+            }
             if let Some(path) = &grammar.injections {
                 definition.injection_query = Some(read_query(path, config_dir, "injection")?);
             }
         }
 
+        anyhow::ensure!(
+            definition.indent_queries.is_empty() || definition.grammar.is_some(),
+            "language `{id}` declares indentation queries without a grammar"
+        );
         if let Some(source) = &definition.grammar {
             let language = grammar_language(source);
             let mut parser = Parser::new();
@@ -259,6 +279,11 @@ impl LanguageRegistry {
                         );
                     }
                 }
+            }
+            if !definition.indent_queries.is_empty() {
+                let query = Query::new(&language, &definition.indent_queries.join("\n"))
+                    .with_context(|| format!("language `{id}` has an invalid indentation query"))?;
+                crate::syntax_indent::validate_query(&query)?;
             }
             if let Some(query) = &definition.injection_query {
                 Query::new(&language, query)
@@ -292,6 +317,17 @@ impl LanguageRegistry {
         self.languages.insert(id, definition);
     }
 
+    pub(crate) fn indentation_language(&self, id: &str) -> Option<(Language, String)> {
+        let definition = self.languages.get(id)?;
+        let source = definition.grammar.as_ref()?;
+        (!definition.indent_queries.is_empty()).then(|| {
+            (
+                grammar_language(source),
+                definition.indent_queries.join("\n"),
+            )
+        })
+    }
+
     /// Returns the grammar and normalized structural queries for one language.
     pub(crate) fn textobject_language(&self, id: &str) -> Option<(Language, String)> {
         let definition = self.languages.get(id)?;
@@ -302,6 +338,24 @@ impl LanguageRegistry {
                 definition.textobject_queries.join("\n"),
             )
         })
+    }
+}
+
+fn bundled_indent_query(id: &str) -> Option<&'static str> {
+    match id {
+        "rust" => Some(include_str!("queries/indents/rust.scm")),
+        "javascript" | "jsx" | "typescript" | "tsx" => {
+            Some(include_str!("queries/indents/ecma.scm"))
+        }
+        "json" => Some(include_str!("queries/indents/json.scm")),
+        "toml" => Some(include_str!("queries/indents/toml.scm")),
+        "powershell" => Some(include_str!("queries/indents/powershell.scm")),
+        "bash" => Some(include_str!("queries/indents/bash.scm")),
+        "fish" => Some(include_str!("queries/indents/fish.scm")),
+        "lua" => Some(include_str!("queries/indents/lua.scm")),
+        "yaml" => Some(include_str!("queries/indents/yaml.scm")),
+
+        _ => None,
     }
 }
 
@@ -1664,6 +1718,36 @@ mod tests {
         let (_, loaded_query) = registry.textobject_language("buildspec").unwrap();
 
         assert_eq!(loaded_query, query_source);
+    }
+
+    #[test]
+    fn configurable_indentation_queries_inherit_override_and_validate() {
+        let directory = tempfile::tempdir().unwrap();
+        let query_path = directory.path().join("indents.scm");
+        let mut definition = LanguageConfig {
+            grammar: Some(LanguageGrammarConfig {
+                builtin: Some("rust".into()),
+                ..LanguageGrammarConfig::default()
+            }),
+            ..LanguageConfig::default()
+        };
+        let mut languages = HashMap::from([("buildspec".to_string(), definition.clone())]);
+        let inherited = LanguageRegistry::from_config(&languages, directory.path()).unwrap();
+        assert!(inherited
+            .indentation_language("buildspec")
+            .unwrap()
+            .1
+            .contains("@indent.begin"));
+        fs::write(&query_path, "(line_comment) @indent.ignore").unwrap();
+        definition.grammar.as_mut().unwrap().indents = vec![query_path.clone()];
+        languages.insert("buildspec".into(), definition);
+        let registry = LanguageRegistry::from_config(&languages, directory.path()).unwrap();
+        assert_eq!(
+            registry.indentation_language("buildspec").unwrap().1,
+            "(line_comment) @indent.ignore"
+        );
+        fs::write(&query_path, "(block) @indent.unsupported").unwrap();
+        assert!(LanguageRegistry::from_config(&languages, directory.path()).is_err());
     }
 
     #[test]
