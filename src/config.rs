@@ -873,7 +873,7 @@ pub struct LspConfig {
     /// Master switch for all language-server activity.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Apply server formatting before saving supported documents.
+    /// Legacy alias for formatting.on_save, normalized by the config loaders.
     #[serde(default)]
     pub format_on_save: bool,
     /// Named language-server launch and routing definitions.
@@ -897,16 +897,25 @@ pub enum FormattingProvider {
     Lsp,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 /// Global document formatting behavior.
 pub struct FormattingConfig {
-    /// Format supported documents immediately before saving them.
-    #[serde(default)]
+    /// Format supported documents immediately before saving them. Defaults to on.
+    #[serde(default = "default_true")]
     pub on_save: bool,
     /// Backend selected for explicit and save-time formatting.
     #[serde(default)]
     pub provider: FormattingProvider,
+}
+
+impl Default for FormattingConfig {
+    fn default() -> Self {
+        Self {
+            on_save: true,
+            provider: FormattingProvider::default(),
+        }
+    }
 }
 
 /// One configurable language shared by highlighting, editing, and LSP routing.
@@ -1510,11 +1519,13 @@ impl Config {
     pub fn from_toml_with_overrides(contents: &str, overrides: &[String]) -> anyhow::Result<Self> {
         let mut value: toml::Value = toml::from_str(contents)
             .map_err(|err| anyhow::anyhow!("failed to parse config.toml: {err}"))?;
+        normalize_format_on_save_alias(&mut value);
 
         for (index, override_toml) in overrides.iter().enumerate() {
-            let override_value: toml::Value = toml::from_str(override_toml).map_err(|err| {
+            let mut override_value: toml::Value = toml::from_str(override_toml).map_err(|err| {
                 anyhow::anyhow!("failed to parse config override #{}: {err}", index + 1)
             })?;
+            normalize_format_on_save_alias(&mut override_value);
             merge_toml_values(&mut value, override_value);
         }
 
@@ -1576,7 +1587,7 @@ impl Config {
         let mut disable_lsp = false;
 
         if !contents.trim().is_empty() {
-            let user_value = match toml::from_str::<toml::Value>(contents) {
+            let mut user_value = match toml::from_str::<toml::Value>(contents) {
                 Ok(value) => value,
                 Err(error) => {
                     let mut loaded = safe_loaded_config(
@@ -1596,6 +1607,7 @@ impl Config {
                 }
             };
 
+            normalize_format_on_save_alias(&mut user_value);
             let table = user_value.as_table().ok_or_else(|| {
                 anyhow::anyhow!("user config must contain a top-level TOML table")
             })?;
@@ -1784,6 +1796,7 @@ fn safe_loaded_config(path: &Path, code: &str, message: String) -> anyhow::Resul
     config.agent = AgentConfig::default();
     config.lsp.enabled = false;
     config.lsp.servers.clear();
+    config.formatting.on_save = false;
     config.languages.clear();
     Ok(LoadedConfig {
         config,
@@ -2215,6 +2228,29 @@ fn value_at_path<'a>(value: &'a toml::Value, path: &[String]) -> Option<&'a toml
         .try_fold(value, |current, part| current.as_table()?.get(part))
 }
 
+/// Resolves the legacy spelling within one layer before higher-priority layers merge.
+/// Keep the original field so invalid legacy values retain their source diagnostics.
+fn normalize_format_on_save_alias(value: &mut toml::Value) {
+    let Some(on_save) = value
+        .get("lsp")
+        .and_then(|lsp| lsp.get("format_on_save"))
+        .and_then(toml::Value::as_bool)
+    else {
+        return;
+    };
+    let Some(table) = value.as_table_mut() else {
+        return;
+    };
+    let formatting = table
+        .entry("formatting")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    if let Some(formatting) = formatting.as_table_mut() {
+        formatting
+            .entry("on_save")
+            .or_insert(toml::Value::Boolean(on_save));
+    }
+}
+
 fn apply_strict_overrides(config: &mut Config, overrides: &[String]) -> anyhow::Result<()> {
     if overrides.is_empty() {
         return Ok(());
@@ -2222,7 +2258,7 @@ fn apply_strict_overrides(config: &mut Config, overrides: &[String]) -> anyhow::
     let mut value = toml::Value::try_from(&*config)?;
     let mut allowed_servers = config.lsp.servers.keys().cloned().collect::<HashSet<_>>();
     for (index, override_toml) in overrides.iter().enumerate() {
-        let override_value: toml::Value = toml::from_str(override_toml)
+        let mut override_value: toml::Value = toml::from_str(override_toml)
             .map_err(|_| anyhow::anyhow!("failed to parse config override #{}", index + 1))?;
         if let Some(path) = first_unknown_path(&override_value, &[]) {
             anyhow::bail!(
@@ -2238,6 +2274,7 @@ fn apply_strict_overrides(config: &mut Config, overrides: &[String]) -> anyhow::
         {
             allowed_servers.extend(servers.keys().cloned());
         }
+        normalize_format_on_save_alias(&mut override_value);
         merge_config_values(&mut value, override_value, &[]);
         *config = deserialize_config(value.clone()).map_err(|_| {
             anyhow::anyhow!(
@@ -2819,6 +2856,7 @@ wrap = "yes"
         assert!(loaded.config.plugins.is_empty());
         assert!(loaded.config.plugin_permissions.is_empty());
         assert!(!loaded.config.lsp.enabled);
+        assert!(!loaded.config.formatting.on_save);
         assert!(loaded.config.lsp.servers.is_empty());
         assert!(loaded.config.log_file.is_none());
         assert_eq!(loaded.config.theme, "red.json");
@@ -2833,6 +2871,7 @@ wrap = "yes"
         assert_eq!(loaded.diagnostics[0].code, "CFG001");
         assert!(loaded.config.disable_ai);
         assert!(!loaded.config.lsp.enabled);
+        assert!(!loaded.config.formatting.on_save);
     }
 
     #[test]
@@ -4259,6 +4298,115 @@ workspace_name = "frontend"
         assert_eq!(server.documents()[0].file_extensions, vec!["ts", "tsx"]);
         assert_eq!(server.root_markers, vec!["package.json", ".git"]);
         assert_eq!(server.workspace_name.as_deref(), Some("frontend"));
+    }
+
+    #[test]
+    fn formatting_defaults_to_on_for_missing_fields_and_files() {
+        assert!(Config::default().formatting.on_save);
+        assert!(toml::from_str::<FormattingConfig>("").unwrap().on_save);
+        let config: Config = toml::from_str("theme = \"red.json\"\n[keys]").unwrap();
+        assert!(config.formatting.on_save);
+        let config: Config = toml::from_str(assets::DEFAULT_CONFIG).unwrap();
+        assert!(config.formatting.on_save);
+        assert_eq!(config.formatting.provider, FormattingProvider::Auto);
+
+        let directory = tempfile::tempdir().unwrap();
+        let loaded = Config::load_user_file(&directory.path().join("missing.toml"), &[]).unwrap();
+        assert!(loaded.is_clean());
+        assert!(loaded.config.formatting.on_save);
+    }
+
+    #[test]
+    fn formatting_on_save_resolves_each_config_layer() {
+        let cases = [
+            ("", vec![], true),
+            ("[formatting]\nprovider = \"lsp\"", vec![], true),
+            ("[formatting]\non_save = false", vec![], false),
+            ("[lsp]\nformat_on_save = false", vec![], false),
+            ("[lsp]\nformat_on_save = true", vec![], true),
+            (
+                "[lsp]\nformat_on_save = true\n[formatting]\non_save = false",
+                vec![],
+                false,
+            ),
+            (
+                "[lsp]\nformat_on_save = false\n[formatting]\non_save = true",
+                vec![],
+                true,
+            ),
+            (
+                "[formatting]\non_save = false",
+                vec!["lsp.format_on_save = true"],
+                true,
+            ),
+            (
+                "[lsp]\nformat_on_save = true",
+                vec!["formatting.on_save = false"],
+                false,
+            ),
+            (
+                "",
+                vec!["lsp.format_on_save = true\nformatting.on_save = false"],
+                false,
+            ),
+            (
+                "",
+                vec!["lsp.format_on_save = false\nformatting.on_save = true"],
+                true,
+            ),
+            (
+                "",
+                vec!["formatting.on_save = false", "lsp.format_on_save = true"],
+                true,
+            ),
+            (
+                "",
+                vec!["formatting.on_save = true", "lsp.format_on_save = false"],
+                false,
+            ),
+            (
+                "[lsp]\nformat_on_save = false",
+                vec!["formatting.provider = \"external\""],
+                false,
+            ),
+        ];
+        for (source, overrides, expected) in cases {
+            let overrides = overrides.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            let loaded =
+                Config::load_user_toml(source, Path::new("/tmp/config.toml"), &overrides).unwrap();
+            assert!(loaded.is_clean(), "{source:?}: {:?}", loaded.diagnostics);
+            assert_eq!(loaded.config.formatting.on_save, expected, "{source:?}");
+
+            let source = format!("theme = \"red.json\"\n[keys]\n{source}");
+            let strict = Config::from_toml_with_overrides(&source, &overrides).unwrap();
+            assert_eq!(strict.formatting.on_save, expected, "{source:?}");
+            let roundtrip: Config = toml::from_str(&toml::to_string(&strict).unwrap()).unwrap();
+            assert_eq!(roundtrip.formatting.on_save, expected, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_formatting_settings_keep_their_original_diagnostics() {
+        for (source, expected_path) in [
+            ("[formatting]\non_save = \"no\"", "formatting.on_save"),
+            ("[lsp]\nformat_on_save = \"no\"", "lsp.format_on_save"),
+            (
+                "formatting = false\n[lsp]\nformat_on_save = false",
+                "formatting",
+            ),
+        ] {
+            let loaded =
+                Config::load_user_toml(source, Path::new("/tmp/config.toml"), &[]).unwrap();
+            assert_eq!(loaded.diagnostics.len(), 1, "{source:?}");
+            assert_eq!(loaded.diagnostics[0].path, expected_path);
+            assert!(loaded.diagnostics[0].line.is_some());
+            assert!(Config::load_user_toml(
+                "",
+                Path::new("/tmp/config.toml"),
+                &[source.to_string()],
+            )
+            .is_err());
+        }
     }
 
     #[test]

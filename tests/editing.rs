@@ -1435,8 +1435,7 @@ async fn format_on_save_restores_save_as_identity_and_insert_transaction_after_s
     let target_file = target.to_string_lossy().into_owned();
     let lsp = RecordingLsp::failing_next_did_open();
     let events = lsp.events();
-    let mut config = Config::default();
-    config.lsp.format_on_save = true;
+    let config = Config::default();
     let mut editor = Editor::with_size(
         Box::new(lsp),
         /*width*/ 80,

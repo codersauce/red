@@ -110,6 +110,20 @@ Patterns use Rust regular-expression syntax. `incsearch`, `hlsearch`,
 | `Space .` | Show code actions and quick fixes |
 | `Space r` | Rename the current symbol |
 
+Supported documents are formatted on save by default. Red prefers an installed
+language-pack formatter and otherwise uses LSP. To disable automatic formatting,
+add this to `~/.config/red/config.toml`:
+
+```toml
+[formatting]
+on_save = false
+```
+
+`Space f` still formats explicitly. The same section accepts
+`provider = "auto"`, `"external"`, or `"lsp"`. The legacy
+`lsp.format_on_save` setting remains supported; `formatting.on_save` wins if
+both are present in the same config layer.
+
 Husk's first-party server is included and starts for `.hk` and `.husk` files.
 Built-in defaults also cover Rust, TypeScript/JavaScript, Markdown, JSON, TOML,
 YAML, and Lua; those external servers must be installed separately and

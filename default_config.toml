@@ -157,13 +157,15 @@ waiting = "steady_underscore"
 # You can override or add servers here. Existing single-language configs still work:
 #
 # [lsp]
-# format_on_save = true
+# format_on_save = false # Legacy alias for formatting.on_save.
 #
-# `lsp.format_on_save` remains supported. New configurations can select an
-# external language-pack formatter, LSP formatting, or automatic fallback:
+# Supported documents are formatted on save by default. Set on_save to false
+# to disable it. The modern setting wins over the legacy alias in the same
+# config layer; command-line overrides still take precedence over the user file.
+# Select an external language-pack formatter, LSP formatting, or automatic fallback:
 #
 # [formatting]
-# on_save = true
+# on_save = false
 # provider = "auto" # "auto", "external", or "lsp"
 #
 # [lsp.servers.rust]
