@@ -214,6 +214,12 @@ pub trait Component: Send {
         false
     }
 
+    /// Whether this is a completion popup with no selectable item.
+    /// Filtering can leave such a popup installed even when it draws nothing.
+    fn is_empty_completion(&self) -> bool {
+        false
+    }
+
     /// Absolute bounds of an interactive completion popup, including its border.
     fn completion_popup_bounds(&self) -> Option<(usize, usize, usize, usize)> {
         None

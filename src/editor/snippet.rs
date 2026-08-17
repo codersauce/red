@@ -314,7 +314,6 @@ impl Editor {
 
     pub(super) fn handle_snippet_event(&mut self, event: &Event) -> Option<KeyAction> {
         if !self.is_insert()
-            || self.current_dialog.is_some()
             || self.panel_manager.focused_panel_id().is_some()
             || self
                 .snippet_session
@@ -345,6 +344,17 @@ impl Editor {
             }
             _ => return None,
         };
+
+        if let Some(dialog) = &self.current_dialog {
+            // An invisible, zero-match completion must not swallow snippet Tab.
+            // Keep ordinary completion acceptance and other dialog keys intact.
+            return (dialog.is_empty_completion()
+                && matches!(
+                    action,
+                    Action::NextSnippetPlaceholder | Action::PreviousSnippetPlaceholder
+                ))
+            .then(|| KeyAction::Multiple(vec![Action::CloseDialog, action]));
+        }
         Some(KeyAction::Single(action))
     }
 

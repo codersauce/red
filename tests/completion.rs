@@ -646,6 +646,109 @@ async fn an_open_completion_menu_accepts_before_snippet_navigation() {
     assert_eq!(editor.test_cursor_position(), (12, 1));
 }
 
+async fn editor_with_argument_snippet() -> Editor {
+    let (mut editor, _) = recording_editor(Buffer::new(None, "alpha\nseed".to_string()));
+    let mut completion = item("call");
+    completion.text_edit = Some(text_edit(
+        range(1, 0, 1, 4),
+        "call(${1:value}, ${2:next}, ${3:last})$0",
+    ));
+    completion.insert_text_format = Some(InsertTextFormat::Snippet);
+    editor
+        .test_execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    editor
+        .test_execute_action(Action::ApplyCompletion {
+            item: Box::new(completion),
+            commit_character: None,
+        })
+        .await
+        .unwrap();
+    editor
+}
+
+async fn filter_argument_completion_to_zero(editor: &mut Editor) {
+    editor.test_type_text("a").await.unwrap();
+    editor
+        .test_execute_action(Action::RequestCompletion)
+        .await
+        .unwrap();
+    // Use real key events so the open popup's filter changes with the buffer.
+    for character in "zzz".chars() {
+        editor
+            .test_execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn empty_completion_menu_does_not_block_next_snippet_placeholder() {
+    let mut editor = editor_with_argument_snippet().await;
+    filter_argument_completion_to_zero(&mut editor).await;
+    assert_eq!(
+        editor.test_buffer_contents(),
+        "alpha\ncall(azzz, next, last)"
+    );
+
+    editor
+        .test_execute_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+    assert_eq!(
+        editor.test_buffer_contents(),
+        "alpha\ncall(azzz, next, last)"
+    );
+    assert_eq!(editor.test_cursor_position(), (11, 1));
+
+    editor.test_type_text("42").await.unwrap();
+    editor
+        .test_execute_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+    assert_eq!(editor.test_buffer_contents(), "alpha\ncall(azzz, 42, last)");
+    assert_eq!(editor.test_cursor_position(), (15, 1));
+}
+
+#[tokio::test]
+async fn empty_completion_menu_does_not_block_previous_snippet_placeholder() {
+    let mut editor = editor_with_argument_snippet().await;
+    editor
+        .test_execute_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+    filter_argument_completion_to_zero(&mut editor).await;
+    assert_eq!(
+        editor.test_buffer_contents(),
+        "alpha\ncall(value, azzz, last)"
+    );
+
+    editor
+        .test_execute_event(Event::Key(KeyEvent::new(
+            KeyCode::BackTab,
+            KeyModifiers::SHIFT,
+        )))
+        .await
+        .unwrap();
+    assert_eq!(
+        editor.test_buffer_contents(),
+        "alpha\ncall(value, azzz, last)"
+    );
+    assert_eq!(editor.test_cursor_position(), (5, 1));
+
+    editor.test_type_text("7").await.unwrap();
+    editor
+        .test_execute_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+    assert_eq!(editor.test_buffer_contents(), "alpha\ncall(7, azzz, last)");
+    assert_eq!(editor.test_cursor_position(), (8, 1));
+}
+
 #[tokio::test]
 async fn moving_outside_snippet_cancels_selected_argument_replacement() {
     let (mut editor, _) = recording_editor(Buffer::new(None, "prefix seed".to_string()));

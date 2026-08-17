@@ -582,6 +582,10 @@ impl CompletionUI {
 }
 
 impl Component for CompletionUI {
+    fn is_empty_completion(&self) -> bool {
+        self.selected_item().is_none()
+    }
+
     fn completion_popup_bounds(&self) -> Option<(usize, usize, usize, usize)> {
         self.has_shortcut_context()
             .then_some((self.x, self.y, self.width, self.visible_rows + 2))
@@ -1175,8 +1179,10 @@ mod tests {
     fn enter_inserts_a_newline_when_no_completion_is_selected() {
         let mut ui = CompletionUI::new();
         ui.show(vec![item("alpha", Some(CompletionItemKind::Text))], 0, 0);
+        assert!(!ui.is_empty_completion());
         ui.set_filter("no_match");
 
+        assert!(ui.is_empty_completion());
         assert!(ui.selected_item().is_none());
         assert_eq!(
             ui.handle_event(&key(KeyCode::Tab, KeyModifiers::NONE)),
