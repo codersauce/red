@@ -65,8 +65,16 @@ pub enum LspEvent {
     },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedDocument {
+    pub file: String,
+    pub text: String,
+    pub disk_text: Option<String>,
+}
+
 #[derive(Clone, Default)]
 pub struct RecordingLsp {
+    saves: Arc<Mutex<Vec<SavedDocument>>>,
     events: Arc<Mutex<Vec<LspEvent>>>,
     reconfigurations: Arc<Mutex<Vec<LspConfig>>>,
     workspace_root: Option<PathBuf>,
@@ -77,6 +85,7 @@ pub struct RecordingLsp {
 impl RecordingLsp {
     pub fn with_workspace_root(root: &Path) -> Self {
         Self {
+            saves: Arc::default(),
             events: Arc::default(),
             reconfigurations: Arc::default(),
             workspace_root: Some(root.to_path_buf()),
@@ -84,6 +93,10 @@ impl RecordingLsp {
             fail_next_did_change: false,
         }
     }
+    pub fn saves(&self) -> Arc<Mutex<Vec<SavedDocument>>> {
+        Arc::clone(&self.saves)
+    }
+
     pub fn events(&self) -> Arc<Mutex<Vec<LspEvent>>> {
         Arc::clone(&self.events)
     }
@@ -306,6 +319,15 @@ impl LspClient for RecordingLsp {
                 "injected didChange failure".to_string(),
             ));
         }
+        Ok(())
+    }
+
+    async fn did_save(&mut self, file: &str, contents: &str) -> Result<(), LspError> {
+        self.saves.lock().unwrap().push(SavedDocument {
+            file: file.to_string(),
+            text: contents.to_string(),
+            disk_text: std::fs::read_to_string(file).ok(),
+        });
         Ok(())
     }
 

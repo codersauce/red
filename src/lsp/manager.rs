@@ -407,6 +407,16 @@ impl LspClient for LspManager {
         result
     }
 
+    async fn did_save(&mut self, file: &str, contents: &str) -> Result<(), LspError> {
+        self.did_open(file, contents).await?;
+        if let Some(key) = self.document_clients.get(file) {
+            if let Some(client) = self.clients.get_mut(key) {
+                client.did_save(file, contents).await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn did_close(&mut self, file: &str) -> Result<(), LspError> {
         self.document_clients.remove(file);
         let Some(document) = self.resolve_document(file) else {

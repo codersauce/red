@@ -321,6 +321,10 @@ pub trait LspClient: std::any::Any + Send {
     async fn did_open(&mut self, file: &str, contents: &str) -> Result<(), LspError>;
     /// Publishes the current full document text as the next version.
     async fn did_change(&mut self, file: &str, contents: String) -> Result<(), LspError>;
+    /// Notifies the server after the supplied document contents were saved successfully.
+    async fn did_save(&mut self, _file: &str, _contents: &str) -> Result<(), LspError> {
+        Ok(())
+    }
     /// Closes a document if this client tracks document lifecycles.
     async fn did_close(&mut self, _file: &str) -> Result<(), LspError> {
         Ok(())
