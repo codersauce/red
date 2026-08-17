@@ -23,6 +23,7 @@ mod inline_comments;
 mod inline_completion;
 mod inline_history;
 mod keyboard_shortcuts;
+mod learning;
 mod lsp_coordinator;
 #[cfg(test)]
 mod navigation_perf_tests;
@@ -2370,6 +2371,11 @@ pub enum Action {
     OpenSyntaxPicker,
     SetSyntax(String),
     OpenWhatsNew,
+    OpenLearn,
+    StartLearnLesson,
+    ExitLearnLesson,
+    RestartLearnLesson,
+    FinishLearnLesson,
     OpenStatuslineManager,
     OpenDiagnosticsPicker,
     OpenErrorDiagnosticsPicker,
@@ -3137,6 +3143,9 @@ pub struct Editor {
 
     /// Persistent preferences, including command-line history.
     preferences: PreferencesStore,
+
+    /// Owns the protected practice buffer and original window layout.
+    learn_session: Option<learning::LearnSession>,
 
     /// A release has changed, but no visible client has seen its announcement yet.
     whats_new_startup_pending: bool,
@@ -4442,6 +4451,7 @@ impl Editor {
             command: String::new(),
             preferences,
             whats_new_startup_pending,
+            learn_session: None,
             whats_new_auto_presentation_enabled: false,
             whats_new_needs_persistence: false,
             command_history_navigation: None,
@@ -5371,6 +5381,9 @@ impl Editor {
     }
 
     fn resize_window_layout(&mut self, terminal_size: (usize, usize)) {
+        if self.resize_learn_layout(terminal_size) {
+            return;
+        }
         self.sync_to_window();
         self.configure_pane_presentation(terminal_size);
         let (reserved_left, reserved_right) = self.reserved_panel_widths(terminal_size.0);
@@ -5415,7 +5428,12 @@ impl Editor {
         self.invalidate_terminal_render_state(buffer);
 
         let viewport_width = self.vwidth();
-        let viewport_height = if self.inline_history_browser.is_some() {
+        let viewport_height = if self.inline_history_browser.is_some()
+            || self
+                .current_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.uses_full_editor_viewport())
+        {
             self.inline_history_viewport_height()
         } else {
             self.vheight()
@@ -13666,6 +13684,16 @@ impl Editor {
         if matches!(cmd, "whats-new" | "changelog") {
             return vec![Action::OpenWhatsNew];
         }
+        if matches!(cmd, "learn" | "tutorial" | "welcome") {
+            return vec![Action::OpenLearn];
+        }
+        match cmd {
+            "tutorial essentials" => return vec![Action::StartLearnLesson],
+            "tutorial quit" => return vec![Action::ExitLearnLesson],
+            "tutorial restart" => return vec![Action::RestartLearnLesson],
+            "tutorial next" => return vec![Action::FinishLearnLesson],
+            _ => {}
+        }
         if cmd == "config-diagnostics" {
             return vec![Action::ConfigDiagnostics];
         }
@@ -16258,6 +16286,9 @@ impl Editor {
     ) -> anyhow::Result<bool> {
         // log!("Action: {action:?}");
         self.set_legacy_message(None);
+        if self.intercept_learn_action(action, buffer, runtime)? {
+            return Ok(false);
+        }
         let sensitive_action = matches!(action, Action::NotifyPlugin(_, _, _))
             || matches!(
                 action,
@@ -19483,6 +19514,17 @@ impl Editor {
                     self.render(buffer)?;
                 }
             }
+            Action::OpenLearn | Action::FinishLearnLesson => {
+                self.finish_learn_lesson(buffer, runtime)?;
+                self.open_learn_hub(runtime);
+                self.render(buffer)?;
+            }
+            Action::StartLearnLesson | Action::RestartLearnLesson => {
+                self.start_learn_lesson(buffer, runtime).await?;
+            }
+            Action::ExitLearnLesson => {
+                self.finish_learn_lesson(buffer, runtime)?;
+            }
             Action::OpenStatuslineManager => {
                 self.release_current_dialog_callbacks(runtime);
                 self.current_dialog = Some(Box::new(StatuslineLayoutPanel::new(self)));
@@ -20424,6 +20466,7 @@ impl Editor {
                 .await?;
         }
 
+        self.observe_learn_action(action, buffer)?;
         Ok(false)
     }
 
@@ -23941,6 +23984,11 @@ impl Editor {
     }
 
     fn persist_session_snapshot(&mut self, force: bool) -> bool {
+        // Learn Red checkpoints the real workspace before opening its scratch
+        // window. Keep that recovery snapshot intact until the lesson exits.
+        if self.learn_session.is_some() {
+            return false;
+        }
         let Some(store) = self.session_manager.store().cloned() else {
             return false;
         };
@@ -27544,6 +27592,140 @@ mod test {
     use super::*;
     use crate::lsp::DiagnosticSeverity;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn learn_red_restores_the_original_workspace_and_protects_files() {
+        let mut editor = test_editor(120, 32);
+        let mut buffer = RenderBuffer::new(120, 32, &Style::default());
+        let mut runtime = Runtime::new();
+        editor
+            .execute(&Action::SplitVertical, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        let original_id = editor.current_buffer().id();
+        let original_text = editor.current_buffer().contents();
+        let original_windows = editor.window_manager.snapshot();
+        let directory = tempfile::tempdir().unwrap();
+        let forbidden = directory.path().join("must-not-exist.rs");
+
+        editor
+            .execute(&Action::StartLearnLesson, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        let practice_id = editor.current_buffer().id();
+        assert_ne!(practice_id, original_id);
+        assert_eq!(editor.window_manager.window_count(), 1);
+        assert!(editor.current_buffer().file.is_none());
+        editor
+            .execute(
+                &Action::SaveAs(forbidden.to_string_lossy().into_owned()),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        editor
+            .execute(&Action::NextBuffer, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(!forbidden.exists());
+        assert_eq!(editor.current_buffer().id(), practice_id);
+
+        for action in [
+            Action::EnterMode(Mode::Insert),
+            Action::InsertCharAtCursorPos('x'),
+            Action::EnterMode(Mode::Normal),
+            Action::Undo,
+        ] {
+            editor
+                .execute(&action, &mut buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            crate::learn::PracticeStep::Complete
+        );
+        assert!(editor
+            .preferences
+            .learn_lesson_completed(crate::learn::FIRST_LESSON_ID));
+        editor
+            .execute(&Action::ExitLearnLesson, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().id(), original_id);
+        assert_eq!(editor.current_buffer().contents(), original_text);
+        assert_eq!(editor.window_manager.snapshot(), original_windows);
+        assert!(!editor
+            .buffer_manager
+            .iter()
+            .any(|candidate| candidate.id() == practice_id));
+    }
+
+    #[test]
+    fn learn_red_commands_are_explicit_and_discoverable() {
+        let mut editor = test_editor(80, 24);
+        let runtime = Runtime::new();
+        for command in ["learn", "tutorial", "welcome"] {
+            assert_eq!(
+                editor.handle_command(command, &runtime),
+                vec![Action::OpenLearn]
+            );
+        }
+        assert_eq!(
+            editor.handle_command("tutorial essentials", &runtime),
+            vec![Action::StartLearnLesson]
+        );
+        assert_eq!(
+            editor.handle_command("tutorial quit", &runtime),
+            vec![Action::ExitLearnLesson]
+        );
+        assert_eq!(
+            editor.handle_command("tutorial restart", &runtime),
+            vec![Action::RestartLearnLesson]
+        );
+    }
+
+    #[tokio::test]
+    async fn learn_red_keeps_the_real_workspace_in_crash_recovery() {
+        let mut editor = test_editor(100, 28);
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().join("recovery"));
+        editor.set_session_store(store.clone());
+        let mut buffer = RenderBuffer::new(100, 28, &Style::default());
+        editor.render(&mut buffer).unwrap();
+        let original_windows = editor.window_manager.snapshot();
+        let mut runtime = Runtime::new();
+        editor
+            .execute(&Action::StartLearnLesson, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        let before = store.load().unwrap();
+        assert_eq!(before.window_layout, original_windows);
+        assert_eq!(before.buffers.len(), 1);
+        editor
+            .execute(&Action::EnterMode(Mode::Insert), &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        editor
+            .execute(
+                &Action::InsertCharAtCursorPos('x'),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        editor.persist_session_snapshot(true);
+        assert_eq!(store.load().unwrap().generation, before.generation);
+        editor
+            .execute(&Action::ExitLearnLesson, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        let after = store.load().unwrap();
+        assert_eq!(after.window_layout, original_windows);
+        assert_eq!(after.buffers.len(), 1);
+        assert_eq!(after.buffers[0].contents, "hello");
+    }
 
     #[test]
     fn commit_message_prompt_bounds_context_and_separates_style_from_facts() {

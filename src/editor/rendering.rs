@@ -1311,6 +1311,7 @@ impl Editor {
                 help.context.clone_from(&context);
             }
         }
+        self.render_learn_coach(buffer);
         self.render_dialog(buffer)?;
 
         // Render all plugins
@@ -1414,6 +1415,7 @@ impl Editor {
 
     fn can_reuse_editor_surfaces(&self) -> bool {
         self.previous_render_buffer.is_some()
+            && self.learn_session.is_none()
             && !self.force_full_redraw
             && self.last_rendered_window == self.window_manager.active_stable_window_id()
             && self.current_dialog.is_none()
@@ -1443,6 +1445,7 @@ impl Editor {
             self.render_window(buffer, self.window_manager.active_window_id())?;
         }
         self.render_ui_chrome(buffer)?;
+        self.render_learn_coach(buffer);
         self.render_dialog(buffer)?;
         self.update_and_render_overlays(buffer)?;
         self.update_terminal_cursor_surface(buffer);
