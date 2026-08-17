@@ -4,6 +4,7 @@ use crate::editor::{Action, Mode, SearchDirection};
 
 mod git;
 pub(crate) mod navigation;
+pub(crate) mod personalization;
 pub(crate) mod precision;
 pub(crate) mod staging;
 mod workspace;
@@ -62,10 +63,11 @@ pub(crate) enum Lesson {
     RepeatAndRecover,
     FindAndReplace,
     ChooseATheme,
+    DiscoverYourKeymap,
 }
 
 impl Lesson {
-    pub const AVAILABLE: [Self; 23] = [
+    pub const AVAILABLE: [Self; 24] = [
         Self::FindYourFooting,
         Self::EditWithConfidence,
         Self::FindACommand,
@@ -89,6 +91,7 @@ impl Lesson {
         Self::RepeatAndRecover,
         Self::FindAndReplace,
         Self::ChooseATheme,
+        Self::DiscoverYourKeymap,
     ];
 
     pub fn from_id(id: &str) -> Option<Self> {
@@ -136,6 +139,7 @@ impl Lesson {
             Self::RepeatAndRecover => 20,
             Self::FindAndReplace => 21,
             Self::ChooseATheme => 22,
+            Self::DiscoverYourKeymap => 23,
         }
     }
 
@@ -159,7 +163,7 @@ impl Lesson {
             | Self::ChangeATextObject
             | Self::RepeatAndRecover
             | Self::FindAndReplace => 4,
-            Self::ChooseATheme => 5,
+            Self::ChooseATheme | Self::DiscoverYourKeymap => 5,
             _ => 0,
         }
     }
@@ -229,6 +233,7 @@ impl Lesson {
             Self::RepeatAndRecover => "precision.repeat-and-recover.v1",
             Self::FindAndReplace => "precision.find-and-replace.v1",
             Self::ChooseATheme => "custom.choose-a-theme.v1",
+            Self::DiscoverYourKeymap => "custom.discover-your-keymap.v1",
         }
     }
 
@@ -242,6 +247,7 @@ impl Lesson {
             Self::ChangeATextObject => precision::OBJECT_CONTENTS,
             Self::RepeatAndRecover => precision::REPEAT_CONTENTS,
             Self::FindAndReplace => precision::REPLACE_CONTENTS,
+            Self::DiscoverYourKeymap => personalization::KEYMAP_CONTENTS,
             Self::FindYourFooting | Self::ChooseATheme => PRACTICE_CONTENTS,
             Self::EditWithConfidence => EDIT_CONTENTS,
             Self::FindACommand => COMMAND_CONTENTS,
@@ -285,6 +291,7 @@ impl Lesson {
             Self::RepeatAndRecover => PracticeStep::RepeatEdit,
             Self::FindAndReplace => PracticeStep::ReplaceSearch,
             Self::ChooseATheme => PracticeStep::ThemeOpen,
+            Self::DiscoverYourKeymap => PracticeStep::KeymapOpen,
         }
     }
 
@@ -335,6 +342,12 @@ impl Lesson {
                 "Undo the unwanted change",
                 "Request and refine a suggestion",
                 "Keep only the corrected result",
+            ],
+            Self::DiscoverYourKeymap => &[
+                "Inspect your current shortcuts",
+                "Save a practice F6 mapping",
+                "Try the remapped command",
+                "Find F6 in keyboard help",
             ],
             Self::ChooseATheme => &[
                 "Open the theme browser",
@@ -637,12 +650,22 @@ pub(crate) enum PracticeStep {
     ThemePreview,
     ThemeCancel,
     ThemeChoose,
+    KeymapOpen,
+    KeymapReturn,
+    KeymapEdit,
+    KeymapTry,
+    KeymapInspect,
+    KeymapClose,
     Complete,
 }
 
 impl PracticeStep {
     pub fn suggested_action(self) -> Option<Action> {
         match self {
+            Self::KeymapOpen | Self::KeymapInspect => Some(Action::KeyboardShortcuts),
+            Self::KeymapReturn | Self::KeymapClose => None,
+            Self::KeymapEdit => Some(Action::Save),
+            Self::KeymapTry => Some(Action::ToggleWrap),
             Self::ThemeOpen | Self::ThemeChoose => {
                 Some(Action::PluginCommand("ThemeBrowser".into()))
             }
@@ -794,6 +817,12 @@ impl PracticeStep {
             Self::DiagnosticJump => "Choose the missing-semicolon error and press Enter. The editor will take you to the reported location. Reopen Diagnostics if you closed the picker.".into(),
             Self::DiagnosticRead => format!("Press {} to read the diagnostic on this line. The parser points at the next token; the incomplete statement is just above it.", shortcut.unwrap_or("D")),
             Self::DiagnosticReturn => "Read the message and diagnostic code, then press Esc to return to the source. You will repair the defect in a later lesson.".into(),
+            Self::KeymapOpen => format!("Press {} to inspect your effective shortcuts. Keyboard help includes your own overrides, not just Red's defaults.", shortcut.unwrap_or("F1")),
+            Self::KeymapReturn => "Try / to search by action or binding, and Tab to switch scope. Press Esc to clear a search, then Esc again to return to the practice config.".into(),
+            Self::KeymapEdit => format!("Change MoveRight to ToggleWrap in this owned TOML file, then press {}. You can use :%s/MoveRight/ToggleWrap/ followed by :w. Only the practice F6 binding is applied; your real config is untouched.", shortcut.unwrap_or(":w")),
+            Self::KeymapTry => "Press F6 to run your temporary mapping. The long comment should stop wrapping. This is the real key resolver using the action loaded from your practice TOML.".into(),
+            Self::KeymapInspect => format!("Press {}, type /F6, and inspect the remapped action. The shortcut explorer updates from the effective keymap.", shortcut.unwrap_or("F1")),
+            Self::KeymapClose => "F6 now resolves to Toggle line wrap. Press Esc to leave the search, then Esc again to return. Your original F6 binding will return when the lesson ends.".into(),
             Self::ThemeOpen => format!("Press {} (or :ThemeBrowser) to browse installed and bundled themes. Moving through the list previews colors without saving a preference.", shortcut.unwrap_or("Space t")),
             Self::ThemePreview => "Move to a different theme or filter by name. The editor previews it immediately. Enter saves a choice; for this first pass, try Esc after the colors change.".into(),
             Self::ThemeCancel => "Press Esc to restore the saved theme. If you already selected a theme with Enter, reopen :ThemeBrowser and cancel; an explicit saved choice is never silently undone.".into(),
@@ -857,6 +886,7 @@ impl PracticeStep {
                 Lesson::UnderstandSelectedCode => "You explained selected code without editing it. Recorded practice complete; real inline assist sends your selected context only when you submit a prompt.",
                 Lesson::MakeAFocusedChange => "The fix is kept in the buffer, still unsaved. Inline edits use normal undo history; keeping one is not the same as writing a file.",
                 Lesson::ChooseWhatToKeep => "You rejected an unwanted change, refined a suggestion, and kept the corrected result. The final edit is unsaved and remains undoable.",
+                Lesson::DiscoverYourKeymap => "You edited a real keymap fragment, tried its temporary binding, and found it in keyboard help. Copy an intentional override into your own config later if you want to keep it.",
                 Lesson::ChooseATheme => "You previewed a theme, tested cancellation, and made an explicit choice. Your saved theme remains in effect after the lesson.",
                 Lesson::FindAndReplace => "You searched, repeated the search, replaced both matches, and undid the substitution in one step. Edit with precision complete! The original practice text is restored.",
                 Lesson::RepeatAndRecover => "Both unwanted words are gone. You repeated a completed change and recovered the second edit independently. The practice text is still unsaved.",
@@ -906,7 +936,9 @@ impl PracticeStep {
             | Self::ObjectFind
             | Self::RepeatEdit
             | Self::ReplaceSearch
-            | Self::ThemeOpen => 0,
+            | Self::ThemeOpen
+            | Self::KeymapOpen
+            | Self::KeymapReturn => 0,
             Self::Type
             | Self::EditDelete
             | Self::CommandRun
@@ -929,7 +961,8 @@ impl PracticeStep {
             | Self::ObjectChange
             | Self::RepeatNext
             | Self::ReplaceNext
-            | Self::ThemePreview => 1,
+            | Self::ThemePreview
+            | Self::KeymapEdit => 1,
             Self::Normal
             | Self::EditUndo
             | Self::CommandHelp
@@ -954,7 +987,8 @@ impl PracticeStep {
             | Self::ObjectType
             | Self::RepeatUndo
             | Self::ReplaceAll
-            | Self::ThemeCancel => 2,
+            | Self::ThemeCancel
+            | Self::KeymapTry => 2,
             Self::Undo
             | Self::EditRedo
             | Self::CommandReturn
@@ -977,7 +1011,9 @@ impl PracticeStep {
             | Self::ObjectNormal
             | Self::RepeatRedo
             | Self::ReplaceUndo
-            | Self::ThemeChoose => 3,
+            | Self::ThemeChoose
+            | Self::KeymapInspect
+            | Self::KeymapClose => 3,
             Self::Complete => 4,
         }
     }
@@ -1099,6 +1135,14 @@ impl PracticeStep {
     /// Observes UI state that can change through either a key or an action.
     pub fn observe_view(&mut self, action: &Action, view: PracticeView) -> bool {
         let next = match (*self, action) {
+            (Self::KeymapOpen, _) if view.shortcuts_open => Self::KeymapReturn,
+            (Self::KeymapReturn, _) if !view.shortcuts_open => Self::KeymapEdit,
+            (Self::KeymapEdit, Action::Save) if view.keymap_installed => Self::KeymapTry,
+            (Self::KeymapTry, Action::ToggleWrap) if view.keymap_installed && !view.wrapping => {
+                Self::KeymapInspect
+            }
+            (Self::KeymapInspect, _) if view.keymap_binding_visible => Self::KeymapClose,
+            (Self::KeymapClose, _) if !view.shortcuts_open => Self::Complete,
             (Self::ThemeOpen, Action::PluginCommand(name))
                 if name == "ThemeBrowser" && view.theme_picker_open =>
             {
@@ -1361,6 +1405,8 @@ pub(crate) struct PracticeView {
     pub code_actions_open: bool,
     pub husk_fixed_text: bool,
     pub diagnostics_clean: bool,
+    pub keymap_installed: bool,
+    pub keymap_binding_visible: bool,
     pub theme_picker_open: bool,
     pub theme_previewed: bool,
     pub theme_cancelled: bool,
@@ -1390,14 +1436,27 @@ pub(crate) struct PracticeView {
 
 /// Scratch lessons permit only edits to their isolated practice buffer.
 pub(crate) fn practice_action_allowed(lesson: Lesson, action: &Action) -> bool {
-    (lesson == Lesson::ChooseATheme
-        && (matches!(
+    (lesson == Lesson::DiscoverYourKeymap
+        && matches!(
             action,
-            Action::PreviewTheme(_)
-                | Action::SetTheme(_)
+            Action::KeyboardShortcuts
                 | Action::CommandPalette
-                | Action::KeyboardShortcuts
-        ) || matches!(action, Action::PluginCommand(name) if matches!(name.as_str(), "ThemeBrowser" | "LearnThemeCancel"))))
+                | Action::Save
+                | Action::ToggleWrap
+                | Action::Substitute(_)
+                | Action::ConfirmSubstitute(_)
+                | Action::ChangeTextRange(_)
+                | Action::DeleteTextRange(_)
+                | Action::DeleteWord
+        ))
+        || (lesson == Lesson::ChooseATheme
+            && (matches!(
+                action,
+                Action::PreviewTheme(_)
+                    | Action::SetTheme(_)
+                    | Action::CommandPalette
+                    | Action::KeyboardShortcuts
+            ) || matches!(action, Action::PluginCommand(name) if matches!(name.as_str(), "ThemeBrowser" | "LearnThemeCancel"))))
         || (lesson == Lesson::FindAndReplace
             && matches!(
                 action,

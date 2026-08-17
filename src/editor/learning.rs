@@ -10,6 +10,7 @@ mod agent;
 mod committing;
 mod customization;
 mod git;
+mod keymap;
 mod language;
 mod navigation;
 mod outline;
@@ -40,6 +41,7 @@ pub(super) struct LearnSession {
     symbols: Option<symbols::LearnSymbolState>,
     outline: Option<outline::LearnOutlineState>,
     theme: Option<customization::LearnThemeState>,
+    keymap: Option<keymap::LearnKeymapState>,
 }
 
 impl LearnSession {
@@ -158,8 +160,10 @@ impl Editor {
         }
         // Create owned storage before changing any editor state, so a failed
         // setup leaves the user's current workspace untouched.
-        let workspace = if matches!(lesson, Lesson::SaveAPracticeFile | Lesson::ContinueInAgent)
-            || lesson.is_lsp_practice()
+        let workspace = if matches!(
+            lesson,
+            Lesson::SaveAPracticeFile | Lesson::ContinueInAgent | Lesson::DiscoverYourKeymap
+        ) || lesson.is_lsp_practice()
             || lesson.is_git_practice()
             || lesson.is_navigation_practice()
         {
@@ -171,6 +175,12 @@ impl Editor {
             let workspace = workspace.as_ref().expect("file lesson owns a workspace");
             workspace.write_fixture("score.rs", lesson.contents())?;
             workspace.write_fixture("example.rs", crate::learn::AGENT_EXAMPLE)?;
+        }
+        if lesson == Lesson::DiscoverYourKeymap {
+            workspace
+                .as_ref()
+                .expect("keymap lesson owns a workspace")
+                .write_fixture("keymap.toml", lesson.contents())?;
         }
         if lesson.is_navigation_practice() {
             let workspace = workspace
@@ -244,7 +254,9 @@ impl Editor {
         self.pending_semantic_change = None;
         let file = workspace.as_ref().map(|workspace| {
             workspace
-                .path(if lesson.is_navigation_practice() {
+                .path(if lesson == Lesson::DiscoverYourKeymap {
+                    "keymap.toml"
+                } else if lesson.is_navigation_practice() {
                     "README.md"
                 } else if lesson.is_lsp_practice() {
                     "main.hk"
@@ -297,9 +309,11 @@ impl Editor {
             outline: (lesson == Lesson::FollowSymbols).then(outline::LearnOutlineState::default),
             theme: (lesson == Lesson::ChooseATheme)
                 .then(|| customization::LearnThemeState::new(self)),
+            keymap: (lesson == Lesson::DiscoverYourKeymap)
+                .then(|| keymap::LearnKeymapState::new(self)),
         }));
         self.mode = Mode::Normal;
-        if lesson == Lesson::FindACommand {
+        if matches!(lesson, Lesson::FindACommand | Lesson::DiscoverYourKeymap) {
             self.wrap = true;
         }
         self.splash_dismissed = true;
@@ -380,6 +394,9 @@ impl Editor {
         self.registers = session.original_registers;
         self.config.clipboard.enabled = session.original_clipboard_enabled;
         session.input.restore(self);
+        if let Some(keymap) = session.keymap {
+            keymap.restore(self);
+        }
         if let Some(history) = session.original_inline_history {
             self.inline_history = history;
         }
@@ -501,6 +518,9 @@ impl Editor {
                 "this practice step only edits tutorial text; use :tutorial quit to return".into(),
             ));
             self.render(buffer)?;
+            return Ok(true);
+        }
+        if self.intercept_learn_keymap_action(action, buffer).await? {
             return Ok(true);
         }
         if self
@@ -641,6 +661,12 @@ impl Editor {
                 .flatten()
                 .and_then(|uri| self.diagnostics.get(&uri))
                 .is_some_and(Vec::is_empty),
+            keymap_installed: self.learn_keymap_installed(),
+            keymap_binding_visible: self.learn_keymap_installed()
+                && self
+                    .keyboard_shortcuts
+                    .as_ref()
+                    .is_some_and(|help| help.shows_filtered_binding("F6")),
             theme_picker_open: self
                 .current_dialog
                 .as_ref()

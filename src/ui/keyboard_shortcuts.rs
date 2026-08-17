@@ -171,6 +171,15 @@ impl KeyboardShortcuts {
             .collect()
     }
 
+    /// Whether a filtered result contains this complete effective binding.
+    pub(crate) fn shows_filtered_binding(&self, key: &str) -> bool {
+        !self.query.trim().is_empty()
+            && self
+                .matching()
+                .iter()
+                .any(|entry| entry.key.eq_ignore_ascii_case(key))
+    }
+
     fn move_by(&mut self, amount: isize) {
         self.selected = self
             .selected
