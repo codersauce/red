@@ -138,8 +138,13 @@ async fn inline_history_multifile_navigation_reuses_rendered_receipt() {
                 .test_execute_production_action(Action::InlineHistoryAction(action))
                 .await
                 .unwrap();
+            let current_cache = &editor.inline_history_browser.as_ref().unwrap().render_cache;
             assert!(
-                Arc::ptr_eq(&rendered, &cache.cached_lines().unwrap()),
+                Arc::ptr_eq(&cache, current_cache),
+                "unchanged History navigation replaced the browser cache"
+            );
+            assert!(
+                Arc::ptr_eq(&rendered, &current_cache.cached_lines().unwrap()),
                 "unchanged History navigation rebuilt the six-file diff"
             );
         }

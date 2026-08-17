@@ -18,13 +18,13 @@ struct CompletionNotice {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct InlineCompletionState {
+pub(super) struct InlineCompletionNoticeState {
     latest: Option<String>,
     notice: Option<CompletionNotice>,
     hit: Option<(std::ops::Range<usize>, String)>,
 }
 
-impl InlineCompletionState {
+impl InlineCompletionNoticeState {
     pub(super) fn clear_hit(&mut self) {
         self.hit = None;
     }
@@ -56,24 +56,24 @@ impl Editor {
     }
 
     pub(super) fn notify_inline_outcome(&mut self, request: &str) {
-        self.inline_completion.latest = Some(request.to_owned());
-        self.inline_completion.notice = Some(CompletionNotice {
+        self.inline_completion_notice.latest = Some(request.to_owned());
+        self.inline_completion_notice.notice = Some(CompletionNotice {
             request_id: request.to_owned(),
             expires_at: None,
         });
-        self.inline_completion.clear_hit();
+        self.inline_completion_notice.clear_hit();
     }
 
     pub(super) fn poll_inline_completion_notice(&mut self, now: Instant) -> bool {
         if self
-            .inline_completion
+            .inline_completion_notice
             .notice
             .as_ref()
             .and_then(|notice| notice.expires_at)
             .is_some_and(|until| now >= until)
         {
-            self.inline_completion.notice = None;
-            return self.inline_completion.hit.take().is_some();
+            self.inline_completion_notice.notice = None;
+            return self.inline_completion_notice.hit.take().is_some();
         }
         false
     }
@@ -90,7 +90,7 @@ impl Editor {
     pub(super) fn inline_completion_notice_available(&self) -> bool {
         self.inline_completion_surface_available()
             && self
-                .inline_completion
+                .inline_completion_notice
                 .notice
                 .as_ref()
                 .is_some_and(|notice| notice.expires_at.is_none_or(|until| Instant::now() < until))
@@ -106,7 +106,7 @@ impl Editor {
         if !self.inline_completion_notice_available() || width == 0 {
             return;
         }
-        let Some(notice) = &self.inline_completion.notice else {
+        let Some(notice) = &self.inline_completion_notice.notice else {
             return;
         };
         let request = &notice.request_id;
@@ -207,8 +207,8 @@ impl Editor {
         buffer.set_text(x, y, &link, &link_style);
         buffer.set_text(x + link_width, y, hint, style);
         if link_width > 0 {
-            self.inline_completion.hit = Some((x..x + link_width, request.clone()));
-            if let Some(notice) = &mut self.inline_completion.notice {
+            self.inline_completion_notice.hit = Some((x..x + link_width, request.clone()));
+            if let Some(notice) = &mut self.inline_completion_notice.notice {
                 notice
                     .expires_at
                     .get_or_insert_with(|| Instant::now() + NOTICE_DURATION);
@@ -232,11 +232,11 @@ impl Editor {
         else {
             return None;
         };
-        let (columns, request) = self.inline_completion.hit.as_ref()?;
+        let (columns, request) = self.inline_completion_notice.hit.as_ref()?;
         (usize::from(*row) == usize::from(self.size.1).saturating_sub(1)
             && columns.contains(&usize::from(*column))
             && self
-                .inline_completion
+                .inline_completion_notice
                 .notice
                 .as_ref()
                 .is_some_and(|notice| {
@@ -253,7 +253,7 @@ impl Editor {
         frame: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
-        if let Some(request) = self.inline_completion.latest.clone() {
+        if let Some(request) = self.inline_completion_notice.latest.clone() {
             self.open_inline_completion(&request, frame, runtime).await
         } else {
             self.set_legacy_message(Some(
@@ -295,13 +295,13 @@ impl Editor {
             return self.render(frame);
         };
         if self
-            .inline_completion
+            .inline_completion_notice
             .notice
             .as_ref()
             .is_some_and(|notice| notice.request_id == request)
         {
-            self.inline_completion.notice = None;
-            self.inline_completion.clear_hit();
+            self.inline_completion_notice.notice = None;
+            self.inline_completion_notice.clear_hit();
         }
         self.waiting_key_action = None;
         self.waiting_command = None;

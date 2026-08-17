@@ -123,7 +123,7 @@ async fn inline_completion_notice_links_to_background_result_without_applying_it
         row(&mut editor),
         "Inline edit ready · [src/sample.c:1] · Space N"
     );
-    let (columns, _) = editor.inline_completion.hit.clone().unwrap();
+    let (columns, _) = editor.inline_completion_notice.hit.clone().unwrap();
     assert!(editor
         .inline_completion_click(&click(columns.start - 1))
         .is_none());
@@ -146,7 +146,7 @@ async fn inline_completion_notice_links_to_background_result_without_applying_it
         Some("one")
     );
     assert!(editor.inline_jobs.contains_key("second"));
-    assert!(editor.inline_completion.notice.is_none());
+    assert!(editor.inline_completion_notice.notice.is_none());
 }
 
 #[tokio::test]
@@ -156,7 +156,13 @@ async fn inline_completion_shortcut_survives_notice_expiry() {
     editor.park_inline_assist();
     finish(&mut editor, "one", None);
     assert!(row(&mut editor).starts_with("Inline finished"));
-    let columns = editor.inline_completion.hit.as_ref().unwrap().0.clone();
+    let columns = editor
+        .inline_completion_notice
+        .hit
+        .as_ref()
+        .unwrap()
+        .0
+        .clone();
     assert!(editor.poll_inline_completion_notice(Instant::now() + NOTICE_DURATION));
     assert!(row(&mut editor).is_empty());
     assert!(editor
@@ -189,20 +195,26 @@ fn inline_completion_notice_preserves_errors_commands_and_narrow_layouts() {
     editor.park_inline_assist();
     finish(&mut editor, "one", None);
     row(&mut editor);
-    let columns = editor.inline_completion.hit.as_ref().unwrap().0.clone();
+    let columns = editor
+        .inline_completion_notice
+        .hit
+        .as_ref()
+        .unwrap()
+        .0
+        .clone();
     editor.set_notification_message(Severity::Error, Some("important error".into()));
     let error = editor.notifications.primary(Instant::now()).unwrap().id;
     assert!(editor
         .inline_completion_click(&click(columns.start))
         .is_none());
     assert!(row(&mut editor).starts_with("× important error"));
-    assert!(editor.inline_completion.hit.is_none());
+    assert!(editor.inline_completion_notice.hit.is_none());
     editor.notifications.acknowledge(error).unwrap();
     editor.notifications.clear_inactive(Instant::now());
     editor.mode = Mode::Command;
     editor.command = "write".into();
     assert_eq!(row(&mut editor), ":write");
-    assert!(editor.inline_completion.hit.is_none());
+    assert!(editor.inline_completion_notice.hit.is_none());
     editor.mode = Mode::Normal;
     editor.inline_history.turn_mut("one").unwrap().location.file =
         "/workspace/very/long/界界界/sample.c".into();
@@ -211,7 +223,7 @@ fn inline_completion_notice_preserves_errors_commands_and_narrow_layouts() {
         let text = row(&mut editor);
         assert!(display_width(&text) <= usize::from(width));
         assert!(editor
-            .inline_completion
+            .inline_completion_notice
             .hit
             .as_ref()
             .is_none_or(|(columns, _)| columns.end <= usize::from(width)));
@@ -227,7 +239,13 @@ fn inline_completion_link_and_message_history_share_the_bottom_line() {
     editor.park_inline_assist();
     finish(&mut editor, "one", None);
     row(&mut editor);
-    let old_columns = editor.inline_completion.hit.as_ref().unwrap().0.clone();
+    let old_columns = editor
+        .inline_completion_notice
+        .hit
+        .as_ref()
+        .unwrap()
+        .0
+        .clone();
 
     editor.set_notification_message(Severity::Error, Some("save failed".into()));
     let error = editor.notifications.primary(Instant::now()).unwrap().id;
@@ -236,8 +254,8 @@ fn inline_completion_link_and_message_history_share_the_bottom_line() {
         .is_none());
     let text = row(&mut editor);
     assert!(text.starts_with("× save failed"), "{text}");
-    assert!(text.contains("1 active · :messages"), "{text}");
-    assert!(editor.inline_completion.hit.is_none());
+    assert!(text.contains("1 needs attention · :messages"), "{text}");
+    assert!(editor.inline_completion_notice.hit.is_none());
 
     editor.notifications.acknowledge(error).unwrap();
     // The compatibility slot may outlive the displayed notification. It must
@@ -245,8 +263,14 @@ fn inline_completion_link_and_message_history_share_the_bottom_line() {
     assert!(editor.last_error.is_some());
     let text = row(&mut editor);
     assert!(text.starts_with("Inline finished"), "{text}");
-    assert!(text.ends_with("[:messages]"), "{text}");
-    let columns = editor.inline_completion.hit.as_ref().unwrap().0.clone();
+    assert!(!text.contains(":messages"), "{text}");
+    let columns = editor
+        .inline_completion_notice
+        .hit
+        .as_ref()
+        .unwrap()
+        .0
+        .clone();
     assert_eq!(
         editor.handle_event(&click(columns.start)).unwrap(),
         Some(KeyAction::Single(Action::OpenInlineCompletion(
@@ -262,7 +286,7 @@ fn inline_completion_link_and_message_history_share_the_bottom_line() {
     let text = row(&mut editor);
     assert!(text.ends_with("sample.c:1]"), "{text}");
     assert!(display_width(&text) <= 24);
-    assert!(editor.inline_completion.hit.is_some());
+    assert!(editor.inline_completion_notice.hit.is_some());
 }
 
 #[tokio::test]
@@ -282,20 +306,23 @@ fn inline_completion_notices_ignore_foreground_and_late_results() {
     let mut editor = editor();
     start(&mut editor, "first", "one", 0);
     editor.record_inline_failure("one", "failed");
-    assert!(editor.inline_completion.latest.is_none());
+    assert!(editor.inline_completion_notice.latest.is_none());
     start(&mut editor, "second", "two", 1);
     editor.park_inline_assist();
     editor.record_inline_failure("two", "failed");
     assert!(row(&mut editor).starts_with("Inline failed"));
-    let notice = editor.inline_completion.notice.clone();
+    let notice = editor.inline_completion_notice.notice.clone();
     editor.record_inline_failure("two", "duplicate");
     finish(&mut editor, "two", None);
-    assert_eq!(editor.inline_completion.notice, notice);
+    assert_eq!(editor.inline_completion_notice.notice, notice);
     start(&mut editor, "third", "three", 0);
     editor.park_inline_assist();
     finish(&mut editor, "three", None);
-    assert_eq!(editor.inline_completion.latest.as_deref(), Some("three"));
-    assert!(editor.inline_completion.hit.is_none());
+    assert_eq!(
+        editor.inline_completion_notice.latest.as_deref(),
+        Some("three")
+    );
+    assert!(editor.inline_completion_notice.hit.is_none());
 }
 
 #[test]
@@ -309,7 +336,7 @@ fn inline_completion_notice_does_not_expire_before_it_can_be_seen() {
     assert!(row(&mut editor).starts_with("× important error"));
     assert!(!editor.poll_inline_completion_notice(Instant::now() + Duration::from_secs(60)));
     assert!(editor
-        .inline_completion
+        .inline_completion_notice
         .notice
         .as_ref()
         .unwrap()
@@ -318,7 +345,7 @@ fn inline_completion_notice_does_not_expire_before_it_can_be_seen() {
     editor.notifications.acknowledge(error).unwrap();
     assert!(row(&mut editor).starts_with("Inline finished"));
     assert!(editor
-        .inline_completion
+        .inline_completion_notice
         .notice
         .as_ref()
         .unwrap()
@@ -334,7 +361,13 @@ async fn inline_completion_click_cannot_bypass_a_draft_close_confirmation() {
     editor.park_inline_assist();
     finish(&mut editor, "one", None);
     row(&mut editor);
-    let columns = editor.inline_completion.hit.as_ref().unwrap().0.clone();
+    let columns = editor
+        .inline_completion_notice
+        .hit
+        .as_ref()
+        .unwrap()
+        .0
+        .clone();
     action(&mut editor, Action::InlineAssist).await;
     editor
         .current_dialog

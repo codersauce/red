@@ -27,9 +27,9 @@ mod inline_completion;
 mod inline_context;
 mod inline_expansion;
 mod inline_history;
-mod keyboard_shortcuts;
 mod inline_jobs;
 mod inline_notifications;
+mod keyboard_shortcuts;
 mod learning;
 mod lsp_coordinator;
 #[cfg(test)]
@@ -2975,7 +2975,7 @@ pub struct Editor {
     /// Hidden jobs remain addressable independently of the foreground dialog.
     inline_jobs: BTreeMap<String, inline_jobs::ParkedInlineAssist>,
     inline_activity_animation: inline_jobs::InlineActivityAnimation,
-    inline_completion: inline_notifications::InlineCompletionState,
+    inline_completion_notice: inline_notifications::InlineCompletionNoticeState,
     staged_inline_agent_handoff: Option<inline_agent_outcomes::StagedHandoff>,
 
     /// Session-local annotations; never serialized into source or text undo history.
@@ -4444,7 +4444,7 @@ impl Editor {
             inline_assist: None,
             inline_jobs: BTreeMap::new(),
             inline_activity_animation: inline_jobs::InlineActivityAnimation::default(),
-            inline_completion: inline_notifications::InlineCompletionState::default(),
+            inline_completion_notice: inline_notifications::InlineCompletionNoticeState::default(),
             staged_inline_agent_handoff: None,
             inline_comments: Vec::new(),
             inline_comment_selections: HashMap::new(),

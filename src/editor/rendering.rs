@@ -3486,7 +3486,7 @@ impl Editor {
 
     pub fn draw_commandline(&mut self, buffer: &mut RenderBuffer) {
         self.notification_frame_candidate = None;
-        self.inline_completion.clear_hit();
+        self.inline_completion_notice.clear_hit();
         let style = self.theme.style.clone();
         let width = self.size.0 as usize;
         if width == 0 || self.size.1 == 0 {
