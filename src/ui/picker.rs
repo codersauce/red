@@ -49,6 +49,31 @@ type SelectAction = Box<dyn Fn(String) -> Action + Send>;
 type FilterAction = Box<dyn Fn(&PickerItem, &str) -> Option<i64> + Send>;
 type FilterTieBreaker = Box<dyn Fn(&PickerItem) -> usize + Send>;
 type FilterHighlightAction = Box<dyn Fn(&PickerItem, &str) -> PickerFilterHighlights + Send>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PickerMatchKind {
+    Exact,
+    ExactIgnoreCase,
+    Fuzzy,
+}
+
+fn default_filter_score(
+    matcher: &SkimMatcherV2,
+    label: &str,
+    query: &str,
+) -> Option<(PickerMatchKind, Reverse<i64>)> {
+    // Keep smart-case eligibility, but rank whole labels ahead of fuzzy prefixes.
+    let score = matcher.fuzzy_match(label, query)?;
+    let kind = if label == query {
+        PickerMatchKind::Exact
+    } else if label.eq_ignore_ascii_case(query) {
+        PickerMatchKind::ExactIgnoreCase
+    } else {
+        PickerMatchKind::Fuzzy
+    };
+    Some((kind, Reverse(score)))
+}
+
 const MIN_HORIZONTAL_PREVIEW_PANE_WIDTH: usize = 40;
 const MAX_PREVIEW_HIGHLIGHT_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_UNFOCUSED_PREVIEW_BYTES: u64 = 256 * 1024;
@@ -729,8 +754,11 @@ impl Picker {
                         self.filter_action
                             .as_ref()
                             .map_or_else(
-                                || self.matcher.fuzzy_match(&item.label, term),
-                                |filter| filter(item, term),
+                                || default_filter_score(&self.matcher, &item.label, term),
+                                |filter| {
+                                    filter(item, term)
+                                        .map(|score| (PickerMatchKind::Fuzzy, Reverse(score)))
+                                },
                             )
                             .map(|score| {
                                 let tie_breaker = self
@@ -742,7 +770,7 @@ impl Picker {
                     })
                     .collect::<Vec<_>>();
                 matches.sort_unstable_by_key(|(index, score, tie_breaker)| {
-                    (Reverse(*score), *tie_breaker, *index)
+                    (*score, *tie_breaker, *index)
                 });
                 self.visible_dynamic_items =
                     matches.into_iter().map(|(index, _, _)| index).collect();
@@ -761,12 +789,10 @@ impl Picker {
             .iter()
             .enumerate()
             .filter_map(|(index, item)| {
-                self.matcher
-                    .fuzzy_match(item, term)
-                    .map(|score| (index, score))
+                default_filter_score(&self.matcher, item, term).map(|score| (index, score))
             })
             .collect::<Vec<_>>();
-        new_items.sort_unstable_by_key(|(index, score)| (Reverse(*score), *index));
+        new_items.sort_unstable_by_key(|(index, score)| (*score, *index));
 
         let new_items = new_items
             .into_iter()
@@ -6171,6 +6197,203 @@ mod tests {
         assert_eq!(selected.id, "b");
         assert_eq!(selected.label.as_ptr(), original_label);
         assert!(picker.list.items().is_empty());
+    }
+
+    fn visible_picker_labels(picker: &Picker) -> Vec<&str> {
+        match &picker.dynamic_items {
+            Some(items) => picker
+                .visible_dynamic_items
+                .iter()
+                .map(|index| items[*index].label.as_str())
+                .collect(),
+            None => picker.list.items().iter().map(String::as_str).collect(),
+        }
+    }
+
+    #[test]
+    fn default_picker_ranks_exact_names_before_fuzzy_matches() {
+        let editor = test_editor();
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            (
+                "draw",
+                &[
+                    "DrawTail",
+                    "DrawBullet",
+                    "DrawShip",
+                    "DrawTextCenter",
+                    "Draw",
+                ],
+                &[
+                    "Draw",
+                    "DrawTail",
+                    "DrawBullet",
+                    "DrawShip",
+                    "DrawTextCenter",
+                ],
+            ),
+            (
+                "Draw",
+                &["DrawTail", "DrawBullet", "Draw"],
+                &["Draw", "DrawTail", "DrawBullet"],
+            ),
+            (
+                "spawn",
+                &["spawn_wave", "spawn_asteroid", "spawn"],
+                &["spawn", "spawn_wave", "spawn_asteroid"],
+            ),
+            (
+                "draw",
+                &["draw_tail", "DRAW", "Draw", "draw"],
+                &["draw", "Draw", "DRAW", "draw_tail"],
+            ),
+            (
+                "Draw",
+                &["draw", "DrawTail", "Draw", "DRAW"],
+                &["Draw", "DrawTail"],
+            ),
+            (
+                "DRAW",
+                &["Draw", "DRAW_TAIL", "DRAW", "draw"],
+                &["DRAW", "DRAW_TAIL"],
+            ),
+            (
+                "",
+                &["DrawTail", "Draw", "draw"],
+                &["DrawTail", "Draw", "draw"],
+            ),
+        ];
+
+        for &(query, labels, expected) in cases {
+            let items = labels
+                .iter()
+                .map(|label| (*label).to_string())
+                .collect::<Vec<_>>();
+            let mut plain = Picker::new(/*title*/ None, &editor, &items, /*id*/ None);
+            let mut structured = Picker::new_dynamic(
+                /*title*/ None,
+                &editor,
+                labels
+                    .iter()
+                    .map(|label| dynamic_item(label, label))
+                    .collect(),
+                /*id*/ 23,
+                PickerOptions::default(),
+            );
+
+            for picker in [&mut plain, &mut structured] {
+                picker.filter(query);
+                assert_eq!(visible_picker_labels(picker), expected, "query {query:?}");
+                picker.filter("");
+                assert_eq!(visible_picker_labels(picker), labels);
+            }
+        }
+    }
+
+    #[test]
+    fn custom_picker_scorers_keep_control_of_matching_and_order() {
+        let editor = test_editor();
+        let mut picker = Picker::builder()
+            .structured_items(vec![
+                dynamic_item("Draw", "Draw"),
+                dynamic_item("draw", "draw"),
+                dynamic_item("draw_tail", "draw_tail"),
+                dynamic_item("unrelated", "unrelated"),
+            ])
+            .filter_action(|item, _| match item.id.as_str() {
+                "unrelated" => Some(300),
+                "draw_tail" => Some(200),
+                "Draw" => Some(100),
+                _ => None,
+            })
+            .build(&editor);
+
+        picker.filter("draw");
+
+        assert_eq!(
+            visible_picker_labels(&picker),
+            ["unrelated", "draw_tail", "Draw"],
+        );
+    }
+
+    #[test]
+    fn custom_picker_tie_breakers_are_not_overridden_by_exact_names() {
+        let editor = test_editor();
+        let mut picker = Picker::builder()
+            .structured_items(vec![
+                dynamic_item("long", "draw"),
+                dynamic_item("a", "draw_tail"),
+            ])
+            .filter_action(|_, _| Some(1))
+            .filter_tie_breaker(|item| item.id.len())
+            .build(&editor);
+
+        picker.filter("draw");
+
+        assert_eq!(visible_picker_labels(&picker), ["draw_tail", "draw"]);
+    }
+
+    #[test]
+    fn external_picker_filter_preserves_server_order() {
+        let editor = test_editor();
+        let mut picker = Picker::new_dynamic(
+            /*title*/ None,
+            &editor,
+            vec![
+                dynamic_item("tail", "draw_tail"),
+                dynamic_item("exact", "draw"),
+            ],
+            /*id*/ 24,
+            PickerOptions {
+                external_filter: true,
+                initial_query: "draw".to_string(),
+                ..PickerOptions::default()
+            },
+        );
+
+        picker.filter("draw");
+        assert_eq!(visible_picker_labels(&picker), ["draw_tail", "draw"]);
+
+        assert!(picker.apply_update(
+            /*id*/ 24,
+            PickerUpdate::Items(vec![
+                dynamic_item("other", "unrelated"),
+                dynamic_item("exact", "draw"),
+            ]),
+        ));
+        assert_eq!(visible_picker_labels(&picker), ["unrelated", "draw"]);
+    }
+
+    #[test]
+    fn later_picker_batches_promote_exact_names_and_preserve_selection() {
+        let editor = test_editor();
+        let mut items = (0..64)
+            .map(|index| {
+                let name = format!("DrawThing{index:02}");
+                dynamic_item(&name, &name)
+            })
+            .collect::<Vec<_>>();
+        let mut picker = Picker::new_dynamic(
+            /*title*/ None,
+            &editor,
+            items.clone(),
+            /*id*/ 25,
+            PickerOptions {
+                initial_query: "draw".to_string(),
+                ..PickerOptions::default()
+            },
+        );
+        let selected_id = picker.selected_dynamic_item().unwrap().id.clone();
+        items.push(dynamic_item("Draw", "Draw"));
+
+        assert!(picker.apply_update(/*id*/ 25, PickerUpdate::Items(items)));
+
+        assert_eq!(picker.visible_dynamic_items.len(), 65);
+        assert_eq!(visible_picker_labels(&picker)[0], "Draw");
+        assert_eq!(
+            picker.visible_dynamic_items[1..],
+            (0..64).collect::<Vec<_>>()
+        );
+        assert_eq!(picker.selected_dynamic_item().unwrap().id, selected_id);
     }
 
     #[test]
