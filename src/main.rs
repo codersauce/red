@@ -454,10 +454,23 @@ async fn run_plugin_command(command: &PluginCommand) -> anyhow::Result<()> {
 }
 
 fn run_language_command(command: &LanguageCommand, overrides: &[String]) -> anyhow::Result<()> {
+    if let LanguageCommand::CheckIndent(arguments) = command {
+        let config_dir = Config::config_dir();
+        let mut loaded = Config::load_user_file(&Config::path("config.toml"), overrides)?;
+        red::language::finalize_language_configuration(&mut loaded, &config_dir)?;
+        let registry = std::sync::Arc::new(red::highlighter::LanguageRegistry::from_config(
+            &loaded.config.languages,
+            &config_dir,
+        )?);
+        let count = red::syntax_indent::check_fixtures(&arguments.fixtures, registry)?;
+        println!("Passed {count} indentation fixtures");
+        return Ok(());
+    }
     let value = match command {
         LanguageCommand::Trust(arguments) | LanguageCommand::Untrust(arguments) => {
             arguments.language_or_path.as_str()
         }
+        LanguageCommand::CheckIndent(_) => unreachable!(),
     };
     let config_dir = Config::config_dir();
     let loaded = Config::load_user_file(&Config::path("config.toml"), overrides)?;
@@ -507,6 +520,7 @@ fn run_language_command(command: &LanguageCommand, overrides: &[String]) -> anyh
             trust.revoke_path(&path)?;
             println!("Revoked native grammar trust for {}", path.display());
         }
+        LanguageCommand::CheckIndent(_) => unreachable!(),
     }
     Ok(())
 }

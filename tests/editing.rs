@@ -481,6 +481,81 @@ fn python_harness(contents: &str) -> EditorHarness {
 }
 
 #[tokio::test]
+async fn rust_syntax_indentation_open_lines_closer_and_undo() {
+    let source = "fn wrap() {\n    if pos.x > 0 {\n}\n";
+    let mut harness = comment_harness("main.rs", source);
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(8, 2);
+    harness.type_text("pos.x += SCREEN_WIDTH;").await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(8, 3);
+    harness.type_text("}").await.unwrap();
+    harness.assert_cursor_at(5, 3);
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents(
+        "fn wrap() {\n    if pos.x > 0 {\n        pos.x += SCREEN_WIDTH;\n    }\n}\n",
+    );
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents(
+        "fn wrap() {\n    if pos.x > 0 {\n        pos.x += SCREEN_WIDTH;\n}\n",
+    );
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents(
+        "fn wrap() {\n    if pos.x > 0 {\n        pos.x += SCREEN_WIDTH;\n    }\n}\n",
+    );
+}
+
+#[tokio::test]
+async fn rust_syntax_indentation_enter_splits_empty_pair() {
+    let mut harness = comment_harness("main.rs", "fn f() {}");
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::SetCursor(8, 0))
+        .await
+        .unwrap();
+    harness.execute_action(Action::InsertNewLine).await.unwrap();
+    harness.assert_cursor_at(4, 1);
+    harness.assert_buffer_contents("fn f() {\n    \n}");
+    harness.type_text("work();").await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("fn f() {}");
+}
+
+#[tokio::test]
+async fn rust_syntax_indentation_open_above_closer() {
+    let mut harness = comment_harness("main.rs", "fn f() {\n}");
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness
+        .execute_action(Action::InsertLineAtCursor)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(4, 1);
+    harness.type_text("work();").await.unwrap();
+    harness.assert_buffer_contents("fn f() {\n    work();\n}");
+}
+
+#[tokio::test]
 async fn comment_gcc_toggles_the_current_line() {
     let mut harness = comment_harness("main.rs", "    let value = 1;");
 

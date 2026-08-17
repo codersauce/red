@@ -125,6 +125,14 @@ pub enum LanguageCommand {
     Trust(LanguageTrustArgs),
     /// Revoke the current approval associated with a native grammar path or id.
     Untrust(LanguageTrustArgs),
+    /// Check portable indentation fixtures using the effective language configuration.
+    CheckIndent(LanguageIndentArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct LanguageIndentArgs {
+    /// JSON fixture file. Native grammars must already be explicitly trusted.
+    pub fixtures: PathBuf,
 }
 
 #[derive(Debug, ClapArgs)]

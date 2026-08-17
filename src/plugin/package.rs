@@ -44,6 +44,7 @@ const MAX_PACKAGE_ARCHIVE_FILES: usize = 1024;
 const MAX_CATALOG_GRAMMAR_BYTES: u64 = 64 * 1024 * 1024;
 const COMMAND_SCOPE_API_VERSION: &str = "0.7.0";
 const COMMAND_ARGUMENTS_API_VERSION: &str = "0.11.0";
+const INDENTATION_API_VERSION: &str = "0.12.0";
 
 /// A parsed and validated stable plugin identifier.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -319,11 +320,21 @@ impl PluginPackageManifest {
             let Some(grammar) = &language.grammar else {
                 continue;
             };
+            if !grammar.indents.is_empty() {
+                anyhow::ensure!(
+                    host_api_requirement_requires_at_least(
+                        &self.plugin.red_api,
+                        INDENTATION_API_VERSION
+                    )?,
+                    "indentation queries require red_api = \"^{INDENTATION_API_VERSION}\" or later"
+                );
+            }
             for relative in grammar
                 .path
                 .iter()
                 .chain(grammar.highlights.iter())
                 .chain(grammar.textobjects.iter())
+                .chain(grammar.indents.iter())
                 .chain(grammar.injections.iter())
             {
                 validate_package_file(package_root, relative)?;
@@ -2180,9 +2191,11 @@ symbol = "tree_sitter_buildspec"
             "(function_item) @function.outer",
         )
         .unwrap();
+        fs::write(query_dir.join("indents.scm"), "\"{\" @indent.begin").unwrap();
         let manifest_path = package.path().join(PLUGIN_MANIFEST_FILE);
         let mut source = fs::read_to_string(&manifest_path).unwrap();
         source.push_str("textobjects = [\"queries/textobjects.scm\"]\n");
+        source.push_str("indents = [\"queries/indents.scm\"]\n");
         fs::write(&manifest_path, source).unwrap();
         let manager = PluginPackageManager::new(config.path());
 
@@ -2206,6 +2219,22 @@ symbol = "tree_sitter_buildspec"
                 .textobjects,
             [installed.package_root.join("queries/textobjects.scm")]
         );
+        assert_eq!(
+            loaded.config.languages["buildspec"]
+                .grammar
+                .as_ref()
+                .unwrap()
+                .indents,
+            [installed.package_root.join("queries/indents.scm")]
+        );
+        let old_api = fs::read_to_string(&manifest_path)
+            .unwrap()
+            .replace(&format!("^{RED_HOST_API_VERSION}"), "^0.11.0");
+        fs::write(&manifest_path, old_api).unwrap();
+        assert!(PluginPackageManifest::load(package.path())
+            .unwrap_err()
+            .to_string()
+            .contains(INDENTATION_API_VERSION));
     }
 
     #[tokio::test]

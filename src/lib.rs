@@ -52,6 +52,7 @@ mod self_check;
 pub mod session;
 pub mod splash;
 pub mod sync;
+pub mod syntax_indent;
 pub mod terminal_input;
 pub mod terminal_output;
 pub mod text_layout;

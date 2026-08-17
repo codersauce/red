@@ -267,3 +267,40 @@ previews, preserves open and unsaved buffers, and restarts only language-server
 processes whose definitions actually changed. Invalid reloads leave the current
 language configuration active. There is no automatic filesystem watching or
 implicit native-code approval.
+
+## Indentation queries
+
+Red owns newline edits, cursor movement, indentation width, and undo. A language
+pack supplies declarative Tree-sitter rules, without a running language server:
+
+```toml
+[languages.example.grammar]
+indents = ["queries/indents.scm"]
+```
+
+This field requires host API `^0.12.0`. Explicit query lists replace bundled
+indentation rules. Query files use Red's version-1 capture contract:
+
+- `@indent.begin`: opens one indentation level.
+- `@indent.end`: closes the matching level and aligns with its opener.
+- `@indent.branch`: aligns with an opener without closing its level.
+- `@indent.ignore`: makes a comment or literal opaque, preserving multiline text.
+- `@indent.zero`: aligns a leading token at column zero.
+- `@indent.match`: supplies a dynamic matching key, such as a tag name.
+- `@indent.continuation`: marks an explicit line continuation; consecutive
+  continuations share one indentation level and the completed statement resets it.
+
+Brackets match automatically. For keywords or tag nodes, use
+`(#set! indent.match "group")` on both matching patterns. Unknown captures,
+properties, or custom predicates are rejected. Multiple openers on one source
+line contribute one level. New lines inherit nearby actual indentation plus
+the structural difference; leading closers align with their matching opener.
+Unfinished syntax is supported, and size/time limits fall back to ordinary
+auto-indent. Python retains its established provider during migration.
+
+Use `red language check-indent fixtures.json` to test the effective, installed
+language configuration. Native grammars still require explicit trust. Fixtures
+are a JSON array with `name`, `language`, `source`, zero-based `line`,
+`expected` display columns, and optional `width` (default 4). Include a blank
+target line in `source` to test opening a line; include a closing token on the
+target to test dedenting.

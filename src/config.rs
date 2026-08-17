@@ -977,6 +977,9 @@ pub struct LanguageGrammarConfig {
     /// Ordered paths to Tree-sitter structural text-object query files.
     #[serde(default)]
     pub textobjects: Vec<PathBuf>,
+    /// Ordered paths to Red indentation query files.
+    #[serde(default)]
+    pub indents: Vec<PathBuf>,
     /// Optional Tree-sitter injection query file.
     #[serde(default)]
     pub injections: Option<PathBuf>,
@@ -2041,6 +2044,7 @@ fn known_schema_path(path: &[String]) -> bool {
                 | "symbol"
                 | "highlights"
                 | "textobjects"
+                | "indents"
                 | "injections"
                 | "trusted"
                 | "targets"

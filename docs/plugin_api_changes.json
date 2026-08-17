@@ -1,6 +1,12 @@
 {
-  "api_version": "0.11.0",
+  "api_version": "0.12.0",
   "changes": [
+    {
+      "version": "0.12.0",
+      "kind": "introduced",
+      "symbols": ["languages.*.grammar.indents", "red language check-indent"],
+      "migration_note": "docs/PLUGIN_API.md#language-pack-indentation"
+    },
     {
       "version": "0.11.0",
       "kind": "introduced",
