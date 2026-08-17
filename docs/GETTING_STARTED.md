@@ -22,6 +22,12 @@ On the first interactive run, Red offers to create a starter configuration at
 `~/.config/red/config.toml`. The file is optional; Red starts with its embedded
 configuration, themes, and plugins when it is absent.
 
+## Learn by doing
+
+Run `:tutorial` to choose a hands-on learning track. [Learn Red](LEARN_RED.md)
+uses protected practice buffers and disposable projects, so you can try editing,
+AI, language-server, and Git workflows without changing your own project.
+
 ## Editor model
 
 Red uses Vim-inspired modes. `Esc` returns to Normal mode.

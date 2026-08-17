@@ -1791,6 +1791,9 @@ pub(crate) fn practice_action_allowed(lesson: Lesson, action: &Action) -> bool {
                 | Action::ExitLearnLesson
                 | Action::RestartLearnLesson
                 | Action::FinishLearnLesson
+                | Action::SkipLearnLesson
+                | Action::ResumeLearnLesson
+                | Action::ShowLearnHelp
                 | Action::Quit(_)
                 | Action::Command(_)
                 | Action::Print(_)

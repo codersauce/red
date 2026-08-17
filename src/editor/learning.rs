@@ -16,6 +16,7 @@ mod language_support;
 mod live;
 mod navigation;
 mod outline;
+mod progress;
 mod recovery;
 mod search;
 mod staging;
@@ -94,6 +95,16 @@ impl Editor {
                         self.render(buffer)?;
                     }
                 }
+                Action::SkipLearnLesson => {
+                    self.skip_learn_lesson(buffer, runtime).await?;
+                }
+                Action::ResumeLearnLesson => {
+                    let lesson = self
+                        .next_learn_lesson_for_track(self.learn_last_track_index())
+                        .unwrap_or_default();
+                    self.start_learn_lesson(lesson, buffer, runtime).await?;
+                }
+                Action::ShowLearnHelp => self.show_learn_help(buffer, runtime)?,
                 Action::RestartLearnLesson => {
                     self.restart_learn_lesson(buffer, runtime).await?;
                 }
@@ -147,11 +158,13 @@ impl Editor {
     }
 
     pub(super) fn next_learn_lesson_for_track(&self, track: usize) -> Option<Lesson> {
-        Lesson::for_track(track)
-            .find(|lesson| {
-                !lesson.is_optional() && !self.preferences.learn_lesson_completed(lesson.id())
-            })
-            .or_else(|| Lesson::for_track(track).next())
+        self.learn_resume_lesson_for_track(track).or_else(|| {
+            Lesson::for_track(track)
+                .find(|lesson| {
+                    !lesson.is_optional() && !self.preferences.learn_lesson_completed(lesson.id())
+                })
+                .or_else(|| Lesson::for_track(track).next())
+        })
     }
 
     pub(super) async fn continue_learn_lesson(
@@ -162,7 +175,7 @@ impl Editor {
         if let Some(session) = &self.learn_session {
             if session.step != PracticeStep::Complete {
                 self.set_legacy_message(Some(
-                    "finish this checkpoint first, or use :tutorial quit to leave".into(),
+                    "finish this checkpoint first, or use :tutorial skip to move on".into(),
                 ));
                 return self.render(buffer);
             }
@@ -418,6 +431,7 @@ impl Editor {
             );
             return self.render(buffer);
         }
+        self.remember_learn_position(lesson);
         Ok(())
     }
 
@@ -692,6 +706,9 @@ impl Editor {
                 | Action::StartLearnLessonAt(_)
                 | Action::RestartLearnLesson
                 | Action::FinishLearnLesson
+                | Action::SkipLearnLesson
+                | Action::ResumeLearnLesson
+                | Action::ShowLearnHelp
         ) {
             return Ok(());
         }
@@ -869,9 +886,11 @@ impl Editor {
             || session.step.observe_view(action, view)
         {
             if session.step == PracticeStep::Complete {
-                if let Err(error) = self.preferences.complete_learn_lesson(session.lesson.id()) {
+                let lesson = session.lesson;
+                if let Err(error) = self.preferences.complete_learn_lesson(lesson.id()) {
                     log!("could not persist Learn Red progress: {error}");
                 }
+                self.advance_learn_bookmark(lesson);
             }
             self.render(buffer)?;
         }

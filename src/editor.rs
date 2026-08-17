@@ -2377,6 +2377,9 @@ pub enum Action {
     ExitLearnLesson,
     RestartLearnLesson,
     FinishLearnLesson,
+    SkipLearnLesson,
+    ResumeLearnLesson,
+    ShowLearnHelp,
     SnapshotLearnRecovery,
     RestoreLearnRecovery,
     CheckLearnLiveAi,
@@ -13732,6 +13735,9 @@ impl Editor {
             "tutorial quit" => return vec![Action::ExitLearnLesson],
             "tutorial restart" => return vec![Action::RestartLearnLesson],
             "tutorial next" => return vec![Action::FinishLearnLesson],
+            "tutorial skip" => return vec![Action::SkipLearnLesson],
+            "tutorial resume" => return vec![Action::ResumeLearnLesson],
+            "tutorial help" => return vec![Action::ShowLearnHelp],
             "tutorial snapshot" => return vec![Action::SnapshotLearnRecovery],
             "tutorial recover" => return vec![Action::RestoreLearnRecovery],
             "tutorial ai-check" => return vec![Action::CheckLearnLiveAi],
@@ -19642,6 +19648,9 @@ impl Editor {
             | Action::StartLearnLessonAt(_)
             | Action::RestartLearnLesson
             | Action::FinishLearnLesson
+            | Action::SkipLearnLesson
+            | Action::ResumeLearnLesson
+            | Action::ShowLearnHelp
             | Action::ExitLearnLesson
             | Action::SnapshotLearnRecovery
             | Action::RestoreLearnRecovery

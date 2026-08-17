@@ -95,6 +95,7 @@ pub(crate) struct LearnHub {
     selected: usize,
     details: bool,
     completed: [bool; Lesson::AVAILABLE.len()],
+    bookmarks: [Option<Lesson>; TRACKS.len()],
     width: usize,
     height: usize,
     theme: Theme,
@@ -103,9 +104,10 @@ pub(crate) struct LearnHub {
 impl LearnHub {
     pub fn new(editor: &Editor, completed: [bool; Lesson::AVAILABLE.len()]) -> Self {
         Self {
-            selected: 0,
+            selected: editor.learn_last_track_index(),
             details: false,
             completed,
+            bookmarks: std::array::from_fn(|track| editor.learn_resume_lesson_for_track(track)),
             width: editor.vwidth(),
             height: editor.inline_history_viewport_height().saturating_add(1),
             theme: editor.theme.clone(),
@@ -120,9 +122,11 @@ impl LearnHub {
     }
 
     fn next_lesson(&self) -> Option<Lesson> {
-        Lesson::for_track(self.selected)
-            .find(|lesson| !lesson.is_optional() && !self.completed[lesson.index()])
-            .or_else(|| Lesson::for_track(self.selected).next())
+        self.bookmarks[self.selected].or_else(|| {
+            Lesson::for_track(self.selected)
+                .find(|lesson| !lesson.is_optional() && !self.completed[lesson.index()])
+                .or_else(|| Lesson::for_track(self.selected).next())
+        })
     }
 
     fn track_progress(&self) -> (usize, usize) {
@@ -143,6 +147,8 @@ impl LearnHub {
             let (completed, total) = self.track_progress();
             if completed == total {
                 "Replay lesson"
+            } else if self.bookmarks[self.selected].is_some() {
+                "Resume lesson"
             } else if completed > 0 {
                 "Continue lesson"
             } else {
@@ -313,6 +319,8 @@ impl LearnHub {
                 let (completed, total) = self.track_progress();
                 if completed == total {
                     "✓ Available lessons complete · Enter to replay".to_string()
+                } else if self.bookmarks[self.selected].is_some() {
+                    format!("Enter  Resume: {} →", next.title())
                 } else if completed > 0 {
                     format!("Enter  Continue: {} →", next.title())
                 } else {
@@ -713,7 +721,11 @@ fn draw_coach(
             |next| format!(":tutorial next  →  Lesson {}", next.lesson_index() + 1),
         )
     } else {
-        ":tutorial quit  ·  :tutorial restart".to_string()
+        if layout.right == 0 {
+            ":tutorial help · skip · restart · quit".to_string()
+        } else {
+            ":tutorial help/skip/restart/quit".to_string()
+        }
     };
     if area.height <= 3 {
         horizontal_rule(buffer, area.x, area.y, area.width, &palette.divider);
@@ -988,6 +1000,7 @@ mod tests {
             selected: 0,
             details: false,
             completed: [false; Lesson::AVAILABLE.len()],
+            bookmarks: [None; TRACKS.len()],
             width,
             height: height - 1,
             theme: Theme::default(),
@@ -1020,6 +1033,40 @@ mod tests {
                 });
             assert_eq!(hub.open_selected(), KeyAction::Single(expected));
         }
+    }
+
+    #[test]
+    fn optional_live_ai_does_not_block_recorded_completion() {
+        let mut hub = panel(120, 32);
+        hub.selected = 1;
+        for lesson in Lesson::for_track(1).filter(|lesson| !lesson.is_optional()) {
+            hub.completed[lesson.index()] = true;
+        }
+        assert_eq!(hub.track_progress(), (5, 5));
+        assert_eq!(hub.next_lesson(), Some(Lesson::UnderstandSelectedCode));
+        assert_eq!(Lesson::ReviewWhatChanged.next(), None);
+        assert_eq!(
+            hub.handle_event(&Event::Key(KeyEvent::new(
+                KeyCode::Char('l'),
+                KeyModifiers::NONE
+            ))),
+            Some(KeyAction::Single(Action::StartLearnLessonAt(
+                Lesson::TryLiveAi.id().into()
+            )))
+        );
+    }
+
+    #[test]
+    fn hub_resumes_a_skipped_to_lesson_without_a_badge() {
+        let mut hub = panel(120, 32);
+        hub.selected = 4;
+        hub.bookmarks[4] = Some(Lesson::ChangeATextObject);
+        assert_eq!(hub.track_progress(), (0, 4));
+        assert_eq!(hub.next_lesson(), Some(Lesson::ChangeATextObject));
+        assert!(hub
+            .actions()
+            .iter()
+            .any(|action| action.label == "Resume lesson"));
     }
 
     #[test]

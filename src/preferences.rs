@@ -39,6 +39,12 @@ pub struct Preferences {
     copilot_setup_hint_seen: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     learn_completed_lessons: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    learn_resume_lessons: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    learn_last_track: Option<String>,
+    #[serde(default, rename = "tutorial_progress", skip_serializing)]
+    legacy_tutorial_progress: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +107,116 @@ impl PreferencesStore {
         self.save()
     }
 
+    pub(crate) fn learn_resume_lesson(&self, track: &str) -> Option<&str> {
+        self.preferences
+            .learn_resume_lessons
+            .get(track)
+            .map(String::as_str)
+    }
+
+    pub(crate) fn learn_last_track(&self) -> Option<&str> {
+        self.preferences.learn_last_track.as_deref()
+    }
+
+    /// A bookmark resumes a lesson with fresh, owned fixtures, never stale files.
+    pub(crate) fn remember_learn_lesson(
+        &mut self,
+        track: &str,
+        lesson: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if self.learn_last_track() == Some(track) && self.learn_resume_lesson(track) == lesson {
+            return Ok(());
+        }
+        self.preferences.learn_last_track = Some(track.into());
+        if let Some(lesson) = lesson {
+            self.preferences
+                .learn_resume_lessons
+                .insert(track.into(), lesson.into());
+        } else {
+            self.preferences.learn_resume_lessons.remove(track);
+        }
+        self.save()
+    }
+
+    fn migrate_legacy_tutorial(&mut self) -> anyhow::Result<()> {
+        use crate::learn::{Lesson, TRACKS};
+        let Some(progress) = self.preferences.legacy_tutorial_progress.take() else {
+            return Ok(());
+        };
+        #[derive(Deserialize)]
+        struct LegacyProgress {
+            curriculum_version: Option<u16>,
+            track: Option<String>,
+            #[serde(default)]
+            lesson_index: usize,
+            #[serde(default)]
+            completed: bool,
+        }
+        let Ok(progress) = serde_json::from_value::<LegacyProgress>(progress) else {
+            return Ok(());
+        };
+        if progress.curriculum_version.unwrap_or(1) != 1 {
+            return Ok(());
+        }
+        let quick = match progress.track.as_deref().unwrap_or("guided") {
+            "quick" => true,
+            "guided" => false,
+            _ => return Ok(()),
+        };
+        let guided = [
+            Lesson::FindYourFooting,
+            Lesson::FindACommand,
+            Lesson::OpenAFileByName,
+            Lesson::CheckLanguageSupport,
+            Lesson::ReviewWhatChanged,
+            Lesson::UnderstandSelectedCode,
+            Lesson::ChooseATheme,
+        ];
+        let short = [
+            Lesson::FindACommand,
+            Lesson::OpenAFileByName,
+            Lesson::UnderstandSelectedCode,
+        ];
+        let lessons = if quick {
+            short.as_slice()
+        } else {
+            guided.as_slice()
+        };
+        let index = progress.lesson_index;
+        let completed = progress.completed;
+        if index >= lessons.len() && !completed {
+            return Ok(());
+        }
+        // Only the old editing exercise had the same observable outcome. The
+        // old navigation, Git, and Agent demos are not equivalent to real work.
+        if !quick
+            && (completed || index > 0)
+            && !self.learn_lesson_completed(Lesson::FindYourFooting.id())
+        {
+            self.preferences
+                .learn_completed_lessons
+                .push(Lesson::FindYourFooting.id().into());
+        }
+        if self.preferences.learn_last_track.is_none() {
+            let lesson = if completed {
+                if quick {
+                    Lesson::UnderstandSelectedCode
+                } else {
+                    Lesson::EditWithConfidence
+                }
+            } else {
+                lessons[index]
+            };
+            let track = TRACKS[lesson.track_index()].id;
+            self.preferences.learn_last_track = Some(track.into());
+            self.preferences
+                .learn_resume_lessons
+                .entry(track.into())
+                .or_insert_with(|| lesson.id().into());
+        }
+        self.save()
+    }
+
     /// Loads preferences, falling back to empty state on any read or parse error.
     ///
     /// Failures are logged when a logger exists. Legacy plugin state is
@@ -119,6 +235,9 @@ impl PreferencesStore {
             path: Some(path),
             preferences,
         };
+        if let Err(error) = store.migrate_legacy_tutorial() {
+            log_if_configured(&format!("failed to migrate tutorial progress: {error}"));
+        }
         if let Err(error) = store.import_legacy_plugin_storage() {
             log_if_configured(&format!("failed to import legacy plugin storage: {error}"));
         }
@@ -539,8 +658,90 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn learn_bookmarks_and_real_completions_survive_reload() {
+        use crate::learn::Lesson;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preferences.json");
+        let mut store = PreferencesStore::load(&path);
+        store
+            .complete_learn_lesson(Lesson::FindYourFooting.id())
+            .unwrap();
+        store
+            .remember_learn_lesson("editing", Some(Lesson::ChangeATextObject.id()))
+            .unwrap();
+        let store = PreferencesStore::load(&path);
+        assert_eq!(store.learn_last_track(), Some("editing"));
+        assert_eq!(
+            store.learn_resume_lesson("editing"),
+            Some(Lesson::ChangeATextObject.id())
+        );
+        assert!(store.learn_lesson_completed(Lesson::FindYourFooting.id()));
+        assert!(!store.learn_lesson_completed(Lesson::MoveWithIntent.id()));
+    }
+
+    #[test]
+    fn learn_migrates_legacy_topics_without_awarding_simulated_work() {
+        use crate::learn::Lesson;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preferences.json");
+        fs::write(&path, r#"{"tutorial_progress":{"curriculum_version":1,"track":"guided","lesson_index":5,"phase":1,"completed":false}}"#).unwrap();
+        let store = PreferencesStore::load(&path);
+        assert!(store.learn_lesson_completed(Lesson::FindYourFooting.id()));
+        assert!(!store.learn_lesson_completed(Lesson::ReviewWhatChanged.id()));
+        assert_eq!(
+            store.learn_resume_lesson("ai"),
+            Some(Lesson::UnderstandSelectedCode.id())
+        );
+        assert!(!fs::read_to_string(&path)
+            .unwrap()
+            .contains("tutorial_progress"));
+        let mut store = store;
+        store
+            .remember_learn_lesson("custom", Some(Lesson::KeepYourPlace.id()))
+            .unwrap();
+        assert_eq!(
+            PreferencesStore::load(&path).learn_last_track(),
+            Some("custom")
+        );
+
+        fs::write(
+            &path,
+            r#"{"tutorial_progress":{"track":"quick","completed":true}}"#,
+        )
+        .unwrap();
+        let store = PreferencesStore::load(&path);
+        assert!(!store.learn_lesson_completed(Lesson::FindYourFooting.id()));
+        assert_eq!(
+            store.learn_resume_lesson("ai"),
+            Some(Lesson::UnderstandSelectedCode.id())
+        );
+    }
+
     fn unique_temp_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("red-{name}-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn learn_ignores_malformed_or_unknown_legacy_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preferences.json");
+        for progress in [
+            serde_json::json!({"curriculum_version": "bad", "completed": true}),
+            serde_json::json!({"curriculum_version": 2, "completed": true}),
+            serde_json::json!({"lesson_index": -1, "completed": true}),
+            serde_json::json!({"track": "unknown", "completed": true}),
+            serde_json::json!("invalid"),
+        ] {
+            fs::write(
+                &path,
+                serde_json::json!({"tutorial_progress": progress}).to_string(),
+            )
+            .unwrap();
+            let store = PreferencesStore::load(&path);
+            assert!(store.preferences.learn_completed_lessons.is_empty());
+            assert!(store.learn_last_track().is_none());
+        }
     }
 
     #[test]
