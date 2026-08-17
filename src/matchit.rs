@@ -146,10 +146,10 @@ impl BracketMatchCache {
                     }
                     if character == '\'' {
                         if is_rust
-                            && rope
-                                .get_char(index.saturating_add(1))
-                                .is_some_and(|next| next == '_' || next.is_alphabetic())
-                            && rope.get_char(index.saturating_add(2)) != Some('\'')
+                            && is_rust_lifetime_start(
+                                rope.get_char(index.saturating_add(1)),
+                                rope.get_char(index.saturating_add(2)),
+                            )
                         {
                             continue;
                         }
@@ -195,6 +195,14 @@ fn single_character(token: &str) -> Option<char> {
     let mut characters = token.chars();
     let character = characters.next()?;
     characters.next().is_none().then_some(character)
+}
+
+/// Distinguishes a Rust lifetime or loop label from a quoted character.
+/// The caller has already found the apostrophe; an immediate closing quote
+/// keeps character literals such as `'a'` and `'_'` in the quoted path.
+fn is_rust_lifetime_start(next: Option<char>, after_next: Option<char>) -> bool {
+    next.is_some_and(|character| character == '_' || character.is_alphabetic())
+        && after_next != Some('\'')
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -413,7 +421,7 @@ fn tokens_for_document(
     config: &MatchitConfig,
 ) -> Vec<Token> {
     let groups = groups_for_config(language_id, config);
-    let skip_ranges = skip_ranges(doc);
+    let skip_ranges = skip_ranges(doc, language_id);
     let mut tokens = Vec::new();
     for (group_idx, group) in groups.iter().enumerate() {
         collect_group_tokens(doc, group_idx, group, &skip_ranges, &mut tokens);
@@ -587,12 +595,20 @@ fn should_keep_token(
         .any(|(range_start, range_end)| start >= *range_start && end <= *range_end)
 }
 
-fn skip_ranges(doc: &Document) -> Vec<(usize, usize)> {
+fn skip_ranges(doc: &Document, language_id: Option<&str>) -> Vec<(usize, usize)> {
     let chars = doc.chars();
     let mut ranges = Vec::new();
     let mut idx = 0;
     while idx < chars.len() {
         match chars[idx] {
+            '\'' if language_id == Some("rust")
+                && is_rust_lifetime_start(
+                    chars.get(idx + 1).copied(),
+                    chars.get(idx + 2).copied(),
+                ) =>
+            {
+                idx += 1;
+            }
             '"' | '\'' => {
                 let quote = chars[idx];
                 let start = idx;
@@ -993,5 +1009,122 @@ mod bracket_match_tests {
             ),
             Some(position(contents, "}", 0))
         );
+    }
+
+    #[test]
+    fn rust_percent_motion_matches_methods_with_lifetimes() {
+        for signature in [
+            "fn update(&mut self, d: &mut DrawHandle<'_>)",
+            "fn borrow<'value>(text: &'value str) -> &'value str",
+            "fn permanent(text: &'static str)",
+            "fn unicode<'é>(text: &'é str) -> &'é str",
+        ] {
+            let contents = format!("{signature} {{\n    let values = [1, 2];\n}}");
+            let config = MatchitConfig::default();
+            for (open, close) in [("{", "}"), ("[", "]"), ("(", ")")] {
+                let opener = position(&contents, open, 0);
+                let closer = position(&contents, close, 0);
+                for direction in [MatchDirection::Forward, MatchDirection::Backward] {
+                    for (start, expected) in [(opener, closer), (closer, opener)] {
+                        assert_eq!(
+                            find_motion(&contents, start, Some("rust"), &config, direction)
+                                .map(|motion| motion.target),
+                            Some(expected),
+                            "{signature}: {open}{close} {direction:?} from {start:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rust_percent_motion_preserves_quoted_literals() {
+        for literal in [
+            "'a'",
+            "'_'",
+            "'é'",
+            "']'",
+            "b']'",
+            r"'\''",
+            r"'\u{5d}'",
+            r#""text ']""#,
+        ] {
+            let contents = format!("[{literal}]");
+            let config = MatchitConfig::default();
+            assert_eq!(
+                find_motion(
+                    &contents,
+                    position(&contents, "[", 0),
+                    Some("rust"),
+                    &config,
+                    MatchDirection::Forward,
+                )
+                .map(|motion| motion.target),
+                Some(TextPosition::new(0, contents.chars().count() - 1)),
+                "literal: {literal}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_rust_percent_motion_preserves_single_quoted_strings() {
+        let contents = "['word ] text']";
+        for language in [None, Some("python"), Some("javascript"), Some("bash")] {
+            assert_eq!(
+                find_motion(
+                    contents,
+                    position(contents, "[", 0),
+                    language,
+                    &MatchitConfig::default(),
+                    MatchDirection::Forward,
+                )
+                .map(|motion| motion.target),
+                Some(position(contents, "]", 1)),
+                "language: {language:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_lifetimes_preserve_unmatched_and_around_motions() {
+        let contents = "fn update(d: &mut DrawHandle<'_>) {\n    work();\n}";
+        let config = MatchitConfig::default();
+        let cursor = position(contents, "work", 0);
+        let opener = position(contents, "{", 0);
+        let closer = position(contents, "}", 0);
+        for (direction, expected) in [
+            (MatchDirection::Backward, opener),
+            (MatchDirection::Forward, closer),
+        ] {
+            assert_eq!(
+                find_unmatched_group(contents, cursor, Some("rust"), &config, direction)
+                    .map(|motion| motion.target),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            select_around(contents, cursor, Some("rust"), &config),
+            Some(TextRange::new(opener, advance_position(closer)))
+        );
+    }
+
+    #[test]
+    fn rust_loop_labels_do_not_hide_matching_braces() {
+        let contents = "fn run() { 'outer: loop { break 'outer; } }";
+        let config = MatchitConfig::default();
+        for (open_occurrence, close_occurrence) in [(0, 1), (1, 0)] {
+            assert_eq!(
+                find_motion(
+                    contents,
+                    position(contents, "{", open_occurrence),
+                    Some("rust"),
+                    &config,
+                    MatchDirection::Forward,
+                )
+                .map(|motion| motion.target),
+                Some(position(contents, "}", close_occurrence))
+            );
+        }
     }
 }
