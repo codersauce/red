@@ -54,6 +54,9 @@ impl Editor {
         buffer: &'a mut RenderBuffer,
     ) -> BoxFuture<'a, anyhow::Result<bool>> {
         Box::pin(async move {
+            if self.intercept_learn_outline_action(action, buffer).await? {
+                return Ok(true);
+            }
             if self
                 .learn_session
                 .as_ref()
@@ -128,6 +131,9 @@ impl Editor {
         &mut self,
         message: &InboundMessage,
     ) -> Option<Option<Action>> {
+        if let Some(action) = self.handle_learn_outline_response(message) {
+            return Some(action);
+        }
         let id = match message {
             InboundMessage::Message(response) => response.id,
             InboundMessage::Error(error) => error.id?,

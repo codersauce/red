@@ -11,6 +11,7 @@ mod committing;
 mod git;
 mod language;
 mod navigation;
+mod outline;
 mod staging;
 mod symbols;
 
@@ -33,6 +34,7 @@ pub(super) struct LearnSession {
     original_workspaces: Option<plugin::WorkspaceManager>,
     original_language: language::SavedLanguageState,
     symbols: Option<symbols::LearnSymbolState>,
+    outline: Option<outline::LearnOutlineState>,
 }
 
 impl LearnSession {
@@ -238,7 +240,7 @@ impl Editor {
                 .into_owned()
         });
         let mut practice = Buffer::new(file, lesson.contents().to_string());
-        if lesson == Lesson::FollowTheSymbol {
+        if matches!(lesson, Lesson::FollowTheSymbol | Lesson::FollowSymbols) {
             practice.pos = (16, 5);
         }
         let practice_buffer_id = practice.id();
@@ -270,6 +272,7 @@ impl Editor {
             original_workspaces,
             original_language,
             symbols: (lesson == Lesson::FollowTheSymbol).then(symbols::LearnSymbolState::default),
+            outline: (lesson == Lesson::FollowSymbols).then(outline::LearnOutlineState::default),
         }));
         self.mode = Mode::Normal;
         if lesson == Lesson::FindACommand {
@@ -599,6 +602,14 @@ impl Editor {
                 .flatten()
                 .and_then(|uri| self.diagnostics.get(&uri))
                 .is_some_and(Vec::is_empty),
+            outline_received: session
+                .outline
+                .as_ref()
+                .is_some_and(|outline| outline.received),
+            outline_picker_open: self
+                .current_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.shortcut_context() == "Document Symbols"),
             project_search_open: self
                 .current_dialog
                 .as_ref()

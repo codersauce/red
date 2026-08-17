@@ -54,10 +54,11 @@ pub(crate) enum Lesson {
     MakeALocalCommit,
     OpenAFileByName,
     SearchTheProject,
+    FollowSymbols,
 }
 
 impl Lesson {
-    pub const AVAILABLE: [Self; 16] = [
+    pub const AVAILABLE: [Self; 17] = [
         Self::FindYourFooting,
         Self::EditWithConfidence,
         Self::FindACommand,
@@ -74,6 +75,7 @@ impl Lesson {
         Self::MakeALocalCommit,
         Self::OpenAFileByName,
         Self::SearchTheProject,
+        Self::FollowSymbols,
     ];
 
     pub fn from_id(id: &str) -> Option<Self> {
@@ -114,6 +116,7 @@ impl Lesson {
             Self::MakeALocalCommit => 13,
             Self::OpenAFileByName => 14,
             Self::SearchTheProject => 15,
+            Self::FollowSymbols => 16,
         }
     }
 
@@ -129,7 +132,7 @@ impl Lesson {
             | Self::RepairTheCode
             | Self::StageTheRightHunk
             | Self::MakeALocalCommit => 2,
-            Self::OpenAFileByName | Self::SearchTheProject => 3,
+            Self::OpenAFileByName | Self::SearchTheProject | Self::FollowSymbols => 3,
             _ => 0,
         }
     }
@@ -154,7 +157,10 @@ impl Lesson {
     pub const fn is_lsp_practice(self) -> bool {
         matches!(
             self,
-            Self::ReadTheDiagnostic | Self::FollowTheSymbol | Self::RepairTheCode
+            Self::ReadTheDiagnostic
+                | Self::FollowTheSymbol
+                | Self::RepairTheCode
+                | Self::FollowSymbols
         )
     }
 
@@ -186,6 +192,7 @@ impl Lesson {
             Self::MakeALocalCommit => "ship.make-a-local-commit.v1",
             Self::OpenAFileByName => "navigation.open-a-file-by-name.v1",
             Self::SearchTheProject => "navigation.search-the-project.v1",
+            Self::FollowSymbols => "navigation.follow-symbols.v1",
         }
     }
 
@@ -205,7 +212,7 @@ impl Lesson {
             | Self::ContinueInAgent => AI_CONTENTS,
             Self::ReviewWhatChanged => AI_FIXED_CONTENTS,
             Self::ReadTheDiagnostic | Self::RepairTheCode => HUSK_CONTENTS,
-            Self::FollowTheSymbol => HUSK_SYMBOL_CONTENTS,
+            Self::FollowTheSymbol | Self::FollowSymbols => HUSK_SYMBOL_CONTENTS,
             Self::StageTheRightHunk | Self::MakeALocalCommit => staging::WORKTREE,
             Self::OpenAFileByName | Self::SearchTheProject => navigation::GUIDE,
         }
@@ -229,6 +236,7 @@ impl Lesson {
             Self::MakeALocalCommit => PracticeStep::CommitOpen,
             Self::OpenAFileByName => PracticeStep::FilesOpen,
             Self::SearchTheProject => PracticeStep::SearchOpen,
+            Self::FollowSymbols => PracticeStep::OutlineOpen,
         }
     }
 
@@ -279,6 +287,12 @@ impl Lesson {
                 "Undo the unwanted change",
                 "Request and refine a suggestion",
                 "Keep only the corrected result",
+            ],
+            Self::FollowSymbols => &[
+                "Open document symbols",
+                "Find the scoring function",
+                "Jump back to the call",
+                "Jump forward to the definition",
             ],
             Self::SearchTheProject => &[
                 "Open project search",
@@ -510,12 +524,20 @@ pub(crate) enum PracticeStep {
     SearchCall,
     SearchExpectation,
     SearchReturn,
+    OutlineOpen,
+    OutlineChoose,
+    OutlineBack,
+    OutlineForward,
     Complete,
 }
 
 impl PracticeStep {
     pub fn suggested_action(self) -> Option<Action> {
         match self {
+            Self::OutlineOpen => Some(Action::PluginCommand("LspDocumentSymbols".into())),
+            Self::OutlineChoose => None,
+            Self::OutlineBack => Some(Action::JumpBack),
+            Self::OutlineForward => Some(Action::JumpForward),
             Self::SearchOpen | Self::SearchExpectation => {
                 Some(Action::PluginCommand("ProjectSearch".into()))
             }
@@ -637,6 +659,10 @@ impl PracticeStep {
             Self::DiagnosticJump => "Choose the missing-semicolon error and press Enter. The editor will take you to the reported location. Reopen Diagnostics if you closed the picker.".into(),
             Self::DiagnosticRead => format!("Press {} to read the diagnostic on this line. The parser points at the next token; the incomplete statement is just above it.", shortcut.unwrap_or("D")),
             Self::DiagnosticReturn => "Read the message and diagnostic code, then press Esc to return to the source. You will repair the defect in a later lesson.".into(),
+            Self::OutlineOpen => format!("Press {} (or :LspDocumentSymbols) to see the functions in this file. The bundled Husk server supplies the real outline.", shortcut.unwrap_or("Ctrl-t")),
+            Self::OutlineChoose => "Filter for add_score and press Enter to open its definition. If you closed the picker, reopen :LspDocumentSymbols. The outline is useful when you know a symbol's name but not its line.".into(),
+            Self::OutlineBack => format!("Press {} to return to the call where you started. A symbol jump records your previous position; ordinary cursor motions do not replace it.", shortcut.unwrap_or("Ctrl-o")),
+            Self::OutlineForward => format!("Press {} to revisit the definition. Back and forward let you explore without losing your place.", shortcut.unwrap_or("Ctrl-i")),
             Self::SearchOpen => format!("Press {} (or :ProjectSearch) to search the contents of the practice project. This uses real ripgrep, with literal text and smart case.", shortcut.unwrap_or("Space g")),
             Self::SearchCall => "Search for add_score. Read the matching lines and their previews, then choose the call in src/main.hk. If you closed the picker, reopen :ProjectSearch.".into(),
             Self::SearchExpectation => format!("Press {} again and search for zero-point. Open the matching expectation in tests/score.hk. Project search finds text even when you do not know its filename.", shortcut.unwrap_or("Space g")),
@@ -671,6 +697,7 @@ impl PracticeStep {
                 Lesson::UnderstandSelectedCode => "You explained selected code without editing it. Recorded practice complete; real inline assist sends your selected context only when you submit a prompt.",
                 Lesson::MakeAFocusedChange => "The fix is kept in the buffer, still unsaved. Inline edits use normal undo history; keeping one is not the same as writing a file.",
                 Lesson::ChooseWhatToKeep => "You rejected an unwanted change, refined a suggestion, and kept the corrected result. The final edit is unsaved and remains undoable.",
+                Lesson::FollowSymbols => "You used a real symbol outline and traveled backward and forward through the jump list. No source was changed.",
                 Lesson::SearchTheProject => "You searched real file contents, inspected matching lines, and opened two results at their exact positions. The practice project is unchanged.",
                 Lesson::OpenAFileByName => "You found two files with the same name, used their paths to choose the right one, and returned to the guide. No project files were changed.",
                 Lesson::MakeALocalCommit => "You created and inspected a local commit containing only the score fix. Fix & ship complete! The title change remains unstaged, and nothing was pushed.",
@@ -705,7 +732,8 @@ impl PracticeStep {
             | Self::StageOpen
             | Self::CommitOpen
             | Self::FilesOpen
-            | Self::SearchOpen => 0,
+            | Self::SearchOpen
+            | Self::OutlineOpen => 0,
             Self::Type
             | Self::EditDelete
             | Self::CommandRun
@@ -721,7 +749,8 @@ impl PracticeStep {
             | Self::StageChoose
             | Self::CommitWrite
             | Self::FilesSource
-            | Self::SearchCall => 1,
+            | Self::SearchCall
+            | Self::OutlineChoose => 1,
             Self::Normal
             | Self::EditUndo
             | Self::CommandHelp
@@ -739,7 +768,8 @@ impl PracticeStep {
             | Self::StageInspect
             | Self::CommitInspect
             | Self::FilesTests
-            | Self::SearchExpectation => 2,
+            | Self::SearchExpectation
+            | Self::OutlineBack => 2,
             Self::Undo
             | Self::EditRedo
             | Self::CommandReturn
@@ -755,7 +785,8 @@ impl PracticeStep {
             | Self::StageReturn
             | Self::CommitReturn
             | Self::FilesReturn
-            | Self::SearchReturn => 3,
+            | Self::SearchReturn
+            | Self::OutlineForward => 3,
             Self::Complete => 4,
         }
     }
@@ -820,6 +851,22 @@ impl PracticeStep {
     /// Observes UI state that can change through either a key or an action.
     pub fn observe_view(&mut self, action: &Action, view: PracticeView) -> bool {
         let next = match (*self, action) {
+            (Self::OutlineOpen, Action::ShowDialog)
+                if view.outline_received && view.outline_picker_open =>
+            {
+                Self::OutlineChoose
+            }
+            (Self::OutlineChoose, Action::OpenLocation(_, _))
+                if view.outline_received && view.symbol_at_definition =>
+            {
+                Self::OutlineBack
+            }
+            (Self::OutlineBack, Action::JumpBack) if view.symbol_at_first_call => {
+                Self::OutlineForward
+            }
+            (Self::OutlineForward, Action::JumpForward) if view.symbol_at_definition => {
+                Self::Complete
+            }
             (Self::SearchOpen, Action::PluginCommand(name))
                 if name == "ProjectSearch" && view.project_search_open =>
             {
@@ -1006,6 +1053,8 @@ pub(crate) struct PracticeView {
     pub code_actions_open: bool,
     pub husk_fixed_text: bool,
     pub diagnostics_clean: bool,
+    pub outline_received: bool,
+    pub outline_picker_open: bool,
     pub project_search_open: bool,
     pub search_call_visible: bool,
     pub search_expectation_visible: bool,
@@ -1023,9 +1072,12 @@ pub(crate) struct PracticeView {
 
 /// Scratch lessons permit only edits to their isolated practice buffer.
 pub(crate) fn practice_action_allowed(lesson: Lesson, action: &Action) -> bool {
-    (lesson == Lesson::SearchTheProject
-        && (matches!(action, Action::OpenLocation(_, _))
-            || matches!(action,Action::PluginCommand(name) if name == "ProjectSearch")))
+    (lesson == Lesson::FollowSymbols
+        && (matches!(action, Action::JumpBack | Action::JumpForward)
+            || matches!(action, Action::PluginCommand(name) if name == "LspDocumentSymbols")))
+        || (lesson == Lesson::SearchTheProject
+            && (matches!(action, Action::OpenLocation(_, _))
+                || matches!(action,Action::PluginCommand(name) if name == "ProjectSearch")))
         || (lesson.is_navigation_practice()
             && matches!(
                 action,
@@ -1146,6 +1198,36 @@ pub(crate) fn practice_action_allowed(lesson: Lesson, action: &Action) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outline_lesson_requires_server_results_and_both_jump_directions() {
+        let mut step = Lesson::FollowSymbols.first_step();
+        let mut view = PracticeView::default();
+        let location = Action::OpenLocation(
+            crate::plugin::PluginLocation {
+                path: "main.hk".into(),
+                line: 0,
+                column: 3,
+                column_encoding: crate::plugin::LocationColumnEncoding::Utf16,
+            },
+            crate::plugin::OpenLocationTarget::Current,
+        );
+        view.outline_picker_open = true;
+        assert!(!step.observe_view(&Action::ShowDialog, view));
+        view.outline_received = true;
+        assert!(step.observe_view(&Action::ShowDialog, view));
+        assert!(!step.observe_view(&location, view));
+        view.symbol_at_definition = true;
+        assert!(step.observe_view(&location, view));
+        assert!(!step.observe_view(&Action::JumpBack, view));
+        view.symbol_at_definition = false;
+        view.symbol_at_first_call = true;
+        assert!(step.observe_view(&Action::JumpBack, view));
+        assert!(!step.observe_view(&Action::JumpForward, view));
+        view.symbol_at_definition = true;
+        assert!(step.observe_view(&Action::JumpForward, view));
+        assert_eq!(step, PracticeStep::Complete);
+    }
 
     #[test]
     fn symbol_lesson_requires_lsp_results_and_return_to_the_original_call() {
