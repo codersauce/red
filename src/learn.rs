@@ -1,9 +1,88 @@
-//! Curriculum metadata and the first editor-native Learn Red exercise.
+//! Curriculum metadata and editor-native Learn Red exercises.
 
 use crate::editor::{Action, Mode};
 
 pub(crate) const FIRST_LESSON_ID: &str = "essentials.find-your-footing.v1";
 pub(crate) const PRACTICE_CONTENTS: &str = "// This practice buffer never touches your project.\n\nfn add_score(score: u32, points: u32) -> u32 {\n    score + points\n}\n";
+pub(crate) const EDIT_CONTENTS: &str =
+    "let score = 41;;\n\n// Remove the extra semicolon on the first line.\n";
+pub(crate) const EDIT_RESULT: &str =
+    "let score = 41;\n\n// Remove the extra semicolon on the first line.\n";
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lesson {
+    #[default]
+    FindYourFooting,
+    EditWithConfidence,
+}
+
+impl Lesson {
+    pub const AVAILABLE: [Self; 2] = [Self::FindYourFooting, Self::EditWithConfidence];
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::AVAILABLE.into_iter().find(|lesson| lesson.id() == id)
+    }
+
+    pub fn from_number(number: usize) -> Option<Self> {
+        number
+            .checked_sub(1)
+            .and_then(|index| Self::AVAILABLE.get(index))
+            .copied()
+    }
+
+    pub const fn index(self) -> usize {
+        match self {
+            Self::FindYourFooting => 0,
+            Self::EditWithConfidence => 1,
+        }
+    }
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::FindYourFooting => FIRST_LESSON_ID,
+            Self::EditWithConfidence => "essentials.edit-with-confidence.v1",
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        TRACKS[0].lessons[self.index()]
+    }
+
+    pub const fn contents(self) -> &'static str {
+        match self {
+            Self::FindYourFooting => PRACTICE_CONTENTS,
+            Self::EditWithConfidence => EDIT_CONTENTS,
+        }
+    }
+
+    pub const fn first_step(self) -> PracticeStep {
+        match self {
+            Self::FindYourFooting => PracticeStep::Insert,
+            Self::EditWithConfidence => PracticeStep::EditMove,
+        }
+    }
+
+    pub fn next(self) -> Option<Self> {
+        Self::AVAILABLE.get(self.index() + 1).copied()
+    }
+
+    pub const fn checkpoints(self) -> &'static [&'static str] {
+        match self {
+            Self::FindYourFooting => &[
+                "Enter Insert mode",
+                "Change the practice text",
+                "Return to Normal mode",
+                "Undo back to the original",
+            ],
+            Self::EditWithConfidence => &[
+                "Find the extra semicolon",
+                "Delete one character",
+                "Undo the change",
+                "Redo to keep the fix",
+            ],
+        }
+    }
+}
 
 pub(crate) struct Track {
     pub id: &'static str,
@@ -112,6 +191,10 @@ pub(crate) enum PracticeStep {
     Type,
     Normal,
     Undo,
+    EditMove,
+    EditDelete,
+    EditUndo,
+    EditRedo,
     Complete,
 }
 
@@ -120,12 +203,15 @@ impl PracticeStep {
         match self {
             Self::Insert => Some(Action::EnterMode(Mode::Insert)),
             Self::Normal => Some(Action::EnterMode(Mode::Normal)),
-            Self::Undo => Some(Action::Undo),
+            Self::Undo | Self::EditUndo => Some(Action::Undo),
+            Self::EditMove => Some(Action::MoveToLineEnd),
+            Self::EditDelete => Some(Action::DeleteCharAtCursorPos),
+            Self::EditRedo => Some(Action::Redo),
             Self::Type | Self::Complete => None,
         }
     }
 
-    pub fn instruction(self, shortcut: Option<&str>) -> String {
+    pub fn instruction(self, lesson: Lesson, shortcut: Option<&str>) -> String {
         match self {
             Self::Insert => format!("Press {} to enter Insert mode.", shortcut.unwrap_or("i")),
             Self::Type => "Type a few characters in the practice buffer.".into(),
@@ -137,27 +223,69 @@ impl PracticeStep {
                 "Press {} to undo your practice edit.",
                 shortcut.unwrap_or("u")
             ),
-            Self::Complete => "Your original text is restored. Nicely done.".into(),
+            Self::EditMove => format!(
+                "Press {} to reach the extra semicolon at the end of the first line.",
+                shortcut.unwrap_or("$")
+            ),
+            Self::EditDelete => format!(
+                "Press {} to delete the extra semicolon. Leave the other one in place.",
+                shortcut.unwrap_or("x")
+            ),
+            Self::EditUndo => format!(
+                "Press {} to bring the extra semicolon back. You can always undo a change.",
+                shortcut.unwrap_or("u")
+            ),
+            Self::EditRedo => format!(
+                "Press {} to redo the change and keep the fix.",
+                shortcut.unwrap_or("Ctrl-r")
+            ),
+            Self::Complete => match lesson {
+                Lesson::FindYourFooting => "Your original text is restored. Nicely done.",
+                Lesson::EditWithConfidence => {
+                    "The extra semicolon is gone. You can edit, undo, and redo with confidence."
+                }
+            }
+            .into(),
         }
     }
 
     pub const fn completed_steps(self) -> usize {
         match self {
-            Self::Insert => 0,
-            Self::Type => 1,
-            Self::Normal => 2,
-            Self::Undo => 3,
+            Self::Insert | Self::EditMove => 0,
+            Self::Type | Self::EditDelete => 1,
+            Self::Normal | Self::EditUndo => 2,
+            Self::Undo | Self::EditRedo => 3,
             Self::Complete => 4,
         }
     }
 
     /// Progress follows successful editor effects, not just pressed keys.
-    pub fn observe(&mut self, action: &Action, mode: Mode, original_text: bool) -> bool {
+    pub fn observe(
+        &mut self,
+        lesson: Lesson,
+        action: &Action,
+        mode: Mode,
+        contents: &str,
+        cursor: (usize, usize),
+    ) -> bool {
+        let original_text = contents == lesson.contents();
         let next = match (*self, action) {
             (Self::Insert, _) if mode == Mode::Insert => Self::Type,
             (Self::Type, _) if !original_text => Self::Normal,
             (Self::Normal, Action::EnterMode(Mode::Normal)) if mode == Mode::Normal => Self::Undo,
             (Self::Undo, Action::Undo) if original_text => Self::Complete,
+            (Self::EditMove, _)
+                if original_text
+                    && mode == Mode::Normal
+                    && cursor == ("let score = 41;;".len() - 1, 0) =>
+            {
+                Self::EditDelete
+            }
+            (Self::EditDelete, Action::DeleteCharAtCursorPos) if contents == EDIT_RESULT => {
+                Self::EditUndo
+            }
+            (Self::EditUndo, Action::Undo) if original_text => Self::EditRedo,
+            (Self::EditRedo, Action::Redo) if contents == EDIT_RESULT => Self::Complete,
             _ => return false,
         };
         *self = next;
@@ -165,12 +293,13 @@ impl PracticeStep {
     }
 }
 
-/// This first checkpoint permits only edits to its isolated scratch buffer.
+/// Scratch lessons permit only edits to their isolated practice buffer.
 pub(crate) fn practice_action_allowed(action: &Action) -> bool {
     matches!(
         action,
         Action::OpenLearn
             | Action::StartLearnLesson
+            | Action::StartLearnLessonAt(_)
             | Action::ExitLearnLesson
             | Action::RestartLearnLesson
             | Action::FinishLearnLesson
@@ -216,16 +345,100 @@ pub(crate) fn practice_action_allowed(action: &Action) -> bool {
 mod tests {
     use super::*;
 
+    fn observe_first(step: &mut PracticeStep, action: &Action, mode: Mode, original: bool) -> bool {
+        step.observe(
+            Lesson::FindYourFooting,
+            action,
+            mode,
+            if original {
+                PRACTICE_CONTENTS
+            } else {
+                "changed"
+            },
+            (0, 0),
+        )
+    }
+
     #[test]
     fn lesson_requires_a_real_edit_and_restoring_undo() {
         let mut step = PracticeStep::default();
-        assert!(!step.observe(&Action::Undo, Mode::Normal, true));
-        assert!(step.observe(&Action::EnterMode(Mode::Insert), Mode::Insert, true));
-        assert!(!step.observe(&Action::Refresh, Mode::Insert, true));
-        assert!(step.observe(&Action::InsertCharAtCursorPos('x'), Mode::Insert, false));
-        assert!(step.observe(&Action::EnterMode(Mode::Normal), Mode::Normal, false));
-        assert!(!step.observe(&Action::Undo, Mode::Normal, false));
-        assert!(step.observe(&Action::Undo, Mode::Normal, true));
+        assert!(!observe_first(&mut step, &Action::Undo, Mode::Normal, true));
+        assert!(observe_first(
+            &mut step,
+            &Action::EnterMode(Mode::Insert),
+            Mode::Insert,
+            true
+        ));
+        assert!(!observe_first(
+            &mut step,
+            &Action::Refresh,
+            Mode::Insert,
+            true
+        ));
+        assert!(observe_first(
+            &mut step,
+            &Action::InsertCharAtCursorPos('x'),
+            Mode::Insert,
+            false
+        ));
+        assert!(observe_first(
+            &mut step,
+            &Action::EnterMode(Mode::Normal),
+            Mode::Normal,
+            false
+        ));
+        assert!(!observe_first(
+            &mut step,
+            &Action::Undo,
+            Mode::Normal,
+            false
+        ));
+        assert!(observe_first(&mut step, &Action::Undo, Mode::Normal, true));
+        assert_eq!(step, PracticeStep::Complete);
+    }
+
+    #[test]
+    fn edit_lesson_requires_the_target_edit_undo_and_redo() {
+        let lesson = Lesson::EditWithConfidence;
+        let mut step = lesson.first_step();
+        assert!(!step.observe(
+            lesson,
+            &Action::MoveToLineEnd,
+            Mode::Normal,
+            EDIT_CONTENTS,
+            (0, 0)
+        ));
+        assert!(step.observe(
+            lesson,
+            &Action::MoveToLineEnd,
+            Mode::Normal,
+            EDIT_CONTENTS,
+            (15, 0)
+        ));
+        assert!(!step.observe(
+            lesson,
+            &Action::DeleteCharAtCursorPos,
+            Mode::Normal,
+            "wrong",
+            (14, 0)
+        ));
+        assert!(step.observe(
+            lesson,
+            &Action::DeleteCharAtCursorPos,
+            Mode::Normal,
+            EDIT_RESULT,
+            (14, 0)
+        ));
+        assert!(!step.observe(lesson, &Action::Undo, Mode::Normal, EDIT_RESULT, (14, 0)));
+        assert!(step.observe(lesson, &Action::Undo, Mode::Normal, EDIT_CONTENTS, (15, 0)));
+        assert!(!step.observe(
+            lesson,
+            &Action::DeleteCharAtCursorPos,
+            Mode::Normal,
+            EDIT_RESULT,
+            (14, 0)
+        ));
+        assert!(step.observe(lesson, &Action::Redo, Mode::Normal, EDIT_RESULT, (14, 0)));
         assert_eq!(step, PracticeStep::Complete);
     }
 

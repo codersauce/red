@@ -35,6 +35,53 @@ use std::{
 static COMMAND_COMPLETION_CWD_LOCK: Mutex<()> = Mutex::new(());
 
 #[tokio::test]
+async fn learn_red_edit_lesson_uses_real_keys_and_restores_the_workspace() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "original workspace\n".into()),
+        default_key_config(),
+    );
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+    harness
+        .execute_action(Action::Command("tutorial essentials 2".into()))
+        .await
+        .unwrap();
+    assert!(harness.buffer_contents().starts_with("let score = 41;;\n"));
+    let directory = tempfile::tempdir().unwrap();
+    let forbidden = directory.path().join("must-not-exist.rs");
+    harness
+        .execute_action(Action::SaveAs(forbidden.to_string_lossy().into_owned()))
+        .await
+        .unwrap();
+    assert!(!forbidden.exists());
+    for code in [KeyCode::Char('$'), KeyCode::Char('x'), KeyCode::Char('u')] {
+        harness
+            .execute_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+            .await
+            .unwrap();
+    }
+    assert!(harness.buffer_contents().starts_with("let score = 41;;\n"));
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    assert!(harness.buffer_contents().starts_with("let score = 41;\n"));
+    let rows = (0..24)
+        .map(|row| harness.render_row(row).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rows.contains(":tutorial next"));
+    harness
+        .execute_action(Action::Command("tutorial quit".into()))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("original workspace\n");
+    assert_eq!(harness.editor.test_window_count(), 2);
+}
+
+#[tokio::test]
 async fn language_reload_opens_previously_tracked_buffers_that_gain_a_route() {
     let directory = tempfile::tempdir().unwrap();
     let config_path = directory.path().join("config.toml");

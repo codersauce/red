@@ -1,10 +1,11 @@
-//! Lifecycle for the first Learn Red practice-buffer checkpoint.
+//! Lifecycle for Learn Red's protected practice-buffer lessons.
 
 use super::*;
-use crate::learn::{practice_action_allowed, PracticeStep, FIRST_LESSON_ID, PRACTICE_CONTENTS};
+use crate::learn::{practice_action_allowed, Lesson, PracticeStep};
 use crate::ui::{draw_learn_coach, CoachLayout, LearnHub};
 
 pub(super) struct LearnSession {
+    lesson: Lesson,
     pub(super) step: PracticeStep,
     practice_buffer_id: BufferId,
     original_buffer_id: BufferId,
@@ -33,12 +34,53 @@ impl Editor {
         self.release_current_dialog_callbacks(runtime);
         self.current_dialog = Some(Box::new(LearnHub::new(
             self,
-            self.preferences.learn_lesson_completed(FIRST_LESSON_ID),
+            Lesson::AVAILABLE.map(|lesson| self.preferences.learn_lesson_completed(lesson.id())),
         )));
+    }
+
+    pub(super) fn next_learn_lesson(&self) -> Lesson {
+        Lesson::AVAILABLE
+            .into_iter()
+            .find(|lesson| !self.preferences.learn_lesson_completed(lesson.id()))
+            .unwrap_or_default()
+    }
+
+    pub(super) async fn continue_learn_lesson(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        if let Some(session) = &self.learn_session {
+            if session.step != PracticeStep::Complete {
+                self.set_legacy_message(Some(
+                    "finish this checkpoint first, or use :tutorial quit to leave".into(),
+                ));
+                return self.render(buffer);
+            }
+            if let Some(next) = session.lesson.next() {
+                return self.start_learn_lesson(next, buffer, runtime).await;
+            }
+        }
+        self.finish_learn_lesson(buffer, runtime)?;
+        self.open_learn_hub(runtime);
+        self.render(buffer)
+    }
+
+    pub(super) async fn restart_learn_lesson(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        let lesson = self
+            .learn_session
+            .as_ref()
+            .map_or_else(|| self.next_learn_lesson(), |session| session.lesson);
+        self.start_learn_lesson(lesson, buffer, runtime).await
     }
 
     pub(super) async fn start_learn_lesson(
         &mut self,
+        lesson: Lesson,
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<()> {
@@ -72,7 +114,7 @@ impl Editor {
         let original_repeat = self.last_semantic_change.take();
         let original_registers = self.registers.clone();
         self.pending_semantic_change = None;
-        let practice = Buffer::new(None, PRACTICE_CONTENTS.to_string());
+        let practice = Buffer::new(None, lesson.contents().to_string());
         let practice_buffer_id = practice.id();
         let practice_index = self.buffer_manager.len();
         self.buffer_manager.push_buffer(practice);
@@ -84,7 +126,8 @@ impl Editor {
             ),
         );
         self.learn_session = Some(LearnSession {
-            step: PracticeStep::default(),
+            lesson,
+            step: lesson.first_step(),
             practice_buffer_id,
             original_buffer_id,
             original_windows,
@@ -190,7 +233,10 @@ impl Editor {
     ) -> anyhow::Result<()> {
         if matches!(
             action,
-            Action::StartLearnLesson | Action::RestartLearnLesson
+            Action::StartLearnLesson
+                | Action::StartLearnLessonAt(_)
+                | Action::RestartLearnLesson
+                | Action::FinishLearnLesson
         ) {
             return Ok(());
         }
@@ -200,15 +246,20 @@ impl Editor {
         if self.current_buffer().id() != session.practice_buffer_id {
             return Ok(());
         }
-        let original_text = self.current_buffer().contents() == PRACTICE_CONTENTS;
+        let contents = self.current_buffer().contents();
+        let position = self.cursor_text_position();
+        let cursor = (position.character, position.line);
         let mode = self.mode;
         let session = self
             .learn_session
             .as_mut()
             .expect("the active lesson was checked above");
-        if session.step.observe(action, mode, original_text) {
+        if session
+            .step
+            .observe(session.lesson, action, mode, &contents, cursor)
+        {
             if session.step == PracticeStep::Complete {
-                if let Err(error) = self.preferences.complete_learn_lesson(FIRST_LESSON_ID) {
+                if let Err(error) = self.preferences.complete_learn_lesson(session.lesson.id()) {
                     log!("could not persist Learn Red progress: {error}");
                 }
             }
@@ -247,6 +298,12 @@ impl Editor {
                 .into_iter()
                 .next()
         });
-        draw_learn_coach(buffer, &self.theme, session.step, shortcut.as_deref());
+        draw_learn_coach(
+            buffer,
+            &self.theme,
+            session.lesson,
+            session.step,
+            shortcut.as_deref(),
+        );
     }
 }

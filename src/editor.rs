@@ -2373,6 +2373,7 @@ pub enum Action {
     OpenWhatsNew,
     OpenLearn,
     StartLearnLesson,
+    StartLearnLessonAt(String),
     ExitLearnLesson,
     RestartLearnLesson,
     FinishLearnLesson,
@@ -13694,6 +13695,17 @@ impl Editor {
             "tutorial next" => return vec![Action::FinishLearnLesson],
             _ => {}
         }
+        if let Some(number) = cmd.strip_prefix("tutorial essentials ") {
+            if let Some(lesson) = number
+                .parse()
+                .ok()
+                .and_then(crate::learn::Lesson::from_number)
+            {
+                return vec![Action::StartLearnLessonAt(lesson.id().into())];
+            }
+            self.set_legacy_message(Some("that Essentials lesson is not available yet".into()));
+            return Vec::new();
+        }
         if cmd == "config-diagnostics" {
             return vec![Action::ConfigDiagnostics];
         }
@@ -19514,13 +19526,28 @@ impl Editor {
                     self.render(buffer)?;
                 }
             }
-            Action::OpenLearn | Action::FinishLearnLesson => {
+            Action::OpenLearn => {
                 self.finish_learn_lesson(buffer, runtime)?;
                 self.open_learn_hub(runtime);
                 self.render(buffer)?;
             }
-            Action::StartLearnLesson | Action::RestartLearnLesson => {
-                self.start_learn_lesson(buffer, runtime).await?;
+            Action::StartLearnLesson => {
+                self.start_learn_lesson(self.next_learn_lesson(), buffer, runtime)
+                    .await?;
+            }
+            Action::StartLearnLessonAt(id) => {
+                if let Some(lesson) = crate::learn::Lesson::from_id(id) {
+                    self.start_learn_lesson(lesson, buffer, runtime).await?;
+                } else {
+                    self.set_legacy_message(Some("that lesson is not available yet".into()));
+                    self.render(buffer)?;
+                }
+            }
+            Action::RestartLearnLesson => {
+                self.restart_learn_lesson(buffer, runtime).await?;
+            }
+            Action::FinishLearnLesson => {
+                self.continue_learn_lesson(buffer, runtime).await?;
             }
             Action::ExitLearnLesson => {
                 self.finish_learn_lesson(buffer, runtime)?;
@@ -27660,6 +27687,65 @@ mod test {
             .buffer_manager
             .iter()
             .any(|candidate| candidate.id() == practice_id));
+    }
+
+    #[tokio::test]
+    async fn learn_red_continues_and_restarts_the_current_lesson() {
+        use crate::learn::{Lesson, PracticeStep, EDIT_CONTENTS, EDIT_RESULT};
+        let mut editor = test_editor(120, 32);
+        let mut buffer = RenderBuffer::new(120, 32, &Style::default());
+        let mut runtime = Runtime::new();
+        editor
+            .preferences
+            .complete_learn_lesson(Lesson::FindYourFooting.id())
+            .unwrap();
+        editor
+            .execute(&Action::StartLearnLesson, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), EDIT_CONTENTS);
+        editor
+            .execute(&Action::FinishLearnLesson, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::EditMove
+        );
+        editor
+            .execute(&Action::DeleteCharAtCursorPos, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        editor
+            .execute(&Action::RestartLearnLesson, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), EDIT_CONTENTS);
+        for action in [
+            Action::MoveToLineEnd,
+            Action::DeleteCharAtCursorPos,
+            Action::Undo,
+            Action::Redo,
+        ] {
+            editor
+                .execute(&action, &mut buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+        assert_eq!(editor.current_buffer().contents(), EDIT_RESULT);
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::Complete
+        );
+        assert!(editor
+            .preferences
+            .learn_lesson_completed(Lesson::EditWithConfidence.id()));
+        editor
+            .execute(&Action::FinishLearnLesson, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(editor.learn_session.is_none());
+        assert_eq!(editor.current_buffer().contents(), "hello");
     }
 
     #[test]

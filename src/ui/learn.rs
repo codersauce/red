@@ -5,7 +5,7 @@ use crossterm::event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind
 use crate::{
     config::KeyAction,
     editor::{Action, Editor, RenderBuffer},
-    learn::{PracticeStep, TRACKS},
+    learn::{Lesson, PracticeStep, TRACKS},
     theme::{Style, SurfaceCardColors, SurfaceCardPalette, SurfacePalette, Theme},
     unicode_utils::{display_width, truncate_display_width},
 };
@@ -94,14 +94,14 @@ impl HubLayout {
 pub(crate) struct LearnHub {
     selected: usize,
     details: bool,
-    completed: bool,
+    completed: [bool; Lesson::AVAILABLE.len()],
     width: usize,
     height: usize,
     theme: Theme,
 }
 
 impl LearnHub {
-    pub fn new(editor: &Editor, completed: bool) -> Self {
+    pub fn new(editor: &Editor, completed: [bool; Lesson::AVAILABLE.len()]) -> Self {
         Self {
             selected: 0,
             details: false,
@@ -119,12 +119,21 @@ impl LearnHub {
         self.layout().wide
     }
 
+    fn next_lesson(&self) -> Lesson {
+        Lesson::AVAILABLE
+            .into_iter()
+            .find(|lesson| !self.completed[lesson.index()])
+            .unwrap_or_default()
+    }
+
     fn actions(&self) -> Vec<UiAction> {
         let open = if !self.wide() && !self.details {
             "View track"
         } else if self.selected == 0 {
-            if self.completed {
+            if self.completed.iter().all(|completed| *completed) {
                 "Replay lesson"
+            } else if self.completed.iter().any(|completed| *completed) {
+                "Continue lesson"
             } else {
                 "Start lesson"
             }
@@ -264,7 +273,7 @@ impl LearnHub {
                 if y >= bottom.saturating_sub(2) {
                     break;
                 }
-                let mark = if self.selected == 0 && index == 0 && self.completed {
+                let mark = if self.selected == 0 && self.completed.get(index) == Some(&true) {
                     "✓ ".to_string()
                 } else {
                     format!("{:02}", index + 1)
@@ -282,13 +291,15 @@ impl LearnHub {
         }
         if y + 1 < bottom {
             let status = if self.selected == 0 {
-                if self.completed {
-                    "✓ First lesson complete · Enter to replay"
+                if self.completed.iter().all(|completed| *completed) {
+                    "✓ Available lessons complete · Enter to replay".to_string()
+                } else if self.completed.iter().any(|completed| *completed) {
+                    format!("Enter  Continue: {} →", self.next_lesson().title())
                 } else {
-                    "Enter  Start the first lesson →"
+                    "Enter  Start the first lesson →".to_string()
                 }
             } else {
-                "Planned · more lessons are on the way"
+                "Planned · more lessons are on the way".to_string()
             };
             if y + 3 < bottom {
                 horizontal_rule(buffer, x, y + 1, width, &palette.divider);
@@ -299,7 +310,7 @@ impl LearnHub {
                 x,
                 y + 1,
                 width,
-                status,
+                &status,
                 if self.selected == 0 {
                     &palette.accent
                 } else {
@@ -581,6 +592,7 @@ impl CoachLayout {
 pub(crate) fn draw_learn_coach(
     buffer: &mut RenderBuffer,
     theme: &Theme,
+    lesson: Lesson,
     step: PracticeStep,
     shortcut: Option<&str>,
 ) {
@@ -628,11 +640,14 @@ pub(crate) fn draw_learn_coach(
     );
     let left = area.x + 2;
     let text_width = area.width.saturating_sub(4);
-    let instruction = step.instruction(shortcut);
+    let instruction = step.instruction(lesson, shortcut);
     let exit = if step == PracticeStep::Complete {
-        ":tutorial next  →  All tracks"
+        lesson.next().map_or_else(
+            || ":tutorial next  →  All tracks".to_string(),
+            |next| format!(":tutorial next  →  Lesson {}", next.index() + 1),
+        )
     } else {
-        ":tutorial quit  ·  :tutorial restart"
+        ":tutorial quit  ·  :tutorial restart".to_string()
     };
     if area.height <= 3 {
         horizontal_rule(buffer, area.x, area.y, area.width, &palette.divider);
@@ -649,7 +664,7 @@ pub(crate) fn draw_learn_coach(
             left,
             area.y + 2,
             text_width,
-            exit,
+            &exit,
             &palette.secondary,
         );
         return;
@@ -663,7 +678,7 @@ pub(crate) fn draw_learn_coach(
             left,
             area.y + 1,
             text_width,
-            "ESSENTIALS  ·  Find your footing",
+            &format!("ESSENTIALS  ·  {}", lesson.title()),
             &palette.accent,
         );
         wrapped(
@@ -675,7 +690,14 @@ pub(crate) fn draw_learn_coach(
             &instruction,
             &palette.primary,
         );
-        put(buffer, left, footer_y, text_width, exit, &palette.secondary);
+        put(
+            buffer,
+            left,
+            footer_y,
+            text_width,
+            &exit,
+            &palette.secondary,
+        );
         return;
     }
     put(
@@ -683,7 +705,11 @@ pub(crate) fn draw_learn_coach(
         left,
         area.y + 1,
         text_width,
-        "01 / 04  ·  ESSENTIALS",
+        &format!(
+            "{:02} / {:02}  ·  ESSENTIALS",
+            lesson.index() + 1,
+            TRACKS[0].lessons.len()
+        ),
         &palette.accent,
     );
     put(
@@ -691,7 +717,7 @@ pub(crate) fn draw_learn_coach(
         left,
         area.y + 2,
         text_width,
-        "Find your footing",
+        lesson.title(),
         &Style {
             bold: true,
             ..palette.primary.clone()
@@ -716,15 +742,7 @@ pub(crate) fn draw_learn_coach(
             &format!("CHECKPOINT  ·  {}/4", step.completed_steps()),
             &palette.secondary,
         );
-        for (index, text) in [
-            "Enter Insert mode",
-            "Change the practice text",
-            "Return to Normal mode",
-            "Undo back to the original",
-        ]
-        .iter()
-        .enumerate()
-        {
+        for (index, text) in lesson.checkpoints().iter().enumerate() {
             let completed = index < step.completed_steps();
             let active = index == step.completed_steps();
             let mark = if completed {
@@ -757,7 +775,7 @@ pub(crate) fn draw_learn_coach(
         text_width,
         &palette.divider,
     );
-    put(buffer, left, footer_y, text_width, exit, &palette.accent);
+    put(buffer, left, footer_y, text_width, &exit, &palette.accent);
 }
 
 fn horizontal_rule(buffer: &mut RenderBuffer, x: usize, y: usize, width: usize, style: &Style) {
@@ -902,7 +920,7 @@ mod tests {
         LearnHub {
             selected: 0,
             details: false,
-            completed: false,
+            completed: [false; Lesson::AVAILABLE.len()],
             width,
             height: height - 1,
             theme: Theme::default(),
@@ -953,6 +971,7 @@ mod tests {
             draw_learn_coach(
                 &mut buffer,
                 &Theme::default(),
+                Lesson::FindYourFooting,
                 PracticeStep::Insert,
                 Some("i"),
             );
@@ -993,7 +1012,13 @@ mod tests {
                 );
 
                 let mut buffer = RenderBuffer::new(width, height, &theme.style);
-                draw_learn_coach(&mut buffer, &theme, PracticeStep::Complete, None);
+                draw_learn_coach(
+                    &mut buffer,
+                    &theme,
+                    Lesson::FindYourFooting,
+                    PracticeStep::Complete,
+                    None,
+                );
                 assert_readable_text(&buffer, path);
                 assert!(
                     buffer
