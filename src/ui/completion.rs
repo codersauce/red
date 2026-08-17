@@ -650,10 +650,10 @@ impl Component for CompletionUI {
                 Some(KeyAction::None)
             }
             Event::Key(KeyEvent {
-                code: KeyCode::Tab,
+                code: KeyCode::Tab | KeyCode::Enter,
                 modifiers: KeyModifiers::NONE,
                 ..
-            }) => self.selected_item().map(|item| {
+            }) if self.selected_item().is_some() => self.selected_item().map(|item| {
                 KeyAction::Multiple(vec![
                     Action::ApplyCompletion {
                         item: Box::new(item.clone()),
@@ -1117,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_accepts_the_selected_completion() {
+    fn tab_and_enter_accept_the_selected_completion() {
         let mut ui = CompletionUI::new();
         ui.show(
             vec![
@@ -1129,17 +1129,21 @@ mod tests {
             0,
         );
 
+        ui.move_selection(1);
         let selected = ui.selected_item().unwrap().clone();
-        assert_eq!(
-            ui.handle_event(&Event::Key(KeyEvent::from(KeyCode::Tab))),
-            Some(KeyAction::Multiple(vec![
-                Action::ApplyCompletion {
-                    item: Box::new(selected),
-                    commit_character: None,
-                },
-                Action::CloseDialog,
-            ]))
-        );
+        assert_eq!(selected.label, "beta");
+        for code in [KeyCode::Tab, KeyCode::Enter] {
+            assert_eq!(
+                ui.handle_event(&key(code, KeyModifiers::NONE)),
+                Some(KeyAction::Multiple(vec![
+                    Action::ApplyCompletion {
+                        item: Box::new(selected.clone()),
+                        commit_character: None,
+                    },
+                    Action::CloseDialog,
+                ]))
+            );
+        }
     }
 
     #[test]
@@ -1163,10 +1167,16 @@ mod tests {
     }
 
     #[test]
-    fn enter_inserts_a_newline_and_ctrl_e_only_dismisses_completion() {
+    fn enter_inserts_a_newline_when_no_completion_is_selected() {
         let mut ui = CompletionUI::new();
         ui.show(vec![item("alpha", Some(CompletionItemKind::Text))], 0, 0);
+        ui.set_filter("no_match");
 
+        assert!(ui.selected_item().is_none());
+        assert_eq!(
+            ui.handle_event(&key(KeyCode::Tab, KeyModifiers::NONE)),
+            None
+        );
         assert_eq!(
             ui.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE)),
             Some(KeyAction::Multiple(vec![
@@ -1174,6 +1184,33 @@ mod tests {
                 Action::InsertNewLine,
             ]))
         );
+    }
+
+    #[test]
+    fn modified_enter_keeps_inserting_a_newline() {
+        let mut ui = CompletionUI::new();
+        ui.show(vec![item("alpha", Some(CompletionItemKind::Text))], 0, 0);
+
+        for modifiers in [
+            KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+        ] {
+            assert_eq!(
+                ui.handle_event(&key(KeyCode::Enter, modifiers)),
+                Some(KeyAction::Multiple(vec![
+                    Action::CloseDialog,
+                    Action::InsertNewLine,
+                ]))
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_e_only_dismisses_completion() {
+        let mut ui = CompletionUI::new();
+        ui.show(vec![item("alpha", Some(CompletionItemKind::Text))], 0, 0);
+
         assert_eq!(
             ui.handle_event(&key(KeyCode::Char('e'), KeyModifiers::CONTROL)),
             Some(KeyAction::Single(Action::CloseDialog))
