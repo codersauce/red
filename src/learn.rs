@@ -65,10 +65,11 @@ pub(crate) enum Lesson {
     ChooseATheme,
     DiscoverYourKeymap,
     CheckLanguageSupport,
+    KeepYourPlace,
 }
 
 impl Lesson {
-    pub const AVAILABLE: [Self; 25] = [
+    pub const AVAILABLE: [Self; 26] = [
         Self::FindYourFooting,
         Self::EditWithConfidence,
         Self::FindACommand,
@@ -94,6 +95,7 @@ impl Lesson {
         Self::ChooseATheme,
         Self::DiscoverYourKeymap,
         Self::CheckLanguageSupport,
+        Self::KeepYourPlace,
     ];
 
     pub fn from_id(id: &str) -> Option<Self> {
@@ -143,6 +145,7 @@ impl Lesson {
             Self::ChooseATheme => 22,
             Self::DiscoverYourKeymap => 23,
             Self::CheckLanguageSupport => 24,
+            Self::KeepYourPlace => 25,
         }
     }
 
@@ -166,7 +169,10 @@ impl Lesson {
             | Self::ChangeATextObject
             | Self::RepeatAndRecover
             | Self::FindAndReplace => 4,
-            Self::ChooseATheme | Self::DiscoverYourKeymap | Self::CheckLanguageSupport => 5,
+            Self::ChooseATheme
+            | Self::DiscoverYourKeymap
+            | Self::CheckLanguageSupport
+            | Self::KeepYourPlace => 5,
             _ => 0,
         }
     }
@@ -239,6 +245,7 @@ impl Lesson {
             Self::ChooseATheme => "custom.choose-a-theme.v1",
             Self::DiscoverYourKeymap => "custom.discover-your-keymap.v1",
             Self::CheckLanguageSupport => "custom.check-language-support.v1",
+            Self::KeepYourPlace => "custom.keep-your-place.v1",
         }
     }
 
@@ -253,6 +260,7 @@ impl Lesson {
             Self::RepeatAndRecover => precision::REPEAT_CONTENTS,
             Self::FindAndReplace => precision::REPLACE_CONTENTS,
             Self::DiscoverYourKeymap => personalization::KEYMAP_CONTENTS,
+            Self::KeepYourPlace => personalization::RECOVERY_CONTENTS,
             Self::FindYourFooting | Self::ChooseATheme => PRACTICE_CONTENTS,
             Self::EditWithConfidence => EDIT_CONTENTS,
             Self::FindACommand => COMMAND_CONTENTS,
@@ -300,6 +308,7 @@ impl Lesson {
             Self::ChooseATheme => PracticeStep::ThemeOpen,
             Self::DiscoverYourKeymap => PracticeStep::KeymapOpen,
             Self::CheckLanguageSupport => PracticeStep::SupportSyntax,
+            Self::KeepYourPlace => PracticeStep::RecoveryEdit,
         }
     }
 
@@ -350,6 +359,12 @@ impl Lesson {
                 "Undo the unwanted change",
                 "Request and refine a suggestion",
                 "Keep only the corrected result",
+            ],
+            Self::KeepYourPlace => &[
+                "Make an unsaved change",
+                "Snapshot and close the practice buffer",
+                "Recover the unsaved text and cursor",
+                "Undo and redo the recovered edit",
             ],
             Self::CheckLanguageSupport => &[
                 "Choose the buffer syntax",
@@ -675,12 +690,22 @@ pub(crate) enum PracticeStep {
     SupportDiagnostic,
     SupportInventory,
     SupportReturn,
+    RecoveryEdit,
+    RecoverySnapshot,
+    RecoveryRestore,
+    RecoveryUndo,
+    RecoveryRedo,
     Complete,
 }
 
 impl PracticeStep {
     pub fn suggested_action(self) -> Option<Action> {
         match self {
+            Self::RecoveryEdit => None,
+            Self::RecoverySnapshot => Some(Action::SnapshotLearnRecovery),
+            Self::RecoveryRestore => Some(Action::RestoreLearnRecovery),
+            Self::RecoveryUndo => Some(Action::Undo),
+            Self::RecoveryRedo => Some(Action::Redo),
             Self::SupportSyntax => Some(Action::OpenSyntaxPicker),
             Self::SupportChooseSyntax | Self::SupportReturn => None,
             Self::SupportDiagnostic => Some(Action::OpenDiagnosticsPicker),
@@ -840,6 +865,11 @@ impl PracticeStep {
             Self::DiagnosticJump => "Choose the missing-semicolon error and press Enter. The editor will take you to the reported location. Reopen Diagnostics if you closed the picker.".into(),
             Self::DiagnosticRead => format!("Press {} to read the diagnostic on this line. The parser points at the next token; the incomplete statement is just above it.", shortcut.unwrap_or("D")),
             Self::DiagnosticReturn => "Read the message and diagnostic code, then press Esc to return to the source. You will repair the defect in a later lesson.".into(),
+            Self::RecoveryEdit => "Change TODO to DONE without saving. Try :%s/TODO/DONE/. Red normally snapshots unsaved buffers automatically; this lesson gives you an explicit, isolated recovery checkpoint.".into(),
+            Self::RecoverySnapshot => "Run :tutorial snapshot. This writes a real recovery snapshot in the disposable lesson directory, then closes and reopens only this practice buffer from disk. Your actual recovery store is protected.".into(),
+            Self::RecoveryRestore => "The file on disk still says TODO. Run :tutorial recover to load the unsaved DONE text, cursor, and undo history from the lesson snapshot. This uses the same snapshot format and buffer recovery as red --resume.".into(),
+            Self::RecoveryUndo => format!("The recovered DONE is still unsaved. Press {} to undo the recovered change; recovery preserves editing history, not just text.", shortcut.unwrap_or("u")),
+            Self::RecoveryRedo => format!("Press {} to redo it. In your own workspace, red --resume restores the latest crash-safe snapshot. Use red --detach=NAME and red --attach NAME when you want a live detachable session.", shortcut.unwrap_or("Ctrl-r")),
             Self::SupportSyntax => "Run :syntax to see the language definitions available in this Red installation. Syntax highlighting and language-server features are separate capabilities.".into(),
             Self::SupportChooseSyntax => "Choose husk in the syntax picker. This is a buffer-local choice; it does not change file associations or install anything. Reopen :syntax if needed.".into(),
             Self::SupportDiagnostic => format!("Press {} and open the missing-semicolon diagnostic. This real response from the bundled Husk server proves more than syntax colors alone.", shortcut.unwrap_or("Space d")),
@@ -914,6 +944,7 @@ impl PracticeStep {
                 Lesson::UnderstandSelectedCode => "You explained selected code without editing it. Recorded practice complete; real inline assist sends your selected context only when you submit a prompt.",
                 Lesson::MakeAFocusedChange => "The fix is kept in the buffer, still unsaved. Inline edits use normal undo history; keeping one is not the same as writing a file.",
                 Lesson::ChooseWhatToKeep => "You rejected an unwanted change, refined a suggestion, and kept the corrected result. The final edit is unsaved and remains undoable.",
+                Lesson::KeepYourPlace => "You recovered an unsaved edit and its undo history from a real, isolated snapshot. In your own workspace, red --resume recovers the latest session; red --detach=NAME and red --attach NAME keep a live session available. Your original recovery data is untouched.",
                 Lesson::CheckLanguageSupport => "You checked syntax, observed a real language-server diagnostic, and inspected local language support. Your configuration and installed packs are unchanged.",
                 Lesson::DiscoverYourKeymap => "You edited a real keymap fragment, tried its temporary binding, and found it in keyboard help. Copy an intentional override into your own config later if you want to keep it.",
                 Lesson::ChooseATheme => "You previewed a theme, tested cancellation, and made an explicit choice. Your saved theme remains in effect after the lesson.",
@@ -969,7 +1000,8 @@ impl PracticeStep {
             | Self::KeymapOpen
             | Self::KeymapReturn
             | Self::SupportSyntax
-            | Self::SupportChooseSyntax => 0,
+            | Self::SupportChooseSyntax
+            | Self::RecoveryEdit => 0,
             Self::Type
             | Self::EditDelete
             | Self::CommandRun
@@ -994,7 +1026,8 @@ impl PracticeStep {
             | Self::ReplaceNext
             | Self::ThemePreview
             | Self::KeymapEdit
-            | Self::SupportDiagnostic => 1,
+            | Self::SupportDiagnostic
+            | Self::RecoverySnapshot => 1,
             Self::Normal
             | Self::EditUndo
             | Self::CommandHelp
@@ -1021,7 +1054,8 @@ impl PracticeStep {
             | Self::ReplaceAll
             | Self::ThemeCancel
             | Self::KeymapTry
-            | Self::SupportInventory => 2,
+            | Self::SupportInventory
+            | Self::RecoveryRestore => 2,
             Self::Undo
             | Self::EditRedo
             | Self::CommandReturn
@@ -1047,7 +1081,9 @@ impl PracticeStep {
             | Self::ThemeChoose
             | Self::KeymapInspect
             | Self::KeymapClose
-            | Self::SupportReturn => 3,
+            | Self::SupportReturn
+            | Self::RecoveryUndo
+            | Self::RecoveryRedo => 3,
             Self::Complete => 4,
         }
     }
@@ -1063,6 +1099,15 @@ impl PracticeStep {
     ) -> bool {
         let original_text = contents == lesson.contents();
         let next = match (*self, action) {
+            (Self::RecoveryEdit, _)
+                if mode == Mode::Normal && contents == personalization::RECOVERY_RESULT =>
+            {
+                Self::RecoverySnapshot
+            }
+            (Self::RecoveryUndo, Action::Undo) if original_text => Self::RecoveryRedo,
+            (Self::RecoveryRedo, Action::Redo) if contents == personalization::RECOVERY_RESULT => {
+                Self::Complete
+            }
             (Self::ReplaceAll, Action::Substitute(_) | Action::ConfirmSubstitute(_))
                 if contents == precision::REPLACE_RESULT =>
             {
@@ -1169,6 +1214,16 @@ impl PracticeStep {
     /// Observes UI state that can change through either a key or an action.
     pub fn observe_view(&mut self, action: &Action, view: PracticeView) -> bool {
         let next = match (*self, action) {
+            (Self::RecoverySnapshot, Action::SnapshotLearnRecovery)
+                if view.recovery_snapshot_saved && view.original_text && !view.dirty =>
+            {
+                Self::RecoveryRestore
+            }
+            (Self::RecoveryRestore, Action::RestoreLearnRecovery)
+                if view.recovery_restored && view.dirty =>
+            {
+                Self::RecoveryUndo
+            }
             (Self::SupportSyntax, Action::OpenSyntaxPicker) if view.syntax_picker_open => {
                 Self::SupportChooseSyntax
             }
@@ -1460,6 +1515,8 @@ pub(crate) struct PracticeView {
     pub code_actions_open: bool,
     pub husk_fixed_text: bool,
     pub diagnostics_clean: bool,
+    pub recovery_snapshot_saved: bool,
+    pub recovery_restored: bool,
     pub syntax_picker_open: bool,
     pub explicit_husk_syntax: bool,
     pub language_server_ready: bool,
@@ -1495,11 +1552,19 @@ pub(crate) struct PracticeView {
 
 /// Scratch lessons permit only edits to their isolated practice buffer.
 pub(crate) fn practice_action_allowed(lesson: Lesson, action: &Action) -> bool {
-    (lesson == Lesson::CheckLanguageSupport
+    (lesson == Lesson::KeepYourPlace
         && matches!(
             action,
-            Action::OpenSyntaxPicker | Action::SetSyntax(_) | Action::ListPlugins
+            Action::SnapshotLearnRecovery
+                | Action::RestoreLearnRecovery
+                | Action::Substitute(_)
+                | Action::ConfirmSubstitute(_)
         ))
+        || (lesson == Lesson::CheckLanguageSupport
+            && matches!(
+                action,
+                Action::OpenSyntaxPicker | Action::SetSyntax(_) | Action::ListPlugins
+            ))
         || (lesson == Lesson::DiscoverYourKeymap
             && matches!(
                 action,

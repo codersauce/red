@@ -2377,6 +2377,8 @@ pub enum Action {
     ExitLearnLesson,
     RestartLearnLesson,
     FinishLearnLesson,
+    SnapshotLearnRecovery,
+    RestoreLearnRecovery,
     OpenStatuslineManager,
     OpenDiagnosticsPicker,
     OpenErrorDiagnosticsPicker,
@@ -13728,6 +13730,8 @@ impl Editor {
             "tutorial quit" => return vec![Action::ExitLearnLesson],
             "tutorial restart" => return vec![Action::RestartLearnLesson],
             "tutorial next" => return vec![Action::FinishLearnLesson],
+            "tutorial snapshot" => return vec![Action::SnapshotLearnRecovery],
+            "tutorial recover" => return vec![Action::RestoreLearnRecovery],
             _ => {}
         }
         if let Some(number) = cmd.strip_prefix("tutorial essentials ") {
@@ -19623,31 +19627,15 @@ impl Editor {
                     self.render(buffer)?;
                 }
             }
-            Action::OpenLearn => {
-                self.finish_learn_lesson(buffer, runtime).await?;
-                self.open_learn_hub(runtime);
-                self.render(buffer)?;
-            }
-            Action::StartLearnLesson => {
-                self.start_learn_lesson(self.next_learn_lesson(), buffer, runtime)
-                    .await?;
-            }
-            Action::StartLearnLessonAt(id) => {
-                if let Some(lesson) = crate::learn::Lesson::from_id(id) {
-                    self.start_learn_lesson(lesson, buffer, runtime).await?;
-                } else {
-                    self.set_legacy_message(Some("that lesson is not available yet".into()));
-                    self.render(buffer)?;
-                }
-            }
-            Action::RestartLearnLesson => {
-                self.restart_learn_lesson(buffer, runtime).await?;
-            }
-            Action::FinishLearnLesson => {
-                self.continue_learn_lesson(buffer, runtime).await?;
-            }
-            Action::ExitLearnLesson => {
-                self.finish_learn_lesson(buffer, runtime).await?;
+            Action::OpenLearn
+            | Action::StartLearnLesson
+            | Action::StartLearnLessonAt(_)
+            | Action::RestartLearnLesson
+            | Action::FinishLearnLesson
+            | Action::ExitLearnLesson
+            | Action::SnapshotLearnRecovery
+            | Action::RestoreLearnRecovery => {
+                self.execute_learn_control(action, buffer, runtime).await?;
             }
             Action::OpenStatuslineManager => {
                 self.release_current_dialog_callbacks(runtime);
@@ -23886,6 +23874,59 @@ impl Editor {
         })
     }
 
+    fn capture_recovery_buffer(
+        buffer: &Buffer,
+        index: usize,
+        (cursor_x, cursor_y, viewport_top): (usize, usize, usize),
+        include_disk_contents: bool,
+    ) -> (SessionBufferSnapshot, Option<SessionDiskFingerprint>) {
+        let mut undo_history = buffer.undo_history.clone();
+        undo_history.commit_transaction(CursorSnapshot::new(cursor_x, cursor_y, viewport_top));
+        let disk_fingerprint = buffer.file.as_deref().and_then(|path| {
+            capture_session_disk_fingerprint(Path::new(path))
+                .ok()
+                .flatten()
+        });
+        (
+            SessionBufferSnapshot {
+                index,
+                path: buffer.file.clone(),
+                // Periodic snapshots flatten the structurally shared Rope on the
+                // writer thread so large open buffers cannot stall input.
+                contents: if include_disk_contents {
+                    buffer.contents()
+                } else {
+                    String::new()
+                },
+                saved_contents: if include_disk_contents {
+                    buffer
+                        .saved_contents_snapshot()
+                        .map(|contents| contents.to_string())
+                } else {
+                    None
+                },
+                dirty: buffer.dirty,
+                revision: buffer.revision(),
+                cursor_x,
+                cursor_y,
+                viewport_top,
+                undo_history,
+                disk_contents: if include_disk_contents {
+                    buffer
+                        .file
+                        .as_deref()
+                        .zip(disk_fingerprint)
+                        .and_then(|(path, fingerprint)| {
+                            read_session_disk_contents(Path::new(path), fingerprint).ok()
+                        })
+                } else {
+                    None
+                },
+            },
+            disk_fingerprint,
+        )
+    }
+
     fn durable_session_snapshot(
         &mut self,
         include_disk_contents: bool,
@@ -23916,52 +23957,11 @@ impl Editor {
                     .get(&index)
                     .copied()
                     .unwrap_or((buffer.pos.0, buffer.vtop + buffer.pos.1, buffer.vtop));
-                let mut undo_history = buffer.undo_history.clone();
-                undo_history.commit_transaction(CursorSnapshot::new(
-                    cursor_x,
-                    cursor_y,
-                    viewport_top,
-                ));
-                let disk_fingerprint = buffer.file.as_deref().and_then(|path| {
-                    capture_session_disk_fingerprint(Path::new(path))
-                        .ok()
-                        .flatten()
-                });
-                (
-                    SessionBufferSnapshot {
-                        index,
-                        path: buffer.file.clone(),
-                        // Periodic snapshots flatten the structurally shared Rope on the
-                        // writer thread so large open buffers cannot stall input.
-                        contents: if include_disk_contents {
-                            buffer.contents()
-                        } else {
-                            String::new()
-                        },
-                        saved_contents: if include_disk_contents {
-                            buffer
-                                .saved_contents_snapshot()
-                                .map(|contents| contents.to_string())
-                        } else {
-                            None
-                        },
-                        dirty: buffer.dirty,
-                        revision: buffer.revision(),
-                        cursor_x,
-                        cursor_y,
-                        viewport_top,
-                        undo_history,
-                        disk_contents: if include_disk_contents {
-                            buffer.file.as_deref().zip(disk_fingerprint).and_then(
-                                |(path, fingerprint)| {
-                                    read_session_disk_contents(Path::new(path), fingerprint).ok()
-                                },
-                            )
-                        } else {
-                            None
-                        },
-                    },
-                    disk_fingerprint,
+                Self::capture_recovery_buffer(
+                    buffer,
+                    index,
+                    (cursor_x, cursor_y, viewport_top),
+                    include_disk_contents,
                 )
             })
             .unzip();

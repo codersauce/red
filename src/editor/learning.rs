@@ -15,6 +15,7 @@ mod language;
 mod language_support;
 mod navigation;
 mod outline;
+mod recovery;
 mod search;
 mod staging;
 mod symbols;
@@ -43,6 +44,7 @@ pub(super) struct LearnSession {
     outline: Option<outline::LearnOutlineState>,
     theme: Option<customization::LearnThemeState>,
     keymap: Option<keymap::LearnKeymapState>,
+    recovery: Option<recovery::LearnRecoveryState>,
 }
 
 impl LearnSession {
@@ -62,6 +64,55 @@ impl LearnSession {
 }
 
 impl Editor {
+    // Keep tutorial lifecycle futures out of the recursively replayed editor
+    // dispatcher. Even ordinary dot-repeat creates that dispatcher's frame.
+    #[inline(never)]
+    pub(super) fn execute_learn_control<'a>(
+        &'a mut self,
+        action: &'a Action,
+        buffer: &'a mut RenderBuffer,
+        runtime: &'a mut Runtime,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            match action {
+                Action::OpenLearn => {
+                    self.finish_learn_lesson(buffer, runtime).await?;
+                    self.open_learn_hub(runtime);
+                    self.render(buffer)?;
+                }
+                Action::StartLearnLesson => {
+                    self.start_learn_lesson(self.next_learn_lesson(), buffer, runtime)
+                        .await?;
+                }
+                Action::StartLearnLessonAt(id) => {
+                    if let Some(lesson) = crate::learn::Lesson::from_id(id) {
+                        self.start_learn_lesson(lesson, buffer, runtime).await?;
+                    } else {
+                        self.set_legacy_message(Some("that lesson is not available yet".into()));
+                        self.render(buffer)?;
+                    }
+                }
+                Action::RestartLearnLesson => {
+                    self.restart_learn_lesson(buffer, runtime).await?;
+                }
+                Action::FinishLearnLesson => {
+                    self.continue_learn_lesson(buffer, runtime).await?;
+                }
+                Action::ExitLearnLesson => {
+                    self.finish_learn_lesson(buffer, runtime).await?;
+                }
+                Action::SnapshotLearnRecovery | Action::RestoreLearnRecovery => {
+                    self.set_quiet_message(Some(
+                        "start :tutorial custom 4 to try isolated recovery".into(),
+                    ));
+                    self.render(buffer)?;
+                }
+                _ => unreachable!("only Learn control actions are routed here"),
+            }
+            Ok(())
+        })
+    }
+
     pub(super) fn open_learn_hub(&mut self, runtime: &mut Runtime) {
         if self.inline_assist.is_some()
             || self.workspace_manager.is_active()
@@ -163,7 +214,10 @@ impl Editor {
         // setup leaves the user's current workspace untouched.
         let workspace = if matches!(
             lesson,
-            Lesson::SaveAPracticeFile | Lesson::ContinueInAgent | Lesson::DiscoverYourKeymap
+            Lesson::SaveAPracticeFile
+                | Lesson::ContinueInAgent
+                | Lesson::DiscoverYourKeymap
+                | Lesson::KeepYourPlace
         ) || lesson.is_lsp_practice()
             || lesson.is_git_practice()
             || lesson.is_navigation_practice()
@@ -176,6 +230,13 @@ impl Editor {
             let workspace = workspace.as_ref().expect("file lesson owns a workspace");
             workspace.write_fixture("score.rs", lesson.contents())?;
             workspace.write_fixture("example.rs", crate::learn::AGENT_EXAMPLE)?;
+        }
+        if lesson == Lesson::KeepYourPlace {
+            let workspace = workspace
+                .as_ref()
+                .expect("recovery lesson owns a workspace");
+            workspace.write_fixture("practice.txt", lesson.contents())?;
+            workspace.write_fixture("recovery/.owned", "")?;
         }
         if lesson == Lesson::DiscoverYourKeymap {
             workspace
@@ -312,6 +373,7 @@ impl Editor {
                 .then(|| customization::LearnThemeState::new(self)),
             keymap: (lesson == Lesson::DiscoverYourKeymap)
                 .then(|| keymap::LearnKeymapState::new(self)),
+            recovery: (lesson == Lesson::KeepYourPlace).then(recovery::LearnRecoveryState::default),
         }));
         self.mode = Mode::Normal;
         if matches!(lesson, Lesson::FindACommand | Lesson::DiscoverYourKeymap) {
@@ -521,6 +583,9 @@ impl Editor {
             self.render(buffer)?;
             return Ok(true);
         }
+        if self.intercept_learn_recovery_action(action, buffer)? {
+            return Ok(true);
+        }
         if self.intercept_learn_language_support(action, buffer, runtime)? {
             return Ok(true);
         }
@@ -665,6 +730,12 @@ impl Editor {
                 .flatten()
                 .and_then(|uri| self.diagnostics.get(&uri))
                 .is_some_and(Vec::is_empty),
+            recovery_snapshot_saved: session.recovery.as_ref().is_some_and(|state| state.saved),
+            recovery_restored: session
+                .recovery
+                .as_ref()
+                .is_some_and(|state| state.restored)
+                && contents == crate::learn::personalization::RECOVERY_RESULT,
             syntax_picker_open: self
                 .current_dialog
                 .as_ref()
