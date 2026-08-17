@@ -9,7 +9,13 @@
 //! manager-owned UI state. A plugin may replace content but must use the same panel ID to
 //! preserve that lifecycle intentionally.
 
-use std::{cell::RefCell, collections::HashMap, ops::Range, sync::Arc, time::Instant};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    ops::Range,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use serde::{Deserialize, Serialize};
@@ -2424,6 +2430,14 @@ impl PanelPresentation {
     }
 }
 
+const ROW_DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
+
+struct RowClick {
+    panel_id: String,
+    row_id: String,
+    at: Instant,
+}
+
 #[derive(Default)]
 pub struct PanelManager {
     presentation: PanelPresentation,
@@ -2436,6 +2450,7 @@ pub struct PanelManager {
     animation_state: Vec<(String, u8, u64)>,
     pending_restore: HashMap<String, PendingPanelRestore>,
     pending_focused: Option<String>,
+    last_row_click: Option<RowClick>,
 }
 
 impl PanelManager {
@@ -3997,6 +4012,7 @@ impl PanelManager {
         terminal_height: usize,
     ) -> Option<PanelEvent> {
         let placement = self.panel_at_position(x, y, terminal_width, terminal_height)?;
+        let previous_row_click = self.last_row_click.take();
         self.focused = Some(placement.id.clone());
         if let Some(panel) = self.text_panels.get_mut(&placement.id) {
             let metrics = TextPanelContentMetrics::new(placement.width);
@@ -4079,11 +4095,36 @@ impl PanelManager {
         }
 
         let panel = self.panels.get_mut(&placement.id)?;
-        panel.select_screen_row(y.saturating_sub(placement.y));
+        let screen_row = y.saturating_sub(placement.y);
+        panel.select_screen_row(screen_row);
+
+        let clicked_row = screen_row
+            .checked_sub(panel.rows_start())
+            .and_then(|index| panel.rows.get(panel.scroll.saturating_add(index)));
+        let action = if let Some(row) = clicked_row {
+            let now = Instant::now();
+            let is_double_click = previous_row_click.is_some_and(|click| {
+                click.panel_id == panel.id
+                    && click.row_id == row.id
+                    && now.duration_since(click.at) <= ROW_DOUBLE_CLICK_INTERVAL
+            });
+            if is_double_click {
+                "activate"
+            } else {
+                self.last_row_click = Some(RowClick {
+                    panel_id: panel.id.clone(),
+                    row_id: row.id.clone(),
+                    at: now,
+                });
+                "select"
+            }
+        } else {
+            "select"
+        };
 
         Some(PanelEvent {
             panel_id: panel.id.clone(),
-            action: "select".to_string(),
+            action: action.to_string(),
             selected_index: panel.selected,
             row: panel.selected_row(),
             text: None,
@@ -8485,6 +8526,60 @@ mod tests {
         let event = manager.handle_focused_key("down", 10, 80, 0).unwrap();
         assert_eq!(event.selected_index, 1);
         assert_eq!(event.row.unwrap().id, "b");
+    }
+
+    #[test]
+    fn double_clicking_a_row_activates_it_once() {
+        let mut manager = PanelManager::default();
+        manager.create_panel("tree".to_string(), PanelConfig::default());
+        manager.update_panel("tree", vec![row("a"), row("b")]);
+
+        let first = manager.focus_panel_at_position(1, 1, 80, 20).unwrap();
+        assert_eq!(first.action, "select");
+        assert_eq!(first.row.unwrap().id, "b");
+
+        let second = manager.focus_panel_at_position(2, 1, 80, 20).unwrap();
+        assert_eq!(second.action, "activate");
+        assert_eq!(second.row.unwrap().id, "b");
+
+        let third = manager.focus_panel_at_position(1, 1, 80, 20).unwrap();
+        assert_eq!(third.action, "select");
+    }
+
+    #[test]
+    fn row_double_click_requires_the_same_row_within_its_time_window() {
+        let mut manager = PanelManager::default();
+        manager.create_panel("tree".to_string(), PanelConfig::default());
+        manager.update_panel("tree", vec![row("a"), row("b")]);
+
+        manager.focus_panel_at_position(1, 0, 80, 20).unwrap();
+        let different_row = manager.focus_panel_at_position(1, 1, 80, 20).unwrap();
+        assert_eq!(different_row.action, "select");
+
+        manager.last_row_click.as_mut().unwrap().at -=
+            ROW_DOUBLE_CLICK_INTERVAL + Duration::from_millis(1);
+        let expired = manager.focus_panel_at_position(1, 1, 80, 20).unwrap();
+        assert_eq!(expired.action, "select");
+    }
+
+    #[test]
+    fn clicking_panel_header_or_empty_space_cannot_activate_a_row() {
+        let mut manager = PanelManager::default();
+        manager.create_panel(
+            "tree".to_string(),
+            PanelConfig {
+                title: Some("Tree".to_string()),
+                ..PanelConfig::default()
+            },
+        );
+        manager.update_panel("tree", vec![row("a")]);
+
+        for screen_row in [0, 0, 2, 2] {
+            let event = manager
+                .focus_panel_at_position(1, screen_row, 80, 20)
+                .unwrap();
+            assert_eq!(event.action, "select");
+        }
     }
 
     #[test]

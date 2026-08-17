@@ -7437,6 +7437,36 @@ async fn mouse_click_inside_panel_focuses_and_selects_row() {
     assert_eq!(harness.render_cursor_position(), None);
 }
 
+#[test]
+fn mouse_double_click_inside_panel_activates_selected_row() {
+    let mut harness = EditorHarness::with_content("abcdef");
+    add_tree_panel(&mut harness);
+
+    for expected_action in ["select", "activate"] {
+        let action = harness
+            .editor
+            .test_handle_event(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .unwrap();
+
+        assert!(matches!(
+            action,
+            Some(KeyAction::Multiple(actions))
+                if actions.iter().any(|action| matches!(
+                    action,
+                    Action::NotifyPlugins(name, payload)
+                        if name == "panel:event:tree"
+                            && payload["action"] == expected_action
+                            && payload["selected_index"] == 2
+                ))
+        ));
+    }
+}
+
 #[tokio::test]
 async fn mouse_click_in_editor_clears_panel_focus() {
     let mut harness = EditorHarness::with_content("abcdef");
