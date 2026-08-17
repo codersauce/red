@@ -25340,7 +25340,7 @@ impl Editor {
             return Ok(false);
         }
         let resume_insert_transaction = self.commit_active_transaction_before_save();
-        let format_on_save = self.config.formatting.on_save || self.config.lsp.format_on_save;
+        let format_on_save = self.config.formatting.on_save;
         let mut format_warning = None;
         let mut use_lsp = format_on_save;
         if format_on_save && self.config.formatting.provider != FormattingProvider::Lsp {
@@ -25452,7 +25452,7 @@ impl Editor {
         let previous_uri = self.current_buffer().uri()?;
         let previous_file = self.current_buffer().file.clone();
         let resume_insert_transaction = self.commit_active_transaction_before_save();
-        let format_on_save = self.config.formatting.on_save || self.config.lsp.format_on_save;
+        let format_on_save = self.config.formatting.on_save;
         let mut format_warning = None;
         let mut use_lsp = format_on_save;
         if format_on_save && self.config.formatting.provider != FormattingProvider::Lsp {
@@ -33963,7 +33963,7 @@ builtin = "rust"
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn external_formatter_is_undoable_and_runs_before_save() {
+    async fn external_formatter_is_undoable_and_runs_before_save_by_default() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = tempfile::tempdir().unwrap();
@@ -34016,7 +34016,6 @@ builtin = "rust"
             .unwrap();
         assert_eq!(editor.current_buffer().contents(), "hello\n");
 
-        editor.config.formatting.on_save = true;
         editor
             .test_execute_production_action(Action::Save)
             .await
@@ -34024,6 +34023,30 @@ builtin = "rust"
         assert_eq!(editor.current_buffer().contents(), "HELLO\n");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "HELLO\n");
         assert!(!editor.current_buffer().is_dirty());
+
+        editor
+            .test_execute_production_action(Action::Undo)
+            .await
+            .unwrap();
+        editor.config.formatting.on_save = false;
+        editor.config.lsp.format_on_save = true;
+        editor
+            .test_execute_production_action(Action::Save)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+
+        let target = root.path().join("other.testfmt");
+        editor
+            .test_execute_production_action(Action::SaveAs(target.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello\n");
+        editor
+            .test_execute_production_action(Action::FormatDocument)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), "HELLO\n");
     }
 
     #[cfg(unix)]
@@ -35581,7 +35604,6 @@ builtin = "rust"
             Some(path.to_string_lossy().into_owned()),
             "value   \n".to_string(),
         )]);
-        editor.config.lsp.format_on_save = true;
         let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
         editor.pending_lsp_edit_requests.insert(
             61,
@@ -35630,7 +35652,6 @@ builtin = "rust"
             Some(path.to_string_lossy().into_owned()),
             "value   \n".to_string(),
         )]);
-        editor.config.lsp.format_on_save = true;
         let uri = editor.buffer_manager[0].uri().unwrap().unwrap();
         editor.pending_lsp_edit_requests.insert(
             64,
@@ -35731,7 +35752,8 @@ while True:
     record(message)
     method = message.get("method")
     if method == "textDocument/formatting":
-        send({"jsonrpc": "2.0", "id": message["id"], "result": [{"range": {"start": {"line": 0, "character": 5}, "end": {"line": 0, "character": 8}}, "newText": ""}]})
+        # Include the empty EOF line, as whole-document formatters do.
+        send({"jsonrpc": "2.0", "id": message["id"], "result": [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": "value\n"}]})
         break
 "#,
         )
@@ -35739,7 +35761,6 @@ while True:
         std::fs::write(root.join(".red-root"), "").unwrap();
         let mut config = Config::default();
         config.lsp.enabled = true;
-        config.lsp.format_on_save = true;
         config.lsp.servers = HashMap::from([(
             "formatter".to_string(),
             crate::config::LanguageServerConfig {
@@ -35828,7 +35849,6 @@ while True:
         std::fs::write(root.join(".red-root"), "").unwrap();
         let mut config = Config::default();
         config.lsp.enabled = true;
-        config.lsp.format_on_save = true;
         config.lsp.servers = [("rust", "rs"), ("python", "py")]
             .into_iter()
             .map(|(language, extension)| {
@@ -36024,7 +36044,6 @@ while True:
             Buffer::new(Some(target_file.clone()), "open target\n".to_string()),
             Buffer::new(Some(source_file.clone()), "unsaved source\n".to_string()),
         ]);
-        editor.config.lsp.format_on_save = true;
         editor.buffer_manager.set_active_index(1);
         editor.mode = Mode::Insert;
         editor.begin_transaction("insert");

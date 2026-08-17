@@ -31,11 +31,19 @@ fn recording_workspace_editor(
     buffers: Vec<Buffer>,
     format_on_save: bool,
 ) -> (Editor, Arc<Mutex<Vec<LspEvent>>>) {
+    let mut config = Config::default();
+    config.formatting.on_save = format_on_save;
+    recording_workspace_editor_with_config(root, buffers, config)
+}
+
+fn recording_workspace_editor_with_config(
+    root: &Path,
+    buffers: Vec<Buffer>,
+    config: Config,
+) -> (Editor, Arc<Mutex<Vec<LspEvent>>>) {
     let lsp = RecordingLsp::with_workspace_root(root);
     let events = lsp.events();
     let lsp = Box::new(lsp) as Box<dyn LspClient + Send>;
-    let mut config = Config::default();
-    config.lsp.format_on_save = format_on_save;
     let mut editor = Editor::with_size(lsp, 80, 24, config, Theme::default(), buffers).unwrap();
     editor.test_disable_terminal_output();
     (editor, events)
@@ -319,17 +327,17 @@ async fn split_with_file_opens_new_active_lsp_buffer() {
 }
 
 #[tokio::test]
-async fn format_on_save_requests_once_before_writing_and_ignores_a_duplicate_save() {
+async fn default_format_on_save_requests_once_before_writing_and_ignores_a_duplicate_save() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("format.rs");
     std::fs::write(&path, "value   \n").unwrap();
-    let (mut editor, events) = recording_workspace_editor(
+    let (mut editor, events) = recording_workspace_editor_with_config(
         root.path(),
         vec![Buffer::new(
             Some(path.to_string_lossy().into_owned()),
             "value   \n".to_string(),
         )],
-        true,
+        Config::default(),
     );
 
     editor.test_execute_action(Action::Save).await.unwrap();
@@ -346,6 +354,53 @@ async fn format_on_save_requests_once_before_writing_and_ignores_a_duplicate_sav
     assert!(editor
         .test_last_error()
         .is_some_and(|error| error.contains("already pending")));
+}
+
+#[tokio::test]
+async fn disabled_format_on_save_skips_lsp_for_save_and_save_as_but_allows_manual_format() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source.rs");
+    let target = root.path().join("target.rs");
+    std::fs::write(&path, "disk\n").unwrap();
+    let config = Config::from_toml_with_overrides(
+        "theme = \"red.json\"\n[keys]\n[lsp]\nformat_on_save = true\n[formatting]\non_save = false",
+        &[],
+    )
+    .unwrap();
+    let (mut editor, events) = recording_workspace_editor_with_config(
+        root.path(),
+        vec![Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "value   \n".to_string(),
+        )],
+        config,
+    );
+
+    editor.test_execute_action(Action::Save).await.unwrap();
+    editor
+        .test_execute_action(Action::SaveAs(target.to_string_lossy().into_owned()))
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "value   \n");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "value   \n");
+    assert!(!recorded(&events)
+        .iter()
+        .any(|event| matches!(event, LspEvent::FormatDocument(_))));
+
+    editor
+        .test_execute_action(Action::FormatDocument)
+        .await
+        .unwrap();
+    assert_eq!(
+        recorded(&events)
+            .into_iter()
+            .filter(|event| matches!(event, LspEvent::FormatDocument(_)))
+            .collect::<Vec<_>>(),
+        vec![LspEvent::FormatDocument(
+            target.to_string_lossy().into_owned()
+        )],
+    );
 }
 
 #[tokio::test]
