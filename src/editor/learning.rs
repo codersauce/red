@@ -4,7 +4,9 @@ use super::*;
 use crate::learn::{
     practice_action_allowed, Lesson, PracticeStep, PracticeView, PracticeWorkspace,
 };
-use crate::ui::{draw_learn_coach, CoachLayout, LearnHub};
+use crate::ui::{draw_learn_coach, draw_learn_panel_coach, CoachLayout, LearnHub};
+
+mod agent;
 
 pub(super) struct LearnSession {
     lesson: Lesson,
@@ -19,6 +21,20 @@ pub(super) struct LearnSession {
     original_registers: HashMap<char, Content>,
     original_inline_history: Option<InlineHistory>,
     original_active_inline_comment: Option<uuid::Uuid>,
+    original_panels: Option<plugin::panel::PanelManager>,
+    agent: Option<agent::LearnAgentState>,
+}
+
+impl LearnSession {
+    fn owns_buffer(&self, buffer: &Buffer) -> bool {
+        buffer.id() == self.practice_buffer_id
+            || self.workspace.as_ref().is_some_and(|workspace| {
+                buffer
+                    .file
+                    .as_deref()
+                    .is_some_and(|file| workspace.permits_file(Path::new(file)))
+            })
+    }
 }
 
 impl Editor {
@@ -115,11 +131,16 @@ impl Editor {
         }
         // Create owned storage before changing any editor state, so a failed
         // setup leaves the user's current workspace untouched.
-        let workspace = if lesson == Lesson::SaveAPracticeFile {
+        let workspace = if matches!(lesson, Lesson::SaveAPracticeFile | Lesson::ContinueInAgent) {
             Some(PracticeWorkspace::new()?)
         } else {
             None
         };
+        if lesson == Lesson::ContinueInAgent {
+            let workspace = workspace.as_ref().expect("file lesson owns a workspace");
+            workspace.write_fixture("score.rs", lesson.contents())?;
+            workspace.write_fixture("example.rs", crate::learn::AGENT_EXAMPLE)?;
+        }
         if self.inline_assist.is_some()
             || self.workspace_manager.is_active()
             || self.agent_manager.has_active_sessions()
@@ -137,6 +158,8 @@ impl Editor {
         self.persist_session_snapshot(true);
         let original_buffer_id = self.current_buffer().id();
         let original_panel_focus = self.panel_manager.focused_panel_id().map(str::to_string);
+        let original_panels =
+            (lesson == Lesson::ContinueInAgent).then(|| std::mem::take(&mut self.panel_manager));
         self.panel_manager.focus_editor();
         let original_zoom = self.zoomed_pane.take();
         let original_repeat = self.last_semantic_change.take();
@@ -148,7 +171,11 @@ impl Editor {
         self.pending_semantic_change = None;
         let file = workspace.as_ref().map(|workspace| {
             workspace
-                .path("practice.txt")
+                .path(if lesson == Lesson::ContinueInAgent {
+                    "score.rs"
+                } else {
+                    "practice.txt"
+                })
                 .to_string_lossy()
                 .into_owned()
         });
@@ -176,6 +203,8 @@ impl Editor {
             original_registers,
             original_inline_history,
             original_active_inline_comment,
+            original_panels,
+            agent: (lesson == Lesson::ContinueInAgent).then(agent::LearnAgentState::default),
         });
         self.mode = Mode::Normal;
         if lesson == Lesson::FindACommand {
@@ -204,15 +233,26 @@ impl Editor {
         self.release_current_dialog_callbacks(runtime);
         self.current_dialog = None;
         self.completion_snapshot = None;
-        if let Some(index) = self
+        let owned = self
             .buffer_manager
             .iter()
-            .position(|candidate| candidate.id() == session.practice_buffer_id)
-        {
+            .enumerate()
+            .filter(|(_, candidate)| session.owns_buffer(candidate))
+            .map(|(index, candidate)| (index, candidate.id()))
+            .collect::<Vec<_>>();
+        for &(index, id) in owned.iter().rev() {
             self.buffer_manager.remove_buffer(index);
+            self.lsp_coordinator.forget_buffer(id);
+            self.local_marks.remove(&id);
+            self.special_marks
+                .retain(|(buffer_id, _), _| *buffer_id != id);
+            self.last_visual_selections.remove(&id);
+            self.forget_jumps_for_buffer(id);
         }
-        self.lsp_coordinator
-            .forget_buffer(session.practice_buffer_id);
+        let restored_panels = session.original_panels.is_some();
+        if let Some(panels) = session.original_panels {
+            self.panel_manager = panels;
+        }
         self.window_manager = session.original_windows;
         if let Some(index) = self
             .buffer_manager
@@ -229,13 +269,8 @@ impl Editor {
             self.inline_history = history;
         }
         self.inline_comments
-            .retain(|comment| comment.anchor.buffer_id != session.practice_buffer_id);
+            .retain(|comment| !owned.iter().any(|(_, id)| *id == comment.anchor.buffer_id));
         self.active_inline_comment = session.original_active_inline_comment;
-        self.local_marks.remove(&session.practice_buffer_id);
-        self.special_marks
-            .retain(|(id, _), _| *id != session.practice_buffer_id);
-        self.last_visual_selections
-            .remove(&session.practice_buffer_id);
         self.sync_with_window();
         self.mode = Mode::Normal;
         self.selection = None;
@@ -245,8 +280,10 @@ impl Editor {
         self.pending_character_motion = None;
         self.waiting_key_action = None;
         self.command.clear();
-        if let Some(panel) = session.original_panel_focus {
-            self.panel_manager.restore_panel_focus(&panel);
+        if !restored_panels {
+            if let Some(panel) = session.original_panel_focus {
+                self.panel_manager.restore_panel_focus(&panel);
+            }
         }
         self.highlight_cache.clear();
         self.layout_cache.borrow_mut().clear();
@@ -270,7 +307,7 @@ impl Editor {
             self.finish_learn_lesson(buffer, runtime)?;
             return Ok(true);
         }
-        if self.current_buffer().id() != session.practice_buffer_id {
+        if !session.owns_buffer(self.current_buffer()) {
             self.finish_learn_lesson(buffer, runtime)?;
             self.set_legacy_message(Some(
                 "lesson paused because the active buffer changed".into(),
@@ -333,7 +370,7 @@ impl Editor {
         let Some(session) = self.learn_session.as_ref() else {
             return Ok(());
         };
-        if self.current_buffer().id() != session.practice_buffer_id {
+        if !session.owns_buffer(self.current_buffer()) {
             return Ok(());
         }
         let contents = self.current_buffer().contents();
@@ -378,6 +415,9 @@ impl Editor {
             fixed_text: contents == crate::learn::AI_FIXED_CONTENTS,
             bonus_text: contents == crate::learn::AI_BONUS_CONTENTS,
             original_text: contents == session.lesson.contents(),
+            agent_pane_open: self.learn_agent_pane_open(),
+            agent_files_saved: self.learn_agent_files_saved(),
+            agent_example_visible: contents == crate::learn::AGENT_EXAMPLE_FIXED,
         };
         let session = self
             .learn_session
@@ -436,7 +476,7 @@ impl Editor {
                 assist.request_id = Some(request.clone());
             }
             let (replacement, message) = match lesson {
-                Some(Lesson::MakeAFocusedChange) => (Some(crate::learn::AI_FIXED_LINE),
+                Some(Lesson::MakeAFocusedChange | Lesson::ContinueInAgent) => (Some(crate::learn::AI_FIXED_LINE),
                     "Recorded practice response: changed subtraction to addition. This edit is in the buffer and has not been saved."),
                 Some(Lesson::ChooseWhatToKeep) if refining_choice => (Some(crate::learn::AI_FIXED_LINE),
                     "Recorded practice response: removed the extra bonus point. The refined edit is still unsaved."),
@@ -462,6 +502,20 @@ impl Editor {
     pub(super) fn resize_learn_layout(&mut self, size: (usize, usize)) -> bool {
         if self.learn_session.is_none() {
             return false;
+        }
+        if self.learn_agent_pane_open() {
+            let layout = CoachLayout::for_panel(size.1);
+            self.sync_to_window();
+            self.window_manager
+                .set_presentation(WindowPresentation::Hidden);
+            self.panel_manager
+                .set_presentation(plugin::panel::PanelPresentation::Docked);
+            self.panel_manager.update_panel_layout(
+                crate::learn::LEARN_AGENT_PANEL,
+                plugin::PanelSide::Top,
+                size.1.saturating_sub(layout.bottom + 2),
+            );
+            return true;
         }
         let layout = CoachLayout::new(size.0, size.1);
         self.sync_to_window();
@@ -489,7 +543,12 @@ impl Editor {
                 .into_iter()
                 .next()
         });
-        draw_learn_coach(
+        let draw = if self.learn_agent_pane_open() {
+            draw_learn_panel_coach
+        } else {
+            draw_learn_coach
+        };
+        draw(
             buffer,
             &self.theme,
             session.lesson,

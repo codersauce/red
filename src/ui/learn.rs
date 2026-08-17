@@ -576,6 +576,14 @@ pub(crate) struct CoachLayout {
 }
 
 impl CoachLayout {
+    pub const fn for_panel(height: usize) -> Self {
+        Self {
+            top: 0,
+            right: 0,
+            bottom: if height >= 20 { 7 } else { 3 },
+        }
+    }
+
     pub const fn new(width: usize, height: usize) -> Self {
         if width >= 104 && height >= 18 {
             Self {
@@ -613,6 +621,28 @@ pub(crate) fn draw_learn_coach(
     shortcut: Option<&str>,
 ) {
     let layout = CoachLayout::new(buffer.width, buffer.height);
+    draw_coach(buffer, theme, lesson, step, shortcut, layout);
+}
+
+pub(crate) fn draw_learn_panel_coach(
+    buffer: &mut RenderBuffer,
+    theme: &Theme,
+    lesson: Lesson,
+    step: PracticeStep,
+    shortcut: Option<&str>,
+) {
+    let layout = CoachLayout::for_panel(buffer.height);
+    draw_coach(buffer, theme, lesson, step, shortcut, layout);
+}
+
+fn draw_coach(
+    buffer: &mut RenderBuffer,
+    theme: &Theme,
+    lesson: Lesson,
+    step: PracticeStep,
+    shortcut: Option<&str>,
+    layout: CoachLayout,
+) {
     let track = &TRACKS[lesson.track_index()];
     let palette = SurfacePalette::new(theme, &theme.ui_style.dialog);
     if layout.top > 0 {

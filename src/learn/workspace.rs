@@ -19,6 +19,21 @@ impl PracticeWorkspace {
         self.root.path().join(name)
     }
 
+    pub fn root(&self) -> &Path {
+        self.root.path()
+    }
+
+    pub fn write_fixture(&self, name: &str, contents: &str) -> std::io::Result<()> {
+        let path = self.path(name);
+        if !self.permits_file(&path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "invalid practice fixture path",
+            ));
+        }
+        std::fs::write(path, contents)
+    }
+
     /// Only a direct, ordinary file in this private directory may be saved.
     /// Reject symlinks as well as paths that escape through `..`.
     pub fn permits_file(&self, path: &Path) -> bool {

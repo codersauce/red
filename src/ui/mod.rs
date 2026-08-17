@@ -61,7 +61,7 @@ pub(crate) use keyboard_shortcuts::{
     ShortcutHelpRegion, ShortcutTarget,
 };
 pub(crate) use keymap_hints::draw_keymap_hints;
-pub(crate) use learn::{draw_learn_coach, CoachLayout, LearnHub};
+pub(crate) use learn::{draw_learn_coach, draw_learn_panel_coach, CoachLayout, LearnHub};
 use list::List;
 pub(crate) use messages::{MessageRow, MessagesPanel, MessagesView};
 pub(crate) use picker::MAX_UNFOCUSED_PREVIEW_BYTES;

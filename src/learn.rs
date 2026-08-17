@@ -22,6 +22,10 @@ pub(crate) const AI_FIXED_CONTENTS: &str = "fn add_score(score: u32, points: u32
 pub(crate) const AI_BONUS_LINE: &str =
     "fn add_score(score: u32, points: u32) -> u32 { score + points + 1 }\n";
 pub(crate) const AI_BONUS_CONTENTS: &str = "fn add_score(score: u32, points: u32) -> u32 { score + points + 1 }\n\n// Offline practice: no prompt or code is sent to an AI service.\n";
+pub(crate) const AGENT_EXAMPLE: &str = "// Practice usage example\nlet expected_score = 39;\n";
+pub(crate) const AGENT_EXAMPLE_FIXED: &str =
+    "// Practice usage example: add_score(40, 2)\nlet expected_score = 42;\n";
+pub(crate) const LEARN_AGENT_PANEL: &str = "learn-recorded-agent";
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Lesson {
@@ -33,10 +37,11 @@ pub(crate) enum Lesson {
     UnderstandSelectedCode,
     MakeAFocusedChange,
     ChooseWhatToKeep,
+    ContinueInAgent,
 }
 
 impl Lesson {
-    pub const AVAILABLE: [Self; 7] = [
+    pub const AVAILABLE: [Self; 8] = [
         Self::FindYourFooting,
         Self::EditWithConfidence,
         Self::FindACommand,
@@ -44,6 +49,7 @@ impl Lesson {
         Self::UnderstandSelectedCode,
         Self::MakeAFocusedChange,
         Self::ChooseWhatToKeep,
+        Self::ContinueInAgent,
     ];
 
     pub fn from_id(id: &str) -> Option<Self> {
@@ -75,12 +81,16 @@ impl Lesson {
             Self::UnderstandSelectedCode => 4,
             Self::MakeAFocusedChange => 5,
             Self::ChooseWhatToKeep => 6,
+            Self::ContinueInAgent => 7,
         }
     }
 
     pub const fn track_index(self) -> usize {
         match self {
-            Self::UnderstandSelectedCode | Self::MakeAFocusedChange | Self::ChooseWhatToKeep => 1,
+            Self::UnderstandSelectedCode
+            | Self::MakeAFocusedChange
+            | Self::ChooseWhatToKeep
+            | Self::ContinueInAgent => 1,
             _ => 0,
         }
     }
@@ -94,7 +104,10 @@ impl Lesson {
     pub const fn is_ai_practice(self) -> bool {
         matches!(
             self,
-            Self::UnderstandSelectedCode | Self::MakeAFocusedChange | Self::ChooseWhatToKeep
+            Self::UnderstandSelectedCode
+                | Self::MakeAFocusedChange
+                | Self::ChooseWhatToKeep
+                | Self::ContinueInAgent
         )
     }
 
@@ -107,6 +120,7 @@ impl Lesson {
             Self::UnderstandSelectedCode => "ai.understand-selected-code.v1",
             Self::MakeAFocusedChange => "ai.make-a-focused-change.v1",
             Self::ChooseWhatToKeep => "ai.choose-what-to-keep.v1",
+            Self::ContinueInAgent => "ai.continue-in-agent.v1",
         }
     }
 
@@ -120,9 +134,10 @@ impl Lesson {
             Self::EditWithConfidence => EDIT_CONTENTS,
             Self::FindACommand => COMMAND_CONTENTS,
             Self::SaveAPracticeFile => SAVE_CONTENTS,
-            Self::UnderstandSelectedCode | Self::MakeAFocusedChange | Self::ChooseWhatToKeep => {
-                AI_CONTENTS
-            }
+            Self::UnderstandSelectedCode
+            | Self::MakeAFocusedChange
+            | Self::ChooseWhatToKeep
+            | Self::ContinueInAgent => AI_CONTENTS,
         }
     }
 
@@ -135,6 +150,7 @@ impl Lesson {
             Self::UnderstandSelectedCode => PracticeStep::AiSelect,
             Self::MakeAFocusedChange => PracticeStep::AiChangeSelect,
             Self::ChooseWhatToKeep => PracticeStep::AiChoiceSelect,
+            Self::ContinueInAgent => PracticeStep::AgentSelect,
         }
     }
 
@@ -185,6 +201,12 @@ impl Lesson {
                 "Undo the unwanted change",
                 "Request and refine a suggestion",
                 "Keep only the corrected result",
+            ],
+            Self::ContinueInAgent => &[
+                "Make an unsaved inline fix",
+                "Continue the task in Agent",
+                "Submit the recorded follow-up",
+                "Inspect the saved practice files",
             ],
         }
     }
@@ -324,6 +346,12 @@ pub(crate) enum PracticeStep {
     AiChoiceAgain,
     AiChoiceRefine,
     AiChoiceKeep,
+    AgentSelect,
+    AgentInlineOpen,
+    AgentInlineSubmit,
+    AgentEscalate,
+    AgentPrompt,
+    AgentInspect,
     Complete,
 }
 
@@ -343,14 +371,19 @@ impl PracticeStep {
             Self::AiSelect
             | Self::AiChangeSelect
             | Self::AiChoiceSelect
-            | Self::AiChoiceAgainSelect => Some(Action::EnterMode(Mode::VisualLine)),
-            Self::AiOpen | Self::AiChangeOpen | Self::AiChoiceRequest | Self::AiChoiceAgain => {
-                Some(Action::InlineAssist)
-            }
+            | Self::AiChoiceAgainSelect
+            | Self::AgentSelect => Some(Action::EnterMode(Mode::VisualLine)),
+            Self::AiOpen
+            | Self::AiChangeOpen
+            | Self::AiChoiceRequest
+            | Self::AiChoiceAgain
+            | Self::AgentInlineOpen => Some(Action::InlineAssist),
             Self::AiRead => Some(Action::ShowInlineComment),
             Self::AiChangeKeep | Self::AiChoiceKeep => Some(Action::KeepInlineAssist),
             Self::AiChoiceUndo => Some(Action::UndoInlineAssist),
             Self::AiChoiceRefine => Some(Action::RefineInlineAssist),
+            Self::AgentEscalate => Some(Action::EscalateInlineAssist),
+            Self::AgentInlineSubmit | Self::AgentPrompt | Self::AgentInspect => None,
             Self::AiSubmit | Self::AiChangeSubmit => None,
             Self::Type | Self::CommandRun | Self::CommandReturn | Self::Complete => None,
         }
@@ -407,6 +440,12 @@ impl PracticeStep {
             Self::AiChoiceAgain => format!("Open inline assist with {}, ask to add points again, and submit. This time you will refine the suggestion.", shortcut.unwrap_or("Space i")),
             Self::AiChoiceRefine => "Press r in the result controls. Ask to remove the extra bonus point, then press Enter. Refinement stays scoped to the same function.".into(),
             Self::AiChoiceKeep => "Check that the function is now score + points, with no extra + 1. Press Enter to keep that result. It is still unsaved.".into(),
+            Self::AgentSelect => format!("This lesson owns two disposable files. Press {} on the first function to select it. No prompt will leave Red.", shortcut.unwrap_or("V")),
+            Self::AgentInlineOpen => format!("Open inline assist with {}. Ask to add points instead of subtracting them.", shortcut.unwrap_or("Space i")),
+            Self::AgentInlineSubmit => "Ask to add points, then submit. The inline fix will be unsaved; next you will continue the task in Agent.".into(),
+            Self::AgentEscalate => "The inline fix is unsaved. Press A in its result controls to continue in the recorded Agent workspace.".into(),
+            Self::AgentPrompt => "Ask Agent to save the fix and update the usage example. Press Enter to submit. This recorded turn uses real editor file tools, not a live model.".into(),
+            Self::AgentInspect => "The recorded Agent saved both files. Choose Back to code (or q), then use :bn to open example.rs and inspect the saved value 42.".into(),
             Self::Complete => match lesson {
                 Lesson::FindYourFooting => "Your original text is restored. Nicely done.",
                 Lesson::EditWithConfidence => {
@@ -417,6 +456,7 @@ impl PracticeStep {
                 Lesson::UnderstandSelectedCode => "You explained selected code without editing it. Recorded practice complete; real inline assist sends your selected context only when you submit a prompt.",
                 Lesson::MakeAFocusedChange => "The fix is kept in the buffer, still unsaved. Inline edits use normal undo history; keeping one is not the same as writing a file.",
                 Lesson::ChooseWhatToKeep => "You rejected an unwanted change, refined a suggestion, and kept the corrected result. The final edit is unsaved and remains undoable.",
+                Lesson::ContinueInAgent => "Both practice files are saved. Unlike Keep in inline assist, Agent file-edit tools can write to disk. Your real workspace and Agent draft are untouched.",
             }
             .into(),
         }
@@ -431,14 +471,18 @@ impl PracticeStep {
             | Self::AiSelect
             | Self::AiChangeSelect
             | Self::AiChoiceSelect
-            | Self::AiChoiceRequest => 0,
+            | Self::AiChoiceRequest
+            | Self::AgentSelect
+            | Self::AgentInlineOpen
+            | Self::AgentInlineSubmit => 0,
             Self::Type
             | Self::EditDelete
             | Self::CommandRun
             | Self::SaveWrite
             | Self::AiOpen
             | Self::AiChangeOpen
-            | Self::AiChoiceUndo => 1,
+            | Self::AiChoiceUndo
+            | Self::AgentEscalate => 1,
             Self::Normal
             | Self::EditUndo
             | Self::CommandHelp
@@ -447,14 +491,16 @@ impl PracticeStep {
             | Self::AiChangeSubmit
             | Self::AiChoiceAgainSelect
             | Self::AiChoiceAgain
-            | Self::AiChoiceRefine => 2,
+            | Self::AiChoiceRefine
+            | Self::AgentPrompt => 2,
             Self::Undo
             | Self::EditRedo
             | Self::CommandReturn
             | Self::SaveWriteAgain
             | Self::AiRead
             | Self::AiChangeKeep
-            | Self::AiChoiceKeep => 3,
+            | Self::AiChoiceKeep
+            | Self::AgentInspect => 3,
             Self::Complete => 4,
         }
     }
@@ -504,6 +550,11 @@ impl PracticeStep {
                 if original_text && mode == Mode::VisualLine && cursor.1 == 0 =>
             {
                 Self::AiChoiceAgain
+            }
+            (Self::AgentSelect, _)
+                if original_text && mode == Mode::VisualLine && cursor.1 == 0 =>
+            {
+                Self::AgentInlineOpen
             }
             _ => return false,
         };
@@ -566,6 +617,26 @@ impl PracticeStep {
             {
                 Self::Complete
             }
+            (Self::AgentInlineOpen, Action::InlineAssist) if view.inline_target_selected => {
+                Self::AgentInlineSubmit
+            }
+            (Self::AgentInlineSubmit, Action::SubmitInlineAssist(_))
+                if view.inline_edit_applied && view.fixed_text && view.dirty =>
+            {
+                Self::AgentEscalate
+            }
+            (Self::AgentEscalate, Action::EscalateInlineAssist) if view.agent_pane_open => {
+                Self::AgentPrompt
+            }
+            (Self::AgentPrompt, _) if view.agent_files_saved => Self::AgentInspect,
+            (Self::AgentInspect, _)
+                if !view.agent_pane_open
+                    && view.agent_files_saved
+                    && view.file_matches_buffer
+                    && view.agent_example_visible =>
+            {
+                Self::Complete
+            }
             _ => return false,
         };
         *self = next;
@@ -588,26 +659,39 @@ pub(crate) struct PracticeView {
     pub fixed_text: bool,
     pub bonus_text: bool,
     pub original_text: bool,
+    pub agent_pane_open: bool,
+    pub agent_files_saved: bool,
+    pub agent_example_visible: bool,
 }
 
 /// Scratch lessons permit only edits to their isolated practice buffer.
 pub(crate) fn practice_action_allowed(lesson: Lesson, action: &Action) -> bool {
-    (lesson.is_ai_practice()
-        && matches!(
+    (lesson == Lesson::ContinueInAgent
+        && (matches!(
             action,
-            Action::EnterMode(Mode::Visual | Mode::VisualLine)
-                | Action::InlineAssist
-                | Action::SubmitInlineAssist(_)
-                | Action::CancelInlineAssist
-                | Action::CancelInlineAssistRefine
-                | Action::KeepInlineAssist
-                | Action::UndoInlineAssist
-                | Action::RefineInlineAssist
-                | Action::ShowInlineComment
-                | Action::DismissInlineComment
-                | Action::NextInlineComment
-                | Action::PreviousInlineComment
-        ))
+            Action::EscalateInlineAssist
+                | Action::OpenTextPanelTurnActions
+                | Action::NextBuffer
+                | Action::PreviousBuffer
+        ) || matches!(action, Action::CopyTextPanelTurn { panel_id, .. } | Action::ReuseTextPanelPrompt { panel_id, .. } if panel_id == LEARN_AGENT_PANEL)
+            || matches!(action, Action::PluginCommand(name) if matches!(name.as_str(), "Agent" | "AgentOpen" | "AgentToggle"))
+            || matches!(action, Action::NotifyPlugins(method, _) if method == &format!("panel:event:{LEARN_AGENT_PANEL}"))))
+        || (lesson.is_ai_practice()
+            && matches!(
+                action,
+                Action::EnterMode(Mode::Visual | Mode::VisualLine)
+                    | Action::InlineAssist
+                    | Action::SubmitInlineAssist(_)
+                    | Action::CancelInlineAssist
+                    | Action::CancelInlineAssistRefine
+                    | Action::KeepInlineAssist
+                    | Action::UndoInlineAssist
+                    | Action::RefineInlineAssist
+                    | Action::ShowInlineComment
+                    | Action::DismissInlineComment
+                    | Action::NextInlineComment
+                    | Action::PreviousInlineComment
+            ))
         || (lesson == Lesson::SaveAPracticeFile && matches!(action, Action::Save))
         || (lesson == Lesson::FindACommand
             && matches!(
@@ -796,6 +880,9 @@ mod tests {
             fixed_text: false,
             bonus_text: false,
             original_text: true,
+            agent_pane_open: false,
+            agent_files_saved: false,
+            agent_example_visible: false,
         };
         assert!(!step.observe_view(&Action::CommandPalette, view));
         view.command_palette_open = true;

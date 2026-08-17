@@ -2703,6 +2703,13 @@ struct InlineAssistSession {
     result_request_id: Option<String>,
 }
 
+/// Identity and filesystem boundary for one editor-owned Agent operation.
+#[derive(Clone, Copy)]
+struct AgentToolContext<'a> {
+    session_id: &'a str,
+    root: &'a Path,
+}
+
 struct StyleCursor<'a> {
     spans: &'a [HighlightSpan],
     next: usize,
@@ -7700,7 +7707,12 @@ impl Editor {
         };
         match result {
             Ok(message) => {
-                if let Some(file) = self.current_buffer().file.clone() {
+                if let Some(file) = self
+                    .current_buffer()
+                    .file
+                    .clone()
+                    .filter(|_| self.learn_session.is_none())
+                {
                     let _ = self
                         .plugin_registry
                         .notify(
@@ -7724,7 +7736,7 @@ impl Editor {
 
     async fn apply_agent_contents(
         &mut self,
-        session_id: &str,
+        context: AgentToolContext<'_>,
         path: &Path,
         expected_revision: u64,
         contents: String,
@@ -7744,26 +7756,23 @@ impl Editor {
         );
         let turn_id = self
             .agent_manager
-            .turn_id(session_id)
+            .turn_id(context.session_id)
             .unwrap_or("unattributed")
             .to_string();
         let end = self.current_buffer().char_idx_to_position(usize::MAX);
         self.begin_transaction_with_origin(
             format!("agent edit {}", path.display()),
             EditOrigin::Agent {
-                session_id: session_id.to_string(),
+                session_id: context.session_id.to_string(),
                 turn_id,
             },
         );
         self.replace_range(TextRange::new(TextPosition::new(0, 0), end), &contents);
         self.commit_transaction(self.cursor_snapshot());
-        let root = self
-            .agent_manager
-            .root()
-            .ok_or_else(|| anyhow::anyhow!("no agent workspace is active"))?
-            .to_path_buf();
         let notification_error = self.notify_change(runtime).await.err();
-        let persistence = self.save_current_agent_buffer(&root, path, runtime).await;
+        let persistence = self
+            .save_current_agent_buffer(context.root, path, runtime)
+            .await;
         let render_error = self.render(render_buffer).err();
         let operational_error = notification_error
             .map(|error| format!("change notification failed: {error}"))
@@ -7794,6 +7803,19 @@ impl Editor {
             .ok_or_else(|| anyhow::anyhow!("no agent workspace is active"))?
             .to_path_buf();
 
+        self.dispatch_agent_editor_tool_in_workspace(request, root, render_buffer, runtime)
+            .await
+    }
+
+    // The normal bridge validates its active session above. Recorded lessons
+    // call this private core with an editor-owned temporary workspace only.
+    async fn dispatch_agent_editor_tool_in_workspace(
+        &mut self,
+        request: EditorToolRequest,
+        root: PathBuf,
+        render_buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<Value> {
         let resolve_path =
             |path: &str| -> anyhow::Result<PathBuf> { resolve_agent_tool_path(&root, path) };
 
@@ -7825,7 +7847,10 @@ impl Editor {
             } => {
                 let path = resolve_path(&path)?;
                 self.apply_agent_contents(
-                    &request.session_id,
+                    AgentToolContext {
+                        session_id: &request.session_id,
+                        root: &root,
+                    },
                     &path,
                     expected_revision,
                     content,
@@ -7954,7 +7979,10 @@ impl Editor {
                 );
                 let contents = apply_text_edits(&self.current_buffer().contents(), &edits)?;
                 self.apply_agent_contents(
-                    &request.session_id,
+                    AgentToolContext {
+                        session_id: &request.session_id,
+                        root: &root,
+                    },
                     &path,
                     expected_revision,
                     contents,
@@ -16321,6 +16349,12 @@ impl Editor {
         // log!("Action: {action:?}");
         self.set_legacy_message(None);
         if self.intercept_learn_action(action, buffer, runtime)? {
+            return Ok(false);
+        }
+        if self
+            .intercept_learn_agent_action(action, buffer, runtime)
+            .await?
+        {
             return Ok(false);
         }
         let sensitive_action = matches!(action, Action::NotifyPlugin(_, _, _))
@@ -27650,6 +27684,136 @@ mod test {
     use super::*;
     use crate::lsp::DiagnosticSeverity;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn learn_red_agent_saves_owned_files_and_restores_the_real_composer() {
+        use crate::learn::{
+            Lesson, PracticeStep, AGENT_EXAMPLE_FIXED, AI_CONTENTS, AI_FIXED_CONTENTS,
+            LEARN_AGENT_PANEL,
+        };
+        let mut editor = test_editor(140, 38);
+        let mut buffer = RenderBuffer::new(140, 38, &Style::default());
+        let mut runtime = Runtime::new();
+        let original_root = tempfile::tempdir().unwrap();
+        editor
+            .agent_manager
+            .set_root(Some(original_root.path().to_path_buf()));
+        editor.panel_manager.create_text_panel(
+            "agent-conversation".into(),
+            plugin::PanelConfig {
+                side: plugin::PanelSide::Right,
+                width: 42,
+                composer: Some(plugin::TextPanelComposerConfig {
+                    placeholder: "Ask".into(),
+                    rows: 3,
+                }),
+                ..plugin::PanelConfig::default()
+            },
+        );
+        editor
+            .panel_manager
+            .focus_text_panel_composer("agent-conversation");
+        editor
+            .panel_manager
+            .handle_focused_text_input(&Event::Paste("my unsent real prompt".into()), 140);
+        let panels = editor.panel_manager.snapshot(140);
+        let original_id = editor.current_buffer().id();
+        let original_count = editor.buffer_manager.len();
+        editor
+            .execute(
+                &Action::StartLearnLessonAt(Lesson::ContinueInAgent.id().into()),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        let path = PathBuf::from(editor.current_buffer().file.as_ref().unwrap());
+        let root = path.parent().unwrap().to_path_buf();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), AI_CONTENTS);
+        assert!(editor
+            .dispatch_agent_editor_tool(
+                EditorToolRequest {
+                    session_id: "learn-practice:agent".into(),
+                    call: EditorToolCall::ReadFile {
+                        path: "score.rs".into()
+                    },
+                },
+                &mut buffer,
+                &mut runtime
+            )
+            .await
+            .is_err());
+        for action in [
+            Action::EnterMode(Mode::VisualLine),
+            Action::InlineAssist,
+            Action::SubmitInlineAssist("Add points".into()),
+            Action::EscalateInlineAssist,
+        ] {
+            editor
+                .execute(&action, &mut buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+        assert!(editor.learn_agent_pane_open());
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::AgentPrompt
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), AI_CONTENTS);
+        editor
+            .execute(
+                &Action::NotifyPlugins(
+                    format!("panel:event:{LEARN_AGENT_PANEL}"),
+                    json!({"action":"submit", "text":"Save the fix and update the example"}),
+                ),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        assert!(editor.learn_agent_files_saved());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), AI_FIXED_CONTENTS);
+        assert_eq!(
+            std::fs::read_to_string(root.join("example.rs")).unwrap(),
+            AGENT_EXAMPLE_FIXED
+        );
+        assert!(!editor.current_buffer().is_dirty());
+        assert_eq!(editor.buffer_manager.len(), original_count + 2);
+        assert_eq!(editor.agent_manager.root(), Some(original_root.path()));
+        assert!(editor.agent_manager.bridge().is_none());
+        editor
+            .execute(
+                &Action::NotifyPlugins(
+                    format!("panel:event:{LEARN_AGENT_PANEL}"),
+                    json!({"action":"close"}),
+                ),
+                &mut buffer,
+                &mut runtime,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::AgentInspect
+        );
+        editor
+            .execute(&Action::NextBuffer, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::Complete
+        );
+        editor
+            .execute(&Action::ExitLearnLesson, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert!(!root.exists());
+        assert_eq!(editor.current_buffer().id(), original_id);
+        assert_eq!(editor.buffer_manager.len(), original_count);
+        assert_eq!(editor.panel_manager.snapshot(140), panels);
+        assert!(editor.panel_manager.focused_text_input_active());
+    }
 
     #[tokio::test]
     async fn learn_red_choice_lesson_requires_undo_refine_and_the_exact_result() {
