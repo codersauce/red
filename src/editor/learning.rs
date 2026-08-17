@@ -376,6 +376,8 @@ impl Editor {
                 .is_some_and(|assist| assist.has_result && assist.transaction_id.is_some()),
             inline_closed: self.inline_assist.is_none(),
             fixed_text: contents == crate::learn::AI_FIXED_CONTENTS,
+            bonus_text: contents == crate::learn::AI_BONUS_CONTENTS,
+            original_text: contents == session.lesson.contents(),
         };
         let session = self
             .learn_session
@@ -417,7 +419,10 @@ impl Editor {
             };
             let range = assist.range;
             let scope = assist.scope.clone();
-            if assist.expected_text != crate::learn::AI_LINE
+            let lesson = self.learn_session.as_ref().map(|session| session.lesson);
+            let refining_choice = lesson == Some(Lesson::ChooseWhatToKeep)
+                && assist.expected_text == crate::learn::AI_BONUS_LINE;
+            if (assist.expected_text != crate::learn::AI_LINE && !refining_choice)
                 || !scope.contains("selection")
                 || prompt.trim().is_empty()
             {
@@ -430,20 +435,22 @@ impl Editor {
             if let Some(assist) = self.inline_assist.as_mut() {
                 assist.request_id = Some(request.clone());
             }
-            let change = self
-                .learn_session
-                .as_ref()
-                .is_some_and(|session| session.lesson == Lesson::MakeAFocusedChange);
+            let (replacement, message) = match lesson {
+                Some(Lesson::MakeAFocusedChange) => (Some(crate::learn::AI_FIXED_LINE),
+                    "Recorded practice response: changed subtraction to addition. This edit is in the buffer and has not been saved."),
+                Some(Lesson::ChooseWhatToKeep) if refining_choice => (Some(crate::learn::AI_FIXED_LINE),
+                    "Recorded practice response: removed the extra bonus point. The refined edit is still unsaved."),
+                Some(Lesson::ChooseWhatToKeep) => (Some(crate::learn::AI_BONUS_LINE),
+                    "Recorded practice response: this intentionally imperfect suggestion adds a bonus point. Inspect the extra + 1 before deciding what to keep."),
+                _ => (None,
+                    "Recorded practice response: this function subtracts points from score. Its name suggests adding points instead. This explanation did not change the source."),
+            };
             let result = InlineAssistResult {
-                replacement: change.then(|| crate::learn::AI_FIXED_LINE.to_string()),
+                replacement: replacement.map(str::to_string),
                 comments: vec![crate::inline_assist::InlineCommentInput {
                     start_line: 1,
                     end_line: None,
-                    message: if change {
-                        "Recorded practice response: changed subtraction to addition. This edit is in the buffer and has not been saved."
-                    } else {
-                        "Recorded practice response: this function subtracts points from score. Its name suggests adding points instead. This explanation did not change the source."
-                    }.into(),
+                    message: message.into(),
                 }],
             };
             self.apply_inline_result(&request, "learn-practice:offline", &result, buffer, runtime)

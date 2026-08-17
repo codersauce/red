@@ -27652,6 +27652,94 @@ mod test {
     use std::path::PathBuf;
 
     #[tokio::test]
+    async fn learn_red_choice_lesson_requires_undo_refine_and_the_exact_result() {
+        use crate::learn::{
+            Lesson, PracticeStep, AI_BONUS_CONTENTS, AI_CONTENTS, AI_FIXED_CONTENTS,
+        };
+        let mut editor = test_editor(140, 38);
+        let mut buffer = RenderBuffer::new(140, 38, &Style::default());
+        let mut runtime = Runtime::new();
+        for action in [
+            Action::StartLearnLessonAt(Lesson::ChooseWhatToKeep.id().into()),
+            Action::EnterMode(Mode::VisualLine),
+            Action::InlineAssist,
+            Action::SubmitInlineAssist("Add points".into()),
+        ] {
+            editor
+                .execute(&action, &mut buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+        assert_eq!(editor.current_buffer().contents(), AI_BONUS_CONTENTS);
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::AiChoiceUndo
+        );
+        // Keeping the wrong result cannot complete the checkpoint. The user
+        // can still recover with ordinary editor undo after closing the popup.
+        editor
+            .execute(&Action::KeepInlineAssist, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::AiChoiceUndo
+        );
+        editor
+            .execute(&Action::Undo, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), AI_CONTENTS);
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::AiChoiceAgainSelect
+        );
+        for action in [
+            Action::EnterMode(Mode::VisualLine),
+            Action::InlineAssist,
+            Action::SubmitInlineAssist("Add points".into()),
+            Action::RefineInlineAssist,
+            Action::SubmitInlineAssist("Remove the extra bonus point".into()),
+        ] {
+            editor
+                .execute(&action, &mut buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+        assert_eq!(editor.current_buffer().contents(), AI_FIXED_CONTENTS);
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::AiChoiceKeep
+        );
+        assert!(editor.current_buffer().is_dirty());
+        assert!(editor.agent_manager.bridge().is_none());
+        editor
+            .execute(&Action::KeepInlineAssist, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::Complete
+        );
+        editor
+            .execute(&Action::Undo, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), AI_BONUS_CONTENTS);
+        editor
+            .execute(&Action::Undo, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), AI_CONTENTS);
+        editor
+            .execute(&Action::ExitLearnLesson, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), "hello");
+        assert!(editor.inline_history.conversations.is_empty());
+    }
+
+    #[tokio::test]
     async fn learn_red_focused_inline_change_is_unsaved_and_undoable() {
         use crate::learn::{Lesson, PracticeStep, AI_CONTENTS, AI_FIXED_CONTENTS};
         let mut editor = test_editor(140, 38);
