@@ -61,10 +61,11 @@ pub(crate) enum Lesson {
     ChangeATextObject,
     RepeatAndRecover,
     FindAndReplace,
+    ChooseATheme,
 }
 
 impl Lesson {
-    pub const AVAILABLE: [Self; 22] = [
+    pub const AVAILABLE: [Self; 23] = [
         Self::FindYourFooting,
         Self::EditWithConfidence,
         Self::FindACommand,
@@ -87,6 +88,7 @@ impl Lesson {
         Self::ChangeATextObject,
         Self::RepeatAndRecover,
         Self::FindAndReplace,
+        Self::ChooseATheme,
     ];
 
     pub fn from_id(id: &str) -> Option<Self> {
@@ -133,6 +135,7 @@ impl Lesson {
             Self::ChangeATextObject => 19,
             Self::RepeatAndRecover => 20,
             Self::FindAndReplace => 21,
+            Self::ChooseATheme => 22,
         }
     }
 
@@ -156,6 +159,7 @@ impl Lesson {
             | Self::ChangeATextObject
             | Self::RepeatAndRecover
             | Self::FindAndReplace => 4,
+            Self::ChooseATheme => 5,
             _ => 0,
         }
     }
@@ -224,6 +228,7 @@ impl Lesson {
             Self::ChangeATextObject => "precision.change-a-text-object.v1",
             Self::RepeatAndRecover => "precision.repeat-and-recover.v1",
             Self::FindAndReplace => "precision.find-and-replace.v1",
+            Self::ChooseATheme => "custom.choose-a-theme.v1",
         }
     }
 
@@ -237,7 +242,7 @@ impl Lesson {
             Self::ChangeATextObject => precision::OBJECT_CONTENTS,
             Self::RepeatAndRecover => precision::REPEAT_CONTENTS,
             Self::FindAndReplace => precision::REPLACE_CONTENTS,
-            Self::FindYourFooting => PRACTICE_CONTENTS,
+            Self::FindYourFooting | Self::ChooseATheme => PRACTICE_CONTENTS,
             Self::EditWithConfidence => EDIT_CONTENTS,
             Self::FindACommand => COMMAND_CONTENTS,
             Self::SaveAPracticeFile => SAVE_CONTENTS,
@@ -279,6 +284,7 @@ impl Lesson {
             Self::ChangeATextObject => PracticeStep::ObjectFind,
             Self::RepeatAndRecover => PracticeStep::RepeatEdit,
             Self::FindAndReplace => PracticeStep::ReplaceSearch,
+            Self::ChooseATheme => PracticeStep::ThemeOpen,
         }
     }
 
@@ -329,6 +335,12 @@ impl Lesson {
                 "Undo the unwanted change",
                 "Request and refine a suggestion",
                 "Keep only the corrected result",
+            ],
+            Self::ChooseATheme => &[
+                "Open the theme browser",
+                "Preview a different theme",
+                "Cancel and restore the saved theme",
+                "Save a choice or keep your theme",
             ],
             Self::FindAndReplace => &[
                 "Search for old",
@@ -621,12 +633,20 @@ pub(crate) enum PracticeStep {
     ReplaceNext,
     ReplaceAll,
     ReplaceUndo,
+    ThemeOpen,
+    ThemePreview,
+    ThemeCancel,
+    ThemeChoose,
     Complete,
 }
 
 impl PracticeStep {
     pub fn suggested_action(self) -> Option<Action> {
         match self {
+            Self::ThemeOpen | Self::ThemeChoose => {
+                Some(Action::PluginCommand("ThemeBrowser".into()))
+            }
+            Self::ThemePreview | Self::ThemeCancel => None,
             Self::ReplaceSearch => Some(Action::EnterSearch(SearchDirection::Forward)),
             Self::ReplaceNext => Some(Action::RepeatSearch),
             Self::ReplaceAll => None,
@@ -774,6 +794,10 @@ impl PracticeStep {
             Self::DiagnosticJump => "Choose the missing-semicolon error and press Enter. The editor will take you to the reported location. Reopen Diagnostics if you closed the picker.".into(),
             Self::DiagnosticRead => format!("Press {} to read the diagnostic on this line. The parser points at the next token; the incomplete statement is just above it.", shortcut.unwrap_or("D")),
             Self::DiagnosticReturn => "Read the message and diagnostic code, then press Esc to return to the source. You will repair the defect in a later lesson.".into(),
+            Self::ThemeOpen => format!("Press {} (or :ThemeBrowser) to browse installed and bundled themes. Moving through the list previews colors without saving a preference.", shortcut.unwrap_or("Space t")),
+            Self::ThemePreview => "Move to a different theme or filter by name. The editor previews it immediately. Enter saves a choice; for this first pass, try Esc after the colors change.".into(),
+            Self::ThemeCancel => "Press Esc to restore the saved theme. If you already selected a theme with Enter, reopen :ThemeBrowser and cancel; an explicit saved choice is never silently undone.".into(),
+            Self::ThemeChoose => format!("Open {} again. Press Enter on a theme to save it, or Esc to keep the current one. Saving is optional; only an explicit Enter changes your configuration.", shortcut.unwrap_or(":ThemeBrowser")),
             Self::ReplaceSearch => format!("Press {}, type old, and press Enter. Search previews matching text before you commit the jump. This exercise keeps its search history separate from yours.", shortcut.unwrap_or("/")),
             Self::ReplaceNext => format!("Press {} to visit the next match on the second line. The same search can be repeated without typing it again.", shortcut.unwrap_or("n")),
             Self::ReplaceAll => "Run :%s/old/new/g. The % selects the whole buffer; g replaces every occurrence on each selected line. Red uses Rust regular-expression syntax.".into(),
@@ -833,6 +857,7 @@ impl PracticeStep {
                 Lesson::UnderstandSelectedCode => "You explained selected code without editing it. Recorded practice complete; real inline assist sends your selected context only when you submit a prompt.",
                 Lesson::MakeAFocusedChange => "The fix is kept in the buffer, still unsaved. Inline edits use normal undo history; keeping one is not the same as writing a file.",
                 Lesson::ChooseWhatToKeep => "You rejected an unwanted change, refined a suggestion, and kept the corrected result. The final edit is unsaved and remains undoable.",
+                Lesson::ChooseATheme => "You previewed a theme, tested cancellation, and made an explicit choice. Your saved theme remains in effect after the lesson.",
                 Lesson::FindAndReplace => "You searched, repeated the search, replaced both matches, and undid the substitution in one step. Edit with precision complete! The original practice text is restored.",
                 Lesson::RepeatAndRecover => "Both unwanted words are gone. You repeated a completed change and recovered the second edit independently. The practice text is still unsaved.",
                 Lesson::ChangeATextObject => "The title is now Scoreboard, with both quotes preserved. You changed an entire text object in one unsaved, undoable edit.",
@@ -880,7 +905,8 @@ impl PracticeStep {
             | Self::MotionFind
             | Self::ObjectFind
             | Self::RepeatEdit
-            | Self::ReplaceSearch => 0,
+            | Self::ReplaceSearch
+            | Self::ThemeOpen => 0,
             Self::Type
             | Self::EditDelete
             | Self::CommandRun
@@ -902,7 +928,8 @@ impl PracticeStep {
             | Self::MotionDelete
             | Self::ObjectChange
             | Self::RepeatNext
-            | Self::ReplaceNext => 1,
+            | Self::ReplaceNext
+            | Self::ThemePreview => 1,
             Self::Normal
             | Self::EditUndo
             | Self::CommandHelp
@@ -926,7 +953,8 @@ impl PracticeStep {
             | Self::MotionUndo
             | Self::ObjectType
             | Self::RepeatUndo
-            | Self::ReplaceAll => 2,
+            | Self::ReplaceAll
+            | Self::ThemeCancel => 2,
             Self::Undo
             | Self::EditRedo
             | Self::CommandReturn
@@ -948,7 +976,8 @@ impl PracticeStep {
             | Self::MotionRedo
             | Self::ObjectNormal
             | Self::RepeatRedo
-            | Self::ReplaceUndo => 3,
+            | Self::ReplaceUndo
+            | Self::ThemeChoose => 3,
             Self::Complete => 4,
         }
     }
@@ -1070,6 +1099,25 @@ impl PracticeStep {
     /// Observes UI state that can change through either a key or an action.
     pub fn observe_view(&mut self, action: &Action, view: PracticeView) -> bool {
         let next = match (*self, action) {
+            (Self::ThemeOpen, Action::PluginCommand(name))
+                if name == "ThemeBrowser" && view.theme_picker_open =>
+            {
+                Self::ThemePreview
+            }
+            (Self::ThemePreview, Action::PreviewTheme(_)) if view.theme_previewed => {
+                Self::ThemeCancel
+            }
+            (Self::ThemeCancel, Action::PluginCommand(name))
+                if name == "LearnThemeCancel" && view.theme_cancelled =>
+            {
+                Self::ThemeChoose
+            }
+            (Self::ThemeChoose, Action::SetTheme(_)) if view.theme_decided => Self::Complete,
+            (Self::ThemeChoose, Action::PluginCommand(name))
+                if name == "LearnThemeCancel" && view.theme_decided =>
+            {
+                Self::Complete
+            }
             (Self::ReplaceSearch, Action::CommitSearch) if view.replace_first_match => {
                 Self::ReplaceNext
             }
@@ -1313,6 +1361,10 @@ pub(crate) struct PracticeView {
     pub code_actions_open: bool,
     pub husk_fixed_text: bool,
     pub diagnostics_clean: bool,
+    pub theme_picker_open: bool,
+    pub theme_previewed: bool,
+    pub theme_cancelled: bool,
+    pub theme_decided: bool,
     pub replace_first_match: bool,
     pub replace_second_match: bool,
     pub workspace_two_views: bool,
@@ -1338,21 +1390,29 @@ pub(crate) struct PracticeView {
 
 /// Scratch lessons permit only edits to their isolated practice buffer.
 pub(crate) fn practice_action_allowed(lesson: Lesson, action: &Action) -> bool {
-    (lesson == Lesson::FindAndReplace
-        && matches!(
+    (lesson == Lesson::ChooseATheme
+        && (matches!(
             action,
-            Action::EnterSearch(_)
-                | Action::EnterMode(Mode::Search)
-                | Action::CommitSearch
-                | Action::CancelSearch
-                | Action::FindNext
-                | Action::FindPrevious
-                | Action::RepeatSearch
-                | Action::RepeatSearchOpposite
-                | Action::ClearSearchHighlight
-                | Action::Substitute(_)
-                | Action::ConfirmSubstitute(_)
-        ))
+            Action::PreviewTheme(_)
+                | Action::SetTheme(_)
+                | Action::CommandPalette
+                | Action::KeyboardShortcuts
+        ) || matches!(action, Action::PluginCommand(name) if matches!(name.as_str(), "ThemeBrowser" | "LearnThemeCancel"))))
+        || (lesson == Lesson::FindAndReplace
+            && matches!(
+                action,
+                Action::EnterSearch(_)
+                    | Action::EnterMode(Mode::Search)
+                    | Action::CommitSearch
+                    | Action::CancelSearch
+                    | Action::FindNext
+                    | Action::FindPrevious
+                    | Action::RepeatSearch
+                    | Action::RepeatSearchOpposite
+                    | Action::ClearSearchHighlight
+                    | Action::Substitute(_)
+                    | Action::ConfirmSubstitute(_)
+            ))
         || (lesson == Lesson::RepeatAndRecover
             && matches!(
                 action,

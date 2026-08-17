@@ -8,6 +8,7 @@ use crate::ui::{draw_learn_coach, draw_learn_panel_coach, CoachLayout, LearnHub}
 
 mod agent;
 mod committing;
+mod customization;
 mod git;
 mod language;
 mod navigation;
@@ -38,6 +39,7 @@ pub(super) struct LearnSession {
     original_language: language::SavedLanguageState,
     symbols: Option<symbols::LearnSymbolState>,
     outline: Option<outline::LearnOutlineState>,
+    theme: Option<customization::LearnThemeState>,
 }
 
 impl LearnSession {
@@ -293,6 +295,8 @@ impl Editor {
             original_language,
             symbols: (lesson == Lesson::FollowTheSymbol).then(symbols::LearnSymbolState::default),
             outline: (lesson == Lesson::FollowSymbols).then(outline::LearnOutlineState::default),
+            theme: (lesson == Lesson::ChooseATheme)
+                .then(|| customization::LearnThemeState::new(self)),
         }));
         self.mode = Mode::Normal;
         if lesson == Lesson::FindACommand {
@@ -399,6 +403,9 @@ impl Editor {
         self.highlight_cache.clear();
         self.layout_cache.borrow_mut().clear();
         session.original_language.restore(self).await;
+        if let Some(theme) = session.theme {
+            theme.restore(self, runtime).await?;
+        }
         // Finish deleting owned files before showing the restored workspace.
         drop(session.workspace);
         self.force_full_redraw = true;
@@ -496,6 +503,16 @@ impl Editor {
             self.render(buffer)?;
             return Ok(true);
         }
+        if self
+            .intercept_learn_customization_action(action, buffer, runtime)
+            .await?
+        {
+            return Ok(true);
+        }
+        let session = self
+            .learn_session
+            .as_ref()
+            .expect("active lesson was checked");
         if session.lesson.is_navigation_practice()
             && self
                 .intercept_learn_navigation_action(action, buffer, runtime)
@@ -624,6 +641,13 @@ impl Editor {
                 .flatten()
                 .and_then(|uri| self.diagnostics.get(&uri))
                 .is_some_and(Vec::is_empty),
+            theme_picker_open: self
+                .current_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.shortcut_context() == "Themes"),
+            theme_previewed: session.theme.as_ref().is_some_and(|theme| theme.previewed),
+            theme_cancelled: session.theme.as_ref().is_some_and(|theme| theme.cancelled),
+            theme_decided: session.theme.as_ref().is_some_and(|theme| theme.decided),
             replace_first_match: self.search_term == "old"
                 && contents == crate::learn::precision::REPLACE_CONTENTS
                 && cursor == (13, 0),

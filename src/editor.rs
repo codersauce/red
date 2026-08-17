@@ -22019,6 +22019,15 @@ impl Editor {
         } else {
             parse_vscode_theme_contents(&theme_asset.read_to_string()?)?
         };
+        self.install_theme(theme)?;
+        if update_config {
+            Config::persist_theme(theme_name)?;
+            self.config.theme = theme_name.to_string();
+        }
+        Ok(())
+    }
+
+    fn install_theme(&mut self, theme: Theme) -> anyhow::Result<()> {
         let highlighter = Highlighter::with_registry(&theme, self.highlighter.registry())?;
         self.theme = theme;
         self.highlighter = highlighter;
@@ -22029,10 +22038,6 @@ impl Editor {
         self.force_full_redraw = true;
         if let Some(dialog) = &mut self.current_dialog {
             dialog.set_theme(&self.theme);
-        }
-        if update_config {
-            self.config.theme = theme_name.to_string();
-            Config::persist_theme(theme_name)?;
         }
         Ok(())
     }

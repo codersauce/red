@@ -301,6 +301,8 @@ pub struct Picker {
     dialog: Dialog,
     matcher: SkimMatcherV2,
     select_action: Option<SelectAction>,
+    change_action: Option<SelectAction>,
+    cancel_action: Option<Box<dyn Fn() -> Action + Send>>,
     filter_action: Option<FilterAction>,
     filter_tie_breaker: Option<FilterTieBreaker>,
     filter_highlight_action: Option<FilterHighlightAction>,
@@ -470,6 +472,8 @@ impl Picker {
             dialog,
             matcher: SkimMatcherV2::default(),
             select_action: None,
+            change_action: None,
+            cancel_action: None,
             filter_action: None,
             filter_tie_breaker: None,
             filter_highlight_action: None,
@@ -915,7 +919,10 @@ impl Picker {
     }
 
     fn notify_selection_changed(&mut self, previous: Option<String>) -> Option<KeyAction> {
-        self.reset_preview_scroll_if_selection_changed(previous)?;
+        let selected = self.reset_preview_scroll_if_selection_changed(previous)?;
+        if let Some(change) = &self.change_action {
+            return Some(KeyAction::Single(change(selected)));
+        }
         if !self.live {
             return None;
         }
@@ -1054,6 +1061,9 @@ impl Picker {
     }
 
     fn notify_cancelled(&self) -> Option<KeyAction> {
+        if let Some(cancel) = &self.cancel_action {
+            return Some(KeyAction::Multiple(vec![cancel(), Action::CloseDialog]));
+        }
         if !self.live {
             return Some(KeyAction::Single(Action::CloseDialog));
         }
@@ -3448,6 +3458,9 @@ pub struct PickerBuilder {
     structured_items: Option<Vec<PickerItem>>,
     id: Option<i32>,
     select_action: Option<SelectAction>,
+    change_action: Option<SelectAction>,
+    cancel_action: Option<Box<dyn Fn() -> Action + Send>>,
+    initial_selection: Option<String>,
     filter_action: Option<FilterAction>,
     filter_tie_breaker: Option<FilterTieBreaker>,
     filter_highlight_action: Option<FilterHighlightAction>,
@@ -3475,6 +3488,9 @@ impl PickerBuilder {
             structured_items: None,
             id: None,
             select_action: None,
+            change_action: None,
+            cancel_action: None,
+            initial_selection: None,
             filter_action: None,
             filter_tie_breaker: None,
             filter_highlight_action: None,
@@ -3513,6 +3529,26 @@ impl PickerBuilder {
 
     pub fn select_action(mut self, action: impl Fn(String) -> Action + Send + 'static) -> Self {
         self.select_action = Some(Box::new(action));
+        self
+    }
+
+    /// Runs an editor-owned action when the selected row changes.
+    pub(crate) fn change_action(
+        mut self,
+        action: impl Fn(String) -> Action + Send + 'static,
+    ) -> Self {
+        self.change_action = Some(Box::new(action));
+        self
+    }
+
+    /// Runs before the picker closes through cancellation.
+    pub(crate) fn cancel_action(mut self, action: impl Fn() -> Action + Send + 'static) -> Self {
+        self.cancel_action = Some(Box::new(action));
+        self
+    }
+
+    pub(crate) fn initial_selection(mut self, id: impl Into<String>) -> Self {
+        self.initial_selection = Some(id.into());
         self
     }
 
@@ -3612,6 +3648,9 @@ impl PickerBuilder {
         };
         let id = self.id;
         let select_action = self.select_action;
+        let change_action = self.change_action;
+        let cancel_action = self.cancel_action;
+        let initial_selection = self.initial_selection;
         let filter_action = self.filter_action;
         let filter_tie_breaker = self.filter_tie_breaker;
         let filter_highlight_action = self.filter_highlight_action;
@@ -3632,6 +3671,11 @@ impl PickerBuilder {
         }
         if let Some(select_action) = select_action {
             picker.select_action = Some(select_action);
+        }
+        picker.change_action = change_action;
+        picker.cancel_action = cancel_action;
+        if let Some(selection) = initial_selection {
+            picker.select_dynamic_id(&selection);
         }
         picker.filter_action = filter_action;
         picker.filter_tie_breaker = filter_tie_breaker;
@@ -5850,6 +5894,40 @@ mod tests {
         assert_eq!(match_cell.style.bg, Some(match_color));
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn editor_owned_picker_previews_cancels_and_preserves_stable_ids() {
+        let editor = test_editor();
+        let mut picker = Picker::builder()
+            .structured_items(vec![
+                dynamic_item("alpha.json", "Alpha"),
+                dynamic_item("bravo.json", "Bravo"),
+            ])
+            .initial_selection("bravo.json")
+            .change_action(Action::PreviewTheme)
+            .cancel_action(|| Action::Print("cancel preview".into()))
+            .select_action(Action::SetTheme)
+            .build(&editor);
+        assert_eq!(picker.selected_item().as_deref(), Some("bravo.json"));
+        assert_eq!(
+            picker.handle_event(&key(KeyCode::Up, KeyModifiers::NONE)),
+            Some(KeyAction::Single(Action::PreviewTheme("alpha.json".into())))
+        );
+        assert_eq!(
+            picker.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(KeyAction::Multiple(vec![
+                Action::Print("cancel preview".into()),
+                Action::CloseDialog
+            ]))
+        );
+        assert_eq!(
+            select(&mut picker),
+            Some(KeyAction::Multiple(vec![
+                Action::CloseDialog,
+                Action::SetTheme("alpha.json".into())
+            ]))
+        );
     }
 
     #[test]
