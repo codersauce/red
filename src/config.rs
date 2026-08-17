@@ -3995,6 +3995,10 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
             config.keys.normal.get("Alt-x"),
             Some(&KeyAction::Single(Action::CommandPalette))
         );
+        assert_eq!(
+            config.keys.insert.get("Ctrl-l"),
+            Some(&KeyAction::Single(Action::AcceptInlineCompletion))
+        );
         let Some(KeyAction::Nested(leader)) = config.keys.normal.get(" ") else {
             panic!("expected a Space leader mapping");
         };

@@ -1221,6 +1221,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ctrl_l_accepts_inline_completion() {
+        let mut editor = editor("foo");
+        show(&mut editor, "bar", 3).await;
+
+        assert_eq!(
+            editor
+                .handle_event(&Event::Key(KeyEvent::new(
+                    KeyCode::Char('l'),
+                    KeyModifiers::CONTROL,
+                )))
+                .unwrap(),
+            Some(KeyAction::Single(Action::AcceptInlineCompletion)),
+        );
+        editor
+            .test_execute_action(Action::AcceptInlineCompletion)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), "foobar");
+    }
+
+    #[tokio::test]
     async fn explicit_inline_request_supersedes_old_popup_responses_only() {
         let mut editor = editor("foo foobar");
         let (bridge, _requests, _controls, _events) = Bridge::test_channels();
