@@ -16,6 +16,9 @@ pub(crate) const SAVE_CONTENTS: &str = "Today I learned:\n";
 pub(crate) const AI_LINE: &str =
     "fn add_score(score: u32, points: u32) -> u32 { score - points }\n";
 pub(crate) const AI_CONTENTS: &str = "fn add_score(score: u32, points: u32) -> u32 { score - points }\n\n// Offline practice: no prompt or code is sent to an AI service.\n";
+pub(crate) const AI_FIXED_LINE: &str =
+    "fn add_score(score: u32, points: u32) -> u32 { score + points }\n";
+pub(crate) const AI_FIXED_CONTENTS: &str = "fn add_score(score: u32, points: u32) -> u32 { score + points }\n\n// Offline practice: no prompt or code is sent to an AI service.\n";
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Lesson {
@@ -25,15 +28,17 @@ pub(crate) enum Lesson {
     FindACommand,
     SaveAPracticeFile,
     UnderstandSelectedCode,
+    MakeAFocusedChange,
 }
 
 impl Lesson {
-    pub const AVAILABLE: [Self; 5] = [
+    pub const AVAILABLE: [Self; 6] = [
         Self::FindYourFooting,
         Self::EditWithConfidence,
         Self::FindACommand,
         Self::SaveAPracticeFile,
         Self::UnderstandSelectedCode,
+        Self::MakeAFocusedChange,
     ];
 
     pub fn from_id(id: &str) -> Option<Self> {
@@ -63,12 +68,13 @@ impl Lesson {
             Self::FindACommand => 2,
             Self::SaveAPracticeFile => 3,
             Self::UnderstandSelectedCode => 4,
+            Self::MakeAFocusedChange => 5,
         }
     }
 
     pub const fn track_index(self) -> usize {
         match self {
-            Self::UnderstandSelectedCode => 1,
+            Self::UnderstandSelectedCode | Self::MakeAFocusedChange => 1,
             _ => 0,
         }
     }
@@ -80,7 +86,10 @@ impl Lesson {
     }
 
     pub const fn is_ai_practice(self) -> bool {
-        matches!(self, Self::UnderstandSelectedCode)
+        matches!(
+            self,
+            Self::UnderstandSelectedCode | Self::MakeAFocusedChange
+        )
     }
 
     pub const fn id(self) -> &'static str {
@@ -90,6 +99,7 @@ impl Lesson {
             Self::FindACommand => "essentials.find-a-command.v1",
             Self::SaveAPracticeFile => "essentials.save-a-practice-file.v1",
             Self::UnderstandSelectedCode => "ai.understand-selected-code.v1",
+            Self::MakeAFocusedChange => "ai.make-a-focused-change.v1",
         }
     }
 
@@ -103,7 +113,7 @@ impl Lesson {
             Self::EditWithConfidence => EDIT_CONTENTS,
             Self::FindACommand => COMMAND_CONTENTS,
             Self::SaveAPracticeFile => SAVE_CONTENTS,
-            Self::UnderstandSelectedCode => AI_CONTENTS,
+            Self::UnderstandSelectedCode | Self::MakeAFocusedChange => AI_CONTENTS,
         }
     }
 
@@ -114,6 +124,7 @@ impl Lesson {
             Self::FindACommand => PracticeStep::CommandOpen,
             Self::SaveAPracticeFile => PracticeStep::SaveEdit,
             Self::UnderstandSelectedCode => PracticeStep::AiSelect,
+            Self::MakeAFocusedChange => PracticeStep::AiChangeSelect,
         }
     }
 
@@ -152,6 +163,12 @@ impl Lesson {
                 "Open inline assist",
                 "Ask for an explanation",
                 "Read the inline comment",
+            ],
+            Self::MakeAFocusedChange => &[
+                "Select only the function",
+                "Open a bounded inline prompt",
+                "Request the focused fix",
+                "Keep the unsaved edit",
             ],
         }
     }
@@ -280,6 +297,10 @@ pub(crate) enum PracticeStep {
     AiOpen,
     AiSubmit,
     AiRead,
+    AiChangeSelect,
+    AiChangeOpen,
+    AiChangeSubmit,
+    AiChangeKeep,
     Complete,
 }
 
@@ -296,10 +317,11 @@ impl PracticeStep {
             Self::CommandHelp => Some(Action::KeyboardShortcuts),
             Self::SaveWrite | Self::SaveWriteAgain => Some(Action::Save),
             Self::SaveEdit | Self::SaveEditAgain => Some(Action::EnterMode(Mode::Insert)),
-            Self::AiSelect => Some(Action::EnterMode(Mode::VisualLine)),
-            Self::AiOpen => Some(Action::InlineAssist),
+            Self::AiSelect | Self::AiChangeSelect => Some(Action::EnterMode(Mode::VisualLine)),
+            Self::AiOpen | Self::AiChangeOpen => Some(Action::InlineAssist),
             Self::AiRead => Some(Action::ShowInlineComment),
-            Self::AiSubmit => None,
+            Self::AiChangeKeep => Some(Action::KeepInlineAssist),
+            Self::AiSubmit | Self::AiChangeSubmit => None,
             Self::Type | Self::CommandRun | Self::CommandReturn | Self::Complete => None,
         }
     }
@@ -344,6 +366,10 @@ impl PracticeStep {
             Self::AiOpen => format!("Press {} to open inline assist for the selected function.", shortcut.unwrap_or("Space i")),
             Self::AiSubmit => "Ask what this function does, then press Enter. This lesson supplies a labeled recorded response.".into(),
             Self::AiRead => format!("Press Enter to keep the explanation, then {} to read its inline comment. The source text has not changed.", shortcut.unwrap_or("Space v")),
+            Self::AiChangeSelect => format!("The function subtracts points. Press {} on the first line to select only that function. This is recorded, offline practice.", shortcut.unwrap_or("V")),
+            Self::AiChangeOpen => format!("Press {} to request a change limited to your selection.", shortcut.unwrap_or("Space i")),
+            Self::AiChangeSubmit => "Ask to add points instead of subtracting them, then press Enter. The recorded result will make a real, unsaved buffer edit.".into(),
+            Self::AiChangeKeep => "Inspect the + in the function. Press Enter to keep the edit. Keep closes inline assist; it does not save the file. If you undid it, select the line and request it again.".into(),
             Self::Complete => match lesson {
                 Lesson::FindYourFooting => "Your original text is restored. Nicely done.",
                 Lesson::EditWithConfidence => {
@@ -352,6 +378,7 @@ impl PracticeStep {
                 Lesson::FindACommand => "You found a command and its shortcuts. The practice text is unchanged, and your original view will return when you leave.",
                 Lesson::SaveAPracticeFile => "Your latest text is saved. Essentials complete! This disposable file is removed when you leave; your own work is untouched.",
                 Lesson::UnderstandSelectedCode => "You explained selected code without editing it. Recorded practice complete; real inline assist sends your selected context only when you submit a prompt.",
+                Lesson::MakeAFocusedChange => "The fix is kept in the buffer, still unsaved. Inline edits use normal undo history; keeping one is not the same as writing a file.",
             }
             .into(),
         }
@@ -359,20 +386,30 @@ impl PracticeStep {
 
     pub const fn completed_steps(self) -> usize {
         match self {
-            Self::Insert | Self::EditMove | Self::CommandOpen | Self::SaveEdit | Self::AiSelect => {
-                0
-            }
-            Self::Type | Self::EditDelete | Self::CommandRun | Self::SaveWrite | Self::AiOpen => 1,
+            Self::Insert
+            | Self::EditMove
+            | Self::CommandOpen
+            | Self::SaveEdit
+            | Self::AiSelect
+            | Self::AiChangeSelect => 0,
+            Self::Type
+            | Self::EditDelete
+            | Self::CommandRun
+            | Self::SaveWrite
+            | Self::AiOpen
+            | Self::AiChangeOpen => 1,
             Self::Normal
             | Self::EditUndo
             | Self::CommandHelp
             | Self::SaveEditAgain
-            | Self::AiSubmit => 2,
+            | Self::AiSubmit
+            | Self::AiChangeSubmit => 2,
             Self::Undo
             | Self::EditRedo
             | Self::CommandReturn
             | Self::SaveWriteAgain
-            | Self::AiRead => 3,
+            | Self::AiRead
+            | Self::AiChangeKeep => 3,
             Self::Complete => 4,
         }
     }
@@ -408,6 +445,11 @@ impl PracticeStep {
             (Self::AiSelect, _) if original_text && mode == Mode::VisualLine && cursor.1 == 0 => {
                 Self::AiOpen
             }
+            (Self::AiChangeSelect, _)
+                if original_text && mode == Mode::VisualLine && cursor.1 == 0 =>
+            {
+                Self::AiChangeOpen
+            }
             _ => return false,
         };
         *self = next;
@@ -431,6 +473,19 @@ impl PracticeStep {
                 Self::AiRead
             }
             (Self::AiRead, Action::ShowInlineComment) if view.inline_comment_open => Self::Complete,
+            (Self::AiChangeOpen, Action::InlineAssist) if view.inline_target_selected => {
+                Self::AiChangeSubmit
+            }
+            (Self::AiChangeSubmit, Action::SubmitInlineAssist(_))
+                if view.inline_edit_applied && view.fixed_text && view.dirty =>
+            {
+                Self::AiChangeKeep
+            }
+            (Self::AiChangeKeep, Action::KeepInlineAssist)
+                if view.inline_closed && view.fixed_text && view.dirty =>
+            {
+                Self::Complete
+            }
             _ => return false,
         };
         *self = next;
@@ -448,6 +503,9 @@ pub(crate) struct PracticeView {
     pub inline_target_selected: bool,
     pub inline_explanation_received: bool,
     pub inline_comment_open: bool,
+    pub inline_edit_applied: bool,
+    pub inline_closed: bool,
+    pub fixed_text: bool,
 }
 
 /// Scratch lessons permit only edits to their isolated practice buffer.
@@ -651,6 +709,9 @@ mod tests {
             inline_target_selected: false,
             inline_explanation_received: false,
             inline_comment_open: false,
+            inline_edit_applied: false,
+            inline_closed: true,
+            fixed_text: false,
         };
         assert!(!step.observe_view(&Action::CommandPalette, view));
         view.command_palette_open = true;

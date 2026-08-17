@@ -370,6 +370,12 @@ impl Editor {
                     .iter()
                     .any(|comment| comment.anchor.buffer_id == session.practice_buffer_id)
                 && contents == crate::learn::AI_CONTENTS,
+            inline_edit_applied: self
+                .inline_assist
+                .as_ref()
+                .is_some_and(|assist| assist.has_result && assist.transaction_id.is_some()),
+            inline_closed: self.inline_assist.is_none(),
+            fixed_text: contents == crate::learn::AI_FIXED_CONTENTS,
         };
         let session = self
             .learn_session
@@ -411,7 +417,10 @@ impl Editor {
             };
             let range = assist.range;
             let scope = assist.scope.clone();
-            if assist.expected_text != crate::learn::AI_LINE || prompt.trim().is_empty() {
+            if assist.expected_text != crate::learn::AI_LINE
+                || !scope.contains("selection")
+                || prompt.trim().is_empty()
+            {
                 self.current_dialog = Some(Box::new(self.inline_assist_popup(scope,
                     InlineAssistPopupState::Failed("Recorded practice needs the first function line selected and a nonempty question. Esc, then select it with V and try again.".into()))));
                 return self.render(buffer);
@@ -421,12 +430,20 @@ impl Editor {
             if let Some(assist) = self.inline_assist.as_mut() {
                 assist.request_id = Some(request.clone());
             }
+            let change = self
+                .learn_session
+                .as_ref()
+                .is_some_and(|session| session.lesson == Lesson::MakeAFocusedChange);
             let result = InlineAssistResult {
-                replacement: None,
+                replacement: change.then(|| crate::learn::AI_FIXED_LINE.to_string()),
                 comments: vec![crate::inline_assist::InlineCommentInput {
                     start_line: 1,
                     end_line: None,
-                    message: "Recorded practice response: this function subtracts points from score. Its name suggests adding points instead. This explanation did not change the source.".into(),
+                    message: if change {
+                        "Recorded practice response: changed subtraction to addition. This edit is in the buffer and has not been saved."
+                    } else {
+                        "Recorded practice response: this function subtracts points from score. Its name suggests adding points instead. This explanation did not change the source."
+                    }.into(),
                 }],
             };
             self.apply_inline_result(&request, "learn-practice:offline", &result, buffer, runtime)

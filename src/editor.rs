@@ -27652,6 +27652,54 @@ mod test {
     use std::path::PathBuf;
 
     #[tokio::test]
+    async fn learn_red_focused_inline_change_is_unsaved_and_undoable() {
+        use crate::learn::{Lesson, PracticeStep, AI_CONTENTS, AI_FIXED_CONTENTS};
+        let mut editor = test_editor(140, 38);
+        let mut buffer = RenderBuffer::new(140, 38, &Style::default());
+        let mut runtime = Runtime::new();
+        for action in [
+            Action::StartLearnLessonAt(Lesson::MakeAFocusedChange.id().into()),
+            Action::EnterMode(Mode::VisualLine),
+            Action::InlineAssist,
+            Action::SubmitInlineAssist("Add points instead of subtracting them".into()),
+        ] {
+            editor
+                .execute(&action, &mut buffer, &mut runtime)
+                .await
+                .unwrap();
+        }
+        assert_eq!(editor.current_buffer().contents(), AI_FIXED_CONTENTS);
+        assert!(editor.current_buffer().is_dirty());
+        assert!(editor.current_buffer().file.is_none());
+        assert!(editor.agent_manager.bridge().is_none());
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::AiChangeKeep
+        );
+        editor
+            .execute(&Action::KeepInlineAssist, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(
+            editor.learn_session.as_ref().unwrap().step,
+            PracticeStep::Complete
+        );
+        assert!(editor.current_buffer().is_dirty());
+        editor
+            .execute(&Action::Undo, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), AI_CONTENTS);
+        assert!(!editor.current_buffer().is_dirty());
+        editor
+            .execute(&Action::ExitLearnLesson, &mut buffer, &mut runtime)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), "hello");
+        assert!(editor.inline_history.conversations.is_empty());
+    }
+
+    #[tokio::test]
     async fn learn_red_recorded_explanation_never_starts_a_bridge_or_leaks_history() {
         use crate::learn::{Lesson, PracticeStep, AI_CONTENTS};
         let mut editor = test_editor(140, 38);
